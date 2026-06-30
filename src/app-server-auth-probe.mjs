@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { watch } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -98,6 +99,12 @@ export class AppServerClient {
       } catch {
         this.#failAll(
           new Error(`invalid app-server JSONL (${Buffer.byteLength(line, "utf8")} bytes)`),
+        );
+        return;
+      }
+      if (message === null || typeof message !== "object" || Array.isArray(message)) {
+        this.#failAll(
+          new Error(`invalid app-server message (${Buffer.byteLength(line, "utf8")} bytes)`),
         );
         return;
       }
@@ -432,6 +439,46 @@ export async function assertNoWorkerAuth(codexHome, phase) {
   );
 }
 
+export function createWorkerAuthMonitor(codexHome, watchDirectory = watch) {
+  let monitorError;
+  let observed = false;
+  let resolveObservation;
+  const observation = new Promise((resolve) => {
+    resolveObservation = resolve;
+  });
+  const watcher = watchDirectory(codexHome, { persistent: false }, (_eventType, filename) => {
+    if (filename === null) {
+      monitorError ??= new Error("worker auth monitor received an event without a filename");
+      resolveObservation();
+      return;
+    }
+    if (filename.toString().toLowerCase() === "auth.json") {
+      observed = true;
+      resolveObservation();
+    }
+  });
+  watcher.on("error", (error) => {
+    monitorError ??= error;
+    resolveObservation();
+  });
+
+  return {
+    async assertNoAuthObserved() {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (monitorError) {
+        throw new Error("worker auth monitor failed", { cause: monitorError });
+      }
+      assert.equal(observed, false, "app-server created or changed worker auth.json");
+    },
+    close() {
+      watcher.close();
+    },
+    waitForObservation() {
+      return observation;
+    },
+  };
+}
+
 export async function stopAndAssertNoWorkerAuth(client, codexHome) {
   const existedBeforeStop = await fileExists(join(codexHome, "auth.json"));
   await client.stop();
@@ -497,6 +544,7 @@ export async function probeExternalAuthRefresh({
   startMock = startResponsesMock,
 } = {}) {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-auth-"));
+  let authMonitor;
   let client;
   let mock;
   try {
@@ -532,6 +580,7 @@ export async function probeExternalAuthRefresh({
     });
 
     await writeProbeConfig(codexHome, mock.baseUrl, mock.chatgptBaseUrl);
+    authMonitor = createWorkerAuthMonitor(codexHome);
     await client.start();
     const initializeResult = await client.initialize(true);
     const loginResult = await client.request("account/login/start", {
@@ -542,6 +591,7 @@ export async function probeExternalAuthRefresh({
     });
     assert.equal(loginResult.type, "chatgptAuthTokens");
     await assertNoWorkerAuth(codexHome, "after external-auth login");
+    await authMonitor.assertNoAuthObserved();
 
     const threadResult = await client.request("thread/start", {
       cwd: workspace,
@@ -563,7 +613,9 @@ export async function probeExternalAuthRefresh({
     assert.equal(mock.requests[1].authorization, `Bearer ${refreshedToken}`);
     assert.equal(completed.params.turn.status, "completed");
     await assertNoWorkerAuth(codexHome, "after turn completion");
+    await authMonitor.assertNoAuthObserved();
     await stopAndAssertNoWorkerAuth(client, codexHome);
+    await authMonitor.assertNoAuthObserved();
 
     return {
       codexVersion: codexVersion(codexBin),
@@ -581,6 +633,7 @@ export async function probeExternalAuthRefresh({
     try {
       await Promise.all([client?.stop(), mock?.close()]);
     } finally {
+      authMonitor?.close();
       await rm(codexHome, { recursive: true, force: true });
     }
   }

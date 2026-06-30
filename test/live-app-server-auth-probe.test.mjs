@@ -18,6 +18,7 @@ import test from "node:test";
 import {
   assertRefreshAccountContinuity,
   assertNoCredentialMaterial,
+  assertSourceAuthUnchanged,
   probeLiveExternalAuth,
   readDedicatedChatgptCredential,
   validateEvidenceDestination,
@@ -89,7 +90,12 @@ test("dedicated credential metadata is redacted before evidence is written", asy
           credential,
           credential,
         ),
-      /refresh request account does not match/,
+      (error) => {
+        assert.match(error.message, /refresh request account does not match/);
+        assert.equal(error.stack.includes("different-account"), false);
+        assert.equal(error.stack.includes(credential.accountId), false);
+        return true;
+      },
     );
     assert.throws(
       () =>
@@ -98,7 +104,24 @@ test("dedicated credential metadata is redacted before evidence is written", asy
           credential,
           { ...credential, accountId: "different-account" },
         ),
-      /refreshed credential account does not match/,
+      (error) => {
+        assert.match(error.message, /refreshed credential account does not match/);
+        assert.equal(error.stack.includes("different-account"), false);
+        assert.equal(error.stack.includes(credential.accountId), false);
+        return true;
+      },
+    );
+    assert.throws(
+      () =>
+        assertSourceAuthUnchanged(
+          { authFileFingerprint: "AUTH_FILE_FINGERPRINT_SECRET_A" },
+          { authFileFingerprint: "AUTH_FILE_FINGERPRINT_SECRET_B" },
+        ),
+      (error) => {
+        assert.match(error.message, /source auth\.json changed/);
+        assert.doesNotMatch(error.stack, /AUTH_FILE_FINGERPRINT_SECRET/);
+        return true;
+      },
     );
 
     const safeEvidence = JSON.stringify({
@@ -155,6 +178,13 @@ test("dedicated credential metadata is redacted before evidence is written", asy
       /must not be hard linked/,
     );
     assert.equal(await readFile(unrelatedHardLinkSource, "utf8"), "leave hardlink unchanged\n");
+
+    const directoryEvidencePath = join(evidenceHome, "directory-evidence");
+    await mkdir(directoryEvidencePath);
+    await assert.rejects(
+      () => validateEvidenceDestination(directoryEvidencePath, credential.authPath),
+      /must be a regular file/,
+    );
 
     const safeEvidencePath = join(evidenceHome, "safe-evidence.json");
     await writeFile(safeEvidencePath, "stale evidence that is longer\n");

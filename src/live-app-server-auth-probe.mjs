@@ -19,6 +19,7 @@ import {
   AppServerClient,
   assertNoWorkerAuth,
   codexVersion,
+  createWorkerAuthMonitor,
   stopAndAssertNoWorkerAuth,
 } from "./app-server-auth-probe.mjs";
 
@@ -155,15 +156,20 @@ export function assertNoCredentialMaterial(serializedEvidence, credential) {
 }
 
 export function assertRefreshAccountContinuity(params, initialCredential, latestCredential) {
-  assert.equal(
-    params?.previousAccountId,
-    initialCredential.accountId,
+  assert(
+    params?.previousAccountId === initialCredential.accountId,
     "refresh request account does not match the initial credential",
   );
-  assert.equal(
-    latestCredential.accountId,
-    initialCredential.accountId,
+  assert(
+    latestCredential.accountId === initialCredential.accountId,
     "refreshed credential account does not match the initial credential",
+  );
+}
+
+export function assertSourceAuthUnchanged(initialCredential, latestCredential) {
+  assert(
+    latestCredential.authFileFingerprint === initialCredential.authFileFingerprint,
+    "source auth.json changed during the read-only live probe",
   );
 }
 
@@ -225,6 +231,11 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
       "evidence destination must not be a symbolic link",
     );
     assert.equal(
+      destinationStat.isFile(),
+      true,
+      "evidence destination must be a regular file",
+    );
+    assert.equal(
       destinationStat.dev === sourceStat.dev && destinationStat.ino === sourceStat.ino,
       false,
       "evidence destination must not reference the source auth file",
@@ -284,6 +295,7 @@ export async function writeEvidenceSafely(
       false,
       "evidence destination must not reference the source auth file",
     );
+    assert.equal(handleStat.isFile(), true, "evidence destination must be a regular file");
     assert.equal(handleStat.nlink, 1, "evidence destination must not be hard linked");
     assert.equal(
       currentParent,
@@ -294,6 +306,11 @@ export async function writeEvidenceSafely(
       destinationStat.isSymbolicLink(),
       false,
       "evidence destination must not be a symbolic link",
+    );
+    assert.equal(
+      destinationStat.isFile(),
+      true,
+      "evidence destination must be a regular file",
     );
     assert.equal(
       destinationStat.dev === handleStat.dev && destinationStat.ino === handleStat.ino,
@@ -325,6 +342,7 @@ export async function probeLiveExternalAuth({
   const startedAt = new Date().toISOString();
   const sourceBefore = await readDedicatedChatgptCredential(authHome);
   const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
+  let authMonitor;
   let client;
   try {
     const workspace = join(workerHome, "workspace");
@@ -348,6 +366,7 @@ export async function probeLiveExternalAuth({
     });
 
     await writeLiveConfig(workerHome, model);
+    authMonitor = createWorkerAuthMonitor(workerHome);
     await client.start();
     const initializeResult = await client.initialize(true);
     const loginResult = await client.request("account/login/start", {
@@ -358,6 +377,7 @@ export async function probeLiveExternalAuth({
     });
     assert.equal(loginResult.type, "chatgptAuthTokens");
     await assertNoWorkerAuth(workerHome, "after external-auth login");
+    await authMonitor.assertNoAuthObserved();
 
     const threadResult = await client.request("thread/start", {
       cwd: workspace,
@@ -376,14 +396,12 @@ export async function probeLiveExternalAuth({
     const completed = await client.waitForNotification("turn/completed");
     assert.equal(completed.params.turn.status, "completed");
     await assertNoWorkerAuth(workerHome, "after turn completion");
+    await authMonitor.assertNoAuthObserved();
     await stopAndAssertNoWorkerAuth(client, workerHome);
+    await authMonitor.assertNoAuthObserved();
 
     const sourceAfter = await readDedicatedChatgptCredential(authHome);
-    assert.equal(
-      sourceAfter.authFileFingerprint,
-      sourceBefore.authFileFingerprint,
-      "source auth.json changed during the read-only live probe",
-    );
+    assertSourceAuthUnchanged(sourceBefore, sourceAfter);
 
     const report = {
       schemaVersion: 1,
@@ -421,6 +439,7 @@ export async function probeLiveExternalAuth({
     try {
       await client?.stop();
     } finally {
+      authMonitor?.close();
       await rm(workerHome, { recursive: true, force: true });
     }
   }

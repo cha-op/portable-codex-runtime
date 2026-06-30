@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   AppServerClient,
   buildWorkerEnvironment,
+  createWorkerAuthMonitor,
   fileExists,
   probeExperimentalGate,
   probeExternalAuthRefresh,
@@ -92,6 +93,35 @@ test("worker auth is checked before app-server shutdown", async () => {
     await rm(codexHome, { recursive: true, force: true });
   }
 });
+
+test(
+  "worker auth monitor detects a transient auth file",
+  { timeout: 2_000 },
+  async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-auth-monitor-"));
+    let signalChange;
+    const monitor = createWorkerAuthMonitor(codexHome, (_path, _options, listener) => {
+      signalChange = listener;
+      return {
+        close() {},
+        on() {},
+      };
+    });
+    try {
+      await writeFile(join(codexHome, "auth.json"), "{}\n", { mode: 0o600 });
+      signalChange("rename", "auth.json");
+      await rm(join(codexHome, "auth.json"));
+      await monitor.waitForObservation();
+      await assert.rejects(
+        () => monitor.assertNoAuthObserved(),
+        /created or changed worker auth\.json/,
+      );
+    } finally {
+      monitor.close();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  },
+);
 
 test("app-server shutdown waits for EOF and ignores late refresh replies", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stop-client-fixture-"));
@@ -218,6 +248,34 @@ setTimeout(() => process.exit(0), 500);
       assert.doesNotMatch(error.stack, /GITHUB_SECRET_SENTINEL/);
       return true;
     });
+  } finally {
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("non-object app-server JSONL is rejected cleanly", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-jsonl-shape-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  await writeFile(
+    fixturePath,
+    `
+process.stdout.write("null\\n");
+setTimeout(() => process.exit(0), 500);
+`,
+  );
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexArgs: [fixturePath],
+    codexHome,
+    timeoutMs: 1_000,
+  });
+  try {
+    await client.start();
+    await assert.rejects(
+      client.waitForNotification("fixture/never"),
+      /invalid app-server message \(4 bytes\)/,
+    );
   } finally {
     await client.stop();
     await rm(codexHome, { recursive: true, force: true });
