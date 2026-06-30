@@ -132,6 +132,23 @@ function isSameOrDescendant(candidate, parent) {
   return candidate === parent || candidate.startsWith(`${parent}${sep}`);
 }
 
+async function resolveThroughExistingAncestor(path) {
+  const missingSegments = [];
+  let cursor = resolve(path);
+  while (true) {
+    try {
+      const canonicalAncestor = await realpath(cursor);
+      return join(canonicalAncestor, ...missingSegments.reverse());
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = dirname(cursor);
+      assert.notEqual(parent, cursor, "could not resolve an existing evidence path ancestor");
+      missingSegments.push(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
 export async function validateEvidenceDestination(path, sourceAuthPath) {
   const evidencePath = resolve(path);
   const lexicalAuthHome = resolve(dirname(sourceAuthPath));
@@ -141,18 +158,24 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
     "evidence destination must not overlap the dedicated auth home",
   );
 
-  await mkdir(dirname(evidencePath), { recursive: true });
-  const [canonicalParent, canonicalSource, sourceStat] = await Promise.all([
-    realpath(dirname(evidencePath)),
+  const [canonicalDestination, canonicalSource, sourceStat] = await Promise.all([
+    resolveThroughExistingAncestor(evidencePath),
     realpath(sourceAuthPath),
     stat(sourceAuthPath),
   ]);
-  const canonicalDestination = join(canonicalParent, basename(evidencePath));
   const canonicalAuthHome = dirname(canonicalSource);
   assert.equal(
     isSameOrDescendant(canonicalDestination, canonicalAuthHome),
     false,
     "evidence destination must not resolve inside the dedicated auth home",
+  );
+
+  const canonicalParent = dirname(canonicalDestination);
+  await mkdir(canonicalParent, { recursive: true });
+  assert.equal(
+    await realpath(canonicalParent),
+    canonicalParent,
+    "evidence destination parent changed while it was being prepared",
   );
 
   try {

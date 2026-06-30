@@ -89,6 +89,12 @@ test("dedicated credential metadata is redacted before evidence is written", asy
       () => validateEvidenceDestination(join(linkedAuthHome, "evidence.json"), credential.authPath),
       /must not resolve inside the dedicated auth home/,
     );
+    const nestedAuthPath = join(linkedAuthHome, "new", "evidence.json");
+    await assert.rejects(
+      () => validateEvidenceDestination(nestedAuthPath, credential.authPath),
+      /must not resolve inside the dedicated auth home/,
+    );
+    await assert.rejects(() => readFile(join(authHome, "new")), /ENOENT/);
 
     const collisionEvidencePath = join(evidenceHome, "collision-evidence.json");
     const collisionNonce = "known-collision";
