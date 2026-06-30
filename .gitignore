@@ -2,6 +2,7 @@
 .env
 .env.*
 .codex-tmp/
+.test-codex-home/
 node_modules/
 dist/
 build/

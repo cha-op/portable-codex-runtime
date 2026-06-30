@@ -1,0 +1,20 @@
+{
+  "name": "portable-codex-runtime",
+  "version": "0.1.0",
+  "description": "Portable host runtime and compatibility probes for Codex app-server.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cha-op/portable-codex-runtime.git"
+  },
+  "scripts": {
+    "probe:external-auth": "node scripts/probe-app-server-auth.mjs",
+    "probe:external-auth:live": "node scripts/probe-live-app-server-auth.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
