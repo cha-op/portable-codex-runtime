@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "probe": "app-server-chatgpt-auth-tokens-live",
+  "startedAt": "2026-06-30T12:17:01.309Z",
+  "completedAt": "2026-06-30T12:17:08.452Z",
+  "codexVersion": "codex-cli 0.142.4",
+  "userAgent": "portable_codex_runtime_probe/0.142.4 (Mac OS 26.5.1; arm64) dumb (portable_codex_runtime_probe; 0.1.0)",
+  "experimentalApi": true,
+  "sourceAuth": {
+    "path": ".test-codex-home/auth.json",
+    "mode": "0600",
+    "authMode": "chatgpt",
+    "planType": "business",
+    "unchangedDuringProbe": true
+  },
+  "worker": {
+    "loginType": "chatgptAuthTokens",
+    "model": "gpt-5.4",
+    "modelProvider": "openai",
+    "turnStatus": "completed",
+    "refreshCallbackCount": 0,
+    "authJsonCreated": false
+  },
+  "result": "passed"
+}
