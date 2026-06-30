@@ -1,0 +1,446 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import {
+  mkdir,
+  mkdtemp,
+  lstat,
+  open,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
+
+import {
+  AppServerClient,
+  assertNoWorkerAuth,
+  codexVersion,
+  createWorkerAuthMonitor,
+  stopAndAssertNoWorkerAuth,
+} from "./app-server-auth-probe.mjs";
+
+const DEFAULT_AUTH_HOME = ".test-codex-home";
+const DEFAULT_EVIDENCE_PATH = "evidence/live-external-auth.json";
+const DEFAULT_MODEL = "gpt-5.4";
+const MIN_TOKEN_VALIDITY_SECONDS = 120;
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function fingerprint(value) {
+  return `sha256:${sha256(value).slice(0, 24)}`;
+}
+
+function decodeJwtPayload(token, label) {
+  const parts = token.split(".");
+  assert(parts.length >= 2, `${label} is not a JWT`);
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch (error) {
+    throw new Error(`${label} has an invalid JWT payload`, { cause: error });
+  }
+}
+
+function authClaims(payload) {
+  const claims = payload?.["https://api.openai.com/auth"];
+  return claims && typeof claims === "object" ? claims : {};
+}
+
+function collectRedactionValues(auth, accessPayload, idPayload) {
+  const candidates = [
+    auth.OPENAI_API_KEY,
+    auth.tokens?.access_token,
+    auth.tokens?.refresh_token,
+    auth.tokens?.id_token,
+    auth.tokens?.account_id,
+    accessPayload?.email,
+    idPayload?.email,
+    authClaims(accessPayload).chatgpt_account_id,
+    authClaims(accessPayload).chatgpt_user_id,
+    authClaims(idPayload).chatgpt_account_id,
+    authClaims(idPayload).chatgpt_user_id,
+  ];
+  return [...new Set(candidates.filter((value) => typeof value === "string" && value.length >= 8))];
+}
+
+export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOME) {
+  const authPath = join(resolve(authHome), "auth.json");
+  assert.equal(
+    typeof constants.O_NOFOLLOW,
+    "number",
+    "safe credential reads require O_NOFOLLOW support",
+  );
+  let authHandle;
+  let raw;
+  let fileStat;
+  try {
+    authHandle = await open(authPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fileStat = await authHandle.stat();
+    assert.equal(fileStat.isFile(), true, "dedicated auth.json must be a regular file");
+    raw = await authHandle.readFile("utf8");
+  } finally {
+    await authHandle?.close().catch(() => {});
+  }
+  assert.equal(fileStat.mode & 0o077, 0, "dedicated auth.json must not be group/world accessible");
+
+  let auth;
+  try {
+    auth = JSON.parse(raw);
+  } catch {
+    throw new Error("dedicated auth.json is not valid JSON");
+  }
+  assert.equal(auth.auth_mode, "chatgpt", "dedicated auth.json must use ChatGPT auth");
+  assert.equal(typeof auth.tokens?.access_token, "string", "auth.json is missing access_token");
+  assert.equal(typeof auth.tokens?.id_token, "string", "auth.json is missing id_token");
+  assert.equal(typeof auth.tokens?.refresh_token, "string", "auth.json is missing refresh_token");
+
+  const accessPayload = decodeJwtPayload(auth.tokens.access_token, "access_token");
+  const idPayload = decodeJwtPayload(auth.tokens.id_token, "id_token");
+  const accessAuth = authClaims(accessPayload);
+  const idAuth = authClaims(idPayload);
+  const accountIds = [
+    ["auth.tokens.account_id", auth.tokens.account_id],
+    ["access_token chatgpt_account_id", accessAuth.chatgpt_account_id],
+    ["id_token chatgpt_account_id", idAuth.chatgpt_account_id],
+  ].filter(([, value]) => value !== null && value !== undefined);
+  assert(accountIds.length > 0, "auth.json is missing a ChatGPT account/workspace id");
+  for (const [label, value] of accountIds) {
+    assert.equal(typeof value, "string", `${label} must be a string`);
+    assert.notEqual(value.length, 0, `${label} must not be empty`);
+  }
+  const accountId = accountIds[0][1];
+  assert(
+    accountIds.every(([, value]) => value === accountId),
+    "auth.json account IDs do not match",
+  );
+  const planType = accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null;
+  const expiresAt =
+    typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null;
+  if (typeof accessPayload.exp === "number") {
+    const remainingSeconds = accessPayload.exp - Math.floor(Date.now() / 1000);
+    assert(
+      remainingSeconds >= MIN_TOKEN_VALIDITY_SECONDS,
+      `access token expires too soon (${remainingSeconds}s); refresh the dedicated login first`,
+    );
+  }
+
+  return {
+    accessToken: auth.tokens.access_token,
+    accountId,
+    authFileFingerprint: fingerprint(raw),
+    authMode: auth.auth_mode,
+    authPath,
+    authPathForEvidence: "dedicated-auth-home/auth.json",
+    credentialFingerprint: fingerprint(auth.tokens.access_token),
+    expiresAt,
+    fileMode: (fileStat.mode & 0o777).toString(8).padStart(4, "0"),
+    lastRefreshAt: auth.last_refresh ?? null,
+    planType,
+    redactionValues: collectRedactionValues(auth, accessPayload, idPayload),
+  };
+}
+
+export function assertNoCredentialMaterial(serializedEvidence, credential) {
+  for (const secret of credential.redactionValues) {
+    assert.equal(
+      serializedEvidence.includes(secret),
+      false,
+      "evidence contains raw credential or account identity material",
+    );
+  }
+}
+
+export function assertRefreshAccountContinuity(params, initialCredential, latestCredential) {
+  assert(
+    params?.previousAccountId === initialCredential.accountId,
+    "refresh request account does not match the initial credential",
+  );
+  assert(
+    latestCredential.accountId === initialCredential.accountId,
+    "refreshed credential account does not match the initial credential",
+  );
+}
+
+export function assertSourceAuthUnchanged(initialCredential, latestCredential) {
+  assert(
+    latestCredential.authFileFingerprint === initialCredential.authFileFingerprint,
+    "source auth.json changed during the read-only live probe",
+  );
+}
+
+function isSameOrDescendant(candidate, parent) {
+  return candidate === parent || candidate.startsWith(`${parent}${sep}`);
+}
+
+async function resolveThroughExistingAncestor(path) {
+  const missingSegments = [];
+  let cursor = resolve(path);
+  while (true) {
+    try {
+      const canonicalAncestor = await realpath(cursor);
+      return join(canonicalAncestor, ...missingSegments.reverse());
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = dirname(cursor);
+      assert.notEqual(parent, cursor, "could not resolve an existing evidence path ancestor");
+      missingSegments.push(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+export async function validateEvidenceDestination(path, sourceAuthPath) {
+  const evidencePath = resolve(path);
+  const lexicalAuthHome = resolve(dirname(sourceAuthPath));
+  assert.equal(
+    isSameOrDescendant(evidencePath, lexicalAuthHome),
+    false,
+    "evidence destination must not overlap the dedicated auth home",
+  );
+
+  const [canonicalParent, canonicalSource, sourceStat] = await Promise.all([
+    resolveThroughExistingAncestor(dirname(evidencePath)),
+    realpath(sourceAuthPath),
+    stat(sourceAuthPath),
+  ]);
+  const canonicalDestination = join(canonicalParent, basename(evidencePath));
+  const canonicalAuthHome = dirname(canonicalSource);
+  assert.equal(
+    isSameOrDescendant(canonicalDestination, canonicalAuthHome),
+    false,
+    "evidence destination must not resolve inside the dedicated auth home",
+  );
+
+  await mkdir(canonicalParent, { recursive: true });
+  assert.equal(
+    await realpath(canonicalParent),
+    canonicalParent,
+    "evidence destination parent changed while it was being prepared",
+  );
+
+  try {
+    const destinationStat = await lstat(canonicalDestination);
+    assert.equal(
+      destinationStat.isSymbolicLink(),
+      false,
+      "evidence destination must not be a symbolic link",
+    );
+    assert.equal(
+      destinationStat.isFile(),
+      true,
+      "evidence destination must be a regular file",
+    );
+    assert.equal(
+      destinationStat.dev === sourceStat.dev && destinationStat.ino === sourceStat.ino,
+      false,
+      "evidence destination must not reference the source auth file",
+    );
+    assert.equal(
+      destinationStat.nlink,
+      1,
+      "evidence destination must not be hard linked",
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return canonicalDestination;
+}
+
+async function writeLiveConfig(codexHome, model) {
+  const config = `
+model = ${JSON.stringify(model)}
+approval_policy = "never"
+sandbox_mode = "read-only"
+disable_response_storage = true
+
+[features]
+shell_snapshot = false
+`;
+  await writeFile(join(codexHome, "config.toml"), config);
+}
+
+export async function writeEvidenceSafely(
+  evidencePath,
+  serialized,
+  sourceAuthPath,
+  { afterOpen } = {},
+) {
+  assert.equal(
+    typeof constants.O_NOFOLLOW,
+    "number",
+    "safe evidence writes require O_NOFOLLOW support",
+  );
+  const canonicalDestination = await validateEvidenceDestination(evidencePath, sourceAuthPath);
+  const sourceStat = await stat(sourceAuthPath);
+  let handle;
+  try {
+    handle = await open(
+      canonicalDestination,
+      constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await afterOpen?.();
+    const [handleStat, currentParent, destinationStat] = await Promise.all([
+      handle.stat(),
+      realpath(dirname(canonicalDestination)),
+      lstat(canonicalDestination),
+    ]);
+    assert.equal(
+      handleStat.dev === sourceStat.dev && handleStat.ino === sourceStat.ino,
+      false,
+      "evidence destination must not reference the source auth file",
+    );
+    assert.equal(handleStat.isFile(), true, "evidence destination must be a regular file");
+    assert.equal(handleStat.nlink, 1, "evidence destination must not be hard linked");
+    assert.equal(
+      currentParent,
+      dirname(canonicalDestination),
+      "evidence destination parent changed before the write",
+    );
+    assert.equal(
+      destinationStat.isSymbolicLink(),
+      false,
+      "evidence destination must not be a symbolic link",
+    );
+    assert.equal(
+      destinationStat.isFile(),
+      true,
+      "evidence destination must be a regular file",
+    );
+    assert.equal(
+      destinationStat.dev === handleStat.dev && destinationStat.ino === handleStat.ino,
+      true,
+      "evidence destination no longer refers to the validated file",
+    );
+    await handle.writeFile(serialized, "utf8");
+    await handle.truncate(Buffer.byteLength(serialized));
+    await handle.sync();
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+  return canonicalDestination;
+}
+
+async function writeEvidence(path, report, credential) {
+  const serialized = `${JSON.stringify(report, null, 2)}\n`;
+  assertNoCredentialMaterial(serialized, credential);
+  return writeEvidenceSafely(path, serialized, credential.authPath);
+}
+
+export async function probeLiveExternalAuth({
+  authHome = process.env.CODEX_TEST_HOME ?? DEFAULT_AUTH_HOME,
+  codexBin = process.env.CODEX_BIN ?? "codex",
+  evidencePath = process.env.CODEX_LIVE_EVIDENCE ?? DEFAULT_EVIDENCE_PATH,
+  makeDirectory = mkdir,
+  model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
+} = {}) {
+  const startedAt = new Date().toISOString();
+  const sourceBefore = await readDedicatedChatgptCredential(authHome);
+  const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
+  let authMonitor;
+  let client;
+  try {
+    const workspace = join(workerHome, "workspace");
+    await makeDirectory(workspace);
+    let refreshCallbackCount = 0;
+
+    client = new AppServerClient({
+      codexBin,
+      codexHome: workerHome,
+      timeoutMs: 120_000,
+      onRefresh: async (params) => {
+        refreshCallbackCount += 1;
+        const latest = await readDedicatedChatgptCredential(authHome);
+        assertRefreshAccountContinuity(params, sourceBefore, latest);
+        return {
+          accessToken: latest.accessToken,
+          chatgptAccountId: latest.accountId,
+          chatgptPlanType: latest.planType,
+        };
+      },
+    });
+
+    await writeLiveConfig(workerHome, model);
+    authMonitor = createWorkerAuthMonitor(workerHome);
+    await client.start();
+    const initializeResult = await client.initialize(true);
+    const loginResult = await client.request("account/login/start", {
+      type: "chatgptAuthTokens",
+      accessToken: sourceBefore.accessToken,
+      chatgptAccountId: sourceBefore.accountId,
+      chatgptPlanType: sourceBefore.planType,
+    });
+    assert.equal(loginResult.type, "chatgptAuthTokens");
+    await assertNoWorkerAuth(workerHome, "after external-auth login");
+    await authMonitor.assertNoAuthObserved();
+
+    const threadResult = await client.request("thread/start", {
+      cwd: workspace,
+      model,
+    });
+    const turnResult = await client.request("turn/start", {
+      threadId: threadResult.thread.id,
+      input: [
+        {
+          type: "text",
+          text: "Reply with exactly LIVE_EXTERNAL_AUTH_OK. Do not call tools.",
+          textElements: [],
+        },
+      ],
+    });
+    const completed = await client.waitForNotification("turn/completed");
+    assert.equal(completed.params.turn.status, "completed");
+    await assertNoWorkerAuth(workerHome, "after turn completion");
+    await authMonitor.assertNoAuthObserved();
+    await stopAndAssertNoWorkerAuth(client, workerHome);
+    await authMonitor.assertNoAuthObserved();
+
+    const sourceAfter = await readDedicatedChatgptCredential(authHome);
+    assertSourceAuthUnchanged(sourceBefore, sourceAfter);
+
+    const report = {
+      schemaVersion: 1,
+      probe: "app-server-chatgpt-auth-tokens-live",
+      startedAt,
+      completedAt: new Date().toISOString(),
+      codexVersion: codexVersion(codexBin),
+      userAgent: initializeResult.userAgent,
+      experimentalApi: true,
+      sourceAuth: {
+        path: sourceBefore.authPathForEvidence,
+        mode: sourceBefore.fileMode,
+        authMode: sourceBefore.authMode,
+        planType: sourceBefore.planType,
+        unchangedDuringProbe: true,
+      },
+      worker: {
+        loginType: loginResult.type,
+        model: threadResult.model,
+        modelProvider: threadResult.modelProvider,
+        turnStatus: completed.params.turn.status,
+        refreshCallbackCount,
+        authJsonCreated: false,
+      },
+      result: "passed",
+    };
+    const serialized = JSON.stringify(report);
+    assertNoCredentialMaterial(serialized, sourceBefore);
+    await writeEvidence(evidencePath, report, sourceBefore);
+    return {
+      ...report,
+      evidenceWritten: true,
+    };
+  } finally {
+    try {
+      await client?.stop();
+    } finally {
+      authMonitor?.close();
+      await rm(workerHome, { recursive: true, force: true });
+    }
+  }
+}

@@ -1,96 +1,105 @@
-# Codex-Gated Repository Template
+# Portable Codex Runtime
 
-This template starts a repository with the Codex review gate workflow already on
-the default branch. It also includes a modular CI generator for adding
-project-specific formatter, linter, test, and benchmark entrypoints after a
-repository is created from the template.
+Portable Codex Runtime is an experimental host runtime for moving Codex
+app-server sessions between trusted machines while keeping the execution
+environment, workspace, rollout state, and recovery data explicit.
 
-## Included
+The current repository focuses on compatibility probes for the authentication
+boundary. The planned runtime keeps refresh tokens in a central auth authority,
+injects short-lived access tokens into session workers, and treats session data
+snapshots separately from monotonic credential state.
 
-- `.github/workflows/codex-review-gate.yml`
-- `.gitignore`
-- `scripts/setup-ci.mjs`
-- this README
+## Status
 
-The workflow writes the `codex/review-gate` status check and requests a controlled
-Codex review marker for each ready pull request head. It pins
-`JoeyTeng/codex-review-gate-action` to the v1.2.1 commit SHA so privileged
-`pull_request_target` runs do not depend on a movable tag.
+The runtime architecture is under active development. The current implementation
+proves that the installed Codex app-server supports external ChatGPT access-token
+injection and keeps those credentials ephemeral inside the worker.
 
-## Generate Project CI
+The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
+Codex binary or image digest and rerun these probes before upgrading it.
 
-Run the setup script from a new repository created from this template:
+## External Auth Compatibility Probe
 
-```bash
-node scripts/setup-ci.mjs
-```
+The offline probe uses synthetic JWTs, an isolated temporary `CODEX_HOME`, and a
+localhost Responses API mock. It verifies that:
 
-With no arguments, the script opens an interactive selector. For repeatable setup,
-pass modules explicitly:
+- `chatgptAuthTokens` is rejected without `experimentalApi` opt-in.
+- The same login succeeds with `experimentalApi: true`.
+- A mocked `401 Unauthorized` triggers
+  `account/chatgptAuthTokens/refresh`.
+- The retried request uses the replacement access token.
+- External auth does not create a worker `auth.json`.
 
-```bash
-node scripts/setup-ci.mjs --tool js-ts --tool python --tool docker --tool markdown
-node scripts/setup-ci.mjs --all --benchmark --dry-run
-```
-
-The script writes `.github/workflows/ci.yml` plus the selected tool configs. It is
-idempotent when generated files have not changed. If a target file already exists
-with different content, the script refuses to overwrite it unless `--force` is
-provided. Use `--dry-run` to inspect planned writes first.
-
-Supported modules:
-
-- `js-ts`: pnpm, ESLint, Prettier, Vite, and Vitest.
-- `python`: uv, Ruff, Pyright, and pytest.
-- `swift`: swift-format, SwiftLint, and `swift test`.
-- `go`: `gofmt`, `go vet`, and `go test`.
-- `rust`: `cargo fmt`, `cargo clippy`, and `cargo test`.
-- `github-actions`: actionlint.
-- `bash`: shfmt, shellcheck, and `bash -n`.
-- `markdown`: Prettier and markdownlint-cli2.
-- `docker`: hadolint and `docker buildx build --check`.
-
-`--benchmark` creates `scripts/benchmark.sh` only. It does not create or enable a
-benchmark workflow, and benchmark commands are not part of the default PR gate.
-The script includes benchmark entries for JavaScript/TypeScript, Python, Go, and
-Rust when those modules are selected.
-
-## After Creating a Repository
-
-1. Add the project source, tests, and license.
-2. Run `node scripts/setup-ci.mjs` and commit the generated CI/tooling files.
-3. Install or lock generated dependencies where applicable, such as `pnpm install`
-   for JavaScript/TypeScript or Markdown modules.
-4. Confirm `.github/workflows/codex-review-gate.yml` is present on the default
-   branch before requiring the status check.
-5. Enable the required status check with the bootstrap helper from
-   `JoeyTeng/codex-review-gate`:
+Run the full local test suite:
 
 ```bash
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO
-node scripts/bootstrap-codex-review-gate.mjs --repo OWNER/REPO --apply
+npm test
 ```
 
-The helper defaults to dry-run. It refuses to require `codex/review-gate` until
-the workflow exists on the repository default branch.
+The two app-server integration tests run when `CODEX_BIN` (or `codex` on
+`PATH`) is executable. They are reported as skipped on Node-only CI runners;
+the remaining tests still run normally.
 
-## Optional Repository Variables
-
-- `CODEX_REVIEW_GATE_RUNNER_LABELS`: JSON runner label array. Defaults to
-  `["ubuntu-slim"]`; use `["ubuntu-latest"]` when `ubuntu-slim` is unavailable.
-- `CODEX_REVIEW_GATE_AUTO_RETRY=false`: disables scheduled retry jobs before a
-  runner is allocated.
-- `CODEX_REVIEW_GATE_EVENT_MODE`: `standard`, `comment-only`, or `full`.
-- `CODEX_REVIEW_GATE_BOT_LOGINS`: comma-separated additional Codex bot logins.
-- `CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS`: clean completion buffer.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY`: set to `false` to disable
-  same-head recovery after resolved Codex findings.
-- `CODEX_REVIEW_GATE_FAILED_FINDINGS_RECOVERY_MODE`: `head` or `fresh`.
-
-## Template Maintenance
-
-Run the generator tests with Node's built-in test runner:
+Run the offline protocol probe and print a JSON report:
 
 ```bash
-node --test test/setup-ci.node-test.mjs
+npm run probe:external-auth
 ```
+
+Set `CODEX_BIN` to test a specific Codex executable:
+
+```bash
+CODEX_BIN=/path/to/codex npm test
+```
+
+## Live External Auth Probe
+
+The live probe reads a dedicated managed ChatGPT login from
+`.test-codex-home/auth.json`, injects only its access token into a temporary
+worker, and sends one fixed, non-repository prompt to the real Codex backend.
+It does not pass the refresh token to the worker or modify the source auth file.
+
+The dedicated auth home is ignored by Git. On success, the probe writes a
+redacted record to `evidence/live-external-auth.json`. The tracked evidence
+contains runtime metadata and the final status only; it omits credentials,
+emails, complete account/workspace identifiers, and token-derived fingerprints.
+
+Run the live probe explicitly:
+
+```bash
+npm run probe:external-auth:live
+```
+
+Optional overrides:
+
+```bash
+CODEX_TEST_HOME=/path/to/dedicated-codex-home \
+CODEX_LIVE_PROBE_MODEL=gpt-5.4 \
+CODEX_LIVE_EVIDENCE=evidence/live-external-auth.json \
+npm run probe:external-auth:live
+```
+
+## Repository Automation
+
+The default branch contains `.github/workflows/codex-review-gate.yml`. Pull
+requests use the `codex/review-gate` check supplied by the repository template.
+
+The retained `scripts/setup-ci.mjs` generator can add project-specific CI and
+tooling later. Inspect planned writes before enabling a module:
+
+```bash
+node scripts/setup-ci.mjs --list
+node scripts/setup-ci.mjs --tool github-actions --tool markdown --dry-run
+```
+
+Its generator tests are included in the default `npm test` command.
+
+## Project Records
+
+- Current repository state: `docs/PROJECT_STATE.md`
+- Cross-workstream backlog: `docs/PROJECT_TODO.md`
+- Workstream journals: `docs/project_journal/`
+
+## License
+
+Licensed under the Apache License, Version 2.0. See `LICENSE`.
