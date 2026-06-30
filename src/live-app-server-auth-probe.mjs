@@ -17,7 +17,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import {
   AppServerClient,
   codexVersion,
-  fileExists,
+  stopAndAssertNoWorkerAuth,
 } from "./app-server-auth-probe.mjs";
 
 const DEFAULT_AUTH_HOME = ".test-codex-home";
@@ -291,7 +291,7 @@ export async function probeLiveExternalAuth({
     });
     const completed = await client.waitForNotification("turn/completed");
     assert.equal(completed.params.turn.status, "completed");
-    assert.equal(await fileExists(join(workerHome, "auth.json")), false);
+    await stopAndAssertNoWorkerAuth(client, workerHome);
 
     const sourceAfter = await readDedicatedChatgptCredential(authHome);
     assert.equal(

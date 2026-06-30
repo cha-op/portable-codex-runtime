@@ -340,6 +340,15 @@ export async function fileExists(path) {
   }
 }
 
+export async function stopAndAssertNoWorkerAuth(client, codexHome) {
+  await client.stop();
+  assert.equal(
+    await fileExists(join(codexHome, "auth.json")),
+    false,
+    "app-server wrote worker auth.json during shutdown",
+  );
+}
+
 export function codexVersion(codexBin) {
   const result = spawnSync(codexBin, ["--version"], { encoding: "utf8" });
   if (result.error) throw result.error;
@@ -380,7 +389,7 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
 
     assert(rejection instanceof JsonRpcError, "experimental login should be rejected without opt-in");
     assert.match(rejection.message, /experimentalApi capability/);
-    assert.equal(await fileExists(join(codexHome, "auth.json")), false);
+    await stopAndAssertNoWorkerAuth(client, codexHome);
     return { gated: true, errorMessage: rejection.payload.message };
   } finally {
     await client.stop();
@@ -454,7 +463,7 @@ export async function probeExternalAuthRefresh({
     assert.equal(mock.requests[0].authorization, `Bearer ${initialToken}`);
     assert.equal(mock.requests[1].authorization, `Bearer ${refreshedToken}`);
     assert.equal(completed.params.turn.status, "completed");
-    assert.equal(await fileExists(join(codexHome, "auth.json")), false);
+    await stopAndAssertNoWorkerAuth(client, codexHome);
 
     return {
       codexVersion: codexVersion(codexBin),
