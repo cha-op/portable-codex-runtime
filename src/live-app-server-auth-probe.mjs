@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 import {
   AppServerClient,
@@ -66,20 +66,17 @@ function collectRedactionValues(auth, accessPayload, idPayload) {
   return [...new Set(candidates.filter((value) => typeof value === "string" && value.length >= 8))];
 }
 
-function displayAuthPath(authPath) {
-  const workspaceRelative = relative(process.cwd(), authPath);
-  if (!workspaceRelative.startsWith("..") && !isAbsolute(workspaceRelative)) {
-    return workspaceRelative;
-  }
-  return join(basename(dirname(authPath)), basename(authPath));
-}
-
 export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOME) {
   const authPath = join(resolve(authHome), "auth.json");
   const [raw, fileStat] = await Promise.all([readFile(authPath, "utf8"), stat(authPath)]);
   assert.equal(fileStat.mode & 0o077, 0, "dedicated auth.json must not be group/world accessible");
 
-  const auth = JSON.parse(raw);
+  let auth;
+  try {
+    auth = JSON.parse(raw);
+  } catch {
+    throw new Error("dedicated auth.json is not valid JSON");
+  }
   assert.equal(auth.auth_mode, "chatgpt", "dedicated auth.json must use ChatGPT auth");
   assert.equal(typeof auth.tokens?.access_token, "string", "auth.json is missing access_token");
   assert.equal(typeof auth.tokens?.id_token, "string", "auth.json is missing id_token");
@@ -109,7 +106,7 @@ export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOM
     authFileFingerprint: fingerprint(raw),
     authMode: auth.auth_mode,
     authPath,
-    authPathForEvidence: displayAuthPath(authPath),
+    authPathForEvidence: "dedicated-auth-home/auth.json",
     credentialFingerprint: fingerprint(auth.tokens.access_token),
     expiresAt,
     fileMode: (fileStat.mode & 0o777).toString(8).padStart(4, "0"),
@@ -127,6 +124,19 @@ export function assertNoCredentialMaterial(serializedEvidence, credential) {
       "evidence contains raw credential or account identity material",
     );
   }
+}
+
+export function assertRefreshAccountContinuity(params, initialCredential, latestCredential) {
+  assert.equal(
+    params?.previousAccountId,
+    initialCredential.accountId,
+    "refresh request account does not match the initial credential",
+  );
+  assert.equal(
+    latestCredential.accountId,
+    initialCredential.accountId,
+    "refreshed credential account does not match the initial credential",
+  );
 }
 
 function isSameOrDescendant(candidate, parent) {
@@ -191,6 +201,11 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
       false,
       "evidence destination must not reference the source auth file",
     );
+    assert.equal(
+      destinationStat.nlink,
+      1,
+      "evidence destination must not be hard linked",
+    );
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -241,6 +256,7 @@ export async function writeEvidenceSafely(
       false,
       "evidence destination must not reference the source auth file",
     );
+    assert.equal(handleStat.nlink, 1, "evidence destination must not be hard linked");
     assert.equal(
       currentParent,
       dirname(canonicalDestination),
@@ -288,9 +304,10 @@ export async function probeLiveExternalAuth({
     codexBin,
     codexHome: workerHome,
     timeoutMs: 120_000,
-    onRefresh: async () => {
+    onRefresh: async (params) => {
       refreshCallbackCount += 1;
       const latest = await readDedicatedChatgptCredential(authHome);
+      assertRefreshAccountContinuity(params, sourceBefore, latest);
       return {
         accessToken: latest.accessToken,
         chatgptAccountId: latest.accountId,
@@ -363,10 +380,10 @@ export async function probeLiveExternalAuth({
     };
     const serialized = JSON.stringify(report);
     assertNoCredentialMaterial(serialized, sourceBefore);
-    const writtenEvidencePath = await writeEvidence(evidencePath, report, sourceBefore);
+    await writeEvidence(evidencePath, report, sourceBefore);
     return {
       ...report,
-      evidencePath: relative(process.cwd(), writtenEvidencePath),
+      evidenceWritten: true,
     };
   } finally {
     await client.stop();

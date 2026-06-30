@@ -9,6 +9,25 @@ import { createInterface } from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const INITIAL_ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174011";
+const WORKER_ENV_KEYS = [
+  "PATH",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+];
+
+export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
+  const env = { CODEX_HOME: codexHome };
+  for (const key of WORKER_ENV_KEYS) {
+    if (typeof sourceEnv[key] === "string") env[key] = sourceEnv[key];
+  }
+  return env;
+}
 
 export class JsonRpcError extends Error {
   constructor(method, payload) {
@@ -42,9 +61,7 @@ export class AppServerClient {
   }
 
   async start() {
-    const env = { ...process.env, CODEX_HOME: this.codexHome };
-    delete env.CODEX_ACCESS_TOKEN;
-    delete env.OPENAI_API_KEY;
+    const env = buildWorkerEnvironment(this.codexHome);
 
     this.child = spawn(this.codexBin, this.codexArgs, {
       env,
@@ -73,8 +90,10 @@ export class AppServerClient {
       let message;
       try {
         message = JSON.parse(line);
-      } catch (error) {
-        this.#failAll(new Error(`invalid app-server JSONL: ${line}`, { cause: error }));
+      } catch {
+        this.#failAll(
+          new Error(`invalid app-server JSONL (${Buffer.byteLength(line, "utf8")} bytes)`),
+        );
         return;
       }
       this.#handleMessage(message);

@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   AppServerClient,
+  buildWorkerEnvironment,
   probeExperimentalGate,
   probeExternalAuthRefresh,
   stopAndAssertNoWorkerAuth,
@@ -17,6 +18,24 @@ const codexUnavailable =
   spawnSync(codexBin, ["--version"], { stdio: "ignore" }).status === 0
     ? false
     : `Codex CLI is unavailable at ${codexBin}`;
+
+test("worker environment excludes arbitrary host credentials", () => {
+  assert.deepEqual(
+    buildWorkerEnvironment("/isolated/codex-home", {
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+      CODEX_TEST_HOME: "/sensitive/auth-home",
+      GH_TOKEN: "github-secret",
+      HOME: "/host/home",
+      PATH: "/usr/bin:/bin",
+      TMPDIR: "/tmp/",
+    }),
+    {
+      CODEX_HOME: "/isolated/codex-home",
+      PATH: "/usr/bin:/bin",
+      TMPDIR: "/tmp/",
+    },
+  );
+});
 
 test("worker auth is checked after app-server shutdown", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stop-fixture-"));
@@ -128,6 +147,36 @@ test("spawn errors reject cleanly without an unhandled exit promise", async () =
       client.initialize(false),
       (error) => error?.code === "ENOENT",
     );
+  } finally {
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("invalid app-server JSONL errors omit the raw line", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-jsonl-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  const sensitiveLine = "not-json-GITHUB_SECRET_SENTINEL";
+  await writeFile(
+    fixturePath,
+    `
+process.stdout.write(${JSON.stringify(`${sensitiveLine}\n`)});
+setTimeout(() => process.exit(0), 500);
+`,
+  );
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexArgs: [fixturePath],
+    codexHome,
+    timeoutMs: 1_000,
+  });
+  try {
+    await client.start();
+    await assert.rejects(client.waitForNotification("fixture/never"), (error) => {
+      assert.match(error.message, /invalid app-server JSONL \(31 bytes\)/);
+      assert.doesNotMatch(error.stack, /GITHUB_SECRET_SENTINEL/);
+      return true;
+    });
   } finally {
     await client.stop();
     await rm(codexHome, { recursive: true, force: true });

@@ -16,6 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  assertRefreshAccountContinuity,
   assertNoCredentialMaterial,
   readDedicatedChatgptCredential,
   validateEvidenceDestination,
@@ -71,6 +72,33 @@ test("dedicated credential metadata is redacted before evidence is written", asy
     const credential = await readDedicatedChatgptCredential(authHome);
     assert.equal(credential.planType, "enterprise");
     assert.equal(credential.fileMode, "0600");
+    assert.equal(credential.authPathForEvidence, "dedicated-auth-home/auth.json");
+
+    assert.doesNotThrow(() =>
+      assertRefreshAccountContinuity(
+        { previousAccountId: credential.accountId },
+        credential,
+        credential,
+      ),
+    );
+    assert.throws(
+      () =>
+        assertRefreshAccountContinuity(
+          { previousAccountId: "different-account" },
+          credential,
+          credential,
+        ),
+      /refresh request account does not match/,
+    );
+    assert.throws(
+      () =>
+        assertRefreshAccountContinuity(
+          { previousAccountId: credential.accountId },
+          credential,
+          { ...credential, accountId: "different-account" },
+        ),
+      /refreshed credential account does not match/,
+    );
 
     const safeEvidence = JSON.stringify({
       accountFingerprint: `sha256:${"a".repeat(24)}`,
@@ -117,6 +145,16 @@ test("dedicated credential metadata is redacted before evidence is written", asy
     );
     assert.equal(await readFile(unrelatedTargetPath, "utf8"), "leave unchanged\n");
 
+    const unrelatedHardLinkSource = join(evidenceHome, "unrelated-hardlink-source.json");
+    const unrelatedHardLinkPath = join(evidenceHome, "unrelated-hardlink-evidence.json");
+    await writeFile(unrelatedHardLinkSource, "leave hardlink unchanged\n");
+    await link(unrelatedHardLinkSource, unrelatedHardLinkPath);
+    await assert.rejects(
+      () => writeEvidenceSafely(unrelatedHardLinkPath, "must not be written\n", credential.authPath),
+      /must not be hard linked/,
+    );
+    assert.equal(await readFile(unrelatedHardLinkSource, "utf8"), "leave hardlink unchanged\n");
+
     const safeEvidencePath = join(evidenceHome, "safe-evidence.json");
     await writeFile(safeEvidencePath, "stale evidence that is longer\n");
     await writeEvidenceSafely(safeEvidencePath, "{}\n", credential.authPath);
@@ -151,5 +189,22 @@ test("dedicated credential metadata is redacted before evidence is written", asy
   } finally {
     await rm(authHome, { recursive: true, force: true });
     await rm(evidenceHome, { recursive: true, force: true });
+  }
+});
+
+test("malformed dedicated auth JSON errors omit credential fragments", async () => {
+  const authHome = await mkdtemp(join(tmpdir(), "portable-codex-malformed-auth-"));
+  const sensitiveFragment = "REFRESH_TOKEN_SECRET_SENTINEL";
+  try {
+    await writeFile(join(authHome, "auth.json"), `{"refresh_token":"${sensitiveFragment}"`, {
+      mode: 0o600,
+    });
+    await assert.rejects(readDedicatedChatgptCredential(authHome), (error) => {
+      assert.equal(error.message, "dedicated auth.json is not valid JSON");
+      assert.doesNotMatch(error.stack, /REFRESH_TOKEN_SECRET_SENTINEL/);
+      return true;
+    });
+  } finally {
+    await rm(authHome, { recursive: true, force: true });
   }
 });
