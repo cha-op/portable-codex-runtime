@@ -38,6 +38,25 @@ test("worker environment excludes arbitrary host credentials", () => {
   );
 });
 
+test("worker environment preserves standard Windows process variables", () => {
+  assert.deepEqual(
+    buildWorkerEnvironment("C:\\isolated\\codex-home", {
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+      SystemRoot: "C:\\Windows",
+      USERPROFILE: "C:\\Users\\sensitive",
+      WINDIR: "C:\\Windows",
+    }),
+    {
+      CODEX_HOME: "C:\\isolated\\codex-home",
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+      SystemRoot: "C:\\Windows",
+      WINDIR: "C:\\Windows",
+    },
+  );
+});
+
 test("worker auth is checked after app-server shutdown", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stop-fixture-"));
   const client = {
@@ -48,6 +67,27 @@ test("worker auth is checked after app-server shutdown", async () => {
       () => stopAndAssertNoWorkerAuth(client, codexHome),
       /wrote worker auth\.json during shutdown/,
     );
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("worker auth is checked before app-server shutdown", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-pre-stop-fixture-"));
+  let stopCalled = false;
+  const client = {
+    stop: async () => {
+      stopCalled = true;
+      await rm(join(codexHome, "auth.json"));
+    },
+  };
+  try {
+    await writeFile(join(codexHome, "auth.json"), "{}\n", { mode: 0o600 });
+    await assert.rejects(
+      () => stopAndAssertNoWorkerAuth(client, codexHome),
+      /wrote worker auth\.json before shutdown/,
+    );
+    assert.equal(stopCalled, true);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }

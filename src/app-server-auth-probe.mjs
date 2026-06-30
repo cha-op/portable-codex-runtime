@@ -19,6 +19,10 @@ const WORKER_ENV_KEYS = [
   "LC_CTYPE",
   "SSL_CERT_FILE",
   "SSL_CERT_DIR",
+  "PATHEXT",
+  "SystemRoot",
+  "WINDIR",
+  "ComSpec",
 ];
 
 export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
@@ -420,13 +424,23 @@ export async function fileExists(path) {
   }
 }
 
-export async function stopAndAssertNoWorkerAuth(client, codexHome) {
-  await client.stop();
+export async function assertNoWorkerAuth(codexHome, phase) {
   assert.equal(
     await fileExists(join(codexHome, "auth.json")),
     false,
-    "app-server wrote worker auth.json during shutdown",
+    `app-server wrote worker auth.json ${phase}`,
   );
+}
+
+export async function stopAndAssertNoWorkerAuth(client, codexHome) {
+  const existedBeforeStop = await fileExists(join(codexHome, "auth.json"));
+  await client.stop();
+  assert.equal(
+    existedBeforeStop,
+    false,
+    "app-server wrote worker auth.json before shutdown",
+  );
+  await assertNoWorkerAuth(codexHome, "during shutdown");
 }
 
 export function codexVersion(codexBin) {
@@ -527,6 +541,7 @@ export async function probeExternalAuthRefresh({
       chatgptPlanType: "enterprise",
     });
     assert.equal(loginResult.type, "chatgptAuthTokens");
+    await assertNoWorkerAuth(codexHome, "after external-auth login");
 
     const threadResult = await client.request("thread/start", {
       cwd: workspace,
@@ -547,6 +562,7 @@ export async function probeExternalAuthRefresh({
     assert.equal(mock.requests[0].authorization, `Bearer ${initialToken}`);
     assert.equal(mock.requests[1].authorization, `Bearer ${refreshedToken}`);
     assert.equal(completed.params.turn.status, "completed");
+    await assertNoWorkerAuth(codexHome, "after turn completion");
     await stopAndAssertNoWorkerAuth(client, codexHome);
 
     return {

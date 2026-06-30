@@ -17,6 +17,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 
 import {
   AppServerClient,
+  assertNoWorkerAuth,
   codexVersion,
   stopAndAssertNoWorkerAuth,
 } from "./app-server-auth-probe.mjs";
@@ -356,6 +357,7 @@ export async function probeLiveExternalAuth({
       chatgptPlanType: sourceBefore.planType,
     });
     assert.equal(loginResult.type, "chatgptAuthTokens");
+    await assertNoWorkerAuth(workerHome, "after external-auth login");
 
     const threadResult = await client.request("thread/start", {
       cwd: workspace,
@@ -373,6 +375,7 @@ export async function probeLiveExternalAuth({
     });
     const completed = await client.waitForNotification("turn/completed");
     assert.equal(completed.params.turn.status, "completed");
+    await assertNoWorkerAuth(workerHome, "after turn completion");
     await stopAndAssertNoWorkerAuth(client, workerHome);
 
     const sourceAfter = await readDedicatedChatgptCredential(authHome);
