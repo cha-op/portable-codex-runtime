@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
+  open,
   readFile,
   realpath,
   rename,
@@ -180,17 +181,34 @@ shell_snapshot = false
   await writeFile(join(codexHome, "config.toml"), config);
 }
 
+export async function writeEvidenceAtomically(
+  evidencePath,
+  serialized,
+  { nonce = randomUUID() } = {},
+) {
+  const temporaryPath = `${evidencePath}.${process.pid}.${nonce}.tmp`;
+  let created = false;
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    created = true;
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, evidencePath);
+    created = false;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    if (created) await rm(temporaryPath, { force: true });
+  }
+}
+
 async function writeEvidence(path, report, credential) {
   const evidencePath = await validateEvidenceDestination(path, credential.authPath);
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertNoCredentialMaterial(serialized, credential);
-  const temporaryPath = `${evidencePath}.${process.pid}.tmp`;
-  try {
-    await writeFile(temporaryPath, serialized, { mode: 0o644 });
-    await rename(temporaryPath, evidencePath);
-  } finally {
-    await rm(temporaryPath, { force: true });
-  }
+  await writeEvidenceAtomically(evidencePath, serialized);
   return evidencePath;
 }
 

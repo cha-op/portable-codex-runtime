@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import {
   assertNoCredentialMaterial,
   readDedicatedChatgptCredential,
   validateEvidenceDestination,
+  writeEvidenceAtomically,
 } from "../src/live-app-server-auth-probe.mjs";
 
 function encodeJwt(payload) {
@@ -88,6 +89,20 @@ test("dedicated credential metadata is redacted before evidence is written", asy
       () => validateEvidenceDestination(join(linkedAuthHome, "evidence.json"), credential.authPath),
       /must not resolve inside the dedicated auth home/,
     );
+
+    const collisionEvidencePath = join(evidenceHome, "collision-evidence.json");
+    const collisionNonce = "known-collision";
+    const collisionTemporaryPath = `${collisionEvidencePath}.${process.pid}.${collisionNonce}.tmp`;
+    const authBeforeCollision = await readFile(credential.authPath, "utf8");
+    await symlink(credential.authPath, collisionTemporaryPath);
+    await assert.rejects(
+      () =>
+        writeEvidenceAtomically(collisionEvidencePath, "{}\n", {
+          nonce: collisionNonce,
+        }),
+      (error) => error?.code === "EEXIST",
+    );
+    assert.equal(await readFile(credential.authPath, "utf8"), authBeforeCollision);
   } finally {
     await rm(authHome, { recursive: true, force: true });
     await rm(evidenceHome, { recursive: true, force: true });
