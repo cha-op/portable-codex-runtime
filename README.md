@@ -36,6 +36,10 @@ Run the full local test suite:
 npm test
 ```
 
+The two app-server integration tests run when `CODEX_BIN` (or `codex` on
+`PATH`) is executable. They are reported as skipped on Node-only CI runners;
+the remaining tests still run normally.
+
 Run the offline protocol probe and print a JSON report:
 
 ```bash
