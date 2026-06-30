@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
+  lstat,
   open,
   readFile,
   realpath,
@@ -158,11 +159,12 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
     "evidence destination must not overlap the dedicated auth home",
   );
 
-  const [canonicalDestination, canonicalSource, sourceStat] = await Promise.all([
-    resolveThroughExistingAncestor(evidencePath),
+  const [canonicalParent, canonicalSource, sourceStat] = await Promise.all([
+    resolveThroughExistingAncestor(dirname(evidencePath)),
     realpath(sourceAuthPath),
     stat(sourceAuthPath),
   ]);
+  const canonicalDestination = join(canonicalParent, basename(evidencePath));
   const canonicalAuthHome = dirname(canonicalSource);
   assert.equal(
     isSameOrDescendant(canonicalDestination, canonicalAuthHome),
@@ -170,7 +172,6 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
     "evidence destination must not resolve inside the dedicated auth home",
   );
 
-  const canonicalParent = dirname(canonicalDestination);
   await mkdir(canonicalParent, { recursive: true });
   assert.equal(
     await realpath(canonicalParent),
@@ -179,7 +180,12 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
   );
 
   try {
-    const destinationStat = await stat(canonicalDestination);
+    const destinationStat = await lstat(canonicalDestination);
+    assert.equal(
+      destinationStat.isSymbolicLink(),
+      false,
+      "evidence destination must not be a symbolic link",
+    );
     assert.equal(
       destinationStat.dev === sourceStat.dev && destinationStat.ino === sourceStat.ino,
       false,

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  AppServerClient,
   probeExperimentalGate,
   probeExternalAuthRefresh,
   stopAndAssertNoWorkerAuth,
@@ -28,6 +29,54 @@ test("worker auth is checked after app-server shutdown", async () => {
       /wrote worker auth\.json during shutdown/,
     );
   } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("app-server shutdown waits for EOF and ignores late refresh replies", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stop-client-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  await writeFile(
+    fixturePath,
+    `
+process.stdout.write(
+  JSON.stringify({ id: 1, method: "account/chatgptAuthTokens/refresh", params: {} }) + "\\n",
+);
+process.stdin.resume();
+process.stdin.on("end", () => setTimeout(() => process.exit(0), 20));
+`,
+  );
+
+  let releaseRefresh;
+  let markRefreshStarted;
+  const refreshStarted = new Promise((resolve) => {
+    markRefreshStarted = resolve;
+  });
+  const refreshReleased = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexArgs: [fixturePath],
+    codexHome,
+    onRefresh: async () => {
+      markRefreshStarted();
+      await refreshReleased;
+      return { accessToken: "replacement" };
+    },
+  });
+
+  try {
+    await client.start();
+    await refreshStarted;
+    await client.stop();
+    assert.equal(client.child.exitCode, 0);
+    assert.equal(client.child.signalCode, null);
+    releaseRefresh();
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    releaseRefresh?.();
+    await client.stop();
     await rm(codexHome, { recursive: true, force: true });
   }
 });

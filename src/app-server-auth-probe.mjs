@@ -20,8 +20,15 @@ export class JsonRpcError extends Error {
 }
 
 export class AppServerClient {
-  constructor({ codexBin, codexHome, onRefresh, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  constructor({
+    codexBin,
+    codexArgs = ["app-server", "--stdio"],
+    codexHome,
+    onRefresh,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+  }) {
     this.codexBin = codexBin;
+    this.codexArgs = codexArgs;
     this.codexHome = codexHome;
     this.onRefresh = onRefresh;
     this.timeoutMs = timeoutMs;
@@ -38,7 +45,7 @@ export class AppServerClient {
     delete env.CODEX_ACCESS_TOKEN;
     delete env.OPENAI_API_KEY;
 
-    this.child = spawn(this.codexBin, ["app-server", "--stdio"], {
+    this.child = spawn(this.codexBin, this.codexArgs, {
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -108,14 +115,19 @@ export class AppServerClient {
   }
 
   async stop() {
-    if (!this.child || this.child.exitCode !== null) return;
+    if (!this.child) return;
     this.stopping = true;
-    this.child.stdin.end();
-    this.child.kill("SIGTERM");
-    const forceKill = setTimeout(() => this.child.kill("SIGKILL"), 2_000);
-    await this.exitPromise.catch(() => {});
-    clearTimeout(forceKill);
-    this.stdout.close();
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      this.child.stdin.end();
+      if (!(await this.#waitForExit(2_000))) {
+        this.child.kill("SIGTERM");
+        if (!(await this.#waitForExit(2_000))) {
+          this.child.kill("SIGKILL");
+          await this.exitPromise.catch(() => {});
+        }
+      }
+    }
+    this.stdout?.close();
   }
 
   #send(message) {
@@ -127,7 +139,9 @@ export class AppServerClient {
 
   #handleMessage(message) {
     if (message.method && message.id !== undefined) {
-      void this.#handleServerRequest(message);
+      void this.#handleServerRequest(message).catch((error) => {
+        if (!this.stopping) this.#failAll(error);
+      });
       return;
     }
 
@@ -156,7 +170,7 @@ export class AppServerClient {
 
   async #handleServerRequest(message) {
     if (message.method !== "account/chatgptAuthTokens/refresh" || !this.onRefresh) {
-      this.#send({
+      this.#sendServerResponse({
         id: message.id,
         error: { code: -32601, message: `unsupported server request: ${message.method}` },
       });
@@ -165,13 +179,34 @@ export class AppServerClient {
 
     try {
       const result = await this.onRefresh(message.params);
-      this.#send({ id: message.id, result });
+      this.#sendServerResponse({ id: message.id, result });
     } catch (error) {
-      this.#send({
+      this.#sendServerResponse({
         id: message.id,
         error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
       });
     }
+  }
+
+  #sendServerResponse(message) {
+    if (this.stopping || !this.child?.stdin.writable) return;
+    this.#send(message);
+  }
+
+  #waitForExit(timeoutMs) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      this.exitPromise.then(
+        () => {
+          clearTimeout(timer);
+          resolve(true);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(true);
+        },
+      );
+    });
   }
 
   #waitFor(predicate, label) {

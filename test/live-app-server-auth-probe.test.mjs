@@ -96,6 +96,16 @@ test("dedicated credential metadata is redacted before evidence is written", asy
     );
     await assert.rejects(() => readFile(join(authHome, "new")), /ENOENT/);
 
+    const unrelatedTargetPath = join(evidenceHome, "unrelated-target.json");
+    const linkedEvidencePath = join(evidenceHome, "linked-evidence.json");
+    await writeFile(unrelatedTargetPath, "leave unchanged\n");
+    await symlink(unrelatedTargetPath, linkedEvidencePath);
+    await assert.rejects(
+      () => validateEvidenceDestination(linkedEvidencePath, credential.authPath),
+      /must not be a symbolic link/,
+    );
+    assert.equal(await readFile(unrelatedTargetPath, "utf8"), "leave unchanged\n");
+
     const collisionEvidencePath = join(evidenceHome, "collision-evidence.json");
     const collisionNonce = "known-collision";
     const collisionTemporaryPath = `${collisionEvidencePath}.${process.pid}.${collisionNonce}.tmp`;
