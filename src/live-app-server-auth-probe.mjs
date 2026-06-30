@@ -4,13 +4,14 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rename,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
   AppServerClient,
@@ -126,6 +127,46 @@ export function assertNoCredentialMaterial(serializedEvidence, credential) {
   }
 }
 
+function isSameOrDescendant(candidate, parent) {
+  return candidate === parent || candidate.startsWith(`${parent}${sep}`);
+}
+
+export async function validateEvidenceDestination(path, sourceAuthPath) {
+  const evidencePath = resolve(path);
+  const lexicalAuthHome = resolve(dirname(sourceAuthPath));
+  assert.equal(
+    isSameOrDescendant(evidencePath, lexicalAuthHome),
+    false,
+    "evidence destination must not overlap the dedicated auth home",
+  );
+
+  await mkdir(dirname(evidencePath), { recursive: true });
+  const [canonicalParent, canonicalSource, sourceStat] = await Promise.all([
+    realpath(dirname(evidencePath)),
+    realpath(sourceAuthPath),
+    stat(sourceAuthPath),
+  ]);
+  const canonicalDestination = join(canonicalParent, basename(evidencePath));
+  const canonicalAuthHome = dirname(canonicalSource);
+  assert.equal(
+    isSameOrDescendant(canonicalDestination, canonicalAuthHome),
+    false,
+    "evidence destination must not resolve inside the dedicated auth home",
+  );
+
+  try {
+    const destinationStat = await stat(canonicalDestination);
+    assert.equal(
+      destinationStat.dev === sourceStat.dev && destinationStat.ino === sourceStat.ino,
+      false,
+      "evidence destination must not reference the source auth file",
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return canonicalDestination;
+}
+
 async function writeLiveConfig(codexHome, model) {
   const config = `
 model = ${JSON.stringify(model)}
@@ -140,8 +181,7 @@ shell_snapshot = false
 }
 
 async function writeEvidence(path, report, credential) {
-  const evidencePath = resolve(path);
-  await mkdir(dirname(evidencePath), { recursive: true });
+  const evidencePath = await validateEvidenceDestination(path, credential.authPath);
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertNoCredentialMaterial(serialized, credential);
   const temporaryPath = `${evidencePath}.${process.pid}.tmp`;

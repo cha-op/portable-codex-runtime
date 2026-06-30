@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   assertNoCredentialMaterial,
   readDedicatedChatgptCredential,
+  validateEvidenceDestination,
 } from "../src/live-app-server-auth-probe.mjs";
 
 function encodeJwt(payload) {
@@ -18,6 +19,7 @@ function encodeJwt(payload) {
 
 test("dedicated credential metadata is redacted before evidence is written", async () => {
   const authHome = await mkdtemp(join(tmpdir(), "portable-codex-live-fixture-"));
+  const evidenceHome = await mkdtemp(join(tmpdir(), "portable-codex-evidence-fixture-"));
   const accountId = "123e4567-e89b-42d3-a456-426614174099";
   const email = "live-probe@example.com";
   const authClaims = {
@@ -68,7 +70,26 @@ test("dedicated credential metadata is redacted before evidence is written", asy
       () => assertNoCredentialMaterial(JSON.stringify({ accessToken }), credential),
       /credential or account identity material/,
     );
+    await assert.rejects(
+      () => validateEvidenceDestination(join(authHome, "auth.json"), credential.authPath),
+      /must not overlap the dedicated auth home/,
+    );
+
+    const hardLinkPath = join(evidenceHome, "hard-linked-auth.json");
+    await link(credential.authPath, hardLinkPath);
+    await assert.rejects(
+      () => validateEvidenceDestination(hardLinkPath, credential.authPath),
+      /must not reference the source auth file/,
+    );
+
+    const linkedAuthHome = join(evidenceHome, "linked-auth-home");
+    await symlink(authHome, linkedAuthHome, "dir");
+    await assert.rejects(
+      () => validateEvidenceDestination(join(linkedAuthHome, "evidence.json"), credential.authPath),
+      /must not resolve inside the dedicated auth home/,
+    );
   } finally {
     await rm(authHome, { recursive: true, force: true });
+    await rm(evidenceHome, { recursive: true, force: true });
   }
 });
