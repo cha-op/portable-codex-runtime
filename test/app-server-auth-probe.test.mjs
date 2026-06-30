@@ -115,6 +115,25 @@ setTimeout(() => process.exit(0), 500);
   }
 });
 
+test("spawn errors reject cleanly without an unhandled exit promise", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-spawn-fixture-"));
+  const client = new AppServerClient({
+    codexBin: join(codexHome, "missing-codex"),
+    codexHome,
+    timeoutMs: 1_000,
+  });
+  try {
+    await client.start();
+    await assert.rejects(
+      client.initialize(false),
+      (error) => error?.code === "ENOENT",
+    );
+  } finally {
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test(
   "chatgptAuthTokens is gated by experimentalApi",
   { skip: codexUnavailable },

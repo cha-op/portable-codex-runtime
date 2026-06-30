@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -7,7 +8,6 @@ import {
   open,
   readFile,
   realpath,
-  rename,
   rm,
   stat,
   writeFile,
@@ -210,35 +210,65 @@ shell_snapshot = false
   await writeFile(join(codexHome, "config.toml"), config);
 }
 
-export async function writeEvidenceAtomically(
+export async function writeEvidenceSafely(
   evidencePath,
   serialized,
-  { nonce = randomUUID() } = {},
+  sourceAuthPath,
+  { afterOpen } = {},
 ) {
-  const temporaryPath = `${evidencePath}.${process.pid}.${nonce}.tmp`;
-  let created = false;
+  assert.equal(
+    typeof constants.O_NOFOLLOW,
+    "number",
+    "safe evidence writes require O_NOFOLLOW support",
+  );
+  const canonicalDestination = await validateEvidenceDestination(evidencePath, sourceAuthPath);
+  const sourceStat = await stat(sourceAuthPath);
   let handle;
   try {
-    handle = await open(temporaryPath, "wx", 0o600);
-    created = true;
+    handle = await open(
+      canonicalDestination,
+      constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await afterOpen?.();
+    const [handleStat, currentParent, destinationStat] = await Promise.all([
+      handle.stat(),
+      realpath(dirname(canonicalDestination)),
+      lstat(canonicalDestination),
+    ]);
+    assert.equal(
+      handleStat.dev === sourceStat.dev && handleStat.ino === sourceStat.ino,
+      false,
+      "evidence destination must not reference the source auth file",
+    );
+    assert.equal(
+      currentParent,
+      dirname(canonicalDestination),
+      "evidence destination parent changed before the write",
+    );
+    assert.equal(
+      destinationStat.isSymbolicLink(),
+      false,
+      "evidence destination must not be a symbolic link",
+    );
+    assert.equal(
+      destinationStat.dev === handleStat.dev && destinationStat.ino === handleStat.ino,
+      true,
+      "evidence destination no longer refers to the validated file",
+    );
     await handle.writeFile(serialized, "utf8");
+    await handle.truncate(Buffer.byteLength(serialized));
     await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(temporaryPath, evidencePath);
-    created = false;
   } finally {
     if (handle) await handle.close().catch(() => {});
-    if (created) await rm(temporaryPath, { force: true });
   }
+  return canonicalDestination;
 }
 
 async function writeEvidence(path, report, credential) {
-  const evidencePath = await validateEvidenceDestination(path, credential.authPath);
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertNoCredentialMaterial(serialized, credential);
-  await writeEvidenceAtomically(evidencePath, serialized);
-  return evidencePath;
+  return writeEvidenceSafely(path, serialized, credential.authPath);
 }
 
 export async function probeLiveExternalAuth({

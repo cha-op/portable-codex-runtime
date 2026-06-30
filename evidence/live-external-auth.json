@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "probe": "app-server-chatgpt-auth-tokens-live",
-  "startedAt": "2026-06-30T13:35:03.720Z",
-  "completedAt": "2026-06-30T13:35:10.318Z",
+  "startedAt": "2026-06-30T13:49:28.436Z",
+  "completedAt": "2026-06-30T13:49:35.898Z",
   "codexVersion": "codex-cli 0.142.4",
   "userAgent": "portable_codex_runtime_probe/0.142.4 (Mac OS 26.5.1; arm64) dumb (portable_codex_runtime_probe; 0.1.0)",
   "experimentalApi": true,

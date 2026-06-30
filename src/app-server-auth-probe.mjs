@@ -51,6 +51,7 @@ export class AppServerClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.exitPromise = once(this.child, "exit");
+    void this.exitPromise.catch(() => {});
 
     this.child.once("error", (error) => this.#failAll(error));
     this.child.stdin.on("error", (error) => {

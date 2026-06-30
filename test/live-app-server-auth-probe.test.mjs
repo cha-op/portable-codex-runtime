@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdtemp,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +19,7 @@ import {
   assertNoCredentialMaterial,
   readDedicatedChatgptCredential,
   validateEvidenceDestination,
-  writeEvidenceAtomically,
+  writeEvidenceSafely,
 } from "../src/live-app-server-auth-probe.mjs";
 
 function encodeJwt(payload) {
@@ -106,19 +117,37 @@ test("dedicated credential metadata is redacted before evidence is written", asy
     );
     assert.equal(await readFile(unrelatedTargetPath, "utf8"), "leave unchanged\n");
 
-    const collisionEvidencePath = join(evidenceHome, "collision-evidence.json");
-    const collisionNonce = "known-collision";
-    const collisionTemporaryPath = `${collisionEvidencePath}.${process.pid}.${collisionNonce}.tmp`;
-    const authBeforeCollision = await readFile(credential.authPath, "utf8");
-    await symlink(credential.authPath, collisionTemporaryPath);
+    const safeEvidencePath = join(evidenceHome, "safe-evidence.json");
+    await writeFile(safeEvidencePath, "stale evidence that is longer\n");
+    await writeEvidenceSafely(safeEvidencePath, "{}\n", credential.authPath);
+    assert.equal(await readFile(safeEvidencePath, "utf8"), "{}\n");
+
+    const nestedEvidencePath = join(evidenceHome, "nested", "fresh-evidence.json");
+    const writtenNestedPath = await writeEvidenceSafely(
+      nestedEvidencePath,
+      '{"result":"passed"}\n',
+      credential.authPath,
+    );
+    assert.equal(writtenNestedPath, await realpath(nestedEvidencePath));
+    assert.equal(await readFile(nestedEvidencePath, "utf8"), '{"result":"passed"}\n');
+    assert.equal((await stat(nestedEvidencePath)).mode & 0o777, 0o600);
+
+    const exchangeParent = join(evidenceHome, "exchange-parent");
+    const displacedParent = join(evidenceHome, "displaced-parent");
+    const exchangeEvidencePath = join(exchangeParent, "auth.json");
+    await mkdir(exchangeParent);
+    const authBeforeExchange = await readFile(credential.authPath, "utf8");
     await assert.rejects(
       () =>
-        writeEvidenceAtomically(collisionEvidencePath, "{}\n", {
-          nonce: collisionNonce,
+        writeEvidenceSafely(exchangeEvidencePath, "must not be written\n", credential.authPath, {
+          afterOpen: async () => {
+            await rename(exchangeParent, displacedParent);
+            await symlink(authHome, exchangeParent, "dir");
+          },
         }),
-      (error) => error?.code === "EEXIST",
+      /parent changed before the write/,
     );
-    assert.equal(await readFile(credential.authPath, "utf8"), authBeforeCollision);
+    assert.equal(await readFile(credential.authPath, "utf8"), authBeforeExchange);
   } finally {
     await rm(authHome, { recursive: true, force: true });
     await rm(evidenceHome, { recursive: true, force: true });
