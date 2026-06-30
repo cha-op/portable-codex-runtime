@@ -81,6 +81,40 @@ process.stdin.on("end", () => setTimeout(() => process.exit(0), 20));
   }
 });
 
+test("stdin failures reject current and future requests", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stdin-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  await writeFile(
+    fixturePath,
+    `
+process.stdin.destroy();
+process.stdout.write(JSON.stringify({ method: "fixture/ready" }) + "\\n");
+setTimeout(() => process.exit(0), 500);
+`,
+  );
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexArgs: [fixturePath],
+    codexHome,
+    timeoutMs: 1_000,
+  });
+
+  try {
+    await client.start();
+    await client.waitForNotification("fixture/ready");
+    await assert.rejects(
+      client.request("fixture/write", { payload: "x".repeat(1_000_000) }),
+      /EPIPE|exited unexpectedly/,
+    );
+    await assert.rejects(client.waitForNotification("fixture/never"), /EPIPE|exited unexpectedly/);
+    await assert.rejects(client.request("fixture/again", {}), /EPIPE|exited unexpectedly/);
+    assert.throws(() => client.notify("fixture/again", {}), /EPIPE|exited unexpectedly/);
+  } finally {
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test(
   "chatgptAuthTokens is gated by experimentalApi",
   { skip: codexUnavailable },

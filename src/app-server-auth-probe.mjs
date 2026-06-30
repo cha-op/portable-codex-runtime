@@ -38,6 +38,7 @@ export class AppServerClient {
     this.waiters = [];
     this.stderr = [];
     this.stopping = false;
+    this.terminalError = null;
   }
 
   async start() {
@@ -52,6 +53,9 @@ export class AppServerClient {
     this.exitPromise = once(this.child, "exit");
 
     this.child.once("error", (error) => this.#failAll(error));
+    this.child.stdin.on("error", (error) => {
+      if (!this.stopping) this.#failAll(error);
+    });
     this.child.once("exit", (code, signal) => {
       if (!this.stopping) {
         this.#failAll(
@@ -91,6 +95,7 @@ export class AppServerClient {
   }
 
   request(method, params) {
+    if (this.terminalError) return Promise.reject(this.terminalError);
     const id = this.nextRequestId++;
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -99,7 +104,11 @@ export class AppServerClient {
       }, this.timeoutMs);
       this.pending.set(id, { method, resolve, reject, timer });
     });
-    this.#send({ method, id, params });
+    try {
+      this.#send({ method, id, params });
+    } catch (error) {
+      this.#failAll(error);
+    }
     return promise;
   }
 
@@ -128,9 +137,11 @@ export class AppServerClient {
       }
     }
     this.stdout?.close();
+    this.#failAll(this.terminalError ?? new Error("codex app-server stopped"));
   }
 
   #send(message) {
+    if (this.terminalError) throw this.terminalError;
     if (!this.child?.stdin.writable) {
       throw new Error("codex app-server stdin is not writable");
     }
@@ -189,7 +200,7 @@ export class AppServerClient {
   }
 
   #sendServerResponse(message) {
-    if (this.stopping || !this.child?.stdin.writable) return;
+    if (this.stopping || this.terminalError || !this.child?.stdin.writable) return;
     this.#send(message);
   }
 
@@ -210,6 +221,7 @@ export class AppServerClient {
   }
 
   #waitFor(predicate, label) {
+    if (this.terminalError) return Promise.reject(this.terminalError);
     const existingIndex = this.messages.findIndex(predicate);
     if (existingIndex >= 0) {
       return Promise.resolve(this.messages.splice(existingIndex, 1)[0]);
@@ -227,14 +239,16 @@ export class AppServerClient {
   }
 
   #failAll(error) {
+    this.terminalError ??= error;
+    const failure = this.terminalError;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(error);
+      pending.reject(failure);
     }
     this.pending.clear();
     for (const waiter of this.waiters) {
       clearTimeout(waiter.timer);
-      waiter.reject(error);
+      waiter.reject(failure);
     }
     this.waiters = [];
   }
