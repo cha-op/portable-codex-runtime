@@ -55,7 +55,7 @@ export class AppServerClient {
     this.pending = new Map();
     this.messages = [];
     this.waiters = [];
-    this.stderr = [];
+    this.stderrBytes = 0;
     this.stopping = false;
     this.terminalError = null;
   }
@@ -78,7 +78,8 @@ export class AppServerClient {
       if (!this.stopping) {
         this.#failAll(
           new Error(
-            `codex app-server exited unexpectedly (${code ?? signal})\n${this.stderr.join("")}`,
+            `codex app-server exited unexpectedly (${code ?? signal}); ` +
+              `stderr omitted (${this.stderrBytes} bytes)`,
           ),
         );
       }
@@ -98,7 +99,9 @@ export class AppServerClient {
       }
       this.#handleMessage(message);
     });
-    this.child.stderr.on("data", (chunk) => this.stderr.push(chunk.toString()));
+    this.child.stderr.on("data", (chunk) => {
+      this.stderrBytes += chunk.length;
+    });
   }
 
   async initialize(experimentalApi) {
@@ -358,21 +361,29 @@ async function startResponsesMock() {
     });
     response.end(sseBody());
   });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  assert(address && typeof address !== "string");
-  const origin = `http://127.0.0.1:${address.port}`;
-  return {
-    baseUrl: `${origin}/v1`,
-    chatgptBaseUrl: `${origin}/backend-api`,
-    cloudConfigRequests,
-    requests,
-    close: async () => {
+  const close = async () => {
+    if (server.listening) {
       server.close();
       await once(server, "close");
-    },
+    }
   };
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    assert(address && typeof address !== "string");
+    const origin = `http://127.0.0.1:${address.port}`;
+    return {
+      baseUrl: `${origin}/v1`,
+      chatgptBaseUrl: `${origin}/backend-api`,
+      cloudConfigRequests,
+      requests,
+      close,
+    };
+  } catch (error) {
+    await close().catch(() => {});
+    throw error;
+  }
 }
 
 async function writeProbeConfig(codexHome, baseUrl, chatgptBaseUrl) {
@@ -468,40 +479,44 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
 
 export async function probeExternalAuthRefresh({
   codexBin = process.env.CODEX_BIN ?? "codex",
+  makeDirectory = mkdir,
+  startMock = startResponsesMock,
 } = {}) {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-auth-"));
-  const workspace = join(codexHome, "workspace");
-  await mkdir(workspace);
-  const mock = await startResponsesMock();
-
-  const initialToken = encodeJwt({
-    email: "initial@example.com",
-    accountId: INITIAL_ACCOUNT_ID,
-    planType: "enterprise",
-  });
-  const refreshedToken = encodeJwt({
-    email: "refreshed@example.com",
-    accountId: INITIAL_ACCOUNT_ID,
-    planType: "enterprise",
-  });
-  let refreshParams;
-  let refreshCount = 0;
-
-  const client = new AppServerClient({
-    codexBin,
-    codexHome,
-    onRefresh: async (params) => {
-      refreshCount += 1;
-      refreshParams = params;
-      return {
-        accessToken: refreshedToken,
-        chatgptAccountId: INITIAL_ACCOUNT_ID,
-        chatgptPlanType: "enterprise",
-      };
-    },
-  });
-
+  let client;
+  let mock;
   try {
+    const workspace = join(codexHome, "workspace");
+    await makeDirectory(workspace);
+    mock = await startMock();
+
+    const initialToken = encodeJwt({
+      email: "initial@example.com",
+      accountId: INITIAL_ACCOUNT_ID,
+      planType: "enterprise",
+    });
+    const refreshedToken = encodeJwt({
+      email: "refreshed@example.com",
+      accountId: INITIAL_ACCOUNT_ID,
+      planType: "enterprise",
+    });
+    let refreshParams;
+    let refreshCount = 0;
+
+    client = new AppServerClient({
+      codexBin,
+      codexHome,
+      onRefresh: async (params) => {
+        refreshCount += 1;
+        refreshParams = params;
+        return {
+          accessToken: refreshedToken,
+          chatgptAccountId: INITIAL_ACCOUNT_ID,
+          chatgptPlanType: "enterprise",
+        };
+      },
+    });
+
     await writeProbeConfig(codexHome, mock.baseUrl, mock.chatgptBaseUrl);
     await client.start();
     const initializeResult = await client.initialize(true);
@@ -547,9 +562,11 @@ export async function probeExternalAuthRefresh({
       turnStatus: completed.params.turn.status,
     };
   } finally {
-    await client.stop();
-    await mock.close();
-    await rm(codexHome, { recursive: true, force: true });
+    try {
+      await Promise.all([client?.stop(), mock?.close()]);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
   }
 }
 

@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
   AppServerClient,
   buildWorkerEnvironment,
+  fileExists,
   probeExperimentalGate,
   probeExternalAuthRefresh,
   stopAndAssertNoWorkerAuth,
@@ -181,6 +182,61 @@ setTimeout(() => process.exit(0), 500);
     await client.stop();
     await rm(codexHome, { recursive: true, force: true });
   }
+});
+
+test("unexpected app-server stderr is summarized without exposing its contents", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stderr-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  const sensitiveStderr = "STDERR_SECRET_SENTINEL";
+  await writeFile(
+    fixturePath,
+    `
+process.stderr.write(${JSON.stringify(sensitiveStderr)});
+process.exit(7);
+`,
+  );
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexArgs: [fixturePath],
+    codexHome,
+    timeoutMs: 1_000,
+  });
+  try {
+    await client.start();
+    await assert.rejects(client.waitForNotification("fixture/never"), (error) => {
+      assert.match(error.message, /stderr omitted \(22 bytes\)/);
+      assert.doesNotMatch(error.stack, /STDERR_SECRET_SENTINEL/);
+      return true;
+    });
+  } finally {
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("external auth probe releases setup resources after startup failure", async () => {
+  let temporaryHome;
+  let mockClosed = false;
+  await assert.rejects(
+    () =>
+      probeExternalAuthRefresh({
+        codexBin: join(tmpdir(), "definitely-missing-portable-codex"),
+        makeDirectory: async (workspace) => {
+          temporaryHome = dirname(workspace);
+          await mkdir(workspace);
+        },
+        startMock: async () => ({
+          baseUrl: "http://127.0.0.1:9/v1",
+          chatgptBaseUrl: "http://127.0.0.1:9/backend-api",
+          close: async () => {
+            mockClosed = true;
+          },
+        }),
+      }),
+    (error) => error?.code === "ENOENT",
+  );
+  assert.equal(mockClosed, true);
+  assert.equal(await fileExists(temporaryHome), false);
 });
 
 test(

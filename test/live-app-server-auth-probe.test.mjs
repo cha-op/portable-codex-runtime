@@ -12,12 +12,13 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
   assertRefreshAccountContinuity,
   assertNoCredentialMaterial,
+  probeLiveExternalAuth,
   readDedicatedChatgptCredential,
   validateEvidenceDestination,
   writeEvidenceSafely,
@@ -204,6 +205,98 @@ test("malformed dedicated auth JSON errors omit credential fragments", async () 
       assert.doesNotMatch(error.stack, /REFRESH_TOKEN_SECRET_SENTINEL/);
       return true;
     });
+  } finally {
+    await rm(authHome, { recursive: true, force: true });
+  }
+});
+
+test("dedicated credential rejects symlinks and mismatched account claims", async () => {
+  const fixtureHome = await mkdtemp(join(tmpdir(), "portable-codex-credential-checks-"));
+  const matchingAccountId = "123e4567-e89b-42d3-a456-426614174099";
+  const mismatchedAccountId = "123e4567-e89b-42d3-a456-426614174100";
+  const claims = {
+    chatgpt_account_id: matchingAccountId,
+    chatgpt_plan_type: "enterprise",
+  };
+  const auth = {
+    auth_mode: "chatgpt",
+    tokens: {
+      access_token: encodeJwt({
+        exp: Math.floor(Date.now() / 1000) + 3600,
+        "https://api.openai.com/auth": claims,
+      }),
+      account_id: mismatchedAccountId,
+      id_token: encodeJwt({ "https://api.openai.com/auth": claims }),
+      refresh_token: "refresh-sensitive-1234567890",
+    },
+  };
+  const realAuthPath = join(fixtureHome, "real-auth.json");
+  const mismatchedHome = join(fixtureHome, "mismatched");
+  const symlinkHome = join(fixtureHome, "symlinked");
+  try {
+    await mkdir(mismatchedHome);
+    await writeFile(join(mismatchedHome, "auth.json"), JSON.stringify(auth), { mode: 0o600 });
+    await assert.rejects(
+      readDedicatedChatgptCredential(mismatchedHome),
+      /auth\.json account IDs do not match/,
+    );
+
+    await writeFile(
+      realAuthPath,
+      JSON.stringify({
+        ...auth,
+        tokens: { ...auth.tokens, account_id: matchingAccountId },
+      }),
+      { mode: 0o600 },
+    );
+    await mkdir(symlinkHome);
+    await symlink(realAuthPath, join(symlinkHome, "auth.json"));
+    await assert.rejects(
+      readDedicatedChatgptCredential(symlinkHome),
+      (error) => error?.code === "ELOOP",
+    );
+  } finally {
+    await rm(fixtureHome, { recursive: true, force: true });
+  }
+});
+
+test("live auth probe removes its worker home after setup failure", async () => {
+  const authHome = await mkdtemp(join(tmpdir(), "portable-codex-live-cleanup-auth-"));
+  const accountId = "123e4567-e89b-42d3-a456-426614174099";
+  const claims = {
+    chatgpt_account_id: accountId,
+    chatgpt_plan_type: "enterprise",
+  };
+  let workerHome;
+  try {
+    await writeFile(
+      join(authHome, "auth.json"),
+      JSON.stringify({
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: encodeJwt({
+            exp: Math.floor(Date.now() / 1000) + 3600,
+            "https://api.openai.com/auth": claims,
+          }),
+          account_id: accountId,
+          id_token: encodeJwt({ "https://api.openai.com/auth": claims }),
+          refresh_token: "refresh-sensitive-1234567890",
+        },
+      }),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      () =>
+        probeLiveExternalAuth({
+          authHome,
+          makeDirectory: async (workspace) => {
+            workerHome = dirname(workspace);
+            throw new Error("live setup failed");
+          },
+        }),
+      /live setup failed/,
+    );
+    await assert.rejects(stat(workerHome), /ENOENT/);
   } finally {
     await rm(authHome, { recursive: true, force: true });
   }

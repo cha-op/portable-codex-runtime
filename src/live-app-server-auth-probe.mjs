@@ -68,7 +68,22 @@ function collectRedactionValues(auth, accessPayload, idPayload) {
 
 export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOME) {
   const authPath = join(resolve(authHome), "auth.json");
-  const [raw, fileStat] = await Promise.all([readFile(authPath, "utf8"), stat(authPath)]);
+  assert.equal(
+    typeof constants.O_NOFOLLOW,
+    "number",
+    "safe credential reads require O_NOFOLLOW support",
+  );
+  let authHandle;
+  let raw;
+  let fileStat;
+  try {
+    authHandle = await open(authPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fileStat = await authHandle.stat();
+    assert.equal(fileStat.isFile(), true, "dedicated auth.json must be a regular file");
+    raw = await authHandle.readFile("utf8");
+  } finally {
+    await authHandle?.close().catch(() => {});
+  }
   assert.equal(fileStat.mode & 0o077, 0, "dedicated auth.json must not be group/world accessible");
 
   let auth;
@@ -86,9 +101,21 @@ export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOM
   const idPayload = decodeJwtPayload(auth.tokens.id_token, "id_token");
   const accessAuth = authClaims(accessPayload);
   const idAuth = authClaims(idPayload);
-  const accountId =
-    auth.tokens.account_id ?? accessAuth.chatgpt_account_id ?? idAuth.chatgpt_account_id;
-  assert.equal(typeof accountId, "string", "auth.json is missing a ChatGPT account/workspace id");
+  const accountIds = [
+    ["auth.tokens.account_id", auth.tokens.account_id],
+    ["access_token chatgpt_account_id", accessAuth.chatgpt_account_id],
+    ["id_token chatgpt_account_id", idAuth.chatgpt_account_id],
+  ].filter(([, value]) => value !== null && value !== undefined);
+  assert(accountIds.length > 0, "auth.json is missing a ChatGPT account/workspace id");
+  for (const [label, value] of accountIds) {
+    assert.equal(typeof value, "string", `${label} must be a string`);
+    assert.notEqual(value.length, 0, `${label} must not be empty`);
+  }
+  const accountId = accountIds[0][1];
+  assert(
+    accountIds.every(([, value]) => value === accountId),
+    "auth.json account IDs do not match",
+  );
   const planType = accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null;
   const expiresAt =
     typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null;
@@ -291,32 +318,34 @@ export async function probeLiveExternalAuth({
   authHome = process.env.CODEX_TEST_HOME ?? DEFAULT_AUTH_HOME,
   codexBin = process.env.CODEX_BIN ?? "codex",
   evidencePath = process.env.CODEX_LIVE_EVIDENCE ?? DEFAULT_EVIDENCE_PATH,
+  makeDirectory = mkdir,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
 } = {}) {
   const startedAt = new Date().toISOString();
   const sourceBefore = await readDedicatedChatgptCredential(authHome);
   const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
-  const workspace = join(workerHome, "workspace");
-  await mkdir(workspace);
-  let refreshCallbackCount = 0;
-
-  const client = new AppServerClient({
-    codexBin,
-    codexHome: workerHome,
-    timeoutMs: 120_000,
-    onRefresh: async (params) => {
-      refreshCallbackCount += 1;
-      const latest = await readDedicatedChatgptCredential(authHome);
-      assertRefreshAccountContinuity(params, sourceBefore, latest);
-      return {
-        accessToken: latest.accessToken,
-        chatgptAccountId: latest.accountId,
-        chatgptPlanType: latest.planType,
-      };
-    },
-  });
-
+  let client;
   try {
+    const workspace = join(workerHome, "workspace");
+    await makeDirectory(workspace);
+    let refreshCallbackCount = 0;
+
+    client = new AppServerClient({
+      codexBin,
+      codexHome: workerHome,
+      timeoutMs: 120_000,
+      onRefresh: async (params) => {
+        refreshCallbackCount += 1;
+        const latest = await readDedicatedChatgptCredential(authHome);
+        assertRefreshAccountContinuity(params, sourceBefore, latest);
+        return {
+          accessToken: latest.accessToken,
+          chatgptAccountId: latest.accountId,
+          chatgptPlanType: latest.planType,
+        };
+      },
+    });
+
     await writeLiveConfig(workerHome, model);
     await client.start();
     const initializeResult = await client.initialize(true);
@@ -386,7 +415,10 @@ export async function probeLiveExternalAuth({
       evidenceWritten: true,
     };
   } finally {
-    await client.stop();
-    await rm(workerHome, { recursive: true, force: true });
+    try {
+      await client?.stop();
+    } finally {
+      await rm(workerHome, { recursive: true, force: true });
+    }
   }
 }
