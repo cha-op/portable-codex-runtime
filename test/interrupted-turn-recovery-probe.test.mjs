@@ -15,7 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -49,7 +49,7 @@ function scenarioReport(kind) {
     sameThreadId: true,
     tailTurnStatus: "interrupted",
     threadReadAgrees: true,
-    threadReadIsolated: true,
+    threadReadIsolation: "copy-original-path-absent-held-tree-000",
     modelAbortMarker: kind === "logical_interrupt" ? "present" : "absent",
     ...(kind === "snapshot_restore"
       ? {
@@ -72,11 +72,12 @@ function completeEvidenceReport() {
     return scenario;
   });
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     probe: "interrupted-turn-recovery",
     runtime: {
       codexVersion: "codex-cli 0.142.4",
       codexBinarySha256: "a".repeat(64),
+      binaryExecution: "private-read-only-copy",
       sourceAnalysisCommit: "b".repeat(40),
       platform: "darwin",
       arch: "arm64",
@@ -413,11 +414,17 @@ test("portable directory names reject case and Unicode-normalization collisions"
   assert.deepEqual(assertPortableDirectoryNames(["zeta", "Alpha"]), ["Alpha", "zeta"]);
   for (const entries of [
     ["README", "readme"],
-    ["caf\u00e9", "cafe\u0301"],
+    ["\uac00", "\u1100\u1161"],
   ]) {
     assert.throws(
       () => assertPortableDirectoryNames(entries),
       /case or Unicode-normalization name collisions/,
+    );
+  }
+  for (const entry of ["\u03a3", "\u03c2", "Stra\u00dfe", "caf\u00e9"]) {
+    assert.throws(
+      () => assertPortableDirectoryNames([entry]),
+      /non-ASCII cased directory names/,
     );
   }
 });
@@ -578,6 +585,10 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
   try {
     const report = completeEvidenceReport();
     assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
+    assert.throws(
+      () => assertRecoveryEvidenceSafe({ ...report, schemaVersion: 1 }),
+      /1 !== 2/,
+    );
     for (const unsafe of [
       { ...report, cwd: "/Users/example/private" },
       { ...report, value: "123e4567-e89b-42d3-a456-426614174000" },
@@ -635,6 +646,18 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     ]);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), report);
     assert.deepEqual(await readdir(root), ["evidence.json"]);
+
+    const nestedPath = join(root, "new-private", "nested", "evidence.json");
+    const previousUmask = process.umask(0o777);
+    try {
+      await writeRecoveryEvidence(nestedPath, report);
+    } finally {
+      process.umask(previousUmask);
+    }
+    for (const directory of [dirname(nestedPath), dirname(dirname(nestedPath))]) {
+      assert.equal((await stat(directory)).mode & 0o777, 0o700);
+    }
+    assert.equal((await stat(nestedPath)).mode & 0o777, 0o600);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -715,16 +738,26 @@ test("model workspace evidence distinguishes canonical history from active conte
 
 test("probe report contains all four recovery scenarios without runtime identifiers", async () => {
   const calls = [];
+  const scenarioBinaries = [];
+  let versionBinary;
   const report = await probeInterruptedTurnRecovery({
     codexBin: process.execPath,
-    readCodexVersion: () => "codex-cli 0.142.4",
-    runScenario: async ({ kind }) => {
+    readCodexVersion: (codexBin) => {
+      versionBinary = codexBin;
+      return "codex-cli 0.142.4";
+    },
+    runScenario: async ({ codexBin, kind }) => {
       calls.push(kind);
+      scenarioBinaries.push(codexBin);
       return scenarioReport(kind);
     },
   });
   assert.deepEqual(calls, RECOVERY_SCENARIOS);
-  assert.equal(report.schemaVersion, 1);
+  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
+  assert(scenarioBinaries.every((binary) => binary === versionBinary));
+  assert.notEqual(versionBinary, process.execPath);
+  await assert.rejects(lstat(versionBinary), /ENOENT/);
   assert.equal(report.runtime.sourceAnalysisCommit, PINNED_SOURCE_ANALYSIS_COMMIT);
   assert.equal(report.backend.realModelTurn, false);
   assert.equal(report.backend.authMaterialUsed, false);

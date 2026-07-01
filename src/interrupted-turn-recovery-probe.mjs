@@ -347,7 +347,16 @@ export function assertPortableDirectoryNames(entries) {
   const portableKeys = new Set();
   for (const entry of entries) {
     assert.equal(typeof entry, "string", "portable directory entries must be strings");
-    const portableKey = entry.normalize("NFC").toLowerCase();
+    const normalized = entry.normalize("NFC");
+    for (const character of normalized) {
+      if (
+        character.codePointAt(0) > 0x7f &&
+        (character.toLowerCase() !== character || character.toUpperCase() !== character)
+      ) {
+        throw new Error("portable tree rejects non-ASCII cased directory names");
+      }
+    }
+    const portableKey = normalized.toLowerCase();
     if (portableKeys.has(portableKey)) {
       throw new Error(
         "portable tree rejects case or Unicode-normalization name collisions",
@@ -691,13 +700,13 @@ export async function runRecoveryScenario({
 }) {
   if (!RECOVERY_SCENARIOS.includes(kind)) throw new Error(`unknown recovery scenario: ${kind}`);
   const ownedRoot = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-recovery-"));
-  await chmod(ownedRoot, 0o700);
   let client;
   let readClient;
   let recoveredClient;
   let mock;
   let primaryFailure;
   try {
+    await chmod(ownedRoot, 0o700);
     let { codexHome, sessionRoot, workspace } = await createRecoveryLayout(ownedRoot);
     const originalWorkspace = workspace;
     const originalWorkspaceCanonical = await realpath(workspace);
@@ -856,7 +865,7 @@ export async function runRecoveryScenario({
       turnMaterialized: true,
       terminationObserved,
       originalCompletionObserved,
-      threadReadIsolated: true,
+      threadReadIsolation: "copy-original-path-absent-held-tree-000",
       ...recoveryReport,
       ...(snapshot ? { snapshot } : {}),
     };
@@ -888,13 +897,20 @@ function assertRecoveryEvidenceSchema(report) {
     ["schemaVersion", "probe", "runtime", "backend", "snapshot", "scenarios", "result"],
     "recovery evidence",
   );
-  assert.equal(report.schemaVersion, 1);
+  assert.equal(report.schemaVersion, 2);
   assert.equal(report.probe, "interrupted-turn-recovery");
   assert.equal(report.result, "passed");
 
   assertExactObject(
     report.runtime,
-    ["codexVersion", "codexBinarySha256", "sourceAnalysisCommit", "platform", "arch"],
+    [
+      "codexVersion",
+      "codexBinarySha256",
+      "binaryExecution",
+      "sourceAnalysisCommit",
+      "platform",
+      "arch",
+    ],
     "runtime evidence",
   );
   assert.match(
@@ -902,6 +918,7 @@ function assertRecoveryEvidenceSchema(report) {
     /^codex-cli [0-9]+\.[0-9]+\.[0-9]+$/,
   );
   assert.match(report.runtime.codexBinarySha256, /^[0-9a-f]{64}$/);
+  assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert.match(report.runtime.sourceAnalysisCommit, /^[0-9a-f]{40}$/);
   assert(["darwin", "linux"].includes(report.runtime.platform), "unsupported evidence platform");
   assert.match(report.runtime.arch, /^[0-9A-Za-z_-]+$/);
@@ -953,7 +970,7 @@ function assertRecoveryEvidenceSchema(report) {
         "sameThreadId",
         "tailTurnStatus",
         "threadReadAgrees",
-        "threadReadIsolated",
+        "threadReadIsolation",
         "modelAbortMarker",
       ],
       `${scenario.kind} scenario evidence`,
@@ -971,7 +988,10 @@ function assertRecoveryEvidenceSchema(report) {
     assert.equal(scenario.sameThreadId, true);
     assert.equal(scenario.tailTurnStatus, "interrupted");
     assert.equal(scenario.threadReadAgrees, true);
-    assert.equal(scenario.threadReadIsolated, true);
+    assert.equal(
+      scenario.threadReadIsolation,
+      "copy-original-path-absent-held-tree-000",
+    );
     assert.equal(scenario.modelAbortMarker, explicit ? "present" : "absent");
   }
 }
@@ -1011,11 +1031,47 @@ export function assertRecoveryEvidenceSafe(report) {
   return serialized;
 }
 
+async function ensurePrivateEvidenceDirectory(path) {
+  const missing = [];
+  let cursor = resolve(path);
+  while (true) {
+    try {
+      const metadata = await lstat(cursor);
+      assert(metadata.isDirectory(), "evidence parent must be a directory");
+      assert(!metadata.isSymbolicLink(), "evidence parent must not be a symlink");
+      break;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.push(cursor);
+      const parent = dirname(cursor);
+      assert.notEqual(parent, cursor, "evidence path has no existing directory ancestor");
+      cursor = parent;
+    }
+  }
+
+  let current = await realpath(cursor);
+  for (const directory of missing.reverse()) {
+    current = join(current, basename(directory));
+    try {
+      await mkdir(current, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      const metadata = await lstat(current);
+      assert(metadata.isDirectory(), "evidence parent must be a directory");
+      assert(!metadata.isSymbolicLink(), "evidence parent must not be a symlink");
+    }
+    await chmod(current, 0o700);
+  }
+  return current;
+}
+
 export async function writeRecoveryEvidence(path, report) {
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertRecoveryEvidenceSafe(serialized);
-  const evidenceDirectory = dirname(path);
-  await mkdir(evidenceDirectory, { recursive: true });
+  const evidenceName = basename(path);
+  assert(evidenceName !== "." && evidenceName !== "..", "invalid evidence filename");
+  const evidenceDirectory = await ensurePrivateEvidenceDirectory(dirname(path));
+  const evidencePath = join(evidenceDirectory, evidenceName);
   const temporaryDirectory = await mkdtemp(
     join(evidenceDirectory, `.${basename(path)}.tmp-${process.pid}-`),
   );
@@ -1030,7 +1086,7 @@ export async function writeRecoveryEvidence(path, report) {
     } finally {
       await file.close();
     }
-    await rename(temporaryPath, path);
+    await rename(temporaryPath, evidencePath);
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
   }
@@ -1053,37 +1109,69 @@ export async function probeInterruptedTurnRecovery({
   const binaryMetadata = await stat(binary);
   assert(binaryMetadata.isFile(), "CODEX_BIN must resolve to a regular file");
   assert.deepEqual([...scenarios], RECOVERY_SCENARIOS, "the evidence probe requires all scenarios");
+  let binaryRoot;
+  let primaryFailure;
+  try {
+    binaryRoot = await mkdtemp(join(tmpdir(), "portable-codex-binary-"));
+    await chmod(binaryRoot, 0o700);
+    const privateBinary = join(binaryRoot, "codex");
+    await copyFile(binary, privateBinary);
+    await chmod(privateBinary, 0o500);
+    const privateMetadata = await lstat(privateBinary);
+    assert(privateMetadata.isFile(), "private CODEX_BIN copy must be a regular file");
+    assert.equal(privateMetadata.nlink, 1, "private CODEX_BIN copy must not be hard linked");
+    const binaryDigest = await digestFile(privateBinary);
+    const binaryVersion = readCodexVersion(privateBinary);
 
-  const scenarioReports = [];
-  for (const kind of scenarios) {
-    scenarioReports.push(await runScenario({ codexBin: binary, kind }));
+    const scenarioReports = [];
+    for (const kind of scenarios) {
+      scenarioReports.push(await runScenario({ codexBin: privateBinary, kind }));
+    }
+    assert.equal(
+      await digestFile(privateBinary),
+      binaryDigest,
+      "private CODEX_BIN changed during the recovery probe",
+    );
+    const snapshotScenario = scenarioReports.find(
+      (scenario) => scenario.kind === "snapshot_restore",
+    );
+    const report = {
+      schemaVersion: 2,
+      probe: "interrupted-turn-recovery",
+      runtime: {
+        codexVersion: binaryVersion,
+        codexBinarySha256: binaryDigest,
+        binaryExecution: "private-read-only-copy",
+        sourceAnalysisCommit,
+        platform: platform(),
+        arch: arch(),
+      },
+      backend: {
+        type: "loopback-held-responses-mock",
+        realModelTurn: false,
+        authMaterialUsed: false,
+      },
+      snapshot: snapshotScenario.snapshot,
+      scenarios: scenarioReports.map(({ snapshot: _snapshot, ...scenario }) => scenario),
+      result: "passed",
+    };
+    assertRecoveryEvidenceSafe(report);
+    if (writeEvidence) {
+      assert(evidencePath, "evidencePath is required when writeEvidence is enabled");
+      await writeRecoveryEvidence(evidencePath, report);
+    }
+    return report;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    if (binaryRoot) {
+      await runSequentialCleanup(
+        [() => removeTreeForCleanup(binaryRoot)],
+        primaryFailure,
+      );
+    }
   }
-  const snapshotScenario = scenarioReports.find((scenario) => scenario.kind === "snapshot_restore");
-  const report = {
-    schemaVersion: 1,
-    probe: "interrupted-turn-recovery",
-    runtime: {
-      codexVersion: readCodexVersion(binary),
-      codexBinarySha256: await digestFile(binary),
-      sourceAnalysisCommit,
-      platform: platform(),
-      arch: arch(),
-    },
-    backend: {
-      type: "loopback-held-responses-mock",
-      realModelTurn: false,
-      authMaterialUsed: false,
-    },
-    snapshot: snapshotScenario.snapshot,
-    scenarios: scenarioReports.map(({ snapshot: _snapshot, ...scenario }) => scenario),
-    result: "passed",
-  };
-  assertRecoveryEvidenceSafe(report);
-  if (writeEvidence) {
-    assert(evidencePath, "evidencePath is required when writeEvidence is enabled");
-    await writeRecoveryEvidence(evidencePath, report);
-  }
-  return report;
 }
 
 export function interruptedTurnRecoveryFailureReport() {
