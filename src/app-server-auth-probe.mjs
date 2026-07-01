@@ -233,6 +233,9 @@ export class AppServerClient {
     this.stderrBytes = 0;
     this.stopping = false;
     this.terminalError = null;
+    this.processTreeQuiesced = false;
+    this.shutdownCompleted = false;
+    this.shutdownPromise = undefined;
   }
 
   async start() {
@@ -333,26 +336,44 @@ export class AppServerClient {
     );
   }
 
-  async stop() {
-    if (!this.child) return;
+  stop() {
+    if (!this.child) return Promise.resolve();
+    if (this.shutdownPromise) return this.shutdownPromise;
+    const attempt = this.#stopOnce();
+    this.shutdownPromise = attempt;
+    void attempt.then(
+      () => {
+        this.shutdownCompleted = true;
+      },
+      () => {
+        if (this.shutdownPromise === attempt) this.shutdownPromise = undefined;
+      },
+    );
+    return attempt;
+  }
+
+  async #stopOnce() {
     this.stopping = true;
     let shutdownError;
     try {
-      if (this.processControl.exists(this.child)) {
-        this.child.stdin.end();
-        if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
-          this.processControl.signal(this.child, "SIGTERM");
+      if (!this.processTreeQuiesced) {
+        if (this.processControl.exists(this.child)) {
+          this.child.stdin.end();
           if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
-            this.processControl.signal(this.child, "SIGKILL");
-            if (!(
-              await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
-                acceptZombieOnly: true,
-              })
-            )) {
-              throw new Error("codex app-server process group survived SIGKILL");
+            this.processControl.signal(this.child, "SIGTERM");
+            if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
+              this.processControl.signal(this.child, "SIGKILL");
+              if (!(
+                await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
+                  acceptZombieOnly: true,
+                })
+              )) {
+                throw new Error("codex app-server process group survived SIGKILL");
+              }
             }
           }
         }
+        this.processTreeQuiesced = true;
       }
       await this.exitPromise?.catch(() => {});
     } catch (error) {
@@ -367,25 +388,28 @@ export class AppServerClient {
     if (shutdownError) throw shutdownError;
   }
 
-  async abort(error = new Error("codex app-server aborted")) {
-    if (this.abortPromise) return this.abortPromise;
+  abort(error = new Error("codex app-server aborted")) {
+    if (this.shutdownPromise) return this.shutdownPromise;
     this.stopping = true;
     this.#failAll(error);
-    this.abortPromise = (async () => {
+    const attempt = (async () => {
       let shutdownError;
       try {
-        if (
-          this.child &&
-          this.processControl.exists(this.child)
-        ) {
-          this.processControl.signal(this.child, "SIGKILL");
-          if (!(
-            await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
-              acceptZombieOnly: true,
-            })
-          )) {
-            throw new Error("codex app-server process group survived SIGKILL");
+        if (!this.processTreeQuiesced) {
+          if (
+            this.child &&
+            this.processControl.exists(this.child)
+          ) {
+            this.processControl.signal(this.child, "SIGKILL");
+            if (!(
+              await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
+                acceptZombieOnly: true,
+              })
+            )) {
+              throw new Error("codex app-server process group survived SIGKILL");
+            }
           }
+          this.processTreeQuiesced = true;
         }
         await this.exitPromise?.catch(() => {});
       } catch (error) {
@@ -396,7 +420,18 @@ export class AppServerClient {
       }
       if (shutdownError) throw shutdownError;
     })();
-    return this.abortPromise;
+    this.abortPromise = attempt;
+    this.shutdownPromise = attempt;
+    void attempt.then(
+      () => {
+        this.shutdownCompleted = true;
+      },
+      () => {
+        if (this.abortPromise === attempt) this.abortPromise = undefined;
+        if (this.shutdownPromise === attempt) this.shutdownPromise = undefined;
+      },
+    );
+    return attempt;
   }
 
   #send(message) {

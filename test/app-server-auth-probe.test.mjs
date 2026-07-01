@@ -281,6 +281,227 @@ test("Linux process-group inspection distinguishes live and zombie-only members"
   }
 });
 
+function installSyntheticChild(client, { onStdinEnd = () => {} } = {}) {
+  client.child = {
+    pid: 4242,
+    stdin: { destroy: () => {}, end: onStdinEnd },
+    stdout: { destroy: () => {} },
+    stderr: { destroy: () => {} },
+    unref: () => {},
+  };
+  client.exitPromise = Promise.resolve();
+  client.stdout = { close: () => {} };
+}
+
+test("successful stop is a permanent no-op for later callers", async () => {
+  let existsCalls = 0;
+  let waitCalls = 0;
+  let stdinEnds = 0;
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => {
+        existsCalls += 1;
+        return true;
+      },
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => {
+        waitCalls += 1;
+        return true;
+      },
+    },
+  });
+  installSyntheticChild(client, { onStdinEnd: () => { stdinEnds += 1; } });
+
+  const first = client.stop();
+  await first;
+  const second = client.stop();
+  assert.equal(second, first);
+  await second;
+  assert.equal(existsCalls, 1);
+  assert.equal(waitCalls, 1);
+  assert.equal(stdinEnds, 1);
+  assert.deepEqual(signals, []);
+});
+
+test("concurrent stop callers share one in-flight shutdown", async () => {
+  let finishExit;
+  const exit = new Promise((resolve) => {
+    finishExit = resolve;
+  });
+  let existsCalls = 0;
+  let waitCalls = 0;
+  let stdinEnds = 0;
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => {
+        existsCalls += 1;
+        return true;
+      },
+      signal: () => {},
+      waitForExit: async () => {
+        waitCalls += 1;
+        return exit;
+      },
+    },
+  });
+  installSyntheticChild(client, { onStdinEnd: () => { stdinEnds += 1; } });
+
+  const first = client.stop();
+  const second = client.stop();
+  assert.equal(second, first);
+  assert.equal(existsCalls, 1);
+  assert.equal(waitCalls, 1);
+  assert.equal(stdinEnds, 1);
+  finishExit(true);
+  await Promise.all([first, second]);
+});
+
+test("failed stop clears the shared state and allows a successful retry", async () => {
+  let waitCalls = 0;
+  let existsCalls = 0;
+  let stdinEnds = 0;
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => {
+        existsCalls += 1;
+        return true;
+      },
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => {
+        waitCalls += 1;
+        return waitCalls >= 4;
+      },
+    },
+    shutdownGraceMs: 0,
+  });
+  installSyntheticChild(client, { onStdinEnd: () => { stdinEnds += 1; } });
+
+  const first = client.stop();
+  await assert.rejects(first, /survived SIGKILL/);
+  const second = client.stop();
+  assert.notEqual(second, first);
+  await second;
+  assert.equal(client.stop(), second);
+  assert.equal(existsCalls, 2);
+  assert.equal(waitCalls, 4);
+  assert.equal(stdinEnds, 2);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("cleanup-only stop retry does not probe or signal an already quiesced process tree", async () => {
+  const closeError = new Error("synthetic output close failure");
+  let closeCalls = 0;
+  let existsCalls = 0;
+  let waitCalls = 0;
+  let stdinEnds = 0;
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => {
+        existsCalls += 1;
+        return true;
+      },
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => {
+        waitCalls += 1;
+        return true;
+      },
+    },
+  });
+  installSyntheticChild(client, { onStdinEnd: () => { stdinEnds += 1; } });
+  client.stdout = {
+    close: () => {
+      closeCalls += 1;
+      if (closeCalls === 1) throw closeError;
+    },
+  };
+
+  const first = client.stop();
+  await assert.rejects(first, (error) => error === closeError);
+  const second = client.stop();
+  assert.notEqual(second, first);
+  await second;
+  assert.equal(client.stop(), second);
+  assert.equal(closeCalls, 2);
+  assert.equal(existsCalls, 1);
+  assert.equal(waitCalls, 1);
+  assert.equal(stdinEnds, 1);
+  assert.deepEqual(signals, []);
+});
+
+test("successful abort completes shared shutdown and makes stop a no-op", async () => {
+  let existsCalls = 0;
+  let waitCalls = 0;
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => {
+        existsCalls += 1;
+        return true;
+      },
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => {
+        waitCalls += 1;
+        return true;
+      },
+    },
+  });
+  installSyntheticChild(client);
+
+  const abort = client.abort();
+  await abort;
+  const stop = client.stop();
+  assert.equal(stop, abort);
+  await stop;
+  assert.equal(existsCalls, 1);
+  assert.equal(waitCalls, 1);
+  assert.deepEqual(signals, ["SIGKILL"]);
+});
+
+test("failed abort clears shared shutdown so stop can retry", async () => {
+  let existsCalls = 0;
+  let waitCalls = 0;
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => {
+        existsCalls += 1;
+        return true;
+      },
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => {
+        waitCalls += 1;
+        return waitCalls >= 2;
+      },
+    },
+    shutdownGraceMs: 0,
+  });
+  installSyntheticChild(client);
+
+  const abort = client.abort();
+  await assert.rejects(abort, /survived SIGKILL/);
+  const stop = client.stop();
+  assert.notEqual(stop, abort);
+  await stop;
+  assert.equal(existsCalls, 2);
+  assert.equal(waitCalls, 2);
+  assert.deepEqual(signals, ["SIGKILL"]);
+});
+
 test("stop rejects pending RPCs and closes output when a process group survives SIGKILL", async () => {
   const signals = [];
   const client = new AppServerClient({
