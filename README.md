@@ -131,8 +131,11 @@ Run the full local test suite:
 npm test
 ```
 
-The two app-server integration tests run when `CODEX_BIN` (or `codex` on
-`PATH`) is executable. They are reported as skipped on Node-only CI runners;
+Two external-auth app-server integration tests run when `CODEX_BIN` (or
+`codex` on `PATH`) is executable. The third app-server integration test is the
+full interrupted-turn recovery matrix; it requires `CODEX_BIN` to be an
+explicit absolute path so the probe can bind evidence to that exact binary.
+Unavailable integration tests are reported as skipped on Node-only CI runners;
 the remaining tests still run normally.
 
 The reference host app-server runtime currently supports macOS and Linux process

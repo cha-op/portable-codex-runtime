@@ -156,6 +156,39 @@ test("signal termination observes the requested signal and always cleans up", as
   );
 });
 
+test("signal termination drains stdout and child close before abort cleanup", async () => {
+  let abortCalls = 0;
+  let notificationObserved = false;
+  let resolveChildClose;
+  let resolveStdoutClose;
+  const client = {
+    child: { pid: 4242 },
+    childClosePromise: new Promise((resolveClose) => {
+      resolveChildClose = resolveClose;
+    }),
+    exitPromise: Promise.resolve([null, "SIGTERM"]),
+    stdoutClosePromise: new Promise((resolveClose) => {
+      resolveStdoutClose = resolveClose;
+    }),
+  };
+  const termination = terminateAppServer(client, "SIGTERM", {
+    abortClient: async () => {
+      abortCalls += 1;
+      assert.equal(notificationObserved, true);
+    },
+    killProcess: () => {},
+  });
+  await Promise.resolve();
+  assert.equal(abortCalls, 0);
+  notificationObserved = true;
+  resolveStdoutClose();
+  await Promise.resolve();
+  assert.equal(abortCalls, 0);
+  resolveChildClose([null, "SIGTERM"]);
+  assert.deepEqual(await termination, { signal: "SIGTERM" });
+  assert.equal(abortCalls, 1);
+});
+
 test("signal termination tolerates an already absent process group", async () => {
   const missingProcessGroup = new Error("missing process group");
   missingProcessGroup.code = "ESRCH";
@@ -1091,12 +1124,62 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       );
     }
     const path = join(root, "evidence.json");
+    const synchronizedDirectories = [];
     await Promise.all([
-      writeRecoveryEvidence(path, report),
-      writeRecoveryEvidence(path, report),
+      writeRecoveryEvidence(path, report, {
+        syncDirectory: async (directory) => synchronizedDirectories.push(directory),
+      }),
+      writeRecoveryEvidence(path, report, {
+        syncDirectory: async (directory) => synchronizedDirectories.push(directory),
+      }),
     ]);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), report);
     assert.deepEqual(await readdir(root), ["evidence.json"]);
+    assert.deepEqual(synchronizedDirectories, [await realpath(root), await realpath(root)]);
+
+    const unsynchronizedPath = join(root, "unsynchronized-evidence.json");
+    await assert.rejects(
+      writeRecoveryEvidence(unsynchronizedPath, report, {
+        syncDirectory: async () => {
+          throw new Error("synthetic evidence directory sync failure");
+        },
+      }),
+      /synthetic evidence directory sync failure/,
+    );
+    assert.deepEqual(JSON.parse(await readFile(unsynchronizedPath, "utf8")), report);
+
+    const writeFailure = new Error("synthetic evidence write failure");
+    const writeCloseFailure = new Error("synthetic evidence write close failure");
+    await assert.rejects(
+      writeRecoveryEvidence(join(root, "write-failure.json"), report, {
+        openEvidenceFile: async () => ({
+          chmod: async () => {},
+          close: async () => {
+            throw writeCloseFailure;
+          },
+          sync: async () => assert.fail("sync must not run after write failure"),
+          writeFile: async () => {
+            throw writeFailure;
+          },
+        }),
+      }),
+      (error) => error === writeFailure && error.cleanupError === writeCloseFailure,
+    );
+
+    const closeOnlyFailure = new Error("synthetic evidence close-only failure");
+    await assert.rejects(
+      writeRecoveryEvidence(join(root, "close-failure.json"), report, {
+        openEvidenceFile: async () => ({
+          chmod: async () => {},
+          close: async () => {
+            throw closeOnlyFailure;
+          },
+          sync: async () => {},
+          writeFile: async () => {},
+        }),
+      }),
+      (error) => error === closeOnlyFailure,
+    );
 
     const nestedPath = join(root, "new-private", "nested", "evidence.json");
     const previousUmask = process.umask(0o777);
@@ -1217,6 +1300,7 @@ test("model workspace evidence distinguishes canonical history from active conte
 test("probe report contains all four recovery scenarios without runtime identifiers", async () => {
   const calls = [];
   const scenarioBinaries = [];
+  const scenarioRoots = [];
   let versionBinary;
   let versionContext;
   const report = await probeInterruptedTurnRecovery({
@@ -1226,9 +1310,10 @@ test("probe report contains all four recovery scenarios without runtime identifi
       versionContext = context;
       return "codex-cli 0.142.4";
     },
-    runScenario: async ({ codexBin, kind }) => {
+    runScenario: async ({ codexBin, kind, temporaryRoot }) => {
       calls.push(kind);
       scenarioBinaries.push(codexBin);
+      scenarioRoots.push(temporaryRoot);
       return scenarioReport(kind);
     },
   });
@@ -1236,6 +1321,7 @@ test("probe report contains all four recovery scenarios without runtime identifi
   assert.equal(report.schemaVersion, 5);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert(scenarioBinaries.every((binary) => binary === versionBinary));
+  assert(scenarioRoots.every((root) => root === dirname(versionBinary)));
   assert.notEqual(versionBinary, process.execPath);
   assert.equal(versionContext.cwd, versionContext.env.CODEX_HOME);
   assert.equal(versionContext.env.OPENAI_API_KEY, undefined);

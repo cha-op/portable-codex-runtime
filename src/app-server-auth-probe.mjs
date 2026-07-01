@@ -286,6 +286,8 @@ export class AppServerClient {
     });
     this.exitPromise = once(this.child, "exit");
     void this.exitPromise.catch(() => {});
+    this.childClosePromise = once(this.child, "close");
+    void this.childClosePromise.catch(() => {});
 
     this.child.once("error", (error) => this.#failAll(error));
     this.child.stdin.on("error", (error) => {
@@ -303,6 +305,8 @@ export class AppServerClient {
     });
 
     this.stdout = createInterface({ input: this.child.stdout });
+    this.stdoutClosePromise = once(this.stdout, "close");
+    void this.stdoutClosePromise.catch(() => {});
     this.stdout.on("line", (line) => {
       if (line.trim() === "") return;
       let message;

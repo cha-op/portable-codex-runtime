@@ -292,6 +292,14 @@ export async function terminateAppServer(
     // after an implementation-defined clean exit.
     assert.equal(exitResult[0], null, `app-server exited with code ${exitResult[0]}`);
     assert.equal(exitResult[1], signal, `app-server observed ${exitResult[1]} instead of ${signal}`);
+    await withTimeout(
+      Promise.all([
+        client.childClosePromise ?? client.exitPromise,
+        client.stdoutClosePromise ?? Promise.resolve(),
+      ]),
+      timeoutMs,
+      `${signal} app-server stdio close`,
+    );
   } catch (error) {
     primaryFailure = { error };
     throw error;
@@ -1257,10 +1265,17 @@ export async function runRecoveryScenario({
   kind,
   makeTemporaryDirectory = mkdtemp,
   startMock = startHeldResponsesMock,
+  temporaryRoot,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
   if (!RECOVERY_SCENARIOS.includes(kind)) throw new Error(`unknown recovery scenario: ${kind}`);
-  const ownedRoot = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-recovery-"));
+  assert(
+    typeof temporaryRoot === "string" && isAbsolute(temporaryRoot),
+    "recovery scenario requires a validated absolute temporary root",
+  );
+  const ownedRoot = await makeTemporaryDirectory(
+    join(temporaryRoot, "portable-codex-recovery-"),
+  );
   let client;
   let readClient;
   let recoveredClient;
@@ -1732,7 +1747,30 @@ export async function ensurePrivateEvidenceDirectory(
   return current;
 }
 
-export async function writeRecoveryEvidence(path, report) {
+async function syncRecoveryEvidenceDirectory(path) {
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  let primaryFailure;
+  try {
+    await handle.sync();
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+export async function writeRecoveryEvidence(
+  path,
+  report,
+  {
+    openEvidenceFile = open,
+    syncDirectory = syncRecoveryEvidenceDirectory,
+  } = {},
+) {
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertRecoveryEvidenceSafe(serialized);
   const evidenceName = basename(path);
@@ -1745,15 +1783,20 @@ export async function writeRecoveryEvidence(path, report) {
   const temporaryPath = join(temporaryDirectory, "evidence.json");
   try {
     await chmod(temporaryDirectory, 0o700);
-    const file = await open(temporaryPath, "wx", 0o600);
+    const file = await openEvidenceFile(temporaryPath, "wx", 0o600);
+    let primaryFailure;
     try {
       await file.chmod(0o600);
       await file.writeFile(serialized);
       await file.sync();
+    } catch (error) {
+      primaryFailure = { error };
+      throw error;
     } finally {
-      await file.close();
+      await runSequentialCleanup([() => file.close()], primaryFailure);
     }
     await rename(temporaryPath, evidencePath);
+    await syncDirectory(evidenceDirectory);
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
   }
@@ -1881,6 +1924,11 @@ export async function probeInterruptedTurnRecovery({
   try {
     binaryRoot = await mkdtemp(join(canonicalExecutableRoot, "portable-codex-binary-"));
     await chmod(binaryRoot, 0o700);
+    await assertTrustedExecutableRoot(binaryRoot, await stat(binaryRoot), {
+      currentUid,
+      inspectAncestorAcl: inspectExecutableAncestorAcl,
+      inspectRootAcl: inspectExecutableRootAcl,
+    });
     const privateBinary = join(binaryRoot, "codex");
     await copyFile(binary, privateBinary);
     await chmod(privateBinary, 0o500);
@@ -1897,7 +1945,9 @@ export async function probeInterruptedTurnRecovery({
     const scenarioReports = [];
     for (const kind of scenarios) {
       await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
-      scenarioReports.push(await runScenario({ codexBin: privateBinary, kind }));
+      scenarioReports.push(
+        await runScenario({ codexBin: privateBinary, kind, temporaryRoot: binaryRoot }),
+      );
     }
     await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
     const snapshotScenario = scenarioReports.find(

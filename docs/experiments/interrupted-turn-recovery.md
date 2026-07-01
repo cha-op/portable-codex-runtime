@@ -21,7 +21,9 @@ does not implement the production block-volume snapshot barrier.
 The probe runs the installed Codex app-server with a synthetic `CODEX_HOME`, a
 synthetic workspace, and a held localhost Responses API server. The model
 provider does not require OpenAI authentication. Each scenario uses a separate
-mode `0700` temporary root and a fixed prompt that contains no repository data.
+mode `0700` temporary root beneath the same scratch root whose ownership,
+ancestor chain, and ACL state were validated before the private Codex binary was
+staged. The fixed prompt contains no repository data.
 
 | Scenario | Termination evidence | Cold resume | Recovered tail | Next-request abort marker |
 | --- | --- | --- | --- | --- |
