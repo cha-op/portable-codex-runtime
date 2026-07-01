@@ -1306,15 +1306,23 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
 
     const nestedPath = join(root, "new-private", "nested", "evidence.json");
+    const nestedSynchronizedDirectories = [];
     const previousUmask = process.umask(0o777);
     try {
-      await writeRecoveryEvidence(nestedPath, report);
+      await writeRecoveryEvidence(nestedPath, report, {
+        syncDirectory: async (directory) => nestedSynchronizedDirectories.push(directory),
+      });
     } finally {
       process.umask(previousUmask);
     }
     for (const directory of [dirname(nestedPath), dirname(dirname(nestedPath))]) {
       assert.equal((await stat(directory)).mode & 0o777, 0o700);
     }
+    assert.deepEqual(nestedSynchronizedDirectories, [
+      await realpath(dirname(nestedPath)),
+      await realpath(dirname(dirname(nestedPath))),
+      await realpath(root),
+    ]);
     assert.equal((await stat(nestedPath)).mode & 0o777, 0o600);
   } finally {
     await rm(root, { recursive: true, force: true });

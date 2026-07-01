@@ -1823,7 +1823,11 @@ export function assertRecoveryEvidenceSafe(report) {
 
 export async function ensurePrivateEvidenceDirectory(
   path,
-  { createDirectory = mkdir, setMode = chmod } = {},
+  {
+    createDirectory = mkdir,
+    onDirectoryCreated = async () => {},
+    setMode = chmod,
+  } = {},
 ) {
   const missing = [];
   let cursor = resolve(path);
@@ -1849,6 +1853,7 @@ export async function ensurePrivateEvidenceDirectory(
     // after the initial scan, so this invocation must not chmod it.
     await createDirectory(current, { mode: 0o700 });
     await setMode(current, 0o700);
+    await onDirectoryCreated(current);
   }
   return current;
 }
@@ -1881,7 +1886,10 @@ export async function writeRecoveryEvidence(
   assertRecoveryEvidenceSafe(serialized);
   const evidenceName = basename(path);
   assert(evidenceName !== "." && evidenceName !== "..", "invalid evidence filename");
-  const evidenceDirectory = await ensurePrivateEvidenceDirectory(dirname(path));
+  const createdEvidenceDirectories = [];
+  const evidenceDirectory = await ensurePrivateEvidenceDirectory(dirname(path), {
+    onDirectoryCreated: async (directory) => createdEvidenceDirectories.push(directory),
+  });
   const evidencePath = join(evidenceDirectory, evidenceName);
   const temporaryDirectory = await mkdtemp(
     join(evidenceDirectory, `.${basename(path)}.tmp-${process.pid}-`),
@@ -1903,6 +1911,9 @@ export async function writeRecoveryEvidence(
     }
     await rename(temporaryPath, evidencePath);
     await syncDirectory(evidenceDirectory);
+    for (const directory of createdEvidenceDirectories.reverse()) {
+      await syncDirectory(dirname(directory));
+    }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
   }
