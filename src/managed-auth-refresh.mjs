@@ -333,6 +333,12 @@ function integerAsBigInt(value) {
   return Number.isSafeInteger(value) ? BigInt(value) : null;
 }
 
+function currentBrokerUid() {
+  if (typeof process.geteuid === "function") return process.geteuid();
+  if (typeof process.getuid === "function") return process.getuid();
+  return null;
+}
+
 function jsonSafeStatInteger(value) {
   const numeric = Number(value);
   return Number.isSafeInteger(numeric) ? numeric : value.toString();
@@ -593,12 +599,7 @@ async function resolveAuthorityHome(
       "unsafe_auth_home",
       "authority home must be a real directory",
     );
-    const currentUid =
-      typeof process.geteuid === "function"
-        ? process.geteuid()
-        : typeof process.getuid === "function"
-          ? process.getuid()
-          : null;
+    const currentUid = currentBrokerUid();
     assertAuthorityDirectoryTrust(authorityHomeStat, currentUid);
     await assertNoExtendedAcl(
       authorityHome,
@@ -1288,7 +1289,11 @@ export function managedAuthRefreshFailureReport(error) {
 
 export async function readManagedAuthSnapshot(
   authHome,
-  { inspectExtendedAcl = pathHasExtendedAcl } = {},
+  {
+    brokerUid = currentBrokerUid(),
+    inspectExtendedAcl = pathHasExtendedAcl,
+    openFile = open,
+  } = {},
 ) {
   ensure(
     typeof constants.O_NOFOLLOW === "number",
@@ -1301,13 +1306,19 @@ export async function readManagedAuthSnapshot(
   let raw;
   let fileStat;
   try {
-    handle = await open(
+    handle = await openFile(
       authPath,
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
     fileStat = await handle.stat({ bigint: true });
     ensure(fileStat.isFile(), "invalid_auth_record", "authority auth.json must be a regular file");
     ensure(fileStat.nlink === 1n, "invalid_auth_record", "authority auth.json must not be hard linked");
+    const normalizedBrokerUid = integerAsBigInt(brokerUid);
+    ensure(
+      normalizedBrokerUid !== null && integerAsBigInt(fileStat.uid) === normalizedBrokerUid,
+      "invalid_auth_record",
+      "authority auth.json must be owned by the broker",
+    );
     ensure(
       (fileStat.mode & 0o077n) === 0n,
       "invalid_auth_record",

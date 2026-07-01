@@ -323,6 +323,47 @@ test("authority and canonical auth ACL checks fail closed without exposing ACL d
   }
 });
 
+test("authority auth owner mismatch fails before ACL or credential reads", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const authOwnerUid = (await stat(join(authHome, "auth.json"), { bigint: true })).uid;
+  const mismatchedBrokerUid = authOwnerUid + 2n ** 54n + 1n;
+  let authAclInspected = false;
+  let authBytesRead = false;
+  try {
+    await assert.rejects(
+      readManagedAuthSnapshot(authHome, {
+        brokerUid: mismatchedBrokerUid,
+        inspectExtendedAcl: async () => {
+          authAclInspected = true;
+          return false;
+        },
+        openFile: async (...args) => {
+          const handle = await open(...args);
+          return {
+            close: handle.close.bind(handle),
+            readFile: (...readArgs) => {
+              authBytesRead = true;
+              return handle.readFile(...readArgs);
+            },
+            stat: handle.stat.bind(handle),
+          };
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "invalid_auth_record");
+        assert.equal(error.message, "authority auth.json must be owned by the broker");
+        assert.equal(error.message.includes(authHome), false);
+        assert.equal(error.message.includes(mismatchedBrokerUid.toString()), false);
+        return true;
+      },
+    );
+    assert.equal(authAclInspected, false);
+    assert.equal(authBytesRead, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function replaceStagedAuth(
   stagingHome,
   {
