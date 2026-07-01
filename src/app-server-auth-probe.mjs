@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { watch } from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -40,6 +40,50 @@ function processTreeExists(child) {
   }
 }
 
+function parseLinuxProcessStat(raw) {
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd < 0) return null;
+  const fields = raw.slice(commandEnd + 1).trim().split(/\s+/);
+  if (fields.length < 3) return null;
+  const processGroupId = Number(fields[2]);
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return null;
+  return { processGroupId, state: fields[0] };
+}
+
+export async function inspectLinuxProcessGroup(processGroupId, procRoot = "/proc") {
+  let entries;
+  try {
+    entries = await readdir(procRoot, { withFileTypes: true });
+  } catch {
+    return "unknown";
+  }
+
+  let foundMember = false;
+  let inspectionUncertain = false;
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry.name)) continue;
+    let parsed;
+    try {
+      parsed = parseLinuxProcessStat(
+        await readFile(join(procRoot, entry.name, "stat"), "utf8"),
+      );
+    } catch (error) {
+      if (error?.code !== "ENOENT") inspectionUncertain = true;
+      continue;
+    }
+    if (!parsed) {
+      inspectionUncertain = true;
+      continue;
+    }
+    if (parsed.processGroupId !== processGroupId) continue;
+    foundMember = true;
+    if (!["Z", "X", "x"].includes(parsed.state)) return "live";
+  }
+
+  if (inspectionUncertain) return "unknown";
+  return foundMember ? "zombie-only" : "empty";
+}
+
 function signalProcessTree(child, signal) {
   if (!child?.pid) return;
   try {
@@ -50,9 +94,13 @@ function signalProcessTree(child, signal) {
   }
 }
 
-async function waitForProcessTreeExit(child, timeoutMs) {
+async function waitForProcessTreeExit(child, timeoutMs, { acceptZombieOnly = false } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (processTreeExists(child)) {
+    if (acceptZombieOnly && process.platform === "linux") {
+      const state = await inspectLinuxProcessGroup(child.pid);
+      if (state === "empty" || state === "zombie-only") return true;
+    }
     if (Date.now() >= deadline) return false;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -219,7 +267,11 @@ export class AppServerClient {
         signalProcessTree(this.child, "SIGTERM");
         if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
           signalProcessTree(this.child, "SIGKILL");
-          if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
+          if (!(
+            await waitForProcessTreeExit(this.child, this.shutdownGraceMs, {
+              acceptZombieOnly: true,
+            })
+          )) {
             throw new Error("codex app-server process group survived SIGKILL");
           }
         }
@@ -240,7 +292,11 @@ export class AppServerClient {
         processTreeExists(this.child)
       ) {
         signalProcessTree(this.child, "SIGKILL");
-        if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
+        if (!(
+          await waitForProcessTreeExit(this.child, this.shutdownGraceMs, {
+            acceptZombieOnly: true,
+          })
+        )) {
           throw new Error("codex app-server process group survived SIGKILL");
         }
       }

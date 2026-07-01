@@ -461,6 +461,7 @@ async function atomicallyPromoteAuth(
   expectedSource,
   assertLockHeld,
   commitRename,
+  readCanonicalSource,
   syncDirectory,
 ) {
   const authorityHome = authority.path;
@@ -483,7 +484,15 @@ async function atomicallyPromoteAuth(
     handle = undefined;
 
     await assertAuthorityHomeCurrent(authority);
-    const currentSource = await readManagedAuthSnapshot(authorityHome);
+    let currentSource;
+    try {
+      currentSource = await readCanonicalSource(authorityHome);
+    } catch (error) {
+      // A failed pathname read may itself be evidence that the authority was
+      // replaced. Revalidate before exposing the read error or recovery paths.
+      await assertAuthorityHomeCurrent(authority);
+      throw error;
+    }
     await assertAuthorityHomeCurrent(authority);
     ensure(
       currentSource.authFileFingerprint === expectedSource.authFileFingerprint &&
@@ -721,6 +730,7 @@ export async function readManagedAuthSnapshot(authHome) {
 }
 
 export async function runCodexManagedRefresh({
+  assertLockHeldBeforeDispatch,
   codexBin = "codex",
   createClient = (options) => new AppServerClient(options),
   signal,
@@ -774,6 +784,9 @@ export async function runCodexManagedRefresh({
   try {
     await withAbort(() => client.start());
     const initializeResult = await withAbort(() => client.initialize(false));
+    if (typeof assertLockHeldBeforeDispatch === "function") {
+      await withAbort(() => assertLockHeldBeforeDispatch());
+    }
     let response;
     try {
       refreshRequestDispatched = true;
@@ -849,7 +862,7 @@ export async function runCodexManagedRefresh({
   }
 }
 
-async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
+async function assertLockHeldBeforeRefresh(lock) {
   try {
     await lock.assertHeld();
   } catch (error) {
@@ -862,6 +875,10 @@ async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
     markPreDispatchRefreshError(beforeRefresh);
     throw beforeRefresh;
   }
+}
+
+async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
+  await assertLockHeldBeforeRefresh(lock);
   const controller = new AbortController();
   const refresh = Promise.resolve().then(() => operation(controller.signal));
   if (typeof lock.waitForLoss !== "function") return refresh;
@@ -912,18 +929,22 @@ async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, st
 /**
  * Runs one managed credential refresh transaction.
  *
- * A custom `runRefresh` adapter must classify every failure after dispatching
- * `account/read(refreshToken=true)` as a non-retryable
- * `ManagedAuthRefreshError` with code `refresh_outcome_uncertain`. The default
- * adapter marks failures proven to occur before dispatch; every other adapter
- * failure is conservatively wrapped as post-dispatch uncertainty so the
- * durable staging sentinel cannot be reaped before operator recovery.
+ * `runRefresh` is a trusted/test-only injection seam because it receives the
+ * credential-bearing `stagingHome`. A trusted custom adapter receives
+ * `assertLockHeldBeforeDispatch` and MUST await it immediately before
+ * dispatching `account/read(refreshToken=true)`. It must classify every
+ * failure after that dispatch as a non-retryable `ManagedAuthRefreshError`
+ * with code `refresh_outcome_uncertain`. The default adapter performs the
+ * assertion and marks failures proven to occur before dispatch; every other
+ * adapter failure is conservatively wrapped as post-dispatch uncertainty so
+ * the durable staging sentinel cannot be reaped before operator recovery.
  */
 export async function refreshManagedAuthRecord({
   acquireLock = acquireAuthorityLock,
   authHome,
   cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
+  readCanonicalSource = readManagedAuthSnapshot,
   runRefresh = runCodexManagedRefresh,
   syncStagingDirectory = syncDirectoryPath,
   syncDirectory = syncParentDirectory,
@@ -973,7 +994,13 @@ export async function refreshManagedAuthRecord({
     try {
       refreshResult = await runRefreshWhileLockHeld(
         lock,
-        (signal) => runRefresh({ codexBin, signal, stagingHome }),
+        (signal) =>
+          runRefresh({
+            assertLockHeldBeforeDispatch: () => assertLockHeldBeforeRefresh(lock),
+            codexBin,
+            signal,
+            stagingHome,
+          }),
         stagingHome,
       );
     } catch (error) {
@@ -1083,6 +1110,7 @@ export async function refreshManagedAuthRecord({
       before,
       () => lock.assertHeld(),
       (source, destination) => lock.renameWhileHeld(source, destination),
+      readCanonicalSource,
       syncDirectory,
     );
     committedWarnings.push(...promotion.warnings);
@@ -1104,6 +1132,9 @@ export async function refreshManagedAuthRecord({
       preserveStaging = promotion.warnings.length > 0;
     } catch (error) {
       if (error?.code === "authority_home_replaced") throw error;
+      // A verify read can fail because its authority pathname was replaced.
+      // Revalidate before wrapping it with a stale staging recovery path.
+      await assertAuthorityHomeCurrent(authority);
       if (error?.code === "promotion_verification_failed") throw error;
       const verificationError = new ManagedAuthRefreshError(
         "promotion_verification_failed",
@@ -1195,7 +1226,10 @@ export async function refreshManagedAuthRecord({
     await assertAuthorityHomeCurrent(authority);
   } catch (error) {
     authorityCurrent = false;
-    primaryError ??= error;
+    if (primaryError && primaryError !== error && !error.cause) {
+      error.cause = primaryError;
+    }
+    primaryError = error;
     cleanupWarnings.push("authority_home_replaced");
   }
   if (authorityCurrent) {

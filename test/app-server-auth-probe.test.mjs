@@ -11,6 +11,7 @@ import {
   codexVersion,
   createWorkerAuthMonitor,
   fileExists,
+  inspectLinuxProcessGroup,
   probeExperimentalGate,
   probeExternalAuthRefresh,
   resolveAppServerExecutable,
@@ -76,6 +77,34 @@ test("app-server executable resolution preserves PATH commands and freezes relat
   );
   assert.equal(resolveAppServerExecutable("/pinned/codex", "/launcher"), "/pinned/codex");
   assert.equal(codexVersion(relativeNodeExecutable()), process.version);
+});
+
+test("Linux process-group inspection distinguishes live and zombie-only members", async () => {
+  const procRoot = await mkdtemp(join(tmpdir(), "portable-codex-proc-fixture-"));
+  const processGroupId = 4242;
+  const writeStat = async (pid, command, state, groupId) => {
+    const processRoot = join(procRoot, String(pid));
+    await mkdir(processRoot);
+    await writeFile(
+      join(processRoot, "stat"),
+      `${pid} (${command}) ${state} 1 ${groupId} ${groupId} 0 0 0\n`,
+    );
+  };
+  try {
+    await writeStat(100, "zombie ) worker", "Z", processGroupId);
+    await writeStat(101, "unrelated", "S", 9000);
+    assert.equal(await inspectLinuxProcessGroup(processGroupId, procRoot), "zombie-only");
+
+    await writeStat(102, "live worker", "D", processGroupId);
+    assert.equal(await inspectLinuxProcessGroup(processGroupId, procRoot), "live");
+
+    await rm(join(procRoot, "102"), { recursive: true, force: true });
+    await mkdir(join(procRoot, "103"));
+    await writeFile(join(procRoot, "103", "stat"), "malformed\n");
+    assert.equal(await inspectLinuxProcessGroup(processGroupId, procRoot), "unknown");
+  } finally {
+    await rm(procRoot, { recursive: true, force: true });
+  }
 });
 
 test("worker auth is checked after app-server shutdown", async () => {

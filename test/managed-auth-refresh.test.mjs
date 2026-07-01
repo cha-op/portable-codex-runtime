@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, renameSync } from "node:fs";
 import {
   chmod,
   link,
@@ -266,6 +267,7 @@ test("error metadata exposes recovery controls without serializing the error", (
 test("runCodexManagedRefresh uses only the managed account refresh choreography", async () => {
   const calls = [];
   const result = await runCodexManagedRefresh({
+    assertLockHeldBeforeDispatch: async () => calls.push(["assert-lock-before-dispatch"]),
     codexBin: "/pinned/codex",
     stagingHome: "/isolated/staging-home",
     createClient: (options) => {
@@ -296,10 +298,64 @@ test("runCodexManagedRefresh uses only the managed account refresh choreography"
     ],
     ["start"],
     ["initialize", false],
+    ["assert-lock-before-dispatch"],
     ["request", "account/read", { refreshToken: true }],
     ["stop"],
   ]);
   assert.deepEqual(result.rpcAudit, RPC_AUDIT);
+});
+
+test("managed refresh rechecks lock ownership after initialize and before account/read", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let lockHeld = true;
+  let lockAssertions = 0;
+  let released = false;
+  const requestMethods = [];
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async () => ({
+          assertHeld: async () => {
+            lockAssertions += 1;
+            if (!lockHeld) throw new AdvisoryLockError("lock_lost", "synthetic lock loss");
+          },
+          release: async () => {
+            released = true;
+          },
+          waitForLoss: () => new Promise(() => {}),
+        }),
+        codexBin: "/pinned/codex",
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: () => ({
+              initialize: async () => {
+                lockHeld = false;
+                return { userAgent: "codex-test" };
+              },
+              request: async (method) => {
+                requestMethods.push(method);
+                return { account: { type: "chatgpt" }, requiresOpenaiAuth: true };
+              },
+              start: async () => {},
+              stop: async () => {},
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "lock_lost_before_refresh");
+    assert.equal(refreshError.retryable, true);
+    assert.deepEqual(requestMethods, []);
+    assert.equal(lockAssertions, 2);
+    assert.equal(released, true);
+    await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("runCodexManagedRefresh always stops the app-server after request failure", async () => {
@@ -950,22 +1006,36 @@ test("permanent account loss becomes reauth_required without changing canonical 
   const { authHome, root } = await createAuthorityHome();
   try {
     const before = await readFile(join(authHome, "auth.json"), "utf8");
-    await assert.rejects(
-      refreshManagedAuthRecord({
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
         authHome,
         runRefresh: async () => ({
           ...successResponse(),
           response: { account: null, requiresOpenaiAuth: true },
         }),
-      }),
-      (error) => {
-        assert(error instanceof ManagedAuthRefreshError);
-        assert.equal(error.code, "reauth_required");
-        assert.equal(error.retryable, false);
-        return true;
-      },
-    );
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "reauth_required");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "post_dispatch_outcome_uncertain");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
     assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), before);
+    let nextRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          nextRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(nextRefreshCalled, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1026,6 +1096,34 @@ test("canonical compare-and-swap conflict preserves the staged recovery record",
     assert.equal(refreshError.code, "authority_conflict_after_refresh");
     assert.equal(typeof refreshError.recoveryPath, "string");
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority replacement wins when the canonical CAS reread fails", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-during-cas-read");
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        readCanonicalSource: async (path) => {
+          await rename(authHome, displaced);
+          await mkdir(authHome, { mode: 0o700 });
+          return readManagedAuthSnapshot(path);
+        },
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1329,6 +1427,80 @@ test("post-commit verification failure blocks success and preserves recovery sta
 
     const lock = await acquireAdvisoryLock(authorityLockPath(authHome));
     await lock.release();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority replacement wins when the post-promotion reread fails", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-during-promotion-verify");
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+        verifyPromoted: async (path) => {
+          await rename(authHome, displaced);
+          await mkdir(authHome, { mode: 0o700 });
+          return readManagedAuthSnapshot(path);
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("final authority guard replaces an earlier error with a stale recovery path", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-before-final-authority-check");
+  let stagingHome;
+  let replaced = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async (options) => {
+          stagingHome = options.stagingHome;
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+        verifyPromoted: async (path) => {
+          const promoted = await readManagedAuthSnapshot(path);
+          return new Proxy(promoted, {
+            get(target, property, receiver) {
+              if (property === "authFileFingerprint" && !replaced) {
+                replaced = true;
+                renameSync(authHome, displaced);
+                mkdirSync(authHome, { mode: 0o700 });
+                throw new ManagedAuthRefreshError(
+                  "synthetic_post_verify_failure",
+                  "synthetic failure after verified canonical reread",
+                  { recoveryPath: stagingHome },
+                );
+              }
+              return Reflect.get(target, property, receiver);
+            },
+          });
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(replaced, true);
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.cause.code, "synthetic_post_verify_failure");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
