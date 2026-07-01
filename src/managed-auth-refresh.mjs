@@ -761,17 +761,31 @@ remote_plugin = false
       attachErrorCause(setupError, error);
     }
 
+    const assertCleanupAuthorityCurrent = async () => {
+      try {
+        await assertAuthorityHomeCurrent(authority);
+      } catch (authorityError) {
+        attachErrorCause(authorityError, setupError, { ifAbsent: true });
+        throw authorityError;
+      }
+    };
+    await assertCleanupAuthorityCurrent();
+
     let retainedAttempt = false;
     if (stagingHome) {
       try {
+        await assertCleanupAuthorityCurrent();
         await cleanupStagingAttempt(stagingHome);
-      } catch {
+      } catch (cleanupError) {
+        if (cleanupError?.code === "authority_home_replaced") throw cleanupError;
         // Confirm whether the attempt still exists before reporting recovery.
       }
       try {
+        await assertCleanupAuthorityCurrent();
         await lstat(stagingHome, { bigint: true });
         retainedAttempt = true;
       } catch (statError) {
+        if (statError?.code === "authority_home_replaced") throw statError;
         retainedAttempt = statError?.code !== "ENOENT";
       }
     }
@@ -790,8 +804,10 @@ remote_plugin = false
     if (stagingRootCreated && !retainedAttempt) {
       // An empty staging root is harmless and is not a recovery artifact.
       try {
+        await assertCleanupAuthorityCurrent();
         await cleanupStagingRoot(stagingRoot);
-      } catch {
+      } catch (cleanupError) {
+        if (cleanupError?.code === "authority_home_replaced") throw cleanupError;
         // The next run may safely reuse or remove an empty staging root.
       }
     }

@@ -17,7 +17,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -2652,6 +2652,55 @@ test("staging setup failure removes a staging root created by this attempt", asy
       /synthetic staging write failure/,
     );
     await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("staging setup cleanup never follows paths through a replaced authority home", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-during-staging-setup");
+  const setupError = new Error("synthetic config staging failure after replacement");
+  let displacedAttempt;
+  let marker;
+  let writeCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        writeStagingFile: async (path, contents, options) => {
+          writeCount += 1;
+          if (writeCount === 1) {
+            const attemptName = basename(dirname(path));
+            displacedAttempt = join(authorityStagingDirectory(displaced), attemptName);
+            await writeFile(path, contents, options);
+            return;
+          }
+
+          const attemptName = basename(dirname(path));
+          await rename(authHome, displaced);
+          const replacementAttempt = join(authorityStagingDirectory(authHome), attemptName);
+          await mkdir(replacementAttempt, { mode: 0o700, recursive: true });
+          marker = join(replacementAttempt, "replacement-marker");
+          await writeFile(marker, "must remain\n", { mode: 0o600 });
+          throw setupError;
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(writeCount, 2);
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    assert.equal(await readFile(marker, "utf8"), "must remain\n");
+    assert.equal((await stat(displacedAttempt)).isDirectory(), true);
+    assert.equal((await stat(join(displacedAttempt, "auth.json"))).isFile(), true);
+    const metadata = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
+    assert.equal(metadata.includes(displacedAttempt), false);
+    assert.equal(metadata.includes(dirname(marker)), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
