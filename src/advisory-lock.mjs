@@ -519,6 +519,10 @@ export async function acquireAdvisoryLock(
       void failLockReplacement(
         new AdvisoryLockError("lock_replaced", "authority lock path changed"),
       ).then(pending.resolve, pending.reject);
+    } else if (response.code === "lock_commit_uncertain") {
+      void quiesceUncertainCommit(
+        "lock holder detected a lock-path change after the atomic rename",
+      ).then(pending.reject, pending.reject);
     } else {
       pending.reject(
         new AdvisoryLockError(

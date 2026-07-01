@@ -9,11 +9,19 @@ import {
 const input = createInterface({ input: process.stdin });
 const lockPath = holderLockPath();
 let operations = Promise.resolve();
+let unavailable = false;
+
+function uncertainCommitError() {
+  const error = new Error("authority lock holder is unavailable");
+  error.code = "lock_commit_uncertain";
+  return error;
+}
 
 async function handleCommand(line) {
   let command;
   try {
     command = JSON.parse(line);
+    if (unavailable) throw uncertainCommitError();
     if (
       command?.action !== "rename" ||
       !Number.isSafeInteger(command.id) ||
@@ -22,8 +30,22 @@ async function handleCommand(line) {
     ) {
       throw new Error("invalid lock holder command");
     }
-    await assertInheritedLockPathCurrent(lockPath);
+    try {
+      await assertInheritedLockPathCurrent(lockPath);
+    } catch (error) {
+      if (error?.code === "lock_replaced") unavailable = true;
+      throw error;
+    }
     await rename(command.source, command.destination);
+    try {
+      await assertInheritedLockPathCurrent(lockPath);
+    } catch (error) {
+      if (error?.code === "lock_replaced") {
+        unavailable = true;
+        throw uncertainCommitError();
+      }
+      throw error;
+    }
     process.stdout.write(`${JSON.stringify({ id: command.id, ok: true })}\n`);
   } catch (error) {
     const id = Number.isSafeInteger(command?.id) ? command.id : null;

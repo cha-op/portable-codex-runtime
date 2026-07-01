@@ -42,6 +42,9 @@ const QUEUED_DELAYED_HOLDER_FIXTURE = fileURLToPath(
 const CONTROLLED_LOCK_PATH_GUARD_FIXTURE = fileURLToPath(
   new URL("../fixtures/controlled-lock-path-guard-holder.mjs", import.meta.url),
 );
+const POST_RENAME_LOCK_PATH_GUARD_FIXTURE = fileURLToPath(
+  new URL("../fixtures/post-rename-lock-path-guard-holder.mjs", import.meta.url),
+);
 const KILL_LOCKF_PARENT_FIXTURE = fileURLToPath(
   new URL("../fixtures/kill-lockf-parent-holder.mjs", import.meta.url),
 );
@@ -989,6 +992,109 @@ test("holder rejects a lock replacement in the final controlled rename window", 
   } finally {
     await lock?.release().catch(() => {});
     await replacementLock?.release().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("holder-local post-rename fence blocks queued mutation before broker quiescence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-post-rename-guard-"));
+  const path = join(root, "authority.lock");
+  const displaced = join(root, "displaced.lock");
+  const readyMarker = join(root, "holder-ready");
+  const continueMarker = join(root, "holder-continue");
+  const queuedMarker = join(root, "holder-queued");
+  const latchedMarker = join(root, "holder-latched");
+  const source = join(root, "auth.next");
+  const destination = join(root, "auth.json");
+  const queuedSource = join(root, "queued.next");
+  const queuedDestination = join(root, "queued-auth.json");
+  const cleanupError = new Error("synthetic post-rename quiescence cleanup failure");
+  let stopCalls = 0;
+  let lock;
+  let replacementLock;
+  let recoveredLock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    await writeFile(destination, "canonical\n", { mode: 0o600 });
+    await writeFile(queuedSource, "queued candidate\n", { mode: 0o600 });
+    await writeFile(queuedDestination, "queued canonical\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path, {
+      holderArgs: [readyMarker, continueMarker, queuedMarker, latchedMarker],
+      holderPath: POST_RENAME_LOCK_PATH_GUARD_FIXTURE,
+      signalGraceMs: 100,
+      stopProcess: async (child, options, defaultStopProcess) => {
+        stopCalls += 1;
+        await defaultStopProcess(child, options);
+        if (stopCalls === 1) throw cleanupError;
+      },
+      timeoutMs: 2_000,
+    });
+
+    let currentRejections = 0;
+    const current = lock.renameWhileHeld(source, destination).catch((error) => {
+      currentRejections += 1;
+      throw error;
+    });
+    void current.catch(() => {});
+    await waitForPath(readyMarker);
+
+    let queuedRejections = 0;
+    const queued = lock.renameWhileHeld(queuedSource, queuedDestination).catch((error) => {
+      queuedRejections += 1;
+      throw error;
+    });
+    void queued.catch(() => {});
+    const observedLoss = lock.waitForLoss();
+    await waitForPath(queuedMarker);
+
+    await rename(path, displaced);
+    await writeFile(path, "replacement\n", { mode: 0o600 });
+    replacementLock = await acquireAdvisoryLock(path);
+    await replacementLock.assertHeld();
+    await replacementLock.release();
+    replacementLock = undefined;
+    await rm(path);
+    await rename(displaced, path);
+    await writeFile(continueMarker, "continue\n", { mode: 0o600 });
+    await waitForPath(latchedMarker);
+
+    const [currentError, queuedError, lossError] = await Promise.all([
+      current.then(
+        () => assert.fail("post-rename command unexpectedly succeeded"),
+        (error) => error,
+      ),
+      queued.then(
+        () => assert.fail("queued command unexpectedly succeeded"),
+        (error) => error,
+      ),
+      observedLoss,
+    ]);
+    for (const error of [currentError, queuedError]) {
+      assert(error instanceof AdvisoryLockError);
+      assert.equal(error.code, "lock_commit_uncertain");
+      assert.equal(error.cause, cleanupError);
+    }
+    assert.equal(lossError.code, "lock_lost");
+    assert.equal(lossError.cause, cleanupError);
+    assert.equal(stopCalls, 1);
+    await assert.rejects(lock.assertHeld(), (error) => error.code === "lock_lost");
+
+    recoveredLock = await acquireAdvisoryLock(path);
+    await recoveredLock.assertHeld();
+    assert.equal(await readFile(destination, "utf8"), "candidate\n");
+    await assert.rejects(access(source), (error) => error?.code === "ENOENT");
+    assert.equal(await readFile(queuedSource, "utf8"), "queued candidate\n");
+    assert.equal(await readFile(queuedDestination, "utf8"), "queued canonical\n");
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(currentRejections, 1);
+    assert.equal(queuedRejections, 1);
+    assert.equal(await readFile(destination, "utf8"), "candidate\n");
+    assert.equal(await readFile(queuedDestination, "utf8"), "queued canonical\n");
+  } finally {
+    await lock?.release().catch(() => {});
+    await replacementLock?.release().catch(() => {});
+    await recoveredLock?.release().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
