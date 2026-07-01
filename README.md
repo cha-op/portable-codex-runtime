@@ -65,6 +65,12 @@ The two app-server integration tests run when `CODEX_BIN` (or `codex` on
 `PATH`) is executable. They are reported as skipped on Node-only CI runners;
 the remaining tests still run normally.
 
+The reference app-server runtime currently supports macOS and Linux. Windows
+is rejected before reading managed credentials, creating a worker home, or
+spawning Codex because reliable descendant cleanup requires a Job Object
+backend, which is not implemented; `ChildProcess.kill()` alone is not treated
+as process-tree isolation.
+
 Run the offline protocol probe and print a JSON report:
 
 ```bash

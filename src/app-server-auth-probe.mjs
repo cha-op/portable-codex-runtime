@@ -29,6 +29,21 @@ const WORKER_ENV_KEYS = [
   "ComSpec",
 ];
 
+export function isSupportedAppServerPlatform(hostPlatform, requestedPlatform = hostPlatform) {
+  const isSupported = (platform) => platform === "darwin" || platform === "linux";
+  return isSupported(hostPlatform) && isSupported(requestedPlatform);
+}
+
+export function assertSupportedAppServerPlatform(platform = process.platform) {
+  if (isSupportedAppServerPlatform(process.platform, platform)) return;
+  const error = new Error(
+    "portable app-server supports only macOS and Linux; " +
+      "Windows Job Object process-tree cleanup is not implemented",
+  );
+  error.code = "unsupported_platform";
+  throw error;
+}
+
 function processTreeExists(child) {
   if (!child?.pid) return false;
   if (process.platform === "win32") {
@@ -215,11 +230,13 @@ export class AppServerClient {
     forcedKillSettleMs = DEFAULT_FORCED_KILL_SETTLE_MS,
     launcherDirectory = process.cwd(),
     onRefresh,
+    platform = process.platform,
     processControl = DEFAULT_PROCESS_CONTROL,
     shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
     sourceEnv = process.env,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   }) {
+    assertSupportedAppServerPlatform(platform);
     this.codexBin = resolveAppServerExecutable(codexBin, launcherDirectory);
     this.codexArgs = codexArgs;
     this.codexHome = codexHome;
@@ -251,7 +268,7 @@ export class AppServerClient {
   async start() {
     this.child = spawn(this.codexBin, this.codexArgs, {
       cwd: this.codexHome,
-      detached: process.platform !== "win32",
+      detached: true,
       env: this.environment,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -754,10 +771,15 @@ export function codexVersion(codexBin) {
   return result.stdout.trim();
 }
 
-export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?? "codex" } = {}) {
+export async function probeExperimentalGate({
+  codexBin = process.env.CODEX_BIN ?? "codex",
+  makeTemporaryDirectory = mkdtemp,
+  platform = process.platform,
+} = {}) {
+  assertSupportedAppServerPlatform(platform);
   const executable = resolveAppServerExecutable(codexBin);
-  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-gate-"));
-  const client = new AppServerClient({ codexBin: executable, codexHome });
+  const codexHome = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-gate-"));
+  const client = new AppServerClient({ codexBin: executable, codexHome, platform });
   let primaryFailure;
   try {
     await writeProbeConfig(
@@ -806,10 +828,13 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
 export async function probeExternalAuthRefresh({
   codexBin = process.env.CODEX_BIN ?? "codex",
   makeDirectory = mkdir,
+  makeTemporaryDirectory = mkdtemp,
+  platform = process.platform,
   startMock = startResponsesMock,
 } = {}) {
+  assertSupportedAppServerPlatform(platform);
   const executable = resolveAppServerExecutable(codexBin);
-  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-auth-"));
+  const codexHome = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-auth-"));
   let authMonitor;
   let client;
   let mock;
@@ -835,6 +860,7 @@ export async function probeExternalAuthRefresh({
     client = new AppServerClient({
       codexBin: executable,
       codexHome,
+      platform,
       onRefresh: async (params) => {
         refreshCount += 1;
         refreshParams = params;

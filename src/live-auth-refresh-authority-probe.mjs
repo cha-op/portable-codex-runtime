@@ -4,7 +4,10 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-import { codexVersion } from "./app-server-auth-probe.mjs";
+import {
+  assertSupportedAppServerPlatform,
+  codexVersion,
+} from "./app-server-auth-probe.mjs";
 import {
   assertNoCredentialMaterial,
   probeLiveExternalAuth,
@@ -45,11 +48,17 @@ export async function probeLiveAuthRefreshAuthority({
   allowAuthMutation = process.env.CODEX_ALLOW_AUTH_MUTATION === "1",
   authHome = process.env.CODEX_TEST_HOME ?? DEFAULT_AUTH_HOME,
   codexBin = process.env.CODEX_BIN,
+  createAuthority = (options) => new ManagedAuthRefreshAuthority(options),
   evidencePath = process.env.CODEX_AUTH_REFRESH_EVIDENCE ?? DEFAULT_EVIDENCE_PATH,
   makeDirectory = mkdir,
+  makeTemporaryDirectory = mkdtemp,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
+  platform = process.platform,
+  readSnapshot = readManagedAuthSnapshot,
+  runWorkerProbe = probeLiveExternalAuth,
   sourceMirror = process.env.CODEX_SOURCE_MIRROR,
 } = {}) {
+  assertSupportedAppServerPlatform(platform);
   assert.equal(
     allowAuthMutation,
     true,
@@ -62,8 +71,8 @@ export async function probeLiveAuthRefreshAuthority({
   );
 
   const startedAt = new Date().toISOString();
-  const before = await readManagedAuthSnapshot(authHome);
-  const authority = new ManagedAuthRefreshAuthority({ authHome, codexBin });
+  const before = await readSnapshot(authHome);
+  const authority = createAuthority({ authHome, codexBin });
   const concurrentCallers = 2;
   const [first, second] = await Promise.all([authority.refresh(), authority.refresh()]);
   assert.equal(authority.refreshExecutions, 1, "concurrent callers were not coalesced");
@@ -76,7 +85,7 @@ export async function probeLiveAuthRefreshAuthority({
     "coalesced callers saw different credentials",
   );
 
-  const after = await readManagedAuthSnapshot(authHome);
+  const after = await readSnapshot(authHome);
   assert.equal(after.accountId === before.accountId, true, "authority account identity changed");
   assert.equal(
     after.authFileFingerprint !== before.authFileFingerprint,
@@ -91,15 +100,18 @@ export async function probeLiveAuthRefreshAuthority({
     "authority refresh unexpectedly started a model turn",
   );
 
-  const workerEvidenceHome = await mkdtemp(join(tmpdir(), "portable-auth-refresh-worker-"));
+  const workerEvidenceHome = await makeTemporaryDirectory(
+    join(tmpdir(), "portable-auth-refresh-worker-"),
+  );
   let workerReport;
   try {
     await makeDirectory(workerEvidenceHome, { recursive: true });
-    workerReport = await probeLiveExternalAuth({
+    workerReport = await runWorkerProbe({
       authHome,
       codexBin,
       evidencePath: join(workerEvidenceHome, "worker-validation.json"),
       model,
+      platform,
     });
   } finally {
     await rm(workerEvidenceHome, { recursive: true, force: true });

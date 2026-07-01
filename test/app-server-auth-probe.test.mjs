@@ -8,11 +8,13 @@ import test from "node:test";
 import {
   AppServerClient,
   JsonRpcError,
+  assertSupportedAppServerPlatform,
   buildWorkerEnvironment,
   codexVersion,
   createWorkerAuthMonitor,
   fileExists,
   inspectLinuxProcessGroup,
+  isSupportedAppServerPlatform,
   probeExperimentalGate,
   probeExternalAuthRefresh,
   resolveAppServerExecutable,
@@ -128,6 +130,53 @@ test("worker environment preserves standard Windows process variables", () => {
       WINDIR: "C:\\Windows",
     },
   );
+});
+
+test("Windows app-server clients fail closed before process startup", () => {
+  assert.throws(
+    () =>
+      new AppServerClient({
+        codexBin: join(tmpdir(), "must-not-start-portable-codex"),
+        codexHome: join(tmpdir(), "must-not-create-portable-codex-home"),
+        platform: "win32",
+      }),
+    (error) => {
+      assert.equal(error.code, "unsupported_platform");
+      assert.match(error.message, /Windows Job Object/);
+      return true;
+    },
+  );
+});
+
+test("app-server platform guard accepts supported hosts", () => {
+  assert.doesNotThrow(() => assertSupportedAppServerPlatform("darwin"));
+  assert.doesNotThrow(() => assertSupportedAppServerPlatform("linux"));
+  assert.equal(isSupportedAppServerPlatform("win32", "linux"), false);
+  assert.equal(isSupportedAppServerPlatform("linux", "win32"), false);
+  assert.equal(isSupportedAppServerPlatform("darwin", "linux"), true);
+  assert.equal(isSupportedAppServerPlatform("linux", "linux"), true);
+});
+
+test("Windows app-server probes fail before creating worker homes", async () => {
+  for (const probe of [probeExperimentalGate, probeExternalAuthRefresh]) {
+    let temporaryDirectoryCalls = 0;
+    await assert.rejects(
+      probe({
+        codexBin: join(tmpdir(), "must-not-start-portable-codex"),
+        makeTemporaryDirectory: async () => {
+          temporaryDirectoryCalls += 1;
+          throw new Error("worker home creation must not be reached");
+        },
+        platform: "win32",
+      }),
+      (error) => {
+        assert.equal(error.code, "unsupported_platform");
+        assert.match(error.message, /Windows Job Object/);
+        return true;
+      },
+    );
+    assert.equal(temporaryDirectoryCalls, 0);
+  }
 });
 
 test("worker environment anchors relative PATH entries to the launcher directory", () => {

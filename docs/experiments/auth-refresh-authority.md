@@ -163,6 +163,13 @@ CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
   from util-linux plus procfs on Linux. Fixed runtime images must include and
   test the matching backend. The repository test workflow exercises both
   `macos-latest` and `ubuntu-latest`.
+- Authority directories and credential files must not carry extended ACLs. The
+  broker checks them with argv-safe `/bin/ls` calls and fails closed when the
+  tool output cannot be inspected. Every authority ancestor rejects allow or
+  unknown ACL entries; macOS ancestors may retain explicitly parsed deny-only
+  entries such as the standard home-directory delete guard. Fixed runtime
+  images must provide `/bin/ls`; operators must remove or relocate an unexpected
+  ACL themselves because the broker never rewrites access-control policy.
 - The adapter rejects PATH lookup for the credential-bearing Codex process, but
   binary digest, ownership, and immutability remain deployment responsibilities
   of the fixed runtime image.

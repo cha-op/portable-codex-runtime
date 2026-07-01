@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import {
   chmod,
@@ -382,6 +383,93 @@ export function authorityDirectoryPermissionsAreSafe(
   );
 }
 
+function runAclListing(binary, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(binary, args, options, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve({ stderr, stdout });
+    });
+  });
+}
+
+export function parseAclListingDisposition(stdout, platform = process.platform) {
+  if (typeof stdout !== "string" || !["darwin", "linux"].includes(platform)) {
+    throw new Error("extended ACL listing could not be parsed");
+  }
+  const lines = stdout.split(/\r?\n/u);
+  if (lines.at(-1) === "") lines.pop();
+  const mode = lines[0]?.match(/^(\S+)/u)?.[1];
+  const match = mode?.match(
+    /^[bcdlps-][r-][w-][xSs-][r-][w-][xSs-][r-][w-][xTt-]([+@.]?)$/u,
+  );
+  if (!match) throw new Error("extended ACL listing could not be parsed");
+
+  const marker = match[1];
+  const detailLines = lines.slice(1).filter((line) => line.length > 0);
+  if (platform === "linux") {
+    if (!["", ".", "+"].includes(marker) || detailLines.length > 0) {
+      throw new Error("extended ACL listing could not be parsed");
+    }
+    return marker === "+" ? "allow-or-unknown" : "none";
+  }
+
+  if (!["", "@", "+"].includes(marker)) {
+    throw new Error("extended ACL listing could not be parsed");
+  }
+  if (detailLines.length === 0) {
+    return marker === "+" ? "allow-or-unknown" : "none";
+  }
+  const actions = detailLines.map(
+    (line) => line.match(/^\s+\d+:\s+.+\s+(allow|deny)\s+\S.*$/u)?.[1],
+  );
+  if (actions.some((action) => action === undefined)) {
+    throw new Error("extended ACL listing could not be parsed");
+  }
+  return actions.every((action) => action === "deny") ? "deny-only" : "allow-or-unknown";
+}
+
+export function parseExtendedAclListing(stdout, platform = process.platform) {
+  return parseAclListingDisposition(stdout, platform) !== "none";
+}
+
+async function inspectPathAclDisposition(
+  path,
+  { platform = process.platform, runCommand = runAclListing } = {},
+) {
+  try {
+    if (typeof path !== "string" || !isAbsolute(path)) throw new Error("invalid path");
+    const flags = platform === "darwin" ? ["-l", "-e", "-d", "-b"] : ["-l", "-d", "-b"];
+    if (!["darwin", "linux"].includes(platform)) throw new Error("unsupported platform");
+    const { stderr, stdout } = await runCommand("/bin/ls", [...flags, path], {
+      encoding: "utf8",
+      env: { ...process.env, LANG: "C", LC_ALL: "C" },
+      maxBuffer: 64 * 1024,
+    });
+    if (stderr !== "") throw new Error("unexpected ACL listing diagnostics");
+    return parseAclListingDisposition(stdout, platform);
+  } catch {
+    throw new Error("extended ACL inspection failed");
+  }
+}
+
+export async function pathHasExtendedAcl(path, options) {
+  return (await inspectPathAclDisposition(path, options)) !== "none";
+}
+
+export async function pathHasUnsafeAncestorAcl(path, options) {
+  return (await inspectPathAclDisposition(path, options)) === "allow-or-unknown";
+}
+
+async function assertNoExtendedAcl(path, inspectExtendedAcl, code, message) {
+  let hasExtendedAcl;
+  try {
+    hasExtendedAcl = await inspectExtendedAcl(path);
+  } catch {
+    fail(code, message);
+  }
+  ensure(hasExtendedAcl === false, code, message);
+}
+
 function attachRecoveryPaths(target, paths) {
   if (!target || typeof target !== "object") return;
   try {
@@ -422,7 +510,11 @@ function accessTokenExpiration(exp) {
   };
 }
 
-async function resolveAuthorityHome(authHome) {
+async function resolveAuthorityHome(
+  authHome,
+  inspectExtendedAcl = pathHasExtendedAcl,
+  inspectAncestorAcl = pathHasUnsafeAncestorAcl,
+) {
   ensure(
     typeof constants.O_DIRECTORY === "number" && typeof constants.O_NOFOLLOW === "number",
     "unsupported_platform",
@@ -463,6 +555,12 @@ async function resolveAuthorityHome(authHome) {
       "unsafe_auth_home",
       "authority home must be broker-owned with private owner permissions",
     );
+    await assertNoExtendedAcl(
+      authorityHome,
+      inspectExtendedAcl,
+      "unsafe_auth_home",
+      "authority home must not have extended access controls",
+    );
     let childUid = authorityHomeStat.uid;
     let ancestor = dirname(authorityHome);
     while (true) {
@@ -489,6 +587,12 @@ async function resolveAuthorityHome(authHome) {
         ),
         "unsafe_auth_home",
         "authority ancestor chain is not trusted",
+      );
+      await assertNoExtendedAcl(
+        ancestor,
+        inspectAncestorAcl,
+        "unsafe_auth_home",
+        "authority ancestor chain has unsafe access controls",
       );
       const parent = dirname(ancestor);
       if (parent === ancestor) break;
@@ -517,7 +621,7 @@ async function resolveAuthorityHome(authHome) {
       "unsafe_auth_home",
       "refusing to mutate the default or active Codex home; use a dedicated authority home",
     );
-    return { handle, identity: authorityHomeStat, path: authorityHome };
+    return { handle, identity: authorityHomeStat, inspectExtendedAcl, path: authorityHome };
   } catch (error) {
     await handle?.close().catch(() => {});
     throw error;
@@ -543,6 +647,22 @@ async function assertAuthorityHomeCurrent(authority) {
   } finally {
     await current?.close().catch(() => {});
   }
+}
+
+async function assertCredentialWriteAuthorityCurrent(authority) {
+  await assertAuthorityHomeCurrent(authority);
+  await assertNoExtendedAcl(
+    authority.path,
+    authority.inspectExtendedAcl,
+    "unsafe_auth_home",
+    "authority home must not have extended access controls",
+  );
+  await assertNoExtendedAcl(
+    join(authority.path, "auth.json"),
+    authority.inspectExtendedAcl,
+    "invalid_auth_record",
+    "authority auth.json must not have extended access controls",
+  );
 }
 
 async function acquireAuthorityLock(authority, acquireFileLock = acquireAdvisoryLock) {
@@ -725,7 +845,9 @@ async function handleChangedPreDispatchStaging(
 ) {
   let stagingChanged = true;
   try {
-    const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome);
+    const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome, {
+      inspectExtendedAcl: authority.inspectExtendedAcl,
+    });
     stagingChanged =
       stagedAfterFailure.authFileFingerprint !== before.authFileFingerprint;
   } catch {
@@ -819,9 +941,9 @@ async function createStagingHome(
       "staging_not_durable",
       "authority filesystem cannot durably record the staging attempt",
     );
-    await assertAuthorityHomeCurrent(authority);
+    await assertCredentialWriteAuthorityCurrent(authority);
     await writeStagingFile(join(stagingHome, "auth.json"), rawAuth, {
-      beforeWrite: () => assertAuthorityHomeCurrent(authority),
+      beforeWrite: () => assertCredentialWriteAuthorityCurrent(authority),
       flag: "wx",
       mode: 0o600,
       openFile,
@@ -937,14 +1059,14 @@ async function atomicallyPromoteAuth(
   let retainTemporary = false;
   let operationError;
   try {
-    await assertAuthorityHomeCurrent(authority);
+    await assertCredentialWriteAuthorityCurrent(authority);
     handle = await openFile(
       temporary,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
     await handle.chmod(0o600);
-    await assertAuthorityHomeCurrent(authority);
+    await assertCredentialWriteAuthorityCurrent(authority);
     await handle.writeFile(rawAuth);
     await handle.sync();
     await handle.close();
@@ -953,7 +1075,9 @@ async function atomicallyPromoteAuth(
     await assertAuthorityHomeCurrent(authority);
     let currentSource;
     try {
-      currentSource = await readCanonicalSource(authorityHome);
+      currentSource = await readCanonicalSource(authorityHome, {
+        inspectExtendedAcl: authority.inspectExtendedAcl,
+      });
     } catch (error) {
       // A failed pathname read may itself be evidence that the authority was
       // replaced. Revalidate before exposing the read error or recovery paths.
@@ -972,7 +1096,7 @@ async function atomicallyPromoteAuth(
     );
 
     await assertLockHeld();
-    await assertAuthorityHomeCurrent(authority);
+    await assertCredentialWriteAuthorityCurrent(authority);
     try {
       await commitRename(temporary, destination);
       renamed = true;
@@ -1105,7 +1229,10 @@ export function managedAuthRefreshFailureReport(error) {
   };
 }
 
-export async function readManagedAuthSnapshot(authHome) {
+export async function readManagedAuthSnapshot(
+  authHome,
+  { inspectExtendedAcl = pathHasExtendedAcl } = {},
+) {
   ensure(
     typeof constants.O_NOFOLLOW === "number",
     "unsupported_platform",
@@ -1128,6 +1255,12 @@ export async function readManagedAuthSnapshot(authHome) {
       (fileStat.mode & 0o077n) === 0n,
       "invalid_auth_record",
       "authority auth.json must not be group/world accessible",
+    );
+    await assertNoExtendedAcl(
+      authPath,
+      inspectExtendedAcl,
+      "invalid_auth_record",
+      "authority auth.json must not have extended access controls",
     );
     raw = await handle.readFile("utf8");
   } finally {
@@ -1492,6 +1625,8 @@ export async function refreshManagedAuthRecord({
   cleanupStagingRoot = removeEmptyStagingRoot,
   cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
+  inspectAncestorAcl = pathHasUnsafeAncestorAcl,
+  inspectExtendedAcl = pathHasExtendedAcl,
   openFile = open,
   readCanonicalSource = readManagedAuthSnapshot,
   runRefresh = runCodexManagedRefresh,
@@ -1500,7 +1635,11 @@ export async function refreshManagedAuthRecord({
   verifyPromoted = readManagedAuthSnapshot,
   writeStagingFile = writeFileDurably,
 }) {
-  const authority = await resolveAuthorityHome(authHome);
+  const authority = await resolveAuthorityHome(
+    authHome,
+    inspectExtendedAcl,
+    inspectAncestorAcl,
+  );
   let lock;
   try {
     lock = await acquireLock(authority);
@@ -1550,7 +1689,7 @@ export async function refreshManagedAuthRecord({
         recoveryReason: "orphaned_refresh_artifacts",
       },
     );
-    before = await readManagedAuthSnapshot(authorityHome);
+    before = await readManagedAuthSnapshot(authorityHome, { inspectExtendedAcl });
     await assertAuthorityHomeCurrent(authority);
     ({ stagingHome, stagingRoot } = await createStagingHome(authority, before.raw, {
       cleanupStagingAttempt,
@@ -1559,7 +1698,7 @@ export async function refreshManagedAuthRecord({
       syncStagingDirectory,
       writeStagingFile,
     }));
-    await assertAuthorityHomeCurrent(authority);
+    await assertCredentialWriteAuthorityCurrent(authority);
     let refreshResult;
     let refreshError;
     try {
@@ -1567,7 +1706,10 @@ export async function refreshManagedAuthRecord({
         lock,
         (signal) =>
           runRefresh({
-            assertLockHeldBeforeDispatch: () => assertLockHeldBeforeRefresh(lock),
+            assertLockHeldBeforeDispatch: async () => {
+              await assertLockHeldBeforeRefresh(lock);
+              await assertCredentialWriteAuthorityCurrent(authority);
+            },
             codexBin,
             signal,
             stagingHome,
@@ -1636,7 +1778,7 @@ export async function refreshManagedAuthRecord({
       },
     );
 
-    const staged = await readManagedAuthSnapshot(stagingHome);
+    const staged = await readManagedAuthSnapshot(stagingHome, { inspectExtendedAcl });
     await lock.assertHeld();
     ensure(
       refreshResult?.response &&
@@ -1715,7 +1857,7 @@ export async function refreshManagedAuthRecord({
     try {
       await assertAuthorityHomeCurrent(authority);
       await lock.assertHeld();
-      promoted = await verifyPromoted(authorityHome);
+      promoted = await verifyPromoted(authorityHome, { inspectExtendedAcl });
       await assertAuthorityHomeCurrent(authority);
       await lock.assertHeld();
       ensure(
@@ -1787,7 +1929,9 @@ export async function refreshManagedAuthRecord({
     const authorityReplaced = error?.code === "authority_home_replaced";
     if (stagingHome && before && !preserveStaging && !authorityReplaced) {
       try {
-        const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome);
+        const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome, {
+          inspectExtendedAcl,
+        });
         preserveStaging =
           stagedAfterFailure.authFileFingerprint !== before.authFileFingerprint;
       } catch {

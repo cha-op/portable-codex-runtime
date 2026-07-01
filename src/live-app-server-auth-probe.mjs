@@ -18,6 +18,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   AppServerClient,
   assertNoWorkerAuth,
+  assertSupportedAppServerPlatform,
   codexVersion,
   createWorkerAuthMonitor,
   resolveAppServerExecutable,
@@ -344,12 +345,16 @@ export async function probeLiveExternalAuth({
   codexBin = process.env.CODEX_BIN ?? "codex",
   evidencePath = process.env.CODEX_LIVE_EVIDENCE ?? DEFAULT_EVIDENCE_PATH,
   makeDirectory = mkdir,
+  makeTemporaryDirectory = mkdtemp,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
+  platform = process.platform,
+  readCredential = readDedicatedChatgptCredential,
 } = {}) {
+  assertSupportedAppServerPlatform(platform);
   const executable = resolveAppServerExecutable(codexBin);
   const startedAt = new Date().toISOString();
-  const sourceBefore = await readDedicatedChatgptCredential(authHome);
-  const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
+  const sourceBefore = await readCredential(authHome);
+  const workerHome = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-live-auth-"));
   let authMonitor;
   let client;
   let primaryFailure;
@@ -361,10 +366,11 @@ export async function probeLiveExternalAuth({
     client = new AppServerClient({
       codexBin: executable,
       codexHome: workerHome,
+      platform,
       timeoutMs: 120_000,
       onRefresh: async (params) => {
         refreshCallbackCount += 1;
-        const latest = await readDedicatedChatgptCredential(authHome);
+        const latest = await readCredential(authHome);
         assertRefreshAccountContinuity(params, sourceBefore, latest);
         return {
           accessToken: latest.accessToken,
@@ -409,7 +415,7 @@ export async function probeLiveExternalAuth({
     await stopAndAssertNoWorkerAuth(client, workerHome);
     await authMonitor.assertNoAuthObserved();
 
-    const sourceAfter = await readDedicatedChatgptCredential(authHome);
+    const sourceAfter = await readCredential(authHome);
     assertSourceAuthUnchanged(sourceBefore, sourceAfter);
 
     const report = {

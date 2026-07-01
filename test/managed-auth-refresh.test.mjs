@@ -30,6 +30,10 @@ import {
   authorityStagingDirectory,
   managedAuthRefreshErrorMetadata,
   managedAuthRefreshFailureReport,
+  parseAclListingDisposition,
+  parseExtendedAclListing,
+  pathHasExtendedAcl,
+  pathHasUnsafeAncestorAcl,
   readManagedAuthSnapshot,
   refreshManagedAuthRecord,
   runCodexManagedRefresh,
@@ -125,6 +129,97 @@ test("authority directory permission policy accepts only trusted owners and mode
   );
 });
 
+test("extended ACL listing parser distinguishes macOS and Linux ACL markers", () => {
+  const macBase = "drwx------  3 broker  staff  96 Jul  1 10:00 /authority\n";
+  const macExtended =
+    "drwx------@ 3 broker  staff  96 Jul  1 10:00 /authority\n" +
+    " 0: group:everyone inherited allow list,search\n";
+  const macDenyOnly =
+    "drwx------+ 3 broker  staff  96 Jul  1 10:00 /authority\n" +
+    " 0: ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C deny delete\n";
+  const linuxBase = "drwx------ 2 broker broker 60 Jul 1 10:00 /authority\n";
+  assert.equal(parseExtendedAclListing(macBase, "darwin"), false);
+  assert.equal(parseExtendedAclListing(macBase.replace("------ ", "------+"), "darwin"), true);
+  assert.equal(parseExtendedAclListing(macExtended, "darwin"), true);
+  assert.equal(parseAclListingDisposition(macDenyOnly, "darwin"), "deny-only");
+  assert.equal(parseAclListingDisposition(macExtended, "darwin"), "allow-or-unknown");
+  assert.equal(parseExtendedAclListing(linuxBase, "linux"), false);
+  assert.equal(
+    parseExtendedAclListing(linuxBase.replace("drwx------ ", "drwx------. "), "linux"),
+    false,
+  );
+  assert.equal(
+    parseExtendedAclListing(linuxBase.replace("drwx------ ", "drwx------+ "), "linux"),
+    true,
+  );
+  assert.equal(
+    parseAclListingDisposition(
+      linuxBase.replace("drwx------ ", "drwx------+ "),
+      "linux",
+    ),
+    "allow-or-unknown",
+  );
+  assert.throws(
+    () => parseExtendedAclListing("unparseable ACL subject:company-secret\n", "darwin"),
+    /extended ACL listing could not be parsed/,
+  );
+});
+
+test("extended ACL runner uses a fixed binary and argv-safe absolute path", async () => {
+  const unusualPath = "/tmp/authority\n--help";
+  let invocation;
+  const hasAcl = await pathHasExtendedAcl(unusualPath, {
+    platform: "darwin",
+    runCommand: async (binary, args, options) => {
+      invocation = { args, binary, options };
+      return {
+        stderr: "",
+        stdout: "drwx------  3 broker  staff  96 Jul  1 10:00 escaped-path\n",
+      };
+    },
+  });
+  assert.equal(hasAcl, false);
+  assert.equal(invocation.binary, "/bin/ls");
+  assert.deepEqual(invocation.args, ["-l", "-e", "-d", "-b", unusualPath]);
+  assert.equal(invocation.options.shell, undefined);
+  assert.equal(invocation.options.env.LC_ALL, "C");
+
+  const macAclOutput = (action) => ({
+    stderr: "",
+    stdout:
+      "drwx------+ 3 broker  staff  96 Jul  1 10:00 escaped-path\n" +
+      ` 0: group:everyone ${action} delete_child\n`,
+  });
+  assert.equal(
+    await pathHasUnsafeAncestorAcl("/tmp/authority", {
+      platform: "darwin",
+      runCommand: async () => macAclOutput("deny"),
+    }),
+    false,
+  );
+  assert.equal(
+    await pathHasUnsafeAncestorAcl("/tmp/authority", {
+      platform: "darwin",
+      runCommand: async () => macAclOutput("allow"),
+    }),
+    true,
+  );
+
+  for (const runCommand of [
+    async () => {
+      throw new Error("tool failed for secret ACL principal");
+    },
+    async () => ({ stderr: "", stdout: "malformed secret ACL principal\n" }),
+  ]) {
+    await assert.rejects(
+      pathHasExtendedAcl("/tmp/authority", { platform: "linux", runCommand }),
+      (error) =>
+        error.message === "extended ACL inspection failed" &&
+        !error.message.includes("secret ACL principal"),
+    );
+  }
+});
+
 function encodeJwt(payload) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
   return `${encode({ alg: "none", typ: "JWT" })}.${encode(payload)}.${encode("signature")}`;
@@ -177,6 +272,55 @@ async function createAuthorityHome() {
   );
   return { authHome, root };
 }
+
+test("authority and canonical auth ACL checks fail closed without exposing ACL details", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const authorityPath = await realpath(authHome);
+  const aclSecret = "group:company-sensitive allow read";
+  let stagingWriteCalled = false;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        inspectExtendedAcl: async (path) => path === authorityPath,
+        writeStagingFile: async () => {
+          stagingWriteCalled = true;
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "unsafe_auth_home");
+        assert.equal(error.message, "authority home must not have extended access controls");
+        assert.equal(error.message.includes(authorityPath), false);
+        assert.equal(error.message.includes(aclSecret), false);
+        return true;
+      },
+    );
+    assert.equal(stagingWriteCalled, false);
+
+    for (const inspectExtendedAcl of [
+      async (path) => {
+        assert.equal(path, join(authorityPath, "auth.json"));
+        return true;
+      },
+      async () => {
+        throw new Error(aclSecret);
+      },
+    ]) {
+      await assert.rejects(
+        readManagedAuthSnapshot(authHome, { inspectExtendedAcl }),
+        (error) => {
+          assert.equal(error.code, "invalid_auth_record");
+          assert.equal(error.message, "authority auth.json must not have extended access controls");
+          assert.equal(error.message.includes(authorityPath), false);
+          assert.equal(error.message.includes(aclSecret), false);
+          return true;
+        },
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function replaceStagedAuth(
   stagingHome,
@@ -3133,6 +3277,136 @@ test("staging setup cleanup failure reports the retained attempt and gates the n
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test(
+  "macOS rejects a non-inherited allow ACL on an authority parent before staging credentials",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "portable-managed-authority-parent-acl-"));
+    const aclParent = join(root, "acl-parent");
+    const authHome = join(aclParent, "authority-home");
+    const allowAce = "everyone allow add_file,add_subdirectory,delete_child";
+    let stagingWriteCalled = false;
+    try {
+      await mkdir(authHome, { mode: 0o700, recursive: true });
+      await writeFile(
+        join(authHome, "auth.json"),
+        `${JSON.stringify(
+          authDocument({
+            accessMarker: "before",
+            lastRefresh: "2026-07-01T08:00:00.000Z",
+            refreshToken: "refresh-before-sensitive",
+          }),
+        )}\n`,
+        { mode: 0o600 },
+      );
+      const chmodResult = spawnSync("/bin/chmod", ["+a", allowAce, aclParent], {
+        encoding: "utf8",
+      });
+      if (chmodResult.error?.code === "ENOENT") {
+        t.skip("/bin/chmod is unavailable for parent ACL setup");
+        return;
+      }
+      if (chmodResult.status !== 0) {
+        t.skip("the test filesystem does not support a non-inherited macOS parent ACL");
+        return;
+      }
+      assert.equal(await pathHasExtendedAcl(authHome), false);
+      assert.equal(await pathHasUnsafeAncestorAcl(aclParent), true);
+
+      await assert.rejects(
+        refreshManagedAuthRecord({
+          authHome,
+          writeStagingFile: async () => {
+            stagingWriteCalled = true;
+          },
+        }),
+        (error) => {
+          assert.equal(error.code, "unsafe_auth_home");
+          assert.equal(error.message, "authority ancestor chain has unsafe access controls");
+          assert.equal(error.message.includes(aclParent), false);
+          assert.equal(error.message.includes("everyone"), false);
+          return true;
+        },
+      );
+      assert.equal(stagingWriteCalled, false);
+      await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "macOS rejects an authority home with an inherited extended ACL before staging credentials",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "portable-managed-authority-acl-"));
+    const aclParent = join(root, "acl-parent");
+    const authHome = join(aclParent, "authority-home");
+    const inheritedAce =
+      "everyone allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit";
+    let stagingWriteCalled = false;
+    try {
+      await mkdir(aclParent, { mode: 0o700 });
+      const chmodResult = spawnSync("/bin/chmod", ["+a", inheritedAce, aclParent], {
+        encoding: "utf8",
+      });
+      if (chmodResult.error?.code === "ENOENT") {
+        t.skip("/bin/chmod is unavailable for inherited ACL setup");
+        return;
+      }
+      if (chmodResult.status !== 0) {
+        t.skip("the test filesystem does not support inherited macOS ACL setup");
+        return;
+      }
+
+      await mkdir(authHome, { mode: 0o700 });
+      const lsResult = spawnSync("/bin/ls", ["-l", "-e", "-d", "-b", authHome], {
+        encoding: "utf8",
+      });
+      if (lsResult.error?.code === "ENOENT" || lsResult.status !== 0) {
+        t.skip("/bin/ls ACL inspection is unavailable on the test filesystem");
+        return;
+      }
+      if (!parseExtendedAclListing(lsResult.stdout, "darwin")) {
+        t.skip("the test filesystem did not materialize the inherited ACL");
+        return;
+      }
+
+      await writeFile(
+        join(authHome, "auth.json"),
+        `${JSON.stringify(
+          authDocument({
+            accessMarker: "before",
+            lastRefresh: "2026-07-01T08:00:00.000Z",
+            refreshToken: "refresh-before-sensitive",
+          }),
+        )}\n`,
+        { mode: 0o600 },
+      );
+      await assert.rejects(
+        refreshManagedAuthRecord({
+          authHome,
+          writeStagingFile: async () => {
+            stagingWriteCalled = true;
+          },
+        }),
+        (error) => {
+          assert.equal(error.code, "unsafe_auth_home");
+          assert.equal(error.message, "authority home must not have extended access controls");
+          assert.equal(error.message.includes(authHome), false);
+          assert.equal(error.message.includes("everyone"), false);
+          return true;
+        },
+      );
+      assert.equal(stagingWriteCalled, false);
+      await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("authority auth.json rejects symlinks and permissive modes", async () => {
   const { authHome, root } = await createAuthorityHome();

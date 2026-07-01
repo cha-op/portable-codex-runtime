@@ -60,6 +60,42 @@ test("live authority probe rejects PATH-resolved Codex before reading auth", asy
   );
 });
 
+test("live authority probe rejects unsupported platforms before auth mutation", async () => {
+  let authorityCreationCalls = 0;
+  let snapshotReadCalls = 0;
+  let temporaryDirectoryCalls = 0;
+  let workerProbeCalls = 0;
+  await assert.rejects(
+    probeLiveAuthRefreshAuthority({
+      allowAuthMutation: true,
+      authHome: "/definitely/missing/auth-home",
+      codexBin: "/pinned/codex",
+      createAuthority: () => {
+        authorityCreationCalls += 1;
+        throw new Error("authority creation must not be reached");
+      },
+      makeTemporaryDirectory: async () => {
+        temporaryDirectoryCalls += 1;
+        throw new Error("worker home creation must not be reached");
+      },
+      platform: "win32",
+      readSnapshot: async () => {
+        snapshotReadCalls += 1;
+        throw new Error("auth snapshot read must not be reached");
+      },
+      runWorkerProbe: async () => {
+        workerProbeCalls += 1;
+        throw new Error("worker probe must not be reached");
+      },
+    }),
+    (error) => error?.code === "unsupported_platform",
+  );
+  assert.equal(authorityCreationCalls, 0);
+  assert.equal(snapshotReadCalls, 0);
+  assert.equal(temporaryDirectoryCalls, 0);
+  assert.equal(workerProbeCalls, 0);
+});
+
 test("managed auth failure reports never serialize generic error details", () => {
   const secret = "refresh-token-secret-sentinel";
   const report = managedAuthRefreshFailureReport(new Error(secret));
