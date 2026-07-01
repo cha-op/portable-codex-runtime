@@ -18,7 +18,8 @@
     "sourceQuiesced": true,
     "treeDigestMatched": true,
     "workspaceDigestMatched": true,
-    "appServerWorkspaceMatched": true
+    "appServerWorkspaceMatched": true,
+    "historicalWorkspaceRetained": true
   },
   "scenarios": [
     {

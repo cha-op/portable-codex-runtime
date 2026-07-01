@@ -27,6 +27,7 @@ import {
   probeInterruptedTurnRecovery,
   startRecoveryClient,
   terminateAppServer,
+  verifyModelWorkspaceContext,
   writeRecoveryEvidence,
 } from "../src/interrupted-turn-recovery-probe.mjs";
 
@@ -47,6 +48,7 @@ function scenarioReport(kind) {
           snapshot: {
             kind: "stopped-tree-copy",
             appServerWorkspaceMatched: true,
+            historicalWorkspaceRetained: true,
             sourceQuiesced: true,
             treeDigestMatched: true,
             workspaceDigestMatched: true,
@@ -398,6 +400,39 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("model workspace evidence distinguishes immutable history from active context", () => {
+  const previousWorkspace = "/session/workspace";
+  const workspace = "/restored-session/workspace";
+  const environmentMessage = (cwd) => ({
+    type: "message",
+    role: "user",
+    content: [
+      {
+        type: "input_text",
+        text: `<environment_context>\n<cwd>${cwd}</cwd>\n</environment_context>`,
+      },
+    ],
+  });
+  const requestBody = JSON.stringify({
+    input: [
+      environmentMessage(previousWorkspace),
+      { type: "message", role: "user", content: [{ type: "input_text", text: "turn" }] },
+      environmentMessage(workspace),
+    ],
+  });
+  assert.deepEqual(
+    verifyModelWorkspaceContext(requestBody, { previousWorkspace, workspace }),
+    { activeWorkspaceMatched: true, historicalWorkspaceRetained: true },
+  );
+  assert.throws(
+    () => verifyModelWorkspaceContext(requestBody, {
+      previousWorkspace,
+      workspace: "/unexpected/workspace",
+    }),
+    /latest model workspace context did not match/,
+  );
 });
 
 test("probe report contains all four recovery scenarios without runtime identifiers", async () => {

@@ -30,9 +30,11 @@ mode `0700` temporary root and a fixed prompt that contains no repository data.
 | `sigkill` | child observed `SIGKILL` | same thread ID | `interrupted` | absent |
 | `snapshot_restore` | child observed `SIGKILL`; source tree quiesced before copy | same thread ID from a new absolute path | `interrupted` | absent |
 
-Both `thread/resume` and `thread/read {includeTurns:true}` must agree on the
-recovered status. A completed follow-up turn captures the next loopback request
-to distinguish a persisted abort marker from view-only normalization.
+A fresh app-server performs cold `thread/read {includeTurns:true}` before a
+second fresh app-server performs `thread/resume`; both must report the original
+turn as the interrupted tail. A completed follow-up turn is matched by its exact
+turn ID and captures the corresponding next loopback request to distinguish a
+persisted abort marker from view-only normalization.
 
 The snapshot scenario copies the entire synthetic session tree, including
 `CODEX_HOME` and workspace, after the killed process has exited. It hashes
@@ -43,8 +45,11 @@ tree, relative links whose meaning changes after relocation, special permission
 bits, hard-linked files, sockets, FIFOs, and devices fail closed. The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
 the restored workspace path explicitly. Its runtime `cwd` response and the
-follow-up model request context must both resolve to that restored directory;
-`thread/read` independently confirms the recovered turn status.
+latest environment context in the follow-up model request must both resolve to
+that restored directory. Immutable earlier conversation context intentionally
+retains the original workspace path, and the redacted evidence records that
+dual-path behavior as booleans. Cold `thread/read` independently confirms the
+recovered tail in a separate app-server process.
 
 ## Live Result
 

@@ -451,11 +451,48 @@ async function digestFile(path) {
   return hash.digest("hex");
 }
 
-function findTurn(thread, turnId) {
-  assert(Array.isArray(thread?.turns), "thread response did not include turns");
-  const turn = thread.turns.find((candidate) => candidate.id === turnId);
-  assert(turn, "recovered thread omitted the interrupted turn");
+function findTailTurn(thread, turnId) {
+  assert(Array.isArray(thread?.turns) && thread.turns.length > 0, "thread response omitted turns");
+  const turn = thread.turns.at(-1);
+  assert.equal(turn.id, turnId, "recovered tail did not match the interrupted turn");
   return turn;
+}
+
+export function verifyModelWorkspaceContext(requestBody, { previousWorkspace, workspace }) {
+  let request;
+  try {
+    request = JSON.parse(requestBody);
+  } catch {
+    throw new Error("follow-up model request was not valid JSON");
+  }
+  assert(Array.isArray(request?.input), "follow-up model request omitted input messages");
+  const contextCwds = [];
+  for (const item of request.input) {
+    if (item?.type !== "message" || item.role !== "user" || !Array.isArray(item.content)) continue;
+    for (const content of item.content) {
+      if (content?.type !== "input_text" || typeof content.text !== "string") continue;
+      if (!content.text.includes("<environment_context>")) continue;
+      for (const match of content.text.matchAll(/<cwd>([^<\r\n]+)<\/cwd>/g)) {
+        contextCwds.push(match[1]);
+      }
+    }
+  }
+  assert(contextCwds.length > 0, "follow-up model request omitted workspace context");
+  assert.equal(
+    contextCwds.at(-1),
+    workspace,
+    "latest model workspace context did not match the resumed workspace",
+  );
+  const relocated = previousWorkspace !== undefined && previousWorkspace !== workspace;
+  const historicalWorkspaceRetained =
+    relocated && contextCwds.slice(0, -1).includes(previousWorkspace);
+  if (relocated) {
+    assert(
+      historicalWorkspaceRetained,
+      "relocated model context omitted the immutable historical workspace",
+    );
+  }
+  return { activeWorkspaceMatched: true, historicalWorkspaceRetained };
 }
 
 export async function startRecoveryClient({
@@ -477,7 +514,9 @@ export async function startRecoveryClient({
 
 async function recoverAndInspect({
   client,
+  coldReadTurnStatus,
   mock,
+  previousWorkspace,
   threadId,
   turnId,
   workspace,
@@ -486,33 +525,35 @@ async function recoverAndInspect({
   const resumed = await client.request("thread/resume", { threadId, cwd: workspace });
   assert.equal(resumed.thread.id, threadId);
   assert.equal(await realpath(resumed.cwd), await realpath(workspace));
-  const resumedTurn = findTurn(resumed.thread, turnId);
+  const resumedTurn = findTailTurn(resumed.thread, turnId);
   assert.equal(resumedTurn.status, "interrupted");
 
-  const read = await client.request("thread/read", { threadId, includeTurns: true });
-  assert.equal(read.thread.id, threadId);
-  const readTurn = findTurn(read.thread, turnId);
-  assert.equal(readTurn.status, "interrupted");
-
-  await client.request("turn/start", {
+  const requestIndex = mock.requestCount();
+  const followUpTurn = await client.request("turn/start", {
     threadId,
     input: [{ type: "text", text: "Complete the portable recovery probe.", textElements: [] }],
   });
   const completed = await client.waitForNotification("turn/completed");
+  assert.equal(completed.params.turn.id, followUpTurn.turn.id);
   assert.equal(completed.params.turn.status, "completed");
-  await mock.waitForRequest(2);
-  const followUpRequest = mock.requestBody(1);
+  await mock.waitForRequest(requestIndex + 1);
+  assert.equal(mock.requestCount(), requestIndex + 1, "follow-up turn issued unexpected model requests");
+  const followUpRequest = mock.requestBody(requestIndex);
   const markerPresent = followUpRequest.includes("<turn_aborted>");
   assert.equal(markerPresent, expectAbortMarker);
-  assert(followUpRequest.includes(workspace), "follow-up model context omitted the resumed workspace");
+  const workspaceContext = verifyModelWorkspaceContext(followUpRequest, {
+    previousWorkspace,
+    workspace,
+  });
 
   return {
     resumeSucceeded: true,
     sameThreadId: true,
     tailTurnStatus: resumedTurn.status,
-    threadReadAgrees: readTurn.status === resumedTurn.status,
+    threadReadAgrees: coldReadTurnStatus === resumedTurn.status,
     modelAbortMarker: markerPresent ? "present" : "absent",
-    modelWorkspaceContextMatched: true,
+    modelWorkspaceContextMatched: workspaceContext.activeWorkspaceMatched,
+    historicalWorkspaceRetained: workspaceContext.historicalWorkspaceRetained,
   };
 }
 
@@ -527,6 +568,7 @@ export async function runRecoveryScenario({
   const ownedRoot = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-recovery-"));
   await chmod(ownedRoot, 0o700);
   let client;
+  let readClient;
   let recoveredClient;
   let mock;
   let primaryFailure;
@@ -534,6 +576,7 @@ export async function runRecoveryScenario({
     let sessionRoot = join(ownedRoot, "session");
     let codexHome = join(sessionRoot, "codex-home");
     let workspace = join(sessionRoot, "workspace");
+    const originalWorkspace = workspace;
     await mkdir(codexHome, { recursive: true, mode: 0o700 });
     await mkdir(workspace, { mode: 0o700 });
     await writeFile(join(workspace, "sentinel.txt"), "portable-recovery-sentinel\n", {
@@ -601,17 +644,33 @@ export async function runRecoveryScenario({
       };
     }
 
+    readClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
+    const coldRead = await readClient.request("thread/read", { threadId, includeTurns: true });
+    assert.equal(coldRead.thread.id, threadId);
+    const coldReadTurn = findTailTurn(coldRead.thread, turnId);
+    assert.equal(coldReadTurn.status, "interrupted");
+    await readClient.stop();
+
     recoveredClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
     const recovery = await recoverAndInspect({
       client: recoveredClient,
+      coldReadTurnStatus: coldReadTurn.status,
       mock,
+      previousWorkspace: originalWorkspace,
       threadId,
       turnId,
       workspace,
       expectAbortMarker,
     });
-    const { modelWorkspaceContextMatched, ...recoveryReport } = recovery;
-    if (snapshot) snapshot.appServerWorkspaceMatched = modelWorkspaceContextMatched;
+    const {
+      historicalWorkspaceRetained,
+      modelWorkspaceContextMatched,
+      ...recoveryReport
+    } = recovery;
+    if (snapshot) {
+      snapshot.appServerWorkspaceMatched = modelWorkspaceContextMatched;
+      snapshot.historicalWorkspaceRetained = historicalWorkspaceRetained;
+    }
     await recoveredClient.stop();
 
     return {
@@ -629,6 +688,7 @@ export async function runRecoveryScenario({
     await runSequentialCleanup(
       [
         () => recoveredClient?.abort(),
+        () => readClient?.abort(),
         () => client?.abort(),
         () => mock?.close(),
         () => removeTreeForCleanup(ownedRoot),
@@ -681,6 +741,7 @@ function assertRecoveryEvidenceSchema(report) {
     [
       "kind",
       "appServerWorkspaceMatched",
+      "historicalWorkspaceRetained",
       "sourceQuiesced",
       "treeDigestMatched",
       "workspaceDigestMatched",
@@ -690,6 +751,7 @@ function assertRecoveryEvidenceSchema(report) {
   assert.deepEqual(report.snapshot, {
     kind: "stopped-tree-copy",
     appServerWorkspaceMatched: true,
+    historicalWorkspaceRetained: true,
     sourceQuiesced: true,
     treeDigestMatched: true,
     workspaceDigestMatched: true,
