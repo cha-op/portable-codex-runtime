@@ -18,6 +18,26 @@ injection and keeps those credentials ephemeral inside the worker.
 The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
 Codex binary or image digest and rerun these probes before upgrading it.
 
+## Managed Auth Refresh Authority
+
+A central authority can proactively rotate its managed ChatGPT credential
+without starting a model turn. The reference adapter runs stable v2
+`account/read {refreshToken:true}` against an isolated staging `CODEX_HOME`,
+verifies the rotated record, and atomically promotes it into the dedicated
+authority home. Concurrent in-process callers share one refresh execution.
+
+The live probe intentionally mutates the dedicated login and then performs a
+separate worker turn with the refreshed access token:
+
+```bash
+CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
+```
+
+Do not point this command at the default user `~/.codex` home. The probe rejects
+that path and expects `.test-codex-home` or another dedicated authority login.
+See `docs/experiments/auth-refresh-authority.md` for the source evidence,
+failure model, and production limitations.
+
 ## External Auth Compatibility Probe
 
 The offline probe uses synthetic JWTs, an isolated temporary `CODEX_HOME`, and a

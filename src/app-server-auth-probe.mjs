@@ -60,6 +60,7 @@ export class AppServerClient {
     this.pending = new Map();
     this.messages = [];
     this.waiters = [];
+    this.sentRpcMethods = [];
     this.stderrBytes = 0;
     this.stopping = false;
     this.terminalError = null;
@@ -131,6 +132,7 @@ export class AppServerClient {
   request(method, params) {
     if (this.terminalError) return Promise.reject(this.terminalError);
     const id = this.nextRequestId++;
+    this.sentRpcMethods.push({ kind: "request", method });
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -147,7 +149,12 @@ export class AppServerClient {
   }
 
   notify(method, params) {
+    this.sentRpcMethods.push({ kind: "notification", method });
     this.#send({ method, params });
+  }
+
+  rpcMethodAudit() {
+    return this.sentRpcMethods.map((entry) => ({ ...entry }));
   }
 
   waitForNotification(method) {
