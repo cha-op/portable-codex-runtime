@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "probe": "interrupted-turn-recovery",
   "runtime": {
     "codexVersion": "codex-cli 0.142.4",
@@ -7,7 +7,7 @@
     "binaryExecution": "private-read-only-copy",
     "sourceAnalysisCommit": "db887d03e1f907467e33271572dffb73bceecd6b",
     "platform": "darwin",
-    "arch": "arm64"
+    "launcherArch": "arm64"
   },
   "backend": {
     "type": "loopback-held-responses-mock",

@@ -64,7 +64,7 @@ recovered tail in a separate app-server process.
 
 ## Live Result
 
-The complete matrix passed on macOS arm64 with:
+The complete matrix passed on macOS with an arm64 Node launcher and:
 
 - Codex CLI `0.142.4`;
 - execution from a private mode `0500`, single-link copy whose file type, link
@@ -80,7 +80,8 @@ claim that the installed binary was built from that exact commit. The redacted
 machine-readable result is stored in
 `evidence/interrupted-turn-recovery.json`. It contains no thread or turn IDs,
 paths, prompts, model output, credentials, account identifiers, or hostnames.
-Schema version 3 records the private binary execution mode, the exact
+Schema version 4 records the private binary execution mode, the Node launcher
+architecture (not an inferred Codex binary architecture), the exact
 `copy-original-path-absent-held-tree-000` cold-read isolation mode, and the
 distinction between configured inputs and OS-enforced isolation; older evidence
 is rejected.
@@ -181,8 +182,8 @@ restore interfaces.
   filesystem contract. A checkpoint with a live terminal is not migration
   ready even if all files copy successfully.
 - The implementation targets macOS and Linux process groups, while this live
-  evidence records macOS arm64 only. Windows is rejected because a Job Object
-  process-tree implementation is not present.
+  evidence records a macOS host and arm64 Node launcher only. Windows is
+  rejected because a Job Object process-tree implementation is not present.
 - Signal scenarios intentionally require the pinned runtime to report actual
   signal termination. If a future Codex binary traps `SIGTERM` and exits cleanly,
   the compatibility probe fails until that changed shutdown contract is reviewed.

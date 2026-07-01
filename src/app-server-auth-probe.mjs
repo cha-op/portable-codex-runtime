@@ -773,9 +773,13 @@ export async function stopAndAssertNoWorkerAuth(client, codexHome) {
   await assertNoWorkerAuth(codexHome, "during shutdown");
 }
 
-export function codexVersion(codexBin) {
+export function codexVersion(codexBin, { cwd, env } = {}) {
   const executable = resolveAppServerExecutable(codexBin);
-  const result = spawnSync(executable, ["--version"], { encoding: "utf8" });
+  const result = spawnSync(executable, ["--version"], {
+    encoding: "utf8",
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(env === undefined ? {} : { env }),
+  });
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`failed to run ${executable} --version: ${result.stderr}`);

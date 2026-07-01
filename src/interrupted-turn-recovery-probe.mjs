@@ -26,6 +26,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 import {
   AppServerClient,
+  buildWorkerEnvironment,
   codexVersion,
   resolveAppServerExecutable,
   runSequentialCleanup,
@@ -335,9 +336,9 @@ function portableMode(metadata) {
   return metadata.mode & 0o777;
 }
 
-async function assertSnapshotUserAccess(path, mode) {
+async function assertSnapshotUserAccess(path, mode, checkAccess = access) {
   try {
-    await access(path, mode);
+    await checkAccess(path, mode);
   } catch (error) {
     if (error?.code === "EACCES" || error?.code === "EPERM") {
       throw new Error("portable tree rejects entries inaccessible to the snapshot user");
@@ -507,9 +508,14 @@ async function copyTreeEntry(context, source, destination) {
     return;
   }
   if (metadata.isDirectory()) {
-    await assertSnapshotUserAccess(source, fsConstants.R_OK | fsConstants.X_OK);
+    await assertSnapshotUserAccess(
+      source,
+      fsConstants.R_OK | fsConstants.X_OK,
+      context.checkAccess,
+    );
     const finalMode = portableMode(metadata);
     await mkdir(destination, { mode: 0o700 });
+    context.destinationRootCreated(destination);
     await chmod(destination, 0o700);
     const entries = await readPortableDirectory(source);
     for (const entry of entries) {
@@ -521,7 +527,7 @@ async function copyTreeEntry(context, source, destination) {
   if (!metadata.isFile()) {
     throw new Error("stopped-tree copy rejects sockets, devices, and FIFOs");
   }
-  await assertSnapshotUserAccess(source, fsConstants.R_OK);
+  await assertSnapshotUserAccess(source, fsConstants.R_OK, context.checkAccess);
   if (metadata.nlink !== 1) throw new Error("stopped-tree copy rejects hard-linked files");
   const finalMode = portableMode(metadata);
   await copyFile(source, destination);
@@ -544,7 +550,13 @@ export async function removeTreeForCleanup(path) {
   await rm(path, { recursive: metadata.isDirectory(), force: true });
 }
 
-export async function copyStoppedTree({ ownedRoot, source, destination }) {
+export async function copyStoppedTree({
+  ownedRoot,
+  source,
+  destination,
+  afterDestinationValidation,
+  checkAccess = access,
+}) {
   const canonicalSource = await assertDirectOwnedPath(ownedRoot, source, "source", {
     mustExist: true,
   });
@@ -554,9 +566,15 @@ export async function copyStoppedTree({ ownedRoot, source, destination }) {
     "destination",
     { mustExist: false },
   );
+  await afterDestinationValidation?.();
+  let destinationRootCreated = false;
   try {
     await copyTreeEntry(
       {
+        checkAccess,
+        destinationRootCreated: (path) => {
+          if (path === canonicalDestination) destinationRootCreated = true;
+        },
         destinationRoots: [
           resolve(canonicalDestination),
           join(
@@ -570,7 +588,9 @@ export async function copyStoppedTree({ ownedRoot, source, destination }) {
       canonicalDestination,
     );
   } catch (error) {
-    await removeTreeForCleanup(canonicalDestination).catch(() => {});
+    if (destinationRootCreated) {
+      await removeTreeForCleanup(canonicalDestination).catch(() => {});
+    }
     throw error;
   }
 }
@@ -590,7 +610,7 @@ function updateHashFields(hash, fields) {
   }
 }
 
-async function hashTreeEntry(hash, root, path) {
+async function hashTreeEntry(hash, root, path, checkAccess) {
   const metadata = await lstat(path);
   const entryPath = relative(root, path) || ".";
   if (metadata.isSymbolicLink()) {
@@ -600,14 +620,16 @@ async function hashTreeEntry(hash, root, path) {
     return;
   }
   if (metadata.isDirectory()) {
-    await assertSnapshotUserAccess(path, fsConstants.R_OK | fsConstants.X_OK);
+    await assertSnapshotUserAccess(path, fsConstants.R_OK | fsConstants.X_OK, checkAccess);
     updateHashFields(hash, ["directory", entryPath, portableMode(metadata)]);
     const entries = await readPortableDirectory(path);
-    for (const entry of entries) await hashTreeEntry(hash, root, join(path, entry));
+    for (const entry of entries) {
+      await hashTreeEntry(hash, root, join(path, entry), checkAccess);
+    }
     return;
   }
   if (!metadata.isFile()) throw new Error("tree digest rejects non-file entries");
-  await assertSnapshotUserAccess(path, fsConstants.R_OK);
+  await assertSnapshotUserAccess(path, fsConstants.R_OK, checkAccess);
   if (metadata.nlink !== 1) throw new Error("tree digest rejects hard-linked files");
   updateHashFields(hash, [
     "file",
@@ -618,9 +640,9 @@ async function hashTreeEntry(hash, root, path) {
   ]);
 }
 
-export async function digestTree(root) {
+export async function digestTree(root, { checkAccess = access } = {}) {
   const hash = createHash("sha256");
-  await hashTreeEntry(hash, root, root);
+  await hashTreeEntry(hash, root, root, checkAccess);
   return hash.digest("hex");
 }
 
@@ -980,7 +1002,7 @@ function assertRecoveryEvidenceSchema(report) {
     ["schemaVersion", "probe", "runtime", "backend", "snapshot", "scenarios", "result"],
     "recovery evidence",
   );
-  assert.equal(report.schemaVersion, 3);
+  assert.equal(report.schemaVersion, 4);
   assert.equal(report.probe, "interrupted-turn-recovery");
   assert.equal(report.result, "passed");
 
@@ -992,7 +1014,7 @@ function assertRecoveryEvidenceSchema(report) {
       "binaryExecution",
       "sourceAnalysisCommit",
       "platform",
-      "arch",
+      "launcherArch",
     ],
     "runtime evidence",
   );
@@ -1004,7 +1026,7 @@ function assertRecoveryEvidenceSchema(report) {
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert.match(report.runtime.sourceAnalysisCommit, /^[0-9a-f]{40}$/);
   assert(["darwin", "linux"].includes(report.runtime.platform), "unsupported evidence platform");
-  assert.match(report.runtime.arch, /^[0-9A-Za-z_-]+$/);
+  assert.match(report.runtime.launcherArch, /^[0-9A-Za-z_-]+$/);
 
   assertExactObject(
     report.backend,
@@ -1388,7 +1410,13 @@ export async function probeInterruptedTurnRecovery({
     await chmod(privateBinary, 0o500);
     const binaryDigest = await digestFile(privateBinary);
     await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
-    const binaryVersion = readCodexVersion(privateBinary);
+    const versionHome = join(binaryRoot, "version-home");
+    await mkdir(versionHome, { mode: 0o700 });
+    await chmod(versionHome, 0o700);
+    const binaryVersion = readCodexVersion(privateBinary, {
+      cwd: versionHome,
+      env: buildWorkerEnvironment(versionHome, process.env, versionHome),
+    });
 
     const scenarioReports = [];
     for (const kind of scenarios) {
@@ -1400,7 +1428,7 @@ export async function probeInterruptedTurnRecovery({
       (scenario) => scenario.kind === "snapshot_restore",
     );
     const report = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       probe: "interrupted-turn-recovery",
       runtime: {
         codexVersion: binaryVersion,
@@ -1408,7 +1436,7 @@ export async function probeInterruptedTurnRecovery({
         binaryExecution: "private-read-only-copy",
         sourceAnalysisCommit,
         platform: platform(),
-        arch: arch(),
+        launcherArch: arch(),
       },
       backend: {
         type: "loopback-held-responses-mock",

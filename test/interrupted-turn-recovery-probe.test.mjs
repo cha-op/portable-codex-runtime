@@ -73,7 +73,7 @@ function completeEvidenceReport() {
     return scenario;
   });
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     probe: "interrupted-turn-recovery",
     runtime: {
       codexVersion: "codex-cli 0.142.4",
@@ -81,7 +81,7 @@ function completeEvidenceReport() {
       binaryExecution: "private-read-only-copy",
       sourceAnalysisCommit: "b".repeat(40),
       platform: "darwin",
-      arch: "arm64",
+      launcherArch: "arm64",
     },
     backend: {
       type: "loopback-held-responses-mock",
@@ -684,12 +684,19 @@ test("portable tree operations reject entries inaccessible to the snapshot user"
   const root = await mkdtemp(join(tmpdir(), "portable-copy-inaccessible-test-"));
   const source = join(root, "source");
   const inaccessibleFile = join(source, "inaccessible");
+  const inaccessiblePaths = new Set([inaccessibleFile]);
+  const checkAccess = async (path) => {
+    if (!inaccessiblePaths.has(path)) return;
+    const error = new Error("injected access denial");
+    error.code = "EACCES";
+    throw error;
+  };
   try {
     await mkdir(source);
     await writeFile(inaccessibleFile, "sentinel");
-    await chmod(inaccessibleFile, 0o000);
+    inaccessiblePaths.add(await realpath(inaccessibleFile));
     await assert.rejects(
-      digestTree(source),
+      digestTree(source, { checkAccess }),
       /entries inaccessible to the snapshot user/,
     );
     await assert.rejects(
@@ -697,12 +704,38 @@ test("portable tree operations reject entries inaccessible to the snapshot user"
         ownedRoot: root,
         source,
         destination: join(root, "destination"),
+        checkAccess,
       }),
       /entries inaccessible to the snapshot user/,
     );
     await assert.rejects(lstat(join(root, "destination")), /ENOENT/);
   } finally {
-    await chmod(inaccessibleFile, 0o600).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy never removes a destination created by a racing writer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-destination-race-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const sentinel = join(destination, "racing-writer");
+    await mkdir(source);
+    await writeFile(join(source, "source-file"), "source");
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        afterDestinationValidation: async () => {
+          await mkdir(destination);
+          await writeFile(sentinel, "preserve");
+        },
+      }),
+      /EEXIST/,
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "preserve");
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -738,7 +771,7 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
     assert.throws(
       () => assertRecoveryEvidenceSafe({ ...report, schemaVersion: 1 }),
-      /1 !== 3/,
+      /1 !== 4/,
     );
     for (const unsafe of [
       { ...report, cwd: "/Users/example/private" },
@@ -792,11 +825,11 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     const serialized = JSON.stringify(report);
     for (const duplicate of [
-      serialized.replace('"schemaVersion":3', '"schemaVersion":1,"schemaVersion":3'),
+      serialized.replace('"schemaVersion":4', '"schemaVersion":1,"schemaVersion":4'),
       serialized.replace('"result":"passed"', '"result":"failed","result":"passed"'),
       serialized.replace(
-        '"schemaVersion":3',
-        '"\\u0073chemaVersion":1,"schemaVersion":3',
+        '"schemaVersion":4',
+        '"\\u0073chemaVersion":1,"schemaVersion":4',
       ),
     ]) {
       assert.throws(
@@ -932,10 +965,12 @@ test("probe report contains all four recovery scenarios without runtime identifi
   const calls = [];
   const scenarioBinaries = [];
   let versionBinary;
+  let versionContext;
   const report = await probeInterruptedTurnRecovery({
     codexBin: process.execPath,
-    readCodexVersion: (codexBin) => {
+    readCodexVersion: (codexBin, context) => {
       versionBinary = codexBin;
+      versionContext = context;
       return "codex-cli 0.142.4";
     },
     runScenario: async ({ codexBin, kind }) => {
@@ -945,10 +980,13 @@ test("probe report contains all four recovery scenarios without runtime identifi
     },
   });
   assert.deepEqual(calls, RECOVERY_SCENARIOS);
-  assert.equal(report.schemaVersion, 3);
+  assert.equal(report.schemaVersion, 4);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert(scenarioBinaries.every((binary) => binary === versionBinary));
   assert.notEqual(versionBinary, process.execPath);
+  assert.equal(versionContext.cwd, versionContext.env.CODEX_HOME);
+  assert.equal(versionContext.env.OPENAI_API_KEY, undefined);
+  assert.equal(versionContext.env.AWS_SECRET_ACCESS_KEY, undefined);
   await assert.rejects(lstat(versionBinary), /ENOENT/);
   assert.equal(report.runtime.sourceAnalysisCommit, PINNED_SOURCE_ANALYSIS_COMMIT);
   assert.equal(report.backend.realModelTurnConfigured, false);
