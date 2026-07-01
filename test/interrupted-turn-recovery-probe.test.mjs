@@ -12,7 +12,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import test from "node:test";
 
@@ -23,9 +23,11 @@ import {
   assertProcessGroupTarget,
   assertRecoveryEvidenceSafe,
   copyStoppedTree,
+  decodePortablePathBytes,
   digestTree,
   interruptedTurnRecoveryFailureReport,
   probeInterruptedTurnRecovery,
+  removeTreeForCleanup,
   startRecoveryClient,
   terminateAppServer,
   verifyModelWorkspaceContext,
@@ -133,6 +135,17 @@ test("signal termination tolerates an already absent process group", async () =>
     },
   );
   assert.deepEqual(result, { signal: "SIGKILL" });
+});
+
+test("signal termination rejects a different observed signal", async () => {
+  await assert.rejects(
+    terminateAppServer(
+      { child: { pid: 4242 }, exitPromise: Promise.resolve([null, "SIGKILL"]) },
+      "SIGTERM",
+      { abortClient: async () => {}, killProcess: () => {} },
+    ),
+    /observed SIGKILL instead of SIGTERM/,
+  );
 });
 
 test("signal termination preserves the primary failure over cleanup failure", async () => {
@@ -278,6 +291,43 @@ test("stopped-tree copy rejects non-UTF-8 symlink targets", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("portable directory entry decoding rejects lossy UTF-8", () => {
+  assert.equal(decodePortablePathBytes(Buffer.from("portable-name")), "portable-name");
+  assert.throws(
+    () => decodePortablePathBytes(Buffer.from([0x66, 0x80])),
+    /rejects non-UTF-8 directory entry names/,
+  );
+});
+
+test(
+  "portable tree operations reject and clean up non-UTF-8 directory entries",
+  { skip: platform() !== "linux" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-copy-non-utf8-name-test-"));
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    try {
+      await mkdir(source);
+      const rawPath = Buffer.concat([
+        Buffer.from(source),
+        Buffer.from("/"),
+        Buffer.from([0x66, 0x80]),
+      ]);
+      await writeFile(rawPath, "sentinel");
+      await assert.rejects(digestTree(source), /rejects non-UTF-8 directory entry names/);
+      await assert.rejects(
+        copyStoppedTree({ ownedRoot: root, source, destination }),
+        /rejects non-UTF-8 directory entry names/,
+      );
+      await assert.rejects(lstat(destination), /ENOENT/);
+      await removeTreeForCleanup(source);
+      await assert.rejects(lstat(source), /ENOENT/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("stopped-tree copy rejects absolute symlinks into the relocated source tree", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-internal-link-test-"));
@@ -430,6 +480,22 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
         /disallowed runtime data|does not match/,
       );
     }
+    const escapedSecret = JSON.stringify(report).replace(
+      "codex-cli 0.142.4",
+      "codex-cli 0.142.4-s\\u006b-secret-sentinel",
+    );
+    assert.throws(
+      () => assertRecoveryEvidenceSafe(escapedSecret),
+      /disallowed runtime data/,
+    );
+    const duplicateEscapedSecret = JSON.stringify(report).replace(
+      '"codexVersion":"codex-cli 0.142.4"',
+      '"codexVersion":"s\\u006b-secret-sentinel","codexVersion":"codex-cli 0.142.4"',
+    );
+    assert.throws(
+      () => assertRecoveryEvidenceSafe(duplicateEscapedSecret),
+      /disallowed runtime data/,
+    );
     const path = join(root, "evidence.json");
     await writeRecoveryEvidence(path, report);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), report);
@@ -478,6 +544,23 @@ test("model workspace evidence distinguishes canonical history from active conte
       previousWorkspaceCanonical,
       workspace: "/unexpected/workspace",
     }),
+    /latest model workspace context did not match/,
+  );
+  const missingPath = new Error("missing workspace");
+  missingPath.code = "ENOENT";
+  await assert.rejects(
+    verifyModelWorkspaceContext(
+      JSON.stringify({ input: [environmentMessage("/deleted/workspace")] }),
+      {
+        canonicalizePath: async (path) => {
+          if (path === "/deleted/workspace") throw missingPath;
+          return canonicalizePath(path);
+        },
+        previousWorkspace,
+        previousWorkspaceCanonical,
+        workspace,
+      },
+    ),
     /latest model workspace context did not match/,
   );
   const activeOnlyRequest = JSON.stringify({

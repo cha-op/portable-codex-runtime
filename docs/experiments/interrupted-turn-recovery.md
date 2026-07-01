@@ -32,17 +32,19 @@ mode `0700` temporary root and a fixed prompt that contains no repository data.
 
 A fresh app-server performs cold `thread/read {includeTurns:true}` before a
 second fresh app-server performs `thread/resume`; both must report the original
-turn as the interrupted tail. A completed follow-up turn is matched by its exact
-turn ID and captures the corresponding next loopback request to distinguish a
-persisted abort marker from view-only normalization.
+turn as the interrupted tail, and neither operation may issue a model request.
+A completed follow-up turn is matched by its exact turn ID and captures the
+single corresponding next loopback request to distinguish a persisted abort
+marker from view-only normalization.
 
 The snapshot scenario copies the entire synthetic session tree, including
 `CODEX_HOME` and workspace, after the killed process has exited. It hashes
 relative paths, entry types, POSIX rwx permission bits, file bytes, and symlink
-targets before and after copy. Portable UTF-8 relative symlinks and external
-absolute links are copied without following them. Absolute links back into the
-source tree, relative links whose meaning changes after relocation, special permission
-bits, hard-linked files, sockets, FIFOs, and devices fail closed. The source tree
+targets before and after copy. Portable UTF-8 entry names, relative symlinks,
+and external absolute links are copied without following symlink targets.
+Non-UTF-8 entry names, absolute links back into the source tree, relative links
+whose meaning changes after relocation, special permission bits, hard-linked
+files, sockets, FIFOs, and devices fail closed. The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
 the restored workspace path explicitly. Its runtime `cwd` response and the
 latest environment context in the follow-up model request must both resolve to
@@ -151,9 +153,10 @@ restore interfaces.
 - Signal scenarios intentionally require the pinned runtime to report actual
   signal termination. If a future Codex binary traps `SIGTERM` and exits cleanly,
   the compatibility probe fails until that changed shutdown contract is reviewed.
-- Portable UTF-8 relative and existing external absolute symlink targets are
-  preserved exactly; non-UTF-8 targets, dangling absolute targets, internal
-  absolute targets, and non-relocatable relative targets fail closed. A fixed
+- Portable UTF-8 directory entry names, relative symlink targets, and existing
+  external absolute symlink targets are preserved exactly; non-UTF-8 names or
+  targets, dangling absolute targets, internal absolute targets, and
+  non-relocatable relative targets fail closed. A fixed
   runtime image must provide every external target, such as a Codex helper path,
   at a compatible location during copy and after migration.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,

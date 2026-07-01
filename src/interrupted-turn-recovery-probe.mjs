@@ -48,6 +48,8 @@ const SENSITIVE_EVIDENCE_PATTERNS = [
   /<turn_aborted>/,
   /portable recovery probe/i,
 ];
+const JSON_STRING_TOKEN_PATTERN =
+  /"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"/g;
 
 async function withTimeout(promise, timeoutMs, label) {
   let timer;
@@ -306,6 +308,25 @@ async function readPortableSymlink(path) {
   return { bytes, target };
 }
 
+export function decodePortablePathBytes(bytes) {
+  assert(Buffer.isBuffer(bytes), "portable path bytes must be a Buffer");
+  const value = bytes.toString("utf8");
+  if (!Buffer.from(value, "utf8").equals(bytes)) {
+    throw new Error("portable tree rejects non-UTF-8 directory entry names");
+  }
+  return value;
+}
+
+async function readPortableDirectory(path) {
+  const entries = await readdir(path, { encoding: "buffer" });
+  return entries.map(decodePortablePathBytes).sort();
+}
+
+function rawChildPath(parent, entry) {
+  const parentBytes = Buffer.isBuffer(parent) ? parent : Buffer.from(parent);
+  return Buffer.concat([parentBytes, Buffer.from(sep), entry]);
+}
+
 async function assertPortableSymlink({
   destination,
   destinationRoots,
@@ -360,8 +381,7 @@ async function copyTreeEntry(context, source, destination) {
   if (metadata.isDirectory()) {
     const finalMode = portableMode(metadata);
     await mkdir(destination, { mode: 0o700 });
-    const entries = await readdir(source);
-    entries.sort();
+    const entries = await readPortableDirectory(source);
     for (const entry of entries) {
       await copyTreeEntry(context, join(source, entry), join(destination, entry));
     }
@@ -377,7 +397,7 @@ async function copyTreeEntry(context, source, destination) {
   await chmod(destination, finalMode);
 }
 
-async function removeTreeForCleanup(path) {
+export async function removeTreeForCleanup(path) {
   let metadata;
   try {
     metadata = await lstat(path);
@@ -387,8 +407,8 @@ async function removeTreeForCleanup(path) {
   }
   if (metadata.isDirectory()) {
     await chmod(path, (metadata.mode & 0o777) | 0o700);
-    const entries = await readdir(path);
-    for (const entry of entries) await removeTreeForCleanup(join(path, entry));
+    const entries = await readdir(path, { encoding: "buffer" });
+    for (const entry of entries) await removeTreeForCleanup(rawChildPath(path, entry));
   }
   await rm(path, { recursive: metadata.isDirectory(), force: true });
 }
@@ -439,8 +459,7 @@ async function hashTreeEntry(hash, root, path) {
   }
   if (metadata.isDirectory()) {
     updateHashFields(hash, ["directory", entryPath, portableMode(metadata)]);
-    const entries = await readdir(path);
-    entries.sort();
+    const entries = await readPortableDirectory(path);
     for (const entry of entries) await hashTreeEntry(hash, root, join(path, entry));
     return;
   }
@@ -508,13 +527,20 @@ export async function verifyModelWorkspaceContext(
     }
   }
   assert(contextCwds.length > 0, "follow-up model request omitted workspace context");
-  const [activeWorkspaceCanonical, expectedWorkspaceCanonical] = await Promise.all([
-    canonicalizePath(contextCwds.at(-1)),
-    canonicalizePath(workspace),
-  ]);
-  assert.equal(
-    activeWorkspaceCanonical,
-    expectedWorkspaceCanonical,
+  const activeWorkspace = contextCwds.at(-1);
+  const expectedWorkspaceCanonical = await canonicalizePath(workspace);
+  let activeWorkspaceMatched =
+    activeWorkspace === workspace || activeWorkspace === expectedWorkspaceCanonical;
+  if (!activeWorkspaceMatched) {
+    try {
+      activeWorkspaceMatched =
+        (await canonicalizePath(activeWorkspace)) === expectedWorkspaceCanonical;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  assert(
+    activeWorkspaceMatched,
     "latest model workspace context did not match the resumed workspace",
   );
   const relocated = previousWorkspace !== undefined && previousWorkspace !== workspace;
@@ -560,6 +586,7 @@ async function recoverAndInspect({
   turnId,
   workspace,
   expectAbortMarker,
+  modelRequestBaseline,
 }) {
   const resumed = await client.request("thread/resume", { threadId, cwd: workspace });
   assert.equal(resumed.thread.id, threadId);
@@ -567,7 +594,12 @@ async function recoverAndInspect({
   const resumedTurn = findTailTurn(resumed.thread, turnId);
   assert.equal(resumedTurn.status, "interrupted");
 
-  const requestIndex = mock.requestCount();
+  assert.equal(
+    mock.requestCount(),
+    modelRequestBaseline,
+    "cold read or resume unexpectedly issued a model request",
+  );
+  const requestIndex = modelRequestBaseline;
   const followUpTurn = await client.request("turn/start", {
     threadId,
     input: [{ type: "text", text: "Complete the portable recovery probe.", textElements: [] }],
@@ -686,6 +718,12 @@ export async function runRecoveryScenario({
       };
     }
 
+    assert.equal(
+      mock.requestCount(),
+      1,
+      "interrupted turn issued unexpected model requests",
+    );
+    const modelRequestBaseline = mock.requestCount();
     readClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
     const coldRead = await readClient.request("thread/read", { threadId, includeTurns: true });
     assert.equal(coldRead.thread.id, threadId);
@@ -704,6 +742,7 @@ export async function runRecoveryScenario({
       turnId,
       workspace,
       expectAbortMarker,
+      modelRequestBaseline,
     });
     const {
       historicalWorkspaceRetained,
@@ -840,10 +879,20 @@ function assertRecoveryEvidenceSchema(report) {
 
 export function assertRecoveryEvidenceSafe(report) {
   const serialized = typeof report === "string" ? report : JSON.stringify(report);
-  for (const pattern of SENSITIVE_EVIDENCE_PATTERNS) {
-    assert(!pattern.test(serialized), "recovery evidence contains disallowed runtime data");
-  }
   const structured = typeof report === "string" ? JSON.parse(report) : report;
+  const normalized = JSON.stringify(structured);
+  const surfaces = [serialized, normalized];
+  if (typeof report === "string") {
+    for (const token of serialized.matchAll(JSON_STRING_TOKEN_PATTERN)) {
+      surfaces.push(JSON.parse(token[0]));
+    }
+  }
+  for (const pattern of SENSITIVE_EVIDENCE_PATTERNS) {
+    assert(
+      surfaces.every((surface) => !pattern.test(surface)),
+      "recovery evidence contains disallowed runtime data",
+    );
+  }
   assertRecoveryEvidenceSchema(structured);
   return serialized;
 }
