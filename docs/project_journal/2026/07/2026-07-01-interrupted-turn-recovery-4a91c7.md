@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-01
 updated: 2026-07-01
 branch: wip/interrupted-turn-recovery
-pr:
+pr: 3
 supersedes: []
 superseded_by:
 ---
