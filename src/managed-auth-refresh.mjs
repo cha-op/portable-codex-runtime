@@ -507,7 +507,10 @@ export async function readManagedAuthSnapshot(authHome) {
   let raw;
   let fileStat;
   try {
-    handle = await open(authPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(
+      authPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
     fileStat = await handle.stat();
     ensure(fileStat.isFile(), "invalid_auth_record", "authority auth.json must be a regular file");
     ensure(fileStat.nlink === 1, "invalid_auth_record", "authority auth.json must not be hard linked");
@@ -602,6 +605,8 @@ export async function runCodexManagedRefresh({
   stagingHome,
 }) {
   const client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
+  let operationError;
+  let refreshRequestDispatched = false;
   const abortClient = async (reason) => {
     if (typeof client.abort === "function") {
       await client.abort(reason);
@@ -639,16 +644,59 @@ export async function runCodexManagedRefresh({
   try {
     await withAbort(() => client.start());
     const initializeResult = await withAbort(() => client.initialize(false));
-    const response = await withAbort(() =>
-      client.request("account/read", { refreshToken: true }),
-    );
+    let response;
+    try {
+      refreshRequestDispatched = true;
+      response = await withAbort(() =>
+        client.request("account/read", { refreshToken: true }),
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const uncertain = new ManagedAuthRefreshError(
+        "refresh_outcome_uncertain",
+        "account/read failed after the token refresh request was dispatched",
+        {
+          recoveryPath: stagingHome,
+          recoveryReason: "account_read_outcome_unknown",
+        },
+      );
+      uncertain.cause = error;
+      throw uncertain;
+    }
     return {
       initializeResult,
       response,
       rpcAudit: client.rpcMethodAudit(),
     };
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    await client.stop();
+    try {
+      await client.stop();
+    } catch (stopError) {
+      if (operationError) {
+        operationError.cleanupWarnings = [
+          ...(Array.isArray(operationError.cleanupWarnings)
+            ? operationError.cleanupWarnings
+            : []),
+          "app_server_stop_failed",
+        ];
+      } else if (refreshRequestDispatched) {
+        const uncertain = new ManagedAuthRefreshError(
+          "refresh_outcome_uncertain",
+          "app-server cleanup failed after the token refresh request was dispatched",
+          {
+            recoveryPath: stagingHome,
+            recoveryReason: "account_read_outcome_unknown",
+          },
+        );
+        uncertain.cause = stopError;
+        throw uncertain;
+      } else {
+        throw stopError;
+      }
+    }
   }
 }
 
@@ -765,23 +813,33 @@ export async function refreshManagedAuthRecord({
       (signal) => runRefresh({ codexBin, signal, stagingHome }),
       stagingHome,
     );
+    // Once account/read returns, every subsequent failure is conservatively
+    // treated as post-dispatch. The OAuth service may have consumed the old
+    // refresh token even when local staged bytes still match the source.
+    preserveStaging = true;
     await assertAuthorityHomeCurrent(authority);
     ensure(
       rpcAuditMatches(refreshResult?.rpcAudit),
       "unexpected_rpc_sequence",
       "managed authority used an unexpected app-server RPC sequence",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
     );
 
     const staged = await readManagedAuthSnapshot(stagingHome);
     await lock.assertHeld();
-    preserveStaging = staged.authFileFingerprint !== before.authFileFingerprint;
     ensure(
       refreshResult?.response &&
         typeof refreshResult.response === "object" &&
         !Array.isArray(refreshResult.response),
       "invalid_refresh_response",
       "account/read returned an invalid response",
-      { retryable: true },
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
     );
     if (refreshResult.response.requiresOpenaiAuth === true && refreshResult.response.account === null) {
       fail("reauth_required", "managed authority credentials require interactive login");
@@ -802,13 +860,19 @@ export async function refreshManagedAuthRecord({
       lastRefreshAdvanced(before.lastRefreshAt, staged.lastRefreshAt),
       "refresh_not_observed",
       "account/read completed without an observable token refresh",
-      { retryable: true, recoveryPath: preserveStaging ? stagingHome : undefined },
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
     );
     ensure(
       staged.accessTokenFingerprint !== before.accessTokenFingerprint,
       "access_token_unchanged",
       "managed refresh did not produce a new access token",
-      { retryable: true, recoveryPath: stagingHome },
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
     );
     ensure(
       Number.isFinite(staged.expiresAtUnixSeconds) &&
@@ -954,7 +1018,10 @@ export async function refreshManagedAuthRecord({
   }
   if (primaryError) {
     if (cleanupWarnings.length > 0 && typeof primaryError === "object") {
-      primaryError.cleanupWarnings = cleanupWarnings;
+      primaryError.cleanupWarnings = [
+        ...(Array.isArray(primaryError.cleanupWarnings) ? primaryError.cleanupWarnings : []),
+        ...cleanupWarnings,
+      ];
     }
     throw primaryError;
   }

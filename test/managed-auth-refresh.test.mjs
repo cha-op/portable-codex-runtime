@@ -283,9 +283,83 @@ test("runCodexManagedRefresh always stops the app-server after request failure",
         },
       }),
     }),
-    /synthetic request failure/,
+    (error) =>
+      error.code === "refresh_outcome_uncertain" &&
+      error.retryable === false &&
+      error.recoveryReason === "account_read_outcome_unknown" &&
+      error.recoveryPath === "/isolated/staging-home",
   );
   assert.equal(stopped, 1);
+});
+
+test("app-server stop failure cannot mask an uncertain refresh outcome", async () => {
+  await assert.rejects(
+    runCodexManagedRefresh({
+      stagingHome: "/isolated/staging-home",
+      createClient: () => ({
+        initialize: async () => ({}),
+        request: async () => {
+          throw new Error("synthetic request failure");
+        },
+        start: async () => {},
+        stop: async () => {
+          throw new Error("synthetic stop failure");
+        },
+      }),
+    }),
+    (error) => {
+      assert.equal(error.code, "refresh_outcome_uncertain");
+      assert.deepEqual(error.cleanupWarnings, ["app_server_stop_failed"]);
+      assert.match(error.cause.message, /synthetic request failure/);
+      return true;
+    },
+  );
+});
+
+test("post-dispatch RPC failure preserves an unchanged staging sentinel", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const runRefresh = (options) =>
+      runCodexManagedRefresh({
+        ...options,
+        createClient: () => ({
+          initialize: async () => ({}),
+          request: async () => {
+            throw new Error("synthetic post-dispatch failure");
+          },
+          rpcMethodAudit: () => RPC_AUDIT,
+          start: async () => {},
+          stop: async () => {
+            throw new Error("synthetic stop failure after request failure");
+          },
+        }),
+      });
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({ authHome, runRefresh });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "account_read_outcome_unknown");
+    assert.deepEqual(refreshError.cleanupWarnings, ["app_server_stop_failed"]);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    let secondRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          secondRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(secondRefreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("runCodexManagedRefresh aborts an in-flight request and stops the app-server", async () => {
@@ -411,7 +485,7 @@ test("invalid refresh responses and unchanged access tokens fail closed", async 
           return { ...successResponse(), response: null };
         },
       }),
-      (error) => error.code === "invalid_refresh_response" && error.retryable === true,
+      (error) => error.code === "invalid_refresh_response" && error.retryable === false,
     );
   } finally {
     await rm(invalid.root, { recursive: true, force: true });
@@ -427,7 +501,7 @@ test("invalid refresh responses and unchanged access tokens fail closed", async 
           return successResponse();
         },
       }),
-      (error) => error.code === "access_token_unchanged" && error.retryable === true,
+      (error) => error.code === "access_token_unchanged" && error.retryable === false,
     );
   } finally {
     await rm(unchanged.root, { recursive: true, force: true });
@@ -598,20 +672,26 @@ test("permanent account loss becomes reauth_required without changing canonical 
   }
 });
 
-test("unobserved refresh is retryable and leaves canonical auth unchanged", async () => {
+test("unobserved post-dispatch refresh fails closed and retains a sentinel", async () => {
   const { authHome, root } = await createAuthorityHome();
   try {
     const before = await readFile(join(authHome, "auth.json"), "utf8");
-    await assert.rejects(
-      refreshManagedAuthRecord({ authHome, runRefresh: async () => successResponse() }),
-      (error) => {
-        assert(error instanceof ManagedAuthRefreshError);
-        assert.equal(error.code, "refresh_not_observed");
-        assert.equal(error.retryable, true);
-        return true;
-      },
-    );
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({ authHome, runRefresh: async () => successResponse() });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_not_observed");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "post_dispatch_validation_failed");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
     assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), before);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -715,6 +795,34 @@ test("unexpected RPC activity is rejected before canonical promotion", async () 
         },
       }),
       (error) => error.code === "unexpected_rpc_sequence",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unexpected post-dispatch RPC audit retains an unchanged staging sentinel", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => ({
+          ...successResponse(),
+          rpcAudit: [...RPC_AUDIT, { kind: "request", method: "turn/start" }],
+        }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "unexpected_rpc_sequence");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "post_dispatch_validation_failed");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1098,6 +1206,25 @@ test("authority auth.json rejects hard links", async () => {
       readManagedAuthSnapshot(authHome),
       (error) => error.code === "invalid_auth_record" && /hard linked/.test(error.message),
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority auth.json rejects FIFOs without blocking", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const authPath = join(authHome, "auth.json");
+  try {
+    await rm(authPath);
+    const mkfifo = spawnSync("mkfifo", [authPath], { encoding: "utf8" });
+    assert.equal(mkfifo.status, 0, mkfifo.stderr);
+    const probe = spawnSync(process.execPath, [UNSAFE_HOME_FIXTURE, authHome], {
+      encoding: "utf8",
+      timeout: 1_000,
+    });
+    assert.equal(probe.signal, null, probe.error?.message);
+    assert.equal(probe.status, 0, probe.stderr);
+    assert.equal(probe.stdout.trim(), "invalid_auth_record");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

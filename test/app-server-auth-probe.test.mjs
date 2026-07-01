@@ -220,6 +220,52 @@ input.on("line", (line) => {
   },
 );
 
+test(
+  "app-server stop reaps descendants from the detached process group",
+  { skip: process.platform === "win32" },
+  async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stop-group-fixture-"));
+    const fixturePath = join(codexHome, "fixture.mjs");
+    const descendantPath = join(codexHome, "descendant.mjs");
+    const markerPath = join(codexHome, "orphan-mutation");
+    await writeFile(
+      descendantPath,
+      `
+import { writeFileSync } from "node:fs";
+setTimeout(() => writeFileSync(${JSON.stringify(markerPath)}, "orphan mutation\\n"), 250);
+setTimeout(() => process.exit(0), 1_000);
+`,
+    );
+    await writeFile(
+      fixturePath,
+      `
+import { spawn } from "node:child_process";
+spawn(process.execPath, [${JSON.stringify(descendantPath)}], { stdio: "ignore" });
+process.stdout.write(JSON.stringify({ method: "fixture/ready" }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.exit(0));
+`,
+    );
+    const client = new AppServerClient({
+      codexBin: process.execPath,
+      codexArgs: [fixturePath],
+      codexHome,
+      shutdownGraceMs: 20,
+      timeoutMs: 1_000,
+    });
+    try {
+      await client.start();
+      await client.waitForNotification("fixture/ready");
+      await client.stop();
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      await assert.rejects(access(markerPath), (error) => error.code === "ENOENT");
+    } finally {
+      await client.abort().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  },
+);
+
 test("stdin failures reject current and future requests", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stdin-fixture-"));
   const fixturePath = join(codexHome, "fixture.mjs");

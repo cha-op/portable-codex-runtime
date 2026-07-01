@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
 const INITIAL_ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174011";
 const WORKER_ENV_KEYS = [
   "PATH",
@@ -25,6 +26,38 @@ const WORKER_ENV_KEYS = [
   "WINDIR",
   "ComSpec",
 ];
+
+function processTreeExists(child) {
+  if (!child?.pid) return false;
+  if (process.platform === "win32") {
+    return child.exitCode === null && child.signalCode === null;
+  }
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+function signalProcessTree(child, signal) {
+  if (!child?.pid) return;
+  try {
+    if (process.platform === "win32") child.kill(signal);
+    else process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+async function waitForProcessTreeExit(child, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (processTreeExists(child)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
 
 export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
   const env = { CODEX_HOME: codexHome };
@@ -49,12 +82,14 @@ export class AppServerClient {
     codexArgs = ["app-server", "--stdio"],
     codexHome,
     onRefresh,
+    shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   }) {
     this.codexBin = codexBin;
     this.codexArgs = codexArgs;
     this.codexHome = codexHome;
     this.onRefresh = onRefresh;
+    this.shutdownGraceMs = shutdownGraceMs;
     this.timeoutMs = timeoutMs;
     this.nextRequestId = 1;
     this.pending = new Map();
@@ -168,16 +203,19 @@ export class AppServerClient {
   async stop() {
     if (!this.child) return;
     this.stopping = true;
-    if (this.child.exitCode === null && this.child.signalCode === null) {
+    if (processTreeExists(this.child)) {
       this.child.stdin.end();
-      if (!(await this.#waitForExit(2_000))) {
-        this.child.kill("SIGTERM");
-        if (!(await this.#waitForExit(2_000))) {
-          this.child.kill("SIGKILL");
-          await this.exitPromise.catch(() => {});
+      if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
+        signalProcessTree(this.child, "SIGTERM");
+        if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
+          signalProcessTree(this.child, "SIGKILL");
+          if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
+            throw new Error("codex app-server process group survived SIGKILL");
+          }
         }
       }
     }
+    await this.exitPromise?.catch(() => {});
     this.stdout?.close();
     this.#failAll(this.terminalError ?? new Error("codex app-server stopped"));
   }
@@ -189,20 +227,14 @@ export class AppServerClient {
     this.abortPromise = (async () => {
       if (
         this.child &&
-        this.child.exitCode === null &&
-        this.child.signalCode === null
+        processTreeExists(this.child)
       ) {
-        try {
-          if (process.platform === "win32" || !this.child.pid) {
-            this.child.kill("SIGKILL");
-          } else {
-            process.kill(-this.child.pid, "SIGKILL");
-          }
-        } catch (killError) {
-          if (killError?.code !== "ESRCH") throw killError;
+        signalProcessTree(this.child, "SIGKILL");
+        if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
+          throw new Error("codex app-server process group survived SIGKILL");
         }
-        await this.exitPromise?.catch(() => {});
       }
+      await this.exitPromise?.catch(() => {});
       this.stdout?.close();
     })();
     return this.abortPromise;
@@ -270,22 +302,6 @@ export class AppServerClient {
   #sendServerResponse(message) {
     if (this.stopping || this.terminalError || !this.child?.stdin.writable) return;
     this.#send(message);
-  }
-
-  #waitForExit(timeoutMs) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), timeoutMs);
-      this.exitPromise.then(
-        () => {
-          clearTimeout(timer);
-          resolve(true);
-        },
-        () => {
-          clearTimeout(timer);
-          resolve(true);
-        },
-      );
-    });
   }
 
   #waitFor(predicate, label) {

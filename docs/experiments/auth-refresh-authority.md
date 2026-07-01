@@ -67,12 +67,12 @@ the canonical authority file directly:
 4. Copy the credential into a mode `0700` staging `CODEX_HOME`, fsync both
    files and the staging directory chain, and fail before OAuth rotation if
    those recovery markers cannot be made durable.
-5. Recheck the authority lock immediately before the RPC and kill the isolated
-   app-server process group if the independent holder exits. Because a remote
-   OAuth rotation may already have committed, any loss after refresh starts is
-   non-retryable: retain the durable staging attempt as a recovery sentinel so
-   the next authority run cannot reuse the old refresh token. Run only `initialize`,
-   `initialized`, and
+5. Recheck the authority lock immediately before the RPC and synchronously reap
+   the isolated app-server process group on every shutdown path. Because a
+   remote OAuth rotation may already have committed, lock loss or any failure
+   after `account/read` dispatch is non-retryable: retain the durable staging
+   attempt as a recovery sentinel so the next authority run cannot reuse the
+   old refresh token. Run only `initialize`, `initialized`, and
    `account/read(refreshToken=true)` against the staging home.
 6. Verify workspace and user continuity, advanced `last_refresh`, a changed
    access token with at least two minutes of remaining validity, file
