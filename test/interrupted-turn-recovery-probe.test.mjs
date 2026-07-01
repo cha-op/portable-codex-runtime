@@ -261,6 +261,43 @@ test("stopped-tree copy rejects canonical aliases of absolute internal symlinks"
   }
 });
 
+test("stopped-tree copy rejects dangling absolute symlinks through source aliases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-dangling-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await symlink(source, join(root, "source-alias"));
+    await symlink(
+      join(root, "source-alias", "missing"),
+      join(source, "dangling-internal-link"),
+    );
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects dangling absolute symlinks/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects absolute links that would become valid in the destination", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-destination-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "target"), "sentinel");
+    await symlink(join(destination, "target"), join(source, "future-destination-link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects dangling absolute symlinks/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects relative symlinks whose meaning changes after relocation", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-link-test-"));
   try {

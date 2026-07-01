@@ -21,7 +21,7 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:http";
 import { arch, platform, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
   AppServerClient,
@@ -271,7 +271,7 @@ async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist })
 
 function pathIsInside(root, candidate) {
   const child = relative(root, candidate);
-  return child === "" || (!child.startsWith("..") && !isAbsolute(child));
+  return child === "" || (child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child));
 }
 
 function portableMode(metadata) {
@@ -283,24 +283,29 @@ function portableMode(metadata) {
 
 async function assertPortableSymlink({
   destination,
-  destinationRoot,
+  destinationRoots,
   source,
   sourceRoots,
   target,
 }) {
   if (isAbsolute(target)) {
-    const targetCandidates = [resolve(target)];
+    let canonicalTarget;
     try {
-      targetCandidates.push(await realpath(target));
+      canonicalTarget = await realpath(target);
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      if (error?.code === "ENOENT") {
+        throw new Error("stopped-tree copy rejects dangling absolute symlinks");
+      }
+      throw error;
     }
-    if (
-      targetCandidates.some((candidate) =>
-        sourceRoots.some((sourceRoot) => pathIsInside(sourceRoot, candidate)),
-      )
-    ) {
+    const targetCandidates = [resolve(target), canonicalTarget];
+    if (targetCandidates.some((candidate) =>
+      sourceRoots.some((sourceRoot) => pathIsInside(sourceRoot, candidate)))) {
       throw new Error("stopped-tree copy rejects absolute symlinks into the source tree");
+    }
+    if (targetCandidates.some((candidate) =>
+      destinationRoots.some((destinationRoot) => pathIsInside(destinationRoot, candidate)))) {
+      throw new Error("stopped-tree copy rejects absolute symlinks into the destination tree");
     }
     return;
   }
@@ -308,10 +313,12 @@ async function assertPortableSymlink({
   const sourceTarget = resolve(dirname(source), target);
   const destinationTarget = resolve(dirname(destination), target);
   const lexicalSourceRoot = sourceRoots[0];
+  const lexicalDestinationRoot = destinationRoots[0];
   if (
     !pathIsInside(lexicalSourceRoot, sourceTarget) ||
-    !pathIsInside(destinationRoot, destinationTarget) ||
-    relative(lexicalSourceRoot, sourceTarget) !== relative(destinationRoot, destinationTarget)
+    !pathIsInside(lexicalDestinationRoot, destinationTarget) ||
+    relative(lexicalSourceRoot, sourceTarget) !==
+      relative(lexicalDestinationRoot, destinationTarget)
   ) {
     throw new Error("stopped-tree copy rejects non-relocatable relative symlinks");
   }
@@ -367,7 +374,10 @@ export async function copyStoppedTree({ ownedRoot, source, destination }) {
   try {
     await copyTreeEntry(
       {
-        destinationRoot: resolve(destination),
+        destinationRoots: [
+          resolve(destination),
+          join(await realpath(dirname(destination)), basename(destination)),
+        ],
         sourceRoots: [resolve(source), await realpath(source)],
       },
       source,
@@ -453,6 +463,7 @@ async function recoverAndInspect({
 }) {
   const resumed = await client.request("thread/resume", { threadId, cwd: workspace });
   assert.equal(resumed.thread.id, threadId);
+  assert.equal(await realpath(resumed.cwd), await realpath(workspace));
   const resumedTurn = findTurn(resumed.thread, turnId);
   assert.equal(resumedTurn.status, "interrupted");
 

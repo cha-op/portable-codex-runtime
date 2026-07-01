@@ -42,8 +42,9 @@ links are copied without following them. Absolute links back into the source
 tree, relative links whose meaning changes after relocation, special permission
 bits, hard-linked files, sockets, FIFOs, and devices fail closed. The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
-the restored workspace path explicitly, and both resume/read responses must
-resolve to that restored directory.
+the restored workspace path explicitly. Its runtime `cwd` response and the
+follow-up model request context must both resolve to that restored directory;
+`thread/read` independently confirms the recovered turn status.
 
 ## Live Result
 
@@ -141,10 +142,11 @@ restore interfaces.
   ready even if all files copy successfully.
 - macOS and Linux process groups are supported. Windows is rejected because a
   Job Object process-tree implementation is not present.
-- Portable relative and external absolute symlink targets are preserved exactly;
-  internal absolute targets and non-relocatable relative targets fail closed. A
-  fixed runtime image must provide every external target, such as a Codex helper
-  path, at a compatible location after migration.
+- Portable relative and existing external absolute symlink targets are preserved
+  exactly; dangling absolute targets, internal absolute targets, and
+  non-relocatable relative targets fail closed. A fixed runtime image must
+  provide every external target, such as a Codex helper path, at a compatible
+  location during copy and after migration.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,
   timestamps, special permission bits, or hard-link topology. Special bits and
   hard links fail closed; the other metadata remains outside this probe and must
