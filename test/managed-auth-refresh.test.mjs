@@ -2099,6 +2099,64 @@ test("authority replacement wins when the canonical CAS reread fails", async () 
   }
 });
 
+test("promotion auth write revalidates authority after opening a replacement path", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-before-promotion-auth-write");
+  const closeError = new Error("synthetic promotion replacement close secret");
+  let closeAttempts = 0;
+  let replacementCandidate;
+  let replaced = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        openFile: async (path, flags, mode) => {
+          if (!replaced && basename(path).startsWith(".auth.json.next-")) {
+            await rename(authHome, displaced);
+            await mkdir(authHome, { mode: 0o700 });
+            replacementCandidate = path;
+            replaced = true;
+          }
+          const handle = await open(path, flags, mode);
+          if (path === replacementCandidate) {
+            const close = handle.close.bind(handle);
+            handle.close = async () => {
+              closeAttempts += 1;
+              await close();
+              throw closeError;
+            };
+          }
+          return handle;
+        },
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError?.code, "authority_home_replaced");
+    assert.equal(replaced, true);
+    assert.equal(closeAttempts, 1);
+    assert.equal(refreshError.recoveryPath, undefined);
+    const promotionError = refreshError.cause;
+    assert.equal(promotionError.code, "authority_home_replaced");
+    assert.equal(promotionError.closeError, closeError);
+    assert.equal(
+      Object.prototype.propertyIsEnumerable.call(promotionError, "closeError"),
+      false,
+    );
+    assert.equal(JSON.stringify(refreshError).includes(closeError.message), false);
+    assert.equal((await stat(replacementCandidate)).size, 0);
+    assert.equal(await readFile(replacementCandidate, "utf8"), "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("account identity changes fail without exposing either identity", async () => {
   const { authHome, root } = await createAuthorityHome();
   const changedAccount = "123e4567-e89b-42d3-a456-426614174099";
@@ -2476,6 +2534,52 @@ test("final authority guard replaces an earlier error with a stale recovery path
   }
 });
 
+test("final cleanup never follows a same-name staging path through a replaced authority", async () => {
+  for (const cleanupMode of ["default", "failed-before-retained-path-check"]) {
+    const { authHome, root } = await createAuthorityHome();
+    const displaced = join(root, `displaced-final-cleanup-${cleanupMode}`);
+    let displacedAttempt;
+    let marker;
+    try {
+      let refreshError;
+      try {
+        await refreshManagedAuthRecord({
+          authHome,
+          cleanupArtifacts: async (options, defaultCleanup) => {
+            const attemptName = basename(options.stagingHome);
+            displacedAttempt = join(authorityStagingDirectory(displaced), attemptName);
+            await rename(authHome, displaced);
+            const replacementAttempt = join(authorityStagingDirectory(authHome), attemptName);
+            await mkdir(replacementAttempt, { mode: 0o700, recursive: true });
+            marker = join(replacementAttempt, "replacement-marker");
+            await writeFile(marker, "must remain\n", { mode: 0o600 });
+            if (cleanupMode === "default") return defaultCleanup(options);
+            throw new Error("synthetic cleanup failure after authority replacement");
+          },
+          runRefresh: async ({ stagingHome }) => {
+            await replaceStagedAuth(stagingHome);
+            return successResponse();
+          },
+        });
+      } catch (error) {
+        refreshError = error;
+      }
+
+      assert.equal(refreshError.code, "authority_home_replaced");
+      assert.equal(refreshError.recoveryPath, undefined);
+      assert.equal(refreshError.recoveryPaths, undefined);
+      assert.equal(await readFile(marker, "utf8"), "must remain\n");
+      assert.equal((await stat(displacedAttempt)).isDirectory(), true);
+      assert.equal((await stat(join(displacedAttempt, "auth.json"))).isFile(), true);
+      const metadata = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
+      assert.equal(metadata.includes(displacedAttempt), false);
+      assert.equal(metadata.includes(dirname(marker)), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("directory sync failure alone preserves the rotated staging credential", async () => {
   const { authHome, root } = await createAuthorityHome();
   try {
@@ -2615,6 +2719,41 @@ test("authority directory replacement is rejected before protected auth is read"
     assert.equal(released, true);
     assert.equal(await readFile(join(protectedHome, "auth.json"), "utf8"), protectedAuth);
     await assert.rejects(stat(join(protectedHome, ".portable-auth-refresh.lock")), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("staging auth write revalidates authority after opening a replacement path", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-before-staging-auth-write");
+  let replacementAuthPath;
+  let replaced = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        openFile: async (path, flags, mode) => {
+          if (!replaced && basename(path) === "auth.json" && flags === "wx") {
+            await rename(authHome, displaced);
+            await mkdir(authHome, { mode: 0o700 });
+            replacementAuthPath = path;
+            await mkdir(dirname(replacementAuthPath), { mode: 0o700, recursive: true });
+            replaced = true;
+          }
+          return open(path, flags, mode);
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError?.code, "authority_home_replaced");
+    assert.equal(replaced, true);
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal((await stat(replacementAuthPath)).size, 0);
+    assert.equal(await readFile(replacementAuthPath, "utf8"), "");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

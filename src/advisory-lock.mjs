@@ -406,32 +406,87 @@ export async function acquireAdvisoryLock(
     if (disposalError) throw cleanupResourceError(disposalError);
     if (closeError) throw cleanupResourceError(closeError);
   };
-  const rejectPendingCommands = (message) => {
+  const rejectPendingCommands = (message, cause) => {
     const pending = [...pendingCommands.values()];
     pendingCommands.clear();
     for (const command of pending) {
       clearTimeout(command.timer);
-      command.reject(new AdvisoryLockError("lock_commit_uncertain", message));
+      command.reject(
+        withCause(new AdvisoryLockError("lock_commit_uncertain", message), cause),
+      );
     }
   };
-  const markUnavailable = (message) => {
-    unavailable = true;
-    resolveLoss(new AdvisoryLockError("lock_lost", "authority advisory lock is unavailable"));
-    rejectPendingCommands(message);
+  let lossSettled = false;
+  let quiescenceAttempted = false;
+  let quiescenceError;
+  let quiescenceInFlight;
+  let quiescenceSucceeded = false;
+  const settleQuiescence = ({ cleanupError, lossMessage, pendingMessage }) => {
+    if (lossSettled) return;
+    lossSettled = true;
+    resolveLoss(
+      withCause(new AdvisoryLockError("lock_lost", lossMessage), cleanupError),
+    );
+    rejectPendingCommands(pendingMessage, cleanupError);
   };
-  let commitQuiescence;
+  const beginQuiescence = ({
+    initialWaitMs,
+    lossMessage,
+    pendingMessage,
+    retry = false,
+  }) => {
+    unavailable = true;
+    if (quiescenceSucceeded) return Promise.resolve({ cleanupError: undefined });
+    if (quiescenceInFlight) return quiescenceInFlight;
+    if (quiescenceAttempted && !retry) {
+      return Promise.resolve({ cleanupError: quiescenceError });
+    }
+    quiescenceAttempted = true;
+    const attempt = (async () => {
+      let cleanupError;
+      try {
+        await cleanup({ initialWaitMs, signalWaitMs: signalGraceMs });
+        quiescenceSucceeded = true;
+      } catch (error) {
+        cleanupError = error;
+      }
+      quiescenceError = cleanupError;
+      settleQuiescence({ cleanupError, lossMessage, pendingMessage });
+      return { cleanupError };
+    })();
+    quiescenceInFlight = attempt;
+    void attempt
+      .finally(() => {
+        if (quiescenceInFlight === attempt) quiescenceInFlight = undefined;
+      })
+      .catch(() => {});
+    return attempt;
+  };
+  const currentQuiescence = () => {
+    if (quiescenceInFlight) return quiescenceInFlight;
+    if (quiescenceAttempted) {
+      return Promise.resolve({ cleanupError: quiescenceError });
+    }
+    return undefined;
+  };
   const quiesceUncertainCommit = async (message) => {
     const uncertain = new AdvisoryLockError("lock_commit_uncertain", message);
-    markUnavailable("lock holder quiesced before confirming the atomic rename");
-    commitQuiescence ??= cleanup({ initialWaitMs: 0, signalWaitMs: signalGraceMs });
-    try {
-      await commitQuiescence;
-    } catch (error) {
-      uncertain.cause = error;
-    }
-    return uncertain;
+    const { cleanupError } = await beginQuiescence({
+      initialWaitMs: 0,
+      lossMessage: "authority advisory lock is unavailable",
+      pendingMessage: "lock holder quiesced before confirming the atomic rename",
+    });
+    return withCause(uncertain, cleanupError);
+  };
+  const beginUnexpectedLoss = () => {
+    return beginQuiescence({
+      initialWaitMs: 0,
+      lossMessage: "authority advisory lock process exited unexpectedly",
+      pendingMessage: "lock holder exited before confirming the atomic rename",
+    });
   };
   output.on("line", (line) => {
+    if (unavailable) return;
     let response;
     try {
       response = JSON.parse(line);
@@ -453,22 +508,39 @@ export async function acquireAdvisoryLock(
     }
   });
   child.once("exit", () => {
-    unavailable = true;
-    resolveLoss(
-      new AdvisoryLockError("lock_lost", "authority advisory lock process exited unexpectedly"),
-    );
-    rejectPendingCommands("lock holder exited before confirming the atomic rename");
+    void beginUnexpectedLoss();
   });
 
   return {
     async assertHeld() {
+      const processExited = child.exitCode !== null || child.signalCode !== null;
+      const lossSettlement =
+        !unavailable && processExited ? beginUnexpectedLoss() : currentQuiescence();
       if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {
-        throw new AdvisoryLockError("lock_lost", "authority advisory lock was lost");
+        const outcome = await lossSettlement;
+        throw withCause(
+          new AdvisoryLockError("lock_lost", "authority advisory lock was lost"),
+          outcome?.cleanupError,
+        );
       }
       await assertLockPathIdentity(lockPath, handle);
     },
     renameWhileHeld(source, destination) {
+      const processExited = child.exitCode !== null || child.signalCode !== null;
+      const lossSettlement =
+        !unavailable && processExited ? beginUnexpectedLoss() : currentQuiescence();
       if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {
+        if (lossSettlement) {
+          return lossSettlement.then(({ cleanupError }) => {
+            throw withCause(
+              new AdvisoryLockError(
+                "lock_commit_uncertain",
+                "authority advisory lock was lost",
+              ),
+              cleanupError,
+            );
+          });
+        }
         return Promise.reject(
           new AdvisoryLockError("lock_commit_uncertain", "authority advisory lock was lost"),
         );
@@ -499,10 +571,8 @@ export async function acquireAdvisoryLock(
       });
     },
     waitForLoss() {
-      if (unavailable || child.exitCode !== null || child.signalCode !== null) {
-        return Promise.resolve(
-          new AdvisoryLockError("lock_lost", "authority advisory lock is unavailable"),
-        );
+      if (!unavailable && (child.exitCode !== null || child.signalCode !== null)) {
+        beginUnexpectedLoss();
       }
       return loss;
     },
@@ -510,11 +580,13 @@ export async function acquireAdvisoryLock(
       if (released) return Promise.resolve();
       if (releaseInFlight) return releaseInFlight;
       const attempt = (async () => {
-        markUnavailable("lock released before confirming the atomic rename");
-        await cleanup({
+        const { cleanupError } = await beginQuiescence({
           initialWaitMs: releaseGraceMs,
-          signalWaitMs: signalGraceMs,
+          lossMessage: "authority advisory lock is unavailable",
+          pendingMessage: "lock released before confirming the atomic rename",
+          retry: true,
         });
+        if (cleanupError) throw cleanupError;
         released = true;
       })();
       releaseInFlight = attempt;

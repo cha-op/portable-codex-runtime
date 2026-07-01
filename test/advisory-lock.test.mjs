@@ -39,6 +39,9 @@ const DELAYED_HOLDER_FIXTURE = fileURLToPath(
 const KILL_LOCKF_PARENT_FIXTURE = fileURLToPath(
   new URL("../fixtures/kill-lockf-parent-holder.mjs", import.meta.url),
 );
+const KILL_LOCKF_PARENT_DURING_RENAME_FIXTURE = fileURLToPath(
+  new URL("../fixtures/kill-lockf-parent-during-rename-holder.mjs", import.meta.url),
+);
 const REPLACE_LOCK_BEFORE_READY_FIXTURE = fileURLToPath(
   new URL("../fixtures/replace-advisory-lock-before-ready-holder.mjs", import.meta.url),
 );
@@ -363,6 +366,102 @@ test(
     } finally {
       await lostLock?.release().catch(() => {});
       await recovered?.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "macOS lockf executor loss quiesces a pending rename before recovery",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-advisory-lockf-rename-loss-"));
+    const lockPath = join(root, "authority.lock");
+    const staleSource = join(root, "stale.next");
+    const secondStaleSource = join(root, "second-stale.next");
+    const lateSource = join(root, "late.next");
+    const recoveredSource = join(root, "recovered.next");
+    const destination = join(root, "auth.json");
+    const secondDestination = join(root, "second-auth.json");
+    const lateDestination = join(root, "late-auth.json");
+    const cleanupError = new Error("synthetic quiescence cleanup failure");
+    let groupCleanupFinished = false;
+    let resolveStopStarted;
+    const stopStarted = new Promise((resolve) => {
+      resolveStopStarted = resolve;
+    });
+    let stopCalls = 0;
+    let lostLock;
+    let recovered;
+    try {
+      await writeFile(staleSource, "stale\n", { mode: 0o600 });
+      await writeFile(secondStaleSource, "second stale\n", { mode: 0o600 });
+      await writeFile(lateSource, "late\n", { mode: 0o600 });
+      await writeFile(recoveredSource, "recovered\n", { mode: 0o600 });
+      lostLock = await acquireAdvisoryLock(lockPath, {
+        holderPath: KILL_LOCKF_PARENT_DURING_RENAME_FIXTURE,
+        signalGraceMs: 150,
+        stopProcess: async (child, options, defaultStopProcess) => {
+          stopCalls += 1;
+          resolveStopStarted();
+          await defaultStopProcess(child, options);
+          groupCleanupFinished = true;
+          if (stopCalls === 1) throw cleanupError;
+        },
+        startupTimeoutMs: 5_000,
+        timeoutMs: 10,
+      });
+      const assertSettledAfterCleanup = (promise) =>
+        promise.then(
+          () => assert.fail("rename unexpectedly succeeded"),
+          (error) => {
+            assert.equal(groupCleanupFinished, true);
+            return error;
+          },
+        );
+      const firstPending = assertSettledAfterCleanup(
+        lostLock.renameWhileHeld(staleSource, destination),
+      );
+      const secondPending = assertSettledAfterCleanup(
+        lostLock.renameWhileHeld(secondStaleSource, secondDestination),
+      );
+      const observedLoss = lostLock.waitForLoss().then((error) => {
+        assert.equal(groupCleanupFinished, true);
+        return error;
+      });
+      void firstPending.catch(() => {});
+      void secondPending.catch(() => {});
+      void observedLoss.catch(() => {});
+
+      await within(stopStarted, 1_000);
+      const lateRename = assertSettledAfterCleanup(
+        lostLock.renameWhileHeld(lateSource, lateDestination),
+      );
+      void lateRename.catch(() => {});
+
+      const [loss, firstError, secondError, lateError] = await Promise.all([
+        within(observedLoss, 2_000),
+        within(firstPending, 2_000),
+        within(secondPending, 2_000),
+        within(lateRename, 2_000),
+      ]);
+      assert.equal(loss.code, "lock_lost");
+      assert.equal(loss.cause, cleanupError);
+      for (const error of [firstError, secondError, lateError]) {
+        assert(error instanceof AdvisoryLockError);
+        assert.equal(error.code, "lock_commit_uncertain");
+        assert.equal(error.cause, cleanupError);
+      }
+      assert.equal(stopCalls, 1);
+
+      recovered = await acquireAdvisoryLock(lockPath);
+      await recovered.renameWhileHeld(recoveredSource, destination);
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      assert.equal(await readFile(destination, "utf8"), "recovered\n");
+      assert.equal(await readFile(staleSource, "utf8"), "stale\n");
+    } finally {
+      await lostLock?.release().catch(() => {});
+      await recovered?.release().catch(() => {});
       await rm(root, { recursive: true, force: true });
     }
   },

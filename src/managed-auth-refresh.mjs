@@ -637,13 +637,14 @@ async function closeFileHandle(handle, primaryFailure) {
 async function writeFileDurably(
   path,
   contents,
-  { flag = "wx", mode = 0o600, openFile = open } = {},
+  { beforeWrite, flag = "wx", mode = 0o600, openFile = open } = {},
 ) {
   let handle;
   let primaryFailure;
   try {
     handle = await openFile(path, flag, mode);
     await handle.chmod(mode);
+    await beforeWrite?.();
     await handle.writeFile(contents);
     await handle.sync();
   } catch (error) {
@@ -818,7 +819,9 @@ async function createStagingHome(
       "staging_not_durable",
       "authority filesystem cannot durably record the staging attempt",
     );
+    await assertAuthorityHomeCurrent(authority);
     await writeStagingFile(join(stagingHome, "auth.json"), rawAuth, {
+      beforeWrite: () => assertAuthorityHomeCurrent(authority),
       flag: "wx",
       mode: 0o600,
       openFile,
@@ -924,6 +927,7 @@ async function atomicallyPromoteAuth(
   commitRename,
   readCanonicalSource,
   syncDirectory,
+  openFile = open,
 ) {
   const authorityHome = authority.path;
   const destination = join(authorityHome, "auth.json");
@@ -934,12 +938,13 @@ async function atomicallyPromoteAuth(
   let operationError;
   try {
     await assertAuthorityHomeCurrent(authority);
-    handle = await open(
+    handle = await openFile(
       temporary,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
     await handle.chmod(0o600);
+    await assertAuthorityHomeCurrent(authority);
     await handle.writeFile(rawAuth);
     await handle.sync();
     await handle.close();
@@ -1015,7 +1020,16 @@ async function atomicallyPromoteAuth(
     operationError = error;
     throw error;
   } finally {
-    await handle?.close().catch(() => {});
+    let closeFailure;
+    try {
+      await closeFileHandle(
+        handle,
+        operationError === undefined ? undefined : { error: operationError },
+      );
+    } catch (error) {
+      closeFailure = error;
+      operationError = error;
+    }
     if (!renamed && !retainTemporary) {
       let authorityCurrent = false;
       try {
@@ -1033,6 +1047,7 @@ async function atomicallyPromoteAuth(
         }
       }
     }
+    if (closeFailure) throw closeFailure;
   }
 }
 
@@ -1428,11 +1443,17 @@ async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
   throw uncertain;
 }
 
-async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, stagingRoot }) {
+async function cleanupManagedRefreshArtifacts({
+  assertAuthorityCurrent,
+  preserveStaging,
+  stagingHome,
+  stagingRoot,
+}) {
   if (preserveStaging) return;
   if (stagingHome) {
     for (let attempt = 0; ; attempt += 1) {
       try {
+        await assertAuthorityCurrent();
         await rm(stagingHome, { recursive: true, force: true });
         break;
       } catch (error) {
@@ -1443,6 +1464,7 @@ async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, st
     }
   }
   if (stagingRoot) {
+    await assertAuthorityCurrent();
     await rmdir(stagingRoot).catch((error) => {
       if (!["ENOENT", "ENOTEMPTY"].includes(error?.code)) throw error;
     });
@@ -1686,6 +1708,7 @@ export async function refreshManagedAuthRecord({
       (source, destination) => lock.renameWhileHeld(source, destination),
       readCanonicalSource,
       syncDirectory,
+      openFile,
     );
     committedWarnings.push(...promotion.warnings);
     let promoted;
@@ -1797,31 +1820,47 @@ export async function refreshManagedAuthRecord({
 
   const cleanupWarnings = [...committedWarnings];
   let authorityCurrent = true;
-  try {
-    await assertAuthorityHomeCurrent(authority);
-  } catch (error) {
+  const recordAuthorityReplacement = (error) => {
     authorityCurrent = false;
-    if (primaryError && primaryError !== error && !error.cause) {
+    if (primaryError && primaryError !== error) {
       attachErrorCause(error, primaryError, { ifAbsent: true });
     }
     primaryError = error;
     cleanupWarnings.push("authority_home_replaced");
+  };
+  try {
+    await assertAuthorityHomeCurrent(authority);
+  } catch (error) {
+    recordAuthorityReplacement(error);
   }
   if (authorityCurrent) {
     try {
-      await cleanupArtifacts({ preserveStaging, stagingHome, stagingRoot });
-    } catch {
-      cleanupWarnings.push("staging_cleanup_failed");
-      if (stagingHome) {
-        try {
-          await lstat(stagingHome, { bigint: true });
-          if (primaryError && typeof primaryError === "object") {
-            primaryError = mutableManagedAuthRefreshError(primaryError);
-            attachRecoveryPaths(primaryError, [stagingHome]);
+      const cleanupOptions = {
+        assertAuthorityCurrent: () => assertAuthorityHomeCurrent(authority),
+        preserveStaging,
+        stagingHome,
+        stagingRoot,
+      };
+      await cleanupArtifacts(cleanupOptions, cleanupManagedRefreshArtifacts);
+    } catch (cleanupError) {
+      if (cleanupError?.code === "authority_home_replaced") {
+        recordAuthorityReplacement(cleanupError);
+      } else {
+        cleanupWarnings.push("staging_cleanup_failed");
+        if (stagingHome) {
+          try {
+            await assertAuthorityHomeCurrent(authority);
+            await lstat(stagingHome, { bigint: true });
+            if (primaryError && typeof primaryError === "object") {
+              primaryError = mutableManagedAuthRefreshError(primaryError);
+              attachRecoveryPaths(primaryError, [stagingHome]);
+            }
+            if (outcome) outcome.recoveryPath ??= stagingHome;
+          } catch (statError) {
+            if (statError?.code === "authority_home_replaced") {
+              recordAuthorityReplacement(statError);
+            }
           }
-          if (outcome) outcome.recoveryPath ??= stagingHome;
-        } catch {
-          // The staging home was removed before a later cleanup step failed.
         }
       }
     }
