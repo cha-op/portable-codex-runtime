@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import {
+  access,
   chmod,
   copyFile,
   lstat,
@@ -29,6 +30,11 @@ import {
   resolveAppServerExecutable,
   runSequentialCleanup,
 } from "./app-server-auth-probe.mjs";
+import {
+  authorityDirectoryPermissionsAreSafe,
+  pathHasExtendedAcl,
+  pathHasUnsafeAncestorAcl,
+} from "./managed-auth-refresh.mjs";
 
 export const PINNED_SOURCE_ANALYSIS_COMMIT =
   "db887d03e1f907467e33271572dffb73bceecd6b";
@@ -329,6 +335,17 @@ function portableMode(metadata) {
   return metadata.mode & 0o777;
 }
 
+async function assertSnapshotUserAccess(path, mode) {
+  try {
+    await access(path, mode);
+  } catch (error) {
+    if (error?.code === "EACCES" || error?.code === "EPERM") {
+      throw new Error("portable tree rejects entries inaccessible to the snapshot user");
+    }
+    throw error;
+  }
+}
+
 async function readPortableSymlink(path) {
   const bytes = await readlink(path, { encoding: "buffer" });
   const target = bytes.toString("utf8");
@@ -425,9 +442,32 @@ async function assertPortableSymlink({
     throw new Error("stopped-tree copy rejects non-relocatable relative symlinks");
   }
 
-  const targetRelativePath = relative(lexicalSourceRoot, sourceTarget);
-  let current = lexicalSourceRoot;
-  for (const component of targetRelativePath.split(sep).filter(Boolean)) {
+  let current = await realpath(dirname(source));
+  assert(
+    pathIsInside(sourceRoots[1], current),
+    "stopped-tree copy rejects relative symlinks outside the source tree",
+  );
+  let currentIsDirectory = true;
+  for (const component of target.split(sep)) {
+    if (component === "" || component === ".") {
+      if (!currentIsDirectory) {
+        throw new Error("stopped-tree copy rejects relative symlinks through non-directories");
+      }
+      continue;
+    }
+    if (component === "..") {
+      if (!currentIsDirectory) {
+        throw new Error("stopped-tree copy rejects relative symlinks through non-directories");
+      }
+      current = dirname(current);
+      if (!pathIsInside(sourceRoots[1], current)) {
+        throw new Error("stopped-tree copy rejects relative symlinks outside the source tree");
+      }
+      continue;
+    }
+    if (!currentIsDirectory) {
+      throw new Error("stopped-tree copy rejects relative symlinks through non-directories");
+    }
     const entries = await readPortableDirectory(current);
     if (!entries.includes(component)) {
       const portableComponent = component.normalize("NFC").toLowerCase();
@@ -440,19 +480,18 @@ async function assertPortableSymlink({
       }
       throw new Error("stopped-tree copy rejects dangling relative symlinks");
     }
-    current = join(current, component);
-  }
-  let canonicalSourceTarget;
-  try {
-    canonicalSourceTarget = await realpath(sourceTarget);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      throw new Error("stopped-tree copy rejects dangling relative symlinks");
+    try {
+      current = await realpath(join(current, component));
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw new Error("stopped-tree copy rejects dangling relative symlinks");
+      }
+      throw error;
     }
-    throw error;
-  }
-  if (!pathIsInside(sourceRoots[1], canonicalSourceTarget)) {
-    throw new Error("stopped-tree copy rejects relative symlinks outside the source tree");
+    if (!pathIsInside(sourceRoots[1], current)) {
+      throw new Error("stopped-tree copy rejects relative symlinks outside the source tree");
+    }
+    currentIsDirectory = (await stat(current)).isDirectory();
   }
 }
 
@@ -468,6 +507,7 @@ async function copyTreeEntry(context, source, destination) {
     return;
   }
   if (metadata.isDirectory()) {
+    await assertSnapshotUserAccess(source, fsConstants.R_OK | fsConstants.X_OK);
     const finalMode = portableMode(metadata);
     await mkdir(destination, { mode: 0o700 });
     await chmod(destination, 0o700);
@@ -481,6 +521,7 @@ async function copyTreeEntry(context, source, destination) {
   if (!metadata.isFile()) {
     throw new Error("stopped-tree copy rejects sockets, devices, and FIFOs");
   }
+  await assertSnapshotUserAccess(source, fsConstants.R_OK);
   if (metadata.nlink !== 1) throw new Error("stopped-tree copy rejects hard-linked files");
   const finalMode = portableMode(metadata);
   await copyFile(source, destination);
@@ -559,12 +600,14 @@ async function hashTreeEntry(hash, root, path) {
     return;
   }
   if (metadata.isDirectory()) {
+    await assertSnapshotUserAccess(path, fsConstants.R_OK | fsConstants.X_OK);
     updateHashFields(hash, ["directory", entryPath, portableMode(metadata)]);
     const entries = await readPortableDirectory(path);
     for (const entry of entries) await hashTreeEntry(hash, root, join(path, entry));
     return;
   }
   if (!metadata.isFile()) throw new Error("tree digest rejects non-file entries");
+  await assertSnapshotUserAccess(path, fsConstants.R_OK);
   if (metadata.nlink !== 1) throw new Error("tree digest rejects hard-linked files");
   updateHashFields(hash, [
     "file",
@@ -937,7 +980,7 @@ function assertRecoveryEvidenceSchema(report) {
     ["schemaVersion", "probe", "runtime", "backend", "snapshot", "scenarios", "result"],
     "recovery evidence",
   );
-  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.schemaVersion, 3);
   assert.equal(report.probe, "interrupted-turn-recovery");
   assert.equal(report.result, "passed");
 
@@ -965,12 +1008,18 @@ function assertRecoveryEvidenceSchema(report) {
 
   assertExactObject(
     report.backend,
-    ["type", "realModelTurn", "authMaterialUsed"],
+    [
+      "type",
+      "realModelTurnConfigured",
+      "credentialInputProvisioned",
+      "outboundNetworkIsolated",
+    ],
     "backend evidence",
   );
   assert.equal(report.backend.type, "loopback-held-responses-mock");
-  assert.equal(report.backend.realModelTurn, false);
-  assert.equal(report.backend.authMaterialUsed, false);
+  assert.equal(report.backend.realModelTurnConfigured, false);
+  assert.equal(report.backend.credentialInputProvisioned, false);
+  assert.equal(report.backend.outboundNetworkIsolated, false);
 
   assertExactObject(
     report.snapshot,
@@ -1224,9 +1273,84 @@ async function assertPrivateBinaryIntegrity(path, expectedDigest) {
   );
 }
 
+async function assertTrustedExecutableRoot(
+  path,
+  identity,
+  {
+    currentUid,
+    inspectAncestorAcl = pathHasUnsafeAncestorAcl,
+    inspectRootAcl = pathHasExtendedAcl,
+  },
+) {
+  const safeDirectory = (metadata, childUid) =>
+    authorityDirectoryPermissionsAreSafe(
+      {
+        isDirectory: metadata.isDirectory(),
+        mode: metadata.mode,
+        uid: metadata.uid,
+      },
+      {
+        allowRootOwner: true,
+        allowStickyShared: true,
+        brokerUid: currentUid,
+        childUid,
+        disallowedModeBits: 0o022,
+      },
+    );
+
+  assert(
+    safeDirectory(identity, currentUid),
+    "recovery executable root must have trusted ownership and permissions",
+  );
+  let rootHasExtendedAcl;
+  try {
+    rootHasExtendedAcl = await inspectRootAcl(path);
+  } catch {
+    throw new Error("recovery executable root ACL could not be validated");
+  }
+  assert.equal(
+    rootHasExtendedAcl,
+    false,
+    "recovery executable root must not have extended access controls",
+  );
+
+  let childUid = identity.uid;
+  let ancestor = dirname(path);
+  while (true) {
+    let metadata;
+    try {
+      metadata = await lstat(ancestor);
+    } catch {
+      throw new Error("recovery executable root ancestor chain could not be validated");
+    }
+    assert(
+      safeDirectory(metadata, childUid),
+      "recovery executable root ancestor chain is not trusted",
+    );
+    let ancestorHasUnsafeAcl;
+    try {
+      ancestorHasUnsafeAcl = await inspectAncestorAcl(ancestor);
+    } catch {
+      throw new Error("recovery executable root ancestor ACL could not be validated");
+    }
+    assert.equal(
+      ancestorHasUnsafeAcl,
+      false,
+      "recovery executable root ancestor chain has unsafe access controls",
+    );
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    childUid = metadata.uid;
+    ancestor = parent;
+  }
+}
+
 export async function probeInterruptedTurnRecovery({
   codexBin = process.env.CODEX_BIN,
   evidencePath,
+  executableRoot = process.env.CODEX_RECOVERY_EXEC_ROOT ?? tmpdir(),
+  inspectExecutableAncestorAcl = pathHasUnsafeAncestorAcl,
+  inspectExecutableRootAcl = pathHasExtendedAcl,
   readCodexVersion = codexVersion,
   runScenario = runRecoveryScenario,
   scenarios = RECOVERY_SCENARIOS,
@@ -1236,15 +1360,28 @@ export async function probeInterruptedTurnRecovery({
   if (typeof codexBin !== "string" || !isAbsolute(codexBin)) {
     throw new Error("CODEX_BIN must be an absolute pinned-image path");
   }
+  if (typeof executableRoot !== "string" || !isAbsolute(executableRoot)) {
+    throw new Error("recovery executable root must be an absolute path");
+  }
   const executable = resolveAppServerExecutable(codexBin);
   const binary = await realpath(executable);
   const binaryMetadata = await stat(binary);
   assert(binaryMetadata.isFile(), "CODEX_BIN must resolve to a regular file");
+  const canonicalExecutableRoot = await realpath(executableRoot);
+  const executableRootMetadata = await stat(canonicalExecutableRoot);
+  assert(executableRootMetadata.isDirectory(), "recovery executable root must be a directory");
+  const currentUid = process.geteuid?.() ?? process.getuid?.();
+  assert.notEqual(currentUid, undefined, "recovery executable root requires a POSIX host");
+  await assertTrustedExecutableRoot(canonicalExecutableRoot, executableRootMetadata, {
+    currentUid,
+    inspectAncestorAcl: inspectExecutableAncestorAcl,
+    inspectRootAcl: inspectExecutableRootAcl,
+  });
   assert.deepEqual([...scenarios], RECOVERY_SCENARIOS, "the evidence probe requires all scenarios");
   let binaryRoot;
   let primaryFailure;
   try {
-    binaryRoot = await mkdtemp(join(tmpdir(), "portable-codex-binary-"));
+    binaryRoot = await mkdtemp(join(canonicalExecutableRoot, "portable-codex-binary-"));
     await chmod(binaryRoot, 0o700);
     const privateBinary = join(binaryRoot, "codex");
     await copyFile(binary, privateBinary);
@@ -1263,7 +1400,7 @@ export async function probeInterruptedTurnRecovery({
       (scenario) => scenario.kind === "snapshot_restore",
     );
     const report = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       probe: "interrupted-turn-recovery",
       runtime: {
         codexVersion: binaryVersion,
@@ -1275,8 +1412,9 @@ export async function probeInterruptedTurnRecovery({
       },
       backend: {
         type: "loopback-held-responses-mock",
-        realModelTurn: false,
-        authMaterialUsed: false,
+        realModelTurnConfigured: false,
+        credentialInputProvisioned: false,
+        outboundNetworkIsolated: false,
       },
       snapshot: snapshotScenario.snapshot,
       scenarios: scenarioReports.map(({ snapshot: _snapshot, ...scenario }) => scenario),

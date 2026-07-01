@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "probe": "interrupted-turn-recovery",
   "runtime": {
     "codexVersion": "codex-cli 0.142.4",
@@ -11,8 +11,9 @@
   },
   "backend": {
     "type": "loopback-held-responses-mock",
-    "realModelTurn": false,
-    "authMaterialUsed": false
+    "realModelTurnConfigured": false,
+    "credentialInputProvisioned": false,
+    "outboundNetworkIsolated": false
   },
   "snapshot": {
     "kind": "stopped-tree-copy",

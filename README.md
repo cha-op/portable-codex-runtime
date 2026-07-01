@@ -38,10 +38,12 @@ The probe verifies the explicit thread ID through both `thread/resume` and
 `thread/read`. Explicit interruption persists a model-visible abort marker.
 Signal and hard-kill recovery instead normalizes the stale in-progress turn to
 `interrupted` without inventing that marker. The stopped-tree copy preserves
-regular files, directories, POSIX rwx permission bits, and portable UTF-8
-symlinks without following links. Non-ASCII cased names, case-insensitive or
-Unicode-normalized name collisions, dangling relative links, relative-link
-case or normalization aliases, non-relocatable links, special permission bits,
+snapshot-user-accessible regular files, directories, POSIX rwx permission bits,
+and portable UTF-8 symlinks without following links. Inaccessible entries,
+non-ASCII cased names, case-insensitive or Unicode-normalized name collisions,
+dangling relative links, relative-link
+case or normalization aliases, traversal through non-directories,
+non-relocatable links, special permission bits,
 hard links (including hard-linked symlinks), sockets, FIFOs, and devices fail
 closed. Ownership, ACLs,
 extended attributes,
@@ -56,6 +58,11 @@ CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
   npm run probe:turn-recovery
 ```
 
+If the system temporary filesystem is mounted `noexec`, set
+`CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
+filesystem with a trusted owner, ancestor chain, and ACL state; the probe
+creates and removes its own mode `0700` subdirectory there.
+
 To update the redacted evidence after an intentional runtime upgrade:
 
 ```bash
@@ -63,8 +70,10 @@ CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
   npm run probe:turn-recovery -- --write-evidence
 ```
 
-The command does not read `auth.json`, send a real model turn, or use external
-network access. See `docs/experiments/interrupted-turn-recovery.md` for source
+The command provisions no credential input and configures the model provider to
+use the loopback mock. It does not impose OS-level outbound network isolation;
+run it inside a network-isolated container when that stronger evidence is
+required. See `docs/experiments/interrupted-turn-recovery.md` for source
 evidence, exact semantics, and storage limitations.
 
 ## Managed Auth Refresh Authority

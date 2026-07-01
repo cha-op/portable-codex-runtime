@@ -73,7 +73,7 @@ function completeEvidenceReport() {
     return scenario;
   });
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     probe: "interrupted-turn-recovery",
     runtime: {
       codexVersion: "codex-cli 0.142.4",
@@ -85,8 +85,9 @@ function completeEvidenceReport() {
     },
     backend: {
       type: "loopback-held-responses-mock",
-      realModelTurn: false,
-      authMaterialUsed: false,
+      realModelTurnConfigured: false,
+      credentialInputProvisioned: false,
+      outboundNetworkIsolated: false,
     },
     snapshot: scenarioReport("snapshot_restore").snapshot,
     scenarios,
@@ -549,6 +550,51 @@ test("stopped-tree copy rejects relative symlinks whose meaning changes after re
   }
 });
 
+test("stopped-tree copy rejects relative symlink chains that leave and reenter the source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-chain-test-"));
+  try {
+    const source = join(root, "source");
+    const external = join(root, "external");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await mkdir(external);
+    await writeFile(join(source, "target"), "sentinel");
+    await symlink(external, join(source, "link"));
+    await symlink(join(source, "target"), join(external, "back"));
+    await symlink("link/back", join(source, "alias"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /relative symlinks outside the source tree/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy preserves non-directory path component semantics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-nondir-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const linkPath = join(source, "link");
+    await mkdir(source);
+    await writeFile(join(source, "file"), "not a directory");
+    await writeFile(join(source, "target"), "sentinel");
+    for (const target of ["file/../target", "file/.", "file/"]) {
+      await symlink(target, linkPath);
+      await assert.rejects(
+        copyStoppedTree({ ownedRoot: root, source, destination }),
+        /relative symlinks through non-directories/,
+      );
+      await assert.rejects(lstat(destination), /ENOENT/);
+      await rm(linkPath);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects relative symlink case aliases", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-case-test-"));
   try {
@@ -634,6 +680,33 @@ test("stopped-tree copy rejects special permission bits and hard-link topology",
   }
 });
 
+test("portable tree operations reject entries inaccessible to the snapshot user", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-inaccessible-test-"));
+  const source = join(root, "source");
+  const inaccessibleFile = join(source, "inaccessible");
+  try {
+    await mkdir(source);
+    await writeFile(inaccessibleFile, "sentinel");
+    await chmod(inaccessibleFile, 0o000);
+    await assert.rejects(
+      digestTree(source),
+      /entries inaccessible to the snapshot user/,
+    );
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination: join(root, "destination"),
+      }),
+      /entries inaccessible to the snapshot user/,
+    );
+    await assert.rejects(lstat(join(root, "destination")), /ENOENT/);
+  } finally {
+    await chmod(inaccessibleFile, 0o600).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "portable tree operations reject hard-linked symlinks",
   { skip: platform() !== "linux" },
@@ -665,7 +738,7 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
     assert.throws(
       () => assertRecoveryEvidenceSafe({ ...report, schemaVersion: 1 }),
-      /1 !== 2/,
+      /1 !== 3/,
     );
     for (const unsafe of [
       { ...report, cwd: "/Users/example/private" },
@@ -719,11 +792,11 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     const serialized = JSON.stringify(report);
     for (const duplicate of [
-      serialized.replace('"schemaVersion":2', '"schemaVersion":1,"schemaVersion":2'),
+      serialized.replace('"schemaVersion":3', '"schemaVersion":1,"schemaVersion":3'),
       serialized.replace('"result":"passed"', '"result":"failed","result":"passed"'),
       serialized.replace(
-        '"schemaVersion":2',
-        '"\\u0073chemaVersion":1,"schemaVersion":2',
+        '"schemaVersion":3',
+        '"\\u0073chemaVersion":1,"schemaVersion":3',
       ),
     ]) {
       assert.throws(
@@ -872,14 +945,15 @@ test("probe report contains all four recovery scenarios without runtime identifi
     },
   });
   assert.deepEqual(calls, RECOVERY_SCENARIOS);
-  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.schemaVersion, 3);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert(scenarioBinaries.every((binary) => binary === versionBinary));
   assert.notEqual(versionBinary, process.execPath);
   await assert.rejects(lstat(versionBinary), /ENOENT/);
   assert.equal(report.runtime.sourceAnalysisCommit, PINNED_SOURCE_ANALYSIS_COMMIT);
-  assert.equal(report.backend.realModelTurn, false);
-  assert.equal(report.backend.authMaterialUsed, false);
+  assert.equal(report.backend.realModelTurnConfigured, false);
+  assert.equal(report.backend.credentialInputProvisioned, false);
+  assert.equal(report.backend.outboundNetworkIsolated, false);
   assert.equal(report.snapshot.kind, "stopped-tree-copy");
   assert.equal(report.scenarios.length, 4);
   assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
@@ -903,6 +977,87 @@ test("probe rejects private binary mode changes between scenarios", async () => 
   );
   assert.equal(calls, 1);
   await assert.rejects(lstat(privateBinary), /ENOENT/);
+});
+
+test("probe stages its private binary under an explicit executable root", async () => {
+  const executableRoot = await mkdtemp(join(tmpdir(), "portable-executable-root-test-"));
+  let privateBinary;
+  try {
+    await probeInterruptedTurnRecovery({
+      codexBin: process.execPath,
+      executableRoot,
+      readCodexVersion: (codexBin) => {
+        privateBinary = codexBin;
+        return "codex-cli 0.142.4";
+      },
+      runScenario: async ({ kind }) => scenarioReport(kind),
+    });
+    assert.equal(dirname(dirname(privateBinary)), await realpath(executableRoot));
+    await assert.rejects(lstat(privateBinary), /ENOENT/);
+  } finally {
+    await rm(executableRoot, { recursive: true, force: true });
+  }
+});
+
+test("probe rejects an untrusted writable executable root", async () => {
+  const executableRoot = await mkdtemp(join(tmpdir(), "portable-unsafe-exec-root-test-"));
+  try {
+    await chmod(executableRoot, 0o777);
+    await assert.rejects(
+      probeInterruptedTurnRecovery({
+        codexBin: process.execPath,
+        executableRoot,
+        readCodexVersion: () => "codex-cli 0.142.4",
+        runScenario: async ({ kind }) => scenarioReport(kind),
+      }),
+      /recovery executable root must have trusted ownership and permissions/,
+    );
+  } finally {
+    await chmod(executableRoot, 0o700).catch(() => {});
+    await rm(executableRoot, { recursive: true, force: true });
+  }
+});
+
+test("probe rejects an executable root below an unsafe ancestor", async () => {
+  const container = await mkdtemp(join(tmpdir(), "portable-unsafe-exec-parent-test-"));
+  const unsafeParent = join(container, "unsafe-parent");
+  const executableRoot = join(unsafeParent, "safe-root");
+  try {
+    await mkdir(executableRoot, { recursive: true });
+    await chmod(unsafeParent, 0o777);
+    await chmod(executableRoot, 0o700);
+    await assert.rejects(
+      probeInterruptedTurnRecovery({
+        codexBin: process.execPath,
+        executableRoot,
+        readCodexVersion: () => "codex-cli 0.142.4",
+        runScenario: async ({ kind }) => scenarioReport(kind),
+      }),
+      /recovery executable root ancestor chain is not trusted/,
+    );
+  } finally {
+    await chmod(unsafeParent, 0o700).catch(() => {});
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("probe rejects executable-root ACLs through the inspection seam", async () => {
+  const executableRoot = await mkdtemp(join(tmpdir(), "portable-exec-root-acl-test-"));
+  try {
+    await assert.rejects(
+      probeInterruptedTurnRecovery({
+        codexBin: process.execPath,
+        executableRoot,
+        inspectExecutableAncestorAcl: async () => false,
+        inspectExecutableRootAcl: async () => true,
+        readCodexVersion: () => "codex-cli 0.142.4",
+        runScenario: async ({ kind }) => scenarioReport(kind),
+      }),
+      /recovery executable root must not have extended access controls/,
+    );
+  } finally {
+    await rm(executableRoot, { recursive: true, force: true });
+  }
 });
 
 test("probe requires an absolute binary and the complete scenario matrix", async () => {

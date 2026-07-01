@@ -17,7 +17,8 @@ superseded_by:
 - Characterized explicit interruption, `SIGTERM`, `SIGKILL`, and stopped-tree
   restore behavior through a real Codex app-server and loopback model mock.
 - Preserved a deterministic probe, safety tests, source analysis, and redacted
-  evidence without reading credentials or starting a real model turn.
+  evidence with no credential input provisioned and the model provider
+  configured for a loopback mock.
 
 ## Current State
 
@@ -28,7 +29,8 @@ superseded_by:
 - The same explicit thread ID resumes after the complete session tree is copied
   only after process exit, removed, and restored at a different absolute path.
 - The copy preserves portable symlinks without following them and fails closed
-  on non-relocatable links, special permission bits, hard links, sockets, FIFOs,
+  on inaccessible entries, symlink chains that leave the source tree,
+  non-relocatable links, special permission bits, hard links, sockets, FIFOs,
   and devices.
 - Codex flush is not an fsync barrier, rollout-tail repair remains absent, and
   background terminals are not filesystem-migratable state.

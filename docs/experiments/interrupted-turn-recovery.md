@@ -39,18 +39,21 @@ matched by its exact turn ID and captures the single corresponding next
 loopback request to distinguish a persisted abort marker from view-only
 normalization.
 
-The snapshot scenario copies the entire synthetic session tree, including
-`CODEX_HOME` and workspace, after the killed process has exited. It hashes
+The snapshot scenario copies every snapshot-user-accessible entry in the
+synthetic session tree, including `CODEX_HOME` and workspace, after the killed
+process has exited. It hashes
 relative paths, entry types, POSIX rwx permission bits, file bytes, and symlink
 targets before and after copy. Portable UTF-8 entry names without non-ASCII
 cased characters in either their raw or NFC-normalized form, or collisions
 under NFC normalization plus ASCII lowercase comparison, existing relocatable
 relative symlinks, and external absolute links are copied without following
 symlink targets. Unsupported cased names, name collisions, non-UTF-8 entry
-names, absolute links back into the source tree, dangling relative links,
-relative-link case or normalization aliases, relative links whose meaning
-changes after relocation, special permission bits, hard-linked files or
-symlinks, sockets, FIFOs, and devices fail closed. The source tree
+names, inaccessible entries, absolute links back into the source tree,
+dangling relative links, relative-link case or normalization aliases, relative
+link traversal through non-directories, resolution chains that leave the source
+tree, relative links whose meaning changes after relocation, special permission
+bits, hard-linked files or symlinks, sockets, FIFOs, and devices fail closed.
+The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
 the restored workspace path explicitly. Its runtime `cwd` response and the
 latest environment context in the follow-up model request must both resolve to
@@ -77,16 +80,29 @@ claim that the installed binary was built from that exact commit. The redacted
 machine-readable result is stored in
 `evidence/interrupted-turn-recovery.json`. It contains no thread or turn IDs,
 paths, prompts, model output, credentials, account identifiers, or hostnames.
-Schema version 2 records the private binary execution mode and the exact
-`copy-original-path-absent-held-tree-000` cold-read isolation mode; schema 1
-evidence is rejected.
+Schema version 3 records the private binary execution mode, the exact
+`copy-original-path-absent-held-tree-000` cold-read isolation mode, and the
+distinction between configured inputs and OS-enforced isolation; older evidence
+is rejected.
 
-Run the compatibility probe with no real model or credential access:
+Run the compatibility probe with no credential input and a loopback model
+provider:
 
 ```bash
 CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
   npm run probe:turn-recovery
 ```
+
+If the default temporary filesystem is mounted `noexec`, set
+`CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
+filesystem. The root must be owned by the current user or root; if it is
+group/world-writable, it must have the sticky bit. The complete canonical
+ancestor chain must be owned by the current user or root, non-writable except
+for sticky shared ancestors, and free of unsafe extended ACLs; the root itself
+must have no extended ACL. The probe creates a mode `0700` subdirectory there,
+executes a mode `0500` private Codex copy, and removes the subdirectory after
+the matrix. This override is execution scratch only and must not point into the
+recoverable session tree.
 
 ## Upstream Semantics
 
@@ -153,6 +169,11 @@ restore interfaces.
   snapshot, or proof of power-loss durability.
 - The test uses a localhost held-response mock and proves Codex compatibility,
   not real backend behavior.
+- The probe provisions an isolated `CODEX_HOME`, an allowlisted worker
+  environment, and a provider with `requires_openai_auth = false`; it does not
+  prove that the app-server process could not read unrelated host files or make
+  unrelated outbound connections. Use container-level filesystem and network
+  isolation when that stronger claim is required.
 - The probe covers a clean JSONL prefix after process termination. It documents
   but does not inject or repair torn JSON, a missing final newline, filesystem
   writeback loss, or inconsistent SQLite WAL state.
@@ -167,11 +188,12 @@ restore interfaces.
   the compatibility probe fails until that changed shutdown contract is reviewed.
 - Portable UTF-8 directory entry names, existing relocatable relative symlink
   targets, and existing external absolute symlink targets are preserved exactly;
-  non-ASCII cased
-  names, case-insensitive or Unicode-normalized name collisions, non-UTF-8 names
-  or targets, dangling absolute or relative targets, internal absolute targets,
-  relative-link case or normalization aliases, and non-relocatable relative
-  targets fail closed. A fixed
+  entries inaccessible to the snapshot user, non-ASCII cased names,
+  case-insensitive or Unicode-normalized name collisions, non-UTF-8 names or
+  targets, dangling absolute or relative targets, internal absolute targets,
+  relative-link case or normalization aliases, traversal through
+  non-directories, resolution chains that leave the source tree, and
+  non-relocatable relative targets fail closed. A fixed
   runtime image must provide every external target, such as a Codex helper path,
   at a compatible location during copy and after migration.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,
