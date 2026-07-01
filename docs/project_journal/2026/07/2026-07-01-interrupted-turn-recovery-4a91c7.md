@@ -32,10 +32,12 @@ superseded_by:
   on inaccessible entries, symlink chains that leave the source tree,
   non-relocatable links, special permission bits, hard links, sockets, FIFOs,
   and devices.
-- The copy requires a current-user-owned, mode `0700`, extended-ACL-free root;
+- The copy holds a current-user-owned, mode `0700`, extended-ACL-free root and
+  validates its complete trusted ancestor chain;
   redacted evidence publication separately requires a pre-existing trusted
   directory authority, retains pre-rename temp artifacts for owner cleanup, and
-  reports post-rename directory-sync failures as durability-uncertain.
+  reports post-rename directory-sync failures through the CLI as
+  `evidence_durability_uncertain` without exception details.
 - Codex flush is not an fsync barrier, rollout-tail repair remains absent, and
   background terminals are not filesystem-migratable state.
 

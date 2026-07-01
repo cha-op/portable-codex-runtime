@@ -324,8 +324,9 @@ export async function terminateAppServer(
   return { signal: exitResult[1] };
 }
 
-async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist }) {
-  const canonicalRoot = await realpath(ownedRoot);
+async function assertDirectOwnedPath(ownedRootAuthority, candidate, label, { mustExist }) {
+  await ownedRootAuthority.assertCurrent();
+  const canonicalRoot = ownedRootAuthority.path;
   const canonicalParent = await realpath(dirname(candidate));
   assert.equal(canonicalParent, canonicalRoot, `${label} must be a direct owned child`);
   const candidateName = basename(candidate);
@@ -345,13 +346,50 @@ async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist })
     assert(metadata.isDirectory(), `${label} must be a directory`);
     assert(!metadata.isSymbolicLink(), `${label} must not be a symlink`);
   } catch (error) {
-    if (!mustExist && error?.code === "ENOENT") return canonicalCandidate;
+    if (!mustExist && error?.code === "ENOENT") {
+      await ownedRootAuthority.assertCurrent();
+      return canonicalCandidate;
+    }
     throw error;
   }
+  await ownedRootAuthority.assertCurrent();
   return canonicalCandidate;
 }
 
-async function assertPrivateOwnedRoot(ownedRoot, inspectRootAcl) {
+function stoppedTreeAncestorPermissionsAreSafe(metadata, childUid, currentUid) {
+  return authorityDirectoryPermissionsAreSafe(
+    {
+      isDirectory: metadata.isDirectory(),
+      mode: metadata.mode,
+      uid: metadata.uid,
+    },
+    {
+      allowRootOwner: true,
+      allowStickyShared: true,
+      brokerUid: currentUid,
+      childUid,
+      disallowedModeBits: 0o022,
+    },
+  );
+}
+
+async function inspectStoppedTreeAcl(inspector, path, invalidMessage, unsafeMessage) {
+  let unsafe;
+  try {
+    unsafe = await inspector(path);
+  } catch {
+    throw new Error(invalidMessage);
+  }
+  assert.equal(unsafe, false, unsafeMessage);
+}
+
+async function openPrivateOwnedRootAuthority(
+  ownedRoot,
+  {
+    inspectAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
+    inspectRootAcl = recoveryPathHasExtendedAcl,
+  } = {},
+) {
   const requestedRoot = resolve(ownedRoot);
   const metadata = await lstat(requestedRoot, { bigint: true });
   const currentUid = process.geteuid?.() ?? process.getuid?.();
@@ -376,23 +414,103 @@ async function assertPrivateOwnedRoot(ownedRoot, inspectRootAcl) {
     metadata,
     "stopped-tree copy rejects owned-root identity changes",
   );
-  let hasExtendedAcl;
+  const handle = await open(
+    canonicalRoot,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  const ancestors = [];
+  let primaryFailure;
   try {
-    hasExtendedAcl = await inspectRootAcl(canonicalRoot);
-  } catch {
-    throw new Error("stopped-tree owned root ACL could not be validated");
+    const heldIdentity = await handle.stat({ bigint: true });
+    assert(
+      heldIdentity.isDirectory() && sameFileIdentity(metadata, heldIdentity),
+      "stopped-tree copy rejects owned-root identity changes",
+    );
+    await inspectStoppedTreeAcl(
+      inspectRootAcl,
+      canonicalRoot,
+      "stopped-tree owned root ACL could not be validated",
+      "stopped-tree owned root must not have extended access controls",
+    );
+
+    let childUid = metadata.uid;
+    let ancestorPath = dirname(canonicalRoot);
+    while (true) {
+      const ancestorIdentity = await lstat(ancestorPath, { bigint: true });
+      assert(
+        stoppedTreeAncestorPermissionsAreSafe(ancestorIdentity, childUid, currentUid),
+        "stopped-tree owned root ancestor chain is not trusted",
+      );
+      await inspectStoppedTreeAcl(
+        inspectAncestorAcl,
+        ancestorPath,
+        "stopped-tree owned root ancestor ACL could not be validated",
+        "stopped-tree owned root ancestor chain has unsafe access controls",
+      );
+      ancestors.push({ identity: ancestorIdentity, path: ancestorPath });
+      const parent = dirname(ancestorPath);
+      if (parent === ancestorPath) break;
+      childUid = ancestorIdentity.uid;
+      ancestorPath = parent;
+    }
+
+    const authority = {
+      ancestors,
+      currentUid,
+      handle,
+      identity: metadata,
+      inspectAncestorAcl,
+      inspectRootAcl,
+      path: canonicalRoot,
+    };
+    authority.assertCurrent = async () => {
+      const [current, held] = await Promise.all([
+        lstat(authority.path, { bigint: true }),
+        authority.handle.stat({ bigint: true }),
+      ]);
+      assert(
+        current.isDirectory() &&
+          sameFileIdentity(current, authority.identity) &&
+          sameFileIdentity(held, authority.identity) &&
+          current.uid === BigInt(authority.currentUid) &&
+          Number(current.mode & 0o777n) === 0o700,
+        "stopped-tree copy rejects owned-root identity or permission changes",
+      );
+      await inspectStoppedTreeAcl(
+        authority.inspectRootAcl,
+        authority.path,
+        "stopped-tree owned root ACL could not be validated",
+        "stopped-tree owned root must not have extended access controls",
+      );
+      let currentChildUid = current.uid;
+      for (const ancestor of authority.ancestors) {
+        const currentAncestor = await lstat(ancestor.path, { bigint: true });
+        assert(
+          sameFileIdentity(currentAncestor, ancestor.identity) &&
+            stoppedTreeAncestorPermissionsAreSafe(
+              currentAncestor,
+              currentChildUid,
+              authority.currentUid,
+            ),
+          "stopped-tree owned root ancestor identity or permissions changed",
+        );
+        await inspectStoppedTreeAcl(
+          authority.inspectAncestorAcl,
+          ancestor.path,
+          "stopped-tree owned root ancestor ACL could not be validated",
+          "stopped-tree owned root ancestor chain has unsafe access controls",
+        );
+        currentChildUid = currentAncestor.uid;
+      }
+    };
+    await authority.assertCurrent();
+    return authority;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    if (primaryFailure) await runSequentialCleanup([() => handle.close()], primaryFailure);
   }
-  assert.equal(
-    hasExtendedAcl,
-    false,
-    "stopped-tree owned root must not have extended access controls",
-  );
-  await assertPathIdentity(
-    requestedRoot,
-    metadata,
-    "stopped-tree copy rejects owned-root identity changes",
-  );
-  return canonicalRoot;
 }
 
 function pathIsInside(root, candidate) {
@@ -1106,32 +1224,40 @@ export async function copyStoppedTree({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  inspectOwnedRootAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
   inspectOwnedRootAcl = recoveryPathHasExtendedAcl,
   inspectSymlinkPath = lstat,
   listMountPoints = listCurrentMountPoints,
 }) {
-  const canonicalOwnedRoot = await assertPrivateOwnedRoot(ownedRoot, inspectOwnedRootAcl);
-  const canonicalSource = await assertDirectOwnedPath(canonicalOwnedRoot, source, "source", {
-    mustExist: true,
+  const ownedRootAuthority = await openPrivateOwnedRootAuthority(ownedRoot, {
+    inspectAncestorAcl: inspectOwnedRootAncestorAcl,
+    inspectRootAcl: inspectOwnedRootAcl,
   });
-  const canonicalSourceRoot = await realpath(canonicalSource);
-  const sourceRootIdentity = await lstat(canonicalSource, { bigint: true });
-  assert(
-    sourceRootIdentity.isDirectory(),
-    "stopped-tree copy rejects source root identity changes",
-  );
-  await assertNoMountBoundary(canonicalSource, listMountPoints);
-  const canonicalDestination = await assertDirectOwnedPath(
-    canonicalOwnedRoot,
-    destination,
-    "destination",
-    { mustExist: false },
-  );
-  await afterDestinationValidation?.();
   let destinationRootHandle;
   let destinationRootIdentity;
   let primaryFailure;
   try {
+    const canonicalSource = await assertDirectOwnedPath(
+      ownedRootAuthority,
+      source,
+      "source",
+      { mustExist: true },
+    );
+    const canonicalSourceRoot = await realpath(canonicalSource);
+    const sourceRootIdentity = await lstat(canonicalSource, { bigint: true });
+    assert(
+      sourceRootIdentity.isDirectory(),
+      "stopped-tree copy rejects source root identity changes",
+    );
+    await assertNoMountBoundary(canonicalSource, listMountPoints);
+    const canonicalDestination = await assertDirectOwnedPath(
+      ownedRootAuthority,
+      destination,
+      "destination",
+      { mustExist: false },
+    );
+    await afterDestinationValidation?.();
+    await ownedRootAuthority.assertCurrent();
     mkdirPrivate(canonicalDestination);
     destinationRootIdentity = await lstat(canonicalDestination, { bigint: true });
     await afterDestinationRootCreated?.();
@@ -1152,6 +1278,7 @@ export async function copyStoppedTree({
     );
     await destinationRootHandle.chmod(0o700);
     const assertDestinationRootCurrent = async () => {
+      await ownedRootAuthority.assertCurrent();
       const heldIdentity = await destinationRootHandle.stat({ bigint: true });
       const currentIdentity = await assertPathIdentity(
         canonicalDestination,
@@ -1203,7 +1330,10 @@ export async function copyStoppedTree({
     primaryFailure = { error };
     throw error;
   } finally {
-    await runSequentialCleanup([() => destinationRootHandle?.close()], primaryFailure);
+    await runSequentialCleanup(
+      [() => destinationRootHandle?.close(), () => ownedRootAuthority.handle.close()],
+      primaryFailure,
+    );
   }
 }
 
@@ -2520,9 +2650,48 @@ export async function probeInterruptedTurnRecovery({
   }
 }
 
-export function interruptedTurnRecoveryFailureReport() {
+export function interruptedTurnRecoveryFailureReport(error) {
+  let code = "recovery_probe_failed";
+  try {
+    const codeDescriptor =
+      error && (typeof error === "object" || typeof error === "function")
+        ? Object.getOwnPropertyDescriptor(error, "code")
+        : undefined;
+    if (codeDescriptor?.value === "evidence_durability_uncertain") {
+      code = "evidence_durability_uncertain";
+    }
+  } catch {
+    // A hostile error object must not escape the structured redaction boundary.
+  }
   return {
-    error: { code: "recovery_probe_failed", retryable: false, type: "probe_failure" },
+    error: { code, retryable: false, type: "probe_failure" },
     result: "failed",
   };
+}
+
+export async function runInterruptedTurnRecoveryCli({
+  args = process.argv.slice(2),
+  cwd = process.cwd(),
+  env = process.env,
+  probe = probeInterruptedTurnRecovery,
+  stderr = process.stderr,
+  stdout = process.stdout,
+} = {}) {
+  const writeEvidence = args.includes("--write-evidence");
+  const evidencePath = resolve(
+    cwd,
+    env.CODEX_RECOVERY_EVIDENCE ?? "evidence/interrupted-turn-recovery.json",
+  );
+  try {
+    const report = await probe({
+      codexBin: env.CODEX_BIN,
+      evidencePath,
+      writeEvidence,
+    });
+    stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return 0;
+  } catch (error) {
+    stderr.write(`${JSON.stringify(interruptedTurnRecoveryFailureReport(error))}\n`);
+    return 1;
+  }
 }

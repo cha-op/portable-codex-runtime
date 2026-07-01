@@ -108,9 +108,10 @@ with no unsafe ACLs. Publication holds an `O_DIRECTORY|O_NOFOLLOW` handle,
 revalidates directory, temporary-directory, and file identities around rename,
 and fsyncs the held directory handle. A failed publication retains its private
 temporary artifact for trusted-owner inspection when rename has not occurred.
-After rename, a directory-sync failure leaves the destination in place and
-reports `evidence_durability_uncertain`; the caller must not treat that path as
-durable evidence without inspection or a later successful publication. The
+After rename, a directory-sync failure leaves the destination in place and the
+CLI reports `evidence_durability_uncertain` without exception details; the
+caller must not treat that path as durable evidence without inspection or a
+later successful publication. The
 helper never recursively removes a pathname that may have been replaced.
 Concurrent mutation by another process with the same UID is outside this
 pure-Node helper's security boundary.
@@ -235,11 +236,12 @@ restore interfaces.
   preserved by the later volume-snapshot implementation.
 - The stopped-tree copy requires exclusive single-writer control of its
   current-user-owned, mode `0700`, extended-ACL-free root. Missing or malformed
-  ACL inspection fails closed. It pins and revalidates each destination
-  directory as defense in depth, but concurrent mutation by another process
-  with the same UID is outside its security contract. The production design
-  supplies this invariant with session fencing, worker quiescence, and a
-  single-attached volume before snapshot.
+  ACL inspection fails closed. It holds the root, validates its complete
+  ancestor chain as a trusted authority, and revalidates root, ancestor, and
+  destination identities during the copy. Concurrent mutation by another
+  process with the same UID is outside its security contract. The production
+  design supplies this invariant with session fencing, worker quiescence, and
+  a single-attached volume before snapshot.
 - Digest, copy, and pathname cleanup reject a root that is itself a mount point
   or contains a nested mount point. Linux mount boundaries, including
   same-device bind mounts, come from `/proc/self/mountinfo`; macOS boundaries

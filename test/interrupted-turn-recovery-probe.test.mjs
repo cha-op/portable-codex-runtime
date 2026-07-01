@@ -38,6 +38,7 @@ import {
   parseLinuxMountInfo,
   probeInterruptedTurnRecovery,
   removeTreeForCleanup,
+  runInterruptedTurnRecoveryCli,
   startRecoveryClient,
   terminateAppServer,
   verifyModelWorkspaceContext,
@@ -86,7 +87,11 @@ const TRUSTED_RECOVERY_ACL = {
 };
 
 const copyStoppedTree = (options) =>
-  copyStoppedTreeWithAcl({ inspectOwnedRootAcl: async () => false, ...options });
+  copyStoppedTreeWithAcl({
+    inspectOwnedRootAcl: async () => false,
+    inspectOwnedRootAncestorAcl: async () => false,
+    ...options,
+  });
 
 const writeRecoveryEvidence = (path, report, options = {}) =>
   writeRecoveryEvidenceWithAcl(path, report, {
@@ -418,6 +423,60 @@ test("stopped-tree copy requires a private coordinator-owned root", async () => 
   }
 });
 
+test("stopped-tree copy rejects an owned root below an unsafe ancestor", async () => {
+  const container = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-parent-test-"));
+  const unsafeParent = join(container, "unsafe-parent");
+  const ownedRoot = join(unsafeParent, "owned");
+  const source = join(ownedRoot, "source");
+  try {
+    await mkdir(source, { recursive: true });
+    await chmod(unsafeParent, 0o777);
+    await chmod(ownedRoot, 0o700);
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot,
+        source,
+        destination: join(ownedRoot, "destination"),
+      }),
+      /owned root ancestor chain is not trusted/,
+    );
+    await assert.rejects(lstat(join(ownedRoot, "destination")), /ENOENT/);
+  } finally {
+    await chmod(unsafeParent, 0o700).catch(() => {});
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects replacement of its held owned root", async () => {
+  const container = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-race-test-"));
+  const ownedRoot = join(container, "owned");
+  const displacedRoot = join(container, "displaced-owned");
+  const source = join(ownedRoot, "source");
+  const destination = join(ownedRoot, "destination");
+  try {
+    await mkdir(source, { recursive: true });
+    await chmod(ownedRoot, 0o700);
+    await writeFile(join(source, "sentinel"), "source");
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot,
+        source,
+        destination,
+        afterDestinationValidation: async () => {
+          await rename(ownedRoot, displacedRoot);
+          await mkdir(ownedRoot, { mode: 0o700 });
+          await writeFile(join(ownedRoot, "replacement"), "preserve");
+        },
+      }),
+      /owned-root identity or permission changes/,
+    );
+    assert.equal(await readFile(join(ownedRoot, "replacement"), "utf8"), "preserve");
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy fails closed on owned-root ACL inspection", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-acl-test-"));
   try {
@@ -444,6 +503,42 @@ test("stopped-tree copy fails closed on owned-root ACL inspection", async () => 
           source,
           destination,
           inspectOwnedRootAcl: aclCase.inspectOwnedRootAcl,
+        }),
+        (error) => aclCase.message.test(error.message) && !error.message.includes("sensitive"),
+      );
+      await assert.rejects(lstat(destination), /ENOENT/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy fails closed on owned-root ancestor ACL inspection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-parent-acl-test-"));
+  try {
+    const source = join(root, "source");
+    await mkdir(source);
+    await writeFile(join(source, "sentinel"), "inside");
+    const cases = [
+      {
+        inspectOwnedRootAncestorAcl: async () => true,
+        message: /owned root ancestor chain has unsafe access controls/,
+      },
+      {
+        inspectOwnedRootAncestorAcl: async () => {
+          throw new Error("sensitive ancestor ACL principal");
+        },
+        message: /owned root ancestor ACL could not be validated/,
+      },
+    ];
+    for (const [index, aclCase] of cases.entries()) {
+      const destination = join(root, `destination-ancestor-${index}`);
+      await assert.rejects(
+        copyStoppedTree({
+          ownedRoot: root,
+          source,
+          destination,
+          inspectOwnedRootAncestorAcl: aclCase.inspectOwnedRootAncestorAcl,
         }),
         (error) => aclCase.message.test(error.message) && !error.message.includes("sensitive"),
       );
@@ -1892,6 +1987,47 @@ test("failure report never serializes exception details", () => {
     error: { code: "recovery_probe_failed", retryable: false, type: "probe_failure" },
     result: "failed",
   });
+  const hostileError = new Error("secret hostile diagnostics");
+  Object.defineProperty(hostileError, "code", {
+    get() {
+      throw new Error("secret code getter diagnostics");
+    },
+  });
+  assert.deepEqual(interruptedTurnRecoveryFailureReport(hostileError), {
+    error: { code: "recovery_probe_failed", retryable: false, type: "probe_failure" },
+    result: "failed",
+  });
+});
+
+test("CLI preserves only the allowlisted evidence durability error code", async () => {
+  let stdout = "";
+  let stderr = "";
+  const failure = new Error("secret evidence sync diagnostics");
+  failure.code = "evidence_durability_uncertain";
+  const status = await runInterruptedTurnRecoveryCli({
+    args: ["--write-evidence"],
+    cwd: "/safe-working-directory",
+    env: {
+      CODEX_BIN: "/pinned/codex",
+      CODEX_RECOVERY_EVIDENCE: "evidence/result.json",
+    },
+    probe: async () => {
+      throw failure;
+    },
+    stderr: { write: (value) => (stderr += value) },
+    stdout: { write: (value) => (stdout += value) },
+  });
+  assert.equal(status, 1);
+  assert.equal(stdout, "");
+  assert.deepEqual(JSON.parse(stderr), {
+    error: {
+      code: "evidence_durability_uncertain",
+      retryable: false,
+      type: "probe_failure",
+    },
+    result: "failed",
+  });
+  assert(!stderr.includes("secret evidence sync diagnostics"));
 });
 
 const liveCodexBin = process.env.CODEX_BIN;

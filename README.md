@@ -55,8 +55,10 @@ digest. If validation or copy fails after destination creation, the partial
 destination is retained for cleanup by the trusted owner; the helper never
 recursively removes a failure path that another writer could have replaced.
 The copy helper requires exclusive single-writer control of its current-user-
-owned, mode `0700`, extended-ACL-free root; concurrent mutation by another
-process with the same UID is not a supported security boundary.
+owned, mode `0700`, extended-ACL-free root. It holds and revalidates that root,
+and requires a trusted owner, permission, identity, and ACL state across the
+complete ancestor chain. Concurrent mutation by another process with the same
+UID is not a supported security boundary.
 It is not an online, atomic, or power-loss-durable snapshot implementation.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
@@ -87,7 +89,8 @@ The evidence parent directory must already exist, be owned by the current user,
 and have trusted permissions, ancestors, and ACL state. Evidence publication
 holds and revalidates that directory. A failure before rename retains its
 private temp artifact for trusted-owner cleanup; a failure after rename leaves
-the destination in place and reports that publication durability is uncertain.
+the destination in place and the CLI reports
+`evidence_durability_uncertain` without serializing exception details.
 
 The command provisions no credential input and configures the model provider to
 use the loopback mock. It does not impose OS-level outbound network isolation;
