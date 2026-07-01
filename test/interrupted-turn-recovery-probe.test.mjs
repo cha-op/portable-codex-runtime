@@ -661,6 +661,24 @@ test("portable directory names require NFC and reject portable collisions", () =
   }
 });
 
+test("source identity pre-scan failures retain the created destination", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-prescan-failure-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "\u00c4"), "non-portable cased name");
+
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects non-ASCII cased directory names/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "portable tree operations reject and clean up non-UTF-8 directory entries",
   { skip: platform() !== "linux" },

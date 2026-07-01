@@ -1094,9 +1094,6 @@ export async function copyStoppedTree({
     "stopped-tree copy rejects source root identity changes",
   );
   await assertNoMountBoundary(canonicalSource, listMountPoints);
-  // Index before copying so an absolute link cannot reach a source subtree
-  // through an external bind-mount or other filesystem identity alias.
-  const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
   const canonicalDestination = await assertDirectOwnedPath(
     canonicalOwnedRoot,
     destination,
@@ -1139,6 +1136,10 @@ export async function copyStoppedTree({
         "stopped-tree copy rejects destination root identity changes",
       );
     };
+    // Index before copying so an absolute link cannot reach a source subtree
+    // through an external bind-mount or other filesystem identity alias.
+    const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
+    await assertDestinationRootCurrent();
     await copyTreeEntry(
       {
         assertDestinationRootCurrent,
