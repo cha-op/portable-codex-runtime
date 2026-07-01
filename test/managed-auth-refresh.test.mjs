@@ -6,6 +6,7 @@ import {
   link,
   mkdtemp,
   mkdir,
+  open,
   readFile,
   readdir,
   realpath,
@@ -201,6 +202,15 @@ async function replaceStagedAuth(
     )}\n`,
     { mode: 0o600 },
   );
+}
+
+function failHandleCloseAfterClosing(handle, closeError) {
+  const close = handle.close.bind(handle);
+  handle.close = async () => {
+    await close();
+    throw closeError;
+  };
+  return handle;
 }
 
 function successResponse() {
@@ -683,6 +693,65 @@ test("managed refresh rejects PATH-resolved Codex binaries before startup", asyn
   assert.equal(clientCreated, false);
 });
 
+test("client construction failures are confirmed pre-dispatch and leave no recovery gate", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const constructorError = new Error("synthetic client construction failure");
+  let dispatchGuardCalled = false;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            assertLockHeldBeforeDispatch: async () => {
+              dispatchGuardCalled = true;
+            },
+            createClient: () => {
+              throw constructorError;
+            },
+          }),
+      }),
+      (error) => error === constructorError,
+    );
+    assert.equal(dispatchGuardCalled, false);
+    await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+
+    const result = await refreshManagedAuthRecord({
+      authHome,
+      runRefresh: async ({ stagingHome }) => {
+        await replaceStagedAuth(stagingHome);
+        return successResponse();
+      },
+    });
+    assert.equal(result.comparisons.refreshTokenChanged, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("primitive client construction failures are wrapped without serialization leakage", async () => {
+  const thrownValue = "primitive-client-construction-sensitive";
+  await assert.rejects(
+    runCodexManagedRefresh({
+      codexBin: "/pinned/codex",
+      stagingHome: "/isolated/staging-home",
+      createClient: () => {
+        throw thrownValue;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "app_server_client_creation_failed");
+      assert.equal(error.retryable, false);
+      assert.equal(error.cause, thrownValue);
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cause"), false);
+      assert.equal(JSON.stringify(error).includes(thrownValue), false);
+      return true;
+    },
+  );
+});
+
 test("unresolved refresh artifacts block token rotation and expose safe recovery paths", async () => {
   const { authHome, root } = await createAuthorityHome();
   const promotionCandidate = join(authHome, ".auth.json.next-recovery");
@@ -834,6 +903,79 @@ test("unchanged refresh tokens are never promoted after an observed access refre
   }
 });
 
+test("initial durable staging close failures prevent refresh dispatch", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const closeError = new Error("synthetic initial staging close failure");
+  let closeInjected = false;
+  let refreshCalled = false;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        openFile: async (path, flags, mode) => {
+          const handle = await open(path, flags, mode);
+          if (!closeInjected && path.endsWith("auth.json") && flags === "wx") {
+            closeInjected = true;
+            return failHandleCloseAfterClosing(handle, closeError);
+          }
+          return handle;
+        },
+        runRefresh: async () => {
+          refreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error === closeError,
+    );
+    assert.equal(closeInjected, true);
+    assert.equal(refreshCalled, false);
+    await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("initial durable staging preserves write errors when close also fails", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const writeError = new Error("synthetic initial staging write failure");
+  const closeError = new Error("synthetic close failure after write failure");
+  let failureInjected = false;
+  let refreshCalled = false;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        openFile: async (path, flags, mode) => {
+          const handle = await open(path, flags, mode);
+          if (!failureInjected && path.endsWith("auth.json") && flags === "wx") {
+            failureInjected = true;
+            handle.writeFile = async () => {
+              throw writeError;
+            };
+            return failHandleCloseAfterClosing(handle, closeError);
+          }
+          return handle;
+        },
+        runRefresh: async () => {
+          refreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => {
+        assert.equal(error, writeError);
+        assert.equal(error.closeError, closeError);
+        assert.equal(Object.prototype.propertyIsEnumerable.call(error, "closeError"), false);
+        return true;
+      },
+    );
+    assert.equal(failureInjected, true);
+    assert.equal(refreshCalled, false);
+    await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("staging durability is established before token-mutating refresh begins", async () => {
   const { authHome, root } = await createAuthorityHome();
   const events = [];
@@ -891,6 +1033,47 @@ test("post-refresh staging sync failure preserves a non-retryable recovery senti
     assert.equal(refreshError.code, "staging_recovery_not_durable");
     assert.equal(refreshError.retryable, false);
     assert.equal(refreshError.recoveryReason, "staging_sync_failed");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-refresh staging close failures retain a non-retryable recovery sentinel", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const closeError = new Error("synthetic refreshed staging close failure");
+  let closeInjected = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        openFile: async (path, flags, mode) => {
+          const handle = await open(path, flags, mode);
+          if (!closeInjected && path.endsWith("auth.json") && typeof flags === "number") {
+            closeInjected = true;
+            return failHandleCloseAfterClosing(handle, closeError);
+          }
+          return handle;
+        },
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(closeInjected, true);
+    assert.equal(refreshError.code, "staging_recovery_not_durable");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "staging_sync_failed");
+    assert.equal(refreshError.cause, closeError);
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
     await assert.rejects(
       refreshManagedAuthRecord({ authHome }),

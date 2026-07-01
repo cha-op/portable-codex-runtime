@@ -379,15 +379,48 @@ async function releaseAuthorityLock(lock) {
   await lock.release();
 }
 
-async function writeFileDurably(path, contents, { flag = "wx", mode = 0o600 } = {}) {
-  let handle;
+function attachCloseError(primaryError, closeError) {
+  if (!isObjectLike(primaryError)) return;
   try {
-    handle = await open(path, flag, mode);
+    if (!Object.hasOwn(primaryError, "closeError")) {
+      Object.defineProperty(primaryError, "closeError", {
+        configurable: true,
+        enumerable: false,
+        value: closeError,
+      });
+    }
+  } catch {
+    // Preserve a frozen primary error even when diagnostics cannot be attached.
+  }
+}
+
+async function closeFileHandle(handle, primaryFailure) {
+  if (!handle) return;
+  try {
+    await handle.close();
+  } catch (closeError) {
+    if (!primaryFailure) throw closeError;
+    attachCloseError(primaryFailure.error, closeError);
+  }
+}
+
+async function writeFileDurably(
+  path,
+  contents,
+  { flag = "wx", mode = 0o600, openFile = open } = {},
+) {
+  let handle;
+  let primaryFailure;
+  try {
+    handle = await openFile(path, flag, mode);
     await handle.chmod(mode);
     await handle.writeFile(contents);
     await handle.sync();
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await handle?.close().catch(() => {});
+    await closeFileHandle(handle, primaryFailure);
   }
 }
 
@@ -408,10 +441,11 @@ async function syncDirectoryPath(path) {
   }
 }
 
-async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
+async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile = open) {
   let handle;
+  let primaryFailure;
   try {
-    handle = await open(
+    handle = await openFile(
       join(stagingHome, "auth.json"),
       constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
@@ -430,6 +464,15 @@ async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
       { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
     );
   } catch (error) {
+    primaryFailure = { error };
+  }
+  try {
+    await closeFileHandle(handle, primaryFailure);
+  } catch (error) {
+    primaryFailure = { error };
+  }
+  if (primaryFailure) {
+    const { error } = primaryFailure;
     if (error instanceof ManagedAuthRefreshError) throw error;
     const durabilityError = new ManagedAuthRefreshError(
       "staging_recovery_not_durable",
@@ -438,8 +481,6 @@ async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
     );
     durabilityError.cause = error;
     throw durabilityError;
-  } finally {
-    await handle?.close().catch(() => {});
   }
 }
 
@@ -449,6 +490,7 @@ async function handleChangedPreDispatchStaging(
   stagingHome,
   refreshError,
   syncStagingDirectory,
+  openFile,
 ) {
   let stagingChanged = true;
   try {
@@ -464,7 +506,7 @@ async function handleChangedPreDispatchStaging(
   if (!stagingChanged) throw refreshError;
 
   try {
-    await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory);
+    await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile);
   } catch (error) {
     // Never expose a recovery path through a replaced authority home.
     await assertAuthorityHomeCurrent(authority);
@@ -511,6 +553,7 @@ async function createStagingHome(
   {
     cleanupStagingAttempt = removeStagingAttempt,
     cleanupStagingRoot = removeEmptyStagingRoot,
+    openFile = open,
     syncStagingDirectory = syncDirectoryPath,
     writeStagingFile = writeFileDurably,
   } = {},
@@ -548,6 +591,7 @@ async function createStagingHome(
     await writeStagingFile(join(stagingHome, "auth.json"), rawAuth, {
       flag: "wx",
       mode: 0o600,
+      openFile,
     });
     const config = `cli_auth_credentials_store = "file"
 
@@ -560,6 +604,7 @@ remote_plugin = false
     await writeStagingFile(join(stagingHome, "config.toml"), config, {
       flag: "wx",
       mode: 0o600,
+      openFile,
     });
     ensure(
       await syncStagingDirectory(stagingHome),
@@ -933,7 +978,8 @@ export async function runCodexManagedRefresh({
     markPreDispatchRefreshError(error);
     throw error;
   }
-  const client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
+  let client;
+  let clientCreationCompleted = false;
   let operationError;
   let refreshRequestDispatched = false;
   const abortClient = async (reason) => {
@@ -971,6 +1017,8 @@ export async function runCodexManagedRefresh({
     });
   };
   try {
+    client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
+    clientCreationCompleted = true;
     await withAbort(() => client.start());
     const initializeResult = await withAbort(() => client.initialize(false));
     if (typeof assertLockHeldBeforeDispatch === "function") {
@@ -1001,51 +1049,61 @@ export async function runCodexManagedRefresh({
       rpcAudit: client.rpcMethodAudit(),
     };
   } catch (error) {
-    if (!refreshRequestDispatched) markPreDispatchRefreshError(error);
-    operationError = error;
-    throw error;
+    let failure = error;
+    if (!clientCreationCompleted && !isObjectLike(failure)) {
+      failure = new ManagedAuthRefreshError(
+        "app_server_client_creation_failed",
+        "managed refresh app-server client could not be created",
+      );
+      Object.defineProperty(failure, "cause", { value: error });
+    }
+    if (!refreshRequestDispatched) markPreDispatchRefreshError(failure);
+    operationError = failure;
+    throw failure;
   } finally {
-    try {
-      await client.stop();
-    } catch (stopError) {
-      if (operationError) {
-        if (!refreshRequestDispatched) {
-          const uncertain = new ManagedAuthRefreshError(
-            "refresh_outcome_uncertain",
-            "app-server shutdown failed before refresh dispatch could be proven",
-            {
-              recoveryPath: stagingHome,
-              recoveryReason: "app_server_shutdown_unknown",
-            },
-          );
-          uncertain.cause = operationError;
-          uncertain.cleanupWarnings = [
+    if (clientCreationCompleted) {
+      try {
+        await client.stop();
+      } catch (stopError) {
+        if (operationError) {
+          if (!refreshRequestDispatched) {
+            const uncertain = new ManagedAuthRefreshError(
+              "refresh_outcome_uncertain",
+              "app-server shutdown failed before refresh dispatch could be proven",
+              {
+                recoveryPath: stagingHome,
+                recoveryReason: "app_server_shutdown_unknown",
+              },
+            );
+            uncertain.cause = operationError;
+            uncertain.cleanupWarnings = [
+              ...(Array.isArray(operationError.cleanupWarnings)
+                ? operationError.cleanupWarnings
+                : []),
+              "app_server_stop_failed",
+            ];
+            throw uncertain;
+          }
+          operationError.cleanupWarnings = [
             ...(Array.isArray(operationError.cleanupWarnings)
               ? operationError.cleanupWarnings
               : []),
             "app_server_stop_failed",
           ];
+        } else if (refreshRequestDispatched) {
+          const uncertain = new ManagedAuthRefreshError(
+            "refresh_outcome_uncertain",
+            "app-server cleanup failed after the token refresh request was dispatched",
+            {
+              recoveryPath: stagingHome,
+              recoveryReason: "account_read_outcome_unknown",
+            },
+          );
+          uncertain.cause = stopError;
           throw uncertain;
+        } else {
+          throw stopError;
         }
-        operationError.cleanupWarnings = [
-          ...(Array.isArray(operationError.cleanupWarnings)
-            ? operationError.cleanupWarnings
-            : []),
-          "app_server_stop_failed",
-        ];
-      } else if (refreshRequestDispatched) {
-        const uncertain = new ManagedAuthRefreshError(
-          "refresh_outcome_uncertain",
-          "app-server cleanup failed after the token refresh request was dispatched",
-          {
-            recoveryPath: stagingHome,
-            recoveryReason: "account_read_outcome_unknown",
-          },
-        );
-        uncertain.cause = stopError;
-        throw uncertain;
-      } else {
-        throw stopError;
       }
     }
   }
@@ -1135,6 +1193,7 @@ export async function refreshManagedAuthRecord({
   cleanupStagingRoot = removeEmptyStagingRoot,
   cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
+  openFile = open,
   readCanonicalSource = readManagedAuthSnapshot,
   runRefresh = runCodexManagedRefresh,
   syncStagingDirectory = syncDirectoryPath,
@@ -1178,6 +1237,7 @@ export async function refreshManagedAuthRecord({
     ({ stagingHome, stagingRoot } = await createStagingHome(authority, before.raw, {
       cleanupStagingAttempt,
       cleanupStagingRoot,
+      openFile,
       syncStagingDirectory,
       writeStagingFile,
     }));
@@ -1210,6 +1270,7 @@ export async function refreshManagedAuthRecord({
         stagingHome,
         refreshError,
         syncStagingDirectory,
+        openFile,
       );
     }
     if (refreshError?.code !== "refresh_outcome_uncertain" && refreshError) {
@@ -1225,7 +1286,7 @@ export async function refreshManagedAuthRecord({
       refreshError = uncertain;
     }
     try {
-      await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory);
+      await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile);
     } catch (error) {
       // Recheck before exposing stagingHome as a recovery path. A concurrent
       // authority replacement makes that pathname stale and takes precedence.
