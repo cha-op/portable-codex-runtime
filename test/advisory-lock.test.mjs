@@ -75,6 +75,69 @@ function waitForLine(child, expected) {
   });
 }
 
+function failFirstStopProcess({ failFirstUnref = false } = {}) {
+  let attempts = 0;
+  let child;
+  let unrefCalls = 0;
+  const cleanupError = new AdvisoryLockError(
+    "lock_cleanup_failed",
+    "authority lock process group survived SIGKILL",
+  );
+  return {
+    get attempts() {
+      return attempts;
+    },
+    get child() {
+      return child;
+    },
+    get cleanupError() {
+      return cleanupError;
+    },
+    get unrefCalls() {
+      return unrefCalls;
+    },
+    async stopProcess(currentChild, options, defaultStopProcess) {
+      attempts += 1;
+      child = currentChild;
+      if (attempts === 1) {
+        const unref = currentChild.unref.bind(currentChild);
+        currentChild.unref = () => {
+          unrefCalls += 1;
+          if (failFirstUnref && unrefCalls === 1) {
+            throw new Error("injected unref failure");
+          }
+          return unref();
+        };
+        throw cleanupError;
+      }
+      await defaultStopProcess(currentChild, options);
+    },
+  };
+}
+
+function assertProcessReferencesDisposed(probe) {
+  assert(probe.child, "expected stopProcess to observe the lock child");
+  assert.equal(probe.child.stdin.destroyed, true);
+  assert.equal(probe.child.stdout.destroyed, true);
+  assert.equal(probe.child.stderr.destroyed, true);
+  assert.equal(probe.child.stdout.listenerCount("data"), 0);
+  assert.equal(probe.unrefCalls, 1);
+}
+
+async function within(promise, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("operation did not settle promptly")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 test("advisory lock rejects concurrent holders and can be reacquired", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-advisory-lock-"));
   const path = join(root, "authority.lock");
@@ -273,6 +336,284 @@ test("startup timeout kills a stubborn lock process group", async () => {
     );
     recovered = await acquireAdvisoryLock(path);
   } finally {
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("acquire cleanup failure disposes child references and preserves the cleanup error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-acquire-cleanup-"));
+  const path = join(root, "authority.lock");
+  const probe = failFirstStopProcess();
+  let recovered;
+  try {
+    await assert.rejects(
+      acquireAdvisoryLock(path, {
+        holderPath: FAIL_HOLDER_FIXTURE,
+        stopProcess: probe.stopProcess.bind(probe),
+      }),
+      (error) => {
+        assert.equal(error, probe.cleanupError);
+        assert.equal(error.code, "lock_cleanup_failed");
+        assert.equal(error.cause?.code, "lock_runtime_failed");
+        return true;
+      },
+    );
+    assert.equal(probe.attempts, 1);
+    assertProcessReferencesDisposed(probe);
+
+    recovered = await acquireAdvisoryLock(path);
+    await recovered.assertHeld();
+  } finally {
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("acquire disposal-only failure preserves acquisition and resource errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-acquire-disposal-"));
+  const path = join(root, "authority.lock");
+  const disposalError = new Error("injected child unref failure");
+  let recovered;
+  try {
+    await assert.rejects(
+      acquireAdvisoryLock(path, {
+        holderPath: FAIL_HOLDER_FIXTURE,
+        stopProcess: async (child, options, defaultStopProcess) => {
+          child.unref = () => {
+            throw disposalError;
+          };
+          await defaultStopProcess(child, options);
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "lock_cleanup_failed");
+        assert.equal(error.cause?.code, "lock_runtime_failed");
+        assert.equal(error.cleanupError, disposalError);
+        assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupError"), false);
+        return true;
+      },
+    );
+
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("acquire preserves an advisory resource error's existing cause", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-acquire-layered-disposal-"));
+  const path = join(root, "authority.lock");
+  const underlyingError = new Error("injected underlying disposal failure");
+  const disposalError = new AdvisoryLockError(
+    "lock_cleanup_failed",
+    "injected advisory disposal failure",
+  );
+  disposalError.cause = underlyingError;
+  let recovered;
+  try {
+    await assert.rejects(
+      acquireAdvisoryLock(path, {
+        holderPath: FAIL_HOLDER_FIXTURE,
+        stopProcess: async (child, options, defaultStopProcess) => {
+          child.unref = () => {
+            throw disposalError;
+          };
+          await defaultStopProcess(child, options);
+        },
+      }),
+      (error) => {
+        assert.equal(error, disposalError);
+        assert.equal(error.cause?.code, "lock_runtime_failed");
+        assert.equal(error.cleanupError, underlyingError);
+        assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupError"), false);
+        return true;
+      },
+    );
+
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("acquire close-only failure preserves acquisition and resource errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-acquire-close-"));
+  const path = join(root, "authority.lock");
+  const closeError = new Error("injected file handle close failure");
+  let closeCalls = 0;
+  let recovered;
+  try {
+    await assert.rejects(
+      acquireAdvisoryLock(path, {
+        closeFileHandle: async (handle) => {
+          closeCalls += 1;
+          await handle.close();
+          throw closeError;
+        },
+        holderPath: FAIL_HOLDER_FIXTURE,
+      }),
+      (error) => {
+        assert.equal(error.code, "lock_cleanup_failed");
+        assert.equal(error.cause?.code, "lock_runtime_failed");
+        assert.equal(error.cleanupError, closeError);
+        assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupError"), false);
+        return true;
+      },
+    );
+    assert.equal(closeCalls, 1);
+
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed release disposes handles and a later release retries process-group cleanup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-release-retry-"));
+  const path = join(root, "authority.lock");
+  const probe = failFirstStopProcess({ failFirstUnref: true });
+  let lock;
+  let recovered;
+  try {
+    lock = await acquireAdvisoryLock(path, {
+      holderArgs: ["release"],
+      holderPath: STUBBORN_HOLDER_FIXTURE,
+      releaseGraceMs: 20,
+      signalGraceMs: 100,
+      stopProcess: probe.stopProcess.bind(probe),
+      timeoutMs: 5_000,
+    });
+    let pendingRejections = 0;
+    const pendingRename = lock.renameWhileHeld(
+      join(root, "ignored-source"),
+      join(root, "ignored-destination"),
+    );
+    void pendingRename.catch(() => {
+      pendingRejections += 1;
+    });
+    const observedLoss = lock.waitForLoss();
+
+    const firstRelease = lock.release();
+    const concurrentRelease = lock.release();
+    assert.equal(concurrentRelease, firstRelease);
+    await within(
+      assert.rejects(firstRelease, (error) => error === probe.cleanupError),
+      1_000,
+    );
+    await assert.rejects(
+      pendingRename,
+      (error) => error instanceof AdvisoryLockError && error.code === "lock_commit_uncertain",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(pendingRejections, 1);
+    assert.equal(probe.attempts, 1);
+    assertProcessReferencesDisposed(probe);
+    await assert.rejects(lock.assertHeld(), (error) => error.code === "lock_lost");
+    assert.equal((await within(observedLoss, 100)).code, "lock_lost");
+    assert.equal((await within(lock.waitForLoss(), 100)).code, "lock_lost");
+    await assert.rejects(acquireAdvisoryLock(path), (error) => error.code === "lock_unavailable");
+
+    await lock.release();
+    assert.equal(probe.attempts, 2);
+    assert.equal(probe.unrefCalls, 2);
+    await lock.release();
+    assert.equal(probe.attempts, 2);
+    lock = undefined;
+
+    recovered = await acquireAdvisoryLock(path);
+    await recovered.assertHeld();
+  } finally {
+    await lock?.release().catch(() => {});
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release preserves advisory resource cleanup errors without a self-referential cause", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-release-resource-retry-"));
+  const path = join(root, "authority.lock");
+  const underlyingError = new Error("injected underlying unref failure");
+  const cleanupError = new AdvisoryLockError(
+    "lock_cleanup_failed",
+    "injected advisory unref failure",
+  );
+  cleanupError.cause = underlyingError;
+  let unrefCalls = 0;
+  let lock;
+  let recovered;
+  try {
+    lock = await acquireAdvisoryLock(path, {
+      stopProcess: async (child, options, defaultStopProcess) => {
+        const unref = child.unref.bind(child);
+        child.unref = () => {
+          unrefCalls += 1;
+          if (unrefCalls === 1) throw cleanupError;
+          return unref();
+        };
+        await defaultStopProcess(child, options);
+      },
+    });
+
+    await assert.rejects(lock.release(), (error) => {
+      assert.equal(error, cleanupError);
+      assert.equal(error.cause, underlyingError);
+      assert.notEqual(error.cause, error);
+      return true;
+    });
+    assert.equal(unrefCalls, 1);
+
+    await lock.release();
+    assert.equal(unrefCalls, 2);
+    lock = undefined;
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await lock?.release().catch(() => {});
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("uncertain rename cleanup failure disposes references and remains releasable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-quiesce-retry-"));
+  const path = join(root, "authority.lock");
+  const probe = failFirstStopProcess();
+  let lock;
+  let recovered;
+  try {
+    lock = await acquireAdvisoryLock(path, {
+      holderArgs: ["release"],
+      holderPath: STUBBORN_HOLDER_FIXTURE,
+      releaseGraceMs: 20,
+      signalGraceMs: 100,
+      startupTimeoutMs: 5_000,
+      stopProcess: probe.stopProcess.bind(probe),
+      timeoutMs: 20,
+    });
+    await within(
+      assert.rejects(
+        lock.renameWhileHeld(join(root, "source"), join(root, "destination")),
+        (error) => {
+          assert.equal(error.code, "lock_commit_uncertain");
+          assert.equal(error.cause, probe.cleanupError);
+          return true;
+        },
+      ),
+      1_000,
+    );
+    assert.equal(probe.attempts, 1);
+    assertProcessReferencesDisposed(probe);
+    await assert.rejects(lock.assertHeld(), (error) => error.code === "lock_lost");
+
+    await lock.release();
+    assert.equal(probe.attempts, 2);
+    lock = undefined;
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await lock?.release().catch(() => {});
     await recovered?.release();
     await rm(root, { recursive: true, force: true });
   }

@@ -801,6 +801,39 @@ test("invalid refresh responses and unchanged access tokens fail closed", async 
   }
 });
 
+test("unchanged refresh tokens are never promoted after an observed access refresh", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome, {
+            refreshToken: "refresh-before-sensitive",
+          });
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "refresh_token_unchanged");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "refresh_token_not_rotated");
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("staging durability is established before token-mutating refresh begins", async () => {
   const { authHome, root } = await createAuthorityHome();
   const events = [];
@@ -944,6 +977,195 @@ test("pre-dispatch refresh failure is not replaced by post-refresh durability fa
     assert.equal(
       (await readdir(authHome)).some((name) => name === ".portable-auth-refresh-staging"),
       false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("changed pre-dispatch staging is synchronized before a recovery sentinel is returned", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const events = [];
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async (path) => {
+          events.push(["sync-directory", path]);
+          return true;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: ({ codexHome }) => ({
+              start: async () => {},
+              initialize: async () => {
+                await replaceStagedAuth(codexHome);
+                throw new Error("synthetic pre-dispatch initialize failure");
+              },
+              stop: async () => {},
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "pre_dispatch_staging_changed");
+    assert.match(refreshError.cause.message, /pre-dispatch initialize failure/);
+    assert.equal(events.length, 3);
+    assert.equal(events[2][1], refreshError.recoveryPath);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("changed pre-dispatch staging sync failures retain the original cause", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const syncError = new Error("synthetic staging directory sync failure");
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          if (syncCount === 3) throw syncError;
+          return true;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: ({ codexHome }) => ({
+              start: async () => {
+                await replaceStagedAuth(codexHome);
+                throw new Error("synthetic pre-dispatch startup failure after staging change");
+              },
+              stop: async () => {},
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(syncCount, 3);
+    assert.equal(refreshError.code, "staging_recovery_not_durable");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "staging_sync_failed");
+    assert.match(refreshError.cause.message, /startup failure after staging change/);
+    assert.equal(refreshError.syncError.cause, syncError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "syncError"), false);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority replacement wins during changed pre-dispatch staging sync", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-during-pre-dispatch-staging-sync");
+  let stagingHome;
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          if (syncCount === 3) {
+            await rename(authHome, displaced);
+            await mkdir(authHome, { mode: 0o700 });
+            return false;
+          }
+          return true;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: ({ codexHome }) => ({
+              start: async () => {
+                stagingHome = codexHome;
+                await replaceStagedAuth(codexHome);
+                throw new Error("synthetic pre-dispatch authority replacement failure");
+              },
+              stop: async () => {},
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(syncCount, 3);
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    const serialized = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
+    assert.equal(serialized.includes(displaced), false);
+    assert.equal(serialized.includes(stagingHome), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unparseable pre-dispatch staging is synchronized and retained for recovery", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          return true;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: ({ codexHome }) => ({
+              start: async () => {
+                await writeFile(join(codexHome, "auth.json"), "{invalid-json\n");
+                throw new Error("synthetic pre-dispatch malformed staging failure");
+              },
+              stop: async () => {},
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(syncCount, 3);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.recoveryReason, "pre_dispatch_staging_changed");
+    assert.match(refreshError.cause.message, /malformed staging failure/);
+    assert.equal(
+      await readFile(join(refreshError.recoveryPath, "auth.json"), "utf8"),
+      "{invalid-json\n",
+    );
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

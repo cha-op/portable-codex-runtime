@@ -443,6 +443,60 @@ async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
   }
 }
 
+async function handleChangedPreDispatchStaging(
+  authority,
+  before,
+  stagingHome,
+  refreshError,
+  syncStagingDirectory,
+) {
+  let stagingChanged = true;
+  try {
+    const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome);
+    stagingChanged =
+      stagedAfterFailure.authFileFingerprint !== before.authFileFingerprint;
+  } catch {
+    // An unreadable or malformed staged credential may be the only recovery
+    // copy, so treat it as changed until its bytes are made durable.
+  }
+
+  await assertAuthorityHomeCurrent(authority);
+  if (!stagingChanged) throw refreshError;
+
+  try {
+    await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory);
+  } catch (error) {
+    // Never expose a recovery path through a replaced authority home.
+    await assertAuthorityHomeCurrent(authority);
+    const durabilityError = new ManagedAuthRefreshError(
+      "staging_recovery_not_durable",
+      "changed pre-dispatch staging credentials could not be synchronized",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "staging_sync_failed",
+      },
+    );
+    durabilityError.cause = refreshError;
+    Object.defineProperty(durabilityError, "syncError", {
+      enumerable: false,
+      value: error,
+    });
+    throw durabilityError;
+  }
+  await assertAuthorityHomeCurrent(authority);
+
+  const uncertain = new ManagedAuthRefreshError(
+    "refresh_outcome_uncertain",
+    "staged credentials changed before refresh dispatch completed",
+    {
+      recoveryPath: stagingHome,
+      recoveryReason: "pre_dispatch_staging_changed",
+    },
+  );
+  uncertain.cause = refreshError;
+  throw uncertain;
+}
+
 async function removeStagingAttempt(path) {
   await rm(path, { recursive: true, force: true });
 }
@@ -1149,7 +1203,15 @@ export async function refreshManagedAuthRecord({
     // If the authority was replaced during refresh, that replacement is the
     // decisive failure and the displaced volume must be recovered directly.
     await assertAuthorityHomeCurrent(authority);
-    if (refreshError && isKnownPreDispatchRefreshError(refreshError)) throw refreshError;
+    if (refreshError && isKnownPreDispatchRefreshError(refreshError)) {
+      await handleChangedPreDispatchStaging(
+        authority,
+        before,
+        stagingHome,
+        refreshError,
+        syncStagingDirectory,
+      );
+    }
     if (refreshError?.code !== "refresh_outcome_uncertain" && refreshError) {
       const uncertain = new ManagedAuthRefreshError(
         "refresh_outcome_uncertain",
@@ -1232,6 +1294,15 @@ export async function refreshManagedAuthRecord({
       {
         recoveryPath: stagingHome,
         recoveryReason: "post_dispatch_validation_failed",
+      },
+    );
+    ensure(
+      staged.refreshTokenFingerprint !== before.refreshTokenFingerprint,
+      "refresh_token_unchanged",
+      "managed refresh did not rotate the refresh token",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "refresh_token_not_rotated",
       },
     );
     ensure(

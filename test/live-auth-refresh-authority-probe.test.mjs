@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   assertAuthorityEvidenceSafe,
+  assertAuthorityRefreshTokenChanged,
   probeLiveAuthRefreshAuthority,
 } from "../src/live-auth-refresh-authority-probe.mjs";
 import {
@@ -91,5 +92,19 @@ test("authority evidence rejects raw current or rotated credentials", () => {
         [],
       ),
     /eyJ/,
+  );
+});
+
+test("live authority evidence fails closed when refresh-token rotation is unproven", () => {
+  assert.doesNotThrow(() =>
+    assertAuthorityRefreshTokenChanged({ refreshTokenChanged: true }),
+  );
+  assert.throws(
+    () => assertAuthorityRefreshTokenChanged({ refreshTokenChanged: false }),
+    /refresh token did not rotate/,
+  );
+  assert.throws(
+    () => assertAuthorityRefreshTokenChanged(undefined),
+    /refresh token did not rotate/,
   );
 });

@@ -81,7 +81,7 @@ function signalProcessGroup(processGroupId, signal) {
 }
 
 async function stopLockProcess(child, { initialWaitMs, signalWaitMs }) {
-  child.stdin.end();
+  if (!child.stdin.destroyed) child.stdin.end();
   if (!child.pid || (await waitForProcessGroupExit(child.pid, initialWaitMs))) return;
   signalProcessGroup(child.pid, "SIGTERM");
   if (await waitForProcessGroupExit(child.pid, signalWaitMs)) return;
@@ -89,6 +89,84 @@ async function stopLockProcess(child, { initialWaitMs, signalWaitMs }) {
   if (!(await waitForProcessGroupExit(child.pid, signalWaitMs))) {
     throw new AdvisoryLockError("lock_cleanup_failed", "authority lock process group survived SIGKILL");
   }
+}
+
+function disposeLockProcessReferences(child, output) {
+  let firstError;
+  const attempt = (action) => {
+    try {
+      action();
+    } catch (error) {
+      firstError ??= error;
+    }
+  };
+
+  if (output) attempt(() => output.close());
+  for (const stream of [child.stdin, child.stdout, child.stderr]) {
+    if (stream && !stream.destroyed) attempt(() => stream.destroy());
+  }
+  attempt(() => child.unref());
+  return firstError;
+}
+
+function closeLockHandle(handle) {
+  return handle.close();
+}
+
+function createHandleCloser(handle, closeFileHandle) {
+  let closed = false;
+  let closeInFlight;
+  return async () => {
+    if (closed) return;
+    if (!closeInFlight) {
+      const attempt = Promise.resolve().then(() => closeFileHandle(handle));
+      closeInFlight = attempt;
+      try {
+        await attempt;
+        closed = true;
+      } finally {
+        if (!closed && closeInFlight === attempt) closeInFlight = undefined;
+      }
+      return;
+    }
+    await closeInFlight;
+  };
+}
+
+function withCause(error, cause) {
+  if (cause !== undefined && !Object.hasOwn(error, "cause")) error.cause = cause;
+  return error;
+}
+
+function cleanupResourceError(error, operationError) {
+  if (operationError === undefined && error instanceof AdvisoryLockError) return error;
+  const failure =
+    error instanceof AdvisoryLockError
+      ? error
+      : new AdvisoryLockError(
+          "lock_cleanup_failed",
+          "authority lock resources could not be closed",
+        );
+  if (operationError === undefined) return withCause(failure, error);
+
+  const cleanupError =
+    failure === error && Object.hasOwn(failure, "cause") ? failure.cause : error;
+  if (cleanupError !== failure && !Object.hasOwn(failure, "cleanupError")) {
+    Object.defineProperty(failure, "cleanupError", {
+      configurable: true,
+      value: cleanupError,
+    });
+  }
+  Object.defineProperty(failure, "cause", {
+    configurable: true,
+    value: operationError,
+    writable: true,
+  });
+  return failure;
+}
+
+function runStopProcess(stopProcess, child, options) {
+  return stopProcess(child, options, stopLockProcess);
 }
 
 export class AdvisoryLockError extends Error {
@@ -113,11 +191,13 @@ export function sameFileIdentity(left, right) {
 export async function acquireAdvisoryLock(
   lockPath,
   {
+    closeFileHandle = closeLockHandle,
     holderArgs = [],
     holderPath = HOLDER_PATH,
     platform = process.platform,
     releaseGraceMs = 2_000,
     signalGraceMs = 2_000,
+    stopProcess = stopLockProcess,
     timeoutMs = 5_000,
     startupTimeoutMs = timeoutMs,
   } = {},
@@ -164,6 +244,7 @@ export async function acquireAdvisoryLock(
   child.stderr.on("data", (chunk) => {
     stderrBytes += chunk.length;
   });
+  const closeHandle = createHandleCloser(handle, closeFileHandle);
 
   try {
     await new Promise((resolve, reject) => {
@@ -205,20 +286,31 @@ export async function acquireAdvisoryLock(
   } catch (error) {
     let cleanupError;
     try {
-      await stopLockProcess(child, { initialWaitMs: 0, signalWaitMs: signalGraceMs });
+      await runStopProcess(stopProcess, child, {
+        initialWaitMs: 0,
+        signalWaitMs: signalGraceMs,
+      });
     } catch (failure) {
       cleanupError = failure;
-    } finally {
-      await handle.close().catch(() => {});
+    }
+    const disposalError = disposeLockProcessReferences(child);
+    let closeError;
+    try {
+      await closeHandle();
+    } catch (failure) {
+      closeError = failure;
     }
     if (cleanupError) {
-      cleanupError.cause = error;
-      throw cleanupError;
+      throw withCause(cleanupError, error);
     }
+    if (disposalError) throw cleanupResourceError(disposalError, error);
+    if (closeError) throw cleanupResourceError(closeError, error);
     throw error;
   }
 
+  let unavailable = false;
   let released = false;
+  let releaseInFlight;
   let nextCommandId = 1;
   const pendingCommands = new Map();
   let resolveLoss;
@@ -226,13 +318,69 @@ export async function acquireAdvisoryLock(
     resolveLoss = resolve;
   });
   const output = createInterface({ input: child.stdout });
+  let referencesDisposed = false;
+  let stopInFlight;
+  let stopSucceeded = false;
+  const disposeReferences = () => {
+    if (referencesDisposed) return undefined;
+    const error = disposeLockProcessReferences(child, output);
+    if (!error) referencesDisposed = true;
+    return error;
+  };
+  const stopProcessGroup = async (options) => {
+    if (stopSucceeded) return;
+    if (stopInFlight) {
+      await stopInFlight;
+      return;
+    }
+    const attempt = (async () => {
+      await runStopProcess(stopProcess, child, options);
+      stopSucceeded = true;
+    })();
+    stopInFlight = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (stopInFlight === attempt) stopInFlight = undefined;
+    }
+  };
+  const cleanup = async (options) => {
+    let cleanupError;
+    try {
+      await stopProcessGroup(options);
+    } catch (error) {
+      cleanupError = error;
+    }
+    const disposalError = disposeReferences();
+    let closeError;
+    try {
+      await closeHandle();
+    } catch (error) {
+      closeError = error;
+    }
+
+    if (cleanupError) throw cleanupError;
+    if (disposalError) throw cleanupResourceError(disposalError);
+    if (closeError) throw cleanupResourceError(closeError);
+  };
+  const rejectPendingCommands = (message) => {
+    const pending = [...pendingCommands.values()];
+    pendingCommands.clear();
+    for (const command of pending) {
+      clearTimeout(command.timer);
+      command.reject(new AdvisoryLockError("lock_commit_uncertain", message));
+    }
+  };
+  const markUnavailable = (message) => {
+    unavailable = true;
+    resolveLoss(new AdvisoryLockError("lock_lost", "authority advisory lock is unavailable"));
+    rejectPendingCommands(message);
+  };
   let commitQuiescence;
   const quiesceUncertainCommit = async (message) => {
     const uncertain = new AdvisoryLockError("lock_commit_uncertain", message);
-    commitQuiescence ??= stopLockProcess(child, {
-      initialWaitMs: 0,
-      signalWaitMs: signalGraceMs,
-    });
+    markUnavailable("lock holder quiesced before confirming the atomic rename");
+    commitQuiescence ??= cleanup({ initialWaitMs: 0, signalWaitMs: signalGraceMs });
     try {
       await commitQuiescence;
     } catch (error) {
@@ -262,24 +410,16 @@ export async function acquireAdvisoryLock(
     }
   });
   child.once("exit", () => {
+    unavailable = true;
     resolveLoss(
       new AdvisoryLockError("lock_lost", "authority advisory lock process exited unexpectedly"),
     );
-    for (const pending of pendingCommands.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(
-        new AdvisoryLockError(
-          "lock_commit_uncertain",
-          "lock holder exited before confirming the atomic rename",
-        ),
-      );
-    }
-    pendingCommands.clear();
+    rejectPendingCommands("lock holder exited before confirming the atomic rename");
   });
 
   return {
     async assertHeld() {
-      if (released || child.exitCode !== null || child.signalCode !== null) {
+      if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {
         throw new AdvisoryLockError("lock_lost", "authority advisory lock was lost");
       }
       let handleStat;
@@ -309,7 +449,7 @@ export async function acquireAdvisoryLock(
       }
     },
     renameWhileHeld(source, destination) {
-      if (released || child.exitCode !== null || child.signalCode !== null) {
+      if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {
         return Promise.reject(
           new AdvisoryLockError("lock_commit_uncertain", "authority advisory lock was lost"),
         );
@@ -319,6 +459,7 @@ export async function acquireAdvisoryLock(
         const timer = setTimeout(() => {
           pendingCommands.delete(id);
           void quiesceUncertainCommit("lock holder did not confirm the atomic rename").then(
+            reject,
             reject,
           );
         }, timeoutMs);
@@ -333,41 +474,37 @@ export async function acquireAdvisoryLock(
             clearTimeout(timer);
             void quiesceUncertainCommit(
               "lock holder command channel failed before confirming rename",
-            ).then(reject);
+            ).then(reject, reject);
           },
         );
       });
     },
     waitForLoss() {
-      if (child.exitCode !== null || child.signalCode !== null) {
+      if (unavailable || child.exitCode !== null || child.signalCode !== null) {
         return Promise.resolve(
-          new AdvisoryLockError("lock_lost", "authority advisory lock process already exited"),
+          new AdvisoryLockError("lock_lost", "authority advisory lock is unavailable"),
         );
       }
       return loss;
     },
-    async release() {
-      if (released) return;
-      released = true;
-      for (const pending of pendingCommands.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(
-          new AdvisoryLockError(
-            "lock_commit_uncertain",
-            "lock released before confirming the atomic rename",
-          ),
-        );
-      }
-      pendingCommands.clear();
-      output.close();
-      try {
-        await stopLockProcess(child, {
+    release() {
+      if (released) return Promise.resolve();
+      if (releaseInFlight) return releaseInFlight;
+      const attempt = (async () => {
+        markUnavailable("lock released before confirming the atomic rename");
+        await cleanup({
           initialWaitMs: releaseGraceMs,
           signalWaitMs: signalGraceMs,
         });
-      } finally {
-        await handle.close();
-      }
+        released = true;
+      })();
+      releaseInFlight = attempt;
+      void attempt
+        .finally(() => {
+          if (releaseInFlight === attempt) releaseInFlight = undefined;
+        })
+        .catch(() => {});
+      return attempt;
     },
   };
 }

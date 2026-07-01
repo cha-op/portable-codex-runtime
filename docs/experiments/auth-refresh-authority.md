@@ -79,7 +79,11 @@ the canonical authority file directly:
    `account/read(refreshToken=true)` against the staging home.
 6. Verify workspace and user continuity, advanced `last_refresh`, a changed
    access token with at least two minutes of remaining validity, file
-   permissions, and the unchanged canonical source generation.
+   permissions, and the unchanged canonical source generation. This reference
+   authority also requires the staged refresh-token fingerprint to change
+   before promotion. That is a deployment-specific operational safety policy
+   for the currently verified one-time rotating login, not a Codex adapter
+   compatibility requirement.
 7. Write the staged record to a synced mode `0600` temporary file, ask the
    actual lock-holder process to atomically rename it over canonical
    `auth.json`, and sync the held authority-directory descriptor when the
@@ -124,6 +128,13 @@ CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
 
 ## Limitations
 
+- Codex permits a successful refresh response to omit `refresh_token` and keep
+  the existing token. An IdP may therefore legally reuse or omit a refresh
+  token even when the access token changed. This authority intentionally uses
+  a stricter fail-closed policy for its live-proven rotating deployment: it
+  retains the durable staging sentinel instead of promoting such a result and
+  requires reauthentication or an explicit operator decision before another
+  refresh attempt.
 - A crash or lock loss after the OAuth service accepts the old refresh token but
   before the staged record is promoted can still require interactive login.
   The staging attempt is preserved even when its local token bytes did not

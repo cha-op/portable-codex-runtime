@@ -32,6 +32,14 @@ export function assertAuthorityEvidenceSafe(serialized, redactionValues) {
   assert.doesNotMatch(serialized, /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\./);
 }
 
+export function assertAuthorityRefreshTokenChanged(comparisons) {
+  assert.equal(
+    comparisons?.refreshTokenChanged,
+    true,
+    "managed authority refresh token did not rotate",
+  );
+}
+
 export async function probeLiveAuthRefreshAuthority({
   allowAuthMutation = process.env.CODEX_ALLOW_AUTH_MUTATION === "1",
   authHome = process.env.CODEX_TEST_HOME ?? DEFAULT_AUTH_HOME,
@@ -60,6 +68,7 @@ export async function probeLiveAuthRefreshAuthority({
   assert.equal(authority.refreshExecutions, 1, "concurrent callers were not coalesced");
   assert.equal(first.generation, 1, "first refresh must create generation 1");
   assert.equal(second.generation, first.generation, "coalesced callers saw different generations");
+  assertAuthorityRefreshTokenChanged(first.comparisons);
   assert.equal(
     second.accessToken === first.accessToken && second.accountId === first.accountId,
     true,
