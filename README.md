@@ -77,7 +77,8 @@ The pinned macOS runtime must provide `/bin/ls` and `/sbin/mount`; Linux must
 provide ACL-capable `/usr/bin/getfacl` plus `/proc/self/mountinfo`. The probe
 invokes these fixed inspection surfaces and fails closed when they are absent,
 malformed, or when raw Darwin mount paths contain text that is ambiguous with
-the `mount(8)` output separators.
+the `mount(8)` output separators. Both platform tables are captured as bytes
+and rejected before parsing if strict UTF-8 decoding would be lossy.
 
 To update the redacted evidence after an intentional runtime upgrade:
 

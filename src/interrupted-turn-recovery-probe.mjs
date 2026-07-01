@@ -524,9 +524,18 @@ function decodeMountPath(value) {
   );
 }
 
+function decodeMountTableText(value, label) {
+  assert(Buffer.isBuffer(value), `${label} must be bytes`);
+  const decoded = value.toString("utf8");
+  assert(
+    Buffer.from(decoded, "utf8").equals(value),
+    `${label} contains non-UTF-8 bytes`,
+  );
+  return decoded;
+}
+
 export function parseLinuxMountInfo(value) {
-  assert.equal(typeof value, "string", "Linux mountinfo must be text");
-  return value
+  return decodeMountTableText(value, "Linux mountinfo")
     .split("\n")
     .filter((line) => line !== "")
     .map((line) => {
@@ -539,8 +548,7 @@ export function parseLinuxMountInfo(value) {
 }
 
 export function parseDarwinMountTable(value) {
-  assert.equal(typeof value, "string", "Darwin mount table must be text");
-  return value
+  return decodeMountTableText(value, "Darwin mount table")
     .split("\n")
     .filter((line) => line !== "")
     .map((line) => {
@@ -575,15 +583,17 @@ async function listCurrentMountPoints({
 } = {}) {
   try {
     if (currentPlatform === "linux") {
-      return parseLinuxMountInfo(await readMountInfo("/proc/self/mountinfo", "utf8"));
+      return parseLinuxMountInfo(await readMountInfo("/proc/self/mountinfo"));
     }
     if (currentPlatform === "darwin") {
       const { stderr, stdout } = await runMount("/sbin/mount", [], {
-        encoding: "utf8",
+        encoding: "buffer",
         env: { ...process.env, LANG: "C", LC_ALL: "C" },
         maxBuffer: 1024 * 1024,
       });
-      if (stderr !== "") throw new Error("unexpected mount diagnostics");
+      if (Buffer.isBuffer(stderr) ? stderr.length !== 0 : stderr !== "") {
+        throw new Error("unexpected mount diagnostics");
+      }
       return parseDarwinMountTable(stdout);
     }
     throw new Error("unsupported platform");

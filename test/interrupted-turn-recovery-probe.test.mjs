@@ -771,16 +771,20 @@ test("portable directory entry decoding rejects lossy UTF-8", () => {
 test("mount table parsers preserve their platform-specific absolute path encoding", () => {
   assert.deepEqual(
     parseLinuxMountInfo(
-      "36 29 0:32 / / rw,relatime - overlay overlay rw\n" +
-        "37 36 0:33 / /private/session/mounted\\040tree rw - tmpfs tmpfs rw\n",
+      Buffer.from(
+        "36 29 0:32 / / rw,relatime - overlay overlay rw\n" +
+          "37 36 0:33 / /private/session/mounted\\040tree rw - tmpfs tmpfs rw\n",
+      ),
     ),
     ["/", "/private/session/mounted tree"],
   );
   assert.deepEqual(
     parseDarwinMountTable(
-      "/dev/disk3s1s1 on / (apfs, local)\n" +
-        "map on /private/session/mounted tree (autofs, local)\n" +
-        "literal on /private/session/backslash\\040tree (apfs, local)\n",
+      Buffer.from(
+        "/dev/disk3s1s1 on / (apfs, local)\n" +
+          "map on /private/session/mounted tree (autofs, local)\n" +
+          "literal on /private/session/backslash\\040tree (apfs, local)\n",
+      ),
     ),
     ["/", "/private/session/mounted tree", "/private/session/backslash\\040tree"],
   );
@@ -792,10 +796,24 @@ test("Darwin mount table parsing fails closed on unescaped separator text in pat
     "map on /private/session/dir ( child (autofs, local)\n",
   ]) {
     assert.throws(
-      () => parseDarwinMountTable(ambiguous),
+      () => parseDarwinMountTable(Buffer.from(ambiguous)),
       /ambiguous mount path/,
     );
   }
+});
+
+test("mount table parsing fails closed before lossy UTF-8 decoding", () => {
+  assert.throws(() => parseLinuxMountInfo("text"), /Linux mountinfo must be bytes/);
+  assert.throws(() => parseDarwinMountTable("text"), /Darwin mount table must be bytes/);
+  const invalidUtf8 = Buffer.from([0x2f, 0x80, 0x0a]);
+  assert.throws(
+    () => parseLinuxMountInfo(invalidUtf8),
+    /Linux mountinfo contains non-UTF-8 bytes/,
+  );
+  assert.throws(
+    () => parseDarwinMountTable(invalidUtf8),
+    /Darwin mount table contains non-UTF-8 bytes/,
+  );
 });
 
 test("Linux getfacl parsing distinguishes base and extended ACL entries", () => {
