@@ -1,7 +1,13 @@
 import { rename } from "node:fs/promises";
 import { createInterface } from "node:readline";
 
+import {
+  assertInheritedLockPathCurrent,
+  holderLockPath,
+} from "./advisory-lock-holder-guard.mjs";
+
 const input = createInterface({ input: process.stdin });
+const lockPath = holderLockPath();
 let operations = Promise.resolve();
 
 async function handleCommand(line) {
@@ -16,6 +22,7 @@ async function handleCommand(line) {
     ) {
       throw new Error("invalid lock holder command");
     }
+    await assertInheritedLockPathCurrent(lockPath);
     await rename(command.source, command.destination);
     process.stdout.write(`${JSON.stringify({ id: command.id, ok: true })}\n`);
   } catch (error) {

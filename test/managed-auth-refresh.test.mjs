@@ -2299,6 +2299,50 @@ test("authority replacement wins when the canonical CAS reread fails", async () 
   }
 });
 
+test("unsafe ancestor during canonical CAS failure preserves the promotion candidate", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+  let promotionTemporary;
+  let stagingHome;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        readCanonicalSource: async () => {
+          const candidateName = (await readdir(authHome)).find((name) =>
+            name.startsWith(".auth.json.next-"),
+          );
+          assert.equal(typeof candidateName, "string");
+          promotionTemporary = join(authHome, candidateName);
+          await chmod(root, 0o777);
+          throw new Error("synthetic canonical reread failure after unsafe ancestor change");
+        },
+        runRefresh: async (options) => {
+          stagingHome = options.stagingHome;
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "unsafe_auth_home");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal((await stat(promotionTemporary)).isFile(), true);
+    assert.equal((await stat(stagingHome)).isDirectory(), true);
+    const metadata = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
+    assert.equal(metadata.includes(promotionTemporary), false);
+    assert.equal(metadata.includes(stagingHome), false);
+  } finally {
+    await chmod(root, 0o700).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("promotion auth write revalidates authority after opening a replacement path", async () => {
   const { authHome, root } = await createAuthorityHome();
   const displaced = join(root, "displaced-before-promotion-auth-write");
@@ -2780,6 +2824,47 @@ test("final cleanup never follows a same-name staging path through a replaced au
   }
 });
 
+test("default final cleanup preserves staging after an unsafe ancestor change", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let marker;
+  let stagingHome;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        cleanupArtifacts: async (options, defaultCleanup) => {
+          stagingHome = options.stagingHome;
+          marker = join(stagingHome, "cleanup-marker");
+          await writeFile(marker, "must remain\n", { mode: 0o600 });
+          await chmod(root, 0o777);
+          return defaultCleanup(options);
+        },
+        runRefresh: async ({ stagingHome: refreshStagingHome }) => {
+          await replaceStagedAuth(refreshStagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "unsafe_auth_home");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    assert.equal(refreshError.cleanupWarnings?.includes("authority_home_replaced") ?? false, false);
+    assert.equal(await readFile(marker, "utf8"), "must remain\n");
+    assert.equal((await stat(stagingHome)).isDirectory(), true);
+    assert.equal(
+      JSON.stringify(managedAuthRefreshErrorMetadata(refreshError)).includes(stagingHome),
+      false,
+    );
+  } finally {
+    await chmod(root, 0o700).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("directory sync failure alone preserves the rotated staging credential", async () => {
   const { authHome, root } = await createAuthorityHome();
   try {
@@ -2850,6 +2935,56 @@ test("uncertain holder commit fails closed and preserves every recovery copy", a
       (error) => error.code === "recovery_required",
     );
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unsafe ancestor during uncertain holder commit preserves artifacts without recovery paths", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+  const advisoryError = new AdvisoryLockError(
+    "lock_commit_uncertain",
+    "synthetic lost commit acknowledgement after unsafe ancestor change",
+  );
+  let stagingHome;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async () => ({
+          assertHeld: async () => {},
+          release: async () => {},
+          renameWhileHeld: async () => {
+            await chmod(root, 0o777);
+            throw advisoryError;
+          },
+        }),
+        runRefresh: async (options) => {
+          stagingHome = options.stagingHome;
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "unsafe_auth_home");
+    assert.equal(refreshError.cause, advisoryError);
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal((await stat(stagingHome)).isDirectory(), true);
+    assert.equal(
+      (await readdir(authHome)).filter((name) => name.startsWith(".auth.json.next-")).length,
+      1,
+    );
+    const metadata = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
+    assert.equal(metadata.includes(stagingHome), false);
+    assert.equal(metadata.includes(".auth.json.next-"), false);
+  } finally {
+    await chmod(root, 0o700).catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -3170,6 +3305,82 @@ test("outer early cleanup uses a safe carrier for a frozen generic primary error
     assert.equal(failureReport.includes(warningSecret), false);
     assert.equal(failureReport.includes(closeSecret), false);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority mode changes fail before promotion without following cleanup paths", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+  let cleanupCalled = false;
+  let stagingHome;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        cleanupArtifacts: async () => {
+          cleanupCalled = true;
+        },
+        runRefresh: async (options) => {
+          stagingHome = options.stagingHome;
+          await replaceStagedAuth(stagingHome);
+          await chmod(authHome, 0o777);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "unsafe_auth_home");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    assert.equal(refreshError.cleanupWarnings?.includes("authority_home_replaced") ?? false, false);
+    assert.equal(cleanupCalled, false);
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal((await stat(join(stagingHome, "auth.json"))).isFile(), true);
+    assert.equal(JSON.stringify(managedAuthRefreshErrorMetadata(refreshError)).includes(stagingHome), false);
+  } finally {
+    await chmod(authHome, 0o700).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ancestor mode changes fail before promotion without following cleanup paths", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+  let cleanupCalled = false;
+  let stagingHome;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        cleanupArtifacts: async () => {
+          cleanupCalled = true;
+        },
+        runRefresh: async (options) => {
+          stagingHome = options.stagingHome;
+          await replaceStagedAuth(stagingHome);
+          await chmod(root, 0o777);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert.equal(refreshError.code, "unsafe_auth_home");
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(refreshError.recoveryPaths, undefined);
+    assert.equal(refreshError.cleanupWarnings?.includes("authority_home_replaced") ?? false, false);
+    assert.equal(cleanupCalled, false);
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal((await stat(join(stagingHome, "auth.json"))).isFile(), true);
+    assert.equal(JSON.stringify(managedAuthRefreshErrorMetadata(refreshError)).includes(stagingHome), false);
+  } finally {
+    await chmod(root, 0o700).catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });

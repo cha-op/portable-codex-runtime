@@ -169,9 +169,11 @@ CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
   rootless executor implementation remains deferred.
 - Node.js does not expose `openat`/`renameat`; directory-FD identity guards close
   deterministic replacement attacks but cannot eliminate the final pathname
-  TOCTOU window. The authority volume must therefore be single-attached, its
-  parent chain must not be writable or renameable by workers, and only the
-  broker may mount the canonical credential directory.
+  TOCTOU window. The lock holder narrows that window by comparing its inherited
+  lock fd with `lstat(lockPath)` immediately before rename, but the authority
+  volume must still be single-attached, its parent chain must not be writable or
+  renameable by workers, and only the broker may mount the canonical credential
+  directory.
 - The reference lock backend requires `/usr/bin/lockf` on macOS and `/usr/bin/flock`
   from util-linux plus procfs on Linux. Fixed runtime images must include and
   test the matching backend. The repository test workflow exercises both

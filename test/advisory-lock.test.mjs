@@ -36,6 +36,12 @@ const STUBBORN_HOLDER_FIXTURE = fileURLToPath(
 const DELAYED_HOLDER_FIXTURE = fileURLToPath(
   new URL("../fixtures/delayed-advisory-lock-holder.mjs", import.meta.url),
 );
+const QUEUED_DELAYED_HOLDER_FIXTURE = fileURLToPath(
+  new URL("../fixtures/queued-delayed-advisory-lock-holder.mjs", import.meta.url),
+);
+const CONTROLLED_LOCK_PATH_GUARD_FIXTURE = fileURLToPath(
+  new URL("../fixtures/controlled-lock-path-guard-holder.mjs", import.meta.url),
+);
 const KILL_LOCKF_PARENT_FIXTURE = fileURLToPath(
   new URL("../fixtures/kill-lockf-parent-holder.mjs", import.meta.url),
 );
@@ -144,6 +150,20 @@ async function within(promise, timeoutMs) {
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function waitForPath(path, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await access(path);
+      return;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    assert(Date.now() < deadline, `timed out waiting for ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
@@ -259,6 +279,8 @@ test("advisory lock backends use independent lock descriptions", () => {
       protectedLockPath,
       process.execPath,
       fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
+      "--portable-auth-lock-path",
+      protectedLockPath,
     ],
     conflictExitCode: 75,
   });
@@ -266,7 +288,7 @@ test("advisory lock backends use independent lock descriptions", () => {
     () => advisoryLockCommand("darwin"),
     (error) => error instanceof AdvisoryLockError && error.code === "unsafe_lock_file",
   );
-  assert.deepEqual(advisoryLockCommand("linux"), {
+  assert.deepEqual(advisoryLockCommand("linux", { lockPath: protectedLockPath }), {
     command: "/usr/bin/flock",
     args: [
       "--exclusive",
@@ -277,6 +299,8 @@ test("advisory lock backends use independent lock descriptions", () => {
       "/proc/self/fd/3",
       process.execPath,
       fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
+      "--portable-auth-lock-path",
+      protectedLockPath,
     ],
     conflictExitCode: 75,
   });
@@ -861,6 +885,110 @@ test("advisory lock detects path replacement while held", async () => {
     });
   } finally {
     await lock?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("prequeue lock replacement quiesces existing holder commands before exact rejection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-rename-replaced-lock-"));
+  const path = join(root, "authority.lock");
+  const displaced = join(root, "displaced.lock");
+  const queuedMarker = join(root, "queued");
+  const firstSource = join(root, "first.next");
+  const firstDestination = join(root, "first-auth.json");
+  const secondSource = join(root, "second.next");
+  const secondDestination = join(root, "second-auth.json");
+  let lock;
+  let replacementLock;
+  try {
+    await writeFile(firstSource, "first candidate\n", { mode: 0o600 });
+    await writeFile(firstDestination, "first canonical\n", { mode: 0o600 });
+    await writeFile(secondSource, "second candidate\n", { mode: 0o600 });
+    await writeFile(secondDestination, "second canonical\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path, {
+      holderArgs: [queuedMarker],
+      holderPath: QUEUED_DELAYED_HOLDER_FIXTURE,
+      signalGraceMs: 100,
+      timeoutMs: 2_000,
+    });
+    let firstSettled = false;
+    const first = lock.renameWhileHeld(firstSource, firstDestination).then(
+      () => assert.fail("queued rename unexpectedly succeeded"),
+      (error) => {
+        firstSettled = true;
+        return error;
+      },
+    );
+    void first.catch(() => {});
+    await waitForPath(queuedMarker);
+
+    await rename(path, displaced);
+    await writeFile(path, "replacement\n", { mode: 0o600 });
+    replacementLock = await acquireAdvisoryLock(path);
+    await replacementLock.assertHeld();
+
+    let replacementError;
+    try {
+      await lock.renameWhileHeld(secondSource, secondDestination);
+    } catch (error) {
+      replacementError = error;
+    }
+    assert(replacementError instanceof AdvisoryLockError);
+    assert.equal(replacementError.code, "lock_replaced");
+    assert.equal(firstSettled, true);
+    const firstError = await first;
+    assert(firstError instanceof AdvisoryLockError);
+    assert.equal(firstError.code, "lock_commit_uncertain");
+
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(await readFile(firstSource, "utf8"), "first candidate\n");
+    assert.equal(await readFile(firstDestination, "utf8"), "first canonical\n");
+    assert.equal(await readFile(secondSource, "utf8"), "second candidate\n");
+    assert.equal(await readFile(secondDestination, "utf8"), "second canonical\n");
+  } finally {
+    await lock?.release().catch(() => {});
+    await replacementLock?.release().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("holder rejects a lock replacement in the final controlled rename window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-holder-path-guard-"));
+  const path = join(root, "authority.lock");
+  const displaced = join(root, "displaced.lock");
+  const readyMarker = join(root, "holder-ready");
+  const continueMarker = join(root, "holder-continue");
+  const source = join(root, "auth.next");
+  const destination = join(root, "auth.json");
+  let lock;
+  let replacementLock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    await writeFile(destination, "canonical\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path, {
+      holderArgs: [readyMarker, continueMarker],
+      holderPath: CONTROLLED_LOCK_PATH_GUARD_FIXTURE,
+      signalGraceMs: 100,
+      timeoutMs: 2_000,
+    });
+    const renameAttempt = lock.renameWhileHeld(source, destination);
+    void renameAttempt.catch(() => {});
+    await waitForPath(readyMarker);
+
+    await rename(path, displaced);
+    await writeFile(path, "replacement\n", { mode: 0o600 });
+    replacementLock = await acquireAdvisoryLock(path);
+    await replacementLock.assertHeld();
+    await writeFile(continueMarker, "continue\n", { mode: 0o600 });
+
+    await assert.rejects(renameAttempt, (error) => {
+      return error instanceof AdvisoryLockError && error.code === "lock_replaced";
+    });
+    assert.equal(await readFile(source, "utf8"), "candidate\n");
+    assert.equal(await readFile(destination, "utf8"), "canonical\n");
+  } finally {
+    await lock?.release().catch(() => {});
+    await replacementLock?.release().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });

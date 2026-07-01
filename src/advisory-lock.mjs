@@ -4,19 +4,24 @@ import { open } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
+import { HOLDER_LOCK_PATH_FLAG } from "./advisory-lock-holder-guard.mjs";
+
 const HOLDER_PATH = fileURLToPath(new URL("./advisory-lock-holder.mjs", import.meta.url));
 
 export function advisoryLockCommand(
   platform = process.platform,
   { holderArgs = [], holderPath = HOLDER_PATH, lockPath } = {},
 ) {
+  if (
+    ["darwin", "linux"].includes(platform) &&
+    (typeof lockPath !== "string" || lockPath.length === 0)
+  ) {
+    throw new AdvisoryLockError(
+      "unsafe_lock_file",
+      "advisory locks require a protected lock path",
+    );
+  }
   if (platform === "darwin") {
-    if (typeof lockPath !== "string" || lockPath.length === 0) {
-      throw new AdvisoryLockError(
-        "unsafe_lock_file",
-        "macOS advisory locks require a protected lock path",
-      );
-    }
     return {
       command: "/usr/bin/lockf",
       // macOS lockf's fdlock mode would flock the broker-shared descriptor 3,
@@ -33,6 +38,8 @@ export function advisoryLockCommand(
         process.execPath,
         holderPath,
         ...holderArgs,
+        HOLDER_LOCK_PATH_FLAG,
+        lockPath,
       ],
       conflictExitCode: 75,
     };
@@ -56,6 +63,8 @@ export function advisoryLockCommand(
         process.execPath,
         holderPath,
         ...holderArgs,
+        HOLDER_LOCK_PATH_FLAG,
+        lockPath,
       ],
       conflictExitCode: 75,
     };
@@ -485,6 +494,14 @@ export async function acquireAdvisoryLock(
       pendingMessage: "lock holder exited before confirming the atomic rename",
     });
   };
+  const failLockReplacement = async (error) => {
+    const { cleanupError } = await beginQuiescence({
+      initialWaitMs: 0,
+      lossMessage: "authority advisory lock path changed",
+      pendingMessage: "authority lock path changed before confirming the atomic rename",
+    });
+    throw withCause(error, cleanupError);
+  };
   output.on("line", (line) => {
     if (unavailable) return;
     let response;
@@ -498,7 +515,11 @@ export async function acquireAdvisoryLock(
     pendingCommands.delete(response.id);
     clearTimeout(pending.timer);
     if (response.ok === true) pending.resolve();
-    else {
+    else if (response.code === "lock_replaced") {
+      void failLockReplacement(
+        new AdvisoryLockError("lock_replaced", "authority lock path changed"),
+      ).then(pending.resolve, pending.reject);
+    } else {
       pending.reject(
         new AdvisoryLockError(
           "lock_commit_failed",
@@ -523,28 +544,67 @@ export async function acquireAdvisoryLock(
           outcome?.cleanupError,
         );
       }
-      await assertLockPathIdentity(lockPath, handle);
+      try {
+        await assertLockPathIdentity(lockPath, handle);
+      } catch (error) {
+        if (error instanceof AdvisoryLockError && error.code === "lock_replaced") {
+          return failLockReplacement(error);
+        }
+        throw error;
+      }
     },
-    renameWhileHeld(source, destination) {
+    async renameWhileHeld(source, destination) {
       const processExited = child.exitCode !== null || child.signalCode !== null;
       const lossSettlement =
         !unavailable && processExited ? beginUnexpectedLoss() : currentQuiescence();
       if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {
         if (lossSettlement) {
-          return lossSettlement.then(({ cleanupError }) => {
-            throw withCause(
-              new AdvisoryLockError(
-                "lock_commit_uncertain",
-                "authority advisory lock was lost",
-              ),
-              cleanupError,
-            );
-          });
+          const { cleanupError } = await lossSettlement;
+          throw withCause(
+            new AdvisoryLockError(
+              "lock_commit_uncertain",
+              "authority advisory lock was lost",
+            ),
+            cleanupError,
+          );
         }
-        return Promise.reject(
-          new AdvisoryLockError("lock_commit_uncertain", "authority advisory lock was lost"),
+        throw new AdvisoryLockError(
+          "lock_commit_uncertain",
+          "authority advisory lock was lost",
         );
       }
+
+      try {
+        await assertLockPathIdentity(lockPath, handle);
+      } catch (error) {
+        if (error instanceof AdvisoryLockError && error.code === "lock_replaced") {
+          return failLockReplacement(error);
+        }
+        throw error;
+      }
+
+      const processExitedAfterIdentityCheck =
+        child.exitCode !== null || child.signalCode !== null;
+      const lossSettlementAfterIdentityCheck =
+        !unavailable && processExitedAfterIdentityCheck
+          ? beginUnexpectedLoss()
+          : currentQuiescence();
+      if (
+        unavailable ||
+        released ||
+        child.exitCode !== null ||
+        child.signalCode !== null
+      ) {
+        const outcome = await lossSettlementAfterIdentityCheck;
+        throw withCause(
+          new AdvisoryLockError(
+            "lock_commit_uncertain",
+            "authority advisory lock was lost",
+          ),
+          outcome?.cleanupError,
+        );
+      }
+
       const id = nextCommandId++;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {

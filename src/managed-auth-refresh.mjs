@@ -510,6 +510,66 @@ function accessTokenExpiration(exp) {
   };
 }
 
+function assertAuthorityDirectoryTrust(authorityStat, brokerUid) {
+  ensure(
+    authorityDirectoryPermissionsAreSafe(
+      {
+        isDirectory: authorityStat.isDirectory(),
+        mode: authorityStat.mode,
+        uid: authorityStat.uid,
+      },
+      {
+        brokerUid,
+        disallowedModeBits: 0o077,
+        requiredModeBits: 0o700,
+      },
+    ),
+    "unsafe_auth_home",
+    "authority home must be broker-owned with private owner permissions",
+  );
+}
+
+async function assertAuthorityAncestorTrustCurrent(authority) {
+  let childUid = authority.identity.uid;
+  let ancestor = dirname(authority.path);
+  while (true) {
+    let ancestorStat;
+    try {
+      ancestorStat = await lstat(ancestor, { bigint: true });
+    } catch {
+      fail("unsafe_auth_home", "authority ancestor chain could not be validated");
+    }
+    ensure(
+      authorityDirectoryPermissionsAreSafe(
+        {
+          isDirectory: ancestorStat.isDirectory(),
+          mode: ancestorStat.mode,
+          uid: ancestorStat.uid,
+        },
+        {
+          allowRootOwner: true,
+          allowStickyShared: true,
+          brokerUid: authority.brokerUid,
+          childUid,
+          disallowedModeBits: 0o022,
+        },
+      ),
+      "unsafe_auth_home",
+      "authority ancestor chain is not trusted",
+    );
+    await assertNoExtendedAcl(
+      ancestor,
+      authority.inspectAncestorAcl,
+      "unsafe_auth_home",
+      "authority ancestor chain has unsafe access controls",
+    );
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    childUid = ancestorStat.uid;
+    ancestor = parent;
+  }
+}
+
 async function resolveAuthorityHome(
   authHome,
   inspectExtendedAcl = pathHasExtendedAcl,
@@ -539,66 +599,22 @@ async function resolveAuthorityHome(
         : typeof process.getuid === "function"
           ? process.getuid()
           : null;
-    ensure(
-      authorityDirectoryPermissionsAreSafe(
-        {
-          isDirectory: authorityHomeStat.isDirectory(),
-          mode: authorityHomeStat.mode,
-          uid: authorityHomeStat.uid,
-        },
-        {
-          brokerUid: currentUid,
-          disallowedModeBits: 0o077,
-          requiredModeBits: 0o700,
-        },
-      ),
-      "unsafe_auth_home",
-      "authority home must be broker-owned with private owner permissions",
-    );
+    assertAuthorityDirectoryTrust(authorityHomeStat, currentUid);
     await assertNoExtendedAcl(
       authorityHome,
       inspectExtendedAcl,
       "unsafe_auth_home",
       "authority home must not have extended access controls",
     );
-    let childUid = authorityHomeStat.uid;
-    let ancestor = dirname(authorityHome);
-    while (true) {
-      let ancestorStat;
-      try {
-        ancestorStat = await lstat(ancestor, { bigint: true });
-      } catch {
-        fail("unsafe_auth_home", "authority ancestor chain could not be validated");
-      }
-      ensure(
-        authorityDirectoryPermissionsAreSafe(
-          {
-            isDirectory: ancestorStat.isDirectory(),
-            mode: ancestorStat.mode,
-            uid: ancestorStat.uid,
-          },
-          {
-            allowRootOwner: true,
-            allowStickyShared: true,
-            brokerUid: currentUid,
-            childUid,
-            disallowedModeBits: 0o022,
-          },
-        ),
-        "unsafe_auth_home",
-        "authority ancestor chain is not trusted",
-      );
-      await assertNoExtendedAcl(
-        ancestor,
-        inspectAncestorAcl,
-        "unsafe_auth_home",
-        "authority ancestor chain has unsafe access controls",
-      );
-      const parent = dirname(ancestor);
-      if (parent === ancestor) break;
-      childUid = ancestorStat.uid;
-      ancestor = parent;
-    }
+    const authority = {
+      brokerUid: currentUid,
+      handle,
+      identity: authorityHomeStat,
+      inspectAncestorAcl,
+      inspectExtendedAcl,
+      path: authorityHome,
+    };
+    await assertAuthorityAncestorTrustCurrent(authority);
     const protectedHomes = await Promise.all(
       [join(homedir(), ".codex"), process.env.CODEX_HOME]
         .filter((value) => typeof value === "string" && value.length > 0)
@@ -621,7 +637,7 @@ async function resolveAuthorityHome(
       "unsafe_auth_home",
       "refusing to mutate the default or active Codex home; use a dedicated authority home",
     );
-    return { handle, identity: authorityHomeStat, inspectExtendedAcl, path: authorityHome };
+    return authority;
   } catch (error) {
     await handle?.close().catch(() => {});
     throw error;
@@ -641,6 +657,7 @@ async function assertAuthorityHomeCurrent(authority) {
       "authority_home_replaced",
       "authority home identity changed during refresh",
     );
+    assertAuthorityDirectoryTrust(currentStat, authority.brokerUid);
   } catch (error) {
     if (error instanceof ManagedAuthRefreshError) throw error;
     fail("authority_home_replaced", "authority home identity changed during refresh");
@@ -649,7 +666,7 @@ async function assertAuthorityHomeCurrent(authority) {
   }
 }
 
-async function assertCredentialWriteAuthorityCurrent(authority) {
+async function assertAuthorityPathTrustCurrent(authority) {
   await assertAuthorityHomeCurrent(authority);
   await assertNoExtendedAcl(
     authority.path,
@@ -657,12 +674,21 @@ async function assertCredentialWriteAuthorityCurrent(authority) {
     "unsafe_auth_home",
     "authority home must not have extended access controls",
   );
+  await assertAuthorityAncestorTrustCurrent(authority);
+}
+
+async function assertCredentialWriteAuthorityCurrent(authority) {
+  await assertAuthorityPathTrustCurrent(authority);
   await assertNoExtendedAcl(
     join(authority.path, "auth.json"),
     authority.inspectExtendedAcl,
     "invalid_auth_record",
     "authority auth.json must not have extended access controls",
   );
+}
+
+function authorityPathIsUntrusted(error) {
+  return ["authority_home_replaced", "unsafe_auth_home"].includes(error?.code);
 }
 
 async function acquireAuthorityLock(authority, acquireFileLock = acquireAdvisoryLock) {
@@ -979,13 +1005,18 @@ remote_plugin = false
 
     const assertCleanupAuthorityCurrent = async () => {
       try {
-        await assertAuthorityHomeCurrent(authority);
+        await assertAuthorityPathTrustCurrent(authority);
       } catch (authorityError) {
         attachErrorCause(authorityError, setupError, { ifAbsent: true });
         throw authorityError;
       }
     };
-    await assertCleanupAuthorityCurrent();
+    try {
+      await assertAuthorityPathTrustCurrent(authority);
+    } catch (authorityError) {
+      attachErrorCause(authorityError, setupError, { ifAbsent: true });
+      throw authorityError;
+    }
 
     let retainedAttempt = false;
     if (stagingHome) {
@@ -993,7 +1024,7 @@ remote_plugin = false
         await assertCleanupAuthorityCurrent();
         await cleanupStagingAttempt(stagingHome);
       } catch (cleanupError) {
-        if (cleanupError?.code === "authority_home_replaced") throw cleanupError;
+        if (authorityPathIsUntrusted(cleanupError)) throw cleanupError;
         // Confirm whether the attempt still exists before reporting recovery.
       }
       try {
@@ -1001,7 +1032,7 @@ remote_plugin = false
         await lstat(stagingHome, { bigint: true });
         retainedAttempt = true;
       } catch (statError) {
-        if (statError?.code === "authority_home_replaced") throw statError;
+        if (authorityPathIsUntrusted(statError)) throw statError;
         retainedAttempt = statError?.code !== "ENOENT";
       }
     }
@@ -1023,7 +1054,7 @@ remote_plugin = false
         await assertCleanupAuthorityCurrent();
         await cleanupStagingRoot(stagingRoot);
       } catch (cleanupError) {
-        if (cleanupError?.code === "authority_home_replaced") throw cleanupError;
+        if (authorityPathIsUntrusted(cleanupError)) throw cleanupError;
         // The next run may safely reuse or remove an empty staging root.
       }
     }
@@ -1072,7 +1103,7 @@ async function atomicallyPromoteAuth(
     await handle.close();
     handle = undefined;
 
-    await assertAuthorityHomeCurrent(authority);
+    await assertAuthorityPathTrustCurrent(authority);
     let currentSource;
     try {
       currentSource = await readCanonicalSource(authorityHome, {
@@ -1107,9 +1138,14 @@ async function atomicallyPromoteAuth(
       retainTemporary = true;
       const recoveryPaths = [];
       try {
+        await assertAuthorityPathTrustCurrent(authority);
         await lstat(temporary, { bigint: true });
         recoveryPaths.push(temporary);
       } catch (candidateError) {
+        if (authorityPathIsUntrusted(candidateError)) {
+          attachErrorCause(candidateError, error, { ifAbsent: true });
+          throw candidateError;
+        }
         if (candidateError?.code !== "ENOENT") recoveryPaths.push(temporary);
       }
       const uncertain = new ManagedAuthRefreshError(
@@ -1154,22 +1190,43 @@ async function atomicallyPromoteAuth(
       closeFailure = error;
       operationError = error;
     }
+    let authorityTrustFailure;
+    const recordAuthorityTrustFailure = (error) => {
+      if (authorityPathIsUntrusted(operationError)) {
+        authorityTrustFailure = operationError;
+        return;
+      }
+      attachErrorCause(error, operationError, { ifAbsent: true });
+      authorityTrustFailure = error;
+    };
     if (!renamed && !retainTemporary) {
       let authorityCurrent = false;
       try {
-        await assertAuthorityHomeCurrent(authority);
+        await assertAuthorityPathTrustCurrent(authority);
         authorityCurrent = true;
-      } catch {
+      } catch (error) {
+        recordAuthorityTrustFailure(error);
         // Never resolve cleanup through a replaced authority path. A retained
         // candidate must be inspected from the single-attached authority volume.
       }
       if (authorityCurrent) {
         try {
           await rm(temporary, { force: true });
-        } catch {
-          attachRecoveryPaths(operationError, [temporary]);
+        } catch (cleanupError) {
+          try {
+            await assertAuthorityPathTrustCurrent(authority);
+          } catch (error) {
+            recordAuthorityTrustFailure(error);
+          }
+          if (!authorityTrustFailure) {
+            attachRecoveryPaths(operationError, [temporary]);
+            attachCleanupError(operationError, cleanupError);
+          }
         }
       }
+    }
+    if (authorityTrustFailure) {
+      throw authorityTrustFailure;
     }
     if (closeFailure) throw closeFailure;
   }
@@ -1887,7 +1944,7 @@ export async function refreshManagedAuthRecord({
       );
       preserveStaging = promotion.warnings.length > 0;
     } catch (error) {
-      if (error?.code === "authority_home_replaced") throw error;
+      if (authorityPathIsUntrusted(error)) throw error;
       // A verify read can fail because its authority pathname was replaced.
       // Revalidate before wrapping it with a stale staging recovery path.
       await assertAuthorityHomeCurrent(authority);
@@ -1943,8 +2000,8 @@ export async function refreshManagedAuthRecord({
       error = uncertain;
       preserveStaging = true;
     }
-    const authorityReplaced = error?.code === "authority_home_replaced";
-    if (stagingHome && before && !preserveStaging && !authorityReplaced) {
+    const authorityPathUntrusted = authorityPathIsUntrusted(error);
+    if (stagingHome && before && !preserveStaging && !authorityPathUntrusted) {
       try {
         const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome, {
           inspectExtendedAcl,
@@ -1957,7 +2014,7 @@ export async function refreshManagedAuthRecord({
         preserveStaging = true;
       }
     }
-    if (preserveStaging && stagingHome && !authorityReplaced) {
+    if (preserveStaging && stagingHome && !authorityPathUntrusted) {
       if (!(error instanceof ManagedAuthRefreshError)) {
         const uncertain = new ManagedAuthRefreshError(
           "refresh_outcome_uncertain",
@@ -1981,36 +2038,45 @@ export async function refreshManagedAuthRecord({
 
   const cleanupWarnings = [...committedWarnings];
   let authorityCurrent = true;
-  const recordAuthorityReplacement = (error) => {
+  const recordAuthorityGuardFailure = (error) => {
     authorityCurrent = false;
     if (primaryError && primaryError !== error) {
-      attachErrorCause(error, primaryError, { ifAbsent: true });
+      const primaryCause = readErrorProperty(primaryError, "cause");
+      const cause =
+        authorityPathIsUntrusted(primaryError) &&
+        primaryCause instanceof AdvisoryLockError &&
+        primaryCause.code === "lock_commit_uncertain"
+          ? primaryCause
+          : primaryError;
+      attachErrorCause(error, cause, { ifAbsent: true });
     }
     primaryError = error;
-    cleanupWarnings.push("authority_home_replaced");
+    if (error?.code === "authority_home_replaced") {
+      cleanupWarnings.push("authority_home_replaced");
+    }
   };
   try {
-    await assertAuthorityHomeCurrent(authority);
+    await assertAuthorityPathTrustCurrent(authority);
   } catch (error) {
-    recordAuthorityReplacement(error);
+    recordAuthorityGuardFailure(error);
   }
   if (authorityCurrent) {
     try {
       const cleanupOptions = {
-        assertAuthorityCurrent: () => assertAuthorityHomeCurrent(authority),
+        assertAuthorityCurrent: () => assertAuthorityPathTrustCurrent(authority),
         preserveStaging,
         stagingHome,
         stagingRoot,
       };
       await cleanupArtifacts(cleanupOptions, cleanupManagedRefreshArtifacts);
     } catch (cleanupError) {
-      if (cleanupError?.code === "authority_home_replaced") {
-        recordAuthorityReplacement(cleanupError);
+      if (authorityPathIsUntrusted(cleanupError)) {
+        recordAuthorityGuardFailure(cleanupError);
       } else {
         cleanupWarnings.push("staging_cleanup_failed");
         if (stagingHome) {
           try {
-            await assertAuthorityHomeCurrent(authority);
+            await assertAuthorityPathTrustCurrent(authority);
             await lstat(stagingHome, { bigint: true });
             if (primaryError && typeof primaryError === "object") {
               primaryError = mutableManagedAuthRefreshError(primaryError);
@@ -2018,8 +2084,8 @@ export async function refreshManagedAuthRecord({
             }
             if (outcome) outcome.recoveryPath ??= stagingHome;
           } catch (statError) {
-            if (statError?.code === "authority_home_replaced") {
-              recordAuthorityReplacement(statError);
+            if (authorityPathIsUntrusted(statError)) {
+              recordAuthorityGuardFailure(statError);
             }
           }
         }
