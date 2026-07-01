@@ -9,6 +9,7 @@ import {
   readlink,
   realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -23,6 +24,7 @@ import {
   assertProcessGroupTarget,
   assertRecoveryEvidenceSafe,
   copyStoppedTree,
+  createRecoveryLayout,
   decodePortablePathBytes,
   digestTree,
   interruptedTurnRecoveryFailureReport,
@@ -45,6 +47,7 @@ function scenarioReport(kind) {
     sameThreadId: true,
     tailTurnStatus: "interrupted",
     threadReadAgrees: true,
+    threadReadIsolated: true,
     modelAbortMarker: kind === "logical_interrupt" ? "present" : "absent",
     ...(kind === "snapshot_restore"
       ? {
@@ -91,6 +94,24 @@ test("process-group target validation rejects unsafe identifiers", () => {
   assert.equal(assertProcessGroupTarget(4242, 7), 4242);
   for (const value of [undefined, 0, 1, -2, 1.5, 7]) {
     assert.throws(() => assertProcessGroupTarget(value, 7), /unsafe app-server process-group/);
+  }
+});
+
+test("recovery layout restores private directory modes under a restrictive umask", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-recovery-layout-test-"));
+  try {
+    const previousUmask = process.umask(0o777);
+    let layout;
+    try {
+      layout = await createRecoveryLayout(root);
+    } finally {
+      process.umask(previousUmask);
+    }
+    for (const path of [layout.sessionRoot, layout.codexHome, layout.workspace]) {
+      assert.equal((await stat(path)).mode & 0o777, 0o700);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -557,13 +578,14 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       "123e4567-e89b-42d3-a456-426614174000",
       "/var/folders/private-state",
       "/srv/portable/private-state",
+      "codex-cli 0.142.4+builder01.corp.internal",
     ]) {
       assert.throws(
         () => assertRecoveryEvidenceSafe({
           ...report,
           runtime: { ...report.runtime, codexVersion },
         }),
-        /disallowed runtime data|does not match/,
+        /disallowed runtime data|did not match/,
       );
     }
     const escapedSecret = JSON.stringify(report).replace(
@@ -580,6 +602,15 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     assert.throws(
       () => assertRecoveryEvidenceSafe(duplicateEscapedSecret),
+      /disallowed runtime data/,
+    );
+    const nestedSecret = String.raw`{"token":"s\u006b-secret-sentinel"}`;
+    const duplicateNestedSecret = JSON.stringify(report).replace(
+      '"codexVersion":"codex-cli 0.142.4"',
+      `"codexVersion":${JSON.stringify(nestedSecret)},"codexVersion":"codex-cli 0.142.4"`,
+    );
+    assert.throws(
+      () => assertRecoveryEvidenceSafe(duplicateNestedSecret),
       /disallowed runtime data/,
     );
     const path = join(root, "evidence.json");

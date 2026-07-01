@@ -30,12 +30,14 @@ mode `0700` temporary root and a fixed prompt that contains no repository data.
 | `sigkill` | child observed `SIGKILL` | same thread ID | `interrupted` | absent |
 | `snapshot_restore` | child observed `SIGKILL`; source tree quiesced before copy | same thread ID from a new absolute path | `interrupted` | absent |
 
-A fresh app-server performs cold `thread/read {includeTurns:true}` before a
-second fresh app-server performs `thread/resume`; both must report the original
-turn as the interrupted tail, and neither operation may issue a model request.
-A completed follow-up turn is matched by its exact turn ID and captures the
-single corresponding next loopback request to distinguish a persisted abort
-marker from view-only normalization.
+A fresh app-server performs cold `thread/read {includeTurns:true}` on a private
+copy of the quiesced recovery tree. A second fresh app-server performs
+`thread/resume` against the original recovery tree, which the read process has
+never opened. Both must report the original turn as the interrupted tail, and
+neither operation may issue a model request. A completed follow-up turn is
+matched by its exact turn ID and captures the single corresponding next
+loopback request to distinguish a persisted abort marker from view-only
+normalization.
 
 The snapshot scenario copies the entire synthetic session tree, including
 `CODEX_HOME` and workspace, after the killed process has exited. It hashes

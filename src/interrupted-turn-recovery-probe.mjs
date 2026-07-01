@@ -50,6 +50,7 @@ const SENSITIVE_EVIDENCE_PATTERNS = [
 ];
 const JSON_STRING_TOKEN_PATTERN =
   /"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"/g;
+const MAX_EVIDENCE_STRING_SURFACES = 1_024;
 
 async function withTimeout(promise, timeoutMs, label) {
   let timer;
@@ -207,7 +208,20 @@ request_max_retries = 0
 stream_max_retries = 0
 supports_websockets = false
 `;
-  await writeFile(join(codexHome, "config.toml"), config, { mode: 0o600 });
+  const configPath = join(codexHome, "config.toml");
+  await writeFile(configPath, config, { mode: 0o600 });
+  await chmod(configPath, 0o600);
+}
+
+export async function createRecoveryLayout(ownedRoot) {
+  const sessionRoot = join(ownedRoot, "session");
+  const codexHome = join(sessionRoot, "codex-home");
+  const workspace = join(sessionRoot, "workspace");
+  for (const path of [sessionRoot, codexHome, workspace]) {
+    await mkdir(path, { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  return { codexHome, sessionRoot, workspace };
 }
 
 export function assertProcessGroupTarget(pid, currentPid = process.pid) {
@@ -669,16 +683,14 @@ export async function runRecoveryScenario({
   let mock;
   let primaryFailure;
   try {
-    let sessionRoot = join(ownedRoot, "session");
-    let codexHome = join(sessionRoot, "codex-home");
-    let workspace = join(sessionRoot, "workspace");
+    let { codexHome, sessionRoot, workspace } = await createRecoveryLayout(ownedRoot);
     const originalWorkspace = workspace;
-    await mkdir(codexHome, { recursive: true, mode: 0o700 });
-    await mkdir(workspace, { mode: 0o700 });
     const originalWorkspaceCanonical = await realpath(workspace);
-    await writeFile(join(workspace, "sentinel.txt"), "portable-recovery-sentinel\n", {
+    const sentinelPath = join(workspace, "sentinel.txt");
+    await writeFile(sentinelPath, "portable-recovery-sentinel\n", {
       mode: 0o600,
     });
+    await chmod(sentinelPath, 0o600);
     mock = await startMock({ timeoutMs });
     await writeRecoveryConfig(codexHome, mock.baseUrl);
 
@@ -747,7 +759,19 @@ export async function runRecoveryScenario({
       "interrupted turn issued unexpected model requests",
     );
     const modelRequestBaseline = mock.requestCount();
-    readClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
+    const coldReadRoot = join(ownedRoot, "cold-read-session");
+    const recoveryStateDigest = await digestTree(sessionRoot);
+    await copyStoppedTree({
+      ownedRoot,
+      source: sessionRoot,
+      destination: coldReadRoot,
+    });
+    assert.equal(await digestTree(coldReadRoot), recoveryStateDigest);
+    readClient = await startRecoveryClient({
+      codexBin,
+      codexHome: join(coldReadRoot, "codex-home"),
+      timeoutMs,
+    });
     const coldRead = await readClient.request("thread/read", { threadId, includeTurns: true });
     assert.equal(coldRead.thread.id, threadId);
     const coldReadTurn = findTailTurn(coldRead.thread, turnId);
@@ -783,6 +807,7 @@ export async function runRecoveryScenario({
       turnMaterialized: true,
       terminationObserved,
       originalCompletionObserved,
+      threadReadIsolated: true,
       ...recoveryReport,
       ...(snapshot ? { snapshot } : {}),
     };
@@ -825,7 +850,7 @@ function assertRecoveryEvidenceSchema(report) {
   );
   assert.match(
     report.runtime.codexVersion,
-    /^codex-cli [0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/,
+    /^codex-cli [0-9]+\.[0-9]+\.[0-9]+$/,
   );
   assert.match(report.runtime.codexBinarySha256, /^[0-9a-f]{64}$/);
   assert.match(report.runtime.sourceAnalysisCommit, /^[0-9a-f]{40}$/);
@@ -879,6 +904,7 @@ function assertRecoveryEvidenceSchema(report) {
         "sameThreadId",
         "tailTurnStatus",
         "threadReadAgrees",
+        "threadReadIsolated",
         "modelAbortMarker",
       ],
       `${scenario.kind} scenario evidence`,
@@ -896,20 +922,36 @@ function assertRecoveryEvidenceSchema(report) {
     assert.equal(scenario.sameThreadId, true);
     assert.equal(scenario.tailTurnStatus, "interrupted");
     assert.equal(scenario.threadReadAgrees, true);
+    assert.equal(scenario.threadReadIsolated, true);
     assert.equal(scenario.modelAbortMarker, explicit ? "present" : "absent");
   }
+}
+
+function collectEvidenceStringSurfaces(...roots) {
+  const pending = roots.filter((value) => typeof value === "string");
+  const surfaces = [];
+  const seen = new Set();
+  while (pending.length > 0) {
+    const surface = pending.shift();
+    if (seen.has(surface)) continue;
+    assert(
+      surfaces.length < MAX_EVIDENCE_STRING_SURFACES,
+      "recovery evidence contains excessive nested string data",
+    );
+    seen.add(surface);
+    surfaces.push(surface);
+    for (const token of surface.matchAll(JSON_STRING_TOKEN_PATTERN)) {
+      pending.push(JSON.parse(token[0]));
+    }
+  }
+  return surfaces;
 }
 
 export function assertRecoveryEvidenceSafe(report) {
   const serialized = typeof report === "string" ? report : JSON.stringify(report);
   const structured = typeof report === "string" ? JSON.parse(report) : report;
   const normalized = JSON.stringify(structured);
-  const surfaces = [serialized, normalized];
-  if (typeof report === "string") {
-    for (const token of serialized.matchAll(JSON_STRING_TOKEN_PATTERN)) {
-      surfaces.push(JSON.parse(token[0]));
-    }
-  }
+  const surfaces = collectEvidenceStringSurfaces(serialized, normalized);
   for (const pattern of SENSITIVE_EVIDENCE_PATTERNS) {
     assert(
       surfaces.every((surface) => !pattern.test(surface)),
