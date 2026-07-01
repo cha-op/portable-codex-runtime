@@ -148,6 +148,9 @@ restore interfaces.
 - The implementation targets macOS and Linux process groups, while this live
   evidence records macOS arm64 only. Windows is rejected because a Job Object
   process-tree implementation is not present.
+- Signal scenarios intentionally require the pinned runtime to report actual
+  signal termination. If a future Codex binary traps `SIGTERM` and exits cleanly,
+  the compatibility probe fails until that changed shutdown contract is reviewed.
 - Portable UTF-8 relative and existing external absolute symlink targets are
   preserved exactly; non-UTF-8 targets, dangling absolute targets, internal
   absolute targets, and non-relocatable relative targets fail closed. A fixed

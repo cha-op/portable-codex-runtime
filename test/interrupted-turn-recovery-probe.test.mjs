@@ -109,6 +109,14 @@ test("signal termination observes the requested signal and always cleans up", as
   assert.deepEqual(signals, [[-4242, "SIGTERM"]]);
   assert.equal(cleanupCalls, 1);
   assert.equal(client.stopping, true);
+  await assert.rejects(
+    terminateAppServer(
+      { child: { pid: 4242 }, exitPromise: Promise.resolve([null, "SIGINT"]) },
+      "SIGINT",
+      { abortClient: async () => {}, killProcess: () => {} },
+    ),
+    /permits only SIGTERM or SIGKILL/,
+  );
 });
 
 test("signal termination tolerates an already absent process group", async () => {
@@ -471,6 +479,18 @@ test("model workspace evidence distinguishes canonical history from active conte
       workspace: "/unexpected/workspace",
     }),
     /latest model workspace context did not match/,
+  );
+  const activeOnlyRequest = JSON.stringify({
+    input: [environmentMessage(workspaceCanonical)],
+  });
+  await assert.rejects(
+    verifyModelWorkspaceContext(activeOnlyRequest, {
+      canonicalizePath,
+      previousWorkspace,
+      previousWorkspaceCanonical,
+      workspace,
+    }),
+    /omitted the immutable historical workspace/,
   );
 });
 

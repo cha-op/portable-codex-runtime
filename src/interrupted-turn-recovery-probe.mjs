@@ -215,6 +215,12 @@ export function assertProcessGroupTarget(pid, currentPid = process.pid) {
   return pid;
 }
 
+/**
+ * Terminate a probe-owned AppServerClient child. AppServerClient.start() always
+ * spawns detached, so its child PID is the process-group ID. Signal observation
+ * is an intentional pinned-runtime contract; a trapped signal and clean exit
+ * must fail the compatibility probe until that contract is reviewed.
+ */
 export async function terminateAppServer(
   client,
   signal,
@@ -286,7 +292,7 @@ function pathIsInside(root, candidate) {
 
 function portableMode(metadata) {
   if ((metadata.mode & 0o7000) !== 0) {
-    throw new Error("stopped-tree copy rejects special permission bits");
+    throw new Error("portable tree rejects special permission bits");
   }
   return metadata.mode & 0o777;
 }
