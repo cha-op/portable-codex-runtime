@@ -1,0 +1,2184 @@
+import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { constants } from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  rmdir,
+} from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
+import {
+  AdvisoryLockError,
+  acquireAdvisoryLock,
+  sameFileIdentity,
+} from "./advisory-lock.mjs";
+import { AppServerClient } from "./app-server-auth-probe.mjs";
+
+const LOCK_FILE = ".portable-auth-refresh.lock";
+const STAGING_DIRECTORY = ".portable-auth-refresh-staging";
+const MIN_REFRESHED_TOKEN_VALIDITY_SECONDS = 120;
+const EXPECTED_RPC_AUDIT = [
+  { kind: "request", method: "initialize" },
+  { kind: "notification", method: "initialized" },
+  { kind: "request", method: "account/read" },
+];
+const STAGING_CLEANUP_RETRY_DELAYS_MS = [50, 100, 250, 500, 1_000];
+const PRE_DISPATCH_REFRESH_ERRORS = new WeakSet();
+const EXACT_FILE_IDENTITY = Symbol("exactFileIdentity");
+const SAFE_CLEANUP_WARNINGS = new Set([
+  "app_server_stop_failed",
+  "authority_guard_close_failed",
+  "authority_home_replaced",
+  "lock_release_failed",
+  "parent_directory_sync_failed",
+  "refresh_abort_cleanup_failed",
+  "staging_cleanup_failed",
+]);
+
+function isObjectLike(value) {
+  return value !== null && ["object", "function"].includes(typeof value);
+}
+
+function attachErrorCause(error, cause, { ifAbsent = false } = {}) {
+  if (!isObjectLike(error)) return;
+  try {
+    if (ifAbsent && Object.hasOwn(error, "cause")) return;
+    Object.defineProperty(error, "cause", {
+      configurable: true,
+      enumerable: false,
+      value: cause,
+    });
+  } catch {
+    // Preserve the primary error even when a frozen object cannot retain diagnostics.
+  }
+}
+
+function attachCleanupError(error, cleanupError) {
+  if (!isObjectLike(error)) return false;
+  try {
+    if (Object.hasOwn(error, "cleanupError")) return false;
+    Object.defineProperty(error, "cleanupError", {
+      configurable: true,
+      enumerable: false,
+      value: cleanupError,
+    });
+    return true;
+  } catch {
+    // A frozen primary error still takes precedence over cleanup diagnostics.
+    return false;
+  }
+}
+
+function appendCleanupWarnings(error, warnings) {
+  if (!isObjectLike(error)) return false;
+  const safeWarnings = warnings.filter((warning) => SAFE_CLEANUP_WARNINGS.has(warning));
+  try {
+    error.cleanupWarnings = [
+      ...new Set([
+        ...(Array.isArray(error.cleanupWarnings)
+          ? error.cleanupWarnings.filter((warning) => SAFE_CLEANUP_WARNINGS.has(warning))
+          : []),
+        ...safeWarnings,
+      ]),
+    ];
+    return true;
+  } catch {
+    // A frozen primary error still takes precedence over cleanup metadata.
+    return false;
+  }
+}
+
+function readErrorProperty(error, property) {
+  try {
+    return error?.[property];
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneManagedAuthRefreshError(error) {
+  const code = readErrorProperty(error, "code");
+  const message = readErrorProperty(error, "message");
+  const recoveryPath = readErrorProperty(error, "recoveryPath");
+  const recoveryPaths = readErrorProperty(error, "recoveryPaths");
+  const recoveryReason = readErrorProperty(error, "recoveryReason");
+  const retryable = readErrorProperty(error, "retryable");
+  const cleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+  const normalized = new ManagedAuthRefreshError(
+    typeof code === "string" ? code : "refresh_outcome_uncertain",
+    typeof message === "string" ? message : "managed auth refresh failed",
+    {
+      recoveryPath: typeof recoveryPath === "string" ? recoveryPath : undefined,
+      recoveryPaths: Array.isArray(recoveryPaths)
+        ? recoveryPaths.filter((path) => typeof path === "string")
+        : [],
+      recoveryReason: typeof recoveryReason === "string" ? recoveryReason : undefined,
+      retryable: typeof retryable === "boolean" ? retryable : false,
+    },
+  );
+  appendCleanupWarnings(normalized, Array.isArray(cleanupWarnings) ? cleanupWarnings : []);
+  attachErrorCause(normalized, error);
+  return normalized;
+}
+
+function cloneErrorCarrier(error) {
+  if (error instanceof ManagedAuthRefreshError) return cloneManagedAuthRefreshError(error);
+  const message = readErrorProperty(error, "message");
+  const carrier = new Error(typeof message === "string" ? message : "cleanup operation failed");
+  const prototype = isObjectLike(error) ? Object.getPrototypeOf(error) : undefined;
+  if (prototype && typeof prototype === "object") {
+    try {
+      Object.setPrototypeOf(carrier, prototype);
+    } catch {
+      // Error.prototype remains a safe fallback for unusual external errors.
+    }
+  }
+  const name = readErrorProperty(error, "name");
+  if (typeof name === "string") {
+    Object.defineProperty(carrier, "name", {
+      configurable: true,
+      value: name,
+      writable: true,
+    });
+  }
+  const code = readErrorProperty(error, "code");
+  if (code !== undefined) {
+    Object.defineProperty(carrier, "code", {
+      configurable: true,
+      enumerable: false,
+      value: code,
+      writable: true,
+    });
+  }
+  const cleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+  appendCleanupWarnings(carrier, Array.isArray(cleanupWarnings) ? cleanupWarnings : []);
+  attachErrorCause(carrier, error);
+  return carrier;
+}
+
+function mutableErrorCarrier(error) {
+  if (isObjectLike(error) && Object.isExtensible(error)) return error;
+  return cloneErrorCarrier(error);
+}
+
+function mutableManagedAuthRefreshError(error) {
+  return error instanceof ManagedAuthRefreshError ? mutableErrorCarrier(error) : error;
+}
+
+function replaceCleanupError(error, cleanupError) {
+  if (!isObjectLike(error)) return false;
+  try {
+    Object.defineProperty(error, "cleanupError", {
+      configurable: true,
+      enumerable: false,
+      value: cleanupError,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attachCleanupErrorAtTail(error, cleanupError) {
+  const diagnostic = mutableErrorCarrier(cleanupError);
+  let current = error;
+  const seen = new Set();
+  while (isObjectLike(current) && !seen.has(current)) {
+    seen.add(current);
+    const existing = readErrorProperty(current, "cleanupError");
+    if (existing === undefined) return attachCleanupError(current, diagnostic);
+    if (!isObjectLike(existing) || !Object.isExtensible(existing)) {
+      const carrier = cloneErrorCarrier(existing);
+      if (!replaceCleanupError(current, carrier)) return false;
+      current = carrier;
+      continue;
+    }
+    current = existing;
+  }
+  return false;
+}
+
+function recordEarlyCleanupFailure(primaryError, cleanupError, warning) {
+  const normalized = mutableErrorCarrier(primaryError);
+  appendCleanupWarnings(normalized, [warning]);
+  attachCleanupErrorAtTail(normalized, cleanupError);
+  return normalized;
+}
+
+function errorGraphHasCleanupWarning(error, warning, seen = new Set()) {
+  if (!isObjectLike(error) || seen.has(error)) return false;
+  seen.add(error);
+  let cleanupWarnings;
+  let cause;
+  let cleanupError;
+  try {
+    cleanupWarnings = error.cleanupWarnings;
+    cause = error.cause;
+    cleanupError = error.cleanupError;
+  } catch {
+    return false;
+  }
+  return (
+    (Array.isArray(cleanupWarnings) && cleanupWarnings.includes(warning)) ||
+    errorGraphHasCleanupWarning(cause, warning, seen) ||
+    errorGraphHasCleanupWarning(cleanupError, warning, seen)
+  );
+}
+
+function appServerShutdownIsUnconfirmed(error) {
+  return errorGraphHasCleanupWarning(error, "app_server_stop_failed");
+}
+
+function markPreDispatchRefreshError(error) {
+  if (isObjectLike(error)) PRE_DISPATCH_REFRESH_ERRORS.add(error);
+}
+
+function isKnownPreDispatchRefreshError(error) {
+  return isObjectLike(error) && PRE_DISPATCH_REFRESH_ERRORS.has(error);
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function fingerprint(value) {
+  return `sha256:${sha256(value).slice(0, 24)}`;
+}
+
+function fail(
+  code,
+  message,
+  { recoveryPath, recoveryPaths, recoveryReason, retryable = false } = {},
+) {
+  throw new ManagedAuthRefreshError(code, message, {
+    recoveryPath,
+    recoveryPaths,
+    recoveryReason,
+    retryable,
+  });
+}
+
+function ensure(condition, code, message, options) {
+  if (!condition) fail(code, message, options);
+}
+
+function withSensitiveProperties(publicValue, sensitiveProperties) {
+  for (const [name, value] of Object.entries(sensitiveProperties)) {
+    Object.defineProperty(publicValue, name, { enumerable: false, value });
+  }
+  return publicValue;
+}
+
+function decodeJwtPayload(token, label) {
+  const parts = token.split(".");
+  ensure(parts.length >= 2, "invalid_auth_record", `${label} is not a JWT`);
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    ensure(
+      payload !== null && typeof payload === "object" && !Array.isArray(payload),
+      "invalid_auth_record",
+      `${label} JWT payload must be an object`,
+    );
+    return payload;
+  } catch {
+    fail("invalid_auth_record", `${label} has an invalid JWT payload`);
+  }
+}
+
+function authClaims(payload) {
+  const claims = payload?.["https://api.openai.com/auth"];
+  return claims && typeof claims === "object" ? claims : {};
+}
+
+function collectRedactionValues(auth, accessPayload, idPayload) {
+  const values = [
+    auth.OPENAI_API_KEY,
+    auth.tokens?.access_token,
+    auth.tokens?.refresh_token,
+    auth.tokens?.id_token,
+    auth.tokens?.account_id,
+    accessPayload?.email,
+    idPayload?.email,
+    authClaims(accessPayload).chatgpt_account_id,
+    authClaims(accessPayload).chatgpt_user_id,
+    authClaims(idPayload).chatgpt_account_id,
+    authClaims(idPayload).chatgpt_user_id,
+  ];
+  return [...new Set(values.filter((value) => typeof value === "string" && value.length >= 8))];
+}
+
+function rpcAuditMatches(actual) {
+  return (
+    Array.isArray(actual) &&
+    actual.length === EXPECTED_RPC_AUDIT.length &&
+    actual.every(
+      (entry, index) =>
+        entry?.kind === EXPECTED_RPC_AUDIT[index].kind &&
+        entry?.method === EXPECTED_RPC_AUDIT[index].method,
+    )
+  );
+}
+
+function integerAsBigInt(value) {
+  if (typeof value === "bigint") return value;
+  return Number.isSafeInteger(value) ? BigInt(value) : null;
+}
+
+function currentBrokerUid() {
+  if (typeof process.geteuid === "function") return process.geteuid();
+  if (typeof process.getuid === "function") return process.getuid();
+  return null;
+}
+
+function jsonSafeStatInteger(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) ? numeric : value.toString();
+}
+
+export function authorityDirectoryPermissionsAreSafe(
+  { isDirectory, mode, uid },
+  {
+    allowRootOwner = false,
+    allowStickyShared = false,
+    brokerUid,
+    childUid,
+    disallowedModeBits,
+    requiredModeBits = 0,
+  },
+) {
+  const normalizedMode = integerAsBigInt(mode);
+  const normalizedUid = integerAsBigInt(uid);
+  const normalizedBrokerUid = integerAsBigInt(brokerUid);
+  const normalizedChildUid = integerAsBigInt(childUid);
+  const normalizedDisallowedModeBits = integerAsBigInt(disallowedModeBits);
+  const normalizedRequiredModeBits = integerAsBigInt(requiredModeBits);
+  if (
+    normalizedMode === null ||
+    normalizedUid === null ||
+    (brokerUid !== null && normalizedBrokerUid === null) ||
+    normalizedDisallowedModeBits === null ||
+    normalizedRequiredModeBits === null
+  ) {
+    return false;
+  }
+  const ownerIsTrusted =
+    brokerUid === null ||
+    normalizedUid === normalizedBrokerUid ||
+    (allowRootOwner && normalizedUid === 0n);
+  const childOwnerIsTrusted =
+    brokerUid === null ||
+    normalizedChildUid === normalizedBrokerUid ||
+    (allowRootOwner && normalizedChildUid === 0n);
+  const hasDisallowedWrite = (normalizedMode & normalizedDisallowedModeBits) !== 0n;
+  const stickyProtectsTrustedChild =
+    allowStickyShared && (normalizedMode & 0o1000n) !== 0n && childOwnerIsTrusted;
+  return (
+    isDirectory === true &&
+    ownerIsTrusted &&
+    (normalizedMode & normalizedRequiredModeBits) === normalizedRequiredModeBits &&
+    (!hasDisallowedWrite || stickyProtectsTrustedChild)
+  );
+}
+
+function runAclListing(binary, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(binary, args, options, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve({ stderr, stdout });
+    });
+  });
+}
+
+export function parseAclListingDisposition(stdout, platform = process.platform) {
+  if (typeof stdout !== "string" || !["darwin", "linux"].includes(platform)) {
+    throw new Error("extended ACL listing could not be parsed");
+  }
+  const lines = stdout.split(/\r?\n/u);
+  if (lines.at(-1) === "") lines.pop();
+  const mode = lines[0]?.match(/^(\S+)/u)?.[1];
+  const match = mode?.match(
+    /^[bcdlps-][r-][w-][xSs-][r-][w-][xSs-][r-][w-][xTt-]([+@.]?)$/u,
+  );
+  if (!match) throw new Error("extended ACL listing could not be parsed");
+
+  const marker = match[1];
+  const detailLines = lines.slice(1).filter((line) => line.length > 0);
+  if (platform === "linux") {
+    if (!["", ".", "+"].includes(marker) || detailLines.length > 0) {
+      throw new Error("extended ACL listing could not be parsed");
+    }
+    return marker === "+" ? "allow-or-unknown" : "none";
+  }
+
+  if (!["", "@", "+"].includes(marker)) {
+    throw new Error("extended ACL listing could not be parsed");
+  }
+  if (detailLines.length === 0) {
+    return marker === "+" ? "allow-or-unknown" : "none";
+  }
+  const actions = detailLines.map(
+    (line) => line.match(/^\s+\d+:\s+.+\s+(allow|deny)\s+\S.*$/u)?.[1],
+  );
+  if (actions.some((action) => action === undefined)) {
+    throw new Error("extended ACL listing could not be parsed");
+  }
+  return actions.every((action) => action === "deny") ? "deny-only" : "allow-or-unknown";
+}
+
+export function parseExtendedAclListing(stdout, platform = process.platform) {
+  return parseAclListingDisposition(stdout, platform) !== "none";
+}
+
+async function inspectPathAclDisposition(
+  path,
+  { platform = process.platform, runCommand = runAclListing } = {},
+) {
+  try {
+    if (typeof path !== "string" || !isAbsolute(path)) throw new Error("invalid path");
+    const flags = platform === "darwin" ? ["-l", "-e", "-d", "-b"] : ["-l", "-d", "-b"];
+    if (!["darwin", "linux"].includes(platform)) throw new Error("unsupported platform");
+    const { stderr, stdout } = await runCommand("/bin/ls", [...flags, path], {
+      encoding: "utf8",
+      env: { ...process.env, LANG: "C", LC_ALL: "C" },
+      maxBuffer: 64 * 1024,
+    });
+    if (stderr !== "") throw new Error("unexpected ACL listing diagnostics");
+    return parseAclListingDisposition(stdout, platform);
+  } catch {
+    throw new Error("extended ACL inspection failed");
+  }
+}
+
+export async function pathHasExtendedAcl(path, options) {
+  return (await inspectPathAclDisposition(path, options)) !== "none";
+}
+
+export async function pathHasUnsafeAncestorAcl(path, options) {
+  return (await inspectPathAclDisposition(path, options)) === "allow-or-unknown";
+}
+
+async function assertNoExtendedAcl(path, inspectExtendedAcl, code, message) {
+  let hasExtendedAcl;
+  try {
+    hasExtendedAcl = await inspectExtendedAcl(path);
+  } catch {
+    fail(code, message);
+  }
+  ensure(hasExtendedAcl === false, code, message);
+}
+
+function attachRecoveryPaths(target, paths) {
+  if (!target || typeof target !== "object") return;
+  try {
+    const recoveryPaths = [
+      ...(Array.isArray(target.recoveryPaths) ? target.recoveryPaths : []),
+      ...paths,
+    ].filter((value) => typeof value === "string" && value.length > 0);
+    if (recoveryPaths.length === 0) return;
+    target.recoveryPaths = [...new Set(recoveryPaths)];
+    target.recoveryPath ??= target.recoveryPaths[0];
+  } catch {
+    // Frozen external errors are normalized before recovery metadata is required.
+  }
+}
+
+function lastRefreshAdvanced(before, after) {
+  if (typeof after !== "string") return false;
+  const afterTime = Date.parse(after);
+  if (!Number.isFinite(afterTime)) return false;
+  if (before === null || before === undefined) return true;
+  const beforeTime = Date.parse(before);
+  return Number.isFinite(beforeTime) && afterTime > beforeTime;
+}
+
+function accessTokenExpiration(exp) {
+  if (typeof exp !== "number") {
+    return { expiresAt: null, expiresAtUnixSeconds: null };
+  }
+  const date = new Date(exp * 1000);
+  ensure(
+    Number.isFinite(exp) && Number.isFinite(date.getTime()),
+    "invalid_auth_record",
+    "authority access_token has an invalid expiration",
+  );
+  return {
+    expiresAt: date.toISOString(),
+    expiresAtUnixSeconds: exp,
+  };
+}
+
+function assertAuthorityDirectoryTrust(authorityStat, brokerUid) {
+  ensure(
+    authorityDirectoryPermissionsAreSafe(
+      {
+        isDirectory: authorityStat.isDirectory(),
+        mode: authorityStat.mode,
+        uid: authorityStat.uid,
+      },
+      {
+        brokerUid,
+        disallowedModeBits: 0o077,
+        requiredModeBits: 0o700,
+      },
+    ),
+    "unsafe_auth_home",
+    "authority home must be broker-owned with private owner permissions",
+  );
+}
+
+async function assertAuthorityAncestorTrustCurrent(authority) {
+  let childUid = authority.identity.uid;
+  let ancestor = dirname(authority.path);
+  while (true) {
+    let ancestorStat;
+    try {
+      ancestorStat = await lstat(ancestor, { bigint: true });
+    } catch {
+      fail("unsafe_auth_home", "authority ancestor chain could not be validated");
+    }
+    ensure(
+      authorityDirectoryPermissionsAreSafe(
+        {
+          isDirectory: ancestorStat.isDirectory(),
+          mode: ancestorStat.mode,
+          uid: ancestorStat.uid,
+        },
+        {
+          allowRootOwner: true,
+          allowStickyShared: true,
+          brokerUid: authority.brokerUid,
+          childUid,
+          disallowedModeBits: 0o022,
+        },
+      ),
+      "unsafe_auth_home",
+      "authority ancestor chain is not trusted",
+    );
+    await assertNoExtendedAcl(
+      ancestor,
+      authority.inspectAncestorAcl,
+      "unsafe_auth_home",
+      "authority ancestor chain has unsafe access controls",
+    );
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    childUid = ancestorStat.uid;
+    ancestor = parent;
+  }
+}
+
+async function resolveAuthorityHome(
+  authHome,
+  inspectExtendedAcl = pathHasExtendedAcl,
+  inspectAncestorAcl = pathHasUnsafeAncestorAcl,
+) {
+  ensure(
+    typeof constants.O_DIRECTORY === "number" && typeof constants.O_NOFOLLOW === "number",
+    "unsupported_platform",
+    "safe authority directory guards require O_DIRECTORY and O_NOFOLLOW support",
+  );
+  const authorityHome = await realpath(resolve(authHome));
+  let handle;
+  try {
+    handle = await open(
+      authorityHome,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const authorityHomeStat = await handle.stat({ bigint: true });
+    ensure(
+      authorityHomeStat.isDirectory(),
+      "unsafe_auth_home",
+      "authority home must be a real directory",
+    );
+    const currentUid = currentBrokerUid();
+    assertAuthorityDirectoryTrust(authorityHomeStat, currentUid);
+    await assertNoExtendedAcl(
+      authorityHome,
+      inspectExtendedAcl,
+      "unsafe_auth_home",
+      "authority home must not have extended access controls",
+    );
+    const authority = {
+      brokerUid: currentUid,
+      handle,
+      identity: authorityHomeStat,
+      inspectAncestorAcl,
+      inspectExtendedAcl,
+      path: authorityHome,
+    };
+    await assertAuthorityAncestorTrustCurrent(authority);
+    const protectedHomes = await Promise.all(
+      [join(homedir(), ".codex"), process.env.CODEX_HOME]
+        .filter((value) => typeof value === "string" && value.length > 0)
+        .map(async (value) => {
+          try {
+            const path = await realpath(resolve(value));
+            return { path, stat: await lstat(path, { bigint: true }) };
+          } catch {
+            return null;
+          }
+        }),
+    );
+    ensure(
+      !protectedHomes.some(
+        (protectedHome) =>
+          protectedHome !== null &&
+          (protectedHome.path === authorityHome ||
+            sameFileIdentity(protectedHome.stat, authorityHomeStat)),
+      ),
+      "unsafe_auth_home",
+      "refusing to mutate the default or active Codex home; use a dedicated authority home",
+    );
+    return authority;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function assertAuthorityHomeCurrent(authority) {
+  let current;
+  try {
+    current = await open(
+      authority.path,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const currentStat = await current.stat({ bigint: true });
+    ensure(
+      currentStat.isDirectory() && sameFileIdentity(currentStat, authority.identity),
+      "authority_home_replaced",
+      "authority home identity changed during refresh",
+    );
+    assertAuthorityDirectoryTrust(currentStat, authority.brokerUid);
+  } catch (error) {
+    if (error instanceof ManagedAuthRefreshError) throw error;
+    fail("authority_home_replaced", "authority home identity changed during refresh");
+  } finally {
+    await current?.close().catch(() => {});
+  }
+}
+
+async function assertAuthorityPathTrustCurrent(authority) {
+  await assertAuthorityHomeCurrent(authority);
+  await assertNoExtendedAcl(
+    authority.path,
+    authority.inspectExtendedAcl,
+    "unsafe_auth_home",
+    "authority home must not have extended access controls",
+  );
+  await assertAuthorityAncestorTrustCurrent(authority);
+}
+
+async function assertCredentialWriteAuthorityCurrent(authority) {
+  await assertAuthorityPathTrustCurrent(authority);
+  await assertNoExtendedAcl(
+    join(authority.path, "auth.json"),
+    authority.inspectExtendedAcl,
+    "invalid_auth_record",
+    "authority auth.json must not have extended access controls",
+  );
+}
+
+function authorityPathIsUntrusted(error) {
+  return ["authority_home_replaced", "unsafe_auth_home"].includes(error?.code);
+}
+
+async function acquireAuthorityLock(authority, acquireFileLock = acquireAdvisoryLock) {
+  await assertAuthorityHomeCurrent(authority);
+  const lockPath = join(authority.path, LOCK_FILE);
+  let lock;
+  try {
+    lock = await acquireFileLock(lockPath);
+    await assertAuthorityHomeCurrent(authority);
+    return lock;
+  } catch (error) {
+    let primaryError = error;
+    if (lock) {
+      try {
+        await lock.release();
+      } catch (cleanupError) {
+        primaryError = recordEarlyCleanupFailure(
+          primaryError,
+          cleanupError,
+          "lock_release_failed",
+        );
+      }
+    }
+    if (primaryError instanceof AdvisoryLockError && primaryError.code === "lock_unavailable") {
+      fail("authority_locked", "another authority refresh holds the dedicated auth lock", {
+        retryable: true,
+      });
+    }
+    throw primaryError;
+  }
+}
+
+async function findRecoveryArtifacts(authority) {
+  await assertAuthorityHomeCurrent(authority);
+  const recoveryPaths = [];
+  const entries = await readdir(authority.path, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name.startsWith(".auth.json.next-")) {
+      recoveryPaths.push(join(authority.path, entry.name));
+    }
+  }
+
+  const stagingRoot = join(authority.path, STAGING_DIRECTORY);
+  try {
+    const stagingRootStat = await lstat(stagingRoot, { bigint: true });
+    if (!stagingRootStat.isDirectory() || stagingRootStat.isSymbolicLink()) {
+      recoveryPaths.push(stagingRoot);
+    } else {
+      const attempts = await readdir(stagingRoot, { withFileTypes: true });
+      for (const attempt of attempts) {
+        if (attempt.name.startsWith("attempt-")) {
+          recoveryPaths.push(join(stagingRoot, attempt.name));
+        }
+      }
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  await assertAuthorityHomeCurrent(authority);
+  return recoveryPaths.sort();
+}
+
+async function releaseAuthorityLock(lock) {
+  await lock.release();
+}
+
+function attachCloseError(primaryError, closeError) {
+  if (!isObjectLike(primaryError)) return;
+  try {
+    if (!Object.hasOwn(primaryError, "closeError")) {
+      Object.defineProperty(primaryError, "closeError", {
+        configurable: true,
+        enumerable: false,
+        value: closeError,
+      });
+    }
+  } catch {
+    // Preserve a frozen primary error even when diagnostics cannot be attached.
+  }
+}
+
+async function closeFileHandle(handle, primaryFailure) {
+  if (!handle) return;
+  try {
+    await handle.close();
+  } catch (closeError) {
+    if (!primaryFailure) throw closeError;
+    attachCloseError(primaryFailure.error, closeError);
+  }
+}
+
+async function writeFileDurably(
+  path,
+  contents,
+  { beforeWrite, flag = "wx", mode = 0o600, openFile = open } = {},
+) {
+  let handle;
+  let primaryFailure;
+  try {
+    handle = await openFile(path, flag, mode);
+    await handle.chmod(mode);
+    await beforeWrite?.();
+    await handle.writeFile(contents);
+    await handle.sync();
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await closeFileHandle(handle, primaryFailure);
+  }
+}
+
+async function syncDirectoryPath(path) {
+  let handle;
+  try {
+    handle = await open(
+      path,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    await handle.sync();
+    return true;
+  } catch (error) {
+    if (["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(error?.code)) return false;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile = open) {
+  let handle;
+  let primaryFailure;
+  try {
+    handle = await openFile(
+      join(stagingHome, "auth.json"),
+      constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const fileStat = await handle.stat({ bigint: true });
+    ensure(
+      fileStat.isFile() && fileStat.nlink === 1n,
+      "staging_recovery_not_durable",
+      "refreshed staging auth must remain a regular single-link file",
+      { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
+    );
+    await handle.sync();
+    ensure(
+      await syncStagingDirectory(stagingHome),
+      "staging_recovery_not_durable",
+      "refreshed staging auth directory could not be synchronized",
+      { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
+    );
+  } catch (error) {
+    primaryFailure = { error };
+  }
+  try {
+    await closeFileHandle(handle, primaryFailure);
+  } catch (error) {
+    primaryFailure = { error };
+  }
+  if (primaryFailure) {
+    const { error } = primaryFailure;
+    if (error instanceof ManagedAuthRefreshError) throw error;
+    const durabilityError = new ManagedAuthRefreshError(
+      "staging_recovery_not_durable",
+      "refreshed staging auth could not be synchronized",
+      { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
+    );
+    attachErrorCause(durabilityError, error);
+    throw durabilityError;
+  }
+}
+
+async function handleChangedPreDispatchStaging(
+  authority,
+  before,
+  stagingHome,
+  refreshError,
+  syncStagingDirectory,
+  openFile,
+) {
+  let stagingChanged = true;
+  try {
+    const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome, {
+      inspectExtendedAcl: authority.inspectExtendedAcl,
+    });
+    stagingChanged =
+      stagedAfterFailure.authFileFingerprint !== before.authFileFingerprint;
+  } catch {
+    // An unreadable or malformed staged credential may be the only recovery
+    // copy, so treat it as changed until its bytes are made durable.
+  }
+
+  await assertAuthorityHomeCurrent(authority);
+  if (!stagingChanged) throw refreshError;
+
+  try {
+    await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile);
+  } catch (error) {
+    // Never expose a recovery path through a replaced authority home.
+    await assertAuthorityHomeCurrent(authority);
+    const durabilityError = new ManagedAuthRefreshError(
+      "staging_recovery_not_durable",
+      "changed pre-dispatch staging credentials could not be synchronized",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "staging_sync_failed",
+      },
+    );
+    attachErrorCause(durabilityError, refreshError);
+    Object.defineProperty(durabilityError, "syncError", {
+      enumerable: false,
+      value: error,
+    });
+    throw durabilityError;
+  }
+  await assertAuthorityHomeCurrent(authority);
+
+  const uncertain = new ManagedAuthRefreshError(
+    "refresh_outcome_uncertain",
+    "staged credentials changed before refresh dispatch completed",
+    {
+      recoveryPath: stagingHome,
+      recoveryReason: "pre_dispatch_staging_changed",
+    },
+  );
+  attachErrorCause(uncertain, refreshError);
+  throw uncertain;
+}
+
+async function removeStagingAttempt(path) {
+  await rm(path, { recursive: true, force: true });
+}
+
+async function removeEmptyStagingRoot(path) {
+  await rmdir(path);
+}
+
+async function createStagingHome(
+  authority,
+  rawAuth,
+  {
+    cleanupStagingAttempt = removeStagingAttempt,
+    cleanupStagingRoot = removeEmptyStagingRoot,
+    openFile = open,
+    syncStagingDirectory = syncDirectoryPath,
+    writeStagingFile = writeFileDurably,
+  } = {},
+) {
+  const authorityHome = authority.path;
+  const stagingRoot = join(authorityHome, STAGING_DIRECTORY);
+  let stagingRootCreated = false;
+  let stagingHome;
+  try {
+    try {
+      await mkdir(stagingRoot, { mode: 0o700 });
+      stagingRootCreated = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    ensure(
+      await syncParentDirectory(authority),
+      "staging_not_durable",
+      "authority filesystem cannot durably record the staging root",
+    );
+    const stagingRootStat = await lstat(stagingRoot, { bigint: true });
+    ensure(
+      stagingRootStat.isDirectory() && !stagingRootStat.isSymbolicLink(),
+      "unsafe_staging_path",
+      "authority staging root must be a real directory",
+    );
+    await chmod(stagingRoot, 0o700);
+    stagingHome = await mkdtemp(join(stagingRoot, "attempt-"));
+    await chmod(stagingHome, 0o700);
+    ensure(
+      await syncStagingDirectory(stagingRoot),
+      "staging_not_durable",
+      "authority filesystem cannot durably record the staging attempt",
+    );
+    await assertCredentialWriteAuthorityCurrent(authority);
+    await writeStagingFile(join(stagingHome, "auth.json"), rawAuth, {
+      beforeWrite: () => assertCredentialWriteAuthorityCurrent(authority),
+      flag: "wx",
+      mode: 0o600,
+      openFile,
+    });
+    const config = `cli_auth_credentials_store = "file"
+
+[features]
+plugin_hooks = false
+plugin_sharing = false
+plugins = false
+remote_plugin = false
+`;
+    await writeStagingFile(join(stagingHome, "config.toml"), config, {
+      flag: "wx",
+      mode: 0o600,
+      openFile,
+    });
+    ensure(
+      await syncStagingDirectory(stagingHome),
+      "staging_not_durable",
+      "authority filesystem cannot durably record staged credentials",
+    );
+    return { stagingHome, stagingRoot };
+  } catch (error) {
+    let setupError = error;
+    if (!isObjectLike(setupError)) {
+      setupError = new ManagedAuthRefreshError(
+        "staging_setup_failed",
+        "authority staging setup failed",
+      );
+      attachErrorCause(setupError, error);
+    }
+
+    const assertCleanupAuthorityCurrent = async () => {
+      try {
+        await assertAuthorityPathTrustCurrent(authority);
+      } catch (authorityError) {
+        attachErrorCause(authorityError, setupError, { ifAbsent: true });
+        throw authorityError;
+      }
+    };
+    try {
+      await assertAuthorityPathTrustCurrent(authority);
+    } catch (authorityError) {
+      attachErrorCause(authorityError, setupError, { ifAbsent: true });
+      throw authorityError;
+    }
+
+    let retainedAttempt = false;
+    if (stagingHome) {
+      try {
+        await assertCleanupAuthorityCurrent();
+        await cleanupStagingAttempt(stagingHome);
+      } catch (cleanupError) {
+        if (authorityPathIsUntrusted(cleanupError)) throw cleanupError;
+        // Confirm whether the attempt still exists before reporting recovery.
+      }
+      try {
+        await assertCleanupAuthorityCurrent();
+        await lstat(stagingHome, { bigint: true });
+        retainedAttempt = true;
+      } catch (statError) {
+        if (authorityPathIsUntrusted(statError)) throw statError;
+        retainedAttempt = statError?.code !== "ENOENT";
+      }
+    }
+    if (retainedAttempt) {
+      if (!(setupError instanceof ManagedAuthRefreshError) || !Object.isExtensible(setupError)) {
+        const retainedError = new ManagedAuthRefreshError(
+          "staging_setup_failed",
+          "authority staging setup failed and requires recovery",
+        );
+        attachErrorCause(retainedError, setupError);
+        setupError = retainedError;
+      }
+      appendCleanupWarnings(setupError, ["staging_cleanup_failed"]);
+      attachRecoveryPaths(setupError, [stagingHome]);
+    }
+    if (stagingRootCreated && !retainedAttempt) {
+      // An empty staging root is harmless and is not a recovery artifact.
+      try {
+        await assertCleanupAuthorityCurrent();
+        await cleanupStagingRoot(stagingRoot);
+      } catch (cleanupError) {
+        if (authorityPathIsUntrusted(cleanupError)) throw cleanupError;
+        // The next run may safely reuse or remove an empty staging root.
+      }
+    }
+    throw setupError;
+  }
+}
+
+async function syncParentDirectory(authority) {
+  try {
+    await authority.handle.sync();
+    return true;
+  } catch (error) {
+    if (["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(error?.code)) return false;
+    throw error;
+  }
+}
+
+async function atomicallyPromoteAuth(
+  authority,
+  rawAuth,
+  expectedSource,
+  assertLockHeld,
+  commitRename,
+  readCanonicalSource,
+  syncDirectory,
+  openFile = open,
+) {
+  const authorityHome = authority.path;
+  const destination = join(authorityHome, "auth.json");
+  const temporary = join(authorityHome, `.auth.json.next-${randomUUID()}`);
+  let handle;
+  let renamed = false;
+  let retainTemporary = false;
+  let operationError;
+  try {
+    await assertCredentialWriteAuthorityCurrent(authority);
+    handle = await openFile(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.chmod(0o600);
+    await assertCredentialWriteAuthorityCurrent(authority);
+    await handle.writeFile(rawAuth);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+
+    await assertAuthorityPathTrustCurrent(authority);
+    let currentSource;
+    try {
+      currentSource = await readCanonicalSource(authorityHome, {
+        inspectExtendedAcl: authority.inspectExtendedAcl,
+      });
+    } catch (error) {
+      // A failed pathname read may itself be evidence that the authority was
+      // replaced. Revalidate before exposing the read error or recovery paths.
+      await assertAuthorityHomeCurrent(authority);
+      throw error;
+    }
+    await assertAuthorityHomeCurrent(authority);
+    ensure(
+      currentSource.authFileFingerprint === expectedSource.authFileFingerprint &&
+        sameFileIdentity(
+          currentSource[EXACT_FILE_IDENTITY],
+          expectedSource[EXACT_FILE_IDENTITY],
+        ),
+      "authority_conflict_after_refresh",
+      "canonical authority state changed while the staged refresh was running",
+    );
+
+    await assertLockHeld();
+    await assertCredentialWriteAuthorityCurrent(authority);
+    try {
+      await commitRename(temporary, destination);
+      renamed = true;
+    } catch (error) {
+      if (!(error instanceof AdvisoryLockError) || error.code !== "lock_commit_uncertain") {
+        throw error;
+      }
+      retainTemporary = true;
+      const recoveryPaths = [];
+      try {
+        await assertAuthorityPathTrustCurrent(authority);
+        await lstat(temporary, { bigint: true });
+        recoveryPaths.push(temporary);
+      } catch (candidateError) {
+        if (authorityPathIsUntrusted(candidateError)) {
+          attachErrorCause(candidateError, error, { ifAbsent: true });
+          throw candidateError;
+        }
+        if (candidateError?.code !== "ENOENT") recoveryPaths.push(temporary);
+      }
+      const uncertain = new ManagedAuthRefreshError(
+        "promotion_commit_uncertain",
+        "lock holder did not confirm the atomic authority promotion",
+        {
+          recoveryPaths,
+          recoveryReason: "holder_commit_ack_lost",
+        },
+      );
+      attachErrorCause(uncertain, error);
+      const errorCleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+      appendCleanupWarnings(
+        uncertain,
+        Array.isArray(errorCleanupWarnings) ? errorCleanupWarnings : [],
+      );
+      throw uncertain;
+    }
+    try {
+      const parentDirectorySynced = await syncDirectory(authority);
+      return {
+        parentDirectorySynced,
+        warnings: parentDirectorySynced ? [] : ["parent_directory_sync_failed"],
+      };
+    } catch {
+      return {
+        parentDirectorySynced: false,
+        warnings: ["parent_directory_sync_failed"],
+      };
+    }
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    let closeFailure;
+    try {
+      await closeFileHandle(
+        handle,
+        operationError === undefined ? undefined : { error: operationError },
+      );
+    } catch (error) {
+      closeFailure = error;
+      operationError = error;
+    }
+    let authorityTrustFailure;
+    const recordAuthorityTrustFailure = (error) => {
+      if (authorityPathIsUntrusted(operationError)) {
+        authorityTrustFailure = operationError;
+        return;
+      }
+      attachErrorCause(error, operationError, { ifAbsent: true });
+      authorityTrustFailure = error;
+    };
+    if (!renamed && !retainTemporary) {
+      let authorityCurrent = false;
+      try {
+        await assertAuthorityPathTrustCurrent(authority);
+        authorityCurrent = true;
+      } catch (error) {
+        recordAuthorityTrustFailure(error);
+        // Never resolve cleanup through a replaced authority path. A retained
+        // candidate must be inspected from the single-attached authority volume.
+      }
+      if (authorityCurrent) {
+        try {
+          await rm(temporary, { force: true });
+        } catch (cleanupError) {
+          try {
+            await assertAuthorityPathTrustCurrent(authority);
+          } catch (error) {
+            recordAuthorityTrustFailure(error);
+          }
+          if (!authorityTrustFailure) {
+            attachRecoveryPaths(operationError, [temporary]);
+            attachCleanupError(operationError, cleanupError);
+          }
+        }
+      }
+    }
+    if (authorityTrustFailure) {
+      throw authorityTrustFailure;
+    }
+    if (closeFailure) throw closeFailure;
+  }
+}
+
+export class ManagedAuthRefreshError extends Error {
+  constructor(
+    code,
+    message,
+    { recoveryPath, recoveryPaths = [], recoveryReason, retryable = false } = {},
+  ) {
+    super(message);
+    this.name = "ManagedAuthRefreshError";
+    this.code = code;
+    this.retryable = retryable;
+    if (recoveryPath) this.recoveryPath = recoveryPath;
+    attachRecoveryPaths(this, [...recoveryPaths, recoveryPath]);
+    if (recoveryReason) this.recoveryReason = recoveryReason;
+  }
+}
+
+export function managedAuthRefreshErrorMetadata(error) {
+  if (!error || typeof error !== "object") return {};
+  const metadata = {};
+  if (typeof error.code === "string") metadata.code = error.code;
+  if (typeof error.retryable === "boolean") metadata.retryable = error.retryable;
+  if (typeof error.recoveryPath === "string") metadata.recoveryPath = error.recoveryPath;
+  if (Array.isArray(error.recoveryPaths)) {
+    metadata.recoveryPaths = error.recoveryPaths.filter((value) => typeof value === "string");
+  }
+  if (typeof error.recoveryReason === "string") metadata.recoveryReason = error.recoveryReason;
+  if (Array.isArray(error.cleanupWarnings)) {
+    metadata.cleanupWarnings = error.cleanupWarnings.filter((warning) =>
+      SAFE_CLEANUP_WARNINGS.has(warning),
+    );
+  }
+  return metadata;
+}
+
+export function managedAuthRefreshFailureReport(error) {
+  if (error instanceof ManagedAuthRefreshError) {
+    return {
+      error: {
+        type: "managed_auth_refresh",
+        ...managedAuthRefreshErrorMetadata(error),
+      },
+      result: "failed",
+    };
+  }
+  return {
+    error: {
+      code: "live_probe_failed",
+      retryable: false,
+      type: "probe_failure",
+    },
+    result: "failed",
+  };
+}
+
+export async function readManagedAuthSnapshot(
+  authHome,
+  {
+    brokerUid = currentBrokerUid(),
+    inspectExtendedAcl = pathHasExtendedAcl,
+    openFile = open,
+  } = {},
+) {
+  ensure(
+    typeof constants.O_NOFOLLOW === "number",
+    "unsupported_platform",
+    "safe authority credential reads require O_NOFOLLOW support",
+  );
+  const authorityHome = await realpath(resolve(authHome));
+  const authPath = join(authorityHome, "auth.json");
+  let handle;
+  let raw;
+  let fileStat;
+  try {
+    handle = await openFile(
+      authPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    fileStat = await handle.stat({ bigint: true });
+    ensure(fileStat.isFile(), "invalid_auth_record", "authority auth.json must be a regular file");
+    ensure(fileStat.nlink === 1n, "invalid_auth_record", "authority auth.json must not be hard linked");
+    const normalizedBrokerUid = integerAsBigInt(brokerUid);
+    ensure(
+      normalizedBrokerUid !== null && integerAsBigInt(fileStat.uid) === normalizedBrokerUid,
+      "invalid_auth_record",
+      "authority auth.json must be owned by the broker",
+    );
+    ensure(
+      (fileStat.mode & 0o077n) === 0n,
+      "invalid_auth_record",
+      "authority auth.json must not be group/world accessible",
+    );
+    await assertNoExtendedAcl(
+      authPath,
+      inspectExtendedAcl,
+      "invalid_auth_record",
+      "authority auth.json must not have extended access controls",
+    );
+    raw = await handle.readFile("utf8");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+
+  let auth;
+  try {
+    auth = JSON.parse(raw);
+  } catch {
+    fail("invalid_auth_record", "authority auth.json is not valid JSON");
+  }
+  ensure(
+    auth !== null && typeof auth === "object" && !Array.isArray(auth),
+    "invalid_auth_record",
+    "authority auth.json must contain an object",
+  );
+  ensure(auth.auth_mode === "chatgpt", "invalid_auth_record", "authority must use ChatGPT auth");
+  ensure(
+    typeof auth.tokens?.access_token === "string" && auth.tokens.access_token.length > 0,
+    "invalid_auth_record",
+    "authority auth.json is missing access_token",
+  );
+  ensure(
+    typeof auth.tokens?.id_token === "string" && auth.tokens.id_token.length > 0,
+    "invalid_auth_record",
+    "authority auth.json is missing id_token",
+  );
+  ensure(
+    typeof auth.tokens?.refresh_token === "string" && auth.tokens.refresh_token.length > 0,
+    "invalid_auth_record",
+    "authority auth.json is missing refresh_token",
+  );
+
+  const accessPayload = decodeJwtPayload(auth.tokens.access_token, "access_token");
+  const idPayload = decodeJwtPayload(auth.tokens.id_token, "id_token");
+  const accessAuth = authClaims(accessPayload);
+  const idAuth = authClaims(idPayload);
+  ensure(
+    typeof accessAuth.chatgpt_account_id === "string" &&
+      accessAuth.chatgpt_account_id.length > 0 &&
+      typeof accessAuth.chatgpt_user_id === "string" &&
+      accessAuth.chatgpt_user_id.length > 0,
+    "invalid_auth_record",
+    "authority access_token is missing account or user identity claims",
+  );
+  const accountIds = [
+    auth.tokens.account_id,
+    accessAuth.chatgpt_account_id,
+    idAuth.chatgpt_account_id,
+  ].filter((value) => value !== null && value !== undefined);
+  ensure(accountIds.length > 0, "invalid_auth_record", "authority auth.json is missing account id");
+  ensure(
+    accountIds.every(
+      (value) => typeof value === "string" && value.length > 0 && value === accountIds[0],
+    ),
+    "invalid_auth_record",
+    "authority auth.json account identities do not match",
+  );
+  const userIds = [accessAuth.chatgpt_user_id, idAuth.chatgpt_user_id].filter(
+    (value) => value !== null && value !== undefined,
+  );
+  ensure(userIds.length > 0, "invalid_auth_record", "authority auth.json is missing user id");
+  ensure(
+    userIds.every(
+      (value) => typeof value === "string" && value.length > 0 && value === userIds[0],
+    ),
+    "invalid_auth_record",
+    "authority auth.json user identities do not match",
+  );
+  const expiration = accessTokenExpiration(accessPayload.exp);
+
+  const snapshot = withSensitiveProperties({
+    authPath,
+    expiresAt: expiration.expiresAt,
+    expiresAtUnixSeconds: expiration.expiresAtUnixSeconds,
+    fileIdentity: {
+      dev: jsonSafeStatInteger(fileStat.dev),
+      ino: jsonSafeStatInteger(fileStat.ino),
+    },
+    fileMode: (fileStat.mode & 0o777n).toString(8).padStart(4, "0"),
+    lastRefreshAt: auth.last_refresh ?? null,
+    planType: accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null,
+  }, {
+    accessToken: auth.tokens.access_token,
+    accessTokenFingerprint: fingerprint(auth.tokens.access_token),
+    accountId: accountIds[0],
+    authFileFingerprint: fingerprint(raw),
+    raw,
+    redactionValues: collectRedactionValues(auth, accessPayload, idPayload),
+    refreshTokenFingerprint: fingerprint(auth.tokens.refresh_token),
+    userId: userIds[0],
+  });
+  Object.defineProperty(snapshot, EXACT_FILE_IDENTITY, {
+    value: { dev: fileStat.dev, ino: fileStat.ino },
+  });
+  return snapshot;
+}
+
+function refreshContainmentRequiredError() {
+  const error = new ManagedAuthRefreshError(
+    "refresh_containment_required",
+    "managed auth refresh requires an external process containment executor",
+    { retryable: false },
+  );
+  markPreDispatchRefreshError(error);
+  return error;
+}
+
+export async function runCodexManagedRefresh() {
+  throw refreshContainmentRequiredError();
+}
+
+export async function runUncontainedCodexManagedRefreshProbe({
+  assertLockHeldBeforeDispatch,
+  codexBin = "codex",
+  createClient = (options) => new AppServerClient(options),
+  signal,
+  stagingHome,
+}) {
+  if (!(typeof codexBin === "string" && isAbsolute(codexBin))) {
+    const error = new ManagedAuthRefreshError(
+      "unsafe_codex_binary",
+      "managed refresh requires an absolute Codex binary path",
+    );
+    markPreDispatchRefreshError(error);
+    throw error;
+  }
+  let client;
+  let clientCreationCompleted = false;
+  let operationError;
+  let refreshRequestDispatched = false;
+  const abortClient = async (reason) => {
+    if (typeof client.abort === "function") {
+      await client.abort(reason);
+      return;
+    }
+    await client.stop({ force: true });
+  };
+  const withAbort = async (operation) => {
+    if (!signal) return operation();
+    if (signal.aborted) throw signal.reason ?? new Error("managed refresh aborted");
+    const operationPromise = Promise.resolve().then(() => {
+      if (signal.aborted) throw signal.reason ?? new Error("managed refresh aborted");
+      return operation();
+    });
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        const reason = signal.reason ?? new Error("managed refresh aborted");
+        void abortClient(reason).then(
+          () => reject(reason),
+          (error) => reject(error),
+        );
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      operationPromise.then(
+        (value) => {
+          if (signal.aborted) return;
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error) => {
+          if (signal.aborted) return;
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  };
+  try {
+    client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
+    clientCreationCompleted = true;
+    await withAbort(() => client.start());
+    const initializeResult = await withAbort(() => client.initialize(false));
+    if (typeof assertLockHeldBeforeDispatch === "function") {
+      await withAbort(() => assertLockHeldBeforeDispatch());
+    }
+    let response;
+    try {
+      refreshRequestDispatched = true;
+      response = await withAbort(() =>
+        client.request("account/read", { refreshToken: true }),
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const uncertain = new ManagedAuthRefreshError(
+        "refresh_outcome_uncertain",
+        "account/read failed after the token refresh request was dispatched",
+        {
+          recoveryPath: stagingHome,
+          recoveryReason: "account_read_outcome_unknown",
+        },
+      );
+      attachErrorCause(uncertain, error);
+      const errorCleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+      appendCleanupWarnings(
+        uncertain,
+        Array.isArray(errorCleanupWarnings) ? errorCleanupWarnings : [],
+      );
+      throw uncertain;
+    }
+    return {
+      initializeResult,
+      response,
+      rpcAudit: client.rpcMethodAudit(),
+    };
+  } catch (error) {
+    let failure = error;
+    if (!clientCreationCompleted && !isObjectLike(failure)) {
+      failure = new ManagedAuthRefreshError(
+        "app_server_client_creation_failed",
+        "managed refresh app-server client could not be created",
+      );
+      attachErrorCause(failure, error);
+    }
+    if (!refreshRequestDispatched) markPreDispatchRefreshError(failure);
+    operationError = failure;
+    throw failure;
+  } finally {
+    if (clientCreationCompleted) {
+      try {
+        await client.stop();
+      } catch (stopError) {
+        if (operationError) {
+          if (!refreshRequestDispatched) {
+            const uncertain = new ManagedAuthRefreshError(
+              "refresh_outcome_uncertain",
+              "app-server shutdown failed before refresh dispatch could be proven",
+              {
+                recoveryPath: stagingHome,
+                recoveryReason: "app_server_shutdown_unknown",
+              },
+            );
+            attachErrorCause(uncertain, operationError);
+            attachCleanupError(uncertain, stopError);
+            appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
+            throw uncertain;
+          }
+          const operationCleanupWarnings = readErrorProperty(operationError, "cleanupWarnings");
+          const uncertain = new ManagedAuthRefreshError(
+            "refresh_outcome_uncertain",
+            "refresh request failed and app-server shutdown could not be confirmed",
+            {
+              recoveryPath: stagingHome,
+              recoveryReason: "app_server_shutdown_unknown",
+            },
+          );
+          attachErrorCause(uncertain, operationError);
+          attachCleanupError(uncertain, stopError);
+          appendCleanupWarnings(uncertain, [
+            ...(Array.isArray(operationCleanupWarnings) ? operationCleanupWarnings : []),
+            "app_server_stop_failed",
+          ]);
+          throw uncertain;
+        } else if (refreshRequestDispatched) {
+          const uncertain = new ManagedAuthRefreshError(
+            "refresh_outcome_uncertain",
+            "account/read completed but app-server shutdown could not be confirmed",
+            {
+              recoveryPath: stagingHome,
+              recoveryReason: "app_server_shutdown_unknown",
+            },
+          );
+          attachErrorCause(uncertain, stopError);
+          appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
+          throw uncertain;
+        } else {
+          throw stopError;
+        }
+      }
+    }
+  }
+}
+
+async function assertLockHeldBeforeRefresh(lock) {
+  try {
+    await lock.assertHeld();
+  } catch (error) {
+    const beforeRefresh = new ManagedAuthRefreshError(
+      "lock_lost_before_refresh",
+      "authority lock was lost before token refresh started",
+      { retryable: true },
+    );
+    attachErrorCause(beforeRefresh, error);
+    markPreDispatchRefreshError(beforeRefresh);
+    throw beforeRefresh;
+  }
+}
+
+async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
+  await assertLockHeldBeforeRefresh(lock);
+  const controller = new AbortController();
+  const refresh = Promise.resolve().then(() => operation(controller.signal));
+  if (typeof lock.waitForLoss !== "function") return refresh;
+  const first = await Promise.race([
+    refresh.then(
+      (value) => ({ kind: "completed", value }),
+      (error) => ({ error, kind: "failed" }),
+    ),
+    lock.waitForLoss().then((error) => ({ error, kind: "lost" })),
+  ]);
+  if (first.kind === "completed") return first.value;
+  if (first.kind === "failed") throw first.error;
+  controller.abort(first.error);
+  let abortCleanupError;
+  try {
+    await refresh;
+  } catch (error) {
+    if (error !== first.error) abortCleanupError = error;
+  }
+  const uncertain = new ManagedAuthRefreshError(
+    "refresh_outcome_uncertain",
+    "authority lock was lost while the token refresh outcome was uncertain",
+    {
+      recoveryPath,
+      recoveryReason: "lock_lost_during_refresh",
+    },
+  );
+  attachErrorCause(uncertain, first.error);
+  if (abortCleanupError) {
+    attachCleanupError(uncertain, abortCleanupError);
+    appendCleanupWarnings(uncertain, ["refresh_abort_cleanup_failed"]);
+  }
+  if (
+    appServerShutdownIsUnconfirmed(first.error) ||
+    appServerShutdownIsUnconfirmed(abortCleanupError)
+  ) {
+    appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
+  }
+  throw uncertain;
+}
+
+async function cleanupManagedRefreshArtifacts({
+  assertAuthorityCurrent,
+  preserveStaging,
+  stagingHome,
+  stagingRoot,
+}) {
+  if (preserveStaging) return;
+  if (stagingHome) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await assertAuthorityCurrent();
+        await rm(stagingHome, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        const delay = STAGING_CLEANUP_RETRY_DELAYS_MS[attempt];
+        if (!delay || !["EBUSY", "ENOTEMPTY"].includes(error?.code)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+  if (stagingRoot) {
+    await assertAuthorityCurrent();
+    await rmdir(stagingRoot).catch((error) => {
+      if (!["ENOENT", "ENOTEMPTY"].includes(error?.code)) throw error;
+    });
+  }
+}
+
+/**
+ * Runs one managed credential refresh transaction.
+ *
+ * `runRefresh` is a trusted/test-only injection seam because it receives the
+ * credential-bearing `stagingHome`. A trusted custom adapter receives
+ * `assertLockHeldBeforeDispatch` and MUST await it immediately before
+ * dispatching `account/read(refreshToken=true)`. It must classify every
+ * failure after that dispatch as a non-retryable `ManagedAuthRefreshError`
+ * with code `refresh_outcome_uncertain`. The default adapter performs the
+ * assertion and marks failures proven to occur before dispatch; every other
+ * adapter failure is conservatively wrapped as post-dispatch uncertainty so
+ * the durable staging sentinel cannot be reaped before operator recovery.
+ */
+export async function refreshManagedAuthRecord({
+  acquireFileLock = acquireAdvisoryLock,
+  acquireLock = (authority) => acquireAuthorityLock(authority, acquireFileLock),
+  authHome,
+  cleanupStagingAttempt = removeStagingAttempt,
+  cleanupStagingRoot = removeEmptyStagingRoot,
+  cleanupArtifacts = cleanupManagedRefreshArtifacts,
+  codexBin = "codex",
+  inspectAncestorAcl = pathHasUnsafeAncestorAcl,
+  inspectExtendedAcl = pathHasExtendedAcl,
+  openFile = open,
+  readCanonicalSource = readManagedAuthSnapshot,
+  runRefresh = runCodexManagedRefresh,
+  syncStagingDirectory = syncDirectoryPath,
+  syncDirectory = syncParentDirectory,
+  verifyPromoted = readManagedAuthSnapshot,
+  writeStagingFile = writeFileDurably,
+}) {
+  const authority = await resolveAuthorityHome(
+    authHome,
+    inspectExtendedAcl,
+    inspectAncestorAcl,
+  );
+  let lock;
+  try {
+    lock = await acquireLock(authority);
+    await assertAuthorityHomeCurrent(authority);
+  } catch (error) {
+    let primaryError = error;
+    if (lock) {
+      try {
+        await lock.release();
+      } catch (cleanupError) {
+        primaryError = recordEarlyCleanupFailure(
+          primaryError,
+          cleanupError,
+          "lock_release_failed",
+        );
+      }
+    }
+    try {
+      await authority.handle.close();
+    } catch (cleanupError) {
+      primaryError = recordEarlyCleanupFailure(
+        primaryError,
+        cleanupError,
+        "authority_guard_close_failed",
+      );
+    }
+    throw primaryError;
+  }
+  const authorityHome = authority.path;
+  let before;
+  let stagingHome;
+  let stagingRoot;
+  let preserveStaging = false;
+  let outcome;
+  let primaryError;
+  const committedWarnings = [];
+  try {
+    await assertAuthorityHomeCurrent(authority);
+    const recoveryPaths = await findRecoveryArtifacts(authority);
+    ensure(
+      recoveryPaths.length === 0,
+      "recovery_required",
+      "managed authority contains unresolved refresh recovery artifacts",
+      {
+        recoveryPath: recoveryPaths[0],
+        recoveryPaths,
+        recoveryReason: "orphaned_refresh_artifacts",
+      },
+    );
+    before = await readManagedAuthSnapshot(authorityHome, { inspectExtendedAcl });
+    if (runRefresh === runCodexManagedRefresh) {
+      throw refreshContainmentRequiredError();
+    }
+    await assertAuthorityHomeCurrent(authority);
+    ({ stagingHome, stagingRoot } = await createStagingHome(authority, before.raw, {
+      cleanupStagingAttempt,
+      cleanupStagingRoot,
+      openFile,
+      syncStagingDirectory,
+      writeStagingFile,
+    }));
+    await assertCredentialWriteAuthorityCurrent(authority);
+    let refreshResult;
+    let refreshError;
+    try {
+      refreshResult = await runRefreshWhileLockHeld(
+        lock,
+        (signal) =>
+          runRefresh({
+            assertLockHeldBeforeDispatch: async () => {
+              await assertLockHeldBeforeRefresh(lock);
+              await assertCredentialWriteAuthorityCurrent(authority);
+            },
+            codexBin,
+            signal,
+            stagingHome,
+          }),
+        stagingHome,
+      );
+    } catch (error) {
+      refreshError = error;
+    }
+    // Resolve the authority identity before following the staging pathname.
+    // If the authority was replaced during refresh, that replacement is the
+    // decisive failure and the displaced volume must be recovered directly.
+    await assertAuthorityHomeCurrent(authority);
+    if (refreshError && isKnownPreDispatchRefreshError(refreshError)) {
+      await handleChangedPreDispatchStaging(
+        authority,
+        before,
+        stagingHome,
+        refreshError,
+        syncStagingDirectory,
+        openFile,
+      );
+    }
+    if (refreshError?.code !== "refresh_outcome_uncertain" && refreshError) {
+      const uncertain = new ManagedAuthRefreshError(
+        "refresh_outcome_uncertain",
+        "refresh adapter failed without proving that account/read was not dispatched",
+        {
+          recoveryPath: stagingHome,
+          recoveryReason: "unclassified_adapter_failure",
+        },
+      );
+      attachErrorCause(uncertain, refreshError);
+      refreshError = uncertain;
+    }
+    // A failed stop can leave app-server writing this directory. The staging
+    // attempt was durably created before launch and remains a fail-closed gate,
+    // but a later fsync cannot establish that its credential bytes are stable.
+    if (!appServerShutdownIsUnconfirmed(refreshError)) {
+      try {
+        await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile);
+      } catch (error) {
+        // Recheck before exposing stagingHome as a recovery path. A concurrent
+        // authority replacement makes that pathname stale and takes precedence.
+        await assertAuthorityHomeCurrent(authority);
+        if (refreshError && !error.cause) {
+          attachErrorCause(error, refreshError, { ifAbsent: true });
+        }
+        throw error;
+      }
+    }
+    await assertAuthorityHomeCurrent(authority);
+    if (refreshError) throw refreshError;
+    // Once account/read returns, every subsequent failure is conservatively
+    // treated as post-dispatch. The OAuth service may have consumed the old
+    // refresh token even when local staged bytes still match the source.
+    preserveStaging = true;
+    await assertAuthorityHomeCurrent(authority);
+    ensure(
+      rpcAuditMatches(refreshResult?.rpcAudit),
+      "unexpected_rpc_sequence",
+      "managed authority used an unexpected app-server RPC sequence",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
+    );
+
+    const staged = await readManagedAuthSnapshot(stagingHome, { inspectExtendedAcl });
+    await lock.assertHeld();
+    ensure(
+      refreshResult?.response &&
+        typeof refreshResult.response === "object" &&
+        !Array.isArray(refreshResult.response),
+      "invalid_refresh_response",
+      "account/read returned an invalid response",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
+    );
+    if (refreshResult.response.requiresOpenaiAuth === true && refreshResult.response.account === null) {
+      fail("reauth_required", "managed authority credentials require interactive login");
+    }
+    ensure(
+      staged.accountId === before.accountId,
+      "account_identity_changed",
+      "managed refresh changed the ChatGPT account identity",
+      { recoveryPath: stagingHome },
+    );
+    ensure(
+      staged.userId === before.userId,
+      "user_identity_changed",
+      "managed refresh changed the ChatGPT user identity",
+      { recoveryPath: stagingHome },
+    );
+    ensure(
+      lastRefreshAdvanced(before.lastRefreshAt, staged.lastRefreshAt),
+      "refresh_not_observed",
+      "account/read completed without an observable token refresh",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
+    );
+    ensure(
+      staged.accessTokenFingerprint !== before.accessTokenFingerprint,
+      "access_token_unchanged",
+      "managed refresh did not produce a new access token",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "post_dispatch_validation_failed",
+      },
+    );
+    ensure(
+      staged.refreshTokenFingerprint !== before.refreshTokenFingerprint,
+      "refresh_token_unchanged",
+      "managed refresh did not rotate the refresh token",
+      {
+        recoveryPath: stagingHome,
+        recoveryReason: "refresh_token_not_rotated",
+      },
+    );
+    ensure(
+      Number.isFinite(staged.expiresAtUnixSeconds) &&
+        staged.expiresAtUnixSeconds - Math.floor(Date.now() / 1000) >=
+          MIN_REFRESHED_TOKEN_VALIDITY_SECONDS,
+      "refreshed_access_token_invalid",
+      "managed refresh produced an access token without sufficient remaining validity",
+      { recoveryPath: stagingHome },
+    );
+
+    const promotion = await atomicallyPromoteAuth(
+      authority,
+      staged.raw,
+      before,
+      () => lock.assertHeld(),
+      (source, destination) => lock.renameWhileHeld(source, destination),
+      readCanonicalSource,
+      syncDirectory,
+      openFile,
+    );
+    committedWarnings.push(...promotion.warnings);
+    let promoted;
+    try {
+      await assertAuthorityHomeCurrent(authority);
+      await lock.assertHeld();
+      promoted = await verifyPromoted(authorityHome, { inspectExtendedAcl });
+      await assertAuthorityHomeCurrent(authority);
+      await lock.assertHeld();
+      ensure(
+        promoted.raw === staged.raw &&
+          promoted.accountId === before.accountId &&
+          promoted.userId === before.userId,
+        "promotion_verification_failed",
+        "promoted authority state failed verification",
+        { recoveryPath: stagingHome },
+      );
+      preserveStaging = promotion.warnings.length > 0;
+    } catch (error) {
+      if (authorityPathIsUntrusted(error)) throw error;
+      // A verify read can fail because its authority pathname was replaced.
+      // Revalidate before wrapping it with a stale staging recovery path.
+      await assertAuthorityHomeCurrent(authority);
+      if (error?.code === "promotion_verification_failed") throw error;
+      const verificationError = new ManagedAuthRefreshError(
+        "promotion_verification_failed",
+        "promoted authority state could not be verified while the lock was held",
+        { recoveryPath: stagingHome },
+      );
+      attachErrorCause(verificationError, error);
+      throw verificationError;
+    }
+
+    outcome = withSensitiveProperties({
+      codexUserAgent: refreshResult.initializeResult?.userAgent ?? null,
+      comparisons: {
+        accessTokenChanged: true,
+        accountContinuity: true,
+        userContinuity: true,
+        authFileChanged: promoted.authFileFingerprint !== before.authFileFingerprint,
+        lastRefreshAdvanced: true,
+        refreshTokenChanged:
+          promoted.refreshTokenFingerprint !== before.refreshTokenFingerprint,
+      },
+      expiresAt: promoted.expiresAt,
+      fileMode: promoted.fileMode,
+      parentDirectorySynced: promotion.parentDirectorySynced,
+      planType: promoted.planType,
+      ...(preserveStaging ? { recoveryPath: stagingHome } : {}),
+      rpcAudit: refreshResult.rpcAudit,
+    }, {
+      accessToken: promoted.accessToken,
+      accountId: promoted.accountId,
+      redactionValues: [...new Set([...before.redactionValues, ...promoted.redactionValues])],
+    });
+  } catch (error) {
+    if (error?.code === "refresh_outcome_uncertain") preserveStaging = true;
+    if (error?.code === "staging_recovery_not_durable") preserveStaging = true;
+    if (
+      stagingHome &&
+      error instanceof AdvisoryLockError &&
+      ["lock_lost", "lock_replaced"].includes(error.code)
+    ) {
+      const uncertain = new ManagedAuthRefreshError(
+        "refresh_outcome_uncertain",
+        "authority lock was lost after token refresh started",
+        {
+          recoveryPath: stagingHome,
+          recoveryReason: "lock_lost_during_refresh",
+        },
+      );
+      attachErrorCause(uncertain, error);
+      error = uncertain;
+      preserveStaging = true;
+    }
+    const authorityPathUntrusted = authorityPathIsUntrusted(error);
+    if (stagingHome && before && !preserveStaging && !authorityPathUntrusted) {
+      try {
+        const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome, {
+          inspectExtendedAcl,
+        });
+        preserveStaging =
+          stagedAfterFailure.authFileFingerprint !== before.authFileFingerprint;
+      } catch {
+        // A malformed or partially written staged record may be the only copy
+        // left after a refresh-token rotation. Preserve it for manual recovery.
+        preserveStaging = true;
+      }
+    }
+    if (preserveStaging && stagingHome && !authorityPathUntrusted) {
+      if (!(error instanceof ManagedAuthRefreshError)) {
+        const uncertain = new ManagedAuthRefreshError(
+          "refresh_outcome_uncertain",
+          "token refresh may have rotated credentials before the adapter failed",
+          {
+            recoveryPath: stagingHome,
+            recoveryReason: "post_dispatch_outcome_uncertain",
+          },
+        );
+        attachErrorCause(uncertain, error);
+        error = uncertain;
+      } else {
+        error = mutableManagedAuthRefreshError(error);
+        error.retryable = false;
+        error.recoveryReason ??= "post_dispatch_outcome_uncertain";
+        attachRecoveryPaths(error, [stagingHome]);
+      }
+    }
+    primaryError = error;
+  }
+
+  const cleanupWarnings = [...committedWarnings];
+  let authorityCurrent = true;
+  const recordAuthorityGuardFailure = (error) => {
+    authorityCurrent = false;
+    if (primaryError && primaryError !== error) {
+      const primaryCause = readErrorProperty(primaryError, "cause");
+      const cause =
+        authorityPathIsUntrusted(primaryError) &&
+        primaryCause instanceof AdvisoryLockError &&
+        primaryCause.code === "lock_commit_uncertain"
+          ? primaryCause
+          : primaryError;
+      attachErrorCause(error, cause, { ifAbsent: true });
+    }
+    primaryError = error;
+    if (error?.code === "authority_home_replaced") {
+      cleanupWarnings.push("authority_home_replaced");
+    }
+  };
+  try {
+    await assertAuthorityPathTrustCurrent(authority);
+  } catch (error) {
+    recordAuthorityGuardFailure(error);
+  }
+  if (authorityCurrent) {
+    try {
+      const cleanupOptions = {
+        assertAuthorityCurrent: () => assertAuthorityPathTrustCurrent(authority),
+        preserveStaging,
+        stagingHome,
+        stagingRoot,
+      };
+      await cleanupArtifacts(cleanupOptions, cleanupManagedRefreshArtifacts);
+    } catch (cleanupError) {
+      if (authorityPathIsUntrusted(cleanupError)) {
+        recordAuthorityGuardFailure(cleanupError);
+      } else {
+        cleanupWarnings.push("staging_cleanup_failed");
+        if (stagingHome) {
+          try {
+            await assertAuthorityPathTrustCurrent(authority);
+            await lstat(stagingHome, { bigint: true });
+            if (primaryError && typeof primaryError === "object") {
+              primaryError = mutableManagedAuthRefreshError(primaryError);
+              attachRecoveryPaths(primaryError, [stagingHome]);
+            }
+            if (outcome) outcome.recoveryPath ??= stagingHome;
+          } catch (statError) {
+            if (authorityPathIsUntrusted(statError)) {
+              recordAuthorityGuardFailure(statError);
+            }
+          }
+        }
+      }
+    }
+  }
+  try {
+    await releaseAuthorityLock(lock);
+  } catch {
+    cleanupWarnings.push("lock_release_failed");
+  }
+  try {
+    await authority.handle.close();
+  } catch {
+    cleanupWarnings.push("authority_guard_close_failed");
+  }
+  if (primaryError) {
+    if (cleanupWarnings.length > 0) {
+      primaryError = mutableManagedAuthRefreshError(primaryError);
+      appendCleanupWarnings(primaryError, cleanupWarnings);
+    }
+    throw primaryError;
+  }
+  outcome.cleanupWarnings = cleanupWarnings;
+  return outcome;
+}
+
+export class ManagedAuthRefreshAuthority {
+  constructor({ authHome, codexBin, refreshRecord = refreshManagedAuthRecord }) {
+    this.authHome = authHome;
+    this.codexBin = codexBin;
+    this.refreshRecord = refreshRecord;
+    this.generation = 0;
+    this.refreshExecutions = 0;
+    this.inFlight = null;
+  }
+
+  refresh() {
+    if (this.inFlight) return this.inFlight;
+    const task = this.#refreshOnce();
+    this.inFlight = task;
+    task.then(
+      () => {
+        if (this.inFlight === task) this.inFlight = null;
+      },
+      () => {
+        if (this.inFlight === task) this.inFlight = null;
+      },
+    );
+    return task;
+  }
+
+  async #refreshOnce() {
+    this.refreshExecutions += 1;
+    const record = await this.refreshRecord({ authHome: this.authHome, codexBin: this.codexBin });
+    this.generation += 1;
+    return withSensitiveProperties({
+      codexUserAgent: record.codexUserAgent,
+      cleanupWarnings: record.cleanupWarnings,
+      comparisons: record.comparisons,
+      expiresAt: record.expiresAt,
+      fileMode: record.fileMode,
+      generation: this.generation,
+      parentDirectorySynced: record.parentDirectorySynced,
+      planType: record.planType,
+      ...(record.recoveryPath ? { recoveryPath: record.recoveryPath } : {}),
+      rpcAudit: record.rpcAudit,
+    }, {
+      accessToken: record.accessToken,
+      accountId: record.accountId,
+      redactionValues: record.redactionValues,
+    });
+  }
+}
+
+export function authorityStagingDirectory(authHome) {
+  return join(resolve(authHome), STAGING_DIRECTORY);
+}
+
+export function authorityLockPath(authHome) {
+  return join(resolve(authHome), LOCK_FILE);
+}

@@ -12,6 +12,7 @@
   "scripts": {
     "probe:external-auth": "node scripts/probe-app-server-auth.mjs",
     "probe:external-auth:live": "node scripts/probe-live-app-server-auth.mjs",
+    "probe:auth-refresh:live": "node scripts/probe-live-auth-refresh-authority.mjs",
     "test": "node --test"
   },
   "engines": {

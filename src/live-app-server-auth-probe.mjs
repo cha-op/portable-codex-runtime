@@ -18,8 +18,11 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   AppServerClient,
   assertNoWorkerAuth,
+  assertSupportedAppServerPlatform,
   codexVersion,
   createWorkerAuthMonitor,
+  resolveAppServerExecutable,
+  runSequentialCleanup,
   stopAndAssertNoWorkerAuth,
 } from "./app-server-auth-probe.mjs";
 
@@ -119,9 +122,14 @@ export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOM
     "auth.json account IDs do not match",
   );
   const planType = accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null;
-  const expiresAt =
-    typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null;
+  let expiresAt = null;
   if (typeof accessPayload.exp === "number") {
+    const expirationDate = new Date(accessPayload.exp * 1000);
+    assert(
+      Number.isFinite(accessPayload.exp) && Number.isFinite(expirationDate.getTime()),
+      "access_token exp must be finite and within the ECMAScript Date range",
+    );
+    expiresAt = expirationDate.toISOString();
     const remainingSeconds = accessPayload.exp - Math.floor(Date.now() / 1000);
     assert(
       remainingSeconds >= MIN_TOKEN_VALIDITY_SECONDS,
@@ -206,7 +214,7 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
   const [canonicalParent, canonicalSource, sourceStat] = await Promise.all([
     resolveThroughExistingAncestor(dirname(evidencePath)),
     realpath(sourceAuthPath),
-    stat(sourceAuthPath),
+    stat(sourceAuthPath, { bigint: true }),
   ]);
   const canonicalDestination = join(canonicalParent, basename(evidencePath));
   const canonicalAuthHome = dirname(canonicalSource);
@@ -224,7 +232,7 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
   );
 
   try {
-    const destinationStat = await lstat(canonicalDestination);
+    const destinationStat = await lstat(canonicalDestination, { bigint: true });
     assert.equal(
       destinationStat.isSymbolicLink(),
       false,
@@ -242,7 +250,7 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
     );
     assert.equal(
       destinationStat.nlink,
-      1,
+      1n,
       "evidence destination must not be hard linked",
     );
   } catch (error) {
@@ -276,7 +284,7 @@ export async function writeEvidenceSafely(
     "safe evidence writes require O_NOFOLLOW support",
   );
   const canonicalDestination = await validateEvidenceDestination(evidencePath, sourceAuthPath);
-  const sourceStat = await stat(sourceAuthPath);
+  const sourceStat = await stat(sourceAuthPath, { bigint: true });
   let handle;
   try {
     handle = await open(
@@ -286,9 +294,9 @@ export async function writeEvidenceSafely(
     );
     await afterOpen?.();
     const [handleStat, currentParent, destinationStat] = await Promise.all([
-      handle.stat(),
+      handle.stat({ bigint: true }),
       realpath(dirname(canonicalDestination)),
-      lstat(canonicalDestination),
+      lstat(canonicalDestination, { bigint: true }),
     ]);
     assert.equal(
       handleStat.dev === sourceStat.dev && handleStat.ino === sourceStat.ino,
@@ -296,7 +304,7 @@ export async function writeEvidenceSafely(
       "evidence destination must not reference the source auth file",
     );
     assert.equal(handleStat.isFile(), true, "evidence destination must be a regular file");
-    assert.equal(handleStat.nlink, 1, "evidence destination must not be hard linked");
+    assert.equal(handleStat.nlink, 1n, "evidence destination must not be hard linked");
     assert.equal(
       currentParent,
       dirname(canonicalDestination),
@@ -337,25 +345,32 @@ export async function probeLiveExternalAuth({
   codexBin = process.env.CODEX_BIN ?? "codex",
   evidencePath = process.env.CODEX_LIVE_EVIDENCE ?? DEFAULT_EVIDENCE_PATH,
   makeDirectory = mkdir,
+  makeTemporaryDirectory = mkdtemp,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
+  platform = process.platform,
+  readCredential = readDedicatedChatgptCredential,
 } = {}) {
+  assertSupportedAppServerPlatform(platform);
+  const executable = resolveAppServerExecutable(codexBin);
   const startedAt = new Date().toISOString();
-  const sourceBefore = await readDedicatedChatgptCredential(authHome);
-  const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
+  const sourceBefore = await readCredential(authHome);
+  const workerHome = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-live-auth-"));
   let authMonitor;
   let client;
+  let primaryFailure;
   try {
     const workspace = join(workerHome, "workspace");
     await makeDirectory(workspace);
     let refreshCallbackCount = 0;
 
     client = new AppServerClient({
-      codexBin,
+      codexBin: executable,
       codexHome: workerHome,
+      platform,
       timeoutMs: 120_000,
       onRefresh: async (params) => {
         refreshCallbackCount += 1;
-        const latest = await readDedicatedChatgptCredential(authHome);
+        const latest = await readCredential(authHome);
         assertRefreshAccountContinuity(params, sourceBefore, latest);
         return {
           accessToken: latest.accessToken,
@@ -400,7 +415,7 @@ export async function probeLiveExternalAuth({
     await stopAndAssertNoWorkerAuth(client, workerHome);
     await authMonitor.assertNoAuthObserved();
 
-    const sourceAfter = await readDedicatedChatgptCredential(authHome);
+    const sourceAfter = await readCredential(authHome);
     assertSourceAuthUnchanged(sourceBefore, sourceAfter);
 
     const report = {
@@ -408,7 +423,7 @@ export async function probeLiveExternalAuth({
       probe: "app-server-chatgpt-auth-tokens-live",
       startedAt,
       completedAt: new Date().toISOString(),
-      codexVersion: codexVersion(codexBin),
+      codexVersion: codexVersion(executable),
       userAgent: initializeResult.userAgent,
       experimentalApi: true,
       sourceAuth: {
@@ -435,12 +450,17 @@ export async function probeLiveExternalAuth({
       ...report,
       evidenceWritten: true,
     };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    try {
-      await client?.stop();
-    } finally {
-      authMonitor?.close();
-      await rm(workerHome, { recursive: true, force: true });
-    }
+    await runSequentialCleanup(
+      [
+        () => client?.stop(),
+        () => authMonitor?.close(),
+        () => rm(workerHome, { recursive: true, force: true }),
+      ],
+      primaryFailure,
+    );
   }
 }

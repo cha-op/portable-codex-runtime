@@ -331,3 +331,25 @@ test("live auth probe removes its worker home after setup failure", async () => 
     await rm(authHome, { recursive: true, force: true });
   }
 });
+
+test("live auth probe rejects unsupported platforms before auth reads or worker setup", async () => {
+  let authReadCalls = 0;
+  let temporaryDirectoryCalls = 0;
+  await assert.rejects(
+    probeLiveExternalAuth({
+      authHome: "/definitely/missing/auth-home",
+      makeTemporaryDirectory: async () => {
+        temporaryDirectoryCalls += 1;
+        throw new Error("worker home creation must not be reached");
+      },
+      platform: "win32",
+      readCredential: async () => {
+        authReadCalls += 1;
+        throw new Error("credential read must not be reached");
+      },
+    }),
+    (error) => error?.code === "unsupported_platform",
+  );
+  assert.equal(authReadCalls, 0);
+  assert.equal(temporaryDirectoryCalls, 0);
+});

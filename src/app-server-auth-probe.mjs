@@ -3,12 +3,15 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { watch } from "node:fs";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
+const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+const DEFAULT_FORCED_KILL_SETTLE_MS = 2_000;
+const MIN_FORCED_KILL_SETTLE_MS = 250;
 const INITIAL_ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174011";
 const WORKER_ENV_KEYS = [
   "PATH",
@@ -26,20 +29,196 @@ const WORKER_ENV_KEYS = [
   "ComSpec",
 ];
 
-export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
+export function isSupportedAppServerPlatform(hostPlatform, requestedPlatform = hostPlatform) {
+  const isSupported = (platform) => platform === "darwin" || platform === "linux";
+  return isSupported(hostPlatform) && isSupported(requestedPlatform);
+}
+
+export function assertSupportedAppServerPlatform(platform = process.platform) {
+  if (isSupportedAppServerPlatform(process.platform, platform)) return;
+  const error = new Error(
+    "portable app-server supports only macOS and Linux; " +
+      "Windows Job Object process-tree cleanup is not implemented",
+  );
+  error.code = "unsupported_platform";
+  throw error;
+}
+
+function processTreeExists(child) {
+  if (!child?.pid) return false;
+  if (process.platform === "win32") {
+    return child.exitCode === null && child.signalCode === null;
+  }
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+function parseLinuxProcessStat(raw) {
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd < 0) return null;
+  const fields = raw.slice(commandEnd + 1).trim().split(/\s+/);
+  if (fields.length < 3) return null;
+  const processGroupId = Number(fields[2]);
+  if (!Number.isSafeInteger(processGroupId) || processGroupId < 0) return null;
+  return { processGroupId, state: fields[0] };
+}
+
+export async function inspectLinuxProcessGroup(processGroupId, procRoot = "/proc") {
+  let entries;
+  try {
+    entries = await readdir(procRoot, { withFileTypes: true });
+  } catch {
+    return "unknown";
+  }
+
+  let foundMember = false;
+  let inspectionUncertain = false;
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry.name)) continue;
+    let parsed;
+    try {
+      parsed = parseLinuxProcessStat(
+        await readFile(join(procRoot, entry.name, "stat"), "utf8"),
+      );
+    } catch (error) {
+      if (error?.code !== "ENOENT") inspectionUncertain = true;
+      continue;
+    }
+    if (!parsed) {
+      inspectionUncertain = true;
+      continue;
+    }
+    if (parsed.processGroupId !== processGroupId) continue;
+    foundMember = true;
+    if (!["Z", "X", "x"].includes(parsed.state)) return "live";
+  }
+
+  if (inspectionUncertain) return "unknown";
+  return foundMember ? "zombie-only" : "empty";
+}
+
+function signalProcessTree(child, signal) {
+  if (!child?.pid) return;
+  try {
+    if (process.platform === "win32") child.kill(signal);
+    else process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+async function waitForProcessTreeExit(child, timeoutMs, { acceptZombieOnly = false } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (processTreeExists(child)) {
+    if (acceptZombieOnly && process.platform === "linux") {
+      const state = await inspectLinuxProcessGroup(child.pid);
+      if (state === "empty" || state === "zombie-only") return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
+
+const DEFAULT_PROCESS_CONTROL = Object.freeze({
+  exists: processTreeExists,
+  signal: signalProcessTree,
+  waitForExit: waitForProcessTreeExit,
+});
+
+function releaseAppServerHandles(child, output) {
+  let cleanupError;
+  const attempt = (operation) => {
+    try {
+      operation();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+  };
+  attempt(() => output?.close());
+  attempt(() => child?.stdin?.destroy());
+  attempt(() => child?.stdout?.destroy());
+  attempt(() => child?.stderr?.destroy());
+  attempt(() => child?.unref?.());
+  return cleanupError;
+}
+
+export function buildWorkerEnvironment(
+  codexHome,
+  sourceEnv = process.env,
+  launcherDirectory = process.cwd(),
+) {
   const env = { CODEX_HOME: codexHome };
   for (const key of WORKER_ENV_KEYS) {
-    if (typeof sourceEnv[key] === "string") env[key] = sourceEnv[key];
+    if (typeof sourceEnv[key] !== "string") continue;
+    env[key] =
+      key === "PATH"
+        ? sourceEnv[key]
+            .split(delimiter)
+            .map((entry) => (isAbsolute(entry) ? entry : resolve(launcherDirectory, entry || ".")))
+            .join(delimiter)
+        : sourceEnv[key];
   }
   return env;
 }
 
+export function resolveAppServerExecutable(codexBin, baseDirectory = process.cwd()) {
+  if (typeof codexBin !== "string" || codexBin.length === 0 || isAbsolute(codexBin)) {
+    return codexBin;
+  }
+  const containsPathSeparator =
+    codexBin.includes("/") || (sep === "\\" && codexBin.includes("\\"));
+  return containsPathSeparator ? resolve(baseDirectory, codexBin) : codexBin;
+}
+
+export async function runSequentialCleanup(cleanups, primaryFailure) {
+  let firstCleanupFailure;
+  for (const cleanup of cleanups) {
+    try {
+      await cleanup();
+    } catch (error) {
+      firstCleanupFailure ??= { error };
+    }
+  }
+
+  if (primaryFailure) {
+    const primaryError = primaryFailure.error;
+    if (
+      firstCleanupFailure &&
+      primaryError !== null &&
+      ["object", "function"].includes(typeof primaryError)
+    ) {
+      try {
+        if (!Object.hasOwn(primaryError, "cleanupError")) {
+          Object.defineProperty(primaryError, "cleanupError", {
+            configurable: true,
+            enumerable: false,
+            value: firstCleanupFailure.error,
+          });
+        }
+      } catch {
+        // A frozen primary error still takes precedence over cleanup diagnostics.
+      }
+    }
+    return;
+  }
+  if (firstCleanupFailure) throw firstCleanupFailure.error;
+}
+
 export class JsonRpcError extends Error {
   constructor(method, payload) {
-    super(`${method} failed: ${payload.message ?? JSON.stringify(payload)}`);
+    super(`${method} failed`);
     this.name = "JsonRpcError";
     this.method = method;
-    this.payload = payload;
+    Object.defineProperty(this, "payload", {
+      configurable: true,
+      enumerable: false,
+      value: payload,
+    });
   }
 }
 
@@ -48,28 +227,61 @@ export class AppServerClient {
     codexBin,
     codexArgs = ["app-server", "--stdio"],
     codexHome,
+    forcedKillSettleMs = DEFAULT_FORCED_KILL_SETTLE_MS,
+    launcherDirectory = process.cwd(),
     onRefresh,
+    platform = process.platform,
+    processControl = DEFAULT_PROCESS_CONTROL,
+    shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
+    sourceEnv = process.env,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   }) {
-    this.codexBin = codexBin;
+    assertSupportedAppServerPlatform(platform);
+    this.codexBin = resolveAppServerExecutable(codexBin, launcherDirectory);
     this.codexArgs = codexArgs;
     this.codexHome = codexHome;
+    this.environment = buildWorkerEnvironment(codexHome, sourceEnv, launcherDirectory);
     this.onRefresh = onRefresh;
+    this.processControl = processControl;
+    const normalizedForcedKillSettleMs = Number.isFinite(forcedKillSettleMs)
+      ? forcedKillSettleMs
+      : DEFAULT_FORCED_KILL_SETTLE_MS;
+    this.forcedKillSettleMs = Math.max(
+      MIN_FORCED_KILL_SETTLE_MS,
+      normalizedForcedKillSettleMs,
+    );
+    this.shutdownGraceMs = shutdownGraceMs;
     this.timeoutMs = timeoutMs;
     this.nextRequestId = 1;
     this.pending = new Map();
     this.messages = [];
     this.waiters = [];
+    this.sentRpcMethods = [];
     this.stderrBytes = 0;
     this.stopping = false;
     this.terminalError = null;
+    this.processTreeQuiesced = false;
+    this.shutdownCompleted = false;
+    this.shutdownPromise = undefined;
   }
 
   async start() {
-    const env = buildWorkerEnvironment(this.codexHome);
-
+    if (
+      this.stopping ||
+      this.terminalError ||
+      this.shutdownCompleted ||
+      this.shutdownPromise ||
+      this.child
+    ) {
+      throw (
+        this.terminalError ??
+        new Error("codex app-server cannot start more than once or after shutdown has begun")
+      );
+    }
     this.child = spawn(this.codexBin, this.codexArgs, {
-      env,
+      cwd: this.codexHome,
+      detached: true,
+      env: this.environment,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.exitPromise = once(this.child, "exit");
@@ -131,6 +343,7 @@ export class AppServerClient {
   request(method, params) {
     if (this.terminalError) return Promise.reject(this.terminalError);
     const id = this.nextRequestId++;
+    this.sentRpcMethods.push({ kind: "request", method });
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -147,7 +360,12 @@ export class AppServerClient {
   }
 
   notify(method, params) {
+    this.sentRpcMethods.push({ kind: "notification", method });
     this.#send({ method, params });
+  }
+
+  rpcMethodAudit() {
+    return this.sentRpcMethods.map((entry) => ({ ...entry }));
   }
 
   waitForNotification(method) {
@@ -157,21 +375,102 @@ export class AppServerClient {
     );
   }
 
-  async stop() {
-    if (!this.child) return;
+  stop() {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    if (!this.child) return Promise.resolve();
+    const attempt = this.#stopOnce();
+    this.shutdownPromise = attempt;
+    void attempt.then(
+      () => {
+        this.shutdownCompleted = true;
+      },
+      () => {
+        if (this.shutdownPromise === attempt) this.shutdownPromise = undefined;
+      },
+    );
+    return attempt;
+  }
+
+  async #stopOnce() {
     this.stopping = true;
-    if (this.child.exitCode === null && this.child.signalCode === null) {
-      this.child.stdin.end();
-      if (!(await this.#waitForExit(2_000))) {
-        this.child.kill("SIGTERM");
-        if (!(await this.#waitForExit(2_000))) {
-          this.child.kill("SIGKILL");
-          await this.exitPromise.catch(() => {});
+    let shutdownError;
+    try {
+      if (!this.processTreeQuiesced) {
+        if (this.processControl.exists(this.child)) {
+          this.child.stdin.end();
+          if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
+            this.processControl.signal(this.child, "SIGTERM");
+            if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
+              this.processControl.signal(this.child, "SIGKILL");
+              if (!(
+                await this.processControl.waitForExit(this.child, this.forcedKillSettleMs, {
+                  acceptZombieOnly: true,
+                })
+              )) {
+                throw new Error("codex app-server process group survived SIGKILL");
+              }
+            }
+          }
         }
+        this.processTreeQuiesced = true;
       }
+      await this.exitPromise?.catch(() => {});
+    } catch (error) {
+      shutdownError = error;
+    } finally {
+      const handleCleanupError = releaseAppServerHandles(this.child, this.stdout);
+      shutdownError ??= handleCleanupError;
+      this.#failAll(
+        this.terminalError ?? shutdownError ?? new Error("codex app-server stopped"),
+      );
     }
-    this.stdout?.close();
-    this.#failAll(this.terminalError ?? new Error("codex app-server stopped"));
+    if (shutdownError) throw shutdownError;
+  }
+
+  abort(error = new Error("codex app-server aborted")) {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.stopping = true;
+    this.#failAll(error);
+    const attempt = (async () => {
+      let shutdownError;
+      try {
+        if (!this.processTreeQuiesced) {
+          if (
+            this.child &&
+            this.processControl.exists(this.child)
+          ) {
+            this.processControl.signal(this.child, "SIGKILL");
+            if (!(
+              await this.processControl.waitForExit(this.child, this.forcedKillSettleMs, {
+                acceptZombieOnly: true,
+              })
+            )) {
+              throw new Error("codex app-server process group survived SIGKILL");
+            }
+          }
+          this.processTreeQuiesced = true;
+        }
+        await this.exitPromise?.catch(() => {});
+      } catch (error) {
+        shutdownError = error;
+      } finally {
+        const handleCleanupError = releaseAppServerHandles(this.child, this.stdout);
+        shutdownError ??= handleCleanupError;
+      }
+      if (shutdownError) throw shutdownError;
+    })();
+    this.abortPromise = attempt;
+    this.shutdownPromise = attempt;
+    void attempt.then(
+      () => {
+        this.shutdownCompleted = true;
+      },
+      () => {
+        if (this.abortPromise === attempt) this.abortPromise = undefined;
+        if (this.shutdownPromise === attempt) this.shutdownPromise = undefined;
+      },
+    );
+    return attempt;
   }
 
   #send(message) {
@@ -236,22 +535,6 @@ export class AppServerClient {
   #sendServerResponse(message) {
     if (this.stopping || this.terminalError || !this.child?.stdin.writable) return;
     this.#send(message);
-  }
-
-  #waitForExit(timeoutMs) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), timeoutMs);
-      this.exitPromise.then(
-        () => {
-          clearTimeout(timer);
-          resolve(true);
-        },
-        () => {
-          clearTimeout(timer);
-          resolve(true);
-        },
-      );
-    });
   }
 
   #waitFor(predicate, label) {
@@ -491,17 +774,25 @@ export async function stopAndAssertNoWorkerAuth(client, codexHome) {
 }
 
 export function codexVersion(codexBin) {
-  const result = spawnSync(codexBin, ["--version"], { encoding: "utf8" });
+  const executable = resolveAppServerExecutable(codexBin);
+  const result = spawnSync(executable, ["--version"], { encoding: "utf8" });
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    throw new Error(`failed to run ${codexBin} --version: ${result.stderr}`);
+    throw new Error(`failed to run ${executable} --version: ${result.stderr}`);
   }
   return result.stdout.trim();
 }
 
-export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?? "codex" } = {}) {
-  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-gate-"));
-  const client = new AppServerClient({ codexBin, codexHome });
+export async function probeExperimentalGate({
+  codexBin = process.env.CODEX_BIN ?? "codex",
+  makeTemporaryDirectory = mkdtemp,
+  platform = process.platform,
+} = {}) {
+  assertSupportedAppServerPlatform(platform);
+  const executable = resolveAppServerExecutable(codexBin);
+  const codexHome = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-gate-"));
+  const client = new AppServerClient({ codexBin: executable, codexHome, platform });
+  let primaryFailure;
   try {
     await writeProbeConfig(
       codexHome,
@@ -529,24 +820,37 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
     }
 
     assert(rejection instanceof JsonRpcError, "experimental login should be rejected without opt-in");
-    assert.match(rejection.message, /experimentalApi capability/);
+    assert.match(rejection.payload.message, /experimentalApi capability/);
     await stopAndAssertNoWorkerAuth(client, codexHome);
     return { gated: true, errorMessage: rejection.payload.message };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await client.stop();
-    await rm(codexHome, { recursive: true, force: true });
+    await runSequentialCleanup(
+      [
+        () => client.stop(),
+        () => rm(codexHome, { recursive: true, force: true }),
+      ],
+      primaryFailure,
+    );
   }
 }
 
 export async function probeExternalAuthRefresh({
   codexBin = process.env.CODEX_BIN ?? "codex",
   makeDirectory = mkdir,
+  makeTemporaryDirectory = mkdtemp,
+  platform = process.platform,
   startMock = startResponsesMock,
 } = {}) {
-  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-auth-"));
+  assertSupportedAppServerPlatform(platform);
+  const executable = resolveAppServerExecutable(codexBin);
+  const codexHome = await makeTemporaryDirectory(join(tmpdir(), "portable-codex-auth-"));
   let authMonitor;
   let client;
   let mock;
+  let primaryFailure;
   try {
     const workspace = join(codexHome, "workspace");
     await makeDirectory(workspace);
@@ -566,8 +870,9 @@ export async function probeExternalAuthRefresh({
     let refreshCount = 0;
 
     client = new AppServerClient({
-      codexBin,
+      codexBin: executable,
       codexHome,
+      platform,
       onRefresh: async (params) => {
         refreshCount += 1;
         refreshParams = params;
@@ -618,7 +923,7 @@ export async function probeExternalAuthRefresh({
     await authMonitor.assertNoAuthObserved();
 
     return {
-      codexVersion: codexVersion(codexBin),
+      codexVersion: codexVersion(executable),
       userAgent: initializeResult.userAgent,
       loginType: loginResult.type,
       threadId: threadResult.thread.id,
@@ -629,13 +934,19 @@ export async function probeExternalAuthRefresh({
       authJsonCreated: false,
       turnStatus: completed.params.turn.status,
     };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    try {
-      await Promise.all([client?.stop(), mock?.close()]);
-    } finally {
-      authMonitor?.close();
-      await rm(codexHome, { recursive: true, force: true });
-    }
+    await runSequentialCleanup(
+      [
+        () => client?.stop(),
+        () => mock?.close(),
+        () => authMonitor?.close(),
+        () => rm(codexHome, { recursive: true, force: true }),
+      ],
+      primaryFailure,
+    );
   }
 }
 
