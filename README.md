@@ -38,8 +38,9 @@ The probe verifies the explicit thread ID through both `thread/resume` and
 `thread/read`. Explicit interruption persists a model-visible abort marker.
 Signal and hard-kill recovery instead normalizes the stale in-progress turn to
 `interrupted` without inventing that marker. The stopped-tree copy preserves
-regular files, directories, modes, and symlinks without following links; it is
-not an online, atomic, or power-loss-durable snapshot implementation.
+regular files, directories, modes, and portable symlinks without following
+links; absolute links back into the relocated source tree fail closed. It is not
+an online, atomic, or power-loss-durable snapshot implementation.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
 pinned runtime image:

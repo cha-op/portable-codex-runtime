@@ -13,6 +13,7 @@ import {
   digestTree,
   interruptedTurnRecoveryFailureReport,
   probeInterruptedTurnRecovery,
+  startRecoveryClient,
   terminateAppServer,
   writeRecoveryEvidence,
 } from "../src/interrupted-turn-recovery-probe.mjs";
@@ -115,6 +116,33 @@ test("signal termination preserves the primary failure over cleanup failure", as
   assert.match(primary.cleanupError.message, /cleanup sentinel/);
 });
 
+test("client initialization failure aborts the detached app-server before rejection", async () => {
+  const initializationFailure = new Error("initialize sentinel");
+  const calls = [];
+  const client = {
+    async abort() {
+      calls.push("abort");
+    },
+    async initialize() {
+      calls.push("initialize");
+      throw initializationFailure;
+    },
+    async start() {
+      calls.push("start");
+    },
+  };
+  await assert.rejects(
+    startRecoveryClient({
+      codexBin: "/pinned/codex",
+      codexHome: "/owned/home",
+      createClient: () => client,
+      timeoutMs: 100,
+    }),
+    (error) => error === initializationFailure,
+  );
+  assert.deepEqual(calls, ["start", "initialize", "abort"]);
+});
+
 test("stopped-tree copy preserves a deterministic tree digest", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-test-"));
   try {
@@ -150,6 +178,24 @@ test("stopped-tree copy preserves symlinks without following their targets", asy
   }
 });
 
+test("stopped-tree copy rejects absolute symlinks into the relocated source tree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-internal-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "target"), "sentinel");
+    await symlink(join(source, "target"), join(source, "absolute-internal-link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects absolute symlinks into the source tree/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recovery evidence is allowlisted and rejects identifiers, paths, and prompts", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-evidence-test-"));
   try {
@@ -165,6 +211,19 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     ]) {
       assert.throws(() => assertRecoveryEvidenceSafe(unsafe), /unexpected fields|disallowed runtime data/);
     }
+    for (const codexVersion of [
+      "sk-secret-sentinel",
+      "123e4567-e89b-42d3-a456-426614174000",
+      "/var/folders/private-state",
+    ]) {
+      assert.throws(
+        () => assertRecoveryEvidenceSafe({
+          ...report,
+          runtime: { ...report.runtime, codexVersion },
+        }),
+        /disallowed runtime data|does not match/,
+      );
+    }
     const path = join(root, "evidence.json");
     await writeRecoveryEvidence(path, report);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), report);
@@ -177,6 +236,7 @@ test("probe report contains all four recovery scenarios without runtime identifi
   const calls = [];
   const report = await probeInterruptedTurnRecovery({
     codexBin: process.execPath,
+    readCodexVersion: () => "codex-cli 0.142.4",
     runScenario: async ({ kind }) => {
       calls.push(kind);
       return scenarioReport(kind);

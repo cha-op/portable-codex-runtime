@@ -41,9 +41,10 @@ export const RECOVERY_SCENARIOS = Object.freeze([
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const SENSITIVE_EVIDENCE_PATTERNS = [
-  /(?:^|["'\s])\/(?:Users|home|private|tmp)\//,
+  /(?:^|["'\s])\/(?:Users|home|private|tmp|var\/folders)\//,
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i,
   /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/,
+  /\b(?:sk|sess|rk)-[A-Za-z0-9_-]{8,}\b/,
   /<turn_aborted>/,
   /portable recovery probe/i,
 ];
@@ -228,6 +229,7 @@ export async function terminateAppServer(
   let exitResult;
   client.stopping = true;
   try {
+    // AppServerClient starts the child detached, so its PID is also the process-group ID.
     killProcess(-pid, signal);
     exitResult = await withTimeout(client.exitPromise, timeoutMs, `${signal} app-server exit`);
     assert.equal(exitResult[0], null, `app-server exited with code ${exitResult[0]}`);
@@ -267,10 +269,19 @@ async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist })
   }
 }
 
-async function copyTreeEntry(source, destination) {
+function pathIsInside(root, candidate) {
+  const child = relative(root, candidate);
+  return child === "" || (!child.startsWith("..") && !isAbsolute(child));
+}
+
+async function copyTreeEntry(sourceRoot, source, destination) {
   const metadata = await lstat(source);
   if (metadata.isSymbolicLink()) {
-    await symlink(await readlink(source), destination);
+    const target = await readlink(source);
+    if (isAbsolute(target) && pathIsInside(sourceRoot, resolve(target))) {
+      throw new Error("stopped-tree copy rejects absolute symlinks into the source tree");
+    }
+    await symlink(target, destination);
     return;
   }
   if (metadata.isDirectory()) {
@@ -278,7 +289,7 @@ async function copyTreeEntry(source, destination) {
     const entries = await readdir(source);
     entries.sort();
     for (const entry of entries) {
-      await copyTreeEntry(join(source, entry), join(destination, entry));
+      await copyTreeEntry(sourceRoot, join(source, entry), join(destination, entry));
     }
     await chmod(destination, metadata.mode & 0o777);
     return;
@@ -294,7 +305,7 @@ export async function copyStoppedTree({ ownedRoot, source, destination }) {
   await assertDirectOwnedPath(ownedRoot, source, "source", { mustExist: true });
   await assertDirectOwnedPath(ownedRoot, destination, "destination", { mustExist: false });
   try {
-    await copyTreeEntry(source, destination);
+    await copyTreeEntry(resolve(source), source, destination);
   } catch (error) {
     await rm(destination, { recursive: true, force: true }).catch(() => {});
     throw error;
@@ -304,6 +315,7 @@ export async function copyStoppedTree({ ownedRoot, source, destination }) {
 async function updateHashFromFile(hash, path) {
   const input = createReadStream(path);
   input.on("data", (chunk) => hash.update(chunk));
+  // events.once rejects if the stream emits "error" before "end".
   await once(input, "end");
 }
 
@@ -346,11 +358,21 @@ function findTurn(thread, turnId) {
   return turn;
 }
 
-async function startClient({ codexBin, codexHome, timeoutMs }) {
-  const client = new AppServerClient({ codexBin, codexHome, timeoutMs });
-  await client.start();
-  await client.initialize(false);
-  return client;
+export async function startRecoveryClient({
+  codexBin,
+  codexHome,
+  createClient = (options) => new AppServerClient(options),
+  timeoutMs,
+}) {
+  const client = createClient({ codexBin, codexHome, timeoutMs });
+  try {
+    await client.start();
+    await client.initialize(false);
+    return client;
+  } catch (error) {
+    await runSequentialCleanup([() => client.abort()], { error });
+    throw error;
+  }
 }
 
 async function recoverAndInspect({
@@ -416,7 +438,7 @@ export async function runRecoveryScenario({
     mock = await startMock({ timeoutMs });
     await writeRecoveryConfig(codexHome, mock.baseUrl);
 
-    client = await startClient({ codexBin, codexHome, timeoutMs });
+    client = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
     const started = await client.request("thread/start", { cwd: workspace, model: "mock-model" });
     const threadId = started.thread.id;
     const turn = await client.request("turn/start", {
@@ -475,7 +497,7 @@ export async function runRecoveryScenario({
       };
     }
 
-    recoveredClient = await startClient({ codexBin, codexHome, timeoutMs });
+    recoveredClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
     const recovery = await recoverAndInspect({
       client: recoveredClient,
       mock,
@@ -530,7 +552,10 @@ function assertRecoveryEvidenceSchema(report) {
     ["codexVersion", "codexBinarySha256", "sourceAnalysisCommit", "platform", "arch"],
     "runtime evidence",
   );
-  assert.match(report.runtime.codexVersion, /^[0-9A-Za-z][0-9A-Za-z .+_()-]{0,80}$/);
+  assert.match(
+    report.runtime.codexVersion,
+    /^codex-cli [0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/,
+  );
   assert.match(report.runtime.codexBinarySha256, /^[0-9a-f]{64}$/);
   assert.match(report.runtime.sourceAnalysisCommit, /^[0-9a-f]{40}$/);
   assert(["darwin", "linux"].includes(report.runtime.platform), "unsupported evidence platform");
@@ -597,11 +622,11 @@ function assertRecoveryEvidenceSchema(report) {
 
 export function assertRecoveryEvidenceSafe(report) {
   const serialized = typeof report === "string" ? report : JSON.stringify(report);
-  const structured = typeof report === "string" ? JSON.parse(report) : report;
-  assertRecoveryEvidenceSchema(structured);
   for (const pattern of SENSITIVE_EVIDENCE_PATTERNS) {
     assert(!pattern.test(serialized), "recovery evidence contains disallowed runtime data");
   }
+  const structured = typeof report === "string" ? JSON.parse(report) : report;
+  assertRecoveryEvidenceSchema(structured);
   return serialized;
 }
 
@@ -629,6 +654,7 @@ export async function writeRecoveryEvidence(path, report) {
 export async function probeInterruptedTurnRecovery({
   codexBin = process.env.CODEX_BIN,
   evidencePath,
+  readCodexVersion = codexVersion,
   runScenario = runRecoveryScenario,
   scenarios = RECOVERY_SCENARIOS,
   sourceAnalysisCommit = PINNED_SOURCE_ANALYSIS_COMMIT,
@@ -652,7 +678,7 @@ export async function probeInterruptedTurnRecovery({
     schemaVersion: 1,
     probe: "interrupted-turn-recovery",
     runtime: {
-      codexVersion: codexVersion(binary),
+      codexVersion: readCodexVersion(binary),
       codexBinarySha256: await digestFile(binary),
       sourceAnalysisCommit,
       platform: platform(),

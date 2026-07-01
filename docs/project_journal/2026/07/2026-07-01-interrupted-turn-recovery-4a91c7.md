@@ -27,8 +27,9 @@ superseded_by:
   resume/read views but do not synthesize the missing marker.
 - The same explicit thread ID resumes after the complete session tree is copied
   only after process exit, removed, and restored at a different absolute path.
-- The copy preserves symlinks without following them and rejects non-filesystem
-  data entries such as sockets and FIFOs.
+- The copy preserves symlinks without following them, rejects absolute links
+  back into a relocated source tree, and rejects non-filesystem data entries
+  such as sockets and FIFOs.
 - Codex flush is not an fsync barrier, rollout-tail repair remains absent, and
   background terminals are not filesystem-migratable state.
 

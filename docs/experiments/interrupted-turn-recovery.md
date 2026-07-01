@@ -37,9 +37,11 @@ to distinguish a persisted abort marker from view-only normalization.
 The snapshot scenario copies the entire synthetic session tree, including
 `CODEX_HOME` and workspace, after the killed process has exited. It hashes
 relative paths, entry types, modes, file bytes, and symlink targets before and
-after copy. Symlinks are copied without following them. Sockets, FIFOs, and
-devices fail closed. The source tree is then deleted and restored under a new
-absolute path; `thread/resume` receives the restored workspace path explicitly.
+after copy. Symlinks are copied without following them, but absolute links back
+into the source session tree fail closed because they would break after a
+different-path restore. Sockets, FIFOs, and devices also fail closed. The source
+tree is then deleted and restored under a new absolute path; `thread/resume`
+receives the restored workspace path explicitly.
 
 ## Live Result
 
@@ -137,6 +139,7 @@ restore interfaces.
   ready even if all files copy successfully.
 - macOS and Linux process groups are supported. Windows is rejected because a
   Job Object process-tree implementation is not present.
-- Symlink targets are preserved exactly. A fixed runtime image must provide any
-  external target, such as a Codex helper path, at a compatible location after
-  migration.
+- Relative and external absolute symlink targets are preserved exactly;
+  absolute targets inside the source session tree fail closed. A fixed runtime
+  image must provide every external target, such as a Codex helper path, at a
+  compatible location after migration.
