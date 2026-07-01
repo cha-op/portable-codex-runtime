@@ -107,6 +107,116 @@ test("Linux process-group inspection distinguishes live and zombie-only members"
   }
 });
 
+test("stop rejects pending RPCs and closes output when a process group survives SIGKILL", async () => {
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => true,
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => false,
+    },
+    shutdownGraceMs: 0,
+  });
+  let stdinEnded = false;
+  let outputClosed = false;
+  let childUnrefed = false;
+  const destroyedStreams = [];
+  let pendingTimerFired = false;
+  client.child = {
+    pid: 4242,
+    stdin: {
+      destroy: () => destroyedStreams.push("stdin"),
+      end: () => { stdinEnded = true; },
+    },
+    stdout: { destroy: () => destroyedStreams.push("stdout") },
+    stderr: { destroy: () => destroyedStreams.push("stderr") },
+    unref: () => { childUnrefed = true; },
+  };
+  client.exitPromise = new Promise(() => {});
+  client.stdout = { close: () => { outputClosed = true; } };
+
+  let rejectPending;
+  const pendingResult = new Promise((_resolve, reject) => {
+    rejectPending = reject;
+  }).catch((error) => error);
+  const pendingTimer = setTimeout(() => {
+    pendingTimerFired = true;
+  }, 25);
+  client.pending.set(1, {
+    method: "fixture/pending",
+    reject: rejectPending,
+    resolve: () => {},
+    timer: pendingTimer,
+  });
+
+  let settleTimer;
+  const stopOutcome = await Promise.race([
+    client.stop().then(
+      () => ({ kind: "resolved" }),
+      (error) => ({ error, kind: "rejected" }),
+    ),
+    new Promise((resolve) => {
+      settleTimer = setTimeout(() => resolve({ kind: "timed-out" }), 100);
+    }),
+  ]);
+  clearTimeout(settleTimer);
+  assert.equal(stopOutcome.kind, "rejected");
+  assert.match(stopOutcome.error.message, /survived SIGKILL/);
+  assert.equal(await pendingResult, stopOutcome.error);
+  assert.equal(stdinEnded, true);
+  assert.equal(outputClosed, true);
+  assert.deepEqual(destroyedStreams, ["stdin", "stdout", "stderr"]);
+  assert.equal(childUnrefed, true);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(client.pending.size, 0);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(pendingTimerFired, false);
+});
+
+test("abort closes output and preserves process-group survival errors", async () => {
+  const signals = [];
+  const closeError = new Error("synthetic output close failure");
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    processControl: {
+      exists: () => true,
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async () => false,
+    },
+    shutdownGraceMs: 0,
+  });
+  let stdoutCloseAttempted = false;
+  let childUnrefed = false;
+  const destroyedStreams = [];
+  client.child = {
+    pid: 4242,
+    stdin: { destroy: () => destroyedStreams.push("stdin") },
+    stdout: { destroy: () => destroyedStreams.push("stdout") },
+    stderr: { destroy: () => destroyedStreams.push("stderr") },
+    unref: () => { childUnrefed = true; },
+  };
+  client.exitPromise = new Promise(() => {});
+  client.stdout = {
+    close: () => {
+      stdoutCloseAttempted = true;
+      throw closeError;
+    },
+  };
+
+  await assert.rejects(client.abort(), (error) => {
+    assert.match(error.message, /survived SIGKILL/);
+    assert.notEqual(error, closeError);
+    return true;
+  });
+  assert.equal(stdoutCloseAttempted, true);
+  assert.deepEqual(destroyedStreams, ["stdin", "stdout", "stderr"]);
+  assert.equal(childUnrefed, true);
+  assert.deepEqual(signals, ["SIGKILL"]);
+});
+
 test("worker auth is checked after app-server shutdown", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stop-fixture-"));
   const client = {

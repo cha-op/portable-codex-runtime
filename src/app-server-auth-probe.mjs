@@ -107,6 +107,29 @@ async function waitForProcessTreeExit(child, timeoutMs, { acceptZombieOnly = fal
   return true;
 }
 
+const DEFAULT_PROCESS_CONTROL = Object.freeze({
+  exists: processTreeExists,
+  signal: signalProcessTree,
+  waitForExit: waitForProcessTreeExit,
+});
+
+function releaseAppServerHandles(child, output) {
+  let cleanupError;
+  const attempt = (operation) => {
+    try {
+      operation();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+  };
+  attempt(() => output?.close());
+  attempt(() => child?.stdin?.destroy());
+  attempt(() => child?.stdout?.destroy());
+  attempt(() => child?.stderr?.destroy());
+  attempt(() => child?.unref?.());
+  return cleanupError;
+}
+
 export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
   const env = { CODEX_HOME: codexHome };
   for (const key of WORKER_ENV_KEYS) {
@@ -139,6 +162,7 @@ export class AppServerClient {
     codexArgs = ["app-server", "--stdio"],
     codexHome,
     onRefresh,
+    processControl = DEFAULT_PROCESS_CONTROL,
     shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   }) {
@@ -146,6 +170,7 @@ export class AppServerClient {
     this.codexArgs = codexArgs;
     this.codexHome = codexHome;
     this.onRefresh = onRefresh;
+    this.processControl = processControl;
     this.shutdownGraceMs = shutdownGraceMs;
     this.timeoutMs = timeoutMs;
     this.nextRequestId = 1;
@@ -261,25 +286,35 @@ export class AppServerClient {
   async stop() {
     if (!this.child) return;
     this.stopping = true;
-    if (processTreeExists(this.child)) {
-      this.child.stdin.end();
-      if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
-        signalProcessTree(this.child, "SIGTERM");
-        if (!(await waitForProcessTreeExit(this.child, this.shutdownGraceMs))) {
-          signalProcessTree(this.child, "SIGKILL");
-          if (!(
-            await waitForProcessTreeExit(this.child, this.shutdownGraceMs, {
-              acceptZombieOnly: true,
-            })
-          )) {
-            throw new Error("codex app-server process group survived SIGKILL");
+    let shutdownError;
+    try {
+      if (this.processControl.exists(this.child)) {
+        this.child.stdin.end();
+        if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
+          this.processControl.signal(this.child, "SIGTERM");
+          if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
+            this.processControl.signal(this.child, "SIGKILL");
+            if (!(
+              await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
+                acceptZombieOnly: true,
+              })
+            )) {
+              throw new Error("codex app-server process group survived SIGKILL");
+            }
           }
         }
       }
+      await this.exitPromise?.catch(() => {});
+    } catch (error) {
+      shutdownError = error;
+    } finally {
+      const handleCleanupError = releaseAppServerHandles(this.child, this.stdout);
+      shutdownError ??= handleCleanupError;
+      this.#failAll(
+        this.terminalError ?? shutdownError ?? new Error("codex app-server stopped"),
+      );
     }
-    await this.exitPromise?.catch(() => {});
-    this.stdout?.close();
-    this.#failAll(this.terminalError ?? new Error("codex app-server stopped"));
+    if (shutdownError) throw shutdownError;
   }
 
   async abort(error = new Error("codex app-server aborted")) {
@@ -287,21 +322,29 @@ export class AppServerClient {
     this.stopping = true;
     this.#failAll(error);
     this.abortPromise = (async () => {
-      if (
-        this.child &&
-        processTreeExists(this.child)
-      ) {
-        signalProcessTree(this.child, "SIGKILL");
-        if (!(
-          await waitForProcessTreeExit(this.child, this.shutdownGraceMs, {
-            acceptZombieOnly: true,
-          })
-        )) {
-          throw new Error("codex app-server process group survived SIGKILL");
+      let shutdownError;
+      try {
+        if (
+          this.child &&
+          this.processControl.exists(this.child)
+        ) {
+          this.processControl.signal(this.child, "SIGKILL");
+          if (!(
+            await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
+              acceptZombieOnly: true,
+            })
+          )) {
+            throw new Error("codex app-server process group survived SIGKILL");
+          }
         }
+        await this.exitPromise?.catch(() => {});
+      } catch (error) {
+        shutdownError = error;
+      } finally {
+        const handleCleanupError = releaseAppServerHandles(this.child, this.stdout);
+        shutdownError ??= handleCleanupError;
       }
-      await this.exitPromise?.catch(() => {});
-      this.stdout?.close();
+      if (shutdownError) throw shutdownError;
     })();
     return this.abortPromise;
   }
