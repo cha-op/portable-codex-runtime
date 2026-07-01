@@ -53,20 +53,27 @@ the canonical authority file directly:
 1. Open a regular single-link lock file with `O_NOFOLLOW`, pass that exact file
    descriptor to an OS advisory lock holder, and keep the holder alive through
    its parent pipe. Linux opens `/proc/self/fd/3` in `flock` command mode so the
-   bare descriptor is not misparsed as a path. Process death releases the lock
-   automatically, while inode checks reject lock-path replacement.
+   bare descriptor is not misparsed as a path. Linux also uses `--no-fork` and
+   a dedicated conflict exit code; both platforms isolate the holder in a
+   process group that is synchronously terminated on timeout or release.
+   Process death releases the lock automatically, while inode checks reject
+   lock-path replacement.
 2. Read and validate canonical `auth.json` through one `O_NOFOLLOW` file
    descriptor.
-3. Copy the credential into a mode `0700` staging `CODEX_HOME`.
-4. Run only `initialize`, `initialized`, and
+3. Hold an open authority-directory guard for the transaction and revalidate
+   its device/inode identity before every critical pathname operation. Refuse
+   refresh when an earlier promotion candidate or staging attempt requires
+   manual recovery.
+4. Copy the credential into a mode `0700` staging `CODEX_HOME`.
+5. Run only `initialize`, `initialized`, and
    `account/read(refreshToken=true)` against the staging home.
-5. Verify workspace and user continuity, advanced `last_refresh`, a changed
+6. Verify workspace and user continuity, advanced `last_refresh`, a changed
    access token with at least two minutes of remaining validity, file
    permissions, and the unchanged canonical source generation.
-6. Write the staged record to a synced mode `0600` temporary file, atomically
+7. Write the staged record to a synced mode `0600` temporary file, atomically
    rename it over canonical `auth.json`, and sync the parent directory when the
    platform supports it.
-7. Re-read the promoted file before returning the access token to callers.
+8. Re-read the promoted file before returning the access token to callers.
 
 Concurrent callers inside the reference authority share one in-flight refresh
 and observe the same generation. This is process-local proof only; the
@@ -107,14 +114,24 @@ CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
   restoring the now-stale canonical token. Operators must inspect the reported
   recovery path and deliberately promote or securely remove old attempts;
   automatic age-based reaping could delete the only valid rotated token.
+- A crash can also leave `.auth.json.next-*` after that file is synced but
+  before rename. The next authority run reports all matching promotion and
+  staging candidates as `recovery_required` and does not consume the canonical
+  refresh token again. It never guesses which candidate to promote or delete.
 - `account/read` does not return the refreshed access token or a structured
   refresh error. Success must be established from the staged auth record and
   postconditions, not JSON-RPC success alone.
 - The advisory filesystem lock cannot protect against an unrelated process
   that ignores it. Production correctness requires one fenced authority leader.
+- Node.js does not expose `openat`/`renameat`; directory-FD identity guards close
+  deterministic replacement attacks but cannot eliminate the final pathname
+  TOCTOU window. The authority volume must therefore be single-attached, its
+  parent chain must not be writable or renameable by workers, and only the
+  broker may mount the canonical credential directory.
 - The reference lock backend requires `/usr/bin/lockf` on macOS and `flock`
   from util-linux plus procfs on Linux. Fixed runtime images must include and
-  test the matching backend.
+  test the matching backend. The repository test workflow exercises both
+  `macos-latest` and `ubuntu-latest`.
 - Directory-sync, verification, cleanup, or lock-release errors after canonical
   promotion are returned as committed warnings rather than refresh failures,
   preventing callers from rotating a second token in response to an already

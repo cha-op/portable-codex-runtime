@@ -14,6 +14,12 @@ import {
 } from "../src/advisory-lock.mjs";
 
 const HOLDER_FIXTURE = fileURLToPath(new URL("../fixtures/hold-advisory-lock.mjs", import.meta.url));
+const FAIL_HOLDER_FIXTURE = fileURLToPath(
+  new URL("../fixtures/fail-advisory-lock-holder.mjs", import.meta.url),
+);
+const STUBBORN_HOLDER_FIXTURE = fileURLToPath(
+  new URL("../fixtures/stubborn-advisory-lock-holder.mjs", import.meta.url),
+);
 
 function waitForLine(child, expected) {
   return new Promise((resolve, reject) => {
@@ -101,17 +107,77 @@ test("advisory lock backends use the inherited secure file descriptor", () => {
       process.execPath,
       fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
     ],
+    conflictExitCode: 75,
   });
   assert.deepEqual(advisoryLockCommand("linux"), {
     command: "flock",
     args: [
       "--exclusive",
       "--nonblock",
+      "--conflict-exit-code",
+      "75",
+      "--no-fork",
       "/proc/self/fd/3",
       process.execPath,
       fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
     ],
+    conflictExitCode: 75,
   });
+});
+
+test("holder exit one is a runtime failure rather than lock contention", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-holder-failure-"));
+  const path = join(root, "authority.lock");
+  try {
+    await assert.rejects(acquireAdvisoryLock(path, { holderPath: FAIL_HOLDER_FIXTURE }), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "lock_runtime_failed";
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup timeout kills a stubborn lock process group", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-startup-timeout-"));
+  const path = join(root, "authority.lock");
+  let recovered;
+  try {
+    await assert.rejects(
+      acquireAdvisoryLock(path, {
+        holderArgs: ["timeout"],
+        holderPath: STUBBORN_HOLDER_FIXTURE,
+        signalGraceMs: 100,
+        timeoutMs: 100,
+      }),
+      (error) => error instanceof AdvisoryLockError && error.code === "lock_timeout",
+    );
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release kills a stubborn lock process group before returning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-stubborn-release-"));
+  const path = join(root, "authority.lock");
+  let lock;
+  let recovered;
+  try {
+    lock = await acquireAdvisoryLock(path, {
+      holderArgs: ["release"],
+      holderPath: STUBBORN_HOLDER_FIXTURE,
+      releaseGraceMs: 50,
+      signalGraceMs: 100,
+    });
+    await lock.release();
+    lock = undefined;
+    recovered = await acquireAdvisoryLock(path);
+  } finally {
+    await lock?.release();
+    await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("unsupported lock platforms fail before creating the lock file", async () => {

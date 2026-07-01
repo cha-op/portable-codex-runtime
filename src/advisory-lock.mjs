@@ -5,11 +5,25 @@ import { fileURLToPath } from "node:url";
 
 const HOLDER_PATH = fileURLToPath(new URL("./advisory-lock-holder.mjs", import.meta.url));
 
-export function advisoryLockCommand(platform = process.platform) {
+export function advisoryLockCommand(
+  platform = process.platform,
+  { holderArgs = [], holderPath = HOLDER_PATH } = {},
+) {
   if (platform === "darwin") {
     return {
       command: "/usr/bin/lockf",
-      args: ["-k", "-s", "-t", "0", "-w", "/dev/fd/3", process.execPath, HOLDER_PATH],
+      args: [
+        "-k",
+        "-s",
+        "-t",
+        "0",
+        "-w",
+        "/dev/fd/3",
+        process.execPath,
+        holderPath,
+        ...holderArgs,
+      ],
+      conflictExitCode: 75,
     };
   }
   if (platform === "linux") {
@@ -18,21 +32,59 @@ export function advisoryLockCommand(platform = process.platform) {
       // The command form treats a bare "3" as a path. Opening the inherited
       // descriptor through procfs keeps the secure pre-opened inode while the
       // flock wrapper owns the lock for the lifetime of the holder process.
-      args: ["--exclusive", "--nonblock", "/proc/self/fd/3", process.execPath, HOLDER_PATH],
+      args: [
+        "--exclusive",
+        "--nonblock",
+        "--conflict-exit-code",
+        "75",
+        "--no-fork",
+        "/proc/self/fd/3",
+        process.execPath,
+        holderPath,
+        ...holderArgs,
+      ],
+      conflictExitCode: 75,
     };
   }
   throw new AdvisoryLockError("unsupported_platform", "advisory auth locks require macOS or Linux");
 }
 
-function waitForExit(child, timeoutMs) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve(true);
-    });
-  });
+function processGroupExists(processGroupId) {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    return true;
+  }
+}
+
+async function waitForProcessGroupExit(processGroupId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupExists(processGroupId)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
+
+function signalProcessGroup(processGroupId, signal) {
+  try {
+    process.kill(-processGroupId, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+async function stopLockProcess(child, { initialWaitMs, signalWaitMs }) {
+  child.stdin.end();
+  if (!child.pid || (await waitForProcessGroupExit(child.pid, initialWaitMs))) return;
+  signalProcessGroup(child.pid, "SIGTERM");
+  if (await waitForProcessGroupExit(child.pid, signalWaitMs)) return;
+  signalProcessGroup(child.pid, "SIGKILL");
+  if (!(await waitForProcessGroupExit(child.pid, signalWaitMs))) {
+    throw new AdvisoryLockError("lock_cleanup_failed", "authority lock process group survived SIGKILL");
+  }
 }
 
 export class AdvisoryLockError extends Error {
@@ -45,9 +97,19 @@ export class AdvisoryLockError extends Error {
 
 export async function acquireAdvisoryLock(
   lockPath,
-  { timeoutMs = 5_000, platform = process.platform } = {},
+  {
+    holderArgs = [],
+    holderPath = HOLDER_PATH,
+    platform = process.platform,
+    releaseGraceMs = 2_000,
+    signalGraceMs = 2_000,
+    timeoutMs = 5_000,
+  } = {},
 ) {
-  const { command, args } = advisoryLockCommand(platform);
+  const { command, args, conflictExitCode } = advisoryLockCommand(platform, {
+    holderArgs,
+    holderPath,
+  });
   if (typeof constants.O_NOFOLLOW !== "number") {
     throw new AdvisoryLockError(
       "unsupported_platform",
@@ -77,6 +139,7 @@ export async function acquireAdvisoryLock(
   }
 
   const child = spawn(command, args, {
+    detached: true,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     stdio: ["pipe", "pipe", "pipe", handle.fd],
   });
@@ -97,7 +160,6 @@ export async function acquireAdvisoryLock(
         callback();
       };
       const timer = setTimeout(() => {
-        child.kill("SIGTERM");
         finish(() =>
           reject(new AdvisoryLockError("lock_timeout", "timed out acquiring the authority lock")),
         );
@@ -111,7 +173,7 @@ export async function acquireAdvisoryLock(
         finish(() =>
           reject(
             new AdvisoryLockError(
-              code === 1 || code === 75 ? "lock_unavailable" : "lock_runtime_failed",
+              code === conflictExitCode ? "lock_unavailable" : "lock_runtime_failed",
               `authority lock was not acquired; stderr omitted (${stderrBytes} bytes)`,
             ),
           ),
@@ -123,7 +185,11 @@ export async function acquireAdvisoryLock(
       });
     });
   } catch (error) {
-    await handle.close().catch(() => {});
+    try {
+      await stopLockProcess(child, { initialWaitMs: 0, signalWaitMs: signalGraceMs });
+    } finally {
+      await handle.close().catch(() => {});
+    }
     throw error;
   }
 
@@ -163,12 +229,14 @@ export async function acquireAdvisoryLock(
     async release() {
       if (released) return;
       released = true;
-      child.stdin.end();
-      if (!(await waitForExit(child, 2_000))) {
-        child.kill("SIGTERM");
-        if (!(await waitForExit(child, 2_000))) child.kill("SIGKILL");
+      try {
+        await stopLockProcess(child, {
+          initialWaitMs: releaseGraceMs,
+          signalWaitMs: signalGraceMs,
+        });
+      } finally {
+        await handle.close();
       }
-      await handle.close();
     },
   };
 }

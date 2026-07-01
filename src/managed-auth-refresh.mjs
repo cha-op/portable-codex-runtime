@@ -7,6 +7,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -37,8 +38,17 @@ function fingerprint(value) {
   return `sha256:${sha256(value).slice(0, 24)}`;
 }
 
-function fail(code, message, { retryable = false, recoveryPath } = {}) {
-  throw new ManagedAuthRefreshError(code, message, { retryable, recoveryPath });
+function fail(
+  code,
+  message,
+  { recoveryPath, recoveryPaths, recoveryReason, retryable = false } = {},
+) {
+  throw new ManagedAuthRefreshError(code, message, {
+    recoveryPath,
+    recoveryPaths,
+    recoveryReason,
+    retryable,
+  });
 }
 
 function ensure(condition, code, message, options) {
@@ -100,6 +110,17 @@ function sameFileIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function attachRecoveryPaths(target, paths) {
+  if (!target || typeof target !== "object") return;
+  const recoveryPaths = [
+    ...(Array.isArray(target.recoveryPaths) ? target.recoveryPaths : []),
+    ...paths,
+  ].filter((value) => typeof value === "string" && value.length > 0);
+  if (recoveryPaths.length === 0) return;
+  target.recoveryPaths = [...new Set(recoveryPaths)];
+  target.recoveryPath ??= target.recoveryPaths[0];
+}
+
 function lastRefreshAdvanced(before, after) {
   if (typeof after !== "string") return false;
   const afterTime = Date.parse(after);
@@ -110,38 +131,81 @@ function lastRefreshAdvanced(before, after) {
 }
 
 async function resolveAuthorityHome(authHome) {
-  const authorityHome = await realpath(resolve(authHome));
-  const authorityHomeStat = await lstat(authorityHome);
-  const protectedHomes = await Promise.all(
-    [join(homedir(), ".codex"), process.env.CODEX_HOME]
-      .filter((value) => typeof value === "string" && value.length > 0)
-      .map(async (value) => {
-        try {
-          const path = await realpath(resolve(value));
-          return { path, stat: await lstat(path) };
-        } catch {
-          return null;
-        }
-      }),
-  );
   ensure(
-    !protectedHomes.some(
-      (protectedHome) =>
-        protectedHome !== null &&
-        (protectedHome.path === authorityHome ||
-          sameFileIdentity(protectedHome.stat, authorityHomeStat)),
-    ),
-    "unsafe_auth_home",
-    "refusing to mutate the default or active Codex home; use a dedicated authority home",
+    typeof constants.O_DIRECTORY === "number" && typeof constants.O_NOFOLLOW === "number",
+    "unsupported_platform",
+    "safe authority directory guards require O_DIRECTORY and O_NOFOLLOW support",
   );
-  return authorityHome;
+  const authorityHome = await realpath(resolve(authHome));
+  let handle;
+  try {
+    handle = await open(
+      authorityHome,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const authorityHomeStat = await handle.stat();
+    ensure(
+      authorityHomeStat.isDirectory(),
+      "unsafe_auth_home",
+      "authority home must be a real directory",
+    );
+    const protectedHomes = await Promise.all(
+      [join(homedir(), ".codex"), process.env.CODEX_HOME]
+        .filter((value) => typeof value === "string" && value.length > 0)
+        .map(async (value) => {
+          try {
+            const path = await realpath(resolve(value));
+            return { path, stat: await lstat(path) };
+          } catch {
+            return null;
+          }
+        }),
+    );
+    ensure(
+      !protectedHomes.some(
+        (protectedHome) =>
+          protectedHome !== null &&
+          (protectedHome.path === authorityHome ||
+            sameFileIdentity(protectedHome.stat, authorityHomeStat)),
+      ),
+      "unsafe_auth_home",
+      "refusing to mutate the default or active Codex home; use a dedicated authority home",
+    );
+    return { handle, identity: authorityHomeStat, path: authorityHome };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    throw error;
+  }
 }
 
-async function acquireAuthorityLock(authorityHome) {
-  const lockPath = join(authorityHome, LOCK_FILE);
+async function assertAuthorityHomeCurrent(authority) {
+  let current;
+  try {
+    current = await open(
+      authority.path,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const currentStat = await current.stat();
+    ensure(
+      currentStat.isDirectory() && sameFileIdentity(currentStat, authority.identity),
+      "authority_home_replaced",
+      "authority home identity changed during refresh",
+    );
+  } catch (error) {
+    if (error instanceof ManagedAuthRefreshError) throw error;
+    fail("authority_home_replaced", "authority home identity changed during refresh");
+  } finally {
+    await current?.close().catch(() => {});
+  }
+}
+
+async function acquireAuthorityLock(authority) {
+  await assertAuthorityHomeCurrent(authority);
+  const lockPath = join(authority.path, LOCK_FILE);
   let lock;
   try {
     lock = await acquireAdvisoryLock(lockPath);
+    await assertAuthorityHomeCurrent(authority);
     return lock;
   } catch (error) {
     await lock?.release().catch(() => {});
@@ -154,26 +218,64 @@ async function acquireAuthorityLock(authorityHome) {
   }
 }
 
+async function findRecoveryArtifacts(authority) {
+  await assertAuthorityHomeCurrent(authority);
+  const recoveryPaths = [];
+  const entries = await readdir(authority.path, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name.startsWith(".auth.json.next-")) {
+      recoveryPaths.push(join(authority.path, entry.name));
+    }
+  }
+
+  const stagingRoot = join(authority.path, STAGING_DIRECTORY);
+  try {
+    const stagingRootStat = await lstat(stagingRoot);
+    if (!stagingRootStat.isDirectory() || stagingRootStat.isSymbolicLink()) {
+      recoveryPaths.push(stagingRoot);
+    } else {
+      const attempts = await readdir(stagingRoot, { withFileTypes: true });
+      for (const attempt of attempts) {
+        if (attempt.name.startsWith("attempt-")) {
+          recoveryPaths.push(join(stagingRoot, attempt.name));
+        }
+      }
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  await assertAuthorityHomeCurrent(authority);
+  return recoveryPaths.sort();
+}
+
 async function releaseAuthorityLock(lock) {
   await lock.release();
 }
 
-async function createStagingHome(authorityHome, rawAuth) {
+async function createStagingHome(authorityHome, rawAuth, writeStagingFile = writeFile) {
   const stagingRoot = join(authorityHome, STAGING_DIRECTORY);
-  await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
-  const stagingRootStat = await lstat(stagingRoot);
-  ensure(
-    stagingRootStat.isDirectory() && !stagingRootStat.isSymbolicLink(),
-    "unsafe_staging_path",
-    "authority staging root must be a real directory",
-  );
-  await chmod(stagingRoot, 0o700);
-
+  let stagingRootCreated = false;
   let stagingHome;
   try {
+    try {
+      await mkdir(stagingRoot, { mode: 0o700 });
+      stagingRootCreated = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    const stagingRootStat = await lstat(stagingRoot);
+    ensure(
+      stagingRootStat.isDirectory() && !stagingRootStat.isSymbolicLink(),
+      "unsafe_staging_path",
+      "authority staging root must be a real directory",
+    );
+    await chmod(stagingRoot, 0o700);
     stagingHome = await mkdtemp(join(stagingRoot, "attempt-"));
     await chmod(stagingHome, 0o700);
-    await writeFile(join(stagingHome, "auth.json"), rawAuth, { flag: "wx", mode: 0o600 });
+    await writeStagingFile(join(stagingHome, "auth.json"), rawAuth, {
+      flag: "wx",
+      mode: 0o600,
+    });
     const config = `cli_auth_credentials_store = "file"
 
 [features]
@@ -182,40 +284,43 @@ plugin_sharing = false
 plugins = false
 remote_plugin = false
 `;
-    await writeFile(join(stagingHome, "config.toml"), config, { flag: "wx", mode: 0o600 });
+    await writeStagingFile(join(stagingHome, "config.toml"), config, {
+      flag: "wx",
+      mode: 0o600,
+    });
     return { stagingHome, stagingRoot };
   } catch (error) {
     if (stagingHome) await rm(stagingHome, { recursive: true, force: true }).catch(() => {});
+    if (stagingRootCreated) await rmdir(stagingRoot).catch(() => {});
     throw error;
   }
 }
 
-async function syncParentDirectory(path) {
-  let handle;
+async function syncParentDirectory(authority) {
   try {
-    handle = await open(path, constants.O_RDONLY);
-    await handle.sync();
+    await authority.handle.sync();
     return true;
   } catch (error) {
     if (["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(error?.code)) return false;
     throw error;
-  } finally {
-    await handle?.close().catch(() => {});
   }
 }
 
 async function atomicallyPromoteAuth(
-  authorityHome,
+  authority,
   rawAuth,
   expectedSource,
   assertLockHeld,
   syncDirectory,
 ) {
+  const authorityHome = authority.path;
   const destination = join(authorityHome, "auth.json");
   const temporary = join(authorityHome, `.auth.json.next-${randomUUID()}`);
   let handle;
   let renamed = false;
+  let operationError;
   try {
+    await assertAuthorityHomeCurrent(authority);
     handle = await open(
       temporary,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -226,7 +331,9 @@ async function atomicallyPromoteAuth(
     await handle.close();
     handle = undefined;
 
+    await assertAuthorityHomeCurrent(authority);
     const currentSource = await readManagedAuthSnapshot(authorityHome);
+    await assertAuthorityHomeCurrent(authority);
     ensure(
       currentSource.authFileFingerprint === expectedSource.authFileFingerprint &&
         sameFileIdentity(currentSource.fileIdentity, expectedSource.fileIdentity),
@@ -235,10 +342,11 @@ async function atomicallyPromoteAuth(
     );
 
     await assertLockHeld();
+    await assertAuthorityHomeCurrent(authority);
     await rename(temporary, destination);
     renamed = true;
     try {
-      const parentDirectorySynced = await syncDirectory(authorityHome);
+      const parentDirectorySynced = await syncDirectory(authority);
       return {
         parentDirectorySynced,
         warnings: parentDirectorySynced ? [] : ["parent_directory_sync_failed"],
@@ -246,19 +354,44 @@ async function atomicallyPromoteAuth(
     } catch {
       return { parentDirectorySynced: false, warnings: ["parent_directory_sync_failed"] };
     }
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
     await handle?.close().catch(() => {});
-    if (!renamed) await rm(temporary, { force: true }).catch(() => {});
+    if (!renamed) {
+      let authorityCurrent = false;
+      try {
+        await assertAuthorityHomeCurrent(authority);
+        authorityCurrent = true;
+      } catch {
+        // Never resolve cleanup through a replaced authority path. A retained
+        // candidate must be inspected from the single-attached authority volume.
+      }
+      if (authorityCurrent) {
+        try {
+          await rm(temporary, { force: true });
+        } catch {
+          attachRecoveryPaths(operationError, [temporary]);
+        }
+      }
+    }
   }
 }
 
 export class ManagedAuthRefreshError extends Error {
-  constructor(code, message, { retryable = false, recoveryPath } = {}) {
+  constructor(
+    code,
+    message,
+    { recoveryPath, recoveryPaths = [], recoveryReason, retryable = false } = {},
+  ) {
     super(message);
     this.name = "ManagedAuthRefreshError";
     this.code = code;
     this.retryable = retryable;
     if (recoveryPath) this.recoveryPath = recoveryPath;
+    attachRecoveryPaths(this, [...recoveryPaths, recoveryPath]);
+    if (recoveryReason) this.recoveryReason = recoveryReason;
   }
 }
 
@@ -268,6 +401,10 @@ export function managedAuthRefreshErrorMetadata(error) {
   if (typeof error.code === "string") metadata.code = error.code;
   if (typeof error.retryable === "boolean") metadata.retryable = error.retryable;
   if (typeof error.recoveryPath === "string") metadata.recoveryPath = error.recoveryPath;
+  if (Array.isArray(error.recoveryPaths)) {
+    metadata.recoveryPaths = error.recoveryPaths.filter((value) => typeof value === "string");
+  }
+  if (typeof error.recoveryReason === "string") metadata.recoveryReason = error.recoveryReason;
   if (Array.isArray(error.cleanupWarnings)) {
     metadata.cleanupWarnings = error.cleanupWarnings.filter((value) => typeof value === "string");
   }
@@ -374,8 +511,12 @@ export async function readManagedAuthSnapshot(authHome) {
   });
 }
 
-export async function runCodexManagedRefresh({ codexBin = "codex", stagingHome }) {
-  const client = new AppServerClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
+export async function runCodexManagedRefresh({
+  codexBin = "codex",
+  createClient = (options) => new AppServerClient(options),
+  stagingHome,
+}) {
+  const client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
   try {
     await client.start();
     const initializeResult = await client.initialize(false);
@@ -412,15 +553,26 @@ async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, st
 }
 
 export async function refreshManagedAuthRecord({
+  acquireLock = acquireAuthorityLock,
   authHome,
   cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
   runRefresh = runCodexManagedRefresh,
   syncDirectory = syncParentDirectory,
   verifyPromoted = readManagedAuthSnapshot,
+  writeStagingFile = writeFile,
 }) {
-  const authorityHome = await resolveAuthorityHome(authHome);
-  const lock = await acquireAuthorityLock(authorityHome);
+  const authority = await resolveAuthorityHome(authHome);
+  let lock;
+  try {
+    lock = await acquireLock(authority);
+    await assertAuthorityHomeCurrent(authority);
+  } catch (error) {
+    await lock?.release().catch(() => {});
+    await authority.handle.close().catch(() => {});
+    throw error;
+  }
+  const authorityHome = authority.path;
   let before;
   let stagingHome;
   let stagingRoot;
@@ -429,9 +581,28 @@ export async function refreshManagedAuthRecord({
   let primaryError;
   const committedWarnings = [];
   try {
+    await assertAuthorityHomeCurrent(authority);
+    const recoveryPaths = await findRecoveryArtifacts(authority);
+    ensure(
+      recoveryPaths.length === 0,
+      "recovery_required",
+      "managed authority contains unresolved refresh recovery artifacts",
+      {
+        recoveryPath: recoveryPaths[0],
+        recoveryPaths,
+        recoveryReason: "orphaned_refresh_artifacts",
+      },
+    );
     before = await readManagedAuthSnapshot(authorityHome);
-    ({ stagingHome, stagingRoot } = await createStagingHome(authorityHome, before.raw));
+    await assertAuthorityHomeCurrent(authority);
+    ({ stagingHome, stagingRoot } = await createStagingHome(
+      authorityHome,
+      before.raw,
+      writeStagingFile,
+    ));
+    await assertAuthorityHomeCurrent(authority);
     const refreshResult = await runRefresh({ codexBin, stagingHome });
+    await assertAuthorityHomeCurrent(authority);
     ensure(
       rpcAuditMatches(refreshResult?.rpcAudit),
       "unexpected_rpc_sequence",
@@ -486,7 +657,7 @@ export async function refreshManagedAuthRecord({
     );
 
     const promotion = await atomicallyPromoteAuth(
-      authorityHome,
+      authority,
       staged.raw,
       before,
       () => lock.assertHeld(),
@@ -495,7 +666,9 @@ export async function refreshManagedAuthRecord({
     committedWarnings.push(...promotion.warnings);
     let promoted = staged;
     try {
+      await assertAuthorityHomeCurrent(authority);
       const verified = await verifyPromoted(authorityHome);
+      await assertAuthorityHomeCurrent(authority);
       ensure(
         verified.authFileFingerprint === staged.authFileFingerprint &&
           verified.accountId === before.accountId &&
@@ -533,7 +706,8 @@ export async function refreshManagedAuthRecord({
       redactionValues: [...new Set([...before.redactionValues, ...promoted.redactionValues])],
     });
   } catch (error) {
-    if (stagingHome && before && !preserveStaging) {
+    const authorityReplaced = error?.code === "authority_home_replaced";
+    if (stagingHome && before && !preserveStaging && !authorityReplaced) {
       try {
         const stagedAfterFailure = await readManagedAuthSnapshot(stagingHome);
         preserveStaging =
@@ -544,26 +718,36 @@ export async function refreshManagedAuthRecord({
         preserveStaging = true;
       }
     }
-    if (preserveStaging && stagingHome && error && typeof error === "object") {
-      error.recoveryPath ??= stagingHome;
+    if (preserveStaging && stagingHome && !authorityReplaced && error && typeof error === "object") {
+      attachRecoveryPaths(error, [stagingHome]);
     }
     primaryError = error;
   }
 
   const cleanupWarnings = [...committedWarnings];
+  let authorityCurrent = true;
   try {
-    await cleanupArtifacts({ preserveStaging, stagingHome, stagingRoot });
-  } catch {
-    cleanupWarnings.push("staging_cleanup_failed");
-    if (stagingHome) {
-      try {
-        await lstat(stagingHome);
-        if (primaryError && typeof primaryError === "object") {
-          primaryError.recoveryPath ??= stagingHome;
+    await assertAuthorityHomeCurrent(authority);
+  } catch (error) {
+    authorityCurrent = false;
+    primaryError ??= error;
+    cleanupWarnings.push("authority_home_replaced");
+  }
+  if (authorityCurrent) {
+    try {
+      await cleanupArtifacts({ preserveStaging, stagingHome, stagingRoot });
+    } catch {
+      cleanupWarnings.push("staging_cleanup_failed");
+      if (stagingHome) {
+        try {
+          await lstat(stagingHome);
+          if (primaryError && typeof primaryError === "object") {
+            attachRecoveryPaths(primaryError, [stagingHome]);
+          }
+          if (outcome) outcome.recoveryPath ??= stagingHome;
+        } catch {
+          // The staging home was removed before a later cleanup step failed.
         }
-        if (outcome) outcome.recoveryPath ??= stagingHome;
-      } catch {
-        // The staging home was removed before a later cleanup step failed.
       }
     }
   }
@@ -571,6 +755,11 @@ export async function refreshManagedAuthRecord({
     await releaseAuthorityLock(lock);
   } catch {
     cleanupWarnings.push("lock_release_failed");
+  }
+  try {
+    await authority.handle.close();
+  } catch {
+    cleanupWarnings.push("authority_guard_close_failed");
   }
   if (primaryError) {
     if (cleanupWarnings.length > 0 && typeof primaryError === "object") {

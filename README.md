@@ -36,6 +36,8 @@ CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
 Do not point this command at the default user `~/.codex` home or the active
 `$CODEX_HOME`. The probe rejects path aliases and matching directory identities
 and expects `.test-codex-home` or another dedicated authority login.
+Production workers must not be able to mount, rename, or write the authority
+home or its parent path; only the broker owns that single-attached volume.
 See `docs/experiments/auth-refresh-authority.md` for the source evidence,
 failure model, and production limitations.
 
