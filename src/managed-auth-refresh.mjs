@@ -129,12 +129,27 @@ function sameFileIdentity(left, right) {
 
 export function authorityDirectoryPermissionsAreSafe(
   { isDirectory, mode, uid },
-  { allowRootOwner = false, brokerUid, disallowedModeBits },
+  {
+    allowRootOwner = false,
+    allowStickyShared = false,
+    brokerUid,
+    childUid,
+    disallowedModeBits,
+    requiredModeBits = 0,
+  },
 ) {
+  const ownerIsTrusted =
+    brokerUid === null || uid === brokerUid || (allowRootOwner && uid === 0);
+  const childOwnerIsTrusted =
+    brokerUid === null || childUid === brokerUid || (allowRootOwner && childUid === 0);
+  const hasDisallowedWrite = (mode & disallowedModeBits) !== 0;
+  const stickyProtectsTrustedChild =
+    allowStickyShared && (mode & 0o1000) !== 0 && childOwnerIsTrusted;
   return (
     isDirectory === true &&
-    (brokerUid === null || uid === brokerUid || (allowRootOwner && uid === 0)) &&
-    (mode & disallowedModeBits) === 0
+    ownerIsTrusted &&
+    (mode & requiredModeBits) === requiredModeBits &&
+    (!hasDisallowedWrite || stickyProtectsTrustedChild)
   );
 }
 
@@ -177,7 +192,6 @@ async function resolveAuthorityHome(authHome) {
       "unsafe_auth_home",
       "authority home must be a real directory",
     );
-    const authorityParentStat = await lstat(dirname(authorityHome));
     const currentUid =
       typeof process.geteuid === "function"
         ? process.geteuid()
@@ -191,27 +205,47 @@ async function resolveAuthorityHome(authHome) {
           mode: authorityHomeStat.mode,
           uid: authorityHomeStat.uid,
         },
-        { brokerUid: currentUid, disallowedModeBits: 0o077 },
-      ),
-      "unsafe_auth_home",
-      "authority home must be broker-owned and private",
-    );
-    ensure(
-      authorityDirectoryPermissionsAreSafe(
         {
-          isDirectory: authorityParentStat.isDirectory(),
-          mode: authorityParentStat.mode,
-          uid: authorityParentStat.uid,
-        },
-        {
-          allowRootOwner: true,
           brokerUid: currentUid,
-          disallowedModeBits: 0o022,
+          disallowedModeBits: 0o077,
+          requiredModeBits: 0o700,
         },
       ),
       "unsafe_auth_home",
-      "authority home parent must be broker/root-owned and not group/world writable",
+      "authority home must be broker-owned with private owner permissions",
     );
+    let childUid = authorityHomeStat.uid;
+    let ancestor = dirname(authorityHome);
+    while (true) {
+      let ancestorStat;
+      try {
+        ancestorStat = await lstat(ancestor);
+      } catch {
+        fail("unsafe_auth_home", "authority ancestor chain could not be validated");
+      }
+      ensure(
+        authorityDirectoryPermissionsAreSafe(
+          {
+            isDirectory: ancestorStat.isDirectory(),
+            mode: ancestorStat.mode,
+            uid: ancestorStat.uid,
+          },
+          {
+            allowRootOwner: true,
+            allowStickyShared: true,
+            brokerUid: currentUid,
+            childUid,
+            disallowedModeBits: 0o022,
+          },
+        ),
+        "unsafe_auth_home",
+        "authority ancestor chain is not trusted",
+      );
+      const parent = dirname(ancestor);
+      if (parent === ancestor) break;
+      childUid = ancestorStat.uid;
+      ancestor = parent;
+    }
     const protectedHomes = await Promise.all(
       [join(homedir(), ".codex"), process.env.CODEX_HOME]
         .filter((value) => typeof value === "string" && value.length > 0)

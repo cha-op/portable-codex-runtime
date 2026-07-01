@@ -76,6 +76,44 @@ test("authority directory permission policy accepts only trusted owners and mode
     ),
     false,
   );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o41777, uid: 0 },
+      {
+        ...options,
+        allowRootOwner: true,
+        allowStickyShared: true,
+        childUid: 501,
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o41777, uid: 0 },
+      {
+        ...options,
+        allowRootOwner: true,
+        allowStickyShared: true,
+        childUid: 777,
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40700, uid: 501 },
+      { brokerUid: 501, disallowedModeBits: 0o077, requiredModeBits: 0o700 },
+    ),
+    true,
+  );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40500, uid: 501 },
+      { brokerUid: 501, disallowedModeBits: 0o077, requiredModeBits: 0o700 },
+    ),
+    false,
+  );
 });
 
 function encodeJwt(payload) {
@@ -1763,6 +1801,58 @@ test("authority rejects permissive homes and writable parent directories", async
     );
   } finally {
     await rm(permissiveParent.root, { recursive: true, force: true });
+  }
+});
+
+test("authority rejects a writable non-sticky grandparent without leaking its path", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const grandparent = join(root, "writable-grandparent");
+  const parent = join(grandparent, "trusted-parent");
+  const nestedAuthHome = join(parent, "authority-home");
+  let refreshCalled = false;
+  try {
+    await mkdir(parent, { mode: 0o700, recursive: true });
+    await rename(authHome, nestedAuthHome);
+    await chmod(grandparent, 0o777);
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome: nestedAuthHome,
+        runRefresh: async () => {
+          refreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "unsafe_auth_home");
+        assert.equal(error.message.includes(root), false);
+        return true;
+      },
+    );
+    assert.equal(refreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority accepts a sticky shared grandparent protecting a trusted child", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const grandparent = join(root, "sticky-grandparent");
+  const parent = join(grandparent, "trusted-parent");
+  const nestedAuthHome = join(parent, "authority-home");
+  try {
+    await mkdir(parent, { mode: 0o700, recursive: true });
+    await rename(authHome, nestedAuthHome);
+    await chmod(grandparent, 0o1777);
+    const result = await refreshManagedAuthRecord({
+      authHome: nestedAuthHome,
+      runRefresh: async ({ stagingHome }) => {
+        await replaceStagedAuth(stagingHome);
+        return successResponse();
+      },
+    });
+    assert.equal(result.comparisons.accessTokenChanged, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
