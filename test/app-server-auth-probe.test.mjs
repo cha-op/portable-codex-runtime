@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   AppServerClient,
@@ -29,6 +39,38 @@ const codexUnavailable =
   spawnSync(codexBin, ["--version"], { stdio: "ignore" }).status === 0
     ? false
     : `Codex CLI is unavailable at ${codexBin}`;
+const DETACHED_GRANDCHILD_FIXTURE = fileURLToPath(
+  new URL("../fixtures/detached-grandchild-app-server.mjs", import.meta.url),
+);
+
+async function killAndWaitForProcess(pid, timeoutMs = 2_000) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error?.code === "ESRCH") return;
+    throw error;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === "ESRCH") return;
+      throw error;
+    }
+    assert(Date.now() < deadline, `detached fixture process ${pid} survived SIGKILL`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function waitForFile(path, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await fileExists(path))) {
+    assert(Date.now() < deadline, `timed out waiting for fixture file ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
 
 function relativeNodeExecutable() {
   const relativeNode = relative(process.cwd(), process.execPath);
@@ -1007,6 +1049,44 @@ process.stdin.on("end", () => process.exit(0));
     } finally {
       await client.abort().catch(() => {});
       await rm(codexHome, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "host process-group transport is not containment for detached grandchildren",
+  { skip: process.platform === "win32" },
+  async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-group-escape-fixture-"));
+    const markerPath = join(codexHome, "detached-grandchild-mutation");
+    const pidPath = join(codexHome, "detached-grandchild.pid");
+    const client = new AppServerClient({
+      codexBin: process.execPath,
+      codexArgs: [DETACHED_GRANDCHILD_FIXTURE, "app-server", markerPath, pidPath],
+      codexHome,
+      shutdownGraceMs: 20,
+      timeoutMs: 1_000,
+    });
+    let grandchildPid;
+    try {
+      await client.start();
+      const notification = await client.waitForNotification("fixture/detached-grandchild");
+      grandchildPid = notification.params.pid;
+      assert(Number.isSafeInteger(grandchildPid) && grandchildPid > 0);
+
+      await client.stop();
+      await waitForFile(markerPath);
+      assert.equal(await readFile(markerPath, "utf8"), "detached grandchild mutation\n");
+    } finally {
+      if (!grandchildPid && (await fileExists(pidPath))) {
+        grandchildPid = Number.parseInt(await readFile(pidPath, "utf8"), 10);
+      }
+      try {
+        await killAndWaitForProcess(grandchildPid);
+      } finally {
+        await client.abort().catch(() => {});
+        await rm(codexHome, { recursive: true, force: true });
+      }
     }
   },
 );

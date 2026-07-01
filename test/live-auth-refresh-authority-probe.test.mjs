@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -49,15 +52,111 @@ test("source provenance resolves HEAD for an explicit source mirror", () => {
   ]);
 });
 
+test("live authority report marks host process-group containment as probe-only", async () => {
+  const refreshResult = {
+    accessToken: "rotated-access-sensitive",
+    accountId: "account-sensitive",
+    cleanupWarnings: [],
+    comparisons: {
+      accessTokenChanged: true,
+      accountContinuity: true,
+      authFileChanged: true,
+      lastRefreshAdvanced: true,
+      refreshTokenChanged: true,
+      userContinuity: true,
+    },
+    fileMode: "0600",
+    generation: 1,
+    parentDirectorySynced: true,
+    redactionValues: ["rotated-access-sensitive", "account-sensitive"],
+    rpcAudit: [
+      { kind: "request", method: "initialize" },
+      { kind: "notification", method: "initialized" },
+      { kind: "request", method: "account/read" },
+    ],
+  };
+  const authority = {
+    inFlight: undefined,
+    refreshExecutions: 0,
+    refresh() {
+      if (!this.inFlight) {
+        this.refreshExecutions += 1;
+        this.inFlight = Promise.resolve(refreshResult);
+      }
+      return this.inFlight;
+    },
+  };
+  let snapshotReads = 0;
+  let serializedEvidence;
+  const result = await probeLiveAuthRefreshAuthority({
+    allowAuthMutation: true,
+    allowUncontainedAuthProbe: true,
+    authHome: "/dedicated/authority",
+    codexBin: "/pinned/codex",
+    createAuthority: (options) => {
+      assert.equal(typeof options.refreshRecord, "function");
+      return authority;
+    },
+    evidencePath: "/evidence/mock-live-authority.json",
+    makeTemporaryDirectory: () => mkdtemp(join(tmpdir(), "portable-auth-worker-evidence-test-")),
+    readCodexVersion: () => "codex-cli test",
+    readSnapshot: async () => {
+      snapshotReads += 1;
+      return {
+        accountId: "account-sensitive",
+        authFileFingerprint: snapshotReads === 1 ? "before" : "after",
+        authPath: "/dedicated/authority/auth.json",
+      };
+    },
+    runWorkerProbe: async () => ({
+      sourceAuth: { unchangedDuringProbe: true },
+      worker: {
+        authJsonCreated: false,
+        loginType: "chatgptAuthTokens",
+        model: "gpt-test",
+        turnStatus: "completed",
+      },
+    }),
+    writeEvidence: async (_path, serialized, protectedAuthPath) => {
+      assert.equal(protectedAuthPath, "/dedicated/authority/auth.json");
+      serializedEvidence = serialized;
+    },
+  });
+
+  assert.equal(result.schemaVersion, 2);
+  assert.equal(result.processContainment, "host-process-group-probe-only");
+  assert.equal(JSON.parse(serializedEvidence).processContainment, result.processContainment);
+  assert.equal(serializedEvidence.includes("rotated-access-sensitive"), false);
+});
+
 test("live authority probe rejects PATH-resolved Codex before reading auth", async () => {
   await assert.rejects(
     probeLiveAuthRefreshAuthority({
       allowAuthMutation: true,
+      allowUncontainedAuthProbe: true,
       authHome: "/definitely/missing/auth-home",
       codexBin: "codex",
     }),
     /CODEX_BIN to be an absolute pinned-image path/,
   );
+});
+
+test("live authority probe requires a separate uncontained-process opt-in", async () => {
+  let snapshotReadCalls = 0;
+  await assert.rejects(
+    probeLiveAuthRefreshAuthority({
+      allowAuthMutation: true,
+      allowUncontainedAuthProbe: false,
+      authHome: "/definitely/missing/auth-home",
+      codexBin: "/pinned/codex",
+      readSnapshot: async () => {
+        snapshotReadCalls += 1;
+        throw new Error("auth snapshot read must not be reached");
+      },
+    }),
+    /CODEX_ALLOW_UNCONTAINED_AUTH_PROBE=1/,
+  );
+  assert.equal(snapshotReadCalls, 0);
 });
 
 test("live authority probe rejects unsupported platforms before auth mutation", async () => {
@@ -121,7 +220,11 @@ test("managed auth failure reports never serialize generic error details", () =>
 });
 
 test("live authority probe script emits only structured sanitized failures", () => {
-  const env = { ...process.env, CODEX_ALLOW_AUTH_MUTATION: "1" };
+  const env = {
+    ...process.env,
+    CODEX_ALLOW_AUTH_MUTATION: "1",
+    CODEX_ALLOW_UNCONTAINED_AUTH_PROBE: "1",
+  };
   delete env.CODEX_BIN;
   const result = spawnSync(process.execPath, [LIVE_PROBE_SCRIPT], {
     encoding: "utf8",

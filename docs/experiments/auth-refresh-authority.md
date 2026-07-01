@@ -70,8 +70,12 @@ the canonical authority file directly:
    files and the staging directory chain, and fail before OAuth rotation if
    those recovery markers cannot be made durable.
 5. Require an absolute Codex binary path, run it with the staging home as
-   its working directory, recheck the authority lock immediately before the RPC, and synchronously reap
-   the isolated app-server process group on every shutdown path. Because a
+   its working directory, and recheck the authority lock immediately before the
+   RPC. The live compatibility probe synchronously reaps the host app-server
+   process group, but that group cannot contain a child that creates a new
+   session. Production managed refresh therefore fails with
+   `refresh_containment_required` until a per-refresh rootless executor owns the
+   process and staging mount lifecycle. Because a
    remote OAuth rotation may already have committed, lock loss or any failure
    after `account/read` dispatch is non-retryable: retain the durable staging
    attempt as a recovery sentinel. After app-server exit, fsync the rewritten
@@ -118,14 +122,17 @@ The live probe passed with Codex CLI `0.142.4` and the dedicated
 - the worker never created `auth.json`.
 
 The redacted machine-readable result is stored in
-`evidence/live-auth-refresh-authority.json`.
+`evidence/live-auth-refresh-authority.json`. Schema version 2 marks this result
+as `processContainment: host-process-group-probe-only`; it proves the API
+choreography, not production process containment.
 
 Run the live probe only with a dedicated login that may be rotated:
 
 ```bash
 chmod 700 .test-codex-home
 CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
-  CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
+  CODEX_ALLOW_AUTH_MUTATION=1 \
+  CODEX_ALLOW_UNCONTAINED_AUTH_PROBE=1 npm run probe:auth-refresh:live
 ```
 
 ## Limitations
@@ -154,6 +161,12 @@ CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
   postconditions, not JSON-RPC success alone.
 - The advisory filesystem lock cannot protect against an unrelated process
   that ignores it. Production correctness requires one fenced authority leader.
+- A detached host process group cannot contain a descendant that calls `setsid`
+  or otherwise creates a new session. The host managed-refresh choreography is
+  available only through `runUncontainedCodexManagedRefreshProbe` and a separate
+  live-probe opt-in. The production entry point does not create a staging
+  credential or spawn Codex without an external containment executor; the
+  rootless executor implementation remains deferred.
 - Node.js does not expose `openat`/`renameat`; directory-FD identity guards close
   deterministic replacement attacks but cannot eliminate the final pathname
   TOCTOU window. The authority volume must therefore be single-attached, its

@@ -1360,7 +1360,21 @@ export async function readManagedAuthSnapshot(
   return snapshot;
 }
 
-export async function runCodexManagedRefresh({
+function refreshContainmentRequiredError() {
+  const error = new ManagedAuthRefreshError(
+    "refresh_containment_required",
+    "managed auth refresh requires an external process containment executor",
+    { retryable: false },
+  );
+  markPreDispatchRefreshError(error);
+  return error;
+}
+
+export async function runCodexManagedRefresh() {
+  throw refreshContainmentRequiredError();
+}
+
+export async function runUncontainedCodexManagedRefreshProbe({
   assertLockHeldBeforeDispatch,
   codexBin = "codex",
   createClient = (options) => new AppServerClient(options),
@@ -1690,6 +1704,9 @@ export async function refreshManagedAuthRecord({
       },
     );
     before = await readManagedAuthSnapshot(authorityHome, { inspectExtendedAcl });
+    if (runRefresh === runCodexManagedRefresh) {
+      throw refreshContainmentRequiredError();
+    }
     await assertAuthorityHomeCurrent(authority);
     ({ stagingHome, stagingRoot } = await createStagingHome(authority, before.raw, {
       cleanupStagingAttempt,

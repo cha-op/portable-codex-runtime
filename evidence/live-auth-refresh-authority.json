@@ -1,6 +1,7 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "probe": "managed-auth-refresh-authority-live",
+  "processContainment": "host-process-group-probe-only",
   "startedAt": "2026-07-01T03:41:27.988Z",
   "completedAt": "2026-07-01T03:41:34.013Z",
   "codexVersion": "codex-cli 0.142.4",

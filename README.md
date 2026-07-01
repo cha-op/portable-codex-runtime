@@ -13,7 +13,9 @@ snapshots separately from monotonic credential state.
 
 The runtime architecture is under active development. The current implementation
 proves that the installed Codex app-server supports external ChatGPT access-token
-injection and keeps those credentials ephemeral inside the worker.
+injection and proves the managed refresh API choreography with an explicitly
+uncontained host probe. Production managed refresh fails closed until a
+per-refresh rootless containment executor is implemented.
 
 The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
 Codex binary or image digest and rerun these probes before upgrading it.
@@ -32,7 +34,8 @@ separate worker turn with the refreshed access token:
 ```bash
 chmod 700 .test-codex-home
 CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
-  CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
+  CODEX_ALLOW_AUTH_MUTATION=1 \
+  CODEX_ALLOW_UNCONTAINED_AUTH_PROBE=1 npm run probe:auth-refresh:live
 ```
 
 Do not point this command at the default user `~/.codex` home or the active
@@ -65,11 +68,11 @@ The two app-server integration tests run when `CODEX_BIN` (or `codex` on
 `PATH`) is executable. They are reported as skipped on Node-only CI runners;
 the remaining tests still run normally.
 
-The reference app-server runtime currently supports macOS and Linux. Windows
-is rejected before reading managed credentials, creating a worker home, or
-spawning Codex because reliable descendant cleanup requires a Job Object
-backend, which is not implemented; `ChildProcess.kill()` alone is not treated
-as process-tree isolation.
+The reference host app-server runtime currently supports macOS and Linux process
+groups. A process can escape that group by creating a new session, so this is not
+production containment for credential-bearing refresh. Windows is rejected
+before reading managed credentials, creating a worker home, or spawning Codex;
+`ChildProcess.kill()` alone is not treated as process-tree isolation.
 
 Run the offline protocol probe and print a JSON report:
 

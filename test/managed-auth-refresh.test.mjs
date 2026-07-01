@@ -37,6 +37,7 @@ import {
   readManagedAuthSnapshot,
   refreshManagedAuthRecord,
   runCodexManagedRefresh,
+  runUncontainedCodexManagedRefreshProbe,
 } from "../src/managed-auth-refresh.mjs";
 import { AdvisoryLockError, acquireAdvisoryLock } from "../src/advisory-lock.mjs";
 
@@ -510,9 +511,63 @@ test("error metadata and failure reports export only allowlisted cleanup warning
   assert.equal(JSON.stringify(report).includes(warningSecret), false);
 });
 
-test("runCodexManagedRefresh uses only the managed account refresh choreography", async () => {
+test("production managed refresh requires containment before staging or client creation", async () => {
+  let clientCreationCalls = 0;
+  let dispatchCalls = 0;
+  await assert.rejects(
+    runCodexManagedRefresh({
+      codexBin: "/pinned/codex",
+      createClient: () => {
+        clientCreationCalls += 1;
+        return {
+          request: async () => {
+            dispatchCalls += 1;
+          },
+        };
+      },
+      stagingHome: "/isolated/staging-home",
+    }),
+    (error) => {
+      assert(error instanceof ManagedAuthRefreshError);
+      assert.equal(error.code, "refresh_containment_required");
+      assert.equal(error.retryable, false);
+      assert.equal(error.recoveryPath, undefined);
+      assert.equal(error.message.includes("/isolated/staging-home"), false);
+      return true;
+    },
+  );
+  assert.equal(clientCreationCalls, 0);
+  assert.equal(dispatchCalls, 0);
+
+  const { authHome, root } = await createAuthorityHome();
+  let stagingWriteCalls = 0;
+  try {
+    const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        writeStagingFile: async () => {
+          stagingWriteCalls += 1;
+        },
+      }),
+      (error) =>
+        error instanceof ManagedAuthRefreshError &&
+        error.code === "refresh_containment_required" &&
+        error.retryable === false &&
+        error.recoveryPath === undefined,
+    );
+    assert.equal(stagingWriteCalls, 0);
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runUncontainedCodexManagedRefreshProbe uses only the managed account refresh choreography", async () => {
   const calls = [];
-  const result = await runCodexManagedRefresh({
+  const result = await runUncontainedCodexManagedRefreshProbe({
     assertLockHeldBeforeDispatch: async () => calls.push(["assert-lock-before-dispatch"]),
     codexBin: "/pinned/codex",
     stagingHome: "/isolated/staging-home",
@@ -574,7 +629,7 @@ test("managed refresh rechecks lock ownership after initialize and before accoun
         }),
         codexBin: "/pinned/codex",
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: () => ({
               initialize: async () => {
@@ -604,10 +659,10 @@ test("managed refresh rechecks lock ownership after initialize and before accoun
   }
 });
 
-test("runCodexManagedRefresh always stops the app-server after request failure", async () => {
+test("runUncontainedCodexManagedRefreshProbe always stops the app-server after request failure", async () => {
   let stopped = 0;
   await assert.rejects(
-    runCodexManagedRefresh({
+    runUncontainedCodexManagedRefreshProbe({
       codexBin: "/pinned/codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => ({
@@ -638,7 +693,7 @@ test("managed refresh errors do not serialize JSON-RPC credential payloads", asy
   });
 
   await assert.rejects(
-    runCodexManagedRefresh({
+    runUncontainedCodexManagedRefreshProbe({
       codexBin: "/pinned/codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => ({
@@ -668,7 +723,7 @@ test("managed refresh errors do not serialize JSON-RPC credential payloads", asy
 
 test("app-server stop failure cannot mask an uncertain refresh outcome", async () => {
   await assert.rejects(
-    runCodexManagedRefresh({
+    runUncontainedCodexManagedRefreshProbe({
       codexBin: "/pinned/codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => ({
@@ -709,7 +764,7 @@ test("successful account refresh with unconfirmed shutdown retains an unsynced g
           return true;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: ({ codexHome }) => ({
               initialize: async () => ({}),
@@ -788,7 +843,7 @@ test("frozen post-dispatch errors are wrapped before stop-failure metadata is ad
           return true;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: () => ({
               initialize: async () => ({}),
@@ -898,7 +953,7 @@ test("startup failure plus stop failure becomes sanitized non-retryable uncertai
     const stopSecret = `${phase}-stop-credential-secret`;
     let refreshError;
     try {
-      await runCodexManagedRefresh({
+      await runUncontainedCodexManagedRefreshProbe({
         codexBin: "/pinned/codex",
         stagingHome: `/isolated/${phase}-staging-home`,
         createClient: () => ({
@@ -936,7 +991,7 @@ test("initialize plus stop failure retains staging and blocks the next rotation"
   const stopSecret = "stop-login-secret";
   try {
     const runRefresh = (options) =>
-      runCodexManagedRefresh({
+      runUncontainedCodexManagedRefreshProbe({
         ...options,
         createClient: () => ({
           start: async () => {},
@@ -989,7 +1044,7 @@ test("post-dispatch RPC failure preserves an unchanged staging sentinel", async 
   const { authHome, root } = await createAuthorityHome();
   try {
     const runRefresh = (options) =>
-      runCodexManagedRefresh({
+      runUncontainedCodexManagedRefreshProbe({
         ...options,
         createClient: () => ({
           initialize: async () => ({}),
@@ -1035,7 +1090,7 @@ test("post-dispatch RPC failure preserves an unchanged staging sentinel", async 
   }
 });
 
-test("runCodexManagedRefresh aborts an in-flight request and stops the app-server", async () => {
+test("runUncontainedCodexManagedRefreshProbe aborts an in-flight request and stops the app-server", async () => {
   const controller = new AbortController();
   let requestStarted;
   const started = new Promise((resolve) => {
@@ -1048,7 +1103,7 @@ test("runCodexManagedRefresh aborts an in-flight request and stops the app-serve
   let aborted = 0;
   let stopped = 0;
   let settled = false;
-  const refresh = runCodexManagedRefresh({
+  const refresh = runUncontainedCodexManagedRefreshProbe({
     codexBin: "/pinned/codex",
     signal: controller.signal,
     stagingHome: "/isolated/staging-home",
@@ -1085,7 +1140,7 @@ test("runCodexManagedRefresh aborts an in-flight request and stops the app-serve
 test("managed refresh rejects PATH-resolved Codex binaries before startup", async () => {
   let clientCreated = false;
   await assert.rejects(
-    runCodexManagedRefresh({
+    runUncontainedCodexManagedRefreshProbe({
       codexBin: "codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => {
@@ -1108,7 +1163,7 @@ test("client construction failures are confirmed pre-dispatch and leave no recov
         authHome,
         codexBin: "/pinned/codex",
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             assertLockHeldBeforeDispatch: async () => {
               dispatchGuardCalled = true;
@@ -1139,7 +1194,7 @@ test("client construction failures are confirmed pre-dispatch and leave no recov
 test("primitive client construction failures are wrapped without serialization leakage", async () => {
   const thrownValue = "primitive-client-construction-sensitive";
   await assert.rejects(
-    runCodexManagedRefresh({
+    runUncontainedCodexManagedRefreshProbe({
       codexBin: "/pinned/codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => {
@@ -1559,7 +1614,7 @@ test("pre-dispatch refresh failure is not replaced by post-refresh durability fa
           return syncCount < 3;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: () => ({
               start: async () => {
@@ -1578,6 +1633,7 @@ test("pre-dispatch refresh failure is not replaced by post-refresh durability fa
       refreshManagedAuthRecord({
         authHome,
         codexBin: "codex",
+        runRefresh: runUncontainedCodexManagedRefreshProbe,
         syncStagingDirectory: async () => {
           syncCount += 1;
           return syncCount < 3;
@@ -1609,7 +1665,7 @@ test("changed pre-dispatch staging is synchronized before a recovery sentinel is
           return true;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: ({ codexHome }) => ({
               start: async () => {},
@@ -1657,7 +1713,7 @@ test("changed pre-dispatch staging sync failures retain the original cause", asy
           return true;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: ({ codexHome }) => ({
               start: async () => {
@@ -1710,7 +1766,7 @@ test("authority replacement wins during changed pre-dispatch staging sync", asyn
           return true;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: ({ codexHome }) => ({
               start: async () => {
@@ -1752,7 +1808,7 @@ test("unparseable pre-dispatch staging is synchronized and retained for recovery
           return true;
         },
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: ({ codexHome }) => ({
               start: async () => {
@@ -1794,7 +1850,7 @@ test("authority replacement takes precedence over a marked pre-dispatch failure"
         authHome,
         codexBin: "/pinned/codex",
         runRefresh: (options) =>
-          runCodexManagedRefresh({
+          runUncontainedCodexManagedRefreshProbe({
             ...options,
             createClient: () => ({
               start: async () => {
@@ -1949,7 +2005,7 @@ test("lock loss retains abort and shutdown failures as sanitized cleanup evidenc
         return true;
       },
       runRefresh: (options) =>
-        runCodexManagedRefresh({
+        runUncontainedCodexManagedRefreshProbe({
           ...options,
           createClient: () => ({
             abort: async () => {
@@ -2047,7 +2103,7 @@ test("lock loss preserves stop failure metadata when abort rejects with the lock
         return true;
       },
       runRefresh: (options) =>
-        runCodexManagedRefresh({
+        runUncontainedCodexManagedRefreshProbe({
           ...options,
           createClient: () => ({
             abort: async () => {},
@@ -2888,6 +2944,7 @@ test("staging auth write revalidates authority after opening a replacement path"
           }
           return open(path, flags, mode);
         },
+        runRefresh: async () => assert.fail("refresh must not run after staging setup fails"),
       });
     } catch (error) {
       refreshError = error;
@@ -3165,6 +3222,7 @@ test("staging setup failure removes a staging root created by this attempt", asy
     await assert.rejects(
       refreshManagedAuthRecord({
         authHome,
+        runRefresh: async () => assert.fail("refresh must not run after staging setup fails"),
         writeStagingFile: async () => {
           throw new Error("synthetic staging write failure");
         },
@@ -3189,6 +3247,7 @@ test("staging setup cleanup never follows paths through a replaced authority hom
     try {
       await refreshManagedAuthRecord({
         authHome,
+        runRefresh: async () => assert.fail("refresh must not run after staging setup fails"),
         writeStagingFile: async (path, contents, options) => {
           writeCount += 1;
           if (writeCount === 1) {
@@ -3239,6 +3298,7 @@ test("staging setup cleanup failure reports the retained attempt and gates the n
         cleanupStagingAttempt: async () => {
           throw new Error("synthetic attempt cleanup failure");
         },
+        runRefresh: async () => assert.fail("refresh must not run after staging setup fails"),
         writeStagingFile: async (path, contents, options) => {
           writeCount += 1;
           if (writeCount === 2) throw setupError;

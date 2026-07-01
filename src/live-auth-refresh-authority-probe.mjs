@@ -16,6 +16,8 @@ import {
 import {
   ManagedAuthRefreshAuthority,
   readManagedAuthSnapshot,
+  refreshManagedAuthRecord,
+  runUncontainedCodexManagedRefreshProbe,
 } from "./managed-auth-refresh.mjs";
 
 const DEFAULT_AUTH_HOME = ".test-codex-home";
@@ -46,6 +48,7 @@ export function assertAuthorityRefreshTokenChanged(comparisons) {
 
 export async function probeLiveAuthRefreshAuthority({
   allowAuthMutation = process.env.CODEX_ALLOW_AUTH_MUTATION === "1",
+  allowUncontainedAuthProbe = process.env.CODEX_ALLOW_UNCONTAINED_AUTH_PROBE === "1",
   authHome = process.env.CODEX_TEST_HOME ?? DEFAULT_AUTH_HOME,
   codexBin = process.env.CODEX_BIN,
   createAuthority = (options) => new ManagedAuthRefreshAuthority(options),
@@ -54,15 +57,23 @@ export async function probeLiveAuthRefreshAuthority({
   makeTemporaryDirectory = mkdtemp,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
   platform = process.platform,
+  readCodexVersion = codexVersion,
   readSnapshot = readManagedAuthSnapshot,
   runWorkerProbe = probeLiveExternalAuth,
   sourceMirror = process.env.CODEX_SOURCE_MIRROR,
+  writeEvidence = writeEvidenceSafely,
 } = {}) {
   assertSupportedAppServerPlatform(platform);
   assert.equal(
     allowAuthMutation,
     true,
     "live authority refresh mutates the dedicated login; set CODEX_ALLOW_AUTH_MUTATION=1",
+  );
+  assert.equal(
+    allowUncontainedAuthProbe,
+    true,
+    "live authority refresh uses host process-group cleanup only; " +
+      "set CODEX_ALLOW_UNCONTAINED_AUTH_PROBE=1 for the dedicated probe login",
   );
   assert.equal(
     typeof codexBin === "string" && isAbsolute(codexBin),
@@ -72,7 +83,15 @@ export async function probeLiveAuthRefreshAuthority({
 
   const startedAt = new Date().toISOString();
   const before = await readSnapshot(authHome);
-  const authority = createAuthority({ authHome, codexBin });
+  const authority = createAuthority({
+    authHome,
+    codexBin,
+    refreshRecord: (options) =>
+      refreshManagedAuthRecord({
+        ...options,
+        runRefresh: runUncontainedCodexManagedRefreshProbe,
+      }),
+  });
   const concurrentCallers = 2;
   const [first, second] = await Promise.all([authority.refresh(), authority.refresh()]);
   assert.equal(authority.refreshExecutions, 1, "concurrent callers were not coalesced");
@@ -118,11 +137,12 @@ export async function probeLiveAuthRefreshAuthority({
   }
 
   const report = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     probe: "managed-auth-refresh-authority-live",
+    processContainment: "host-process-group-probe-only",
     startedAt,
     completedAt: new Date().toISOString(),
-    codexVersion: codexVersion(codexBin),
+    codexVersion: readCodexVersion(codexBin),
     sourceMirrorCommit: codexSourceCommit(sourceMirror),
     refreshMethod: "account/read",
     authority: {
@@ -157,6 +177,6 @@ export async function probeLiveAuthRefreshAuthority({
   };
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertAuthorityEvidenceSafe(serialized, first.redactionValues);
-  await writeEvidenceSafely(evidencePath, serialized, before.authPath);
+  await writeEvidence(evidencePath, serialized, before.authPath);
   return { ...report, evidenceWritten: true };
 }

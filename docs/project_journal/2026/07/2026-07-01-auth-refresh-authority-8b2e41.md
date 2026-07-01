@@ -37,11 +37,12 @@ superseded_by:
 
 - Characterize interrupted and killed turn recovery in the next serial pull
   request.
-- Use this experiment as the refresh adapter evidence for the Auth Broker MVP.
+- Use this experiment as API-choreography evidence only; production Auth Broker
+  work still requires the deferred rootless containment executor.
 
 ## Evidence
 
 - `docs/experiments/auth-refresh-authority.md`
 - `evidence/live-auth-refresh-authority.json`
 - `npm test`
-- `CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live`
+- `CODEX_ALLOW_AUTH_MUTATION=1 CODEX_ALLOW_UNCONTAINED_AUTH_PROBE=1 npm run probe:auth-refresh:live`
