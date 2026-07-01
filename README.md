@@ -38,17 +38,22 @@ The probe verifies the explicit thread ID through both `thread/resume` and
 `thread/read`. Explicit interruption persists a model-visible abort marker.
 Signal and hard-kill recovery instead normalizes the stale in-progress turn to
 `interrupted` without inventing that marker. The stopped-tree copy preserves
-snapshot-user-accessible regular files, directories, POSIX rwx permission bits,
-and portable UTF-8 symlinks without following links. Inaccessible entries,
+snapshot-user-accessible regular files and directories with their POSIX rwx
+permission bits, plus portable UTF-8 symlink targets without following links.
+Symlink permission bits are outside the modeled digest. Inaccessible entries,
 non-ASCII cased names, case-insensitive or Unicode-normalized name collisions,
 dangling relative links, relative-link
 case or normalization aliases, traversal through non-directories,
-non-relocatable links, special permission bits,
+resolution chains that cross protected trees, non-relocatable links, special
+permission bits,
 hard links (including hard-linked symlinks), sockets, FIFOs, and devices fail
 closed. Ownership, ACLs,
 extended attributes,
 timestamps, and other unmodeled metadata are not preserved or covered by the
-digest. It is not an online, atomic, or power-loss-durable snapshot implementation.
+digest. If validation or copy fails after destination creation, the partial
+destination is retained for cleanup by the trusted owner; the helper never
+recursively removes a failure path that another writer could have replaced.
+It is not an online, atomic, or power-loss-durable snapshot implementation.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
 pinned runtime image:

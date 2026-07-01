@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "probe": "interrupted-turn-recovery",
   "runtime": {
     "codexVersion": "codex-cli 0.142.4",
@@ -18,8 +18,8 @@
   "snapshot": {
     "kind": "stopped-tree-copy",
     "sourceQuiesced": true,
-    "treeDigestMatched": true,
-    "workspaceDigestMatched": true,
+    "modeledTreeDigestMatched": true,
+    "workspaceModeledDigestMatched": true,
     "appServerWorkspaceMatched": true,
     "historicalWorkspaceRetained": true
   },

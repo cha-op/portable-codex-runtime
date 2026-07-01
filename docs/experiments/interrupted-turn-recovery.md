@@ -41,9 +41,9 @@ normalization.
 
 The snapshot scenario copies every snapshot-user-accessible entry in the
 synthetic session tree, including `CODEX_HOME` and workspace, after the killed
-process has exited. It hashes
-relative paths, entry types, POSIX rwx permission bits, file bytes, and symlink
-targets before and after copy. Portable UTF-8 entry names without non-ASCII
+process has exited. It hashes relative paths, entry types, regular-file and
+directory POSIX rwx permission bits, file bytes, and symlink targets before and
+after copy. Portable UTF-8 entry names without non-ASCII
 cased characters in either their raw or NFC-normalized form, or collisions
 under NFC normalization plus ASCII lowercase comparison, existing relocatable
 relative symlinks, and external absolute links are copied without following
@@ -51,8 +51,9 @@ symlink targets. Unsupported cased names, name collisions, non-UTF-8 entry
 names, inaccessible entries, absolute links back into the source tree,
 dangling relative links, relative-link case or normalization aliases, relative
 link traversal through non-directories, resolution chains that leave the source
-tree, relative links whose meaning changes after relocation, special permission
-bits, hard-linked files or symlinks, sockets, FIFOs, and devices fail closed.
+tree, absolute resolution chains that enter the source or destination tree,
+relative links whose meaning changes after relocation, special permission bits,
+hard-linked files or symlinks, sockets, FIFOs, and devices fail closed.
 The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
 the restored workspace path explicitly. Its runtime `cwd` response and the
@@ -80,11 +81,13 @@ claim that the installed binary was built from that exact commit. The redacted
 machine-readable result is stored in
 `evidence/interrupted-turn-recovery.json`. It contains no thread or turn IDs,
 paths, prompts, model output, credentials, account identifiers, or hostnames.
-Schema version 4 records the private binary execution mode, the Node launcher
+Schema version 5 records the private binary execution mode, the Node launcher
 architecture (not an inferred Codex binary architecture), the exact
 `copy-original-path-absent-held-tree-000` cold-read isolation mode, and the
 distinction between configured inputs and OS-enforced isolation; older evidence
 is rejected.
+Snapshot fields use `modeledTreeDigestMatched` terminology because the digest
+intentionally excludes metadata listed under limitations.
 
 Run the compatibility probe with no credential input and a loopback model
 provider:
@@ -193,12 +196,19 @@ restore interfaces.
   case-insensitive or Unicode-normalized name collisions, non-UTF-8 names or
   targets, dangling absolute or relative targets, internal absolute targets,
   relative-link case or normalization aliases, traversal through
-  non-directories, resolution chains that leave the source tree, and
+  non-directories, relative resolution chains that leave the source tree,
+  absolute resolution chains that enter the source or destination tree, and
   non-relocatable relative targets fail closed. A fixed
   runtime image must provide every external target, such as a Codex helper path,
   at a compatible location during copy and after migration.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,
-  timestamps, special permission bits, or hard-link topology. Special bits and
-  hard links, including hard-linked symlinks, fail closed; the other metadata
-  remains outside this probe and must be preserved by the later volume-snapshot
-  implementation.
+  timestamps, symlink permission bits, special permission bits, or hard-link
+  topology. Special bits and hard links, including hard-linked symlinks, fail
+  closed; the other metadata remains outside this modeled digest and must be
+  preserved by the later volume-snapshot implementation.
+- If validation or copy fails after the destination directory is created, the
+  partial destination is retained. Pathname-based recursive cleanup cannot
+  atomically prove that a racing writer has not replaced that directory, so the
+  helper leaves cleanup to a trusted owner that can tear down the enclosing
+  owned root. The production volume-snapshot implementation must provide its
+  own atomic discard operation.

@@ -9,13 +9,14 @@ import {
   readlink,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -58,13 +59,21 @@ function scenarioReport(kind) {
             kind: "stopped-tree-copy",
             appServerWorkspaceMatched: true,
             historicalWorkspaceRetained: true,
+            modeledTreeDigestMatched: true,
             sourceQuiesced: true,
-            treeDigestMatched: true,
-            workspaceDigestMatched: true,
+            workspaceModeledDigestMatched: true,
           },
         }
       : {}),
   };
+}
+
+async function assertRetainedFailedDestination(destination) {
+  assert.equal(
+    (await lstat(destination)).isDirectory(),
+    true,
+    "a failed copy must retain its partial destination for trusted-owner cleanup",
+  );
 }
 
 function completeEvidenceReport() {
@@ -73,7 +82,7 @@ function completeEvidenceReport() {
     return scenario;
   });
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     probe: "interrupted-turn-recovery",
     runtime: {
       codexVersion: "codex-cli 0.142.4",
@@ -398,7 +407,7 @@ test("stopped-tree copy rejects non-UTF-8 symlink targets", async () => {
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /rejects non-UTF-8 symlink targets/,
     );
-    await assert.rejects(lstat(destination), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -451,7 +460,7 @@ test(
         copyStoppedTree({ ownedRoot: root, source, destination }),
         /rejects non-UTF-8 directory entry names/,
       );
-      await assert.rejects(lstat(destination), /ENOENT/);
+      await assertRetainedFailedDestination(destination);
       await removeTreeForCleanup(source);
       await assert.rejects(lstat(source), /ENOENT/);
     } finally {
@@ -472,7 +481,7 @@ test("stopped-tree copy rejects absolute symlinks into the relocated source tree
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /rejects absolute symlinks into the source tree/,
     );
-    await assert.rejects(lstat(destination), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -496,6 +505,29 @@ test("stopped-tree copy rejects canonical aliases of absolute internal symlinks"
   }
 });
 
+test("stopped-tree copy rejects absolute symlink chains that enter and leave the source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-absolute-chain-test-"));
+  try {
+    const source = join(root, "source");
+    const external = join(root, "external");
+    const outsideTarget = join(root, "outside-target");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await mkdir(external);
+    await writeFile(outsideTarget, "sentinel");
+    await symlink(outsideTarget, join(source, "hop"));
+    await symlink(join(source, "hop"), join(external, "bridge"));
+    await symlink(join(external, "bridge"), join(source, "alias"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects absolute symlinks into the source tree/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects dangling absolute symlinks through source aliases", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-dangling-link-test-"));
   try {
@@ -509,7 +541,7 @@ test("stopped-tree copy rejects dangling absolute symlinks through source aliase
     );
     await assert.rejects(
       copyStoppedTree({ ownedRoot: root, source, destination }),
-      /rejects dangling absolute symlinks/,
+      /rejects absolute symlinks into the source tree/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -566,7 +598,7 @@ test("stopped-tree copy rejects relative symlink chains that leave and reenter t
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /relative symlinks outside the source tree/,
     );
-    await assert.rejects(lstat(destination), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -587,7 +619,8 @@ test("stopped-tree copy preserves non-directory path component semantics", async
         copyStoppedTree({ ownedRoot: root, source, destination }),
         /relative symlinks through non-directories/,
       );
-      await assert.rejects(lstat(destination), /ENOENT/);
+      await assertRetainedFailedDestination(destination);
+      await removeTreeForCleanup(destination);
       await rm(linkPath);
     }
   } finally {
@@ -607,7 +640,7 @@ test("stopped-tree copy rejects relative symlink case aliases", async () => {
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /relative symlink case or normalization aliases/,
     );
-    await assert.rejects(lstat(destination), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -625,7 +658,7 @@ test("stopped-tree copy rejects relative symlink normalization aliases", async (
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /relative symlink case or normalization aliases/,
     );
-    await assert.rejects(lstat(destination), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -642,7 +675,7 @@ test("stopped-tree copy rejects dangling relative symlinks", async () => {
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /rejects dangling relative symlinks/,
     );
-    await assert.rejects(lstat(destination), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -708,7 +741,7 @@ test("portable tree operations reject entries inaccessible to the snapshot user"
       }),
       /entries inaccessible to the snapshot user/,
     );
-    await assert.rejects(lstat(join(root, "destination")), /ENOENT/);
+    await assertRetainedFailedDestination(join(root, "destination"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -740,6 +773,133 @@ test("stopped-tree copy never removes a destination created by a racing writer",
   }
 });
 
+test("stopped-tree copy preserves a replacement after destination-root identity changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-destination-identity-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const displaced = join(root, "displaced-destination");
+    const sentinel = join(destination, "replacement-writer");
+    await mkdir(source);
+    await writeFile(join(source, "source-file"), "source");
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        afterDestinationRootCreated: async () => {
+          await rename(destination, displaced);
+          await mkdir(destination);
+          await writeFile(sentinel, "preserve");
+        },
+      }),
+      /destination root identity changes/,
+    );
+    assert.equal(await readFile(sentinel, "utf8"), "preserve");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects source symlinks replaced after target validation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-source-symlink-race-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const sourceLink = join(source, "victim");
+    const displaced = join(root, "displaced-source-link");
+    let replaced = false;
+    await mkdir(source);
+    await writeFile(join(source, "target"), "source");
+    await symlink("target", sourceLink);
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        afterSourceSymlinkValidated: async (path) => {
+          if (replaced || basename(path) !== "victim") return;
+          replaced = true;
+          await rename(sourceLink, displaced);
+          await symlink("target", sourceLink);
+        },
+      }),
+      /source symlink identity changes/,
+    );
+    assert.equal((await lstat(sourceLink)).isSymbolicLink(), true);
+    assert.equal(await readlink(sourceLink), "target");
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects source files replaced by symlinks before open", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-source-race-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const sourceFile = join(source, "victim");
+    const displaced = join(root, "displaced-source-file");
+    const outside = join(root, "outside");
+    let replaced = false;
+    await mkdir(source);
+    await writeFile(sourceFile, "source");
+    await writeFile(outside, "outside");
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        beforeSourceOpen: async (path) => {
+          if (replaced || basename(path) !== "victim") return;
+          replaced = true;
+          await rename(sourceFile, displaced);
+          await symlink(outside, sourceFile);
+        },
+      }),
+      /ELOOP|source file identity changes/,
+    );
+    assert.equal((await lstat(sourceFile)).isSymbolicLink(), true);
+    assert.equal(await readFile(outside, "utf8"), "outside");
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects source directories replaced after open", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-source-directory-race-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const displaced = join(root, "displaced-source");
+    const outside = join(root, "outside-directory");
+    let replaced = false;
+    await mkdir(source);
+    await writeFile(join(source, "source-file"), "source");
+    await mkdir(outside);
+    await writeFile(join(outside, "outside-file"), "outside");
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        afterSourceDirectoryOpen: async (path) => {
+          if (replaced || basename(path) !== "source") return;
+          replaced = true;
+          await rename(source, displaced);
+          await symlink(outside, source);
+        },
+      }),
+      /source directory identity changes/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "portable tree operations reject hard-linked symlinks",
   { skip: platform() !== "linux" },
@@ -757,7 +917,7 @@ test(
         copyStoppedTree({ ownedRoot: root, source, destination }),
         /rejects hard-linked symlinks/,
       );
-      await assert.rejects(lstat(destination), /ENOENT/);
+      await assertRetainedFailedDestination(destination);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -771,7 +931,7 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
     assert.throws(
       () => assertRecoveryEvidenceSafe({ ...report, schemaVersion: 1 }),
-      /1 !== 4/,
+      /1 !== 5/,
     );
     for (const unsafe of [
       { ...report, cwd: "/Users/example/private" },
@@ -798,6 +958,14 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
         /disallowed runtime data|did not match/,
       );
     }
+    assert.throws(
+      () =>
+        assertRecoveryEvidenceSafe({
+          ...report,
+          runtime: { ...report.runtime, launcherArch: "build-host-01" },
+        }),
+      /launcherArch is not a recognized Node architecture/,
+    );
     const escapedSecret = JSON.stringify(report).replace(
       "codex-cli 0.142.4",
       "codex-cli 0.142.4-s\\u006b-secret-sentinel",
@@ -825,11 +993,11 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     const serialized = JSON.stringify(report);
     for (const duplicate of [
-      serialized.replace('"schemaVersion":4', '"schemaVersion":1,"schemaVersion":4'),
+      serialized.replace('"schemaVersion":5', '"schemaVersion":1,"schemaVersion":5'),
       serialized.replace('"result":"passed"', '"result":"failed","result":"passed"'),
       serialized.replace(
-        '"schemaVersion":4',
-        '"\\u0073chemaVersion":1,"schemaVersion":4',
+        '"schemaVersion":5',
+        '"\\u0073chemaVersion":1,"schemaVersion":5',
       ),
     ]) {
       assert.throws(
@@ -980,7 +1148,7 @@ test("probe report contains all four recovery scenarios without runtime identifi
     },
   });
   assert.deepEqual(calls, RECOVERY_SCENARIOS);
-  assert.equal(report.schemaVersion, 4);
+  assert.equal(report.schemaVersion, 5);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert(scenarioBinaries.every((binary) => binary === versionBinary));
   assert.notEqual(versionBinary, process.execPath);
