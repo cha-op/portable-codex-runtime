@@ -593,6 +593,140 @@ test("staging durability is established before token-mutating refresh begins", a
       "write-file",
       "sync-directory",
     ]);
+    assert.deepEqual(events.slice(runIndex + 1).map(([event]) => event), ["sync-directory"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-refresh staging sync failure preserves a non-retryable recovery sentinel", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          return syncCount < 3;
+        },
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "staging_recovery_not_durable");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "staging_sync_failed");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority replacement during post-refresh sync takes precedence over recovery path", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-during-staging-sync");
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          if (syncCount === 3) {
+            await rename(authHome, displaced);
+            await mkdir(authHome, { mode: 0o700 });
+            return false;
+          }
+          return true;
+        },
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pre-dispatch refresh failure is not replaced by post-refresh durability failure", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let syncCount = 0;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          return syncCount < 3;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: () => ({
+              start: async () => {
+                throw new Error("synthetic pre-dispatch startup failure");
+              },
+              stop: async () => {},
+            }),
+          }),
+      }),
+      /synthetic pre-dispatch startup failure/,
+    );
+    assert.equal(syncCount, 2);
+    assert.equal(
+      (await readdir(authHome)).some((name) => name === ".portable-auth-refresh-staging"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority replacement takes precedence over a marked pre-dispatch failure", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-during-startup");
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: () => ({
+              start: async () => {
+                await rename(authHome, displaced);
+                await mkdir(authHome, { mode: 0o700 });
+                throw new Error("synthetic pre-dispatch startup failure");
+              },
+              stop: async () => {},
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(refreshError.recoveryPath, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -72,8 +72,10 @@ the canonical authority file directly:
    the isolated app-server process group on every shutdown path. Because a
    remote OAuth rotation may already have committed, lock loss or any failure
    after `account/read` dispatch is non-retryable: retain the durable staging
-   attempt as a recovery sentinel so the next authority run cannot reuse the
-   old refresh token. Run only `initialize`, `initialized`, and
+   attempt as a recovery sentinel. After app-server exit, fsync the rewritten
+   staged credential and its directory before any validator or error path can
+   rely on it, so the next authority run cannot reuse the old refresh token.
+   Run only `initialize`, `initialized`, and
    `account/read(refreshToken=true)` against the staging home.
 6. Verify workspace and user continuity, advanced `last_refresh`, a changed
    access token with at least two minutes of remaining validity, file

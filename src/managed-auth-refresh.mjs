@@ -27,6 +27,23 @@ const EXPECTED_RPC_AUDIT = [
   { kind: "request", method: "account/read" },
 ];
 const STAGING_CLEANUP_RETRY_DELAYS_MS = [50, 100, 250, 500, 1_000];
+const PRE_DISPATCH_REFRESH_ERRORS = new WeakSet();
+
+function isObjectLike(value) {
+  return value !== null && ["object", "function"].includes(typeof value);
+}
+
+function markPreDispatchRefreshError(error) {
+  if (isObjectLike(error)) PRE_DISPATCH_REFRESH_ERRORS.add(error);
+}
+
+function isKnownPreDispatchRefreshError(error) {
+  return (
+    error?.code === "lock_lost_before_refresh" ||
+    error?.code === "unsafe_codex_binary" ||
+    (isObjectLike(error) && PRE_DISPATCH_REFRESH_ERRORS.has(error))
+  );
+}
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -325,6 +342,41 @@ async function syncDirectoryPath(path) {
   } catch (error) {
     if (["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(error?.code)) return false;
     throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
+  let handle;
+  try {
+    handle = await open(
+      join(stagingHome, "auth.json"),
+      constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const fileStat = await handle.stat();
+    ensure(
+      fileStat.isFile() && fileStat.nlink === 1,
+      "staging_recovery_not_durable",
+      "refreshed staging auth must remain a regular single-link file",
+      { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
+    );
+    await handle.sync();
+    ensure(
+      await syncStagingDirectory(stagingHome),
+      "staging_recovery_not_durable",
+      "refreshed staging auth directory could not be synchronized",
+      { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
+    );
+  } catch (error) {
+    if (error instanceof ManagedAuthRefreshError) throw error;
+    const durabilityError = new ManagedAuthRefreshError(
+      "staging_recovery_not_durable",
+      "refreshed staging auth could not be synchronized",
+      { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
+    );
+    durabilityError.cause = error;
+    throw durabilityError;
   } finally {
     await handle?.close().catch(() => {});
   }
@@ -728,6 +780,7 @@ export async function runCodexManagedRefresh({
       rpcAudit: client.rpcMethodAudit(),
     };
   } catch (error) {
+    if (!refreshRequestDispatched) markPreDispatchRefreshError(error);
     operationError = error;
     throw error;
   } finally {
@@ -867,11 +920,33 @@ export async function refreshManagedAuthRecord({
       writeStagingFile,
     }));
     await assertAuthorityHomeCurrent(authority);
-    const refreshResult = await runRefreshWhileLockHeld(
-      lock,
-      (signal) => runRefresh({ codexBin, signal, stagingHome }),
-      stagingHome,
-    );
+    let refreshResult;
+    let refreshError;
+    try {
+      refreshResult = await runRefreshWhileLockHeld(
+        lock,
+        (signal) => runRefresh({ codexBin, signal, stagingHome }),
+        stagingHome,
+      );
+    } catch (error) {
+      refreshError = error;
+    }
+    // Resolve the authority identity before following the staging pathname.
+    // If the authority was replaced during refresh, that replacement is the
+    // decisive failure and the displaced volume must be recovered directly.
+    await assertAuthorityHomeCurrent(authority);
+    if (refreshError && isKnownPreDispatchRefreshError(refreshError)) throw refreshError;
+    try {
+      await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory);
+    } catch (error) {
+      // Recheck before exposing stagingHome as a recovery path. A concurrent
+      // authority replacement makes that pathname stale and takes precedence.
+      await assertAuthorityHomeCurrent(authority);
+      if (refreshError && !error.cause) error.cause = refreshError;
+      throw error;
+    }
+    await assertAuthorityHomeCurrent(authority);
+    if (refreshError) throw refreshError;
     // Once account/read returns, every subsequent failure is conservatively
     // treated as post-dispatch. The OAuth service may have consumed the old
     // refresh token even when local staged bytes still match the source.
@@ -1003,6 +1078,7 @@ export async function refreshManagedAuthRecord({
     });
   } catch (error) {
     if (error?.code === "refresh_outcome_uncertain") preserveStaging = true;
+    if (error?.code === "staging_recovery_not_durable") preserveStaging = true;
     if (
       stagingHome &&
       error instanceof AdvisoryLockError &&
