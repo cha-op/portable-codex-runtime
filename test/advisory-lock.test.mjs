@@ -36,6 +36,12 @@ const STUBBORN_HOLDER_FIXTURE = fileURLToPath(
 const DELAYED_HOLDER_FIXTURE = fileURLToPath(
   new URL("../fixtures/delayed-advisory-lock-holder.mjs", import.meta.url),
 );
+const KILL_LOCKF_PARENT_FIXTURE = fileURLToPath(
+  new URL("../fixtures/kill-lockf-parent-holder.mjs", import.meta.url),
+);
+const REPLACE_LOCK_BEFORE_READY_FIXTURE = fileURLToPath(
+  new URL("../fixtures/replace-advisory-lock-before-ready-holder.mjs", import.meta.url),
+);
 
 test("file identity comparison preserves large inode precision", () => {
   const inode = 2n ** 54n;
@@ -237,8 +243,9 @@ test("OS releases the advisory lock after the owning process is killed", async (
   }
 });
 
-test("advisory lock backends use the inherited secure file descriptor", () => {
-  assert.deepEqual(advisoryLockCommand("darwin"), {
+test("advisory lock backends use independent lock descriptions", () => {
+  const protectedLockPath = "/protected/authority.lock";
+  assert.deepEqual(advisoryLockCommand("darwin", { lockPath: protectedLockPath }), {
     command: "/usr/bin/lockf",
     args: [
       "-k",
@@ -246,12 +253,16 @@ test("advisory lock backends use the inherited secure file descriptor", () => {
       "-t",
       "0",
       "-w",
-      "/dev/fd/3",
+      protectedLockPath,
       process.execPath,
       fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
     ],
     conflictExitCode: 75,
   });
+  assert.throws(
+    () => advisoryLockCommand("darwin"),
+    (error) => error instanceof AdvisoryLockError && error.code === "unsafe_lock_file",
+  );
   assert.deepEqual(advisoryLockCommand("linux"), {
     command: "/usr/bin/flock",
     args: [
@@ -308,14 +319,75 @@ test(
       lostLock = await acquireAdvisoryLock(path, { holderPath: EXIT_AFTER_LOCK_FIXTURE });
       await lostLock.waitForLoss();
 
-      // Do not release lostLock yet. On macOS the exited lockf process owned the
-      // process-associated fcntl lock; on Linux the holder owned the separate
-      // OFD reopened through procfs. In both cases the broker descriptor remains
-      // open only as an inode-identity guard and must not prevent reacquisition.
+      // Do not release lostLock yet. On macOS lockf path mode owns an independent
+      // description; on Linux the holder owns the separate OFD reopened through
+      // procfs. In both cases the broker descriptor remains open only as an
+      // inode-identity guard and must not prevent reacquisition.
       recovered = await acquireAdvisoryLock(path);
       await recovered.assertHeld();
     } finally {
       await lostLock?.release();
+      await recovered?.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "macOS lockf executor SIGKILL releases the path-mode lock while the broker guard stays open",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-advisory-lockf-sigkill-"));
+    const path = join(root, "authority.lock");
+    let lostLock;
+    let recovered;
+    try {
+      lostLock = await acquireAdvisoryLock(path, {
+        holderPath: KILL_LOCKF_PARENT_FIXTURE,
+      });
+      await within(lostLock.waitForLoss(), 2_000);
+
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        try {
+          recovered = await acquireAdvisoryLock(path);
+          break;
+        } catch (error) {
+          if (!(error instanceof AdvisoryLockError) || error.code !== "lock_unavailable") {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      assert(recovered, "path-mode lock survived after the lockf executor was killed");
+      await recovered.assertHeld();
+    } finally {
+      await lostLock?.release().catch(() => {});
+      await recovered?.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "acquire rejects a lock pathname replacement before returning the lock",
+  { skip: !["darwin", "linux"].includes(process.platform) },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-advisory-acquire-replaced-"));
+    const path = join(root, "authority.lock");
+    const displaced = join(root, "displaced.lock");
+    let recovered;
+    try {
+      await assert.rejects(
+        acquireAdvisoryLock(path, {
+          holderArgs: [path, displaced],
+          holderPath: REPLACE_LOCK_BEFORE_READY_FIXTURE,
+        }),
+        (error) => error instanceof AdvisoryLockError && error.code === "lock_replaced",
+      );
+
+      recovered = await acquireAdvisoryLock(path);
+      await recovered.assertHeld();
+    } finally {
       await recovered?.release();
       await rm(root, { recursive: true, force: true });
     }

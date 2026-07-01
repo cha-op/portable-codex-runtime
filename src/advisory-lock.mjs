@@ -8,21 +8,28 @@ const HOLDER_PATH = fileURLToPath(new URL("./advisory-lock-holder.mjs", import.m
 
 export function advisoryLockCommand(
   platform = process.platform,
-  { holderArgs = [], holderPath = HOLDER_PATH } = {},
+  { holderArgs = [], holderPath = HOLDER_PATH, lockPath } = {},
 ) {
   if (platform === "darwin") {
+    if (typeof lockPath !== "string" || lockPath.length === 0) {
+      throw new AdvisoryLockError(
+        "unsafe_lock_file",
+        "macOS advisory locks require a protected lock path",
+      );
+    }
     return {
       command: "/usr/bin/lockf",
-      // macOS lockf owns a process-associated fcntl lock. The broker keeps
-      // descriptor 3 open only as an inode-identity guard, so holder exit still
-      // releases the lock while that broker descriptor remains open.
+      // macOS lockf's fdlock mode would flock the broker-shared descriptor 3,
+      // allowing an executor SIGKILL to strand the lock on the broker's open
+      // file description. Path mode opens and locks an independent description;
+      // the broker descriptor remains only an inode-identity guard.
       args: [
         "-k",
         "-s",
         "-t",
         "0",
         "-w",
-        "/dev/fd/3",
+        lockPath,
         process.execPath,
         holderPath,
         ...holderArgs,
@@ -191,6 +198,34 @@ export function sameFileIdentity(left, right) {
   );
 }
 
+async function assertLockPathIdentity(lockPath, handle) {
+  let handleStat;
+  let pathHandle;
+  try {
+    handleStat = await handle.stat({ bigint: true });
+    pathHandle = await open(
+      lockPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch {
+    throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
+  }
+  try {
+    const pathStat = await pathHandle.stat({ bigint: true });
+    if (
+      !handleStat.isFile() ||
+      handleStat.nlink !== 1n ||
+      !pathStat.isFile() ||
+      pathStat.nlink !== 1n ||
+      !sameFileIdentity(pathStat, handleStat)
+    ) {
+      throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
+    }
+  } finally {
+    await pathHandle.close().catch(() => {});
+  }
+}
+
 export async function acquireAdvisoryLock(
   lockPath,
   {
@@ -208,6 +243,7 @@ export async function acquireAdvisoryLock(
   const { command, args, conflictExitCode } = advisoryLockCommand(platform, {
     holderArgs,
     holderPath,
+    lockPath,
   });
   if (typeof constants.O_NOFOLLOW !== "number") {
     throw new AdvisoryLockError(
@@ -286,6 +322,10 @@ export async function acquireAdvisoryLock(
       });
       child.stdout.on("data", onAcquireData);
     });
+    // macOS path mode opens the lock independently after the secure broker
+    // pre-open. Revalidate immediately after the holder proves lock acquisition
+    // so any pathname swap fails closed before the lock object is returned.
+    await assertLockPathIdentity(lockPath, handle);
   } catch (error) {
     let cleanupError;
     try {
@@ -425,31 +465,7 @@ export async function acquireAdvisoryLock(
       if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {
         throw new AdvisoryLockError("lock_lost", "authority advisory lock was lost");
       }
-      let handleStat;
-      let pathHandle;
-      try {
-        handleStat = await handle.stat({ bigint: true });
-        pathHandle = await open(
-          lockPath,
-          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-        );
-      } catch {
-        throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
-      }
-      try {
-        const pathStat = await pathHandle.stat({ bigint: true });
-        if (
-          !handleStat.isFile() ||
-          handleStat.nlink !== 1n ||
-          !pathStat.isFile() ||
-          pathStat.nlink !== 1n ||
-          !sameFileIdentity(pathStat, handleStat)
-        ) {
-          throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
-        }
-      } finally {
-        await pathHandle.close().catch(() => {});
-      }
+      await assertLockPathIdentity(lockPath, handle);
     },
     renameWhileHeld(source, destination) {
       if (unavailable || released || child.exitCode !== null || child.signalCode !== null) {

@@ -50,14 +50,16 @@ and flush. It does not provide an atomic rename, directory sync, cross-process
 lock, or generation/CAS primitive. The probe therefore does not let Codex write
 the canonical authority file directly:
 
-1. Open a regular single-link lock file with `O_NOFOLLOW`, pass that exact file
-   descriptor to an OS advisory lock holder, and keep the holder alive through
-   its parent pipe. Linux opens `/proc/self/fd/3` in `flock` command mode so the
-   bare descriptor is not misparsed as a path. Linux also uses `--no-fork` and
-   a dedicated conflict exit code; both platforms isolate the holder in a
-   process group that is synchronously terminated on timeout or release.
-   Process death releases the lock automatically, while inode checks reject
-   lock-path replacement.
+1. Open a regular single-link lock file with `O_NOFOLLOW` and retain that exact
+   descriptor as an inode-identity guard. Linux reopens `/proc/self/fd/3` in
+   `flock` command mode to obtain an independent open-file-description lock.
+   macOS uses `lockf` path mode inside the protected authority directory, then
+   immediately revalidates the locked path against the pre-opened guard; this
+   avoids fdlock mode sharing the broker's description after an executor crash.
+   Linux also uses `--no-fork` and a dedicated conflict exit code. Both
+   platforms isolate the holder in a process group that is synchronously
+   terminated on timeout or release. Process death releases the lock
+   automatically, while inode checks reject lock-path replacement.
 2. Read and validate canonical `auth.json` through one `O_NOFOLLOW` file
    descriptor.
 3. Hold an open authority-directory guard for the transaction and revalidate
