@@ -518,7 +518,7 @@ test("app-server stop failure cannot mask an uncertain refresh outcome", async (
     (error) => {
       assert.equal(error.code, "refresh_outcome_uncertain");
       assert.deepEqual(error.cleanupWarnings, ["app_server_stop_failed"]);
-      assert.match(error.cause.message, /synthetic request failure/);
+      assert.match(error.cause.cause.message, /synthetic request failure/);
       assert.match(error.cleanupError.message, /synthetic stop failure/);
       assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupError"), false);
       return true;
@@ -586,6 +586,140 @@ test("successful account refresh with unconfirmed shutdown retains an unsynced g
       (error) => error.code === "recovery_required",
     );
     assert.equal(secondRefreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("frozen post-dispatch errors are wrapped before stop-failure metadata is added", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const warningSecret = "synthetic-frozen-warning-refresh-token";
+  const stopSecret = "synthetic-frozen-stop-refresh-token";
+  const frozenError = new ManagedAuthRefreshError(
+    "refresh_outcome_uncertain",
+    "frozen adapter request failure",
+    { recoveryReason: "frozen_adapter_failure", retryable: true },
+  );
+  frozenError.cleanupWarnings = ["parent_directory_sync_failed", warningSecret];
+  Object.freeze(frozenError);
+  let released = false;
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async () => ({
+          assertHeld: async () => {},
+          release: async () => {
+            released = true;
+          },
+        }),
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          return true;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: () => ({
+              initialize: async () => ({}),
+              request: async () => ({
+                account: { type: "chatgpt" },
+                requiresOpenaiAuth: false,
+              }),
+              rpcMethodAudit: () => {
+                throw frozenError;
+              },
+              start: async () => {},
+              stop: async () => {
+                throw new Error(`process group survived SIGKILL: ${stopSecret}`);
+              },
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.notEqual(refreshError, frozenError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.recoveryReason, "app_server_shutdown_unknown");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.cause, frozenError);
+    assert.deepEqual(refreshError.cleanupWarnings, [
+      "parent_directory_sync_failed",
+      "app_server_stop_failed",
+    ]);
+    assert.match(refreshError.cleanupError.message, /survived SIGKILL/);
+    assert.equal(released, true);
+    assert.equal(syncCount, 2, "unquiesced frozen failure must not receive a post-refresh sync");
+    assert.equal(JSON.stringify(refreshError).includes(warningSecret), false);
+    assert.equal(JSON.stringify(refreshError).includes(stopSecret), false);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sealed custom adapter errors are normalized before recovery and cleanup metadata", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const warningSecret = "synthetic-sealed-warning-refresh-token";
+  const sealedError = new ManagedAuthRefreshError(
+    "refresh_outcome_uncertain",
+    "sealed custom adapter failure",
+    { recoveryReason: "sealed_adapter_uncertain", retryable: true },
+  );
+  sealedError.cleanupWarnings = ["parent_directory_sync_failed", warningSecret];
+  Object.seal(sealedError);
+  let releaseAttempted = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async () => ({
+          assertHeld: async () => {},
+          release: async () => {
+            releaseAttempted = true;
+            throw new Error("synthetic lock release failure");
+          },
+        }),
+        runRefresh: async () => {
+          throw sealedError;
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.notEqual(refreshError, sealedError);
+    assert.equal(refreshError.code, sealedError.code);
+    assert.equal(refreshError.message, sealedError.message);
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "sealed_adapter_uncertain");
+    assert.equal(refreshError.cause, sealedError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cause"), false);
+    assert.deepEqual(refreshError.cleanupWarnings, [
+      "parent_directory_sync_failed",
+      "lock_release_failed",
+    ]);
+    assert.equal(releaseAttempted, true);
+    assert.equal(JSON.stringify(refreshError).includes(warningSecret), false);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1685,8 +1819,9 @@ test("lock loss retains abort and shutdown failures as sanitized cleanup evidenc
     assert.equal(refreshError.recoveryReason, "lock_lost_during_refresh");
     assert.equal(refreshError.cause, lost);
     assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cause"), false);
-    assert(refreshError.cleanupError instanceof JsonRpcError);
-    assert.equal(refreshError.cleanupError.payload.data.refreshToken, abortSecret);
+    assert(refreshError.cleanupError instanceof ManagedAuthRefreshError);
+    assert(refreshError.cleanupError.cause instanceof JsonRpcError);
+    assert.equal(refreshError.cleanupError.cause.payload.data.refreshToken, abortSecret);
     assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cleanupError"), false);
     assert.match(refreshError.cleanupError.cleanupError.message, /survived SIGKILL/);
     assert.equal(
@@ -1781,11 +1916,18 @@ test("lock loss preserves stop failure metadata when abort rejects with the lock
     assert.equal(refreshError.code, "refresh_outcome_uncertain");
     assert.equal(refreshError.recoveryReason, "lock_lost_during_refresh");
     assert.equal(refreshError.cause, lost);
-    assert.deepEqual(refreshError.cleanupWarnings, ["app_server_stop_failed"]);
-    assert.equal(refreshError.cleanupWarnings.includes("refresh_abort_cleanup_failed"), false);
-    assert.deepEqual(lost.cleanupWarnings, ["app_server_stop_failed"]);
-    assert.match(lost.cleanupError.message, /survived SIGKILL/);
-    assert.equal(Object.prototype.propertyIsEnumerable.call(lost, "cleanupError"), false);
+    assert.deepEqual(refreshError.cleanupWarnings, [
+      "refresh_abort_cleanup_failed",
+      "app_server_stop_failed",
+    ]);
+    assert(refreshError.cleanupError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.cleanupError.cause, lost);
+    assert.deepEqual(refreshError.cleanupError.cleanupWarnings, ["app_server_stop_failed"]);
+    assert.match(refreshError.cleanupError.cleanupError.message, /survived SIGKILL/);
+    assert.equal(
+      Object.prototype.propertyIsEnumerable.call(refreshError.cleanupError, "cleanupError"),
+      false,
+    );
     assert.equal(syncCount, 2, "nested stop failure must suppress post-refresh sync");
     assert.equal(JSON.stringify(refreshError).includes(stopSecret), false);
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);

@@ -33,6 +33,15 @@ const EXPECTED_RPC_AUDIT = [
 const STAGING_CLEANUP_RETRY_DELAYS_MS = [50, 100, 250, 500, 1_000];
 const PRE_DISPATCH_REFRESH_ERRORS = new WeakSet();
 const EXACT_FILE_IDENTITY = Symbol("exactFileIdentity");
+const SAFE_CLEANUP_WARNINGS = new Set([
+  "app_server_stop_failed",
+  "authority_guard_close_failed",
+  "authority_home_replaced",
+  "lock_release_failed",
+  "parent_directory_sync_failed",
+  "refresh_abort_cleanup_failed",
+  "staging_cleanup_failed",
+]);
 
 function isObjectLike(value) {
   return value !== null && ["object", "function"].includes(typeof value);
@@ -67,18 +76,61 @@ function attachCleanupError(error, cleanupError) {
 }
 
 function appendCleanupWarnings(error, warnings) {
-  if (!isObjectLike(error)) return;
-  const safeWarnings = warnings.filter((warning) => typeof warning === "string");
+  if (!isObjectLike(error)) return false;
+  const safeWarnings = warnings.filter((warning) => SAFE_CLEANUP_WARNINGS.has(warning));
   try {
     error.cleanupWarnings = [
       ...new Set([
-        ...(Array.isArray(error.cleanupWarnings) ? error.cleanupWarnings : []),
+        ...(Array.isArray(error.cleanupWarnings)
+          ? error.cleanupWarnings.filter((warning) => SAFE_CLEANUP_WARNINGS.has(warning))
+          : []),
         ...safeWarnings,
       ]),
     ];
+    return true;
   } catch {
     // A frozen primary error still takes precedence over cleanup metadata.
+    return false;
   }
+}
+
+function readErrorProperty(error, property) {
+  try {
+    return error?.[property];
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneManagedAuthRefreshError(error) {
+  const code = readErrorProperty(error, "code");
+  const message = readErrorProperty(error, "message");
+  const recoveryPath = readErrorProperty(error, "recoveryPath");
+  const recoveryPaths = readErrorProperty(error, "recoveryPaths");
+  const recoveryReason = readErrorProperty(error, "recoveryReason");
+  const retryable = readErrorProperty(error, "retryable");
+  const cleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+  const normalized = new ManagedAuthRefreshError(
+    typeof code === "string" ? code : "refresh_outcome_uncertain",
+    typeof message === "string" ? message : "managed auth refresh failed",
+    {
+      recoveryPath: typeof recoveryPath === "string" ? recoveryPath : undefined,
+      recoveryPaths: Array.isArray(recoveryPaths)
+        ? recoveryPaths.filter((path) => typeof path === "string")
+        : [],
+      recoveryReason: typeof recoveryReason === "string" ? recoveryReason : undefined,
+      retryable: typeof retryable === "boolean" ? retryable : false,
+    },
+  );
+  appendCleanupWarnings(normalized, Array.isArray(cleanupWarnings) ? cleanupWarnings : []);
+  attachErrorCause(normalized, error);
+  return normalized;
+}
+
+function mutableManagedAuthRefreshError(error) {
+  return error instanceof ManagedAuthRefreshError && !Object.isExtensible(error)
+    ? cloneManagedAuthRefreshError(error)
+    : error;
 }
 
 function errorGraphHasCleanupWarning(error, warning, seen = new Set()) {
@@ -252,13 +304,17 @@ export function authorityDirectoryPermissionsAreSafe(
 
 function attachRecoveryPaths(target, paths) {
   if (!target || typeof target !== "object") return;
-  const recoveryPaths = [
-    ...(Array.isArray(target.recoveryPaths) ? target.recoveryPaths : []),
-    ...paths,
-  ].filter((value) => typeof value === "string" && value.length > 0);
-  if (recoveryPaths.length === 0) return;
-  target.recoveryPaths = [...new Set(recoveryPaths)];
-  target.recoveryPath ??= target.recoveryPaths[0];
+  try {
+    const recoveryPaths = [
+      ...(Array.isArray(target.recoveryPaths) ? target.recoveryPaths : []),
+      ...paths,
+    ].filter((value) => typeof value === "string" && value.length > 0);
+    if (recoveryPaths.length === 0) return;
+    target.recoveryPaths = [...new Set(recoveryPaths)];
+    target.recoveryPath ??= target.recoveryPaths[0];
+  } catch {
+    // Frozen external errors are normalized before recovery metadata is required.
+  }
 }
 
 function lastRefreshAdvanced(before, after) {
@@ -728,10 +784,7 @@ remote_plugin = false
         attachErrorCause(retainedError, setupError);
         setupError = retainedError;
       }
-      setupError.cleanupWarnings = [
-        ...(Array.isArray(setupError.cleanupWarnings) ? setupError.cleanupWarnings : []),
-        "staging_cleanup_failed",
-      ];
+      appendCleanupWarnings(setupError, ["staging_cleanup_failed"]);
       attachRecoveryPaths(setupError, [stagingHome]);
     }
     if (stagingRootCreated && !retainedAttempt) {
@@ -832,6 +885,11 @@ async function atomicallyPromoteAuth(
         },
       );
       attachErrorCause(uncertain, error);
+      const errorCleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+      appendCleanupWarnings(
+        uncertain,
+        Array.isArray(errorCleanupWarnings) ? errorCleanupWarnings : [],
+      );
       throw uncertain;
     }
     try {
@@ -1123,6 +1181,11 @@ export async function runCodexManagedRefresh({
         },
       );
       attachErrorCause(uncertain, error);
+      const errorCleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+      appendCleanupWarnings(
+        uncertain,
+        Array.isArray(errorCleanupWarnings) ? errorCleanupWarnings : [],
+      );
       throw uncertain;
     }
     return {
@@ -1162,11 +1225,22 @@ export async function runCodexManagedRefresh({
             appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
             throw uncertain;
           }
-          if (operationError instanceof ManagedAuthRefreshError) {
-            operationError.recoveryReason = "app_server_shutdown_unknown";
-          }
-          attachCleanupError(operationError, stopError);
-          appendCleanupWarnings(operationError, ["app_server_stop_failed"]);
+          const operationCleanupWarnings = readErrorProperty(operationError, "cleanupWarnings");
+          const uncertain = new ManagedAuthRefreshError(
+            "refresh_outcome_uncertain",
+            "refresh request failed and app-server shutdown could not be confirmed",
+            {
+              recoveryPath: stagingHome,
+              recoveryReason: "app_server_shutdown_unknown",
+            },
+          );
+          attachErrorCause(uncertain, operationError);
+          attachCleanupError(uncertain, stopError);
+          appendCleanupWarnings(uncertain, [
+            ...(Array.isArray(operationCleanupWarnings) ? operationCleanupWarnings : []),
+            "app_server_stop_failed",
+          ]);
+          throw uncertain;
         } else if (refreshRequestDispatched) {
           const uncertain = new ManagedAuthRefreshError(
             "refresh_outcome_uncertain",
@@ -1583,6 +1657,7 @@ export async function refreshManagedAuthRecord({
         attachErrorCause(uncertain, error);
         error = uncertain;
       } else {
+        error = mutableManagedAuthRefreshError(error);
         error.retryable = false;
         error.recoveryReason ??= "post_dispatch_outcome_uncertain";
         attachRecoveryPaths(error, [stagingHome]);
@@ -1612,6 +1687,7 @@ export async function refreshManagedAuthRecord({
         try {
           await lstat(stagingHome, { bigint: true });
           if (primaryError && typeof primaryError === "object") {
+            primaryError = mutableManagedAuthRefreshError(primaryError);
             attachRecoveryPaths(primaryError, [stagingHome]);
           }
           if (outcome) outcome.recoveryPath ??= stagingHome;
@@ -1632,11 +1708,9 @@ export async function refreshManagedAuthRecord({
     cleanupWarnings.push("authority_guard_close_failed");
   }
   if (primaryError) {
-    if (cleanupWarnings.length > 0 && typeof primaryError === "object") {
-      primaryError.cleanupWarnings = [
-        ...(Array.isArray(primaryError.cleanupWarnings) ? primaryError.cleanupWarnings : []),
-        ...cleanupWarnings,
-      ];
+    if (cleanupWarnings.length > 0) {
+      primaryError = mutableManagedAuthRefreshError(primaryError);
+      appendCleanupWarnings(primaryError, cleanupWarnings);
     }
     throw primaryError;
   }
