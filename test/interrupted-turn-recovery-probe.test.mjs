@@ -768,7 +768,7 @@ test("portable directory entry decoding rejects lossy UTF-8", () => {
   );
 });
 
-test("mount table parsers preserve escaped absolute mount paths", () => {
+test("mount table parsers preserve their platform-specific absolute path encoding", () => {
   assert.deepEqual(
     parseLinuxMountInfo(
       "36 29 0:32 / / rw,relatime - overlay overlay rw\n" +
@@ -779,10 +779,23 @@ test("mount table parsers preserve escaped absolute mount paths", () => {
   assert.deepEqual(
     parseDarwinMountTable(
       "/dev/disk3s1s1 on / (apfs, local)\n" +
-        "map on /private/session/mounted\\040tree (autofs, local)\n",
+        "map on /private/session/mounted tree (autofs, local)\n" +
+        "literal on /private/session/backslash\\040tree (apfs, local)\n",
     ),
-    ["/", "/private/session/mounted tree"],
+    ["/", "/private/session/mounted tree", "/private/session/backslash\\040tree"],
   );
+});
+
+test("Darwin mount table parsing fails closed on unescaped separator text in paths", () => {
+  for (const ambiguous of [
+    "map on /private/session/dir on child (autofs, local)\n",
+    "map on /private/session/dir ( child (autofs, local)\n",
+  ]) {
+    assert.throws(
+      () => parseDarwinMountTable(ambiguous),
+      /ambiguous mount path/,
+    );
+  }
 });
 
 test("Linux getfacl parsing distinguishes base and extended ACL entries", () => {

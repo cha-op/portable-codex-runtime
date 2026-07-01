@@ -544,9 +544,25 @@ export function parseDarwinMountTable(value) {
     .split("\n")
     .filter((line) => line !== "")
     .map((line) => {
-      const match = line.match(/^.* on (.*) \([^)]*\)$/u);
-      assert(match, "Darwin mount table is malformed");
-      const mountPoint = decodeMountPath(match[1]);
+      const mountSeparator = " on ";
+      const mountSeparatorIndex = line.indexOf(mountSeparator);
+      assert(
+        mountSeparatorIndex > 0 && mountSeparatorIndex === line.lastIndexOf(mountSeparator),
+        "Darwin mount table contains an ambiguous mount path",
+      );
+      const mountPointStart = mountSeparatorIndex + mountSeparator.length;
+      const optionsSeparator = " (";
+      const optionsSeparatorIndex = line.indexOf(optionsSeparator, mountPointStart);
+      assert(
+        optionsSeparatorIndex > mountPointStart &&
+          optionsSeparatorIndex === line.lastIndexOf(optionsSeparator) &&
+          line.endsWith(")"),
+        "Darwin mount table contains an ambiguous mount path",
+      );
+      // macOS mount(8) prints f_mntonname directly rather than applying fstab
+      // octal escaping. Preserve the bytes represented by Node's UTF-8 string
+      // and fail closed above when its textual separators are ambiguous.
+      const mountPoint = line.slice(mountPointStart, optionsSeparatorIndex);
       assert(isAbsolute(mountPoint), "Darwin mount table contains a non-absolute path");
       return mountPoint;
     });

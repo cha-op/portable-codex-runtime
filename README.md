@@ -75,8 +75,9 @@ filesystem with a trusted owner, ancestor chain, and ACL state; the probe
 creates and removes its own mode `0700` subdirectory there.
 The pinned macOS runtime must provide `/bin/ls` and `/sbin/mount`; Linux must
 provide ACL-capable `/usr/bin/getfacl` plus `/proc/self/mountinfo`. The probe
-invokes these fixed inspection surfaces and fails closed when they are absent
-or malformed.
+invokes these fixed inspection surfaces and fails closed when they are absent,
+malformed, or when raw Darwin mount paths contain text that is ambiguous with
+the `mount(8)` output separators.
 
 To update the redacted evidence after an intentional runtime upgrade:
 

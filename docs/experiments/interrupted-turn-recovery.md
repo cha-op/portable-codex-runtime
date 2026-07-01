@@ -245,9 +245,10 @@ restore interfaces.
 - Digest, copy, and pathname cleanup reject a root that is itself a mount point
   or contains a nested mount point. Linux mount boundaries, including
   same-device bind mounts, come from `/proc/self/mountinfo`; macOS boundaries
-  come from the fixed `/sbin/mount` table. Production cleanup destroys the
-  fenced session volume instead of recursively deleting an unknown mounted
-  tree.
+  come from the fixed `/sbin/mount` table. Because macOS prints raw mount paths,
+  entries containing text that is ambiguous with its output separators fail
+  closed. Production cleanup destroys the fenced session volume instead of
+  recursively deleting an unknown mounted tree.
 - If validation or copy fails after the destination directory is created, the
   partial destination is retained. Pathname-based recursive cleanup cannot
   atomically prove that a racing writer has not replaced that directory, so the
