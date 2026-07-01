@@ -121,9 +121,14 @@ export async function readDedicatedChatgptCredential(authHome = DEFAULT_AUTH_HOM
     "auth.json account IDs do not match",
   );
   const planType = accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null;
-  const expiresAt =
-    typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null;
+  let expiresAt = null;
   if (typeof accessPayload.exp === "number") {
+    const expirationDate = new Date(accessPayload.exp * 1000);
+    assert(
+      Number.isFinite(accessPayload.exp) && Number.isFinite(expirationDate.getTime()),
+      "access_token exp must be finite and within the ECMAScript Date range",
+    );
+    expiresAt = expirationDate.toISOString();
     const remainingSeconds = accessPayload.exp - Math.floor(Date.now() / 1000);
     assert(
       remainingSeconds >= MIN_TOKEN_VALIDITY_SECONDS,

@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { JsonRpcError } from "../src/app-server-auth-probe.mjs";
 import {
   ManagedAuthRefreshAuthority,
   ManagedAuthRefreshError,
@@ -462,6 +463,42 @@ test("runCodexManagedRefresh always stops the app-server after request failure",
   assert.equal(stopped, 1);
 });
 
+test("managed refresh errors do not serialize JSON-RPC credential payloads", async () => {
+  const syntheticToken = "synthetic-managed-json-rpc-refresh-token";
+  const rpcError = new JsonRpcError("account/read", {
+    data: { refreshToken: syntheticToken },
+    message: `request failed with ${syntheticToken}`,
+  });
+
+  await assert.rejects(
+    runCodexManagedRefresh({
+      codexBin: "/pinned/codex",
+      stagingHome: "/isolated/staging-home",
+      createClient: () => ({
+        initialize: async () => ({}),
+        request: async () => {
+          throw rpcError;
+        },
+        start: async () => {},
+        stop: async () => {},
+      }),
+    }),
+    (error) => {
+      assert(error instanceof ManagedAuthRefreshError);
+      assert.equal(error.code, "refresh_outcome_uncertain");
+      assert.equal(error.cause, rpcError);
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cause"), false);
+      assert.equal(error.cause.payload.data.refreshToken, syntheticToken);
+      assert.equal(JSON.stringify(error).includes(syntheticToken), false);
+      assert.equal(
+        JSON.stringify(managedAuthRefreshFailureReport(error)).includes(syntheticToken),
+        false,
+      );
+      return true;
+    },
+  );
+});
+
 test("app-server stop failure cannot mask an uncertain refresh outcome", async () => {
   await assert.rejects(
     runCodexManagedRefresh({
@@ -482,9 +519,76 @@ test("app-server stop failure cannot mask an uncertain refresh outcome", async (
       assert.equal(error.code, "refresh_outcome_uncertain");
       assert.deepEqual(error.cleanupWarnings, ["app_server_stop_failed"]);
       assert.match(error.cause.message, /synthetic request failure/);
+      assert.match(error.cleanupError.message, /synthetic stop failure/);
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, "cleanupError"), false);
       return true;
     },
   );
+});
+
+test("successful account refresh with unconfirmed shutdown retains an unsynced gate", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+  const stopSecret = "synthetic-survived-sigkill-refresh-token";
+  let syncCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          return true;
+        },
+        runRefresh: (options) =>
+          runCodexManagedRefresh({
+            ...options,
+            createClient: ({ codexHome }) => ({
+              initialize: async () => ({}),
+              request: async () => {
+                await replaceStagedAuth(codexHome);
+                return { account: { type: "chatgpt" }, requiresOpenaiAuth: true };
+              },
+              rpcMethodAudit: () => RPC_AUDIT,
+              start: async () => {},
+              stop: async () => {
+                throw new Error(`codex app-server process group survived SIGKILL: ${stopSecret}`);
+              },
+            }),
+          }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "app_server_shutdown_unknown");
+    assert.deepEqual(refreshError.cleanupWarnings, ["app_server_stop_failed"]);
+    assert.match(refreshError.cause.message, /survived SIGKILL/);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cause"), false);
+    assert.equal(syncCount, 2, "unquiesced staging must not receive a post-refresh sync");
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    assert.equal(JSON.stringify(refreshError).includes(stopSecret), false);
+
+    let secondRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          secondRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(secondRefreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("startup failure plus stop failure becomes sanitized non-retryable uncertainty", async () => {
@@ -610,7 +714,7 @@ test("post-dispatch RPC failure preserves an unchanged staging sentinel", async 
     }
     assert.equal(refreshError.code, "refresh_outcome_uncertain");
     assert.equal(refreshError.retryable, false);
-    assert.equal(refreshError.recoveryReason, "account_read_outcome_unknown");
+    assert.equal(refreshError.recoveryReason, "app_server_shutdown_unknown");
     assert.deepEqual(refreshError.cleanupWarnings, ["app_server_stop_failed"]);
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
     let secondRefreshCalled = false;
@@ -813,6 +917,30 @@ test("non-object JWT payloads are classified as invalid auth records", async () 
       readManagedAuthSnapshot(authHome),
       (error) => error.code === "invalid_auth_record",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("access-token expirations outside the ECMAScript Date range are invalid auth records", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const document = authDocument({
+      accessMarker: "invalid-expiration",
+      expiresAtUnixSeconds: 1e20,
+      lastRefresh: "2026-07-01T08:00:00.000Z",
+      refreshToken: "refresh-invalid-expiration-sensitive",
+    });
+    await writeFile(join(authHome, "auth.json"), `${JSON.stringify(document)}\n`, {
+      mode: 0o600,
+    });
+
+    await assert.rejects(readManagedAuthSnapshot(authHome), (error) => {
+      assert(error instanceof ManagedAuthRefreshError);
+      assert.equal(error.code, "invalid_auth_record");
+      assert.doesNotMatch(error.message, /1e20|refresh-invalid/);
+      return true;
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1476,6 +1604,192 @@ test("holder exit aborts an in-flight token refresh before cleanup", async () =>
     assert.equal(refreshError.retryable, false);
     assert.equal(refreshError.recoveryReason, "lock_lost_during_refresh");
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    let secondRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          secondRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(secondRefreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lock loss retains abort and shutdown failures as sanitized cleanup evidence", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const abortSecret = "synthetic-abort-refresh-token";
+  const stopSecret = "synthetic-stop-refresh-token";
+  let reportLoss;
+  const loss = new Promise((resolve) => {
+    reportLoss = resolve;
+  });
+  let reportStarted;
+  const started = new Promise((resolve) => {
+    reportStarted = resolve;
+  });
+  let syncCount = 0;
+  try {
+    const refresh = refreshManagedAuthRecord({
+      authHome,
+      acquireLock: async () => ({
+        assertHeld: async () => {},
+        release: async () => {},
+        waitForLoss: () => loss,
+      }),
+      codexBin: "/pinned/codex",
+      syncStagingDirectory: async () => {
+        syncCount += 1;
+        return true;
+      },
+      runRefresh: (options) =>
+        runCodexManagedRefresh({
+          ...options,
+          createClient: () => ({
+            abort: async () => {
+              throw new JsonRpcError("account/read", {
+                data: { refreshToken: abortSecret },
+                message: `abort failed with ${abortSecret}`,
+              });
+            },
+            initialize: async () => ({}),
+            request: async () => {
+              reportStarted();
+              return new Promise(() => {});
+            },
+            start: async () => {},
+            stop: async () => {
+              throw new Error(`codex app-server process group survived SIGKILL: ${stopSecret}`);
+            },
+          }),
+        }),
+    });
+    await started;
+    const lost = new AdvisoryLockError("lock_lost", "synthetic holder exit");
+    reportLoss(lost);
+
+    let refreshError;
+    try {
+      await refresh;
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.recoveryReason, "lock_lost_during_refresh");
+    assert.equal(refreshError.cause, lost);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cause"), false);
+    assert(refreshError.cleanupError instanceof JsonRpcError);
+    assert.equal(refreshError.cleanupError.payload.data.refreshToken, abortSecret);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cleanupError"), false);
+    assert.match(refreshError.cleanupError.cleanupError.message, /survived SIGKILL/);
+    assert.equal(
+      Object.prototype.propertyIsEnumerable.call(refreshError.cleanupError, "cleanupError"),
+      false,
+    );
+    assert.deepEqual(refreshError.cleanupWarnings, [
+      "refresh_abort_cleanup_failed",
+      "app_server_stop_failed",
+    ]);
+    assert.equal(syncCount, 2, "unquiesced staging must not receive a post-refresh sync");
+    assert.equal(JSON.stringify(refreshError).includes(abortSecret), false);
+    assert.equal(JSON.stringify(refreshError).includes(stopSecret), false);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+
+    let secondRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          secondRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(secondRefreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lock loss preserves stop failure metadata when abort rejects with the lock error", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const stopSecret = "synthetic-same-error-stop-refresh-token";
+  let reportLoss;
+  const loss = new Promise((resolve) => {
+    reportLoss = resolve;
+  });
+  let reportStarted;
+  const started = new Promise((resolve) => {
+    reportStarted = resolve;
+  });
+  let syncCount = 0;
+  try {
+    const refresh = refreshManagedAuthRecord({
+      authHome,
+      acquireLock: async () => ({
+        assertHeld: async () => {},
+        release: async () => {},
+        waitForLoss: () => loss,
+      }),
+      codexBin: "/pinned/codex",
+      syncStagingDirectory: async () => {
+        syncCount += 1;
+        return true;
+      },
+      runRefresh: (options) =>
+        runCodexManagedRefresh({
+          ...options,
+          createClient: () => ({
+            abort: async () => {},
+            initialize: async () => ({}),
+            request: async () => {
+              reportStarted();
+              return new Promise(() => {});
+            },
+            start: async () => {},
+            stop: async () => {
+              throw new Error(`codex app-server process group survived SIGKILL: ${stopSecret}`);
+            },
+          }),
+        }),
+    });
+    await started;
+    const lost = new AdvisoryLockError("lock_lost", "synthetic holder exit");
+    Object.defineProperty(lost, "cause", {
+      configurable: true,
+      enumerable: false,
+      value: lost,
+    });
+    reportLoss(lost);
+
+    let refreshError;
+    try {
+      await refresh;
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.recoveryReason, "lock_lost_during_refresh");
+    assert.equal(refreshError.cause, lost);
+    assert.deepEqual(refreshError.cleanupWarnings, ["app_server_stop_failed"]);
+    assert.equal(refreshError.cleanupWarnings.includes("refresh_abort_cleanup_failed"), false);
+    assert.deepEqual(lost.cleanupWarnings, ["app_server_stop_failed"]);
+    assert.match(lost.cleanupError.message, /survived SIGKILL/);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(lost, "cleanupError"), false);
+    assert.equal(syncCount, 2, "nested stop failure must suppress post-refresh sync");
+    assert.equal(JSON.stringify(refreshError).includes(stopSecret), false);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+
     let secondRefreshCalled = false;
     await assert.rejects(
       refreshManagedAuthRecord({

@@ -297,10 +297,10 @@ test("assertHeld reports loss after the owning holder exits", async () => {
 });
 
 test(
-  "Linux holder exit releases the lock while the broker inode guard remains open",
-  { skip: process.platform !== "linux" },
+  "holder exit releases the lock while the broker inode guard remains open",
+  { skip: !["darwin", "linux"].includes(process.platform) },
   async () => {
-    const root = await mkdtemp(join(tmpdir(), "portable-advisory-linux-ofd-"));
+    const root = await mkdtemp(join(tmpdir(), "portable-advisory-exited-holder-"));
     const path = join(root, "authority.lock");
     let lostLock;
     let recovered;
@@ -308,8 +308,10 @@ test(
       lostLock = await acquireAdvisoryLock(path, { holderPath: EXIT_AFTER_LOCK_FIXTURE });
       await lostLock.waitForLoss();
 
-      // Do not release lostLock yet: its broker-side handle deliberately stays
-      // open while a new holder proves that only the exited holder owned flock.
+      // Do not release lostLock yet. On macOS the exited lockf process owned the
+      // process-associated fcntl lock; on Linux the holder owned the separate
+      // OFD reopened through procfs. In both cases the broker descriptor remains
+      // open only as an inode-identity guard and must not prevent reacquisition.
       recovered = await acquireAdvisoryLock(path);
       await recovered.assertHeld();
     } finally {

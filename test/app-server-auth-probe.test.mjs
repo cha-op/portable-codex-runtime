@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   AppServerClient,
+  JsonRpcError,
   buildWorkerEnvironment,
   codexVersion,
   createWorkerAuthMonitor,
@@ -18,6 +19,7 @@ import {
   runSequentialCleanup,
   stopAndAssertNoWorkerAuth,
 } from "../src/app-server-auth-probe.mjs";
+import { readDedicatedChatgptCredential } from "../src/live-app-server-auth-probe.mjs";
 
 const configuredCodexBin = process.env.CODEX_BIN ?? "codex";
 const codexBin = resolveAppServerExecutable(configuredCodexBin);
@@ -31,6 +33,11 @@ function relativeNodeExecutable() {
   return relativeNode.includes("/") || relativeNode.includes("\\")
     ? relativeNode
     : `./${relativeNode}`;
+}
+
+function encodeJwt(payload) {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none", typ: "JWT" })}.${encode(payload)}.${encode("signature")}`;
 }
 
 test("worker environment excludes arbitrary host credentials", () => {
@@ -49,6 +56,59 @@ test("worker environment excludes arbitrary host credentials", () => {
       TMPDIR: "/tmp/",
     },
   );
+});
+
+test("JSON-RPC errors retain payload access without serializing credential data", () => {
+  const syntheticToken = "synthetic-json-rpc-refresh-token";
+  const error = new JsonRpcError("account/read", {
+    data: { refreshToken: syntheticToken },
+    message: `request failed with ${syntheticToken}`,
+  });
+
+  assert.equal(error.payload.data.refreshToken, syntheticToken);
+  assert.equal(Object.prototype.propertyIsEnumerable.call(error, "payload"), false);
+  assert.doesNotMatch(error.message, new RegExp(syntheticToken));
+  assert.doesNotMatch(error.stack, new RegExp(syntheticToken));
+  assert.equal(JSON.stringify(error).includes(syntheticToken), false);
+});
+
+test("dedicated credentials reject access-token expirations outside the Date range", async () => {
+  const authHome = await mkdtemp(join(tmpdir(), "portable-codex-invalid-live-exp-"));
+  const accountId = "123e4567-e89b-42d3-a456-426614174099";
+  const claims = {
+    chatgpt_account_id: accountId,
+    chatgpt_plan_type: "enterprise",
+    chatgpt_user_id: "user-invalid-expiration",
+  };
+  const refreshToken = "refresh-invalid-expiration-sensitive";
+  try {
+    await writeFile(
+      join(authHome, "auth.json"),
+      JSON.stringify({
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: encodeJwt({
+            exp: 1e20,
+            "https://api.openai.com/auth": claims,
+          }),
+          account_id: accountId,
+          id_token: encodeJwt({ "https://api.openai.com/auth": claims }),
+          refresh_token: refreshToken,
+        },
+      }),
+      { mode: 0o600 },
+    );
+
+    await assert.rejects(readDedicatedChatgptCredential(authHome), (error) => {
+      assert.equal(error.name, "AssertionError");
+      assert.match(error.message, /finite and within the ECMAScript Date range/);
+      assert.doesNotMatch(error.stack, /refresh-invalid-expiration-sensitive/);
+      assert.notEqual(error.name, "RangeError");
+      return true;
+    });
+  } finally {
+    await rm(authHome, { recursive: true, force: true });
+  }
 });
 
 test("worker environment preserves standard Windows process variables", () => {

@@ -13,6 +13,9 @@ export function advisoryLockCommand(
   if (platform === "darwin") {
     return {
       command: "/usr/bin/lockf",
+      // macOS lockf owns a process-associated fcntl lock. The broker keeps
+      // descriptor 3 open only as an inode-identity guard, so holder exit still
+      // releases the lock while that broker descriptor remains open.
       args: [
         "-k",
         "-s",

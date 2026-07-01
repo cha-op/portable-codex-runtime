@@ -38,6 +38,73 @@ function isObjectLike(value) {
   return value !== null && ["object", "function"].includes(typeof value);
 }
 
+function attachErrorCause(error, cause, { ifAbsent = false } = {}) {
+  if (!isObjectLike(error)) return;
+  try {
+    if (ifAbsent && Object.hasOwn(error, "cause")) return;
+    Object.defineProperty(error, "cause", {
+      configurable: true,
+      enumerable: false,
+      value: cause,
+    });
+  } catch {
+    // Preserve the primary error even when a frozen object cannot retain diagnostics.
+  }
+}
+
+function attachCleanupError(error, cleanupError) {
+  if (!isObjectLike(error)) return;
+  try {
+    if (Object.hasOwn(error, "cleanupError")) return;
+    Object.defineProperty(error, "cleanupError", {
+      configurable: true,
+      enumerable: false,
+      value: cleanupError,
+    });
+  } catch {
+    // A frozen primary error still takes precedence over cleanup diagnostics.
+  }
+}
+
+function appendCleanupWarnings(error, warnings) {
+  if (!isObjectLike(error)) return;
+  const safeWarnings = warnings.filter((warning) => typeof warning === "string");
+  try {
+    error.cleanupWarnings = [
+      ...new Set([
+        ...(Array.isArray(error.cleanupWarnings) ? error.cleanupWarnings : []),
+        ...safeWarnings,
+      ]),
+    ];
+  } catch {
+    // A frozen primary error still takes precedence over cleanup metadata.
+  }
+}
+
+function errorGraphHasCleanupWarning(error, warning, seen = new Set()) {
+  if (!isObjectLike(error) || seen.has(error)) return false;
+  seen.add(error);
+  let cleanupWarnings;
+  let cause;
+  let cleanupError;
+  try {
+    cleanupWarnings = error.cleanupWarnings;
+    cause = error.cause;
+    cleanupError = error.cleanupError;
+  } catch {
+    return false;
+  }
+  return (
+    (Array.isArray(cleanupWarnings) && cleanupWarnings.includes(warning)) ||
+    errorGraphHasCleanupWarning(cause, warning, seen) ||
+    errorGraphHasCleanupWarning(cleanupError, warning, seen)
+  );
+}
+
+function appServerShutdownIsUnconfirmed(error) {
+  return errorGraphHasCleanupWarning(error, "app_server_stop_failed");
+}
+
 function markPreDispatchRefreshError(error) {
   if (isObjectLike(error)) PRE_DISPATCH_REFRESH_ERRORS.add(error);
 }
@@ -201,6 +268,22 @@ function lastRefreshAdvanced(before, after) {
   if (before === null || before === undefined) return true;
   const beforeTime = Date.parse(before);
   return Number.isFinite(beforeTime) && afterTime > beforeTime;
+}
+
+function accessTokenExpiration(exp) {
+  if (typeof exp !== "number") {
+    return { expiresAt: null, expiresAtUnixSeconds: null };
+  }
+  const date = new Date(exp * 1000);
+  ensure(
+    Number.isFinite(exp) && Number.isFinite(date.getTime()),
+    "invalid_auth_record",
+    "authority access_token has an invalid expiration",
+  );
+  return {
+    expiresAt: date.toISOString(),
+    expiresAtUnixSeconds: exp,
+  };
 }
 
 async function resolveAuthorityHome(authHome) {
@@ -479,7 +562,7 @@ async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openF
       "refreshed staging auth could not be synchronized",
       { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
     );
-    durabilityError.cause = error;
+    attachErrorCause(durabilityError, error);
     throw durabilityError;
   }
 }
@@ -518,7 +601,7 @@ async function handleChangedPreDispatchStaging(
         recoveryReason: "staging_sync_failed",
       },
     );
-    durabilityError.cause = refreshError;
+    attachErrorCause(durabilityError, refreshError);
     Object.defineProperty(durabilityError, "syncError", {
       enumerable: false,
       value: error,
@@ -535,7 +618,7 @@ async function handleChangedPreDispatchStaging(
       recoveryReason: "pre_dispatch_staging_changed",
     },
   );
-  uncertain.cause = refreshError;
+  attachErrorCause(uncertain, refreshError);
   throw uncertain;
 }
 
@@ -619,7 +702,7 @@ remote_plugin = false
         "staging_setup_failed",
         "authority staging setup failed",
       );
-      setupError.cause = error;
+      attachErrorCause(setupError, error);
     }
 
     let retainedAttempt = false;
@@ -642,7 +725,7 @@ remote_plugin = false
           "staging_setup_failed",
           "authority staging setup failed and requires recovery",
         );
-        retainedError.cause = setupError;
+        attachErrorCause(retainedError, setupError);
         setupError = retainedError;
       }
       setupError.cleanupWarnings = [
@@ -748,7 +831,7 @@ async function atomicallyPromoteAuth(
           recoveryReason: "holder_commit_ack_lost",
         },
       );
-      uncertain.cause = error;
+      attachErrorCause(uncertain, error);
       throw uncertain;
     }
     try {
@@ -933,13 +1016,12 @@ export async function readManagedAuthSnapshot(authHome) {
     "invalid_auth_record",
     "authority auth.json user identities do not match",
   );
+  const expiration = accessTokenExpiration(accessPayload.exp);
 
   const snapshot = withSensitiveProperties({
     authPath,
-    expiresAt:
-      typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null,
-    expiresAtUnixSeconds:
-      typeof accessPayload.exp === "number" ? accessPayload.exp : null,
+    expiresAt: expiration.expiresAt,
+    expiresAtUnixSeconds: expiration.expiresAtUnixSeconds,
     fileIdentity: {
       dev: jsonSafeStatInteger(fileStat.dev),
       ino: jsonSafeStatInteger(fileStat.ino),
@@ -1040,7 +1122,7 @@ export async function runCodexManagedRefresh({
           recoveryReason: "account_read_outcome_unknown",
         },
       );
-      uncertain.cause = error;
+      attachErrorCause(uncertain, error);
       throw uncertain;
     }
     return {
@@ -1055,7 +1137,7 @@ export async function runCodexManagedRefresh({
         "app_server_client_creation_failed",
         "managed refresh app-server client could not be created",
       );
-      Object.defineProperty(failure, "cause", { value: error });
+      attachErrorCause(failure, error);
     }
     if (!refreshRequestDispatched) markPreDispatchRefreshError(failure);
     operationError = failure;
@@ -1075,31 +1157,27 @@ export async function runCodexManagedRefresh({
                 recoveryReason: "app_server_shutdown_unknown",
               },
             );
-            uncertain.cause = operationError;
-            uncertain.cleanupWarnings = [
-              ...(Array.isArray(operationError.cleanupWarnings)
-                ? operationError.cleanupWarnings
-                : []),
-              "app_server_stop_failed",
-            ];
+            attachErrorCause(uncertain, operationError);
+            attachCleanupError(uncertain, stopError);
+            appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
             throw uncertain;
           }
-          operationError.cleanupWarnings = [
-            ...(Array.isArray(operationError.cleanupWarnings)
-              ? operationError.cleanupWarnings
-              : []),
-            "app_server_stop_failed",
-          ];
+          if (operationError instanceof ManagedAuthRefreshError) {
+            operationError.recoveryReason = "app_server_shutdown_unknown";
+          }
+          attachCleanupError(operationError, stopError);
+          appendCleanupWarnings(operationError, ["app_server_stop_failed"]);
         } else if (refreshRequestDispatched) {
           const uncertain = new ManagedAuthRefreshError(
             "refresh_outcome_uncertain",
-            "app-server cleanup failed after the token refresh request was dispatched",
+            "account/read completed but app-server shutdown could not be confirmed",
             {
               recoveryPath: stagingHome,
-              recoveryReason: "account_read_outcome_unknown",
+              recoveryReason: "app_server_shutdown_unknown",
             },
           );
-          uncertain.cause = stopError;
+          attachErrorCause(uncertain, stopError);
+          appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
           throw uncertain;
         } else {
           throw stopError;
@@ -1118,7 +1196,7 @@ async function assertLockHeldBeforeRefresh(lock) {
       "authority lock was lost before token refresh started",
       { retryable: true },
     );
-    beforeRefresh.cause = error;
+    attachErrorCause(beforeRefresh, error);
     markPreDispatchRefreshError(beforeRefresh);
     throw beforeRefresh;
   }
@@ -1139,7 +1217,12 @@ async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
   if (first.kind === "completed") return first.value;
   if (first.kind === "failed") throw first.error;
   controller.abort(first.error);
-  await refresh.catch(() => {});
+  let abortCleanupError;
+  try {
+    await refresh;
+  } catch (error) {
+    if (error !== first.error) abortCleanupError = error;
+  }
   const uncertain = new ManagedAuthRefreshError(
     "refresh_outcome_uncertain",
     "authority lock was lost while the token refresh outcome was uncertain",
@@ -1148,7 +1231,17 @@ async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
       recoveryReason: "lock_lost_during_refresh",
     },
   );
-  uncertain.cause = first.error;
+  attachErrorCause(uncertain, first.error);
+  if (abortCleanupError) {
+    attachCleanupError(uncertain, abortCleanupError);
+    appendCleanupWarnings(uncertain, ["refresh_abort_cleanup_failed"]);
+  }
+  if (
+    appServerShutdownIsUnconfirmed(first.error) ||
+    appServerShutdownIsUnconfirmed(abortCleanupError)
+  ) {
+    appendCleanupWarnings(uncertain, ["app_server_stop_failed"]);
+  }
   throw uncertain;
 }
 
@@ -1282,17 +1375,24 @@ export async function refreshManagedAuthRecord({
           recoveryReason: "unclassified_adapter_failure",
         },
       );
-      uncertain.cause = refreshError;
+      attachErrorCause(uncertain, refreshError);
       refreshError = uncertain;
     }
-    try {
-      await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile);
-    } catch (error) {
-      // Recheck before exposing stagingHome as a recovery path. A concurrent
-      // authority replacement makes that pathname stale and takes precedence.
-      await assertAuthorityHomeCurrent(authority);
-      if (refreshError && !error.cause) error.cause = refreshError;
-      throw error;
+    // A failed stop can leave app-server writing this directory. The staging
+    // attempt was durably created before launch and remains a fail-closed gate,
+    // but a later fsync cannot establish that its credential bytes are stable.
+    if (!appServerShutdownIsUnconfirmed(refreshError)) {
+      try {
+        await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory, openFile);
+      } catch (error) {
+        // Recheck before exposing stagingHome as a recovery path. A concurrent
+        // authority replacement makes that pathname stale and takes precedence.
+        await assertAuthorityHomeCurrent(authority);
+        if (refreshError && !error.cause) {
+          attachErrorCause(error, refreshError, { ifAbsent: true });
+        }
+        throw error;
+      }
     }
     await assertAuthorityHomeCurrent(authority);
     if (refreshError) throw refreshError;
@@ -1412,7 +1512,7 @@ export async function refreshManagedAuthRecord({
         "promoted authority state could not be verified while the lock was held",
         { recoveryPath: stagingHome },
       );
-      verificationError.cause = error;
+      attachErrorCause(verificationError, error);
       throw verificationError;
     }
 
@@ -1454,7 +1554,7 @@ export async function refreshManagedAuthRecord({
           recoveryReason: "lock_lost_during_refresh",
         },
       );
-      uncertain.cause = error;
+      attachErrorCause(uncertain, error);
       error = uncertain;
       preserveStaging = true;
     }
@@ -1480,7 +1580,7 @@ export async function refreshManagedAuthRecord({
             recoveryReason: "post_dispatch_outcome_uncertain",
           },
         );
-        uncertain.cause = error;
+        attachErrorCause(uncertain, error);
         error = uncertain;
       } else {
         error.retryable = false;
@@ -1498,7 +1598,7 @@ export async function refreshManagedAuthRecord({
   } catch (error) {
     authorityCurrent = false;
     if (primaryError && primaryError !== error && !error.cause) {
-      error.cause = primaryError;
+      attachErrorCause(error, primaryError, { ifAbsent: true });
     }
     primaryError = error;
     cleanupWarnings.push("authority_home_replaced");

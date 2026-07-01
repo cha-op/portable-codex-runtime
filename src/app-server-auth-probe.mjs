@@ -194,10 +194,14 @@ export async function runSequentialCleanup(cleanups, primaryFailure) {
 
 export class JsonRpcError extends Error {
   constructor(method, payload) {
-    super(`${method} failed: ${payload.message ?? JSON.stringify(payload)}`);
+    super(`${method} failed`);
     this.name = "JsonRpcError";
     this.method = method;
-    this.payload = payload;
+    Object.defineProperty(this, "payload", {
+      configurable: true,
+      enumerable: false,
+      value: payload,
+    });
   }
 }
 
@@ -737,7 +741,7 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
     }
 
     assert(rejection instanceof JsonRpcError, "experimental login should be rejected without opt-in");
-    assert.match(rejection.message, /experimentalApi capability/);
+    assert.match(rejection.payload.message, /experimentalApi capability/);
     await stopAndAssertNoWorkerAuth(client, codexHome);
     return { gated: true, errorMessage: rejection.payload.message };
   } catch (error) {
