@@ -71,8 +71,10 @@ If the system temporary filesystem is mounted `noexec`, set
 `CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
 filesystem with a trusted owner, ancestor chain, and ACL state; the probe
 creates and removes its own mode `0700` subdirectory there.
-The pinned macOS/Linux runtime image must provide `/bin/ls`, which the
-fail-closed ACL inspector invokes with fixed arguments.
+The pinned macOS runtime must provide `/bin/ls` and `/sbin/mount`; Linux must
+provide ACL-capable `/usr/bin/getfacl` plus `/proc/self/mountinfo`. The probe
+invokes these fixed inspection surfaces and fails closed when they are absent
+or malformed.
 
 To update the redacted evidence after an intentional runtime upgrade:
 

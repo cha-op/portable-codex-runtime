@@ -32,6 +32,10 @@ import {
   digestTree,
   ensurePrivateEvidenceDirectory,
   interruptedTurnRecoveryFailureReport,
+  inspectLinuxRecoveryAcl,
+  parseDarwinMountTable,
+  parseLinuxGetfacl,
+  parseLinuxMountInfo,
   probeInterruptedTurnRecovery,
   removeTreeForCleanup,
   startRecoveryClient,
@@ -75,6 +79,11 @@ async function assertRetainedFailedDestination(destination) {
     "a failed copy must retain its partial destination for trusted-owner cleanup",
   );
 }
+
+const TRUSTED_RECOVERY_ACL = {
+  inspectExecutableAncestorAcl: async () => false,
+  inspectExecutableRootAcl: async () => false,
+};
 
 function completeEvidenceReport() {
   const scenarios = RECOVERY_SCENARIOS.map((kind) => {
@@ -386,6 +395,34 @@ test("stopped-tree copy requires a private coordinator-owned root", async () => 
   }
 });
 
+test("portable tree operations reject declared nested mount boundaries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-mount-boundary-test-"));
+  try {
+    const source = join(root, "source");
+    const mounted = join(source, "mounted");
+    const destination = join(root, "destination");
+    await mkdir(mounted, { recursive: true });
+    await writeFile(join(mounted, "sentinel"), "preserve");
+    const listMountPoints = async () => [mounted];
+    await assert.rejects(
+      digestTree(source, { listMountPoints }),
+      /rejects nested mount points/,
+    );
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination, listMountPoints }),
+      /rejects nested mount points/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+    await assert.rejects(
+      removeTreeForCleanup(source, { listMountPoints }),
+      /rejects nested mount points/,
+    );
+    assert.equal(await readFile(join(mounted, "sentinel"), "utf8"), "preserve");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects terminal dot segments as owned children", async () => {
   const container = await mkdtemp(join(tmpdir(), "portable-copy-dot-segment-test-"));
   try {
@@ -472,6 +509,70 @@ test("portable directory entry decoding rejects lossy UTF-8", () => {
   assert.throws(
     () => decodePortablePathBytes(Buffer.from([0x66, 0x80])),
     /rejects non-UTF-8 directory entry names/,
+  );
+});
+
+test("mount table parsers preserve escaped absolute mount paths", () => {
+  assert.deepEqual(
+    parseLinuxMountInfo(
+      "36 29 0:32 / / rw,relatime - overlay overlay rw\n" +
+        "37 36 0:33 / /private/session/mounted\\040tree rw - tmpfs tmpfs rw\n",
+    ),
+    ["/", "/private/session/mounted tree"],
+  );
+  assert.deepEqual(
+    parseDarwinMountTable(
+      "/dev/disk3s1s1 on / (apfs, local)\n" +
+        "map on /private/session/mounted\\040tree (autofs, local)\n",
+    ),
+    ["/", "/private/session/mounted tree"],
+  );
+});
+
+test("Linux getfacl parsing distinguishes base and extended ACL entries", () => {
+  assert.equal(parseLinuxGetfacl("user::rwx\ngroup::---\nother::---\n"), false);
+  assert.equal(
+    parseLinuxGetfacl(
+      "user::rwx\nuser:1234:r-x\ngroup::---\nmask::r-x\nother::---\n",
+    ),
+    true,
+  );
+  assert.equal(
+    parseLinuxGetfacl(
+      "user::rwx\ngroup::---\nother::---\ndefault:user::rwx\n" +
+        "default:group::---\ndefault:other::---\n",
+    ),
+    true,
+  );
+  assert.throws(() => parseLinuxGetfacl("user::rwx\ngroup::---\n"), /incomplete|omitted/);
+});
+
+test("Linux recovery ACL inspection requires the fixed getfacl capability", async () => {
+  const calls = [];
+  assert.equal(
+    await inspectLinuxRecoveryAcl("/private/session", {
+      runCommand: async (...arguments_) => {
+        calls.push(arguments_);
+        return { stderr: "", stdout: "user::rwx\ngroup::---\nother::---\n" };
+      },
+    }),
+    false,
+  );
+  assert.deepEqual(calls[0][0], "/usr/bin/getfacl");
+  assert.deepEqual(calls[0][1], [
+    "--absolute-names",
+    "--omit-header",
+    "/private/session",
+  ]);
+  await assert.rejects(
+    inspectLinuxRecoveryAcl("/private/session", {
+      runCommand: async () => {
+        const error = new Error("missing capability");
+        error.code = "ENOENT";
+        throw error;
+      },
+    }),
+    /Linux ACL capability inspection failed/,
   );
 });
 
@@ -755,6 +856,29 @@ test("stopped-tree copy rejects dangling relative symlinks", async () => {
     await assert.rejects(
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /rejects dangling relative symlinks/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects symlink chains beyond the Darwin limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-symlink-depth-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "target"), "sentinel");
+    let target = "target";
+    for (let index = 32; index >= 0; index -= 1) {
+      const name = `hop-${String(index).padStart(2, "0")}`;
+      await symlink(target, join(source, name));
+      target = name;
+    }
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects excessive symlink resolution depth/,
     );
     await assertRetainedFailedDestination(destination);
   } finally {
@@ -1304,6 +1428,7 @@ test("probe report contains all four recovery scenarios without runtime identifi
   let versionBinary;
   let versionContext;
   const report = await probeInterruptedTurnRecovery({
+    ...TRUSTED_RECOVERY_ACL,
     codexBin: process.execPath,
     readCodexVersion: (codexBin, context) => {
       versionBinary = codexBin;
@@ -1341,6 +1466,7 @@ test("probe rejects private binary mode changes between scenarios", async () => 
   let calls = 0;
   await assert.rejects(
     probeInterruptedTurnRecovery({
+      ...TRUSTED_RECOVERY_ACL,
       codexBin: process.execPath,
       readCodexVersion: () => "codex-cli 0.142.4",
       runScenario: async ({ codexBin, kind }) => {
@@ -1361,6 +1487,7 @@ test("probe stages its private binary under an explicit executable root", async 
   let privateBinary;
   try {
     await probeInterruptedTurnRecovery({
+      ...TRUSTED_RECOVERY_ACL,
       codexBin: process.execPath,
       executableRoot,
       readCodexVersion: (codexBin) => {
@@ -1382,6 +1509,7 @@ test("probe rejects an untrusted writable executable root", async () => {
     await chmod(executableRoot, 0o777);
     await assert.rejects(
       probeInterruptedTurnRecovery({
+        ...TRUSTED_RECOVERY_ACL,
         codexBin: process.execPath,
         executableRoot,
         readCodexVersion: () => "codex-cli 0.142.4",
@@ -1405,6 +1533,7 @@ test("probe rejects an executable root below an unsafe ancestor", async () => {
     await chmod(executableRoot, 0o700);
     await assert.rejects(
       probeInterruptedTurnRecovery({
+        ...TRUSTED_RECOVERY_ACL,
         codexBin: process.execPath,
         executableRoot,
         readCodexVersion: () => "codex-cli 0.142.4",
@@ -1444,6 +1573,7 @@ test("probe requires an absolute binary and the complete scenario matrix", async
   );
   await assert.rejects(
     probeInterruptedTurnRecovery({
+      ...TRUSTED_RECOVERY_ACL,
       codexBin: process.execPath,
       scenarios: ["sigkill"],
       runScenario: async () => ({}),

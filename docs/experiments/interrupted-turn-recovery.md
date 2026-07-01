@@ -109,10 +109,13 @@ must have no extended ACL. The probe creates a mode `0700` subdirectory there,
 executes a mode `0500` private Codex copy, and removes the subdirectory after
 the matrix. This override is execution scratch only and must not point into the
 recoverable session tree.
-The pinned macOS/Linux runtime image must provide `/bin/ls`, which the
-fail-closed ACL inspector invokes by absolute path with fixed arguments. Other
-Linux layouts, including images that omit that path, are outside this probe's
-compatibility claim until they provide an equivalent pinned inspector.
+The pinned macOS runtime must provide ACL-aware `/bin/ls` and `/sbin/mount`;
+Linux must provide ACL-aware `/usr/bin/getfacl` and
+`/proc/self/mountinfo`. The probe invokes these inspection surfaces through
+fixed paths and arguments and fails closed on missing, malformed, or
+incomplete output. BusyBox/Toybox `ls` output is not accepted as Linux ACL
+evidence. Other runtime layouts are outside this probe's compatibility claim
+until they provide equivalent pinned inspectors.
 
 ## Upstream Semantics
 
@@ -206,7 +209,8 @@ restore interfaces.
   absolute resolution chains that enter the source or destination tree, and
   non-relocatable relative targets fail closed. A fixed
   runtime image must provide every external target, such as a Codex helper path,
-  at a compatible location during copy and after migration.
+  at a compatible location during copy and after migration. Symlink resolution
+  chains longer than the common macOS/Linux limit of 32 are rejected.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,
   timestamps, symlink permission bits, special permission bits, or hard-link
   topology. Special bits and hard links, including hard-linked symlinks, fail
@@ -218,6 +222,12 @@ restore interfaces.
   UID is outside its security contract. The production design supplies this
   invariant with session fencing, worker quiescence, and a single-attached
   volume before snapshot.
+- Digest, copy, and pathname cleanup reject a root that is itself a mount point
+  or contains a nested mount point. Linux mount boundaries, including
+  same-device bind mounts, come from `/proc/self/mountinfo`; macOS boundaries
+  come from the fixed `/sbin/mount` table. Production cleanup destroys the
+  fenced session volume instead of recursively deleting an unknown mounted
+  tree.
 - If validation or copy fails after the destination directory is created, the
   partial destination is retained. Pathname-based recursive cleanup cannot
   atomically prove that a racing writer has not replaced that directory, so the

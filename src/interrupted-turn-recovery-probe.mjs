@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { constants as fsConstants, mkdirSync } from "node:fs";
@@ -23,6 +24,7 @@ import {
 import { createServer } from "node:http";
 import { arch, platform, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 
 import {
   AppServerClient,
@@ -62,7 +64,8 @@ const JSON_STRING_AT_PATTERN =
 const JSON_PRIMITIVE_AT_PATTERN =
   /(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)/y;
 const MAX_EVIDENCE_STRING_SURFACES = 1_024;
-const MAX_SYMLINK_RESOLUTION_DEPTH = 40;
+const MAX_SYMLINK_RESOLUTION_DEPTH = 32;
+const execFileAsync = promisify(execFile);
 const NODE_ARCHITECTURES = new Set([
   "arm",
   "arm64",
@@ -371,6 +374,87 @@ function pathIsInside(root, candidate) {
   return child === "" || (child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child));
 }
 
+function decodeMountPath(value) {
+  return value.replace(/\\([0-7]{3})/g, (_match, digits) =>
+    String.fromCharCode(Number.parseInt(digits, 8)),
+  );
+}
+
+export function parseLinuxMountInfo(value) {
+  assert.equal(typeof value, "string", "Linux mountinfo must be text");
+  return value
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => {
+      const fields = line.split(" ");
+      assert(fields.length >= 10 && fields.includes("-"), "Linux mountinfo is malformed");
+      const mountPoint = decodeMountPath(fields[4]);
+      assert(isAbsolute(mountPoint), "Linux mountinfo contains a non-absolute path");
+      return mountPoint;
+    });
+}
+
+export function parseDarwinMountTable(value) {
+  assert.equal(typeof value, "string", "Darwin mount table must be text");
+  return value
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => {
+      const match = line.match(/^.* on (.*) \([^)]*\)$/u);
+      assert(match, "Darwin mount table is malformed");
+      const mountPoint = decodeMountPath(match[1]);
+      assert(isAbsolute(mountPoint), "Darwin mount table contains a non-absolute path");
+      return mountPoint;
+    });
+}
+
+async function listCurrentMountPoints({
+  currentPlatform = process.platform,
+  readMountInfo = readFile,
+  runMount = execFileAsync,
+} = {}) {
+  try {
+    if (currentPlatform === "linux") {
+      return parseLinuxMountInfo(await readMountInfo("/proc/self/mountinfo", "utf8"));
+    }
+    if (currentPlatform === "darwin") {
+      const { stderr, stdout } = await runMount("/sbin/mount", [], {
+        encoding: "utf8",
+        env: { ...process.env, LANG: "C", LC_ALL: "C" },
+        maxBuffer: 1024 * 1024,
+      });
+      if (stderr !== "") throw new Error("unexpected mount diagnostics");
+      return parseDarwinMountTable(stdout);
+    }
+    throw new Error("unsupported platform");
+  } catch {
+    throw new Error("portable tree mount boundary inspection failed");
+  }
+}
+
+async function assertNoMountBoundary(path, listMountPoints) {
+  const root = await realpath(path);
+  let mountPoints;
+  try {
+    mountPoints = await listMountPoints();
+  } catch {
+    throw new Error("portable tree mount boundary inspection failed");
+  }
+  assert(Array.isArray(mountPoints), "portable tree mount boundary inspection failed");
+  for (const mountPoint of mountPoints) {
+    assert.equal(typeof mountPoint, "string", "portable tree mount boundary inspection failed");
+    let candidate;
+    try {
+      candidate = await realpath(mountPoint);
+    } catch {
+      candidate = resolve(mountPoint);
+    }
+    if (candidate === root || pathIsInside(root, candidate)) {
+      throw new Error("portable tree rejects nested mount points");
+    }
+  }
+}
+
 function portableMode(metadata) {
   const mode = typeof metadata.mode === "bigint" ? Number(metadata.mode) : metadata.mode;
   if ((mode & 0o7000) !== 0) {
@@ -528,7 +612,8 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
 }) {
   let current = start;
   let currentIsDirectory = true;
-  let followedSymlinks = 0;
+  // The source entry being validated is itself the first symlink traversal.
+  let followedSymlinks = 1;
   const pending = pathComponents(target);
 
   while (pending.length > 0) {
@@ -887,7 +972,7 @@ async function copyTreeEntry(
   }
 }
 
-export async function removeTreeForCleanup(path) {
+async function removeTreeEntryForCleanup(path) {
   let metadata;
   try {
     metadata = await lstat(path);
@@ -898,9 +983,24 @@ export async function removeTreeForCleanup(path) {
   if (metadata.isDirectory()) {
     await chmod(path, (metadata.mode & 0o777) | 0o700);
     const entries = await readdir(path, { encoding: "buffer" });
-    for (const entry of entries) await removeTreeForCleanup(rawChildPath(path, entry));
+    for (const entry of entries) await removeTreeEntryForCleanup(rawChildPath(path, entry));
   }
   await rm(path, { recursive: metadata.isDirectory(), force: true });
+}
+
+export async function removeTreeForCleanup(
+  path,
+  { listMountPoints = listCurrentMountPoints } = {},
+) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (metadata.isDirectory()) await assertNoMountBoundary(path, listMountPoints);
+  await removeTreeEntryForCleanup(path);
 }
 
 export async function copyStoppedTree({
@@ -914,6 +1014,7 @@ export async function copyStoppedTree({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  listMountPoints = listCurrentMountPoints,
 }) {
   const canonicalOwnedRoot = await assertPrivateOwnedRoot(ownedRoot);
   const canonicalSource = await assertDirectOwnedPath(canonicalOwnedRoot, source, "source", {
@@ -925,6 +1026,7 @@ export async function copyStoppedTree({
     sourceRootIdentity.isDirectory(),
     "stopped-tree copy rejects source root identity changes",
   );
+  await assertNoMountBoundary(canonicalSource, listMountPoints);
   const canonicalDestination = await assertDirectOwnedPath(
     canonicalOwnedRoot,
     destination,
@@ -1097,7 +1199,11 @@ async function hashTreeEntry(hash, root, path, checkAccess) {
   }
 }
 
-export async function digestTree(root, { checkAccess = access } = {}) {
+export async function digestTree(
+  root,
+  { checkAccess = access, listMountPoints = listCurrentMountPoints } = {},
+) {
+  await assertNoMountBoundary(root, listMountPoints);
   const hash = createHash("sha256");
   await hashTreeEntry(hash, root, root, checkAccess);
   return hash.digest("hex");
@@ -1814,13 +1920,73 @@ async function assertPrivateBinaryIntegrity(path, expectedDigest) {
   );
 }
 
+export function parseLinuxGetfacl(value) {
+  assert.equal(typeof value, "string", "Linux getfacl output must be text");
+  const entries = value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  assert(entries.length >= 3, "Linux getfacl output is incomplete");
+  let hasUser = false;
+  let hasGroup = false;
+  let hasOther = false;
+  let extended = false;
+  for (const entry of entries) {
+    const match = entry.match(
+      /^(default:)?(user|group|mask|other):([^:]*):[rwx-]{3}(?:\s+#effective:[rwx-]{3})?$/u,
+    );
+    assert(match, "Linux getfacl output is malformed");
+    const [, defaultPrefix, kind, qualifier] = match;
+    if (defaultPrefix || kind === "mask" || qualifier !== "") {
+      extended = true;
+      continue;
+    }
+    if (kind === "user") hasUser = true;
+    if (kind === "group") hasGroup = true;
+    if (kind === "other") hasOther = true;
+  }
+  assert(hasUser && hasGroup && hasOther, "Linux getfacl output omitted base entries");
+  return extended;
+}
+
+export async function inspectLinuxRecoveryAcl(path, { runCommand = execFileAsync } = {}) {
+  try {
+    if (typeof path !== "string" || !isAbsolute(path)) throw new Error("invalid path");
+    const { stderr, stdout } = await runCommand(
+      "/usr/bin/getfacl",
+      ["--absolute-names", "--omit-header", path],
+      {
+        encoding: "utf8",
+        env: { ...process.env, LANG: "C", LC_ALL: "C" },
+        maxBuffer: 64 * 1024,
+      },
+    );
+    if (stderr !== "") throw new Error("unexpected getfacl diagnostics");
+    return parseLinuxGetfacl(stdout);
+  } catch {
+    throw new Error("Linux ACL capability inspection failed");
+  }
+}
+
+async function recoveryPathHasExtendedAcl(path) {
+  return platform() === "linux"
+    ? inspectLinuxRecoveryAcl(path)
+    : pathHasExtendedAcl(path);
+}
+
+async function recoveryPathHasUnsafeAncestorAcl(path) {
+  return platform() === "linux"
+    ? inspectLinuxRecoveryAcl(path)
+    : pathHasUnsafeAncestorAcl(path);
+}
+
 async function assertTrustedExecutableRoot(
   path,
   identity,
   {
     currentUid,
-    inspectAncestorAcl = pathHasUnsafeAncestorAcl,
-    inspectRootAcl = pathHasExtendedAcl,
+    inspectAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
+    inspectRootAcl = recoveryPathHasExtendedAcl,
   },
 ) {
   const safeDirectory = (metadata, childUid) =>
@@ -1890,8 +2056,8 @@ export async function probeInterruptedTurnRecovery({
   codexBin = process.env.CODEX_BIN,
   evidencePath,
   executableRoot = process.env.CODEX_RECOVERY_EXEC_ROOT ?? tmpdir(),
-  inspectExecutableAncestorAcl = pathHasUnsafeAncestorAcl,
-  inspectExecutableRootAcl = pathHasExtendedAcl,
+  inspectExecutableAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
+  inspectExecutableRootAcl = recoveryPathHasExtendedAcl,
   readCodexVersion = codexVersion,
   runScenario = runRecoveryScenario,
   scenarios = RECOVERY_SCENARIOS,
