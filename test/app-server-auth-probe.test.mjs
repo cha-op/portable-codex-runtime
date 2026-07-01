@@ -43,10 +43,18 @@ const DETACHED_GRANDCHILD_FIXTURE = fileURLToPath(
   new URL("../fixtures/detached-grandchild-app-server.mjs", import.meta.url),
 );
 
-async function killAndWaitForProcess(pid, timeoutMs = 2_000) {
+async function killAndWaitForProcess(
+  pid,
+  timeoutMs = 2_000,
+  {
+    inspectProcessGroup = inspectLinuxProcessGroup,
+    killProcess = process.kill,
+    platform = process.platform,
+  } = {},
+) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return;
   try {
-    process.kill(pid, "SIGKILL");
+    killProcess(pid, "SIGKILL");
   } catch (error) {
     if (error?.code === "ESRCH") return;
     throw error;
@@ -54,10 +62,14 @@ async function killAndWaitForProcess(pid, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
-      process.kill(pid, 0);
+      killProcess(pid, 0);
     } catch (error) {
       if (error?.code === "ESRCH") return;
       throw error;
+    }
+    if (platform === "linux") {
+      const state = await inspectProcessGroup(pid);
+      if (state === "empty" || state === "zombie-only") return;
     }
     assert(Date.now() < deadline, `detached fixture process ${pid} survived SIGKILL`);
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -371,6 +383,28 @@ test("Linux process-group inspection distinguishes live and zombie-only members"
   } finally {
     await rm(procRoot, { recursive: true, force: true });
   }
+});
+
+test("Linux detached fixture cleanup accepts a zombie-only process group", async () => {
+  const signals = [];
+  const inspectionStates = ["live", "zombie-only"];
+  await killAndWaitForProcess(4242, 200, {
+    inspectProcessGroup: async (processGroupId) => {
+      assert.equal(processGroupId, 4242);
+      return inspectionStates.shift();
+    },
+    killProcess: (pid, signal) => {
+      signals.push({ pid, signal });
+    },
+    platform: "linux",
+  });
+
+  assert.deepEqual(signals, [
+    { pid: 4242, signal: "SIGKILL" },
+    { pid: 4242, signal: 0 },
+    { pid: 4242, signal: 0 },
+  ]);
+  assert.deepEqual(inspectionStates, []);
 });
 
 function installSyntheticChild(client, { onStdinEnd = () => {} } = {}) {
