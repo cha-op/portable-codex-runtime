@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, mkdirSync } from "node:fs";
 import {
   access,
   chmod,
@@ -339,6 +339,25 @@ async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist })
   return canonicalCandidate;
 }
 
+async function assertPrivateOwnedRoot(ownedRoot) {
+  const requestedRoot = resolve(ownedRoot);
+  const canonicalRoot = await realpath(requestedRoot);
+  const metadata = await lstat(requestedRoot);
+  const currentUid = process.geteuid?.() ?? process.getuid?.();
+  assert.notEqual(currentUid, undefined, "stopped-tree copy requires a POSIX owner identity");
+  assert(
+    metadata.isDirectory() && !metadata.isSymbolicLink(),
+    "stopped-tree owned root must be a directory",
+  );
+  assert.equal(metadata.uid, currentUid, "stopped-tree owned root must be owned by this user");
+  assert.equal(
+    metadata.mode & 0o777,
+    0o700,
+    "stopped-tree owned root must have mode 0700",
+  );
+  return canonicalRoot;
+}
+
 function pathIsInside(root, candidate) {
   const child = relative(root, candidate);
   return child === "" || (child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child));
@@ -409,6 +428,15 @@ async function digestFileHandle(handle) {
   }
 }
 
+function mkdirPrivate(path) {
+  const previousUmask = process.umask(0);
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } finally {
+    process.umask(previousUmask);
+  }
+}
+
 async function assertSnapshotUserAccess(path, mode, checkAccess = access) {
   try {
     await checkAccess(path, mode);
@@ -443,6 +471,9 @@ export function assertPortableDirectoryNames(entries) {
   for (const entry of entries) {
     assert.equal(typeof entry, "string", "portable directory entries must be strings");
     const normalized = entry.normalize("NFC");
+    if (entry !== normalized) {
+      throw new Error("portable tree rejects non-NFC directory names");
+    }
     for (const value of [entry, normalized]) {
       for (const character of value) {
         if (
@@ -483,6 +514,7 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
   start,
   target,
   validateCandidate,
+  validateMetadata = async () => {},
   danglingMessage,
   nonDirectoryMessage,
 }) {
@@ -535,6 +567,7 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
       if (error?.code === "ENOENT") throw new Error(danglingMessage);
       throw error;
     }
+    await validateMetadata(candidate, metadata);
     if (!metadata.isSymbolicLink()) {
       current = candidate;
       currentIsDirectory = metadata.isDirectory();
@@ -567,7 +600,9 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
 async function assertPortableSymlink({
   destination,
   destinationRoots,
+  destinationRootIdentity,
   source,
+  sourceRootIdentity,
   sourceRoots,
   target,
 }) {
@@ -586,6 +621,16 @@ async function assertPortableSymlink({
         if (
           destinationRoots.some((destinationRoot) => pathIsInside(destinationRoot, candidate))
         ) {
+          throw new Error(
+            "stopped-tree copy rejects absolute symlinks into the destination tree",
+          );
+        }
+      },
+      validateMetadata: async (_candidate, metadata) => {
+        if (sameFileIdentity(metadata, sourceRootIdentity)) {
+          throw new Error("stopped-tree copy rejects absolute symlinks into the source tree");
+        }
+        if (sameFileIdentity(metadata, destinationRootIdentity)) {
           throw new Error(
             "stopped-tree copy rejects absolute symlinks into the destination tree",
           );
@@ -629,9 +674,21 @@ async function copyTreeEntry(
   context,
   source,
   destination,
-  { destinationDirectoryCreated = false } = {},
+  {
+    assertDestinationParentCurrent = context.assertDestinationRootCurrent,
+    destinationDirectoryCreated = false,
+    destinationDirectoryHandle: providedDestinationDirectoryHandle,
+    destinationDirectoryIdentity: providedDestinationDirectoryIdentity,
+    expectedSourceIdentity,
+  } = {},
 ) {
   const metadata = await lstat(source, { bigint: true });
+  if (expectedSourceIdentity) {
+    assert(
+      metadata.isDirectory() && sameFileIdentity(metadata, expectedSourceIdentity),
+      "stopped-tree copy rejects source root identity changes",
+    );
+  }
   if (metadata.isSymbolicLink()) {
     if (metadata.nlink !== 1n) {
       throw new Error("stopped-tree copy rejects hard-linked symlinks");
@@ -643,7 +700,7 @@ async function copyTreeEntry(
       "stopped-tree copy rejects source symlink identity changes",
     );
     await assertPortableSymlink({ ...context, source, destination, target });
-    await context.assertDestinationRootCurrent();
+    await assertDestinationParentCurrent();
     await context.afterSourceSymlinkValidated?.(source);
     await assertPathIdentity(
       source,
@@ -656,7 +713,7 @@ async function copyTreeEntry(
       metadata,
       "stopped-tree copy rejects source symlink identity changes",
     );
-    await context.assertDestinationRootCurrent();
+    await assertDestinationParentCurrent();
     return;
   }
   if (metadata.isDirectory()) {
@@ -665,6 +722,9 @@ async function copyTreeEntry(
       source,
       fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
     );
+    let destinationDirectoryHandle = providedDestinationDirectoryHandle;
+    let destinationDirectoryIdentity = providedDestinationDirectoryIdentity;
+    let ownsDestinationDirectoryHandle = false;
     let primaryFailure;
     try {
       const heldMetadata = await sourceHandle.stat({ bigint: true });
@@ -680,11 +740,52 @@ async function copyTreeEntry(
       );
       const finalMode = portableMode(heldMetadata);
       if (!destinationDirectoryCreated) {
-        await context.assertDestinationRootCurrent();
-        await mkdir(destination, { mode: 0o700 });
+        await assertDestinationParentCurrent();
+        mkdirPrivate(destination);
+        destinationDirectoryIdentity = await lstat(destination, { bigint: true });
+        await context.afterDestinationDirectoryCreated?.(destination);
+        await assertPathIdentity(
+          destination,
+          destinationDirectoryIdentity,
+          "stopped-tree copy rejects destination directory identity changes",
+        );
+        destinationDirectoryHandle = await open(
+          destination,
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+        );
+        ownsDestinationDirectoryHandle = true;
       }
-      await context.assertDestinationRootCurrent();
-      await chmod(destination, 0o700);
+      assert(destinationDirectoryHandle, "stopped-tree copy requires a destination handle");
+      assert(
+        destinationDirectoryIdentity?.isDirectory(),
+        "stopped-tree copy rejects destination directory identity changes",
+      );
+      const heldDestinationDirectoryIdentity = await destinationDirectoryHandle.stat({
+        bigint: true,
+      });
+      assert(
+        heldDestinationDirectoryIdentity.isDirectory() &&
+          sameFileIdentity(
+            destinationDirectoryIdentity,
+            heldDestinationDirectoryIdentity,
+          ),
+        "stopped-tree copy rejects destination directory identity changes",
+      );
+      const assertDestinationDirectoryCurrent = async () => {
+        await assertDestinationParentCurrent();
+        const heldIdentity = await destinationDirectoryHandle.stat({ bigint: true });
+        const currentIdentity = await assertPathIdentity(
+          destination,
+          destinationDirectoryIdentity,
+          "stopped-tree copy rejects destination directory identity changes",
+        );
+        assert(
+          sameFileIdentity(heldIdentity, currentIdentity),
+          "stopped-tree copy rejects destination directory identity changes",
+        );
+      };
+      await assertDestinationDirectoryCurrent();
+      await destinationDirectoryHandle.chmod(0o700);
       const entries = await readPortableDirectory(source);
       await assertPathIdentity(
         source,
@@ -692,7 +793,10 @@ async function copyTreeEntry(
         "stopped-tree copy rejects source directory identity changes",
       );
       for (const entry of entries) {
-        await copyTreeEntry(context, join(source, entry), join(destination, entry));
+        await assertDestinationDirectoryCurrent();
+        await copyTreeEntry(context, join(source, entry), join(destination, entry), {
+          assertDestinationParentCurrent: assertDestinationDirectoryCurrent,
+        });
       }
       const finalSourceMetadata = await sourceHandle.stat({ bigint: true });
       assertStableFileMetadata(
@@ -705,15 +809,24 @@ async function copyTreeEntry(
         heldMetadata,
         "stopped-tree copy rejects source directory identity changes",
       );
-      await context.assertDestinationRootCurrent();
-      await chmod(destination, finalMode);
-      await context.assertDestinationRootCurrent();
+      await assertDestinationDirectoryCurrent();
+      await destinationDirectoryHandle.chmod(finalMode);
+      await assertDestinationDirectoryCurrent();
       return;
     } catch (error) {
       primaryFailure = { error };
       throw error;
     } finally {
-      await runSequentialCleanup([() => sourceHandle.close()], primaryFailure);
+      await runSequentialCleanup(
+        [
+          () =>
+            ownsDestinationDirectoryHandle
+              ? destinationDirectoryHandle?.close()
+              : undefined,
+          () => sourceHandle.close(),
+        ],
+        primaryFailure,
+      );
     }
   }
   if (!metadata.isFile()) {
@@ -732,7 +845,7 @@ async function copyTreeEntry(
       "stopped-tree copy rejects source file identity changes",
     );
     const finalMode = portableMode(heldMetadata);
-    await context.assertDestinationRootCurrent();
+    await assertDestinationParentCurrent();
     destinationHandle = await open(
       destination,
       fsConstants.O_WRONLY |
@@ -754,7 +867,7 @@ async function copyTreeEntry(
       "stopped-tree copy rejects source file identity changes",
     );
     await destinationHandle.chmod(finalMode);
-    await context.assertDestinationRootCurrent();
+    await assertDestinationParentCurrent();
   } catch (error) {
     primaryFailure = { error };
     throw error;
@@ -788,16 +901,24 @@ export async function copyStoppedTree({
   destination,
   afterDestinationValidation,
   afterDestinationRootCreated,
+  afterDestinationDirectoryCreated,
   afterSourceSymlinkValidated,
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
 }) {
-  const canonicalSource = await assertDirectOwnedPath(ownedRoot, source, "source", {
+  const canonicalOwnedRoot = await assertPrivateOwnedRoot(ownedRoot);
+  const canonicalSource = await assertDirectOwnedPath(canonicalOwnedRoot, source, "source", {
     mustExist: true,
   });
+  const canonicalSourceRoot = await realpath(canonicalSource);
+  const sourceRootIdentity = await lstat(canonicalSource, { bigint: true });
+  assert(
+    sourceRootIdentity.isDirectory(),
+    "stopped-tree copy rejects source root identity changes",
+  );
   const canonicalDestination = await assertDirectOwnedPath(
-    ownedRoot,
+    canonicalOwnedRoot,
     destination,
     "destination",
     { mustExist: false },
@@ -807,10 +928,14 @@ export async function copyStoppedTree({
   let destinationRootIdentity;
   let primaryFailure;
   try {
-    await mkdir(canonicalDestination, { mode: 0o700 });
+    mkdirPrivate(canonicalDestination);
     destinationRootIdentity = await lstat(canonicalDestination, { bigint: true });
-    await chmod(canonicalDestination, 0o700);
     await afterDestinationRootCreated?.();
+    await assertPathIdentity(
+      canonicalDestination,
+      destinationRootIdentity,
+      "stopped-tree copy rejects destination root identity changes",
+    );
     destinationRootHandle = await open(
       canonicalDestination,
       fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
@@ -821,6 +946,7 @@ export async function copyStoppedTree({
         sameFileIdentity(destinationRootIdentity, heldDestinationRootIdentity),
       "stopped-tree copy rejects destination root identity changes",
     );
+    await destinationRootHandle.chmod(0o700);
     const assertDestinationRootCurrent = async () => {
       const heldIdentity = await destinationRootHandle.stat({ bigint: true });
       const currentIdentity = await assertPathIdentity(
@@ -836,6 +962,7 @@ export async function copyStoppedTree({
     await copyTreeEntry(
       {
         assertDestinationRootCurrent,
+        afterDestinationDirectoryCreated,
         afterSourceSymlinkValidated,
         afterSourceDirectoryOpen,
         beforeSourceOpen,
@@ -847,11 +974,19 @@ export async function copyStoppedTree({
             basename(canonicalDestination),
           ),
         ],
-        sourceRoots: [resolve(canonicalSource), await realpath(canonicalSource)],
+        destinationRootIdentity,
+        sourceRootIdentity,
+        sourceRoots: [resolve(canonicalSource), canonicalSourceRoot],
       },
       canonicalSource,
       canonicalDestination,
-      { destinationDirectoryCreated: true },
+      {
+        assertDestinationParentCurrent: async () => {},
+        destinationDirectoryCreated: true,
+        destinationDirectoryHandle: destinationRootHandle,
+        destinationDirectoryIdentity: destinationRootIdentity,
+        expectedSourceIdentity: sourceRootIdentity,
+      },
     );
     await assertDestinationRootCurrent();
   } catch (error) {

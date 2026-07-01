@@ -43,12 +43,12 @@ The snapshot scenario copies every snapshot-user-accessible entry in the
 synthetic session tree, including `CODEX_HOME` and workspace, after the killed
 process has exited. It hashes relative paths, entry types, regular-file and
 directory POSIX rwx permission bits, file bytes, and symlink targets before and
-after copy. Portable UTF-8 entry names without non-ASCII
-cased characters in either their raw or NFC-normalized form, or collisions
-under NFC normalization plus ASCII lowercase comparison, existing relocatable
-relative symlinks, and external absolute links are copied without following
-symlink targets. Unsupported cased names, name collisions, non-UTF-8 entry
-names, inaccessible entries, absolute links back into the source tree,
+after copy. NFC-normalized portable UTF-8 entry names without non-ASCII cased
+characters or collisions under ASCII lowercase comparison, existing
+relocatable relative symlinks, and external absolute links are copied without
+following symlink targets. Non-NFC names, unsupported cased names, name
+collisions, non-UTF-8 entry names, inaccessible entries, absolute links back
+into the source tree,
 dangling relative links, relative-link case or normalization aliases, relative
 link traversal through non-directories, resolution chains that leave the source
 tree, absolute resolution chains that enter the source or destination tree,
@@ -107,6 +107,10 @@ must have no extended ACL. The probe creates a mode `0700` subdirectory there,
 executes a mode `0500` private Codex copy, and removes the subdirectory after
 the matrix. This override is execution scratch only and must not point into the
 recoverable session tree.
+The pinned macOS/Linux runtime image must provide `/bin/ls`, which the
+fail-closed ACL inspector invokes by absolute path with fixed arguments. Other
+Linux layouts, including images that omit that path, are outside this probe's
+compatibility claim until they provide an equivalent pinned inspector.
 
 ## Upstream Semantics
 
@@ -190,10 +194,10 @@ restore interfaces.
 - Signal scenarios intentionally require the pinned runtime to report actual
   signal termination. If a future Codex binary traps `SIGTERM` and exits cleanly,
   the compatibility probe fails until that changed shutdown contract is reviewed.
-- Portable UTF-8 directory entry names, existing relocatable relative symlink
-  targets, and existing external absolute symlink targets are preserved exactly;
-  entries inaccessible to the snapshot user, non-ASCII cased names,
-  case-insensitive or Unicode-normalized name collisions, non-UTF-8 names or
+- NFC-normalized portable UTF-8 directory entry names, existing relocatable
+  relative symlink targets, and existing external absolute symlink targets are
+  preserved exactly; entries inaccessible to the snapshot user, non-NFC names,
+  non-ASCII cased names, case-insensitive name collisions, non-UTF-8 names or
   targets, dangling absolute or relative targets, internal absolute targets,
   relative-link case or normalization aliases, traversal through
   non-directories, relative resolution chains that leave the source tree,
@@ -206,6 +210,12 @@ restore interfaces.
   topology. Special bits and hard links, including hard-linked symlinks, fail
   closed; the other metadata remains outside this modeled digest and must be
   preserved by the later volume-snapshot implementation.
+- The stopped-tree copy requires exclusive single-writer control of its private
+  mode `0700` owned root. It pins and revalidates each destination directory as
+  defense in depth, but concurrent mutation by another process with the same
+  UID is outside its security contract. The production design supplies this
+  invariant with session fencing, worker quiescence, and a single-attached
+  volume before snapshot.
 - If validation or copy fails after the destination directory is created, the
   partial destination is retained. Pathname-based recursive cleanup cannot
   atomically prove that a racing writer has not replaced that directory, so the

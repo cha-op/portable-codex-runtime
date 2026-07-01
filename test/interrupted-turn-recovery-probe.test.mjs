@@ -306,7 +306,7 @@ test("stopped-tree copy rejects symlink-parent dot-dot paths outside the owned r
   try {
     const ownedRoot = join(container, "owned");
     const outsideRoot = join(container, "outside");
-    await mkdir(ownedRoot);
+    await mkdir(ownedRoot, { mode: 0o700 });
     await mkdir(join(outsideRoot, "child"), { recursive: true });
     await mkdir(join(outsideRoot, "source"));
     await writeFile(join(outsideRoot, "source", "sentinel"), "outside");
@@ -333,12 +333,33 @@ test("stopped-tree copy rejects symlink-parent dot-dot paths outside the owned r
   }
 });
 
+test("stopped-tree copy requires a private coordinator-owned root", async () => {
+  const container = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-test-"));
+  try {
+    const ownedRoot = join(container, "owned");
+    const source = join(ownedRoot, "source");
+    await mkdir(source, { recursive: true });
+    await chmod(ownedRoot, 0o750);
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot,
+        source,
+        destination: join(ownedRoot, "destination"),
+      }),
+      /owned root must have mode 0700/,
+    );
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects terminal dot segments as owned children", async () => {
   const container = await mkdtemp(join(tmpdir(), "portable-copy-dot-segment-test-"));
   try {
     const ownedRoot = join(container, "owned");
     const source = join(ownedRoot, "source");
-    await mkdir(source, { recursive: true });
+    await mkdir(ownedRoot, { mode: 0o700 });
+    await mkdir(source);
     await writeFile(join(source, "sentinel"), "inside");
     for (const segment of [".", ".."]) {
       await assert.rejects(
@@ -421,18 +442,17 @@ test("portable directory entry decoding rejects lossy UTF-8", () => {
   );
 });
 
-test("portable directory names reject case and Unicode-normalization collisions", () => {
+test("portable directory names require NFC and reject portable collisions", () => {
   assert.deepEqual(assertPortableDirectoryNames(["zeta", "Alpha"]), ["Alpha", "zeta"]);
-  for (const entries of [
-    ["README", "readme"],
-    ["\uac00", "\u1100\u1161"],
-  ]) {
-    assert.throws(
-      () => assertPortableDirectoryNames(entries),
-      /case or Unicode-normalization name collisions/,
-    );
-  }
-  for (const entry of ["\u03a3", "\u03c2", "Stra\u00dfe", "caf\u00e9", "\u212a"]) {
+  assert.throws(
+    () => assertPortableDirectoryNames(["README", "readme"]),
+    /case or Unicode-normalization name collisions/,
+  );
+  assert.throws(
+    () => assertPortableDirectoryNames(["e\u0301"]),
+    /rejects non-NFC directory names/,
+  );
+  for (const entry of ["\u03a3", "\u03c2", "Stra\u00dfe", "caf\u00e9"]) {
     assert.throws(
       () => assertPortableDirectoryNames([entry]),
       /non-ASCII cased directory names/,
@@ -500,6 +520,34 @@ test("stopped-tree copy rejects canonical aliases of absolute internal symlinks"
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /rejects absolute symlinks into the source tree/,
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects case aliases of absolute internal symlinks", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-case-alias-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "target"), "sentinel");
+    const sourceAlias = join(root, "SOURCE");
+    try {
+      await lstat(sourceAlias);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        context.skip("filesystem is case-sensitive");
+        return;
+      }
+      throw error;
+    }
+    await symlink(join(sourceAlias, "target"), join(source, "case-alias"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects absolute symlinks into the source tree/,
+    );
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -796,6 +844,43 @@ test("stopped-tree copy preserves a replacement after destination-root identity 
       /destination root identity changes/,
     );
     assert.equal(await readFile(sentinel, "utf8"), "preserve");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects replaced destination subdirectories before writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-destination-child-race-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const destinationChild = join(destination, "nested");
+    const displaced = join(root, "displaced-destination-child");
+    const outside = join(root, "outside");
+    let replaced = false;
+    await mkdir(join(source, "nested"), { recursive: true });
+    await writeFile(join(source, "nested", "source-file"), "source");
+    await mkdir(outside, { mode: 0o750 });
+    await writeFile(join(outside, "sentinel"), "preserve");
+    const outsideMode = (await stat(outside)).mode & 0o777;
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        afterDestinationDirectoryCreated: async (path) => {
+          if (replaced || basename(path) !== "nested") return;
+          replaced = true;
+          await rename(destinationChild, displaced);
+          await symlink(outside, destinationChild);
+        },
+      }),
+      /ELOOP|destination directory identity changes/,
+    );
+    assert.equal(await readFile(join(outside, "sentinel"), "utf8"), "preserve");
+    assert.equal((await stat(outside)).mode & 0o777, outsideMode);
+    await assert.rejects(lstat(join(outside, "source-file")), /ENOENT/);
+    await assertRetainedFailedDestination(destination);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

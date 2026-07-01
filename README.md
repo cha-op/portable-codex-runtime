@@ -40,8 +40,9 @@ Signal and hard-kill recovery instead normalizes the stale in-progress turn to
 `interrupted` without inventing that marker. The stopped-tree copy preserves
 snapshot-user-accessible regular files and directories with their POSIX rwx
 permission bits, plus portable UTF-8 symlink targets without following links.
-Symlink permission bits are outside the modeled digest. Inaccessible entries,
-non-ASCII cased names, case-insensitive or Unicode-normalized name collisions,
+Symlink permission bits are outside the modeled digest. Directory names must be
+NFC-normalized. Inaccessible entries, non-ASCII cased names, case-insensitive
+name collisions,
 dangling relative links, relative-link
 case or normalization aliases, traversal through non-directories,
 resolution chains that cross protected trees, non-relocatable links, special
@@ -53,6 +54,9 @@ timestamps, and other unmodeled metadata are not preserved or covered by the
 digest. If validation or copy fails after destination creation, the partial
 destination is retained for cleanup by the trusted owner; the helper never
 recursively removes a failure path that another writer could have replaced.
+The copy helper requires exclusive single-writer control of its mode `0700`
+owned root; concurrent mutation by another process with the same UID is not a
+supported security boundary.
 It is not an online, atomic, or power-loss-durable snapshot implementation.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
@@ -67,6 +71,8 @@ If the system temporary filesystem is mounted `noexec`, set
 `CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
 filesystem with a trusted owner, ancestor chain, and ACL state; the probe
 creates and removes its own mode `0700` subdirectory there.
+The pinned macOS/Linux runtime image must provide `/bin/ls`, which the
+fail-closed ACL inspector invokes with fixed arguments.
 
 To update the redacted evidence after an intentional runtime upgrade:
 
