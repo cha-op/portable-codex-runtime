@@ -54,6 +54,7 @@ into the source tree,
 dangling relative links, relative-link case or normalization aliases, relative
 link traversal through non-directories, resolution chains that leave the source
 tree, absolute resolution chains that enter the source or destination tree,
+external filesystem-identity aliases into the source tree,
 relative links whose meaning changes after relocation, special permission bits,
 hard-linked files or symlinks, sockets, FIFOs, and devices fail closed.
 The source tree
@@ -206,7 +207,8 @@ restore interfaces.
   targets, dangling absolute or relative targets, internal absolute targets,
   relative-link case or normalization aliases, traversal through
   non-directories, relative resolution chains that leave the source tree,
-  absolute resolution chains that enter the source or destination tree, and
+  absolute resolution chains that enter the source or destination tree,
+  external filesystem-identity aliases into the source tree, and
   non-relocatable relative targets fail closed. A fixed
   runtime image must provide every external target, such as a Codex helper path,
   at a compatible location during copy and after migration. Symlink resolution

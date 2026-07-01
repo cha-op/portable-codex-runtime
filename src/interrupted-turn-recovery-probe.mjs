@@ -467,6 +467,10 @@ function sameFileIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+function fileIdentityKey(metadata) {
+  return `${metadata.dev}:${metadata.ino}`;
+}
+
 function assertStableFileMetadata(before, after, message) {
   assert(
     sameFileIdentity(before, after) &&
@@ -486,6 +490,57 @@ async function assertPathIdentity(path, expected, message) {
   }
   assert(sameFileIdentity(current, expected), message);
   return current;
+}
+
+async function collectTreeIdentities(path, identities = new Set()) {
+  const metadata = await lstat(path, { bigint: true });
+  identities.add(fileIdentityKey(metadata));
+  if (!metadata.isDirectory()) {
+    await assertPathIdentity(
+      path,
+      metadata,
+      "stopped-tree copy rejects source entry identity changes",
+    );
+    return identities;
+  }
+
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  let primaryFailure;
+  try {
+    const heldMetadata = await handle.stat({ bigint: true });
+    assert(
+      heldMetadata.isDirectory() && sameFileIdentity(metadata, heldMetadata),
+      "stopped-tree copy rejects source directory identity changes",
+    );
+    const entries = await readPortableDirectory(path);
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree copy rejects source directory identity changes",
+    );
+    for (const entry of entries) {
+      await collectTreeIdentities(join(path, entry), identities);
+    }
+    assertStableFileMetadata(
+      heldMetadata,
+      await handle.stat({ bigint: true }),
+      "stopped-tree copy rejects source directory metadata changes",
+    );
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree copy rejects source directory identity changes",
+    );
+    return identities;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
 }
 
 async function copyFileContents(sourceHandle, destinationHandle) {
@@ -603,6 +658,7 @@ function pathComponents(path) {
 
 async function resolveSymlinkTargetWithoutHiddenTraversal({
   exactPortableNames,
+  inspectMetadata = lstat,
   start,
   target,
   validateCandidate,
@@ -655,7 +711,7 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
     validateCandidate(candidate);
     let metadata;
     try {
-      metadata = await lstat(candidate, { bigint: true });
+      metadata = await inspectMetadata(candidate, { bigint: true });
     } catch (error) {
       if (error?.code === "ENOENT") throw new Error(danglingMessage);
       throw error;
@@ -694,7 +750,9 @@ async function assertPortableSymlink({
   destination,
   destinationRoots,
   destinationRootIdentity,
+  inspectSymlinkPath,
   source,
+  sourceIdentityKeys,
   sourceRootIdentity,
   sourceRoots,
   target,
@@ -703,6 +761,7 @@ async function assertPortableSymlink({
     const root = parse(target).root;
     await resolveSymlinkTargetWithoutHiddenTraversal({
       exactPortableNames: false,
+      inspectMetadata: inspectSymlinkPath,
       start: root,
       target: target.slice(root.length),
       danglingMessage: "stopped-tree copy rejects dangling absolute symlinks",
@@ -720,7 +779,10 @@ async function assertPortableSymlink({
         }
       },
       validateMetadata: async (_candidate, metadata) => {
-        if (sameFileIdentity(metadata, sourceRootIdentity)) {
+        if (
+          sourceIdentityKeys.has(fileIdentityKey(metadata)) ||
+          sameFileIdentity(metadata, sourceRootIdentity)
+        ) {
           throw new Error("stopped-tree copy rejects absolute symlinks into the source tree");
         }
         if (sameFileIdentity(metadata, destinationRootIdentity)) {
@@ -776,6 +838,10 @@ async function copyTreeEntry(
   } = {},
 ) {
   const metadata = await lstat(source, { bigint: true });
+  assert(
+    context.sourceIdentityKeys.has(fileIdentityKey(metadata)),
+    "stopped-tree copy rejects source entry identity changes",
+  );
   if (expectedSourceIdentity) {
     assert(
       metadata.isDirectory() && sameFileIdentity(metadata, expectedSourceIdentity),
@@ -1014,6 +1080,7 @@ export async function copyStoppedTree({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  inspectSymlinkPath = lstat,
   listMountPoints = listCurrentMountPoints,
 }) {
   const canonicalOwnedRoot = await assertPrivateOwnedRoot(ownedRoot);
@@ -1027,6 +1094,9 @@ export async function copyStoppedTree({
     "stopped-tree copy rejects source root identity changes",
   );
   await assertNoMountBoundary(canonicalSource, listMountPoints);
+  // Index before copying so an absolute link cannot reach a source subtree
+  // through an external bind-mount or other filesystem identity alias.
+  const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
   const canonicalDestination = await assertDirectOwnedPath(
     canonicalOwnedRoot,
     destination,
@@ -1085,6 +1155,8 @@ export async function copyStoppedTree({
           ),
         ],
         destinationRootIdentity,
+        inspectSymlinkPath,
+        sourceIdentityKeys,
         sourceRootIdentity,
         sourceRoots: [resolve(canonicalSource), canonicalSourceRoot],
       },

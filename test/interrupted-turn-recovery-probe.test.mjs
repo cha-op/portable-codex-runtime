@@ -471,6 +471,73 @@ test("stopped-tree copy preserves symlinks without following their targets", asy
   }
 });
 
+test("stopped-tree copy rejects external identity aliases into the source tree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-source-alias-test-"));
+  try {
+    const source = join(root, "source");
+    const sourceSubtree = join(source, "subtree");
+    const externalAlias = join(root, "external-alias");
+    const destination = join(root, "destination");
+    await mkdir(sourceSubtree, { recursive: true });
+    await mkdir(externalAlias);
+    await writeFile(join(sourceSubtree, "source-sentinel"), "source");
+    await writeFile(join(externalAlias, "external-sentinel"), "external");
+    await symlink(join(externalAlias, "external-sentinel"), join(source, "alias-link"));
+    const sourceSubtreeIdentity = await lstat(sourceSubtree, { bigint: true });
+    const canonicalExternalAlias = await realpath(externalAlias);
+
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        inspectSymlinkPath: async (candidate, options) =>
+          (await realpath(candidate)) === canonicalExternalAlias
+            ? sourceSubtreeIdentity
+            : lstat(candidate, options),
+      }),
+      /rejects absolute symlinks into the source tree/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects external identity aliases to source files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-source-file-alias-test-"));
+  try {
+    const source = join(root, "source");
+    const sourceFile = join(source, "source-file");
+    const external = join(root, "external");
+    const externalAlias = join(external, "external-alias");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await mkdir(external);
+    await writeFile(sourceFile, "source");
+    await writeFile(externalAlias, "external");
+    await symlink(externalAlias, join(source, "alias-link"));
+    const sourceFileIdentity = await lstat(sourceFile, { bigint: true });
+    const canonicalExternalAlias = await realpath(externalAlias);
+
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source,
+        destination,
+        inspectSymlinkPath: async (candidate, options) =>
+          (await realpath(candidate)) === canonicalExternalAlias
+            ? sourceFileIdentity
+            : lstat(candidate, options),
+      }),
+      /rejects absolute symlinks into the source tree/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy preserves relocatable relative symlinks", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-ok-test-"));
   try {
@@ -1327,6 +1394,26 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("tracked interrupted-turn recovery evidence matches the pinned run", async () => {
+  const raw = await readFile(
+    new URL("../evidence/interrupted-turn-recovery.json", import.meta.url),
+    "utf8",
+  );
+  assert.equal(assertRecoveryEvidenceSafe(raw), raw);
+  const report = JSON.parse(raw);
+
+  assert.equal(report.schemaVersion, 5);
+  assert.equal(report.probe, "interrupted-turn-recovery");
+  assert.equal(report.runtime.codexVersion, "codex-cli 0.142.4");
+  assert.equal(
+    report.runtime.codexBinarySha256,
+    "32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5",
+  );
+  assert.equal(report.runtime.sourceAnalysisCommit, PINNED_SOURCE_ANALYSIS_COMMIT);
+  assert.equal(report.runtime.platform, "darwin");
+  assert.equal(report.runtime.launcherArch, "arm64");
 });
 
 test("evidence directory creation fails closed on an EEXIST race", async () => {
