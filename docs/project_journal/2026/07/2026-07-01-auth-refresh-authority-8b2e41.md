@@ -24,6 +24,10 @@ superseded_by:
 - The successful method is stable v2 `account/read {refreshToken:true}`.
 - Codex writes only an isolated staging auth home; verified state is atomically
   promoted into the dedicated authority home.
+- Lock loss after refresh starts and lost promotion acknowledgements fail
+  closed, preserve durable recovery sentinels, and block automatic token reuse.
+- Successful results are sourced from a lock-protected canonical reread rather
+  than the staged credential.
 - A separate worker validation consumed the refreshed access token through
   `chatgptAuthTokens` without persisting worker auth state.
 - Distributed leases, encrypted storage, durable CAS, and broker APIs remain in

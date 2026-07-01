@@ -9,10 +9,8 @@ import {
   readFile,
   readdir,
   realpath,
-  rename,
   rm,
   rmdir,
-  writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -66,7 +64,13 @@ function decodeJwtPayload(token, label) {
   const parts = token.split(".");
   ensure(parts.length >= 2, "invalid_auth_record", `${label} is not a JWT`);
   try {
-    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    ensure(
+      payload !== null && typeof payload === "object" && !Array.isArray(payload),
+      "invalid_auth_record",
+      `${label} JWT payload must be an object`,
+    );
+    return payload;
   } catch {
     fail("invalid_auth_record", `${label} has an invalid JWT payload`);
   }
@@ -252,7 +256,43 @@ async function releaseAuthorityLock(lock) {
   await lock.release();
 }
 
-async function createStagingHome(authorityHome, rawAuth, writeStagingFile = writeFile) {
+async function writeFileDurably(path, contents, { flag = "wx", mode = 0o600 } = {}) {
+  let handle;
+  try {
+    handle = await open(path, flag, mode);
+    await handle.writeFile(contents);
+    await handle.sync();
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function syncDirectoryPath(path) {
+  let handle;
+  try {
+    handle = await open(
+      path,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    await handle.sync();
+    return true;
+  } catch (error) {
+    if (["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(error?.code)) return false;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function createStagingHome(
+  authority,
+  rawAuth,
+  {
+    syncStagingDirectory = syncDirectoryPath,
+    writeStagingFile = writeFileDurably,
+  } = {},
+) {
+  const authorityHome = authority.path;
   const stagingRoot = join(authorityHome, STAGING_DIRECTORY);
   let stagingRootCreated = false;
   let stagingHome;
@@ -263,6 +303,11 @@ async function createStagingHome(authorityHome, rawAuth, writeStagingFile = writ
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
     }
+    ensure(
+      await syncParentDirectory(authority),
+      "staging_not_durable",
+      "authority filesystem cannot durably record the staging root",
+    );
     const stagingRootStat = await lstat(stagingRoot);
     ensure(
       stagingRootStat.isDirectory() && !stagingRootStat.isSymbolicLink(),
@@ -272,6 +317,11 @@ async function createStagingHome(authorityHome, rawAuth, writeStagingFile = writ
     await chmod(stagingRoot, 0o700);
     stagingHome = await mkdtemp(join(stagingRoot, "attempt-"));
     await chmod(stagingHome, 0o700);
+    ensure(
+      await syncStagingDirectory(stagingRoot),
+      "staging_not_durable",
+      "authority filesystem cannot durably record the staging attempt",
+    );
     await writeStagingFile(join(stagingHome, "auth.json"), rawAuth, {
       flag: "wx",
       mode: 0o600,
@@ -288,6 +338,11 @@ remote_plugin = false
       flag: "wx",
       mode: 0o600,
     });
+    ensure(
+      await syncStagingDirectory(stagingHome),
+      "staging_not_durable",
+      "authority filesystem cannot durably record staged credentials",
+    );
     return { stagingHome, stagingRoot };
   } catch (error) {
     if (stagingHome) await rm(stagingHome, { recursive: true, force: true }).catch(() => {});
@@ -311,6 +366,7 @@ async function atomicallyPromoteAuth(
   rawAuth,
   expectedSource,
   assertLockHeld,
+  commitRename,
   syncDirectory,
 ) {
   const authorityHome = authority.path;
@@ -318,6 +374,7 @@ async function atomicallyPromoteAuth(
   const temporary = join(authorityHome, `.auth.json.next-${randomUUID()}`);
   let handle;
   let renamed = false;
+  let retainTemporary = false;
   let operationError;
   try {
     await assertAuthorityHomeCurrent(authority);
@@ -343,8 +400,32 @@ async function atomicallyPromoteAuth(
 
     await assertLockHeld();
     await assertAuthorityHomeCurrent(authority);
-    await rename(temporary, destination);
-    renamed = true;
+    try {
+      await commitRename(temporary, destination);
+      renamed = true;
+    } catch (error) {
+      if (!(error instanceof AdvisoryLockError) || error.code !== "lock_commit_uncertain") {
+        throw error;
+      }
+      retainTemporary = true;
+      const recoveryPaths = [];
+      try {
+        await lstat(temporary);
+        recoveryPaths.push(temporary);
+      } catch (candidateError) {
+        if (candidateError?.code !== "ENOENT") recoveryPaths.push(temporary);
+      }
+      const uncertain = new ManagedAuthRefreshError(
+        "promotion_commit_uncertain",
+        "lock holder did not confirm the atomic authority promotion",
+        {
+          recoveryPaths,
+          recoveryReason: "holder_commit_ack_lost",
+        },
+      );
+      uncertain.cause = error;
+      throw uncertain;
+    }
     try {
       const parentDirectorySynced = await syncDirectory(authority);
       return {
@@ -352,14 +433,17 @@ async function atomicallyPromoteAuth(
         warnings: parentDirectorySynced ? [] : ["parent_directory_sync_failed"],
       };
     } catch {
-      return { parentDirectorySynced: false, warnings: ["parent_directory_sync_failed"] };
+      return {
+        parentDirectorySynced: false,
+        warnings: ["parent_directory_sync_failed"],
+      };
     }
   } catch (error) {
     operationError = error;
     throw error;
   } finally {
     await handle?.close().catch(() => {});
-    if (!renamed) {
+    if (!renamed && !retainTemporary) {
       let authorityCurrent = false;
       try {
         await assertAuthorityHomeCurrent(authority);
@@ -514,13 +598,50 @@ export async function readManagedAuthSnapshot(authHome) {
 export async function runCodexManagedRefresh({
   codexBin = "codex",
   createClient = (options) => new AppServerClient(options),
+  signal,
   stagingHome,
 }) {
   const client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
+  const abortClient = async (reason) => {
+    if (typeof client.abort === "function") {
+      await client.abort(reason);
+      return;
+    }
+    await client.stop({ force: true });
+  };
+  const withAbort = async (operation) => {
+    if (!signal) return operation();
+    if (signal.aborted) throw signal.reason ?? new Error("managed refresh aborted");
+    const operationPromise = Promise.resolve().then(operation);
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        const reason = signal.reason ?? new Error("managed refresh aborted");
+        void abortClient(reason).then(
+          () => reject(reason),
+          (error) => reject(error),
+        );
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      operationPromise.then(
+        (value) => {
+          if (signal.aborted) return;
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error) => {
+          if (signal.aborted) return;
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  };
   try {
-    await client.start();
-    const initializeResult = await client.initialize(false);
-    const response = await client.request("account/read", { refreshToken: true });
+    await withAbort(() => client.start());
+    const initializeResult = await withAbort(() => client.initialize(false));
+    const response = await withAbort(() =>
+      client.request("account/read", { refreshToken: true }),
+    );
     return {
       initializeResult,
       response,
@@ -529,6 +650,44 @@ export async function runCodexManagedRefresh({
   } finally {
     await client.stop();
   }
+}
+
+async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
+  try {
+    await lock.assertHeld();
+  } catch (error) {
+    const beforeRefresh = new ManagedAuthRefreshError(
+      "lock_lost_before_refresh",
+      "authority lock was lost before token refresh started",
+      { retryable: true },
+    );
+    beforeRefresh.cause = error;
+    throw beforeRefresh;
+  }
+  const controller = new AbortController();
+  const refresh = Promise.resolve().then(() => operation(controller.signal));
+  if (typeof lock.waitForLoss !== "function") return refresh;
+  const first = await Promise.race([
+    refresh.then(
+      (value) => ({ kind: "completed", value }),
+      (error) => ({ error, kind: "failed" }),
+    ),
+    lock.waitForLoss().then((error) => ({ error, kind: "lost" })),
+  ]);
+  if (first.kind === "completed") return first.value;
+  if (first.kind === "failed") throw first.error;
+  controller.abort(first.error);
+  await refresh.catch(() => {});
+  const uncertain = new ManagedAuthRefreshError(
+    "refresh_outcome_uncertain",
+    "authority lock was lost while the token refresh outcome was uncertain",
+    {
+      recoveryPath,
+      recoveryReason: "lock_lost_during_refresh",
+    },
+  );
+  uncertain.cause = first.error;
+  throw uncertain;
 }
 
 async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, stagingRoot }) {
@@ -558,9 +717,10 @@ export async function refreshManagedAuthRecord({
   cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
   runRefresh = runCodexManagedRefresh,
+  syncStagingDirectory = syncDirectoryPath,
   syncDirectory = syncParentDirectory,
   verifyPromoted = readManagedAuthSnapshot,
-  writeStagingFile = writeFile,
+  writeStagingFile = writeFileDurably,
 }) {
   const authority = await resolveAuthorityHome(authHome);
   let lock;
@@ -595,13 +755,16 @@ export async function refreshManagedAuthRecord({
     );
     before = await readManagedAuthSnapshot(authorityHome);
     await assertAuthorityHomeCurrent(authority);
-    ({ stagingHome, stagingRoot } = await createStagingHome(
-      authorityHome,
-      before.raw,
+    ({ stagingHome, stagingRoot } = await createStagingHome(authority, before.raw, {
+      syncStagingDirectory,
       writeStagingFile,
-    ));
+    }));
     await assertAuthorityHomeCurrent(authority);
-    const refreshResult = await runRefresh({ codexBin, stagingHome });
+    const refreshResult = await runRefreshWhileLockHeld(
+      lock,
+      (signal) => runRefresh({ codexBin, signal, stagingHome }),
+      stagingHome,
+    );
     await assertAuthorityHomeCurrent(authority);
     ensure(
       rpcAuditMatches(refreshResult?.rpcAudit),
@@ -661,26 +824,36 @@ export async function refreshManagedAuthRecord({
       staged.raw,
       before,
       () => lock.assertHeld(),
+      (source, destination) => lock.renameWhileHeld(source, destination),
       syncDirectory,
     );
     committedWarnings.push(...promotion.warnings);
-    let promoted = staged;
+    let promoted;
     try {
       await assertAuthorityHomeCurrent(authority);
-      const verified = await verifyPromoted(authorityHome);
+      await lock.assertHeld();
+      promoted = await verifyPromoted(authorityHome);
       await assertAuthorityHomeCurrent(authority);
+      await lock.assertHeld();
       ensure(
-        verified.authFileFingerprint === staged.authFileFingerprint &&
-          verified.accountId === before.accountId &&
-          verified.userId === before.userId,
+        promoted.raw === staged.raw &&
+          promoted.accountId === before.accountId &&
+          promoted.userId === before.userId,
         "promotion_verification_failed",
         "promoted authority state failed verification",
         { recoveryPath: stagingHome },
       );
-      promoted = verified;
-      preserveStaging = promotion.warnings.includes("parent_directory_sync_failed");
-    } catch {
-      committedWarnings.push("promotion_verification_failed");
+      preserveStaging = promotion.warnings.length > 0;
+    } catch (error) {
+      if (error?.code === "authority_home_replaced") throw error;
+      if (error?.code === "promotion_verification_failed") throw error;
+      const verificationError = new ManagedAuthRefreshError(
+        "promotion_verification_failed",
+        "promoted authority state could not be verified while the lock was held",
+        { recoveryPath: stagingHome },
+      );
+      verificationError.cause = error;
+      throw verificationError;
     }
 
     outcome = withSensitiveProperties({
@@ -706,6 +879,24 @@ export async function refreshManagedAuthRecord({
       redactionValues: [...new Set([...before.redactionValues, ...promoted.redactionValues])],
     });
   } catch (error) {
+    if (error?.code === "refresh_outcome_uncertain") preserveStaging = true;
+    if (
+      stagingHome &&
+      error instanceof AdvisoryLockError &&
+      ["lock_lost", "lock_replaced"].includes(error.code)
+    ) {
+      const uncertain = new ManagedAuthRefreshError(
+        "refresh_outcome_uncertain",
+        "authority lock was lost after token refresh started",
+        {
+          recoveryPath: stagingHome,
+          recoveryReason: "lock_lost_during_refresh",
+        },
+      );
+      uncertain.cause = error;
+      error = uncertain;
+      preserveStaging = true;
+    }
     const authorityReplaced = error?.code === "authority_home_replaced";
     if (stagingHome && before && !preserveStaging && !authorityReplaced) {
       try {

@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { access, link, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  link,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -17,8 +26,14 @@ const HOLDER_FIXTURE = fileURLToPath(new URL("../fixtures/hold-advisory-lock.mjs
 const FAIL_HOLDER_FIXTURE = fileURLToPath(
   new URL("../fixtures/fail-advisory-lock-holder.mjs", import.meta.url),
 );
+const EXIT_AFTER_LOCK_FIXTURE = fileURLToPath(
+  new URL("../fixtures/exit-after-lock-holder.mjs", import.meta.url),
+);
 const STUBBORN_HOLDER_FIXTURE = fileURLToPath(
   new URL("../fixtures/stubborn-advisory-lock-holder.mjs", import.meta.url),
+);
+const DELAYED_HOLDER_FIXTURE = fileURLToPath(
+  new URL("../fixtures/delayed-advisory-lock-holder.mjs", import.meta.url),
 );
 
 function waitForLine(child, expected) {
@@ -60,6 +75,51 @@ test("advisory lock rejects concurrent holders and can be reacquired", async () 
   } finally {
     await first?.release();
     await second?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("uncertain rename quiesces the holder before it can mutate later", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-lock-delayed-"));
+  const lockPath = join(root, "authority.lock");
+  const source = join(root, "source");
+  const destination = join(root, "destination");
+  let lock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(lockPath, {
+      holderPath: DELAYED_HOLDER_FIXTURE,
+      signalGraceMs: 1_000,
+      timeoutMs: 50,
+    });
+    await assert.rejects(
+      lock.renameWhileHeld(source, destination),
+      (error) => error.code === "lock_commit_uncertain",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(await readFile(source, "utf8"), "candidate\n");
+    await assert.rejects(access(destination), (error) => error.code === "ENOENT");
+  } finally {
+    await lock?.release().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock holder performs the final rename while holding the lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-commit-"));
+  const path = join(root, "authority.lock");
+  const source = join(root, "auth.next");
+  const destination = join(root, "auth.json");
+  let lock;
+  try {
+    await writeFile(source, "rotated\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path);
+    await lock.renameWhileHeld(source, destination);
+    assert.equal(await readFile(destination, "utf8"), "rotated\n");
+    await assert.rejects(access(source), (error) => error.code === "ENOENT");
+    await lock.assertHeld();
+  } finally {
+    await lock?.release();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -133,6 +193,22 @@ test("holder exit one is a runtime failure rather than lock contention", async (
       return error instanceof AdvisoryLockError && error.code === "lock_runtime_failed";
     });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("assertHeld reports loss after the owning holder exits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-lost-holder-"));
+  const path = join(root, "authority.lock");
+  let lock;
+  try {
+    lock = await acquireAdvisoryLock(path, { holderPath: EXIT_AFTER_LOCK_FIXTURE });
+    await lock.waitForLoss();
+    await assert.rejects(lock.assertHeld(), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "lock_lost";
+    });
+  } finally {
+    await lock?.release();
     await rm(root, { recursive: true, force: true });
   }
 });

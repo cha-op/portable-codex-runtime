@@ -70,6 +70,7 @@ export class AppServerClient {
     const env = buildWorkerEnvironment(this.codexHome);
 
     this.child = spawn(this.codexBin, this.codexArgs, {
+      detached: process.platform !== "win32",
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -179,6 +180,32 @@ export class AppServerClient {
     }
     this.stdout?.close();
     this.#failAll(this.terminalError ?? new Error("codex app-server stopped"));
+  }
+
+  async abort(error = new Error("codex app-server aborted")) {
+    if (this.abortPromise) return this.abortPromise;
+    this.stopping = true;
+    this.#failAll(error);
+    this.abortPromise = (async () => {
+      if (
+        this.child &&
+        this.child.exitCode === null &&
+        this.child.signalCode === null
+      ) {
+        try {
+          if (process.platform === "win32" || !this.child.pid) {
+            this.child.kill("SIGKILL");
+          } else {
+            process.kill(-this.child.pid, "SIGKILL");
+          }
+        } catch (killError) {
+          if (killError?.code !== "ESRCH") throw killError;
+        }
+        await this.exitPromise?.catch(() => {});
+      }
+      this.stdout?.close();
+    })();
+    return this.abortPromise;
   }
 
   #send(message) {

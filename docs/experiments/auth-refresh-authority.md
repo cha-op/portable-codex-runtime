@@ -64,16 +64,27 @@ the canonical authority file directly:
    its device/inode identity before every critical pathname operation. Refuse
    refresh when an earlier promotion candidate or staging attempt requires
    manual recovery.
-4. Copy the credential into a mode `0700` staging `CODEX_HOME`.
-5. Run only `initialize`, `initialized`, and
+4. Copy the credential into a mode `0700` staging `CODEX_HOME`, fsync both
+   files and the staging directory chain, and fail before OAuth rotation if
+   those recovery markers cannot be made durable.
+5. Recheck the authority lock immediately before the RPC and kill the isolated
+   app-server process group if the independent holder exits. Because a remote
+   OAuth rotation may already have committed, any loss after refresh starts is
+   non-retryable: retain the durable staging attempt as a recovery sentinel so
+   the next authority run cannot reuse the old refresh token. Run only `initialize`,
+   `initialized`, and
    `account/read(refreshToken=true)` against the staging home.
 6. Verify workspace and user continuity, advanced `last_refresh`, a changed
    access token with at least two minutes of remaining validity, file
    permissions, and the unchanged canonical source generation.
-7. Write the staged record to a synced mode `0600` temporary file, atomically
-   rename it over canonical `auth.json`, and sync the parent directory when the
-   platform supports it.
-8. Re-read the promoted file before returning the access token to callers.
+7. Write the staged record to a synced mode `0600` temporary file, ask the
+   actual lock-holder process to atomically rename it over canonical
+   `auth.json`, and sync the held authority-directory descriptor when the
+   platform supports it. A lost holder acknowledgement first terminates and
+   waits for the holder executor, then fails closed as a non-retryable uncertain
+   commit and preserves every recovery copy that still exists.
+8. Re-read the promoted file while the lock and authority-directory guard are
+   still valid. Return only the exact canonical bytes, never a staged fallback.
 
 Concurrent callers inside the reference authority share one in-flight refresh
 and observe the same generation. This is process-local proof only; the
@@ -108,12 +119,14 @@ CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
 
 ## Limitations
 
-- A crash after the OAuth service accepts the old refresh token but before the
-  staged record is promoted can still require interactive login. A changed
-  staging record is preserved for manual recovery instead of automatically
-  restoring the now-stale canonical token. Operators must inspect the reported
-  recovery path and deliberately promote or securely remove old attempts;
-  automatic age-based reaping could delete the only valid rotated token.
+- A crash or lock loss after the OAuth service accepts the old refresh token but
+  before the staged record is promoted can still require interactive login.
+  The staging attempt is preserved even when its local token bytes did not
+  change, because the remote refresh outcome is unknowable after forced local
+  termination. Operators must inspect the reported recovery path and
+  deliberately promote, reauthenticate, or securely remove old attempts;
+  automatic age-based reaping could delete the only valid rotated token or
+  permit reuse of an already-consumed token.
 - A crash can also leave `.auth.json.next-*` after that file is synced but
   before rename. The next authority run reports all matching promotion and
   staging candidates as `recovery_required` and does not consume the canonical
@@ -132,11 +145,12 @@ CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
   from util-linux plus procfs on Linux. Fixed runtime images must include and
   test the matching backend. The repository test workflow exercises both
   `macos-latest` and `ubuntu-latest`.
-- Directory-sync, verification, cleanup, or lock-release errors after canonical
-  promotion are returned as committed warnings rather than refresh failures,
-  preventing callers from rotating a second token in response to an already
-  committed refresh. Failed directory sync or verification preserves staging
-  and returns its exact `recoveryPath` for operator inspection.
+- Directory-sync, cleanup, or lock-release errors after a verified canonical
+  promotion are returned as committed warnings, preventing callers from
+  rotating a second token in response to an already committed refresh. A
+  canonical reread or exact-byte verification failure is non-retryable and
+  preserves staging for operator inspection instead of returning a staged
+  access token as though promotion had succeeded.
 - Refresh results contain secret-bearing properties for the broker adapter.
   Those properties are non-enumerable to reduce accidental JSON/log exposure,
   but callers must still avoid logging or spreading the result object.

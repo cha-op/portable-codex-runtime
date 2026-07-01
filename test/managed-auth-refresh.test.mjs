@@ -29,7 +29,7 @@ import {
   refreshManagedAuthRecord,
   runCodexManagedRefresh,
 } from "../src/managed-auth-refresh.mjs";
-import { acquireAdvisoryLock } from "../src/advisory-lock.mjs";
+import { AdvisoryLockError, acquireAdvisoryLock } from "../src/advisory-lock.mjs";
 
 const ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174088";
 const USER_ID = "user-123e4567-e89b-42d3-a456-426614174088";
@@ -288,6 +288,52 @@ test("runCodexManagedRefresh always stops the app-server after request failure",
   assert.equal(stopped, 1);
 });
 
+test("runCodexManagedRefresh aborts an in-flight request and stops the app-server", async () => {
+  const controller = new AbortController();
+  let requestStarted;
+  const started = new Promise((resolve) => {
+    requestStarted = resolve;
+  });
+  let finishAbort;
+  const abortFinished = new Promise((resolve) => {
+    finishAbort = resolve;
+  });
+  let aborted = 0;
+  let stopped = 0;
+  let settled = false;
+  const refresh = runCodexManagedRefresh({
+    signal: controller.signal,
+    stagingHome: "/isolated/staging-home",
+    createClient: () => ({
+      initialize: async () => ({}),
+      request: async () => {
+        requestStarted();
+        return new Promise(() => {});
+      },
+      start: async () => {},
+      abort: async () => {
+        aborted += 1;
+        await abortFinished;
+      },
+      stop: async () => {
+        stopped += 1;
+      },
+    }),
+  });
+  void refresh.finally(() => {
+    settled = true;
+  }).catch(() => {});
+  await started;
+  const lost = new AdvisoryLockError("lock_lost", "synthetic holder exit");
+  controller.abort(lost);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  finishAbort();
+  await assert.rejects(refresh, (error) => error === lost);
+  assert.equal(aborted, 1);
+  assert.equal(stopped, 1);
+});
+
 test("unresolved refresh artifacts block token rotation and expose safe recovery paths", async () => {
   const { authHome, root } = await createAuthorityHome();
   const promotionCandidate = join(authHome, ".auth.json.next-recovery");
@@ -334,6 +380,194 @@ test("unresolved refresh artifacts block token rotation and expose safe recovery
     assert.equal((await stat(join(attempt, "auth.json"))).isFile(), true);
     const serialized = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
     assert.equal(serialized.includes("refresh-orphaned-sensitive"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("non-object JWT payloads are classified as invalid auth records", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const document = JSON.parse(await readFile(join(authHome, "auth.json"), "utf8"));
+    document.tokens.access_token = encodeJwt(null);
+    await writeFile(join(authHome, "auth.json"), `${JSON.stringify(document)}\n`, { mode: 0o600 });
+    await assert.rejects(
+      readManagedAuthSnapshot(authHome),
+      (error) => error.code === "invalid_auth_record",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid refresh responses and unchanged access tokens fail closed", async () => {
+  const invalid = await createAuthorityHome();
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome: invalid.authHome,
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return { ...successResponse(), response: null };
+        },
+      }),
+      (error) => error.code === "invalid_refresh_response" && error.retryable === true,
+    );
+  } finally {
+    await rm(invalid.root, { recursive: true, force: true });
+  }
+
+  const unchanged = await createAuthorityHome();
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome: unchanged.authHome,
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome, { accessMarker: "before" });
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "access_token_unchanged" && error.retryable === true,
+    );
+  } finally {
+    await rm(unchanged.root, { recursive: true, force: true });
+  }
+});
+
+test("staging durability is established before token-mutating refresh begins", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const events = [];
+  try {
+    await refreshManagedAuthRecord({
+      authHome,
+      syncStagingDirectory: async (path) => {
+        events.push(["sync-directory", path]);
+        return true;
+      },
+      writeStagingFile: async (path, contents, options) => {
+        events.push(["write-file", path]);
+        await writeFile(path, contents, options);
+      },
+      runRefresh: async ({ stagingHome }) => {
+        events.push(["run-refresh", stagingHome]);
+        await replaceStagedAuth(stagingHome);
+        return successResponse();
+      },
+    });
+    const runIndex = events.findIndex(([event]) => event === "run-refresh");
+    const prior = events.slice(0, runIndex).map(([event]) => event);
+    assert.deepEqual(prior, [
+      "sync-directory",
+      "write-file",
+      "write-file",
+      "sync-directory",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unsupported staging directory sync fails before refresh-token rotation", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let refreshCalled = false;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        syncStagingDirectory: async () => false,
+        runRefresh: async () => {
+          refreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "staging_not_durable",
+    );
+    assert.equal(refreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lost lock gates token-mutating refresh before the RPC starts", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let refreshCalled = false;
+  let released = false;
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async () => ({
+          assertHeld: async () => {
+            throw new AdvisoryLockError("lock_lost", "synthetic holder exit");
+          },
+          release: async () => {
+            released = true;
+          },
+        }),
+        runRefresh: async () => {
+          refreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "lock_lost_before_refresh" && error.retryable === true,
+    );
+    assert.equal(refreshCalled, false);
+    assert.equal(released, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("holder exit aborts an in-flight token refresh before cleanup", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let reportLoss;
+  const loss = new Promise((resolve) => {
+    reportLoss = resolve;
+  });
+  let reportStarted;
+  const started = new Promise((resolve) => {
+    reportStarted = resolve;
+  });
+  try {
+    const refresh = refreshManagedAuthRecord({
+      authHome,
+      acquireLock: async () => ({
+        assertHeld: async () => {},
+        release: async () => {},
+        waitForLoss: () => loss,
+      }),
+      runRefresh: async ({ signal }) => {
+        reportStarted();
+        return new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+    await started;
+    const lost = new AdvisoryLockError("lock_lost", "synthetic holder exit");
+    reportLoss(lost);
+    let refreshError;
+    try {
+      await refresh;
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "lock_lost_during_refresh");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    let secondRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          secondRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(secondRefreshCalled, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -596,32 +830,35 @@ test("cleanup failure attaches a retained staging path to error metadata", async
   }
 });
 
-test("post-commit durability and verification failures return committed warnings", async () => {
+test("post-commit verification failure blocks success and preserves recovery state", async () => {
   const { authHome, root } = await createAuthorityHome();
   try {
-    const result = await refreshManagedAuthRecord({
-      authHome,
-      runRefresh: async ({ stagingHome }) => {
-        await replaceStagedAuth(stagingHome);
-        return successResponse();
-      },
-      syncDirectory: async () => {
-        throw new Error("synthetic directory sync failure");
-      },
-      verifyPromoted: async () => {
-        throw new Error("synthetic post-commit verification failure");
-      },
-    });
-    assert.deepEqual(result.cleanupWarnings, [
-      "parent_directory_sync_failed",
-      "promotion_verification_failed",
-    ]);
-    assert.equal(typeof result.recoveryPath, "string");
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+        syncDirectory: async () => {
+          throw new Error("synthetic directory sync failure");
+        },
+        verifyPromoted: async () => {
+          throw new Error("synthetic post-commit verification failure");
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "promotion_verification_failed");
+    assert.deepEqual(refreshError.cleanupWarnings, ["parent_directory_sync_failed"]);
+    assert.equal(typeof refreshError.recoveryPath, "string");
     const promoted = await readManagedAuthSnapshot(authHome);
-    assert.equal(promoted.accessToken, result.accessToken);
-    assert.equal((await stat(result.recoveryPath)).isDirectory(), true);
+    assert.equal((await stat(refreshError.recoveryPath)).isDirectory(), true);
     const stagingRoot = await realpath(authorityStagingDirectory(authHome));
-    assert.equal(result.recoveryPath.startsWith(`${stagingRoot}/`), true);
+    assert.equal(refreshError.recoveryPath.startsWith(`${stagingRoot}/`), true);
+    assert.notEqual(promoted.authFileFingerprint, undefined);
 
     const lock = await acquireAdvisoryLock(authorityLockPath(authHome));
     await lock.release();
@@ -644,6 +881,61 @@ test("directory sync failure alone preserves the rotated staging credential", as
     assert.deepEqual(result.cleanupWarnings, ["parent_directory_sync_failed"]);
     assert.equal(typeof result.recoveryPath, "string");
     assert.equal((await stat(join(result.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("uncertain holder commit fails closed and preserves every recovery copy", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const canonicalBefore = await readFile(join(authHome, "auth.json"), "utf8");
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async () => ({
+          assertHeld: async () => {},
+          release: async () => {},
+          renameWhileHeld: async () => {
+            throw new AdvisoryLockError(
+              "lock_commit_uncertain",
+              "synthetic lost commit acknowledgement",
+            );
+          },
+        }),
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome);
+          return successResponse();
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "promotion_commit_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "holder_commit_ack_lost");
+    const stagingRecoveryPath = refreshError.recoveryPaths.find((path) =>
+      path.includes(".portable-auth-refresh-staging"),
+    );
+    const promotionRecoveryPath = refreshError.recoveryPaths.find((path) =>
+      path.includes(".auth.json.next-"),
+    );
+    assert.equal((await stat(join(stagingRecoveryPath, "auth.json"))).isFile(), true);
+    assert.equal((await stat(promotionRecoveryPath)).isFile(), true);
+    assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
+    assert.equal(
+      (await readdir(authHome)).filter((name) => name.startsWith(".auth.json.next-")).length,
+      1,
+    );
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

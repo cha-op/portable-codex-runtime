@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
 
 const HOLDER_PATH = fileURLToPath(new URL("./advisory-lock-holder.mjs", import.meta.url));
 
@@ -153,10 +154,15 @@ export async function acquireAdvisoryLock(
     await new Promise((resolve, reject) => {
       let settled = false;
       let stdout = "";
+      const onAcquireData = (chunk) => {
+        stdout += chunk.toString("utf8");
+        if (stdout.includes("locked\n")) finish(resolve);
+      };
       const finish = (callback) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        child.stdout.off("data", onAcquireData);
         callback();
       };
       const timer = setTimeout(() => {
@@ -179,21 +185,83 @@ export async function acquireAdvisoryLock(
           ),
         );
       });
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk.toString("utf8");
-        if (stdout.includes("locked\n")) finish(resolve);
-      });
+      child.stdout.on("data", onAcquireData);
     });
   } catch (error) {
+    let cleanupError;
     try {
       await stopLockProcess(child, { initialWaitMs: 0, signalWaitMs: signalGraceMs });
+    } catch (failure) {
+      cleanupError = failure;
     } finally {
       await handle.close().catch(() => {});
+    }
+    if (cleanupError) {
+      cleanupError.cause = error;
+      throw cleanupError;
     }
     throw error;
   }
 
   let released = false;
+  let nextCommandId = 1;
+  const pendingCommands = new Map();
+  let resolveLoss;
+  const loss = new Promise((resolve) => {
+    resolveLoss = resolve;
+  });
+  const output = createInterface({ input: child.stdout });
+  let commitQuiescence;
+  const quiesceUncertainCommit = async (message) => {
+    const uncertain = new AdvisoryLockError("lock_commit_uncertain", message);
+    commitQuiescence ??= stopLockProcess(child, {
+      initialWaitMs: 0,
+      signalWaitMs: signalGraceMs,
+    });
+    try {
+      await commitQuiescence;
+    } catch (error) {
+      uncertain.cause = error;
+    }
+    return uncertain;
+  };
+  output.on("line", (line) => {
+    let response;
+    try {
+      response = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const pending = pendingCommands.get(response?.id);
+    if (!pending) return;
+    pendingCommands.delete(response.id);
+    clearTimeout(pending.timer);
+    if (response.ok === true) pending.resolve();
+    else {
+      pending.reject(
+        new AdvisoryLockError(
+          "lock_commit_failed",
+          `lock holder rename failed (${response.code ?? "unknown"})`,
+        ),
+      );
+    }
+  });
+  child.once("exit", () => {
+    resolveLoss(
+      new AdvisoryLockError("lock_lost", "authority advisory lock process exited unexpectedly"),
+    );
+    for (const pending of pendingCommands.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(
+        new AdvisoryLockError(
+          "lock_commit_uncertain",
+          "lock holder exited before confirming the atomic rename",
+        ),
+      );
+    }
+    pendingCommands.clear();
+  });
+
   return {
     async assertHeld() {
       if (released || child.exitCode !== null || child.signalCode !== null) {
@@ -226,9 +294,58 @@ export async function acquireAdvisoryLock(
         await pathHandle.close().catch(() => {});
       }
     },
+    renameWhileHeld(source, destination) {
+      if (released || child.exitCode !== null || child.signalCode !== null) {
+        return Promise.reject(
+          new AdvisoryLockError("lock_commit_uncertain", "authority advisory lock was lost"),
+        );
+      }
+      const id = nextCommandId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingCommands.delete(id);
+          void quiesceUncertainCommit("lock holder did not confirm the atomic rename").then(
+            reject,
+          );
+        }, timeoutMs);
+        pendingCommands.set(id, { reject, resolve, timer });
+        child.stdin.write(
+          `${JSON.stringify({ action: "rename", destination, id, source })}\n`,
+          (error) => {
+            if (!error) return;
+            const pending = pendingCommands.get(id);
+            if (!pending) return;
+            pendingCommands.delete(id);
+            clearTimeout(timer);
+            void quiesceUncertainCommit(
+              "lock holder command channel failed before confirming rename",
+            ).then(reject);
+          },
+        );
+      });
+    },
+    waitForLoss() {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return Promise.resolve(
+          new AdvisoryLockError("lock_lost", "authority advisory lock process already exited"),
+        );
+      }
+      return loss;
+    },
     async release() {
       if (released) return;
       released = true;
+      for (const pending of pendingCommands.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(
+          new AdvisoryLockError(
+            "lock_commit_uncertain",
+            "lock released before confirming the atomic rename",
+          ),
+        );
+      }
+      pendingCommands.clear();
+      output.close();
       try {
         await stopLockProcess(child, {
           initialWaitMs: releaseGraceMs,

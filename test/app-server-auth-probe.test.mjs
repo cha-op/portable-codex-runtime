@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -170,6 +170,55 @@ process.stdin.on("end", () => setTimeout(() => process.exit(0), 20));
     await rm(codexHome, { recursive: true, force: true });
   }
 });
+
+test(
+  "app-server abort kills an in-flight request before delayed local mutation",
+  { skip: process.platform === "win32" },
+  async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-abort-fixture-"));
+    const fixturePath = join(codexHome, "fixture.mjs");
+    const markerPath = join(codexHome, "late-mutation");
+    await writeFile(
+      fixturePath,
+      `
+import { writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const marker = ${JSON.stringify(markerPath)};
+const input = createInterface({ input: process.stdin });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method !== "account/read") return;
+  process.stdout.write(JSON.stringify({ method: "fixture/request-started" }) + "\\n");
+  setTimeout(() => {
+    writeFileSync(marker, "late mutation\\n");
+    process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+  }, 250);
+});
+`,
+    );
+    const client = new AppServerClient({
+      codexBin: process.execPath,
+      codexArgs: [fixturePath],
+      codexHome,
+      timeoutMs: 1_000,
+    });
+    try {
+      await client.start();
+      const request = client.request("account/read", { refreshToken: true });
+      await client.waitForNotification("fixture/request-started");
+      const lost = new Error("synthetic lock loss");
+      const abort = client.abort(lost);
+      await assert.rejects(request, (error) => error === lost);
+      await abort;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      await assert.rejects(access(markerPath), (error) => error.code === "ENOENT");
+      assert.equal(client.child.signalCode, "SIGKILL");
+    } finally {
+      await client.stop();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  },
+);
 
 test("stdin failures reject current and future requests", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-stdin-fixture-"));
