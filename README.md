@@ -39,11 +39,11 @@ The probe verifies the explicit thread ID through both `thread/resume` and
 Signal and hard-kill recovery instead normalizes the stale in-progress turn to
 `interrupted` without inventing that marker. The stopped-tree copy preserves
 regular files, directories, POSIX rwx permission bits, and portable UTF-8
-symlinks without following links. Non-relocatable links, special permission
-bits, hard links, sockets, FIFOs, and devices fail closed. Ownership, ACLs,
-extended attributes, timestamps, and other unmodeled metadata are not preserved
-or covered by the digest. It is not an online, atomic, or power-loss-durable
-snapshot implementation.
+symlinks without following links. Case-insensitive or Unicode-normalized name
+collisions, non-relocatable links, special permission bits, hard links, sockets,
+FIFOs, and devices fail closed. Ownership, ACLs, extended attributes,
+timestamps, and other unmodeled metadata are not preserved or covered by the
+digest. It is not an online, atomic, or power-loss-durable snapshot implementation.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
 pinned runtime image:

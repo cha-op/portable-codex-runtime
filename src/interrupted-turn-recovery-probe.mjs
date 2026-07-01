@@ -343,9 +343,24 @@ export function decodePortablePathBytes(bytes) {
   return value;
 }
 
+export function assertPortableDirectoryNames(entries) {
+  const portableKeys = new Set();
+  for (const entry of entries) {
+    assert.equal(typeof entry, "string", "portable directory entries must be strings");
+    const portableKey = entry.normalize("NFC").toLowerCase();
+    if (portableKeys.has(portableKey)) {
+      throw new Error(
+        "portable tree rejects case or Unicode-normalization name collisions",
+      );
+    }
+    portableKeys.add(portableKey);
+  }
+  return [...entries].sort();
+}
+
 async function readPortableDirectory(path) {
   const entries = await readdir(path, { encoding: "buffer" });
-  return entries.map(decodePortablePathBytes).sort();
+  return assertPortableDirectoryNames(entries.map(decodePortablePathBytes));
 }
 
 function rawChildPath(parent, entry) {
@@ -710,6 +725,10 @@ export async function runRecoveryScenario({
     let snapshot;
     if (kind === "logical_interrupt") {
       const completedPromise = client.waitForNotification("turn/completed");
+      // If the interrupt RPC fails, outer cleanup rejects this waiter later.
+      // Observe that rejection immediately while retaining the original promise
+      // for the successful path below.
+      void completedPromise.catch(() => {});
       await client.request("turn/interrupt", { threadId, turnId });
       const completed = await completedPromise;
       assert.equal(completed.params.turn.id, turnId);
@@ -767,16 +786,46 @@ export async function runRecoveryScenario({
       destination: coldReadRoot,
     });
     assert.equal(await digestTree(coldReadRoot), recoveryStateDigest);
-    readClient = await startRecoveryClient({
-      codexBin,
-      codexHome: join(coldReadRoot, "codex-home"),
-      timeoutMs,
-    });
-    const coldRead = await readClient.request("thread/read", { threadId, includeTurns: true });
-    assert.equal(coldRead.thread.id, threadId);
-    const coldReadTurn = findTailTurn(coldRead.thread, turnId);
-    assert.equal(coldReadTurn.status, "interrupted");
-    await readClient.stop();
+    const heldRecoveryRoot = join(ownedRoot, "resume-held-session");
+    const recoveryRootMode = portableMode(await lstat(sessionRoot));
+    await rename(sessionRoot, heldRecoveryRoot);
+    await chmod(heldRecoveryRoot, 0o000);
+    let coldReadTurn;
+    let coldReadFailure;
+    try {
+      try {
+        await lstat(sessionRoot);
+        throw new Error("cold read left the original recovery path reachable");
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      readClient = await startRecoveryClient({
+        codexBin,
+        codexHome: join(coldReadRoot, "codex-home"),
+        timeoutMs,
+      });
+      const coldRead = await readClient.request("thread/read", {
+        threadId,
+        includeTurns: true,
+      });
+      assert.equal(coldRead.thread.id, threadId);
+      coldReadTurn = findTailTurn(coldRead.thread, turnId);
+      assert.equal(coldReadTurn.status, "interrupted");
+      await readClient.stop();
+    } catch (error) {
+      coldReadFailure = { error };
+      throw error;
+    } finally {
+      await runSequentialCleanup(
+        [
+          () => readClient?.abort(),
+          () => chmod(heldRecoveryRoot, recoveryRootMode),
+          () => rename(heldRecoveryRoot, sessionRoot),
+        ],
+        coldReadFailure,
+      );
+      readClient = undefined;
+    }
 
     recoveredClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
     const recovery = await recoverAndInspect({
@@ -965,21 +1014,25 @@ export function assertRecoveryEvidenceSafe(report) {
 export async function writeRecoveryEvidence(path, report) {
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertRecoveryEvidenceSafe(serialized);
-  await mkdir(dirname(path), { recursive: true });
-  const temporaryPath = `${path}.next-${process.pid}`;
-  let promoted = false;
+  const evidenceDirectory = dirname(path);
+  await mkdir(evidenceDirectory, { recursive: true });
+  const temporaryDirectory = await mkdtemp(
+    join(evidenceDirectory, `.${basename(path)}.tmp-${process.pid}-`),
+  );
+  const temporaryPath = join(temporaryDirectory, "evidence.json");
   try {
+    await chmod(temporaryDirectory, 0o700);
     const file = await open(temporaryPath, "wx", 0o600);
     try {
+      await file.chmod(0o600);
       await file.writeFile(serialized);
       await file.sync();
     } finally {
       await file.close();
     }
     await rename(temporaryPath, path);
-    promoted = true;
   } finally {
-    if (!promoted) await rm(temporaryPath, { force: true }).catch(() => {});
+    await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
   }
 }
 

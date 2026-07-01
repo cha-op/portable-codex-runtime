@@ -7,6 +7,7 @@ import {
   mkdir,
   readFile,
   readlink,
+  readdir,
   realpath,
   rm,
   stat,
@@ -21,6 +22,7 @@ import {
   PINNED_SOURCE_ANALYSIS_COMMIT,
   RECOVERY_SCENARIOS,
   assertNewTurnId,
+  assertPortableDirectoryNames,
   assertProcessGroupTarget,
   assertRecoveryEvidenceSafe,
   copyStoppedTree,
@@ -407,6 +409,19 @@ test("portable directory entry decoding rejects lossy UTF-8", () => {
   );
 });
 
+test("portable directory names reject case and Unicode-normalization collisions", () => {
+  assert.deepEqual(assertPortableDirectoryNames(["zeta", "Alpha"]), ["Alpha", "zeta"]);
+  for (const entries of [
+    ["README", "readme"],
+    ["caf\u00e9", "cafe\u0301"],
+  ]) {
+    assert.throws(
+      () => assertPortableDirectoryNames(entries),
+      /case or Unicode-normalization name collisions/,
+    );
+  }
+});
+
 test(
   "portable tree operations reject and clean up non-UTF-8 directory entries",
   { skip: platform() !== "linux" },
@@ -614,8 +629,12 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       /disallowed runtime data/,
     );
     const path = join(root, "evidence.json");
-    await writeRecoveryEvidence(path, report);
+    await Promise.all([
+      writeRecoveryEvidence(path, report),
+      writeRecoveryEvidence(path, report),
+    ]);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), report);
+    assert.deepEqual(await readdir(root), ["evidence.json"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
