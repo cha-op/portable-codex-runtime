@@ -1,5 +1,17 @@
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readlink,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import test from "node:test";
@@ -34,6 +46,7 @@ function scenarioReport(kind) {
       ? {
           snapshot: {
             kind: "stopped-tree-copy",
+            appServerWorkspaceMatched: true,
             sourceQuiesced: true,
             treeDigestMatched: true,
             workspaceDigestMatched: true,
@@ -161,6 +174,24 @@ test("stopped-tree copy preserves a deterministic tree digest", async () => {
   }
 });
 
+test("stopped-tree copy populates read-only directories before restoring their mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-read-only-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(join(source, "read-only"), { recursive: true });
+    await writeFile(join(source, "read-only", "state"), "sentinel");
+    await chmod(join(source, "read-only"), 0o500);
+    await copyStoppedTree({ ownedRoot: root, source, destination });
+    assert.equal((await lstat(join(destination, "read-only"))).mode & 0o777, 0o500);
+    assert.equal(await readFile(join(destination, "read-only", "state"), "utf8"), "sentinel");
+  } finally {
+    await chmod(join(root, "source", "read-only"), 0o700).catch(() => {});
+    await chmod(join(root, "destination", "read-only"), 0o700).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy preserves symlinks without following their targets", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-link-test-"));
   try {
@@ -173,6 +204,22 @@ test("stopped-tree copy preserves symlinks without following their targets", asy
     assert.equal((await lstat(join(destination, "link"))).isSymbolicLink(), true);
     assert.equal(await readlink(join(destination, "link")), join(root, "outside"));
     assert.equal(await readFile(join(destination, "link"), "utf8"), "sentinel");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy preserves relocatable relative symlinks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-ok-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(join(source, "nested"), { recursive: true });
+    await writeFile(join(source, "target"), "sentinel");
+    await symlink("../target", join(source, "nested", "link"));
+    await copyStoppedTree({ ownedRoot: root, source, destination });
+    assert.equal(await readlink(join(destination, "nested", "link")), "../target");
+    assert.equal(await readFile(join(destination, "nested", "link"), "utf8"), "sentinel");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -191,6 +238,73 @@ test("stopped-tree copy rejects absolute symlinks into the relocated source tree
       /rejects absolute symlinks into the source tree/,
     );
     await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects canonical aliases of absolute internal symlinks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-canonical-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "target"), "sentinel");
+    const canonicalTarget = join(await realpath(source), "target");
+    await symlink(canonicalTarget, join(source, "canonical-internal-link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects absolute symlinks into the source tree/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects relative symlinks whose meaning changes after relocation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-link-test-"));
+  try {
+    const source = join(root, "session");
+    const destination = join(root, "stopped-tree-copy");
+    await mkdir(join(source, "workspace"), { recursive: true });
+    await writeFile(join(source, "workspace", "target"), "sentinel");
+    await symlink("../session/workspace/target", join(source, "non-relocatable-link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects non-relocatable relative symlinks/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects special permission bits and hard-link topology", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-metadata-test-"));
+  try {
+    const specialSource = join(root, "special-source");
+    await mkdir(specialSource, { mode: 0o700 });
+    await chmod(specialSource, 0o1700);
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source: specialSource,
+        destination: join(root, "special-destination"),
+      }),
+      /rejects special permission bits/,
+    );
+
+    const hardLinkSource = join(root, "hard-link-source");
+    await mkdir(hardLinkSource);
+    await writeFile(join(hardLinkSource, "first"), "sentinel");
+    await link(join(hardLinkSource, "first"), join(hardLinkSource, "second"));
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot: root,
+        source: hardLinkSource,
+        destination: join(root, "hard-link-destination"),
+      }),
+      /rejects hard-linked files/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

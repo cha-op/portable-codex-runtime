@@ -274,40 +274,107 @@ function pathIsInside(root, candidate) {
   return child === "" || (!child.startsWith("..") && !isAbsolute(child));
 }
 
-async function copyTreeEntry(sourceRoot, source, destination) {
+function portableMode(metadata) {
+  if ((metadata.mode & 0o7000) !== 0) {
+    throw new Error("stopped-tree copy rejects special permission bits");
+  }
+  return metadata.mode & 0o777;
+}
+
+async function assertPortableSymlink({
+  destination,
+  destinationRoot,
+  source,
+  sourceRoots,
+  target,
+}) {
+  if (isAbsolute(target)) {
+    const targetCandidates = [resolve(target)];
+    try {
+      targetCandidates.push(await realpath(target));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (
+      targetCandidates.some((candidate) =>
+        sourceRoots.some((sourceRoot) => pathIsInside(sourceRoot, candidate)),
+      )
+    ) {
+      throw new Error("stopped-tree copy rejects absolute symlinks into the source tree");
+    }
+    return;
+  }
+
+  const sourceTarget = resolve(dirname(source), target);
+  const destinationTarget = resolve(dirname(destination), target);
+  const lexicalSourceRoot = sourceRoots[0];
+  if (
+    !pathIsInside(lexicalSourceRoot, sourceTarget) ||
+    !pathIsInside(destinationRoot, destinationTarget) ||
+    relative(lexicalSourceRoot, sourceTarget) !== relative(destinationRoot, destinationTarget)
+  ) {
+    throw new Error("stopped-tree copy rejects non-relocatable relative symlinks");
+  }
+}
+
+async function copyTreeEntry(context, source, destination) {
   const metadata = await lstat(source);
   if (metadata.isSymbolicLink()) {
     const target = await readlink(source);
-    if (isAbsolute(target) && pathIsInside(sourceRoot, resolve(target))) {
-      throw new Error("stopped-tree copy rejects absolute symlinks into the source tree");
-    }
+    await assertPortableSymlink({ ...context, source, destination, target });
     await symlink(target, destination);
     return;
   }
   if (metadata.isDirectory()) {
-    await mkdir(destination, { mode: metadata.mode & 0o777 });
+    const finalMode = portableMode(metadata);
+    await mkdir(destination, { mode: 0o700 });
     const entries = await readdir(source);
     entries.sort();
     for (const entry of entries) {
-      await copyTreeEntry(sourceRoot, join(source, entry), join(destination, entry));
+      await copyTreeEntry(context, join(source, entry), join(destination, entry));
     }
-    await chmod(destination, metadata.mode & 0o777);
+    await chmod(destination, finalMode);
     return;
   }
   if (!metadata.isFile()) {
     throw new Error("stopped-tree copy rejects sockets, devices, and FIFOs");
   }
+  if (metadata.nlink !== 1) throw new Error("stopped-tree copy rejects hard-linked files");
+  const finalMode = portableMode(metadata);
   await copyFile(source, destination);
-  await chmod(destination, metadata.mode & 0o777);
+  await chmod(destination, finalMode);
+}
+
+async function removeTreeForCleanup(path) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if (metadata.isDirectory()) {
+    await chmod(path, (metadata.mode & 0o777) | 0o700);
+    const entries = await readdir(path);
+    for (const entry of entries) await removeTreeForCleanup(join(path, entry));
+  }
+  await rm(path, { recursive: metadata.isDirectory(), force: true });
 }
 
 export async function copyStoppedTree({ ownedRoot, source, destination }) {
   await assertDirectOwnedPath(ownedRoot, source, "source", { mustExist: true });
   await assertDirectOwnedPath(ownedRoot, destination, "destination", { mustExist: false });
   try {
-    await copyTreeEntry(resolve(source), source, destination);
+    await copyTreeEntry(
+      {
+        destinationRoot: resolve(destination),
+        sourceRoots: [resolve(source), await realpath(source)],
+      },
+      source,
+      destination,
+    );
   } catch (error) {
-    await rm(destination, { recursive: true, force: true }).catch(() => {});
+    await removeTreeForCleanup(destination).catch(() => {});
     throw error;
   }
 }
@@ -327,14 +394,15 @@ async function hashTreeEntry(hash, root, path) {
     return;
   }
   if (metadata.isDirectory()) {
-    hash.update(`directory\0${entryPath}\0${metadata.mode & 0o777}\0`);
+    hash.update(`directory\0${entryPath}\0${portableMode(metadata)}\0`);
     const entries = await readdir(path);
     entries.sort();
     for (const entry of entries) await hashTreeEntry(hash, root, join(path, entry));
     return;
   }
   if (!metadata.isFile()) throw new Error("tree digest rejects non-file entries");
-  hash.update(`file\0${entryPath}\0${metadata.mode & 0o777}\0${metadata.size}\0`);
+  if (metadata.nlink !== 1) throw new Error("tree digest rejects hard-linked files");
+  hash.update(`file\0${entryPath}\0${portableMode(metadata)}\0${metadata.size}\0`);
   await updateHashFromFile(hash, path);
   hash.update("\0");
 }
@@ -400,8 +468,10 @@ async function recoverAndInspect({
   const completed = await client.waitForNotification("turn/completed");
   assert.equal(completed.params.turn.status, "completed");
   await mock.waitForRequest(2);
-  const markerPresent = mock.requestBody(1).includes("<turn_aborted>");
+  const followUpRequest = mock.requestBody(1);
+  const markerPresent = followUpRequest.includes("<turn_aborted>");
   assert.equal(markerPresent, expectAbortMarker);
+  assert(followUpRequest.includes(workspace), "follow-up model context omitted the resumed workspace");
 
   return {
     resumeSucceeded: true,
@@ -409,6 +479,7 @@ async function recoverAndInspect({
     tailTurnStatus: resumedTurn.status,
     threadReadAgrees: readTurn.status === resumedTurn.status,
     modelAbortMarker: markerPresent ? "present" : "absent",
+    modelWorkspaceContextMatched: true,
   };
 }
 
@@ -476,7 +547,7 @@ export async function runRecoveryScenario({
       const backupDigest = await digestTree(backupRoot);
       assert.equal(backupDigest, sourceDigest);
       assert.equal(await digestTree(join(backupRoot, "workspace")), sourceWorkspaceDigest);
-      await rm(sessionRoot, { recursive: true });
+      await removeTreeForCleanup(sessionRoot);
       const restoredRoot = join(ownedRoot, "restored-session");
       await copyStoppedTree({ ownedRoot, source: backupRoot, destination: restoredRoot });
       const restoredDigest = await digestTree(restoredRoot);
@@ -506,6 +577,8 @@ export async function runRecoveryScenario({
       workspace,
       expectAbortMarker,
     });
+    const { modelWorkspaceContextMatched, ...recoveryReport } = recovery;
+    if (snapshot) snapshot.appServerWorkspaceMatched = modelWorkspaceContextMatched;
     await recoveredClient.stop();
 
     return {
@@ -513,7 +586,7 @@ export async function runRecoveryScenario({
       turnMaterialized: true,
       terminationObserved,
       originalCompletionObserved,
-      ...recovery,
+      ...recoveryReport,
       ...(snapshot ? { snapshot } : {}),
     };
   } catch (error) {
@@ -525,7 +598,7 @@ export async function runRecoveryScenario({
         () => recoveredClient?.abort(),
         () => client?.abort(),
         () => mock?.close(),
-        () => rm(ownedRoot, { recursive: true, force: true }),
+        () => removeTreeForCleanup(ownedRoot),
       ],
       primaryFailure,
     );
@@ -572,11 +645,18 @@ function assertRecoveryEvidenceSchema(report) {
 
   assertExactObject(
     report.snapshot,
-    ["kind", "sourceQuiesced", "treeDigestMatched", "workspaceDigestMatched"],
+    [
+      "kind",
+      "appServerWorkspaceMatched",
+      "sourceQuiesced",
+      "treeDigestMatched",
+      "workspaceDigestMatched",
+    ],
     "snapshot evidence",
   );
   assert.deepEqual(report.snapshot, {
     kind: "stopped-tree-copy",
+    appServerWorkspaceMatched: true,
     sourceQuiesced: true,
     treeDigestMatched: true,
     workspaceDigestMatched: true,
