@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -166,6 +166,33 @@ process.stdin.on("end", () => setTimeout(() => process.exit(0), 20));
     await new Promise((resolve) => setImmediate(resolve));
   } finally {
     releaseRefresh?.();
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("app-server runs from the isolated Codex home", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-cwd-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  await writeFile(
+    fixturePath,
+    `
+process.stdout.write(JSON.stringify({ method: "fixture/cwd", params: { cwd: process.cwd() } }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.exit(0));
+`,
+  );
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexArgs: [fixturePath],
+    codexHome,
+    timeoutMs: 1_000,
+  });
+  try {
+    await client.start();
+    const message = await client.waitForNotification("fixture/cwd");
+    assert.equal(message.params.cwd, await realpath(codexHome));
+  } finally {
     await client.stop();
     await rm(codexHome, { recursive: true, force: true });
   }

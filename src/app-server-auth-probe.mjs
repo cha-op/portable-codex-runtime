@@ -105,6 +105,7 @@ export class AppServerClient {
     const env = buildWorkerEnvironment(this.codexHome);
 
     this.child = spawn(this.codexBin, this.codexArgs, {
+      cwd: this.codexHome,
       detached: process.platform !== "win32",
       env,
       stdio: ["pipe", "pipe", "pipe"],

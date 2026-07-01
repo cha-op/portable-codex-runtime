@@ -67,7 +67,8 @@ the canonical authority file directly:
 4. Copy the credential into a mode `0700` staging `CODEX_HOME`, fsync both
    files and the staging directory chain, and fail before OAuth rotation if
    those recovery markers cannot be made durable.
-5. Recheck the authority lock immediately before the RPC and synchronously reap
+5. Require an absolute Codex binary path, run it with the staging home as
+   its working directory, recheck the authority lock immediately before the RPC, and synchronously reap
    the isolated app-server process group on every shutdown path. Because a
    remote OAuth rotation may already have committed, lock loss or any failure
    after `account/read` dispatch is non-retryable: retain the durable staging
@@ -114,7 +115,9 @@ The redacted machine-readable result is stored in
 Run the live probe only with a dedicated login that may be rotated:
 
 ```bash
-CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
+chmod 700 .test-codex-home
+CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
+  CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
 ```
 
 ## Limitations
@@ -141,10 +144,13 @@ CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
   TOCTOU window. The authority volume must therefore be single-attached, its
   parent chain must not be writable or renameable by workers, and only the
   broker may mount the canonical credential directory.
-- The reference lock backend requires `/usr/bin/lockf` on macOS and `flock`
+- The reference lock backend requires `/usr/bin/lockf` on macOS and `/usr/bin/flock`
   from util-linux plus procfs on Linux. Fixed runtime images must include and
   test the matching backend. The repository test workflow exercises both
   `macos-latest` and `ubuntu-latest`.
+- The adapter rejects PATH lookup for the credential-bearing Codex process, but
+  binary digest, ownership, and immutability remain deployment responsibilities
+  of the fixed runtime image.
 - Directory-sync, cleanup, or lock-release errors after a verified canonical
   promotion are returned as committed warnings, preventing callers from
   rotating a second token in response to an already committed refresh. A

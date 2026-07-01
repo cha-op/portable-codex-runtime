@@ -13,7 +13,7 @@ import {
   rmdir,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { AdvisoryLockError, acquireAdvisoryLock } from "./advisory-lock.mjs";
 import { AppServerClient } from "./app-server-auth-probe.mjs";
@@ -114,6 +114,17 @@ function sameFileIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+export function authorityDirectoryPermissionsAreSafe(
+  { isDirectory, mode, uid },
+  { allowRootOwner = false, brokerUid, disallowedModeBits },
+) {
+  return (
+    isDirectory === true &&
+    (brokerUid === null || uid === brokerUid || (allowRootOwner && uid === 0)) &&
+    (mode & disallowedModeBits) === 0
+  );
+}
+
 function attachRecoveryPaths(target, paths) {
   if (!target || typeof target !== "object") return;
   const recoveryPaths = [
@@ -152,6 +163,41 @@ async function resolveAuthorityHome(authHome) {
       authorityHomeStat.isDirectory(),
       "unsafe_auth_home",
       "authority home must be a real directory",
+    );
+    const authorityParentStat = await lstat(dirname(authorityHome));
+    const currentUid =
+      typeof process.geteuid === "function"
+        ? process.geteuid()
+        : typeof process.getuid === "function"
+          ? process.getuid()
+          : null;
+    ensure(
+      authorityDirectoryPermissionsAreSafe(
+        {
+          isDirectory: authorityHomeStat.isDirectory(),
+          mode: authorityHomeStat.mode,
+          uid: authorityHomeStat.uid,
+        },
+        { brokerUid: currentUid, disallowedModeBits: 0o077 },
+      ),
+      "unsafe_auth_home",
+      "authority home must be broker-owned and private",
+    );
+    ensure(
+      authorityDirectoryPermissionsAreSafe(
+        {
+          isDirectory: authorityParentStat.isDirectory(),
+          mode: authorityParentStat.mode,
+          uid: authorityParentStat.uid,
+        },
+        {
+          allowRootOwner: true,
+          brokerUid: currentUid,
+          disallowedModeBits: 0o022,
+        },
+      ),
+      "unsafe_auth_home",
+      "authority home parent must be broker/root-owned and not group/world writable",
     );
     const protectedHomes = await Promise.all(
       [join(homedir(), ".codex"), process.env.CODEX_HOME]
@@ -551,6 +597,14 @@ export async function readManagedAuthSnapshot(authHome) {
   const idPayload = decodeJwtPayload(auth.tokens.id_token, "id_token");
   const accessAuth = authClaims(accessPayload);
   const idAuth = authClaims(idPayload);
+  ensure(
+    typeof accessAuth.chatgpt_account_id === "string" &&
+      accessAuth.chatgpt_account_id.length > 0 &&
+      typeof accessAuth.chatgpt_user_id === "string" &&
+      accessAuth.chatgpt_user_id.length > 0,
+    "invalid_auth_record",
+    "authority access_token is missing account or user identity claims",
+  );
   const accountIds = [
     auth.tokens.account_id,
     accessAuth.chatgpt_account_id,
@@ -604,6 +658,11 @@ export async function runCodexManagedRefresh({
   signal,
   stagingHome,
 }) {
+  ensure(
+    typeof codexBin === "string" && isAbsolute(codexBin),
+    "unsafe_codex_binary",
+    "managed refresh requires an absolute Codex binary path",
+  );
   const client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
   let operationError;
   let refreshRequestDispatched = false;
@@ -1045,7 +1104,7 @@ export async function refreshManagedAuthRecord({
 }
 
 export class ManagedAuthRefreshAuthority {
-  constructor({ authHome, codexBin = "codex", refreshRecord = refreshManagedAuthRecord }) {
+  constructor({ authHome, codexBin, refreshRecord = refreshManagedAuthRecord }) {
     this.authHome = authHome;
     this.codexBin = codexBin;
     this.refreshRecord = refreshRecord;

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { codexVersion } from "./app-server-auth-probe.mjs";
 import {
@@ -35,7 +35,7 @@ export function assertAuthorityEvidenceSafe(serialized, redactionValues) {
 export async function probeLiveAuthRefreshAuthority({
   allowAuthMutation = process.env.CODEX_ALLOW_AUTH_MUTATION === "1",
   authHome = process.env.CODEX_TEST_HOME ?? DEFAULT_AUTH_HOME,
-  codexBin = process.env.CODEX_BIN ?? "codex",
+  codexBin = process.env.CODEX_BIN,
   evidencePath = process.env.CODEX_AUTH_REFRESH_EVIDENCE ?? DEFAULT_EVIDENCE_PATH,
   makeDirectory = mkdir,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
@@ -45,6 +45,11 @@ export async function probeLiveAuthRefreshAuthority({
     allowAuthMutation,
     true,
     "live authority refresh mutates the dedicated login; set CODEX_ALLOW_AUTH_MUTATION=1",
+  );
+  assert.equal(
+    typeof codexBin === "string" && isAbsolute(codexBin),
+    true,
+    "live authority refresh requires CODEX_BIN to be an absolute pinned-image path",
   );
 
   const startedAt = new Date().toISOString();

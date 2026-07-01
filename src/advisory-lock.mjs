@@ -29,7 +29,7 @@ export function advisoryLockCommand(
   }
   if (platform === "linux") {
     return {
-      command: "flock",
+      command: "/usr/bin/flock",
       // The command form treats a bare "3" as a path. Opening the inherited
       // descriptor through procfs keeps the secure pre-opened inode while the
       // flock wrapper owns the lock for the lifetime of the holder process.

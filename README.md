@@ -30,7 +30,9 @@ The live probe intentionally mutates the dedicated login and then performs a
 separate worker turn with the refreshed access token:
 
 ```bash
-CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
+chmod 700 .test-codex-home
+CODEX_BIN=/absolute/path/from/the/pinned-image/codex \
+  CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
 ```
 
 Do not point this command at the default user `~/.codex` home or the active

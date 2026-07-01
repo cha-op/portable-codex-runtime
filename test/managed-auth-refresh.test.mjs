@@ -22,6 +22,7 @@ import test from "node:test";
 import {
   ManagedAuthRefreshAuthority,
   ManagedAuthRefreshError,
+  authorityDirectoryPermissionsAreSafe,
   authorityLockPath,
   authorityStagingDirectory,
   managedAuthRefreshErrorMetadata,
@@ -42,6 +43,38 @@ const RPC_AUDIT = [
   { kind: "notification", method: "initialized" },
   { kind: "request", method: "account/read" },
 ];
+
+test("authority directory permission policy accepts only trusted owners and modes", () => {
+  const options = { brokerUid: 501, disallowedModeBits: 0o022 };
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40755, uid: 501 },
+      options,
+    ),
+    true,
+  );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40555, uid: 0 },
+      { ...options, allowRootOwner: true },
+    ),
+    true,
+  );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40555, uid: 777 },
+      { ...options, allowRootOwner: true },
+    ),
+    false,
+  );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40777, uid: 0 },
+      { ...options, allowRootOwner: true },
+    ),
+    false,
+  );
+});
 
 function encodeJwt(payload) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -272,6 +305,7 @@ test("runCodexManagedRefresh always stops the app-server after request failure",
   let stopped = 0;
   await assert.rejects(
     runCodexManagedRefresh({
+      codexBin: "/pinned/codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => ({
         initialize: async () => ({}),
@@ -296,6 +330,7 @@ test("runCodexManagedRefresh always stops the app-server after request failure",
 test("app-server stop failure cannot mask an uncertain refresh outcome", async () => {
   await assert.rejects(
     runCodexManagedRefresh({
+      codexBin: "/pinned/codex",
       stagingHome: "/isolated/staging-home",
       createClient: () => ({
         initialize: async () => ({}),
@@ -337,7 +372,11 @@ test("post-dispatch RPC failure preserves an unchanged staging sentinel", async 
       });
     let refreshError;
     try {
-      await refreshManagedAuthRecord({ authHome, runRefresh });
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        runRefresh,
+      });
     } catch (error) {
       refreshError = error;
     }
@@ -377,6 +416,7 @@ test("runCodexManagedRefresh aborts an in-flight request and stops the app-serve
   let stopped = 0;
   let settled = false;
   const refresh = runCodexManagedRefresh({
+    codexBin: "/pinned/codex",
     signal: controller.signal,
     stagingHome: "/isolated/staging-home",
     createClient: () => ({
@@ -407,6 +447,22 @@ test("runCodexManagedRefresh aborts an in-flight request and stops the app-serve
   await assert.rejects(refresh, (error) => error === lost);
   assert.equal(aborted, 1);
   assert.equal(stopped, 1);
+});
+
+test("managed refresh rejects PATH-resolved Codex binaries before startup", async () => {
+  let clientCreated = false;
+  await assert.rejects(
+    runCodexManagedRefresh({
+      codexBin: "codex",
+      stagingHome: "/isolated/staging-home",
+      createClient: () => {
+        clientCreated = true;
+        return {};
+      },
+    }),
+    (error) => error.code === "unsafe_codex_binary",
+  );
+  assert.equal(clientCreated, false);
 });
 
 test("unresolved refresh artifacts block token rotation and expose safe recovery paths", async () => {
@@ -1211,6 +1267,56 @@ test("authority auth.json rejects hard links", async () => {
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority rejects permissive homes and writable parent directories", async () => {
+  const permissiveHome = await createAuthorityHome();
+  try {
+    await chmod(permissiveHome.authHome, 0o755);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome: permissiveHome.authHome }),
+      (error) => error.code === "unsafe_auth_home",
+    );
+  } finally {
+    await rm(permissiveHome.root, { recursive: true, force: true });
+  }
+
+  const permissiveParent = await createAuthorityHome();
+  try {
+    await chmod(permissiveParent.root, 0o777);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome: permissiveParent.authHome }),
+      (error) => error.code === "unsafe_auth_home",
+    );
+  } finally {
+    await rm(permissiveParent.root, { recursive: true, force: true });
+  }
+});
+
+test("authority requires identity claims in the access token itself", async () => {
+  for (const accessClaims of [
+    { chatgpt_account_id: ACCOUNT_ID },
+    { chatgpt_user_id: USER_ID },
+  ]) {
+    const { authHome, root } = await createAuthorityHome();
+    try {
+      const document = JSON.parse(await readFile(join(authHome, "auth.json"), "utf8"));
+      document.tokens.access_token = encodeJwt({
+        exp: DEFAULT_TEST_TOKEN_EXPIRY_UNIX_SECONDS,
+        "https://api.openai.com/auth": accessClaims,
+      });
+      await writeFile(join(authHome, "auth.json"), `${JSON.stringify(document)}\n`, {
+        mode: 0o600,
+      });
+      await assert.rejects(
+        readManagedAuthSnapshot(authHome),
+        (error) =>
+          error.code === "invalid_auth_record" && /identity claims/.test(error.message),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

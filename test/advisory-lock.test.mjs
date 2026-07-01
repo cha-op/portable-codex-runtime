@@ -170,7 +170,7 @@ test("advisory lock backends use the inherited secure file descriptor", () => {
     conflictExitCode: 75,
   });
   assert.deepEqual(advisoryLockCommand("linux"), {
-    command: "flock",
+    command: "/usr/bin/flock",
     args: [
       "--exclusive",
       "--nonblock",
