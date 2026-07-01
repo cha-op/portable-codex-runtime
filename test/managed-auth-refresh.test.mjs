@@ -26,6 +26,7 @@ import {
   authorityLockPath,
   authorityStagingDirectory,
   managedAuthRefreshErrorMetadata,
+  managedAuthRefreshFailureReport,
   readManagedAuthSnapshot,
   refreshManagedAuthRecord,
   runCodexManagedRefresh,
@@ -350,6 +351,99 @@ test("app-server stop failure cannot mask an uncertain refresh outcome", async (
       return true;
     },
   );
+});
+
+test("startup failure plus stop failure becomes sanitized non-retryable uncertainty", async () => {
+  for (const phase of ["start", "initialize"]) {
+    const operationSecret = `${phase}-credential-secret`;
+    const stopSecret = `${phase}-stop-credential-secret`;
+    let refreshError;
+    try {
+      await runCodexManagedRefresh({
+        codexBin: "/pinned/codex",
+        stagingHome: `/isolated/${phase}-staging-home`,
+        createClient: () => ({
+          start: async () => {
+            if (phase === "start") throw new Error(operationSecret);
+          },
+          initialize: async () => {
+            if (phase === "initialize") throw new Error(operationSecret);
+            return {};
+          },
+          request: async () => assert.fail("account/read must not be dispatched"),
+          stop: async () => {
+            throw new Error(stopSecret);
+          },
+        }),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "app_server_shutdown_unknown");
+    assert.deepEqual(refreshError.cleanupWarnings, ["app_server_stop_failed"]);
+    assert.equal(refreshError.cause.message, operationSecret);
+    const serialized = JSON.stringify(managedAuthRefreshFailureReport(refreshError));
+    assert.equal(serialized.includes(operationSecret), false);
+    assert.equal(serialized.includes(stopSecret), false);
+  }
+});
+
+test("initialize plus stop failure retains staging and blocks the next rotation", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const operationSecret = "initialize-login-secret";
+  const stopSecret = "stop-login-secret";
+  try {
+    const runRefresh = (options) =>
+      runCodexManagedRefresh({
+        ...options,
+        createClient: () => ({
+          start: async () => {},
+          initialize: async () => {
+            throw new Error(operationSecret);
+          },
+          request: async () => assert.fail("account/read must not be dispatched"),
+          stop: async () => {
+            throw new Error(stopSecret);
+          },
+        }),
+      });
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        codexBin: "/pinned/codex",
+        runRefresh,
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "app_server_shutdown_unknown");
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    const serialized = JSON.stringify(managedAuthRefreshFailureReport(refreshError));
+    assert.equal(serialized.includes(operationSecret), false);
+    assert.equal(serialized.includes(stopSecret), false);
+
+    let nextRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          nextRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) => error.code === "recovery_required",
+    );
+    assert.equal(nextRefreshCalled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("post-dispatch RPC failure preserves an unchanged staging sentinel", async () => {

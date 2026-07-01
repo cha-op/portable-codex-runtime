@@ -807,6 +807,24 @@ export async function runCodexManagedRefresh({
       await client.stop();
     } catch (stopError) {
       if (operationError) {
+        if (!refreshRequestDispatched) {
+          const uncertain = new ManagedAuthRefreshError(
+            "refresh_outcome_uncertain",
+            "app-server shutdown failed before refresh dispatch could be proven",
+            {
+              recoveryPath: stagingHome,
+              recoveryReason: "app_server_shutdown_unknown",
+            },
+          );
+          uncertain.cause = operationError;
+          uncertain.cleanupWarnings = [
+            ...(Array.isArray(operationError.cleanupWarnings)
+              ? operationError.cleanupWarnings
+              : []),
+            "app_server_stop_failed",
+          ];
+          throw uncertain;
+        }
         operationError.cleanupWarnings = [
           ...(Array.isArray(operationError.cleanupWarnings)
             ? operationError.cleanupWarnings

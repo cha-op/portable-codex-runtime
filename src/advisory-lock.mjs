@@ -108,6 +108,7 @@ export async function acquireAdvisoryLock(
     releaseGraceMs = 2_000,
     signalGraceMs = 2_000,
     timeoutMs = 5_000,
+    startupTimeoutMs = timeoutMs,
   } = {},
 ) {
   const { command, args, conflictExitCode } = advisoryLockCommand(platform, {
@@ -172,7 +173,7 @@ export async function acquireAdvisoryLock(
         finish(() =>
           reject(new AdvisoryLockError("lock_timeout", "timed out acquiring the authority lock")),
         );
-      }, timeoutMs);
+      }, startupTimeoutMs);
       child.once("error", () => {
         finish(() =>
           reject(new AdvisoryLockError("lock_runtime_unavailable", "authority lock runtime failed")),

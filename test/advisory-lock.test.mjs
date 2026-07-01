@@ -90,6 +90,7 @@ test("uncertain rename quiesces the holder before it can mutate later", async ()
     lock = await acquireAdvisoryLock(lockPath, {
       holderPath: DELAYED_HOLDER_FIXTURE,
       signalGraceMs: 1_000,
+      startupTimeoutMs: 5_000,
       timeoutMs: 50,
     });
     await assert.rejects(
