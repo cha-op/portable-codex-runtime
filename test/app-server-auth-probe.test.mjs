@@ -76,10 +76,19 @@ async function killAndWaitForProcess(
   }
 }
 
-async function waitForFile(path, timeoutMs = 2_000) {
+async function waitForFileContents(
+  path,
+  expectedContents,
+  { read = readFile, timeoutMs = 2_000 } = {},
+) {
   const deadline = Date.now() + timeoutMs;
-  while (!(await fileExists(path))) {
-    assert(Date.now() < deadline, `timed out waiting for fixture file ${path}`);
+  while (true) {
+    try {
+      if ((await read(path, "utf8")) === expectedContents) return;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    assert(Date.now() < deadline, `timed out waiting for fixture contents at ${path}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
@@ -95,6 +104,30 @@ function encodeJwt(payload) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
   return `${encode({ alg: "none", typ: "JWT" })}.${encode(payload)}.${encode("signature")}`;
 }
+
+test("fixture content wait tolerates missing and empty files before exact contents", async () => {
+  const expectedContents = "complete marker\n";
+  const missing = new Error("synthetic missing marker");
+  missing.code = "ENOENT";
+  const observations = [missing, "", expectedContents];
+  const reads = [];
+
+  await waitForFileContents("/synthetic/marker", expectedContents, {
+    read: async (...args) => {
+      reads.push(args);
+      const observation = observations.shift();
+      if (observation instanceof Error) throw observation;
+      return observation;
+    },
+  });
+
+  assert.deepEqual(reads, [
+    ["/synthetic/marker", "utf8"],
+    ["/synthetic/marker", "utf8"],
+    ["/synthetic/marker", "utf8"],
+  ]);
+  assert.deepEqual(observations, []);
+});
 
 test("worker environment excludes arbitrary host credentials", () => {
   assert.deepEqual(
@@ -1102,6 +1135,7 @@ test(
       timeoutMs: 1_000,
     });
     let grandchildPid;
+    const expectedMarker = "detached grandchild mutation\n";
     try {
       await client.start();
       const notification = await client.waitForNotification("fixture/detached-grandchild");
@@ -1109,8 +1143,8 @@ test(
       assert(Number.isSafeInteger(grandchildPid) && grandchildPid > 0);
 
       await client.stop();
-      await waitForFile(markerPath);
-      assert.equal(await readFile(markerPath, "utf8"), "detached grandchild mutation\n");
+      await waitForFileContents(markerPath, expectedMarker);
+      assert.equal(await readFile(markerPath, "utf8"), expectedMarker);
     } finally {
       if (!grandchildPid && (await fileExists(pidPath))) {
         grandchildPid = Number.parseInt(await readFile(pidPath, "utf8"), 10);
