@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmod,
   link,
@@ -26,11 +27,10 @@ import {
   assertPortableDirectoryNames,
   assertProcessGroupTarget,
   assertRecoveryEvidenceSafe,
-  copyStoppedTree,
+  copyStoppedTree as copyStoppedTreeWithAcl,
   createRecoveryLayout,
   decodePortablePathBytes,
   digestTree,
-  ensurePrivateEvidenceDirectory,
   interruptedTurnRecoveryFailureReport,
   inspectLinuxRecoveryAcl,
   parseDarwinMountTable,
@@ -41,7 +41,7 @@ import {
   startRecoveryClient,
   terminateAppServer,
   verifyModelWorkspaceContext,
-  writeRecoveryEvidence,
+  writeRecoveryEvidence as writeRecoveryEvidenceWithAcl,
 } from "../src/interrupted-turn-recovery-probe.mjs";
 
 function scenarioReport(kind) {
@@ -85,6 +85,16 @@ const TRUSTED_RECOVERY_ACL = {
   inspectExecutableRootAcl: async () => false,
 };
 
+const copyStoppedTree = (options) =>
+  copyStoppedTreeWithAcl({ inspectOwnedRootAcl: async () => false, ...options });
+
+const writeRecoveryEvidence = (path, report, options = {}) =>
+  writeRecoveryEvidenceWithAcl(path, report, {
+    inspectEvidenceAncestorAcl: async () => false,
+    inspectEvidenceDirectoryAcl: async () => false,
+    ...options,
+  });
+
 function completeEvidenceReport() {
   const scenarios = RECOVERY_SCENARIOS.map((kind) => {
     const { snapshot: _snapshot, ...scenario } = scenarioReport(kind);
@@ -110,6 +120,19 @@ function completeEvidenceReport() {
     snapshot: scenarioReport("snapshot_restore").snapshot,
     scenarios,
     result: "passed",
+  };
+}
+
+function privateEvidenceFileMetadata() {
+  const currentUid = process.geteuid?.() ?? process.getuid?.();
+  assert.notEqual(currentUid, undefined);
+  return {
+    dev: 1n,
+    ino: 1n,
+    isFile: () => true,
+    mode: 0o600n,
+    nlink: 1n,
+    uid: BigInt(currentUid),
   };
 }
 
@@ -394,6 +417,77 @@ test("stopped-tree copy requires a private coordinator-owned root", async () => 
     await rm(container, { recursive: true, force: true });
   }
 });
+
+test("stopped-tree copy fails closed on owned-root ACL inspection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-acl-test-"));
+  try {
+    const source = join(root, "source");
+    await mkdir(source);
+    await writeFile(join(source, "sentinel"), "inside");
+    const cases = [
+      {
+        inspectOwnedRootAcl: async () => true,
+        message: /owned root must not have extended access controls/,
+      },
+      {
+        inspectOwnedRootAcl: async () => {
+          throw new Error("sensitive ACL principal");
+        },
+        message: /owned root ACL could not be validated/,
+      },
+    ];
+    for (const [index, aclCase] of cases.entries()) {
+      const destination = join(root, `destination-${index}`);
+      await assert.rejects(
+        copyStoppedTree({
+          ownedRoot: root,
+          source,
+          destination,
+          inspectOwnedRootAcl: aclCase.inspectOwnedRootAcl,
+        }),
+        (error) => aclCase.message.test(error.message) && !error.message.includes("sensitive"),
+      );
+      await assert.rejects(lstat(destination), /ENOENT/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "stopped-tree copy rejects a real macOS allow ACL on its owned root",
+  { skip: platform() !== "darwin" },
+  async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "portable-copy-owned-root-real-acl-test-"));
+    try {
+      const source = join(root, "source");
+      const destination = join(root, "destination");
+      await mkdir(source);
+      await writeFile(join(source, "sentinel"), "inside");
+      const result = spawnSync(
+        "/bin/chmod",
+        ["+a", "everyone allow add_file,add_subdirectory,delete_child", root],
+        { encoding: "utf8" },
+      );
+      if (result.error?.code === "ENOENT") {
+        t.skip("/bin/chmod is unavailable for ACL setup");
+        return;
+      }
+      if (result.status !== 0) {
+        t.skip("the test filesystem does not support a macOS allow ACL");
+        return;
+      }
+      assert.equal((await stat(root)).mode & 0o777, 0o700);
+      await assert.rejects(
+        copyStoppedTreeWithAcl({ ownedRoot: root, source, destination }),
+        /owned root must not have extended access controls/,
+      );
+      await assert.rejects(lstat(destination), /ENOENT/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("portable tree operations reject declared nested mount boundaries", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-mount-boundary-test-"));
@@ -1334,14 +1428,12 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     }
     const path = join(root, "evidence.json");
     const synchronizedDirectories = [];
-    await Promise.all([
-      writeRecoveryEvidence(path, report, {
-        syncDirectory: async (directory) => synchronizedDirectories.push(directory),
-      }),
-      writeRecoveryEvidence(path, report, {
-        syncDirectory: async (directory) => synchronizedDirectories.push(directory),
-      }),
-    ]);
+    for (let index = 0; index < 2; index += 1) {
+      await writeRecoveryEvidence(path, report, {
+        syncDirectory: async (_handle, directory) =>
+          synchronizedDirectories.push(directory),
+      });
+    }
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), report);
     assert.deepEqual(await readdir(root), ["evidence.json"]);
     assert.deepEqual(synchronizedDirectories, [await realpath(root), await realpath(root)]);
@@ -1383,6 +1475,7 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
           close: async () => {
             throw closeOnlyFailure;
           },
+          stat: async () => privateEvidenceFileMetadata(),
           sync: async () => {},
           writeFile: async () => {},
         }),
@@ -1390,25 +1483,12 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       (error) => error === closeOnlyFailure,
     );
 
-    const nestedPath = join(root, "new-private", "nested", "evidence.json");
-    const nestedSynchronizedDirectories = [];
-    const previousUmask = process.umask(0o777);
-    try {
-      await writeRecoveryEvidence(nestedPath, report, {
-        syncDirectory: async (directory) => nestedSynchronizedDirectories.push(directory),
-      });
-    } finally {
-      process.umask(previousUmask);
-    }
-    for (const directory of [dirname(nestedPath), dirname(dirname(nestedPath))]) {
-      assert.equal((await stat(directory)).mode & 0o777, 0o700);
-    }
-    assert.deepEqual(nestedSynchronizedDirectories, [
-      await realpath(dirname(nestedPath)),
-      await realpath(dirname(dirname(nestedPath))),
-      await realpath(root),
-    ]);
-    assert.equal((await stat(nestedPath)).mode & 0o777, 0o600);
+    const missingParent = join(root, "missing-parent");
+    await assert.rejects(
+      writeRecoveryEvidence(join(missingParent, "evidence.json"), report),
+      /ENOENT/,
+    );
+    await assert.rejects(lstat(missingParent), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1434,28 +1514,129 @@ test("tracked interrupted-turn recovery evidence matches the pinned run", async 
   assert.equal(report.runtime.launcherArch, "arm64");
 });
 
-test("evidence directory creation fails closed on an EEXIST race", async () => {
-  const root = await mkdtemp(join(tmpdir(), "portable-evidence-race-test-"));
-  const racedDirectory = join(root, "raced");
-  let setModeCalls = 0;
+test("recovery evidence rejects unsafe directory permissions and ACLs before writing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-evidence-trust-test-"));
   try {
+    let openCalls = 0;
+    const openEvidenceFile = async () => {
+      openCalls += 1;
+      assert.fail("unsafe evidence directories must fail before opening a file");
+    };
+    await chmod(root, 0o777);
     await assert.rejects(
-      ensurePrivateEvidenceDirectory(racedDirectory, {
-        createDirectory: async (path) => {
-          await mkdir(path);
-          await chmod(path, 0o755);
-          const error = new Error("simulated concurrent creation");
-          error.code = "EEXIST";
-          throw error;
+      writeRecoveryEvidence(join(root, "mode.json"), completeEvidenceReport(), {
+        openEvidenceFile,
+      }),
+      /not writable by other users/,
+    );
+    await chmod(root, 0o700);
+    await assert.rejects(
+      writeRecoveryEvidence(join(root, "directory-acl.json"), completeEvidenceReport(), {
+        inspectEvidenceDirectoryAcl: async () => true,
+        openEvidenceFile,
+      }),
+      /evidence directory ACL could not be trusted/,
+    );
+    const nested = join(root, "nested");
+    await mkdir(nested, { mode: 0o700 });
+    await assert.rejects(
+      writeRecoveryEvidence(join(nested, "ancestor-acl.json"), completeEvidenceReport(), {
+        inspectEvidenceAncestorAcl: async () => true,
+        openEvidenceFile,
+      }),
+      /evidence directory ancestor ACL could not be trusted/,
+    );
+    assert.equal(openCalls, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recovery evidence rejects a directory replacement before publication", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-evidence-replacement-test-"));
+  const evidenceDirectory = join(root, "evidence");
+  const displacedDirectory = join(root, "displaced");
+  try {
+    await mkdir(evidenceDirectory, { mode: 0o700 });
+    await assert.rejects(
+      writeRecoveryEvidence(
+        join(evidenceDirectory, "result.json"),
+        completeEvidenceReport(),
+        {
+          beforeEvidenceRename: async () => {
+            await rename(evidenceDirectory, displacedDirectory);
+            await mkdir(evidenceDirectory, { mode: 0o700 });
+            await writeFile(join(evidenceDirectory, "sentinel"), "replacement");
+          },
         },
-        setMode: async () => {
-          setModeCalls += 1;
+      ),
+      /evidence directory identity|temporary evidence directory identity/,
+    );
+    assert.equal(await readFile(join(evidenceDirectory, "sentinel"), "utf8"), "replacement");
+    await assert.rejects(lstat(join(evidenceDirectory, "result.json")), /ENOENT/);
+    assert((await readdir(displacedDirectory)).some((entry) => entry.startsWith(".result.json.tmp-")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recovery evidence rejects a temporary-directory replacement before writing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-evidence-temp-replacement-test-"));
+  try {
+    let displacedDirectory;
+    let replacementDirectory;
+    await assert.rejects(
+      writeRecoveryEvidence(join(root, "result.json"), completeEvidenceReport(), {
+        afterTemporaryDirectoryOpened: async ({ temporaryDirectoryAuthority }) => {
+          replacementDirectory = temporaryDirectoryAuthority.path;
+          displacedDirectory = `${temporaryDirectoryAuthority.path}.displaced`;
+          await rename(temporaryDirectoryAuthority.path, displacedDirectory);
+          await mkdir(temporaryDirectoryAuthority.path, { mode: 0o700 });
+          await writeFile(join(temporaryDirectoryAuthority.path, "sentinel"), "replacement");
         },
       }),
-      (error) => error.code === "EEXIST",
+      /temporary evidence directory identity or permissions changed/,
     );
-    assert.equal(setModeCalls, 0);
-    assert.equal((await stat(racedDirectory)).mode & 0o777, 0o755);
+    assert.equal(
+      await readFile(join(replacementDirectory, "sentinel"), "utf8"),
+      "replacement",
+    );
+    await assert.rejects(lstat(join(root, "result.json")), /ENOENT/);
+    assert.equal((await stat(displacedDirectory)).isDirectory(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recovery evidence never removes a replaced temp directory after rename", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-evidence-post-rename-temp-test-"));
+  try {
+    let displacedDirectory;
+    let temporaryDirectory;
+    let syncCalls = 0;
+    await assert.rejects(
+      writeRecoveryEvidence(join(root, "result.json"), completeEvidenceReport(), {
+        afterTemporaryDirectoryOpened: async ({ temporaryDirectoryAuthority }) => {
+          temporaryDirectory = temporaryDirectoryAuthority.path;
+          displacedDirectory = `${temporaryDirectoryAuthority.path}.displaced`;
+        },
+        afterEvidenceRename: async () => {
+          await rename(temporaryDirectory, displacedDirectory);
+          await mkdir(temporaryDirectory, { mode: 0o700 });
+        },
+        syncDirectory: async () => {
+          syncCalls += 1;
+        },
+      }),
+      /temporary evidence directory identity or permissions changed/,
+    );
+    assert.equal((await stat(temporaryDirectory)).isDirectory(), true);
+    assert.equal((await stat(displacedDirectory)).isDirectory(), true);
+    assert.deepEqual(
+      JSON.parse(await readFile(join(root, "result.json"), "utf8")),
+      completeEvidenceReport(),
+    );
+    assert.equal(syncCalls, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -54,9 +54,9 @@ timestamps, and other unmodeled metadata are not preserved or covered by the
 digest. If validation or copy fails after destination creation, the partial
 destination is retained for cleanup by the trusted owner; the helper never
 recursively removes a failure path that another writer could have replaced.
-The copy helper requires exclusive single-writer control of its mode `0700`
-owned root; concurrent mutation by another process with the same UID is not a
-supported security boundary.
+The copy helper requires exclusive single-writer control of its current-user-
+owned, mode `0700`, extended-ACL-free root; concurrent mutation by another
+process with the same UID is not a supported security boundary.
 It is not an online, atomic, or power-loss-durable snapshot implementation.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
@@ -82,6 +82,11 @@ To update the redacted evidence after an intentional runtime upgrade:
 CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
   npm run probe:turn-recovery -- --write-evidence
 ```
+
+The evidence parent directory must already exist, be owned by the current user,
+and have trusted permissions, ancestors, and ACL state. Evidence publication
+holds and revalidates that directory; a failed write retains its private temp
+artifact for trusted-owner cleanup.
 
 The command provisions no credential input and configures the model provider to
 use the loopback mock. It does not impose OS-level outbound network isolation;

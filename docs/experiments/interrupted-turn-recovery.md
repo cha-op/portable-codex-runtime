@@ -100,6 +100,17 @@ CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
   npm run probe:turn-recovery
 ```
 
+When `--write-evidence` is selected, the evidence parent directory must already
+exist, be owned by the current user, grant owner read/write/search access, deny
+group/world writes, and have no extended ACL. Its canonical ancestor chain must
+be current-user/root-owned and non-writable except for sticky shared ancestors,
+with no unsafe ACLs. Publication holds an `O_DIRECTORY|O_NOFOLLOW` handle,
+revalidates directory, temporary-directory, and file identities around rename,
+and fsyncs the held directory handle. A failed publication retains its private
+temporary artifact for trusted-owner inspection instead of recursively removing
+a pathname that may have been replaced. Concurrent mutation by another process
+with the same UID is outside this pure-Node helper's security boundary.
+
 If the default temporary filesystem is mounted `noexec`, set
 `CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
 filesystem. The root must be owned by the current user or root; if it is
@@ -218,12 +229,13 @@ restore interfaces.
   topology. Special bits and hard links, including hard-linked symlinks, fail
   closed; the other metadata remains outside this modeled digest and must be
   preserved by the later volume-snapshot implementation.
-- The stopped-tree copy requires exclusive single-writer control of its private
-  mode `0700` owned root. It pins and revalidates each destination directory as
-  defense in depth, but concurrent mutation by another process with the same
-  UID is outside its security contract. The production design supplies this
-  invariant with session fencing, worker quiescence, and a single-attached
-  volume before snapshot.
+- The stopped-tree copy requires exclusive single-writer control of its
+  current-user-owned, mode `0700`, extended-ACL-free root. Missing or malformed
+  ACL inspection fails closed. It pins and revalidates each destination
+  directory as defense in depth, but concurrent mutation by another process
+  with the same UID is outside its security contract. The production design
+  supplies this invariant with session fencing, worker quiescence, and a
+  single-attached volume before snapshot.
 - Digest, copy, and pathname cleanup reject a root that is itself a mount point
   or contains a nested mount point. Linux mount boundaries, including
   same-device bind mounts, come from `/proc/self/mountinfo`; macOS boundaries

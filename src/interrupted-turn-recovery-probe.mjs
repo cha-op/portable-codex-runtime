@@ -17,6 +17,7 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   symlink,
   writeFile,
@@ -350,21 +351,46 @@ async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist })
   return canonicalCandidate;
 }
 
-async function assertPrivateOwnedRoot(ownedRoot) {
+async function assertPrivateOwnedRoot(ownedRoot, inspectRootAcl) {
   const requestedRoot = resolve(ownedRoot);
-  const canonicalRoot = await realpath(requestedRoot);
-  const metadata = await lstat(requestedRoot);
+  const metadata = await lstat(requestedRoot, { bigint: true });
   const currentUid = process.geteuid?.() ?? process.getuid?.();
   assert.notEqual(currentUid, undefined, "stopped-tree copy requires a POSIX owner identity");
   assert(
     metadata.isDirectory() && !metadata.isSymbolicLink(),
     "stopped-tree owned root must be a directory",
   );
-  assert.equal(metadata.uid, currentUid, "stopped-tree owned root must be owned by this user");
   assert.equal(
-    metadata.mode & 0o777,
+    metadata.uid,
+    BigInt(currentUid),
+    "stopped-tree owned root must be owned by this user",
+  );
+  assert.equal(
+    Number(metadata.mode & 0o777n),
     0o700,
     "stopped-tree owned root must have mode 0700",
+  );
+  const canonicalRoot = await realpath(requestedRoot);
+  await assertPathIdentity(
+    requestedRoot,
+    metadata,
+    "stopped-tree copy rejects owned-root identity changes",
+  );
+  let hasExtendedAcl;
+  try {
+    hasExtendedAcl = await inspectRootAcl(canonicalRoot);
+  } catch {
+    throw new Error("stopped-tree owned root ACL could not be validated");
+  }
+  assert.equal(
+    hasExtendedAcl,
+    false,
+    "stopped-tree owned root must not have extended access controls",
+  );
+  await assertPathIdentity(
+    requestedRoot,
+    metadata,
+    "stopped-tree copy rejects owned-root identity changes",
   );
   return canonicalRoot;
 }
@@ -1080,10 +1106,11 @@ export async function copyStoppedTree({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  inspectOwnedRootAcl = recoveryPathHasExtendedAcl,
   inspectSymlinkPath = lstat,
   listMountPoints = listCurrentMountPoints,
 }) {
-  const canonicalOwnedRoot = await assertPrivateOwnedRoot(ownedRoot);
+  const canonicalOwnedRoot = await assertPrivateOwnedRoot(ownedRoot, inspectOwnedRootAcl);
   const canonicalSource = await assertDirectOwnedPath(canonicalOwnedRoot, source, "source", {
     mustExist: true,
   });
@@ -1894,101 +1921,342 @@ export function assertRecoveryEvidenceSafe(report) {
   return serialized;
 }
 
-export async function ensurePrivateEvidenceDirectory(
-  path,
-  {
-    createDirectory = mkdir,
-    onDirectoryCreated = async () => {},
-    setMode = chmod,
-  } = {},
-) {
-  const missing = [];
-  let cursor = resolve(path);
-  while (true) {
-    try {
-      const metadata = await lstat(cursor);
-      assert(metadata.isDirectory(), "evidence parent must be a directory");
-      assert(!metadata.isSymbolicLink(), "evidence parent must not be a symlink");
-      break;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      missing.push(cursor);
-      const parent = dirname(cursor);
-      assert.notEqual(parent, cursor, "evidence path has no existing directory ancestor");
-      cursor = parent;
-    }
-  }
-
-  let current = await realpath(cursor);
-  for (const directory of missing.reverse()) {
-    current = join(current, basename(directory));
-    // EEXIST is intentionally fatal: another writer created this component
-    // after the initial scan, so this invocation must not chmod it.
-    await createDirectory(current, { mode: 0o700 });
-    await setMode(current, 0o700);
-    await onDirectoryCreated(current);
-  }
-  return current;
+function evidenceDirectoryPermissionsAreSafe(metadata, currentUid) {
+  return authorityDirectoryPermissionsAreSafe(
+    {
+      isDirectory: metadata.isDirectory(),
+      mode: metadata.mode,
+      uid: metadata.uid,
+    },
+    {
+      brokerUid: currentUid,
+      disallowedModeBits: 0o022,
+      requiredModeBits: 0o700,
+    },
+  );
 }
 
-async function syncRecoveryEvidenceDirectory(path) {
+function evidenceAncestorPermissionsAreSafe(metadata, childUid, currentUid) {
+  return authorityDirectoryPermissionsAreSafe(
+    {
+      isDirectory: metadata.isDirectory(),
+      mode: metadata.mode,
+      uid: metadata.uid,
+    },
+    {
+      allowRootOwner: true,
+      allowStickyShared: true,
+      brokerUid: currentUid,
+      childUid,
+      disallowedModeBits: 0o022,
+    },
+  );
+}
+
+async function inspectEvidenceAcl(inspector, path, message) {
+  let unsafe;
+  try {
+    unsafe = await inspector(path);
+  } catch {
+    throw new Error(message);
+  }
+  assert.equal(unsafe, false, message);
+}
+
+async function openEvidenceDirectoryAuthority(
+  path,
+  {
+    inspectAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
+    inspectDirectoryAcl = recoveryPathHasExtendedAcl,
+  } = {},
+) {
+  const currentUid = process.geteuid?.() ?? process.getuid?.();
+  assert.notEqual(currentUid, undefined, "evidence writing requires a POSIX owner identity");
+  const requestedPath = resolve(path);
+  const requestedMetadata = await lstat(requestedPath, { bigint: true });
+  assert(
+    requestedMetadata.isDirectory() && !requestedMetadata.isSymbolicLink(),
+    "evidence directory must be a pre-existing real directory",
+  );
+  const canonicalPath = await realpath(requestedPath);
+  const identity = await lstat(canonicalPath, { bigint: true });
+  assert(
+    sameFileIdentity(requestedMetadata, identity),
+    "evidence directory identity changed during validation",
+  );
+  assert(
+    evidenceDirectoryPermissionsAreSafe(identity, currentUid),
+    "evidence directory must be current-user-owned and not writable by other users",
+  );
+  const handle = await open(
+    canonicalPath,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  const ancestors = [];
+  let primaryFailure;
+  try {
+    const heldIdentity = await handle.stat({ bigint: true });
+    assert(
+      heldIdentity.isDirectory() && sameFileIdentity(identity, heldIdentity),
+      "evidence directory identity changed during validation",
+    );
+    await inspectEvidenceAcl(
+      inspectDirectoryAcl,
+      canonicalPath,
+      "evidence directory ACL could not be trusted",
+    );
+
+    let childUid = identity.uid;
+    let ancestorPath = dirname(canonicalPath);
+    while (true) {
+      const ancestorIdentity = await lstat(ancestorPath, { bigint: true });
+      assert(
+        evidenceAncestorPermissionsAreSafe(ancestorIdentity, childUid, currentUid),
+        "evidence directory ancestor chain is not trusted",
+      );
+      await inspectEvidenceAcl(
+        inspectAncestorAcl,
+        ancestorPath,
+        "evidence directory ancestor ACL could not be trusted",
+      );
+      ancestors.push({ identity: ancestorIdentity, path: ancestorPath });
+      const parent = dirname(ancestorPath);
+      if (parent === ancestorPath) break;
+      childUid = ancestorIdentity.uid;
+      ancestorPath = parent;
+    }
+
+    const authority = {
+      ancestors,
+      currentUid,
+      handle,
+      identity,
+      inspectAncestorAcl,
+      inspectDirectoryAcl,
+      path: canonicalPath,
+    };
+    authority.assertCurrent = async () => {
+      const [current, held] = await Promise.all([
+        lstat(authority.path, { bigint: true }),
+        authority.handle.stat({ bigint: true }),
+      ]);
+      assert(
+        current.isDirectory() &&
+          sameFileIdentity(current, authority.identity) &&
+          sameFileIdentity(held, authority.identity) &&
+          evidenceDirectoryPermissionsAreSafe(current, authority.currentUid),
+        "evidence directory identity or permissions changed",
+      );
+      await inspectEvidenceAcl(
+        authority.inspectDirectoryAcl,
+        authority.path,
+        "evidence directory ACL could not be trusted",
+      );
+      let currentChildUid = current.uid;
+      for (const ancestor of authority.ancestors) {
+        const currentAncestor = await lstat(ancestor.path, { bigint: true });
+        assert(
+          sameFileIdentity(currentAncestor, ancestor.identity) &&
+            evidenceAncestorPermissionsAreSafe(
+              currentAncestor,
+              currentChildUid,
+              authority.currentUid,
+            ),
+          "evidence directory ancestor identity or permissions changed",
+        );
+        await inspectEvidenceAcl(
+          authority.inspectAncestorAcl,
+          ancestor.path,
+          "evidence directory ancestor ACL could not be trusted",
+        );
+        currentChildUid = currentAncestor.uid;
+      }
+    };
+    await authority.assertCurrent();
+    return authority;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    if (primaryFailure) await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+async function openTemporaryEvidenceDirectory(path, currentUid) {
+  const identity = await lstat(path, { bigint: true });
+  assert(
+    identity.isDirectory() &&
+      identity.uid === BigInt(currentUid) &&
+      Number(identity.mode & 0o777n) === 0o700,
+    "temporary evidence directory is not private",
+  );
   const handle = await open(
     path,
     fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
   );
   let primaryFailure;
   try {
-    await handle.sync();
+    const heldIdentity = await handle.stat({ bigint: true });
+    assert(
+      heldIdentity.isDirectory() && sameFileIdentity(identity, heldIdentity),
+      "temporary evidence directory identity changed",
+    );
+    return {
+      assertCurrent: async () => {
+        const [current, held] = await Promise.all([
+          lstat(path, { bigint: true }),
+          handle.stat({ bigint: true }),
+        ]);
+        assert(
+          current.isDirectory() &&
+            sameFileIdentity(current, identity) &&
+            sameFileIdentity(held, identity) &&
+            current.uid === BigInt(currentUid) &&
+            Number(current.mode & 0o777n) === 0o700,
+          "temporary evidence directory identity or permissions changed",
+        );
+      },
+      handle,
+      identity,
+      path,
+    };
   } catch (error) {
     primaryFailure = { error };
     throw error;
   } finally {
-    await runSequentialCleanup([() => handle.close()], primaryFailure);
+    if (primaryFailure) await runSequentialCleanup([() => handle.close()], primaryFailure);
   }
+}
+
+function assertPrivateEvidenceFile(metadata, currentUid, message) {
+  assert(
+    metadata.isFile() &&
+      metadata.nlink === 1n &&
+      metadata.uid === BigInt(currentUid) &&
+      Number(metadata.mode & 0o777n) === 0o600,
+    message,
+  );
+}
+
+async function assertEvidenceFileCurrent(path, identity, currentUid, message) {
+  const current = await lstat(path, { bigint: true });
+  assert(sameFileIdentity(current, identity), message);
+  assertPrivateEvidenceFile(current, currentUid, message);
 }
 
 export async function writeRecoveryEvidence(
   path,
   report,
   {
+    afterEvidenceDirectoryOpened = async () => {},
+    afterEvidenceRename = async () => {},
+    afterTemporaryDirectoryOpened = async () => {},
+    beforeEvidenceRename = async () => {},
+    inspectEvidenceAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
+    inspectEvidenceDirectoryAcl = recoveryPathHasExtendedAcl,
     openEvidenceFile = open,
-    syncDirectory = syncRecoveryEvidenceDirectory,
+    syncDirectory = async (handle) => handle.sync(),
   } = {},
 ) {
   const serialized = `${JSON.stringify(report, null, 2)}\n`;
   assertRecoveryEvidenceSafe(serialized);
   const evidenceName = basename(path);
   assert(evidenceName !== "." && evidenceName !== "..", "invalid evidence filename");
-  const createdEvidenceDirectories = [];
-  const evidenceDirectory = await ensurePrivateEvidenceDirectory(dirname(path), {
-    onDirectoryCreated: async (directory) => createdEvidenceDirectories.push(directory),
-  });
-  const evidencePath = join(evidenceDirectory, evidenceName);
-  const temporaryDirectory = await mkdtemp(
-    join(evidenceDirectory, `.${basename(path)}.tmp-${process.pid}-`),
-  );
-  const temporaryPath = join(temporaryDirectory, "evidence.json");
+  let authority;
+  let temporaryDirectory;
+  let temporaryDirectoryAuthority;
+  let primaryFailure;
   try {
+    authority = await openEvidenceDirectoryAuthority(dirname(path), {
+      inspectAncestorAcl: inspectEvidenceAncestorAcl,
+      inspectDirectoryAcl: inspectEvidenceDirectoryAcl,
+    });
+    const evidencePath = join(authority.path, evidenceName);
+    await afterEvidenceDirectoryOpened({ authority, evidencePath });
+    await authority.assertCurrent();
+    temporaryDirectory = await mkdtemp(
+      join(authority.path, `.${evidenceName}.tmp-${process.pid}-`),
+    );
     await chmod(temporaryDirectory, 0o700);
-    const file = await openEvidenceFile(temporaryPath, "wx", 0o600);
-    let primaryFailure;
+    temporaryDirectoryAuthority = await openTemporaryEvidenceDirectory(
+      temporaryDirectory,
+      authority.currentUid,
+    );
+    await afterTemporaryDirectoryOpened({ authority, temporaryDirectoryAuthority });
+    await temporaryDirectoryAuthority.assertCurrent();
+    await authority.assertCurrent();
+
+    const temporaryPath = join(temporaryDirectory, "evidence.json");
+    const file = await openEvidenceFile(
+      temporaryPath,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_EXCL |
+        fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    let fileIdentity;
+    let fileFailure;
     try {
       await file.chmod(0o600);
       await file.writeFile(serialized);
       await file.sync();
+      fileIdentity = await file.stat({ bigint: true });
+      assertPrivateEvidenceFile(
+        fileIdentity,
+        authority.currentUid,
+        "temporary evidence file is not private",
+      );
     } catch (error) {
-      primaryFailure = { error };
+      fileFailure = { error };
       throw error;
     } finally {
-      await runSequentialCleanup([() => file.close()], primaryFailure);
+      await runSequentialCleanup([() => file.close()], fileFailure);
     }
+
+    await temporaryDirectoryAuthority.assertCurrent();
+    await authority.assertCurrent();
+    await assertEvidenceFileCurrent(
+      temporaryPath,
+      fileIdentity,
+      authority.currentUid,
+      "temporary evidence file identity or permissions changed",
+    );
+    await beforeEvidenceRename({ authority, evidencePath, temporaryPath });
+    await authority.assertCurrent();
+    await temporaryDirectoryAuthority.assertCurrent();
+    await assertEvidenceFileCurrent(
+      temporaryPath,
+      fileIdentity,
+      authority.currentUid,
+      "temporary evidence file identity or permissions changed",
+    );
     await rename(temporaryPath, evidencePath);
-    await syncDirectory(evidenceDirectory);
-    for (const directory of createdEvidenceDirectories.reverse()) {
-      await syncDirectory(dirname(directory));
-    }
+    await afterEvidenceRename({ authority, evidencePath, fileIdentity });
+    await authority.assertCurrent();
+    await assertEvidenceFileCurrent(
+      evidencePath,
+      fileIdentity,
+      authority.currentUid,
+      "published evidence file identity or permissions changed",
+    );
+    await authority.assertCurrent();
+    await temporaryDirectoryAuthority.assertCurrent();
+    await rmdir(temporaryDirectory);
+    temporaryDirectory = undefined;
+    await syncDirectory(authority.handle, authority.path);
+    await authority.assertCurrent();
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+    await runSequentialCleanup(
+      [
+        () => temporaryDirectoryAuthority?.handle.close(),
+        () => authority?.handle.close(),
+      ],
+      primaryFailure,
+    );
   }
 }
 
