@@ -34,7 +34,8 @@ superseded_by:
   and devices.
 - The copy requires a current-user-owned, mode `0700`, extended-ACL-free root;
   redacted evidence publication separately requires a pre-existing trusted
-  directory authority and retains failed temp artifacts for owner cleanup.
+  directory authority, retains pre-rename temp artifacts for owner cleanup, and
+  reports post-rename directory-sync failures as durability-uncertain.
 - Codex flush is not an fsync barrier, rollout-tail repair remains absent, and
   background terminals are not filesystem-migratable state.
 

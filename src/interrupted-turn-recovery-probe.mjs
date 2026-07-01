@@ -2163,6 +2163,8 @@ export async function writeRecoveryEvidence(
   const evidenceName = basename(path);
   assert(evidenceName !== "." && evidenceName !== "..", "invalid evidence filename");
   let authority;
+  let durabilityConfirmed = false;
+  let renamed = false;
   let temporaryDirectory;
   let temporaryDirectoryAuthority;
   let primaryFailure;
@@ -2232,6 +2234,7 @@ export async function writeRecoveryEvidence(
       "temporary evidence file identity or permissions changed",
     );
     await rename(temporaryPath, evidencePath);
+    renamed = true;
     await afterEvidenceRename({ authority, evidencePath, fileIdentity });
     await authority.assertCurrent();
     await assertEvidenceFileCurrent(
@@ -2245,10 +2248,16 @@ export async function writeRecoveryEvidence(
     await rmdir(temporaryDirectory);
     temporaryDirectory = undefined;
     await syncDirectory(authority.handle, authority.path);
+    durabilityConfirmed = true;
     await authority.assertCurrent();
   } catch (error) {
-    primaryFailure = { error };
-    throw error;
+    let failure = error;
+    if (renamed && !durabilityConfirmed && error?.code !== "evidence_durability_uncertain") {
+      failure = new Error("evidence publication durability is uncertain", { cause: error });
+      failure.code = "evidence_durability_uncertain";
+    }
+    primaryFailure = { error: failure };
+    throw failure;
   } finally {
     await runSequentialCleanup(
       [

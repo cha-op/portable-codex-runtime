@@ -1445,9 +1445,16 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
           throw new Error("synthetic evidence directory sync failure");
         },
       }),
-      /synthetic evidence directory sync failure/,
+      (error) =>
+        error.code === "evidence_durability_uncertain" &&
+        error.message === "evidence publication durability is uncertain" &&
+        error.cause?.message === "synthetic evidence directory sync failure",
     );
     assert.deepEqual(JSON.parse(await readFile(unsynchronizedPath, "utf8")), report);
+    assert.deepEqual(
+      (await readdir(root)).filter((entry) => entry.startsWith(".unsynchronized-evidence")),
+      [],
+    );
 
     const writeFailure = new Error("synthetic evidence write failure");
     const writeCloseFailure = new Error("synthetic evidence write close failure");
@@ -1628,7 +1635,11 @@ test("recovery evidence never removes a replaced temp directory after rename", a
           syncCalls += 1;
         },
       }),
-      /temporary evidence directory identity or permissions changed/,
+      (error) =>
+        error.code === "evidence_durability_uncertain" &&
+        /temporary evidence directory identity or permissions changed/.test(
+          error.cause?.message ?? "",
+        ),
     );
     assert.equal((await stat(temporaryDirectory)).isDirectory(), true);
     assert.equal((await stat(displacedDirectory)).isDirectory(), true);

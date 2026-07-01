@@ -85,8 +85,9 @@ CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
 
 The evidence parent directory must already exist, be owned by the current user,
 and have trusted permissions, ancestors, and ACL state. Evidence publication
-holds and revalidates that directory; a failed write retains its private temp
-artifact for trusted-owner cleanup.
+holds and revalidates that directory. A failure before rename retains its
+private temp artifact for trusted-owner cleanup; a failure after rename leaves
+the destination in place and reports that publication durability is uncertain.
 
 The command provisions no credential input and configures the model provider to
 use the loopback mock. It does not impose OS-level outbound network isolation;

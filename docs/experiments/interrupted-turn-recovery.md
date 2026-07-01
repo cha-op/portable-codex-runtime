@@ -107,9 +107,13 @@ be current-user/root-owned and non-writable except for sticky shared ancestors,
 with no unsafe ACLs. Publication holds an `O_DIRECTORY|O_NOFOLLOW` handle,
 revalidates directory, temporary-directory, and file identities around rename,
 and fsyncs the held directory handle. A failed publication retains its private
-temporary artifact for trusted-owner inspection instead of recursively removing
-a pathname that may have been replaced. Concurrent mutation by another process
-with the same UID is outside this pure-Node helper's security boundary.
+temporary artifact for trusted-owner inspection when rename has not occurred.
+After rename, a directory-sync failure leaves the destination in place and
+reports `evidence_durability_uncertain`; the caller must not treat that path as
+durable evidence without inspection or a later successful publication. The
+helper never recursively removes a pathname that may have been replaced.
+Concurrent mutation by another process with the same UID is outside this
+pure-Node helper's security boundary.
 
 If the default temporary filesystem is mounted `noexec`, set
 `CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
