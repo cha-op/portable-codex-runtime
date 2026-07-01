@@ -267,6 +267,7 @@ test("Linux process-group inspection distinguishes live and zombie-only members"
   try {
     await writeStat(100, "zombie ) worker", "Z", processGroupId);
     await writeStat(101, "unrelated", "S", 9000);
+    await writeStat(104, "kernel-style unrelated", "S", 0);
     assert.equal(await inspectLinuxProcessGroup(processGroupId, procRoot), "zombie-only");
 
     await writeStat(102, "live worker", "D", processGroupId);
@@ -394,6 +395,90 @@ test("failed stop clears the shared state and allows a successful retry", async 
   assert.equal(waitCalls, 4);
   assert.equal(stdinEnds, 2);
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("forced-kill settling uses an independent minimum after a short graceful timeout", async () => {
+  const waits = [];
+  const signals = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    forcedKillSettleMs: 20,
+    processControl: {
+      exists: () => true,
+      signal: (_child, signal) => signals.push(signal),
+      waitForExit: async (_child, timeoutMs, options = {}) => {
+        waits.push({ options, timeoutMs });
+        return waits.length === 3;
+      },
+    },
+    shutdownGraceMs: 20,
+  });
+  installSyntheticChild(client);
+
+  await client.stop();
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.deepEqual(waits, [
+    { options: {}, timeoutMs: 20 },
+    { options: {}, timeoutMs: 20 },
+    { options: { acceptZombieOnly: true }, timeoutMs: 250 },
+  ]);
+});
+
+test("abort uses the independent forced-kill settle window", async () => {
+  const waits = [];
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+    forcedKillSettleMs: 20,
+    processControl: {
+      exists: () => true,
+      signal: () => {},
+      waitForExit: async (_child, timeoutMs, options = {}) => {
+        waits.push({ options, timeoutMs });
+        return true;
+      },
+    },
+    shutdownGraceMs: 20,
+  });
+  installSyntheticChild(client);
+
+  await client.abort();
+  assert.deepEqual(waits, [
+    { options: { acceptZombieOnly: true }, timeoutMs: 250 },
+  ]);
+});
+
+test("non-finite forced-kill settle values fall back to the bounded default", async () => {
+  for (const { action, forcedKillSettleMs } of [
+    { action: "stop", forcedKillSettleMs: Number.NaN },
+    { action: "abort", forcedKillSettleMs: Number.POSITIVE_INFINITY },
+  ]) {
+    const waits = [];
+    const client = new AppServerClient({
+      codexBin: process.execPath,
+      codexHome: "/isolated/codex-home",
+      forcedKillSettleMs,
+      processControl: {
+        exists: () => true,
+        signal: () => {},
+        waitForExit: async (_child, timeoutMs, options = {}) => {
+          waits.push({ options, timeoutMs });
+          return action === "abort" || waits.length === 3;
+        },
+      },
+      shutdownGraceMs: 20,
+    });
+    installSyntheticChild(client);
+
+    await client[action]();
+    const forcedWait = waits.at(-1);
+    assert.deepEqual(forcedWait, {
+      options: { acceptZombieOnly: true },
+      timeoutMs: 2_000,
+    });
+    assert.equal(Number.isFinite(forcedWait.timeoutMs), true);
+  }
 });
 
 test("cleanup-only stop retry does not probe or signal an already quiesced process tree", async () => {
@@ -842,6 +927,7 @@ test(
       descendantPath,
       `
 import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => {});
 setTimeout(() => writeFileSync(${JSON.stringify(markerPath)}, "orphan mutation\\n"), 250);
 setTimeout(() => process.exit(0), 1_000);
 `,

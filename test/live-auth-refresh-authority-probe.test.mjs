@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   assertAuthorityEvidenceSafe,
   assertAuthorityRefreshTokenChanged,
+  codexSourceCommit,
   probeLiveAuthRefreshAuthority,
 } from "../src/live-auth-refresh-authority-probe.mjs";
 import {
@@ -16,6 +17,37 @@ import {
 const LIVE_PROBE_SCRIPT = fileURLToPath(
   new URL("../scripts/probe-live-auth-refresh-authority.mjs", import.meta.url),
 );
+
+test("source provenance is omitted without an explicit source mirror", () => {
+  let spawnCalls = 0;
+  const commit = codexSourceCommit(undefined, () => {
+    spawnCalls += 1;
+    throw new Error("git must not run without an explicit source mirror");
+  });
+
+  assert.equal(commit, null);
+  assert.equal(spawnCalls, 0);
+});
+
+test("source provenance resolves HEAD for an explicit source mirror", () => {
+  const calls = [];
+  const commit = codexSourceCommit("/explicit/codex", (...args) => {
+    calls.push(args);
+    return { status: 0, stdout: "0123456789abcdef\n" };
+  });
+
+  assert.equal(commit, "0123456789abcdef");
+  assert.deepEqual(calls, [
+    [
+      "git",
+      ["-C", "/explicit/codex", "rev-parse", "HEAD"],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    ],
+  ]);
+});
 
 test("live authority probe rejects PATH-resolved Codex before reading auth", async () => {
   await assert.rejects(

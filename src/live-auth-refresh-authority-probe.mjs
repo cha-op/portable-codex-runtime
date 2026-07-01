@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 import { codexVersion } from "./app-server-auth-probe.mjs";
@@ -19,8 +19,9 @@ const DEFAULT_AUTH_HOME = ".test-codex-home";
 const DEFAULT_EVIDENCE_PATH = "evidence/live-auth-refresh-authority.json";
 const DEFAULT_MODEL = "gpt-5.4";
 
-function codexSourceCommit(sourceMirror = join(homedir(), "codex")) {
-  const result = spawnSync("git", ["-C", sourceMirror, "rev-parse", "HEAD"], {
+export function codexSourceCommit(sourceMirror, run = spawnSync) {
+  if (typeof sourceMirror !== "string" || sourceMirror.length === 0) return null;
+  const result = run("git", ["-C", sourceMirror, "rev-parse", "HEAD"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
   });

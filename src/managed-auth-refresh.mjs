@@ -62,16 +62,18 @@ function attachErrorCause(error, cause, { ifAbsent = false } = {}) {
 }
 
 function attachCleanupError(error, cleanupError) {
-  if (!isObjectLike(error)) return;
+  if (!isObjectLike(error)) return false;
   try {
-    if (Object.hasOwn(error, "cleanupError")) return;
+    if (Object.hasOwn(error, "cleanupError")) return false;
     Object.defineProperty(error, "cleanupError", {
       configurable: true,
       enumerable: false,
       value: cleanupError,
     });
+    return true;
   } catch {
     // A frozen primary error still takes precedence over cleanup diagnostics.
+    return false;
   }
 }
 
@@ -127,10 +129,88 @@ function cloneManagedAuthRefreshError(error) {
   return normalized;
 }
 
+function cloneErrorCarrier(error) {
+  if (error instanceof ManagedAuthRefreshError) return cloneManagedAuthRefreshError(error);
+  const message = readErrorProperty(error, "message");
+  const carrier = new Error(typeof message === "string" ? message : "cleanup operation failed");
+  const prototype = isObjectLike(error) ? Object.getPrototypeOf(error) : undefined;
+  if (prototype && typeof prototype === "object") {
+    try {
+      Object.setPrototypeOf(carrier, prototype);
+    } catch {
+      // Error.prototype remains a safe fallback for unusual external errors.
+    }
+  }
+  const name = readErrorProperty(error, "name");
+  if (typeof name === "string") {
+    Object.defineProperty(carrier, "name", {
+      configurable: true,
+      value: name,
+      writable: true,
+    });
+  }
+  const code = readErrorProperty(error, "code");
+  if (code !== undefined) {
+    Object.defineProperty(carrier, "code", {
+      configurable: true,
+      enumerable: false,
+      value: code,
+      writable: true,
+    });
+  }
+  const cleanupWarnings = readErrorProperty(error, "cleanupWarnings");
+  appendCleanupWarnings(carrier, Array.isArray(cleanupWarnings) ? cleanupWarnings : []);
+  attachErrorCause(carrier, error);
+  return carrier;
+}
+
+function mutableErrorCarrier(error) {
+  if (isObjectLike(error) && Object.isExtensible(error)) return error;
+  return cloneErrorCarrier(error);
+}
+
 function mutableManagedAuthRefreshError(error) {
-  return error instanceof ManagedAuthRefreshError && !Object.isExtensible(error)
-    ? cloneManagedAuthRefreshError(error)
-    : error;
+  return error instanceof ManagedAuthRefreshError ? mutableErrorCarrier(error) : error;
+}
+
+function replaceCleanupError(error, cleanupError) {
+  if (!isObjectLike(error)) return false;
+  try {
+    Object.defineProperty(error, "cleanupError", {
+      configurable: true,
+      enumerable: false,
+      value: cleanupError,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attachCleanupErrorAtTail(error, cleanupError) {
+  const diagnostic = mutableErrorCarrier(cleanupError);
+  let current = error;
+  const seen = new Set();
+  while (isObjectLike(current) && !seen.has(current)) {
+    seen.add(current);
+    const existing = readErrorProperty(current, "cleanupError");
+    if (existing === undefined) return attachCleanupError(current, diagnostic);
+    if (!isObjectLike(existing) || !Object.isExtensible(existing)) {
+      const carrier = cloneErrorCarrier(existing);
+      if (!replaceCleanupError(current, carrier)) return false;
+      current = carrier;
+      continue;
+    }
+    current = existing;
+  }
+  return false;
+}
+
+function recordEarlyCleanupFailure(primaryError, cleanupError, warning) {
+  const normalized = mutableErrorCarrier(primaryError);
+  appendCleanupWarnings(normalized, [warning]);
+  attachCleanupErrorAtTail(normalized, cleanupError);
+  return normalized;
 }
 
 function errorGraphHasCleanupWarning(error, warning, seen = new Set()) {
@@ -465,22 +545,33 @@ async function assertAuthorityHomeCurrent(authority) {
   }
 }
 
-async function acquireAuthorityLock(authority) {
+async function acquireAuthorityLock(authority, acquireFileLock = acquireAdvisoryLock) {
   await assertAuthorityHomeCurrent(authority);
   const lockPath = join(authority.path, LOCK_FILE);
   let lock;
   try {
-    lock = await acquireAdvisoryLock(lockPath);
+    lock = await acquireFileLock(lockPath);
     await assertAuthorityHomeCurrent(authority);
     return lock;
   } catch (error) {
-    await lock?.release().catch(() => {});
-    if (error instanceof AdvisoryLockError && error.code === "lock_unavailable") {
+    let primaryError = error;
+    if (lock) {
+      try {
+        await lock.release();
+      } catch (cleanupError) {
+        primaryError = recordEarlyCleanupFailure(
+          primaryError,
+          cleanupError,
+          "lock_release_failed",
+        );
+      }
+    }
+    if (primaryError instanceof AdvisoryLockError && primaryError.code === "lock_unavailable") {
       fail("authority_locked", "another authority refresh holds the dedicated auth lock", {
         retryable: true,
       });
     }
-    throw error;
+    throw primaryError;
   }
 }
 
@@ -972,7 +1063,9 @@ export function managedAuthRefreshErrorMetadata(error) {
   }
   if (typeof error.recoveryReason === "string") metadata.recoveryReason = error.recoveryReason;
   if (Array.isArray(error.cleanupWarnings)) {
-    metadata.cleanupWarnings = error.cleanupWarnings.filter((value) => typeof value === "string");
+    metadata.cleanupWarnings = error.cleanupWarnings.filter((warning) =>
+      SAFE_CLEANUP_WARNINGS.has(warning),
+    );
   }
   return metadata;
 }
@@ -1370,7 +1463,8 @@ async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, st
  * the durable staging sentinel cannot be reaped before operator recovery.
  */
 export async function refreshManagedAuthRecord({
-  acquireLock = acquireAuthorityLock,
+  acquireFileLock = acquireAdvisoryLock,
+  acquireLock = (authority) => acquireAuthorityLock(authority, acquireFileLock),
   authHome,
   cleanupStagingAttempt = removeStagingAttempt,
   cleanupStagingRoot = removeEmptyStagingRoot,
@@ -1390,9 +1484,28 @@ export async function refreshManagedAuthRecord({
     lock = await acquireLock(authority);
     await assertAuthorityHomeCurrent(authority);
   } catch (error) {
-    await lock?.release().catch(() => {});
-    await authority.handle.close().catch(() => {});
-    throw error;
+    let primaryError = error;
+    if (lock) {
+      try {
+        await lock.release();
+      } catch (cleanupError) {
+        primaryError = recordEarlyCleanupFailure(
+          primaryError,
+          cleanupError,
+          "lock_release_failed",
+        );
+      }
+    }
+    try {
+      await authority.handle.close();
+    } catch (cleanupError) {
+      primaryError = recordEarlyCleanupFailure(
+        primaryError,
+        cleanupError,
+        "authority_guard_close_failed",
+      );
+    }
+    throw primaryError;
   }
   const authorityHome = authority.path;
   let before;

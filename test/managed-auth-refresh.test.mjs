@@ -343,6 +343,29 @@ test("error metadata exposes recovery controls without serializing the error", (
   });
 });
 
+test("error metadata and failure reports export only allowlisted cleanup warnings", () => {
+  const warningSecret = "synthetic-cleanup-warning-refresh-token";
+  const error = new ManagedAuthRefreshError("refresh_failed", "sanitized failure", {
+    retryable: false,
+  });
+  error.cleanupWarnings = [
+    "app_server_stop_failed",
+    warningSecret,
+    "lock_release_failed",
+  ];
+
+  assert.deepEqual(managedAuthRefreshErrorMetadata(error).cleanupWarnings, [
+    "app_server_stop_failed",
+    "lock_release_failed",
+  ]);
+  const report = managedAuthRefreshFailureReport(error);
+  assert.deepEqual(report.error.cleanupWarnings, [
+    "app_server_stop_failed",
+    "lock_release_failed",
+  ]);
+  assert.equal(JSON.stringify(report).includes(warningSecret), false);
+});
+
 test("runCodexManagedRefresh uses only the managed account refresh choreography", async () => {
   const calls = [];
   const result = await runCodexManagedRefresh({
@@ -2592,6 +2615,220 @@ test("authority directory replacement is rejected before protected auth is read"
     assert.equal(released, true);
     assert.equal(await readFile(join(protectedHome, "auth.json"), "utf8"), protectedAuth);
     await assert.rejects(stat(join(protectedHome, ".portable-auth-refresh.lock")), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-acquire authority guard preserves a lock release cleanup failure", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-after-file-lock-acquire");
+  const releaseSecret = "synthetic-post-acquire-release-secret";
+  const releaseError = new Error(releaseSecret);
+  let releaseAttempted = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireFileLock: async () => {
+          await rename(authHome, displaced);
+          await mkdir(authHome, { mode: 0o700 });
+          return {
+            release: async () => {
+              releaseAttempted = true;
+              throw releaseError;
+            },
+          };
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(releaseAttempted, true);
+    assert.deepEqual(refreshError.cleanupWarnings, ["lock_release_failed"]);
+    assert.equal(refreshError.cleanupError, releaseError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cleanupError"), false);
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(JSON.stringify(refreshError).includes(releaseSecret), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("outer early authority guard attempts release and close without replacing the primary error", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const displaced = join(root, "displaced-after-injected-lock");
+  const releaseSecret = "synthetic-outer-release-secret";
+  const closeSecret = "synthetic-outer-close-secret";
+  const releaseError = new Error(releaseSecret);
+  const closeError = new Error(closeSecret);
+  Object.freeze(releaseError);
+  Object.freeze(closeError);
+  let closeAttempted = false;
+  let releaseAttempted = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async (authority) => {
+          const close = authority.handle.close.bind(authority.handle);
+          authority.handle.close = async () => {
+            closeAttempted = true;
+            await close();
+            throw closeError;
+          };
+          await rename(authHome, displaced);
+          await mkdir(authHome, { mode: 0o700 });
+          return {
+            release: async () => {
+              releaseAttempted = true;
+              throw releaseError;
+            },
+          };
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "authority_home_replaced");
+    assert.equal(releaseAttempted, true);
+    assert.equal(closeAttempted, true);
+    assert.deepEqual(refreshError.cleanupWarnings, [
+      "lock_release_failed",
+      "authority_guard_close_failed",
+    ]);
+    const releaseCarrier = refreshError.cleanupError;
+    const closeCarrier = releaseCarrier.cleanupError;
+    assert.notEqual(releaseCarrier, releaseError);
+    assert.equal(releaseCarrier.cause, releaseError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cleanupError"), false);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(releaseCarrier, "cause"), false);
+    assert.notEqual(closeCarrier, closeError);
+    assert.equal(closeCarrier.cause, closeError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(releaseCarrier, "cleanupError"), false);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(closeCarrier, "cause"), false);
+    assert.equal(refreshError.recoveryPath, undefined);
+    assert.equal(JSON.stringify(refreshError).includes(releaseSecret), false);
+    assert.equal(JSON.stringify(refreshError).includes(closeSecret), false);
+    const failureReport = JSON.stringify(managedAuthRefreshFailureReport(refreshError));
+    assert.equal(failureReport.includes(releaseSecret), false);
+    assert.equal(failureReport.includes(closeSecret), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("outer early cleanup normalizes a frozen managed primary error", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const warningSecret = "synthetic-frozen-early-warning-secret";
+  const closeSecret = "synthetic-frozen-early-close-secret";
+  const frozenError = new ManagedAuthRefreshError(
+    "authority_home_replaced",
+    "frozen early authority failure",
+    { retryable: false },
+  );
+  frozenError.cleanupWarnings = [warningSecret];
+  Object.freeze(frozenError);
+  const closeError = new Error(closeSecret);
+  let closeAttempted = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async (authority) => {
+          const close = authority.handle.close.bind(authority.handle);
+          authority.handle.close = async () => {
+            closeAttempted = true;
+            await close();
+            throw closeError;
+          };
+          throw frozenError;
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.notEqual(refreshError, frozenError);
+    assert.equal(refreshError.code, frozenError.code);
+    assert.equal(refreshError.cause, frozenError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cause"), false);
+    assert.equal(refreshError.cleanupError, closeError);
+    assert.deepEqual(refreshError.cleanupWarnings, ["authority_guard_close_failed"]);
+    assert.equal(closeAttempted, true);
+    assert.equal(JSON.stringify(refreshError).includes(warningSecret), false);
+    assert.equal(JSON.stringify(refreshError).includes(closeSecret), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("outer early cleanup uses a safe carrier for a frozen generic primary error", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const primarySecret = "synthetic-frozen-generic-primary-secret";
+  const warningSecret = "synthetic-frozen-generic-warning-secret";
+  const closeSecret = "synthetic-frozen-generic-close-secret";
+  const frozenError = new Error(primarySecret);
+  frozenError.name = "FrozenAdapterError";
+  frozenError.code = "authority_home_replaced";
+  frozenError.cleanupWarnings = [warningSecret];
+  Object.freeze(frozenError);
+  const closeError = new Error(closeSecret);
+  Object.freeze(closeError);
+  let closeAttempted = false;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        acquireLock: async (authority) => {
+          const close = authority.handle.close.bind(authority.handle);
+          authority.handle.close = async () => {
+            closeAttempted = true;
+            await close();
+            throw closeError;
+          };
+          throw frozenError;
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+
+    assert(refreshError instanceof Error);
+    assert.equal(refreshError instanceof ManagedAuthRefreshError, false);
+    assert.notEqual(refreshError, frozenError);
+    assert.equal(Object.getPrototypeOf(refreshError), Object.getPrototypeOf(frozenError));
+    assert.equal(refreshError.name, frozenError.name);
+    assert.equal(refreshError.message, frozenError.message);
+    assert.equal(refreshError.code, frozenError.code);
+    assert.equal(refreshError.cause, frozenError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cause"), false);
+    assert.deepEqual(refreshError.cleanupWarnings, ["authority_guard_close_failed"]);
+    assert.notEqual(refreshError.cleanupError, closeError);
+    assert.equal(refreshError.cleanupError.cause, closeError);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(refreshError, "cleanupError"), false);
+    assert.equal(
+      Object.prototype.propertyIsEnumerable.call(refreshError.cleanupError, "cause"),
+      false,
+    );
+    assert.equal(closeAttempted, true);
+    assert.equal(JSON.stringify(refreshError).includes(primarySecret), false);
+    assert.equal(JSON.stringify(refreshError).includes(warningSecret), false);
+    assert.equal(JSON.stringify(refreshError).includes(closeSecret), false);
+    const failureReport = JSON.stringify(managedAuthRefreshFailureReport(refreshError));
+    assert.equal(failureReport.includes(primarySecret), false);
+    assert.equal(failureReport.includes(warningSecret), false);
+    assert.equal(failureReport.includes(closeSecret), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

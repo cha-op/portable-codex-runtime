@@ -10,6 +10,8 @@ import { createInterface } from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+const DEFAULT_FORCED_KILL_SETTLE_MS = 2_000;
+const MIN_FORCED_KILL_SETTLE_MS = 250;
 const INITIAL_ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174011";
 const WORKER_ENV_KEYS = [
   "PATH",
@@ -46,7 +48,7 @@ function parseLinuxProcessStat(raw) {
   const fields = raw.slice(commandEnd + 1).trim().split(/\s+/);
   if (fields.length < 3) return null;
   const processGroupId = Number(fields[2]);
-  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) return null;
+  if (!Number.isSafeInteger(processGroupId) || processGroupId < 0) return null;
   return { processGroupId, state: fields[0] };
 }
 
@@ -210,6 +212,7 @@ export class AppServerClient {
     codexBin,
     codexArgs = ["app-server", "--stdio"],
     codexHome,
+    forcedKillSettleMs = DEFAULT_FORCED_KILL_SETTLE_MS,
     launcherDirectory = process.cwd(),
     onRefresh,
     processControl = DEFAULT_PROCESS_CONTROL,
@@ -223,6 +226,13 @@ export class AppServerClient {
     this.environment = buildWorkerEnvironment(codexHome, sourceEnv, launcherDirectory);
     this.onRefresh = onRefresh;
     this.processControl = processControl;
+    const normalizedForcedKillSettleMs = Number.isFinite(forcedKillSettleMs)
+      ? forcedKillSettleMs
+      : DEFAULT_FORCED_KILL_SETTLE_MS;
+    this.forcedKillSettleMs = Math.max(
+      MIN_FORCED_KILL_SETTLE_MS,
+      normalizedForcedKillSettleMs,
+    );
     this.shutdownGraceMs = shutdownGraceMs;
     this.timeoutMs = timeoutMs;
     this.nextRequestId = 1;
@@ -364,7 +374,7 @@ export class AppServerClient {
             if (!(await this.processControl.waitForExit(this.child, this.shutdownGraceMs))) {
               this.processControl.signal(this.child, "SIGKILL");
               if (!(
-                await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
+                await this.processControl.waitForExit(this.child, this.forcedKillSettleMs, {
                   acceptZombieOnly: true,
                 })
               )) {
@@ -402,7 +412,7 @@ export class AppServerClient {
           ) {
             this.processControl.signal(this.child, "SIGKILL");
             if (!(
-              await this.processControl.waitForExit(this.child, this.shutdownGraceMs, {
+              await this.processControl.waitForExit(this.child, this.forcedKillSettleMs, {
                 acceptZombieOnly: true,
               })
             )) {
