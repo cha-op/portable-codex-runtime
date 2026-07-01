@@ -43,12 +43,14 @@ The snapshot scenario copies the entire synthetic session tree, including
 `CODEX_HOME` and workspace, after the killed process has exited. It hashes
 relative paths, entry types, POSIX rwx permission bits, file bytes, and symlink
 targets before and after copy. Portable UTF-8 entry names without non-ASCII
-cased characters or collisions under NFC normalization plus ASCII lowercase
-comparison, relative symlinks, and external absolute links are copied without
-following symlink targets. Unsupported cased names, name collisions, non-UTF-8
-entry names, absolute links back into the source tree, relative links whose
-meaning changes after relocation, special permission bits, hard-linked files,
-sockets, FIFOs, and devices fail closed. The source tree
+cased characters in either their raw or NFC-normalized form, or collisions
+under NFC normalization plus ASCII lowercase comparison, existing relocatable
+relative symlinks, and external absolute links are copied without following
+symlink targets. Unsupported cased names, name collisions, non-UTF-8 entry
+names, absolute links back into the source tree, dangling relative links,
+relative-link case or normalization aliases, relative links whose meaning
+changes after relocation, special permission bits, hard-linked files or
+symlinks, sockets, FIFOs, and devices fail closed. The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
 the restored workspace path explicitly. Its runtime `cwd` response and the
 latest environment context in the follow-up model request must both resolve to
@@ -62,8 +64,9 @@ recovered tail in a separate app-server process.
 The complete matrix passed on macOS arm64 with:
 
 - Codex CLI `0.142.4`;
-- execution from a private mode `0500` copy whose digest is checked before and
-  after all four scenarios;
+- execution from a private mode `0500`, single-link copy whose file type, link
+  count, mode, and digest are checked before every scenario and after the full
+  matrix;
 - binary SHA-256
   `32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5`;
 - source analysis at upstream commit
@@ -162,14 +165,17 @@ restore interfaces.
 - Signal scenarios intentionally require the pinned runtime to report actual
   signal termination. If a future Codex binary traps `SIGTERM` and exits cleanly,
   the compatibility probe fails until that changed shutdown contract is reviewed.
-- Portable UTF-8 directory entry names, relative symlink targets, and existing
-  external absolute symlink targets are preserved exactly; non-ASCII cased
+- Portable UTF-8 directory entry names, existing relocatable relative symlink
+  targets, and existing external absolute symlink targets are preserved exactly;
+  non-ASCII cased
   names, case-insensitive or Unicode-normalized name collisions, non-UTF-8 names
-  or targets, dangling absolute targets, internal absolute targets, and
-  non-relocatable relative targets fail closed. A fixed
+  or targets, dangling absolute or relative targets, internal absolute targets,
+  relative-link case or normalization aliases, and non-relocatable relative
+  targets fail closed. A fixed
   runtime image must provide every external target, such as a Codex helper path,
   at a compatible location during copy and after migration.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,
   timestamps, special permission bits, or hard-link topology. Special bits and
-  hard links fail closed; the other metadata remains outside this probe and must
-  be preserved by the later volume-snapshot implementation.
+  hard links, including hard-linked symlinks, fail closed; the other metadata
+  remains outside this probe and must be preserved by the later volume-snapshot
+  implementation.

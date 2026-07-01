@@ -50,6 +50,10 @@ const SENSITIVE_EVIDENCE_PATTERNS = [
 ];
 const JSON_STRING_TOKEN_PATTERN =
   /"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"/g;
+const JSON_STRING_AT_PATTERN =
+  /"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"/y;
+const JSON_PRIMITIVE_AT_PATTERN =
+  /(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)/y;
 const MAX_EVIDENCE_STRING_SURFACES = 1_024;
 
 async function withTimeout(promise, timeoutMs, label) {
@@ -348,12 +352,14 @@ export function assertPortableDirectoryNames(entries) {
   for (const entry of entries) {
     assert.equal(typeof entry, "string", "portable directory entries must be strings");
     const normalized = entry.normalize("NFC");
-    for (const character of normalized) {
-      if (
-        character.codePointAt(0) > 0x7f &&
-        (character.toLowerCase() !== character || character.toUpperCase() !== character)
-      ) {
-        throw new Error("portable tree rejects non-ASCII cased directory names");
+    for (const value of [entry, normalized]) {
+      for (const character of value) {
+        if (
+          character.codePointAt(0) > 0x7f &&
+          (character.toLowerCase() !== character || character.toUpperCase() !== character)
+        ) {
+          throw new Error("portable tree rejects non-ASCII cased directory names");
+        }
       }
     }
     const portableKey = normalized.toLowerCase();
@@ -418,11 +424,44 @@ async function assertPortableSymlink({
   ) {
     throw new Error("stopped-tree copy rejects non-relocatable relative symlinks");
   }
+
+  const targetRelativePath = relative(lexicalSourceRoot, sourceTarget);
+  let current = lexicalSourceRoot;
+  for (const component of targetRelativePath.split(sep).filter(Boolean)) {
+    const entries = await readPortableDirectory(current);
+    if (!entries.includes(component)) {
+      const portableComponent = component.normalize("NFC").toLowerCase();
+      if (
+        entries.some((entry) => entry.normalize("NFC").toLowerCase() === portableComponent)
+      ) {
+        throw new Error(
+          "stopped-tree copy rejects relative symlink case or normalization aliases",
+        );
+      }
+      throw new Error("stopped-tree copy rejects dangling relative symlinks");
+    }
+    current = join(current, component);
+  }
+  let canonicalSourceTarget;
+  try {
+    canonicalSourceTarget = await realpath(sourceTarget);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error("stopped-tree copy rejects dangling relative symlinks");
+    }
+    throw error;
+  }
+  if (!pathIsInside(sourceRoots[1], canonicalSourceTarget)) {
+    throw new Error("stopped-tree copy rejects relative symlinks outside the source tree");
+  }
 }
 
 async function copyTreeEntry(context, source, destination) {
   const metadata = await lstat(source);
   if (metadata.isSymbolicLink()) {
+    if (metadata.nlink !== 1) {
+      throw new Error("stopped-tree copy rejects hard-linked symlinks");
+    }
     const { target } = await readPortableSymlink(source);
     await assertPortableSymlink({ ...context, source, destination, target });
     await symlink(target, destination);
@@ -514,6 +553,7 @@ async function hashTreeEntry(hash, root, path) {
   const metadata = await lstat(path);
   const entryPath = relative(root, path) || ".";
   if (metadata.isSymbolicLink()) {
+    if (metadata.nlink !== 1) throw new Error("tree digest rejects hard-linked symlinks");
     const { bytes } = await readPortableSymlink(path);
     updateHashFields(hash, ["symlink", entryPath, bytes]);
     return;
@@ -1016,8 +1056,90 @@ function collectEvidenceStringSurfaces(...roots) {
   return surfaces;
 }
 
+function assertNoDuplicateJsonObjectKeys(serialized) {
+  let index = 0;
+  const skipWhitespace = () => {
+    while (/\s/.test(serialized[index] ?? "")) index += 1;
+  };
+  const parseString = () => {
+    JSON_STRING_AT_PATTERN.lastIndex = index;
+    const match = JSON_STRING_AT_PATTERN.exec(serialized);
+    assert(match, "recovery evidence contains invalid JSON string syntax");
+    index = JSON_STRING_AT_PATTERN.lastIndex;
+    return JSON.parse(match[0]);
+  };
+  const parseValue = () => {
+    skipWhitespace();
+    if (serialized[index] === "{") {
+      index += 1;
+      skipWhitespace();
+      const keys = new Set();
+      if (serialized[index] === "}") {
+        index += 1;
+        return;
+      }
+      while (true) {
+        skipWhitespace();
+        const key = parseString();
+        assert(!keys.has(key), "recovery evidence contains duplicate object keys");
+        keys.add(key);
+        skipWhitespace();
+        assert.equal(
+          serialized[index],
+          ":",
+          "recovery evidence contains invalid JSON object syntax",
+        );
+        index += 1;
+        parseValue();
+        skipWhitespace();
+        if (serialized[index] === "}") {
+          index += 1;
+          return;
+        }
+        assert.equal(
+          serialized[index],
+          ",",
+          "recovery evidence contains invalid JSON object syntax",
+        );
+        index += 1;
+      }
+    }
+    if (serialized[index] === "[") {
+      index += 1;
+      skipWhitespace();
+      if (serialized[index] === "]") {
+        index += 1;
+        return;
+      }
+      while (true) {
+        parseValue();
+        skipWhitespace();
+        if (serialized[index] === "]") {
+          index += 1;
+          return;
+        }
+        assert.equal(serialized[index], ",", "recovery evidence contains invalid JSON array syntax");
+        index += 1;
+      }
+    }
+    if (serialized[index] === '"') {
+      parseString();
+      return;
+    }
+    JSON_PRIMITIVE_AT_PATTERN.lastIndex = index;
+    const match = JSON_PRIMITIVE_AT_PATTERN.exec(serialized);
+    assert(match, "recovery evidence contains invalid JSON value syntax");
+    index = JSON_PRIMITIVE_AT_PATTERN.lastIndex;
+  };
+
+  parseValue();
+  skipWhitespace();
+  assert.equal(index, serialized.length, "recovery evidence contains trailing JSON data");
+}
+
 export function assertRecoveryEvidenceSafe(report) {
   const serialized = typeof report === "string" ? report : JSON.stringify(report);
+  if (typeof report === "string") assertNoDuplicateJsonObjectKeys(serialized);
   const structured = typeof report === "string" ? JSON.parse(report) : report;
   const normalized = JSON.stringify(structured);
   const surfaces = collectEvidenceStringSurfaces(serialized, normalized);
@@ -1031,7 +1153,10 @@ export function assertRecoveryEvidenceSafe(report) {
   return serialized;
 }
 
-async function ensurePrivateEvidenceDirectory(path) {
+export async function ensurePrivateEvidenceDirectory(
+  path,
+  { createDirectory = mkdir, setMode = chmod } = {},
+) {
   const missing = [];
   let cursor = resolve(path);
   while (true) {
@@ -1052,15 +1177,10 @@ async function ensurePrivateEvidenceDirectory(path) {
   let current = await realpath(cursor);
   for (const directory of missing.reverse()) {
     current = join(current, basename(directory));
-    try {
-      await mkdir(current, { mode: 0o700 });
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      const metadata = await lstat(current);
-      assert(metadata.isDirectory(), "evidence parent must be a directory");
-      assert(!metadata.isSymbolicLink(), "evidence parent must not be a symlink");
-    }
-    await chmod(current, 0o700);
+    // EEXIST is intentionally fatal: another writer created this component
+    // after the initial scan, so this invocation must not chmod it.
+    await createDirectory(current, { mode: 0o700 });
+    await setMode(current, 0o700);
   }
   return current;
 }
@@ -1092,6 +1212,18 @@ export async function writeRecoveryEvidence(path, report) {
   }
 }
 
+async function assertPrivateBinaryIntegrity(path, expectedDigest) {
+  const metadata = await lstat(path);
+  assert(metadata.isFile(), "private CODEX_BIN copy must be a regular file");
+  assert.equal(metadata.nlink, 1, "private CODEX_BIN copy must not be hard linked");
+  assert.equal(metadata.mode & 0o777, 0o500, "private CODEX_BIN copy must remain mode 0500");
+  assert.equal(
+    await digestFile(path),
+    expectedDigest,
+    "private CODEX_BIN changed during the recovery probe",
+  );
+}
+
 export async function probeInterruptedTurnRecovery({
   codexBin = process.env.CODEX_BIN,
   evidencePath,
@@ -1117,21 +1249,16 @@ export async function probeInterruptedTurnRecovery({
     const privateBinary = join(binaryRoot, "codex");
     await copyFile(binary, privateBinary);
     await chmod(privateBinary, 0o500);
-    const privateMetadata = await lstat(privateBinary);
-    assert(privateMetadata.isFile(), "private CODEX_BIN copy must be a regular file");
-    assert.equal(privateMetadata.nlink, 1, "private CODEX_BIN copy must not be hard linked");
     const binaryDigest = await digestFile(privateBinary);
+    await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
     const binaryVersion = readCodexVersion(privateBinary);
 
     const scenarioReports = [];
     for (const kind of scenarios) {
+      await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
       scenarioReports.push(await runScenario({ codexBin: privateBinary, kind }));
     }
-    assert.equal(
-      await digestFile(privateBinary),
-      binaryDigest,
-      "private CODEX_BIN changed during the recovery probe",
-    );
+    await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
     const snapshotScenario = scenarioReports.find(
       (scenario) => scenario.kind === "snapshot_restore",
     );

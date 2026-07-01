@@ -29,6 +29,7 @@ import {
   createRecoveryLayout,
   decodePortablePathBytes,
   digestTree,
+  ensurePrivateEvidenceDirectory,
   interruptedTurnRecoveryFailureReport,
   probeInterruptedTurnRecovery,
   removeTreeForCleanup,
@@ -421,7 +422,7 @@ test("portable directory names reject case and Unicode-normalization collisions"
       /case or Unicode-normalization name collisions/,
     );
   }
-  for (const entry of ["\u03a3", "\u03c2", "Stra\u00dfe", "caf\u00e9"]) {
+  for (const entry of ["\u03a3", "\u03c2", "Stra\u00dfe", "caf\u00e9", "\u212a"]) {
     assert.throws(
       () => assertPortableDirectoryNames([entry]),
       /non-ASCII cased directory names/,
@@ -548,6 +549,59 @@ test("stopped-tree copy rejects relative symlinks whose meaning changes after re
   }
 });
 
+test("stopped-tree copy rejects relative symlink case aliases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-case-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "target"), "sentinel");
+    await symlink("TARGET", join(source, "link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /relative symlink case or normalization aliases/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects relative symlink normalization aliases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-normalization-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "\uac00"), "sentinel");
+    await symlink("\u1100\u1161", join(source, "link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /relative symlink case or normalization aliases/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects dangling relative symlinks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-relative-dangling-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await symlink("missing", join(source, "link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects dangling relative symlinks/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects special permission bits and hard-link topology", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-metadata-test-"));
   try {
@@ -579,6 +633,30 @@ test("stopped-tree copy rejects special permission bits and hard-link topology",
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test(
+  "portable tree operations reject hard-linked symlinks",
+  { skip: platform() !== "linux" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-copy-hard-link-symlink-test-"));
+    try {
+      const source = join(root, "source");
+      const destination = join(root, "destination");
+      await mkdir(source);
+      await writeFile(join(source, "target"), "sentinel");
+      await symlink("target", join(source, "first"));
+      await link(join(source, "first"), join(source, "second"));
+      await assert.rejects(digestTree(source), /rejects hard-linked symlinks/);
+      await assert.rejects(
+        copyStoppedTree({ ownedRoot: root, source, destination }),
+        /rejects hard-linked symlinks/,
+      );
+      await assert.rejects(lstat(destination), /ENOENT/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("recovery evidence is allowlisted and rejects identifiers, paths, and prompts", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-evidence-test-"));
@@ -628,7 +706,7 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     assert.throws(
       () => assertRecoveryEvidenceSafe(duplicateEscapedSecret),
-      /disallowed runtime data/,
+      /duplicate object keys/,
     );
     const nestedSecret = String.raw`{"token":"s\u006b-secret-sentinel"}`;
     const duplicateNestedSecret = JSON.stringify(report).replace(
@@ -637,8 +715,22 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     assert.throws(
       () => assertRecoveryEvidenceSafe(duplicateNestedSecret),
-      /disallowed runtime data/,
+      /duplicate object keys/,
     );
+    const serialized = JSON.stringify(report);
+    for (const duplicate of [
+      serialized.replace('"schemaVersion":2', '"schemaVersion":1,"schemaVersion":2'),
+      serialized.replace('"result":"passed"', '"result":"failed","result":"passed"'),
+      serialized.replace(
+        '"schemaVersion":2',
+        '"\\u0073chemaVersion":1,"schemaVersion":2',
+      ),
+    ]) {
+      assert.throws(
+        () => assertRecoveryEvidenceSafe(duplicate),
+        /duplicate object keys/,
+      );
+    }
     const path = join(root, "evidence.json");
     await Promise.all([
       writeRecoveryEvidence(path, report),
@@ -658,6 +750,33 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       assert.equal((await stat(directory)).mode & 0o777, 0o700);
     }
     assert.equal((await stat(nestedPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("evidence directory creation fails closed on an EEXIST race", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-evidence-race-test-"));
+  const racedDirectory = join(root, "raced");
+  let setModeCalls = 0;
+  try {
+    await assert.rejects(
+      ensurePrivateEvidenceDirectory(racedDirectory, {
+        createDirectory: async (path) => {
+          await mkdir(path);
+          await chmod(path, 0o755);
+          const error = new Error("simulated concurrent creation");
+          error.code = "EEXIST";
+          throw error;
+        },
+        setMode: async () => {
+          setModeCalls += 1;
+        },
+      }),
+      (error) => error.code === "EEXIST",
+    );
+    assert.equal(setModeCalls, 0);
+    assert.equal((await stat(racedDirectory)).mode & 0o777, 0o755);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -764,6 +883,26 @@ test("probe report contains all four recovery scenarios without runtime identifi
   assert.equal(report.snapshot.kind, "stopped-tree-copy");
   assert.equal(report.scenarios.length, 4);
   assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
+});
+
+test("probe rejects private binary mode changes between scenarios", async () => {
+  let privateBinary;
+  let calls = 0;
+  await assert.rejects(
+    probeInterruptedTurnRecovery({
+      codexBin: process.execPath,
+      readCodexVersion: () => "codex-cli 0.142.4",
+      runScenario: async ({ codexBin, kind }) => {
+        privateBinary = codexBin;
+        calls += 1;
+        await chmod(codexBin, 0o700);
+        return scenarioReport(kind);
+      },
+    }),
+    /private CODEX_BIN copy must remain mode 0500/,
+  );
+  assert.equal(calls, 1);
+  await assert.rejects(lstat(privateBinary), /ENOENT/);
 });
 
 test("probe requires an absolute binary and the complete scenario matrix", async () => {

@@ -40,8 +40,10 @@ Signal and hard-kill recovery instead normalizes the stale in-progress turn to
 `interrupted` without inventing that marker. The stopped-tree copy preserves
 regular files, directories, POSIX rwx permission bits, and portable UTF-8
 symlinks without following links. Non-ASCII cased names, case-insensitive or
-Unicode-normalized name collisions, non-relocatable links, special permission
-bits, hard links, sockets, FIFOs, and devices fail closed. Ownership, ACLs,
+Unicode-normalized name collisions, dangling relative links, relative-link
+case or normalization aliases, non-relocatable links, special permission bits,
+hard links (including hard-linked symlinks), sockets, FIFOs, and devices fail
+closed. Ownership, ACLs,
 extended attributes,
 timestamps, and other unmodeled metadata are not preserved or covered by the
 digest. It is not an online, atomic, or power-loss-durable snapshot implementation.
