@@ -381,6 +381,7 @@ async function copyTreeEntry(context, source, destination) {
   if (metadata.isDirectory()) {
     const finalMode = portableMode(metadata);
     await mkdir(destination, { mode: 0o700 });
+    await chmod(destination, 0o700);
     const entries = await readPortableDirectory(source);
     for (const entry of entries) {
       await copyTreeEntry(context, join(source, entry), join(destination, entry));

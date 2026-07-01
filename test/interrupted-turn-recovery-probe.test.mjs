@@ -242,6 +242,30 @@ test("stopped-tree copy populates read-only directories before restoring their m
   }
 });
 
+test("stopped-tree copy overrides a restrictive umask while populating directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-umask-test-"));
+  const source = join(root, "source");
+  const destination = join(root, "destination");
+  try {
+    await mkdir(join(source, "nested"), { recursive: true, mode: 0o700 });
+    await writeFile(join(source, "nested", "state.jsonl"), "{\"ok\":true}\n", {
+      mode: 0o600,
+    });
+    const previousUmask = process.umask(0o777);
+    try {
+      await copyStoppedTree({ ownedRoot: root, source, destination });
+    } finally {
+      process.umask(previousUmask);
+    }
+    assert.equal(
+      await readFile(join(destination, "nested", "state.jsonl"), "utf8"),
+      "{\"ok\":true}\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy preserves symlinks without following their targets", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-link-test-"));
   try {
