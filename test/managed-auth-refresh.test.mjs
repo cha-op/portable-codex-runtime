@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import {
+  chmod,
+  link,
+  mkdtemp,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -9,11 +22,17 @@ import {
   ManagedAuthRefreshError,
   authorityLockPath,
   authorityStagingDirectory,
+  managedAuthRefreshErrorMetadata,
   readManagedAuthSnapshot,
   refreshManagedAuthRecord,
 } from "../src/managed-auth-refresh.mjs";
+import { acquireAdvisoryLock } from "../src/advisory-lock.mjs";
 
 const ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174088";
+const USER_ID = "user-123e4567-e89b-42d3-a456-426614174088";
+const UNSAFE_HOME_FIXTURE = fileURLToPath(
+  new URL("../fixtures/probe-unsafe-authority-home.mjs", import.meta.url),
+);
 const RPC_AUDIT = [
   { kind: "request", method: "initialize" },
   { kind: "notification", method: "initialized" },
@@ -31,10 +50,12 @@ function authDocument({
   expiresAtUnixSeconds = Math.floor(Date.now() / 1000) + 3600,
   lastRefresh,
   refreshToken,
+  userId = USER_ID,
 }) {
   const claims = {
     chatgpt_account_id: accountId,
     chatgpt_plan_type: "enterprise",
+    chatgpt_user_id: userId,
   };
   return {
     OPENAI_API_KEY: null,
@@ -79,6 +100,7 @@ async function replaceStagedAuth(
     expiresAtUnixSeconds,
     lastRefresh = "2026-07-01T08:01:00.000Z",
     refreshToken = "refresh-after-sensitive",
+    userId,
   } = {},
 ) {
   await writeFile(
@@ -90,6 +112,7 @@ async function replaceStagedAuth(
         expiresAtUnixSeconds,
         lastRefresh,
         refreshToken,
+        userId,
       }),
     )}\n`,
     { mode: 0o600 },
@@ -127,6 +150,7 @@ test("managed refresh stages Codex writes and atomically promotes verified auth"
       authFileChanged: true,
       lastRefreshAdvanced: true,
       refreshTokenChanged: true,
+      userContinuity: true,
     });
     assert.deepEqual(result.rpcAudit.map(({ method }) => method), [
       "initialize",
@@ -135,6 +159,8 @@ test("managed refresh stages Codex writes and atomically promotes verified auth"
     ]);
     assert.equal(after.fileMode, "0600");
     assert.notEqual(afterStat.ino, beforeStat.ino);
+    assert.equal(JSON.stringify(after).includes(after.accessToken), false);
+    assert.equal(JSON.stringify(result).includes(result.accessToken), false);
     assert.equal((await stat(authorityLockPath(authHome))).isFile(), true);
     await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
   } finally {
@@ -162,6 +188,7 @@ test("authority coalesces concurrent refresh callers into one generation", async
         fileMode: "0600",
         parentDirectorySynced: true,
         planType: "enterprise",
+        recoveryPath: "/dedicated-test-home/staging/attempt-1",
         redactionValues: ["access-sensitive", ACCOUNT_ID],
         rpcAudit: RPC_AUDIT,
       };
@@ -179,6 +206,22 @@ test("authority coalesces concurrent refresh callers into one generation", async
     Array(20).fill(1),
   );
   assert.equal(results.every((result) => result.accessToken === "access-sensitive"), true);
+  assert.equal(results[0].recoveryPath, "/dedicated-test-home/staging/attempt-1");
+  assert.equal(JSON.stringify(results[0]).includes("access-sensitive"), false);
+  assert.equal(JSON.stringify(results[0]).includes(ACCOUNT_ID), false);
+});
+
+test("error metadata exposes recovery controls without serializing the error", () => {
+  const error = new ManagedAuthRefreshError("refresh_failed", "secret-bearing message", {
+    recoveryPath: "/dedicated/staging/attempt-1",
+    retryable: false,
+  });
+  error.secret = "must-not-be-returned";
+  assert.deepEqual(managedAuthRefreshErrorMetadata(error), {
+    code: "refresh_failed",
+    retryable: false,
+    recoveryPath: "/dedicated/staging/attempt-1",
+  });
 });
 
 test("permanent account loss becomes reauth_required without changing canonical auth", async () => {
@@ -284,6 +327,30 @@ test("account identity changes fail without exposing either identity", async () 
   }
 });
 
+test("user identity changes fail even inside the same workspace", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const changedUser = "user-123e4567-e89b-42d3-a456-426614174099";
+  try {
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async ({ stagingHome }) => {
+          await replaceStagedAuth(stagingHome, { userId: changedUser });
+          return successResponse();
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "user_identity_changed");
+        assert.equal(error.stack.includes(USER_ID), false);
+        assert.equal(error.stack.includes(changedUser), false);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("unexpected RPC activity is rejected before canonical promotion", async () => {
   const { authHome, root } = await createAuthorityHome();
   try {
@@ -355,6 +422,163 @@ test("expired refreshed access token is never promoted", async () => {
     assert.equal(refreshError.code, "refreshed_access_token_invalid");
     assert.equal(await readFile(join(authHome, "auth.json"), "utf8"), canonicalBefore);
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-commit cleanup failure returns success with a warning", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const result = await refreshManagedAuthRecord({
+      authHome,
+      cleanupArtifacts: async () => {
+        throw new Error("synthetic cleanup failure");
+      },
+      runRefresh: async ({ stagingHome }) => {
+        await replaceStagedAuth(stagingHome);
+        return successResponse();
+      },
+    });
+    assert.deepEqual(result.cleanupWarnings, ["staging_cleanup_failed"]);
+    assert.equal(typeof result.recoveryPath, "string");
+    assert.equal((await stat(result.recoveryPath)).isDirectory(), true);
+    const promoted = await readManagedAuthSnapshot(authHome);
+    assert.equal(promoted.accessToken, result.accessToken);
+
+    const lock = await acquireAdvisoryLock(authorityLockPath(authHome));
+    await lock.release();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cleanup failure attaches a retained staging path to error metadata", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        cleanupArtifacts: async () => {
+          throw new Error("synthetic cleanup failure");
+        },
+        runRefresh: async () => successResponse(),
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert.equal(refreshError.code, "refresh_not_observed");
+    assert.deepEqual(refreshError.cleanupWarnings, ["staging_cleanup_failed"]);
+    assert.equal(typeof refreshError.recoveryPath, "string");
+    assert.equal((await stat(refreshError.recoveryPath)).isDirectory(), true);
+    assert.equal(
+      managedAuthRefreshErrorMetadata(refreshError).recoveryPath,
+      refreshError.recoveryPath,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-commit durability and verification failures return committed warnings", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const result = await refreshManagedAuthRecord({
+      authHome,
+      runRefresh: async ({ stagingHome }) => {
+        await replaceStagedAuth(stagingHome);
+        return successResponse();
+      },
+      syncDirectory: async () => {
+        throw new Error("synthetic directory sync failure");
+      },
+      verifyPromoted: async () => {
+        throw new Error("synthetic post-commit verification failure");
+      },
+    });
+    assert.deepEqual(result.cleanupWarnings, [
+      "parent_directory_sync_failed",
+      "promotion_verification_failed",
+    ]);
+    assert.equal(typeof result.recoveryPath, "string");
+    const promoted = await readManagedAuthSnapshot(authHome);
+    assert.equal(promoted.accessToken, result.accessToken);
+    assert.equal((await stat(result.recoveryPath)).isDirectory(), true);
+    const stagingRoot = await realpath(authorityStagingDirectory(authHome));
+    assert.equal(result.recoveryPath.startsWith(`${stagingRoot}/`), true);
+
+    const lock = await acquireAdvisoryLock(authorityLockPath(authHome));
+    await lock.release();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("directory sync failure alone preserves the rotated staging credential", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const result = await refreshManagedAuthRecord({
+      authHome,
+      runRefresh: async ({ stagingHome }) => {
+        await replaceStagedAuth(stagingHome);
+        return successResponse();
+      },
+      syncDirectory: async () => false,
+    });
+    assert.deepEqual(result.cleanupWarnings, ["parent_directory_sync_failed"]);
+    assert.equal(typeof result.recoveryPath, "string");
+    assert.equal((await stat(join(result.recoveryPath, "auth.json"))).isFile(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority maps a held advisory lock to a retryable error", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  let lock;
+  try {
+    lock = await acquireAdvisoryLock(authorityLockPath(authHome));
+    await assert.rejects(refreshManagedAuthRecord({ authHome }), (error) => {
+      assert.equal(error.code, "authority_locked");
+      assert.equal(error.retryable, true);
+      return true;
+    });
+  } finally {
+    await lock?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority refuses the active CODEX_HOME", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    const result = spawnSync(process.execPath, [UNSAFE_HOME_FIXTURE, authHome], {
+      encoding: "utf8",
+      env: { ...process.env, CODEX_HOME: authHome },
+    });
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, "unsafe_auth_home\n");
+    assert.equal(result.stderr, "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authority auth.json rejects symlinks and permissive modes", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const authPath = join(authHome, "auth.json");
+  const target = join(authHome, "auth-target.json");
+  try {
+    await chmod(authPath, 0o644);
+    await assert.rejects(readManagedAuthSnapshot(authHome), (error) => {
+      return error.code === "invalid_auth_record" && /group\/world/.test(error.message);
+    });
+    await chmod(authPath, 0o600);
+    await writeFile(target, await readFile(authPath), { mode: 0o600 });
+    await rm(authPath);
+    await symlink(target, authPath);
+    await assert.rejects(readManagedAuthSnapshot(authHome));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

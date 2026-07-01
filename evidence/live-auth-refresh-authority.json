@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "probe": "managed-auth-refresh-authority-live",
-  "startedAt": "2026-07-01T03:18:28.420Z",
-  "completedAt": "2026-07-01T03:18:33.573Z",
+  "startedAt": "2026-07-01T03:41:27.988Z",
+  "completedAt": "2026-07-01T03:41:34.013Z",
   "codexVersion": "codex-cli 0.142.4",
   "sourceMirrorCommit": "db887d03e1f907467e33271572dffb73bceecd6b",
   "refreshMethod": "account/read",
@@ -19,13 +19,15 @@
     "generationBefore": 0,
     "generationAfter": 1,
     "accountContinuity": true,
+    "userContinuity": true,
     "lastRefreshAdvanced": true,
     "accessTokenChanged": true,
     "refreshTokenChanged": true,
     "authFileChanged": true,
     "canonicalPromotion": "atomic-rename",
     "parentDirectorySynced": true,
-    "fileMode": "0600"
+    "fileMode": "0600",
+    "cleanupWarnings": []
   },
   "workerValidation": {
     "performedAfterAuthorityRefresh": true,

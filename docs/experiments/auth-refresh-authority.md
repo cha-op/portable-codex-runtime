@@ -50,17 +50,19 @@ and flush. It does not provide an atomic rename, directory sync, cross-process
 lock, or generation/CAS primitive. The probe therefore does not let Codex write
 the canonical authority file directly:
 
-1. Acquire an OS advisory lock in the dedicated authority home. A small holder
-   process keeps the lock while its parent pipe is open, so process death
-   releases the lock automatically.
+1. Open a regular single-link lock file with `O_NOFOLLOW`, pass that exact file
+   descriptor to an OS advisory lock holder, and keep the holder alive through
+   its parent pipe. Linux opens `/proc/self/fd/3` in `flock` command mode so the
+   bare descriptor is not misparsed as a path. Process death releases the lock
+   automatically, while inode checks reject lock-path replacement.
 2. Read and validate canonical `auth.json` through one `O_NOFOLLOW` file
    descriptor.
 3. Copy the credential into a mode `0700` staging `CODEX_HOME`.
 4. Run only `initialize`, `initialized`, and
    `account/read(refreshToken=true)` against the staging home.
-5. Verify account continuity, advanced `last_refresh`, a changed access token
-   with at least two minutes of remaining validity, file permissions, and the
-   unchanged canonical source generation.
+5. Verify workspace and user continuity, advanced `last_refresh`, a changed
+   access token with at least two minutes of remaining validity, file
+   permissions, and the unchanged canonical source generation.
 6. Write the staged record to a synced mode `0600` temporary file, atomically
    rename it over canonical `auth.json`, and sync the parent directory when the
    platform supports it.
@@ -80,8 +82,8 @@ The live probe passed with Codex CLI `0.142.4` and the dedicated
 - the authority RPC audit contained only `initialize`, `initialized`, and
   `account/read`;
 - no authority model turn was started;
-- access and refresh tokens changed while the account identity remained
-  continuous;
+- access and refresh tokens changed while workspace and user identities
+  remained continuous;
 - canonical promotion used atomic rename and the resulting file remained mode
   `0600`;
 - a separate `gpt-5.4` worker turn consumed the refreshed access token through
@@ -102,11 +104,24 @@ CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
 - A crash after the OAuth service accepts the old refresh token but before the
   staged record is promoted can still require interactive login. A changed
   staging record is preserved for manual recovery instead of automatically
-  restoring the now-stale canonical token.
+  restoring the now-stale canonical token. Operators must inspect the reported
+  recovery path and deliberately promote or securely remove old attempts;
+  automatic age-based reaping could delete the only valid rotated token.
 - `account/read` does not return the refreshed access token or a structured
   refresh error. Success must be established from the staged auth record and
   postconditions, not JSON-RPC success alone.
 - The advisory filesystem lock cannot protect against an unrelated process
   that ignores it. Production correctness requires one fenced authority leader.
+- The reference lock backend requires `/usr/bin/lockf` on macOS and `flock`
+  from util-linux plus procfs on Linux. Fixed runtime images must include and
+  test the matching backend.
+- Directory-sync, verification, cleanup, or lock-release errors after canonical
+  promotion are returned as committed warnings rather than refresh failures,
+  preventing callers from rotating a second token in response to an already
+  committed refresh. Failed directory sync or verification preserves staging
+  and returns its exact `recoveryPath` for operator inspection.
+- Refresh results contain secret-bearing properties for the broker adapter.
+  Those properties are non-enumerable to reduce accidental JSON/log exposure,
+  but callers must still avoid logging or spreading the result object.
 - `chatgptAuthTokens` remains an experimental worker API and must be covered by
   a pinned-image compatibility probe on every Codex upgrade.

@@ -27,6 +27,7 @@ const EXPECTED_RPC_AUDIT = [
   { kind: "notification", method: "initialized" },
   { kind: "request", method: "account/read" },
 ];
+const STAGING_CLEANUP_RETRY_DELAYS_MS = [50, 100, 250, 500, 1_000];
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -42,6 +43,13 @@ function fail(code, message, { retryable = false, recoveryPath } = {}) {
 
 function ensure(condition, code, message, options) {
   if (!condition) fail(code, message, options);
+}
+
+function withSensitiveProperties(publicValue, sensitiveProperties) {
+  for (const [name, value] of Object.entries(sensitiveProperties)) {
+    Object.defineProperty(publicValue, name, { enumerable: false, value });
+  }
+  return publicValue;
 }
 
 function decodeJwtPayload(token, label) {
@@ -103,11 +111,28 @@ function lastRefreshAdvanced(before, after) {
 
 async function resolveAuthorityHome(authHome) {
   const authorityHome = await realpath(resolve(authHome));
-  const defaultCodexHome = await realpath(join(homedir(), ".codex")).catch(() => null);
+  const authorityHomeStat = await lstat(authorityHome);
+  const protectedHomes = await Promise.all(
+    [join(homedir(), ".codex"), process.env.CODEX_HOME]
+      .filter((value) => typeof value === "string" && value.length > 0)
+      .map(async (value) => {
+        try {
+          const path = await realpath(resolve(value));
+          return { path, stat: await lstat(path) };
+        } catch {
+          return null;
+        }
+      }),
+  );
   ensure(
-    defaultCodexHome === null || authorityHome !== defaultCodexHome,
+    !protectedHomes.some(
+      (protectedHome) =>
+        protectedHome !== null &&
+        (protectedHome.path === authorityHome ||
+          sameFileIdentity(protectedHome.stat, authorityHomeStat)),
+    ),
     "unsafe_auth_home",
-    "refusing to mutate the default Codex home; use a dedicated authority home",
+    "refusing to mutate the default or active Codex home; use a dedicated authority home",
   );
   return authorityHome;
 }
@@ -117,7 +142,6 @@ async function acquireAuthorityLock(authorityHome) {
   let lock;
   try {
     lock = await acquireAdvisoryLock(lockPath);
-    await chmod(lockPath, 0o600);
     return lock;
   } catch (error) {
     await lock?.release().catch(() => {});
@@ -150,10 +174,15 @@ async function createStagingHome(authorityHome, rawAuth) {
     stagingHome = await mkdtemp(join(stagingRoot, "attempt-"));
     await chmod(stagingHome, 0o700);
     await writeFile(join(stagingHome, "auth.json"), rawAuth, { flag: "wx", mode: 0o600 });
-    await writeFile(join(stagingHome, "config.toml"), 'cli_auth_credentials_store = "file"\n', {
-      flag: "wx",
-      mode: 0o600,
-    });
+    const config = `cli_auth_credentials_store = "file"
+
+[features]
+plugin_hooks = false
+plugin_sharing = false
+plugins = false
+remote_plugin = false
+`;
+    await writeFile(join(stagingHome, "config.toml"), config, { flag: "wx", mode: 0o600 });
     return { stagingHome, stagingRoot };
   } catch (error) {
     if (stagingHome) await rm(stagingHome, { recursive: true, force: true }).catch(() => {});
@@ -175,7 +204,13 @@ async function syncParentDirectory(path) {
   }
 }
 
-async function atomicallyPromoteAuth(authorityHome, rawAuth, expectedSource) {
+async function atomicallyPromoteAuth(
+  authorityHome,
+  rawAuth,
+  expectedSource,
+  assertLockHeld,
+  syncDirectory,
+) {
   const destination = join(authorityHome, "auth.json");
   const temporary = join(authorityHome, `.auth.json.next-${randomUUID()}`);
   let handle;
@@ -199,9 +234,18 @@ async function atomicallyPromoteAuth(authorityHome, rawAuth, expectedSource) {
       "canonical authority state changed while the staged refresh was running",
     );
 
+    await assertLockHeld();
     await rename(temporary, destination);
     renamed = true;
-    return { parentDirectorySynced: await syncParentDirectory(authorityHome) };
+    try {
+      const parentDirectorySynced = await syncDirectory(authorityHome);
+      return {
+        parentDirectorySynced,
+        warnings: parentDirectorySynced ? [] : ["parent_directory_sync_failed"],
+      };
+    } catch {
+      return { parentDirectorySynced: false, warnings: ["parent_directory_sync_failed"] };
+    }
   } finally {
     await handle?.close().catch(() => {});
     if (!renamed) await rm(temporary, { force: true }).catch(() => {});
@@ -216,6 +260,18 @@ export class ManagedAuthRefreshError extends Error {
     this.retryable = retryable;
     if (recoveryPath) this.recoveryPath = recoveryPath;
   }
+}
+
+export function managedAuthRefreshErrorMetadata(error) {
+  if (!error || typeof error !== "object") return {};
+  const metadata = {};
+  if (typeof error.code === "string") metadata.code = error.code;
+  if (typeof error.retryable === "boolean") metadata.retryable = error.retryable;
+  if (typeof error.recoveryPath === "string") metadata.recoveryPath = error.recoveryPath;
+  if (Array.isArray(error.cleanupWarnings)) {
+    metadata.cleanupWarnings = error.cleanupWarnings.filter((value) => typeof value === "string");
+  }
+  return metadata;
 }
 
 export async function readManagedAuthSnapshot(authHome) {
@@ -284,12 +340,19 @@ export async function readManagedAuthSnapshot(authHome) {
     "invalid_auth_record",
     "authority auth.json account identities do not match",
   );
+  const userIds = [accessAuth.chatgpt_user_id, idAuth.chatgpt_user_id].filter(
+    (value) => value !== null && value !== undefined,
+  );
+  ensure(userIds.length > 0, "invalid_auth_record", "authority auth.json is missing user id");
+  ensure(
+    userIds.every(
+      (value) => typeof value === "string" && value.length > 0 && value === userIds[0],
+    ),
+    "invalid_auth_record",
+    "authority auth.json user identities do not match",
+  );
 
-  return {
-    accessToken: auth.tokens.access_token,
-    accessTokenFingerprint: fingerprint(auth.tokens.access_token),
-    accountId: accountIds[0],
-    authFileFingerprint: fingerprint(raw),
+  return withSensitiveProperties({
     authPath,
     expiresAt:
       typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null,
@@ -299,10 +362,16 @@ export async function readManagedAuthSnapshot(authHome) {
     fileMode: (fileStat.mode & 0o777).toString(8).padStart(4, "0"),
     lastRefreshAt: auth.last_refresh ?? null,
     planType: accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null,
+  }, {
+    accessToken: auth.tokens.access_token,
+    accessTokenFingerprint: fingerprint(auth.tokens.access_token),
+    accountId: accountIds[0],
+    authFileFingerprint: fingerprint(raw),
     raw,
     redactionValues: collectRedactionValues(auth, accessPayload, idPayload),
     refreshTokenFingerprint: fingerprint(auth.tokens.refresh_token),
-  };
+    userId: userIds[0],
+  });
 }
 
 export async function runCodexManagedRefresh({ codexBin = "codex", stagingHome }) {
@@ -321,10 +390,34 @@ export async function runCodexManagedRefresh({ codexBin = "codex", stagingHome }
   }
 }
 
+async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, stagingRoot }) {
+  if (preserveStaging) return;
+  if (stagingHome) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rm(stagingHome, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        const delay = STAGING_CLEANUP_RETRY_DELAYS_MS[attempt];
+        if (!delay || !["EBUSY", "ENOTEMPTY"].includes(error?.code)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+  if (stagingRoot) {
+    await rmdir(stagingRoot).catch((error) => {
+      if (!["ENOENT", "ENOTEMPTY"].includes(error?.code)) throw error;
+    });
+  }
+}
+
 export async function refreshManagedAuthRecord({
   authHome,
+  cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
   runRefresh = runCodexManagedRefresh,
+  syncDirectory = syncParentDirectory,
+  verifyPromoted = readManagedAuthSnapshot,
 }) {
   const authorityHome = await resolveAuthorityHome(authHome);
   const lock = await acquireAuthorityLock(authorityHome);
@@ -332,6 +425,9 @@ export async function refreshManagedAuthRecord({
   let stagingHome;
   let stagingRoot;
   let preserveStaging = false;
+  let outcome;
+  let primaryError;
+  const committedWarnings = [];
   try {
     before = await readManagedAuthSnapshot(authorityHome);
     ({ stagingHome, stagingRoot } = await createStagingHome(authorityHome, before.raw));
@@ -343,7 +439,7 @@ export async function refreshManagedAuthRecord({
     );
 
     const staged = await readManagedAuthSnapshot(stagingHome);
-    lock.assertHeld();
+    await lock.assertHeld();
     preserveStaging = staged.authFileFingerprint !== before.authFileFingerprint;
     ensure(
       refreshResult?.response &&
@@ -360,6 +456,12 @@ export async function refreshManagedAuthRecord({
       staged.accountId === before.accountId,
       "account_identity_changed",
       "managed refresh changed the ChatGPT account identity",
+      { recoveryPath: stagingHome },
+    );
+    ensure(
+      staged.userId === before.userId,
+      "user_identity_changed",
+      "managed refresh changed the ChatGPT user identity",
       { recoveryPath: stagingHome },
     );
     ensure(
@@ -383,25 +485,37 @@ export async function refreshManagedAuthRecord({
       { recoveryPath: stagingHome },
     );
 
-    const promotion = await atomicallyPromoteAuth(authorityHome, staged.raw, before);
-    lock.assertHeld();
-    const promoted = await readManagedAuthSnapshot(authorityHome);
-    ensure(
-      promoted.authFileFingerprint === staged.authFileFingerprint &&
-        promoted.accountId === before.accountId,
-      "promotion_verification_failed",
-      "promoted authority state failed verification",
-      { recoveryPath: stagingHome },
+    const promotion = await atomicallyPromoteAuth(
+      authorityHome,
+      staged.raw,
+      before,
+      () => lock.assertHeld(),
+      syncDirectory,
     );
-    preserveStaging = false;
+    committedWarnings.push(...promotion.warnings);
+    let promoted = staged;
+    try {
+      const verified = await verifyPromoted(authorityHome);
+      ensure(
+        verified.authFileFingerprint === staged.authFileFingerprint &&
+          verified.accountId === before.accountId &&
+          verified.userId === before.userId,
+        "promotion_verification_failed",
+        "promoted authority state failed verification",
+        { recoveryPath: stagingHome },
+      );
+      promoted = verified;
+      preserveStaging = promotion.warnings.includes("parent_directory_sync_failed");
+    } catch {
+      committedWarnings.push("promotion_verification_failed");
+    }
 
-    return {
-      accessToken: promoted.accessToken,
-      accountId: promoted.accountId,
+    outcome = withSensitiveProperties({
       codexUserAgent: refreshResult.initializeResult?.userAgent ?? null,
       comparisons: {
         accessTokenChanged: true,
         accountContinuity: true,
+        userContinuity: true,
         authFileChanged: promoted.authFileFingerprint !== before.authFileFingerprint,
         lastRefreshAdvanced: true,
         refreshTokenChanged:
@@ -411,9 +525,13 @@ export async function refreshManagedAuthRecord({
       fileMode: promoted.fileMode,
       parentDirectorySynced: promotion.parentDirectorySynced,
       planType: promoted.planType,
-      redactionValues: [...new Set([...before.redactionValues, ...promoted.redactionValues])],
+      ...(preserveStaging ? { recoveryPath: stagingHome } : {}),
       rpcAudit: refreshResult.rpcAudit,
-    };
+    }, {
+      accessToken: promoted.accessToken,
+      accountId: promoted.accountId,
+      redactionValues: [...new Set([...before.redactionValues, ...promoted.redactionValues])],
+    });
   } catch (error) {
     if (stagingHome && before && !preserveStaging) {
       try {
@@ -429,21 +547,39 @@ export async function refreshManagedAuthRecord({
     if (preserveStaging && stagingHome && error && typeof error === "object") {
       error.recoveryPath ??= stagingHome;
     }
-    throw error;
-  } finally {
-    try {
-      if (stagingHome && !preserveStaging) {
-        await rm(stagingHome, { recursive: true, force: true });
+    primaryError = error;
+  }
+
+  const cleanupWarnings = [...committedWarnings];
+  try {
+    await cleanupArtifacts({ preserveStaging, stagingHome, stagingRoot });
+  } catch {
+    cleanupWarnings.push("staging_cleanup_failed");
+    if (stagingHome) {
+      try {
+        await lstat(stagingHome);
+        if (primaryError && typeof primaryError === "object") {
+          primaryError.recoveryPath ??= stagingHome;
+        }
+        if (outcome) outcome.recoveryPath ??= stagingHome;
+      } catch {
+        // The staging home was removed before a later cleanup step failed.
       }
-      if (stagingRoot && !preserveStaging) {
-        await rmdir(stagingRoot).catch((error) => {
-          if (!["ENOENT", "ENOTEMPTY"].includes(error?.code)) throw error;
-        });
-      }
-    } finally {
-      await releaseAuthorityLock(lock);
     }
   }
+  try {
+    await releaseAuthorityLock(lock);
+  } catch {
+    cleanupWarnings.push("lock_release_failed");
+  }
+  if (primaryError) {
+    if (cleanupWarnings.length > 0 && typeof primaryError === "object") {
+      primaryError.cleanupWarnings = cleanupWarnings;
+    }
+    throw primaryError;
+  }
+  outcome.cleanupWarnings = cleanupWarnings;
+  return outcome;
 }
 
 export class ManagedAuthRefreshAuthority {
@@ -475,19 +611,22 @@ export class ManagedAuthRefreshAuthority {
     this.refreshExecutions += 1;
     const record = await this.refreshRecord({ authHome: this.authHome, codexBin: this.codexBin });
     this.generation += 1;
-    return {
-      accessToken: record.accessToken,
-      accountId: record.accountId,
+    return withSensitiveProperties({
       codexUserAgent: record.codexUserAgent,
+      cleanupWarnings: record.cleanupWarnings,
       comparisons: record.comparisons,
       expiresAt: record.expiresAt,
       fileMode: record.fileMode,
       generation: this.generation,
       parentDirectorySynced: record.parentDirectorySynced,
       planType: record.planType,
-      redactionValues: record.redactionValues,
+      ...(record.recoveryPath ? { recoveryPath: record.recoveryPath } : {}),
       rpcAudit: record.rpcAudit,
-    };
+    }, {
+      accessToken: record.accessToken,
+      accountId: record.accountId,
+      redactionValues: record.redactionValues,
+    });
   }
 }
 

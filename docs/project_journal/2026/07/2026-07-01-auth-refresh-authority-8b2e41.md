@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-01
 updated: 2026-07-01
 branch: wip/auth-refresh-authority-spike
-pr:
+pr: 2
 supersedes: []
 superseded_by:
 ---

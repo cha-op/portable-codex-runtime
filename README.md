@@ -33,8 +33,9 @@ separate worker turn with the refreshed access token:
 CODEX_ALLOW_AUTH_MUTATION=1 npm run probe:auth-refresh:live
 ```
 
-Do not point this command at the default user `~/.codex` home. The probe rejects
-that path and expects `.test-codex-home` or another dedicated authority login.
+Do not point this command at the default user `~/.codex` home or the active
+`$CODEX_HOME`. The probe rejects path aliases and matching directory identities
+and expects `.test-codex-home` or another dedicated authority login.
 See `docs/experiments/auth-refresh-authority.md` for the source evidence,
 failure model, and production limitations.
 

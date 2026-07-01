@@ -107,6 +107,7 @@ export async function probeLiveAuthRefreshAuthority({
       generationBefore: 0,
       generationAfter: first.generation,
       accountContinuity: first.comparisons.accountContinuity,
+      userContinuity: first.comparisons.userContinuity,
       lastRefreshAdvanced: first.comparisons.lastRefreshAdvanced,
       accessTokenChanged: first.comparisons.accessTokenChanged,
       refreshTokenChanged: first.comparisons.refreshTokenChanged,
@@ -114,6 +115,7 @@ export async function probeLiveAuthRefreshAuthority({
       canonicalPromotion: "atomic-rename",
       parentDirectorySynced: first.parentDirectorySynced,
       fileMode: first.fileMode,
+      cleanupWarnings: first.cleanupWarnings,
     },
     workerValidation: {
       performedAfterAuthorityRefresh: true,

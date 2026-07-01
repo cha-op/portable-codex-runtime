@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, link, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
 
-import { AdvisoryLockError, acquireAdvisoryLock } from "../src/advisory-lock.mjs";
+import {
+  AdvisoryLockError,
+  acquireAdvisoryLock,
+  advisoryLockCommand,
+} from "../src/advisory-lock.mjs";
 
 const HOLDER_FIXTURE = fileURLToPath(new URL("../fixtures/hold-advisory-lock.mjs", import.meta.url));
 
@@ -46,7 +50,7 @@ test("advisory lock rejects concurrent holders and can be reacquired", async () 
     await first.release();
     first = undefined;
     second = await acquireAdvisoryLock(path);
-    second.assertHeld();
+    await second.assertHeld();
   } finally {
     await first?.release();
     await second?.release();
@@ -76,10 +80,106 @@ test("OS releases the advisory lock after the owning process is killed", async (
       }
     }
     assert(recovered, "lock was not released after the owner process died");
-    recovered.assertHeld();
+    await recovered.assertHeld();
   } finally {
     if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGKILL");
     await recovered?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock backends use the inherited secure file descriptor", () => {
+  assert.deepEqual(advisoryLockCommand("darwin"), {
+    command: "/usr/bin/lockf",
+    args: [
+      "-k",
+      "-s",
+      "-t",
+      "0",
+      "-w",
+      "/dev/fd/3",
+      process.execPath,
+      fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
+    ],
+  });
+  assert.deepEqual(advisoryLockCommand("linux"), {
+    command: "flock",
+    args: [
+      "--exclusive",
+      "--nonblock",
+      "/proc/self/fd/3",
+      process.execPath,
+      fileURLToPath(new URL("../src/advisory-lock-holder.mjs", import.meta.url)),
+    ],
+  });
+});
+
+test("unsupported lock platforms fail before creating the lock file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-platform-"));
+  const path = join(root, "authority.lock");
+  try {
+    await assert.rejects(acquireAdvisoryLock(path, { platform: "win32" }), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "unsupported_platform";
+    });
+    await assert.rejects(access(path), (error) => error.code === "ENOENT");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock rejects symlinks and hard links", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-unsafe-lock-"));
+  const target = join(root, "target");
+  const path = join(root, "authority.lock");
+  try {
+    await writeFile(target, "unrelated\n", { mode: 0o644 });
+    await symlink(target, path);
+    await assert.rejects(acquireAdvisoryLock(path), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "unsafe_lock_file";
+    });
+    await rm(path);
+    await link(target, path);
+    await assert.rejects(acquireAdvisoryLock(path), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "unsafe_lock_file";
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock detects path replacement while held", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-replaced-lock-"));
+  const path = join(root, "authority.lock");
+  const displaced = join(root, "displaced.lock");
+  let lock;
+  try {
+    lock = await acquireAdvisoryLock(path);
+    await rename(path, displaced);
+    await writeFile(path, "replacement\n", { mode: 0o600 });
+    await assert.rejects(lock.assertHeld(), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "lock_replaced";
+    });
+  } finally {
+    await lock?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock rejects FIFO replacement without blocking", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-fifo-lock-"));
+  const path = join(root, "authority.lock");
+  const displaced = join(root, "displaced.lock");
+  let lock;
+  try {
+    lock = await acquireAdvisoryLock(path);
+    await rename(path, displaced);
+    const created = spawnSync("mkfifo", [path], { encoding: "utf8" });
+    assert.equal(created.status, 0, created.stderr);
+    await assert.rejects(lock.assertHeld(), (error) => {
+      return error instanceof AdvisoryLockError && error.code === "lock_replaced";
+    });
+  } finally {
+    await lock?.release();
     await rm(root, { recursive: true, force: true });
   }
 });
