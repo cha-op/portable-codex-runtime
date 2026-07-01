@@ -274,17 +274,29 @@ export async function terminateAppServer(
 
 async function assertDirectOwnedPath(ownedRoot, candidate, label, { mustExist }) {
   const canonicalRoot = await realpath(ownedRoot);
-  const canonicalParent = await realpath(dirname(resolve(candidate)));
+  const canonicalParent = await realpath(dirname(candidate));
   assert.equal(canonicalParent, canonicalRoot, `${label} must be a direct owned child`);
+  const candidateName = basename(candidate);
+  assert(
+    candidateName !== "." && candidateName !== "..",
+    `${label} must be a direct owned child`,
+  );
+  const canonicalCandidate = join(canonicalParent, candidateName);
+  assert.equal(
+    dirname(canonicalCandidate),
+    canonicalRoot,
+    `${label} must be a direct owned child`,
+  );
   try {
-    const metadata = await lstat(candidate);
+    const metadata = await lstat(canonicalCandidate);
     if (!mustExist) throw new Error(`${label} already exists`);
     assert(metadata.isDirectory(), `${label} must be a directory`);
     assert(!metadata.isSymbolicLink(), `${label} must not be a symlink`);
   } catch (error) {
-    if (!mustExist && error?.code === "ENOENT") return;
+    if (!mustExist && error?.code === "ENOENT") return canonicalCandidate;
     throw error;
   }
+  return canonicalCandidate;
 }
 
 function pathIsInside(root, candidate) {
@@ -415,22 +427,32 @@ export async function removeTreeForCleanup(path) {
 }
 
 export async function copyStoppedTree({ ownedRoot, source, destination }) {
-  await assertDirectOwnedPath(ownedRoot, source, "source", { mustExist: true });
-  await assertDirectOwnedPath(ownedRoot, destination, "destination", { mustExist: false });
+  const canonicalSource = await assertDirectOwnedPath(ownedRoot, source, "source", {
+    mustExist: true,
+  });
+  const canonicalDestination = await assertDirectOwnedPath(
+    ownedRoot,
+    destination,
+    "destination",
+    { mustExist: false },
+  );
   try {
     await copyTreeEntry(
       {
         destinationRoots: [
-          resolve(destination),
-          join(await realpath(dirname(destination)), basename(destination)),
+          resolve(canonicalDestination),
+          join(
+            await realpath(dirname(canonicalDestination)),
+            basename(canonicalDestination),
+          ),
         ],
-        sourceRoots: [resolve(source), await realpath(source)],
+        sourceRoots: [resolve(canonicalSource), await realpath(canonicalSource)],
       },
-      source,
-      destination,
+      canonicalSource,
+      canonicalDestination,
     );
   } catch (error) {
-    await removeTreeForCleanup(destination).catch(() => {});
+    await removeTreeForCleanup(canonicalDestination).catch(() => {});
     throw error;
   }
 }

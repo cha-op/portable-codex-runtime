@@ -266,6 +266,68 @@ test("stopped-tree copy overrides a restrictive umask while populating directori
   }
 });
 
+test("stopped-tree copy rejects symlink-parent dot-dot paths outside the owned root", async () => {
+  const container = await mkdtemp(join(tmpdir(), "portable-copy-parent-alias-test-"));
+  try {
+    const ownedRoot = join(container, "owned");
+    const outsideRoot = join(container, "outside");
+    await mkdir(ownedRoot);
+    await mkdir(join(outsideRoot, "child"), { recursive: true });
+    await mkdir(join(outsideRoot, "source"));
+    await writeFile(join(outsideRoot, "source", "sentinel"), "outside");
+    await symlink(join(outsideRoot, "child"), join(ownedRoot, "link"));
+    const source = `${ownedRoot}/link/../source`;
+    const destination = `${ownedRoot}/link/../destination`;
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot, source, destination }),
+      /source must be a direct owned child/,
+    );
+    await mkdir(join(ownedRoot, "source"));
+    await writeFile(join(ownedRoot, "source", "sentinel"), "inside");
+    await assert.rejects(
+      copyStoppedTree({
+        ownedRoot,
+        source: join(ownedRoot, "source"),
+        destination,
+      }),
+      /destination must be a direct owned child/,
+    );
+    await assert.rejects(lstat(join(outsideRoot, "destination")), /ENOENT/);
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects terminal dot segments as owned children", async () => {
+  const container = await mkdtemp(join(tmpdir(), "portable-copy-dot-segment-test-"));
+  try {
+    const ownedRoot = join(container, "owned");
+    const source = join(ownedRoot, "source");
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, "sentinel"), "inside");
+    for (const segment of [".", ".."]) {
+      await assert.rejects(
+        copyStoppedTree({
+          ownedRoot,
+          source: `${ownedRoot}/${segment}`,
+          destination: join(ownedRoot, `source-${segment.length}`),
+        }),
+        /source must be a direct owned child/,
+      );
+      await assert.rejects(
+        copyStoppedTree({
+          ownedRoot,
+          source,
+          destination: `${ownedRoot}/${segment}`,
+        }),
+        /destination must be a direct owned child/,
+      );
+    }
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy preserves symlinks without following their targets", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-link-test-"));
   try {
