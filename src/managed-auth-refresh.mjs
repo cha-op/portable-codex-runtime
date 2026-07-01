@@ -973,8 +973,23 @@ export async function refreshManagedAuthRecord({
         preserveStaging = true;
       }
     }
-    if (preserveStaging && stagingHome && !authorityReplaced && error && typeof error === "object") {
-      attachRecoveryPaths(error, [stagingHome]);
+    if (preserveStaging && stagingHome && !authorityReplaced) {
+      if (!(error instanceof ManagedAuthRefreshError)) {
+        const uncertain = new ManagedAuthRefreshError(
+          "refresh_outcome_uncertain",
+          "token refresh may have rotated credentials before the adapter failed",
+          {
+            recoveryPath: stagingHome,
+            recoveryReason: "post_dispatch_outcome_uncertain",
+          },
+        );
+        uncertain.cause = error;
+        error = uncertain;
+      } else {
+        error.retryable = false;
+        error.recoveryReason ??= "post_dispatch_outcome_uncertain";
+        attachRecoveryPaths(error, [stagingHome]);
+      }
     }
     primaryError = error;
   }

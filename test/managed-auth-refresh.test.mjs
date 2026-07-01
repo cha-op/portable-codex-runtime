@@ -33,6 +33,7 @@ import { AdvisoryLockError, acquireAdvisoryLock } from "../src/advisory-lock.mjs
 
 const ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174088";
 const USER_ID = "user-123e4567-e89b-42d3-a456-426614174088";
+const DEFAULT_TEST_TOKEN_EXPIRY_UNIX_SECONDS = Math.floor(Date.now() / 1000) + 3600;
 const UNSAFE_HOME_FIXTURE = fileURLToPath(
   new URL("../fixtures/probe-unsafe-authority-home.mjs", import.meta.url),
 );
@@ -50,7 +51,7 @@ function encodeJwt(payload) {
 function authDocument({
   accessMarker,
   accountId = ACCOUNT_ID,
-  expiresAtUnixSeconds = Math.floor(Date.now() / 1000) + 3600,
+  expiresAtUnixSeconds = DEFAULT_TEST_TOKEN_EXPIRY_UNIX_SECONDS,
   lastRefresh,
   refreshToken,
   userId = USER_ID,
@@ -850,6 +851,8 @@ test("adapter failure after rotation preserves the only staged recovery record",
     }
     assert(refreshError instanceof ManagedAuthRefreshError);
     assert.equal(refreshError.code, "adapter_shutdown_failed");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "post_dispatch_outcome_uncertain");
     assert.equal(typeof refreshError.recoveryPath, "string");
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
   } finally {
