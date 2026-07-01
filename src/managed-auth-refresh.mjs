@@ -1471,7 +1471,10 @@ export async function runUncontainedCodexManagedRefreshProbe({
   const withAbort = async (operation) => {
     if (!signal) return operation();
     if (signal.aborted) throw signal.reason ?? new Error("managed refresh aborted");
-    const operationPromise = Promise.resolve().then(operation);
+    const operationPromise = Promise.resolve().then(() => {
+      if (signal.aborted) throw signal.reason ?? new Error("managed refresh aborted");
+      return operation();
+    });
     return new Promise((resolve, reject) => {
       const onAbort = () => {
         const reason = signal.reason ?? new Error("managed refresh aborted");

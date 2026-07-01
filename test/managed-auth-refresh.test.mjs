@@ -1178,6 +1178,63 @@ test("runUncontainedCodexManagedRefreshProbe aborts an in-flight request and sto
   assert.equal(stopped, 1);
 });
 
+test("queued abort prevents app-server startup and still runs stop cleanup", async () => {
+  const controller = new AbortController();
+  const reason = new AdvisoryLockError("lock_lost", "synthetic queued holder exit");
+  let finishAbort;
+  const abortFinished = new Promise((resolve) => {
+    finishAbort = resolve;
+  });
+  let aborted = 0;
+  let initialized = 0;
+  let settled = false;
+  let started = 0;
+  let stopped = 0;
+
+  const refresh = runUncontainedCodexManagedRefreshProbe({
+    codexBin: "/pinned/codex",
+    signal: controller.signal,
+    stagingHome: "/isolated/staging-home",
+    createClient: () => {
+      queueMicrotask(() => controller.abort(reason));
+      return {
+        abort: async (error) => {
+          assert.equal(error, reason);
+          aborted += 1;
+          await abortFinished;
+        },
+        initialize: async () => {
+          initialized += 1;
+        },
+        start: async () => {
+          started += 1;
+        },
+        stop: async () => {
+          stopped += 1;
+        },
+      };
+    },
+  });
+  void refresh.finally(() => {
+    settled = true;
+  }).catch(() => {});
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started, 0);
+  assert.equal(initialized, 0);
+  assert.equal(aborted, 1);
+  assert.equal(stopped, 0);
+  assert.equal(settled, false);
+
+  finishAbort();
+  await assert.rejects(refresh, (error) => error === reason);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started, 0);
+  assert.equal(aborted, 1);
+  assert.equal(stopped, 1);
+  assert.equal(settled, true);
+});
+
 test("managed refresh rejects PATH-resolved Codex binaries before startup", async () => {
   let clientCreated = false;
   await assert.rejects(

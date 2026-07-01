@@ -452,6 +452,22 @@ function installSyntheticChild(client, { onStdinEnd = () => {} } = {}) {
   client.stdout = { close: () => {} };
 }
 
+test("abort before start permanently rejects startup without spawning a child", async () => {
+  const client = new AppServerClient({
+    codexBin: process.execPath,
+    codexHome: "/isolated/codex-home",
+  });
+  const reason = new Error("synthetic abort before start");
+
+  const abort = client.abort(reason);
+  await assert.rejects(client.start(), (error) => error === reason);
+  assert.equal(client.child, undefined);
+  assert.equal(client.stop(), abort);
+  await abort;
+  await assert.rejects(client.start(), (error) => error === reason);
+  assert.equal(client.child, undefined);
+});
+
 test("successful stop is a permanent no-op for later callers", async () => {
   let existsCalls = 0;
   let waitCalls = 0;

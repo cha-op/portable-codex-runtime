@@ -266,6 +266,18 @@ export class AppServerClient {
   }
 
   async start() {
+    if (
+      this.stopping ||
+      this.terminalError ||
+      this.shutdownCompleted ||
+      this.shutdownPromise ||
+      this.child
+    ) {
+      throw (
+        this.terminalError ??
+        new Error("codex app-server cannot start more than once or after shutdown has begun")
+      );
+    }
     this.child = spawn(this.codexBin, this.codexArgs, {
       cwd: this.codexHome,
       detached: true,
@@ -364,8 +376,8 @@ export class AppServerClient {
   }
 
   stop() {
-    if (!this.child) return Promise.resolve();
     if (this.shutdownPromise) return this.shutdownPromise;
+    if (!this.child) return Promise.resolve();
     const attempt = this.#stopOnce();
     this.shutdownPromise = attempt;
     void attempt.then(
