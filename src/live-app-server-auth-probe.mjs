@@ -20,6 +20,7 @@ import {
   assertNoWorkerAuth,
   codexVersion,
   createWorkerAuthMonitor,
+  resolveAppServerExecutable,
   stopAndAssertNoWorkerAuth,
 } from "./app-server-auth-probe.mjs";
 
@@ -339,6 +340,7 @@ export async function probeLiveExternalAuth({
   makeDirectory = mkdir,
   model = process.env.CODEX_LIVE_PROBE_MODEL ?? DEFAULT_MODEL,
 } = {}) {
+  const executable = resolveAppServerExecutable(codexBin);
   const startedAt = new Date().toISOString();
   const sourceBefore = await readDedicatedChatgptCredential(authHome);
   const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
@@ -350,7 +352,7 @@ export async function probeLiveExternalAuth({
     let refreshCallbackCount = 0;
 
     client = new AppServerClient({
-      codexBin,
+      codexBin: executable,
       codexHome: workerHome,
       timeoutMs: 120_000,
       onRefresh: async (params) => {
@@ -408,7 +410,7 @@ export async function probeLiveExternalAuth({
       probe: "app-server-chatgpt-auth-tokens-live",
       startedAt,
       completedAt: new Date().toISOString(),
-      codexVersion: codexVersion(codexBin),
+      codexVersion: codexVersion(executable),
       userAgent: initializeResult.userAgent,
       experimentalApi: true,
       sourceAuth: {

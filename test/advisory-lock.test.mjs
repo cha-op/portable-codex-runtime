@@ -213,6 +213,30 @@ test("assertHeld reports loss after the owning holder exits", async () => {
   }
 });
 
+test(
+  "Linux holder exit releases the lock while the broker inode guard remains open",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-advisory-linux-ofd-"));
+    const path = join(root, "authority.lock");
+    let lostLock;
+    let recovered;
+    try {
+      lostLock = await acquireAdvisoryLock(path, { holderPath: EXIT_AFTER_LOCK_FIXTURE });
+      await lostLock.waitForLoss();
+
+      // Do not release lostLock yet: its broker-side handle deliberately stays
+      // open while a new holder proves that only the exited holder owned flock.
+      recovered = await acquireAdvisoryLock(path);
+      await recovered.assertHeld();
+    } finally {
+      await lostLock?.release();
+      await recovered?.release();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("startup timeout kills a stubborn lock process group", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-advisory-startup-timeout-"));
   const path = join(root, "authority.lock");

@@ -2,24 +2,34 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import test from "node:test";
 
 import {
   AppServerClient,
   buildWorkerEnvironment,
+  codexVersion,
   createWorkerAuthMonitor,
   fileExists,
   probeExperimentalGate,
   probeExternalAuthRefresh,
+  resolveAppServerExecutable,
   stopAndAssertNoWorkerAuth,
 } from "../src/app-server-auth-probe.mjs";
 
-const codexBin = process.env.CODEX_BIN ?? "codex";
+const configuredCodexBin = process.env.CODEX_BIN ?? "codex";
+const codexBin = resolveAppServerExecutable(configuredCodexBin);
 const codexUnavailable =
   spawnSync(codexBin, ["--version"], { stdio: "ignore" }).status === 0
     ? false
     : `Codex CLI is unavailable at ${codexBin}`;
+
+function relativeNodeExecutable() {
+  const relativeNode = relative(process.cwd(), process.execPath);
+  return relativeNode.includes("/") || relativeNode.includes("\\")
+    ? relativeNode
+    : `./${relativeNode}`;
+}
 
 test("worker environment excludes arbitrary host credentials", () => {
   assert.deepEqual(
@@ -56,6 +66,16 @@ test("worker environment preserves standard Windows process variables", () => {
       WINDIR: "C:\\Windows",
     },
   );
+});
+
+test("app-server executable resolution preserves PATH commands and freezes relative paths", () => {
+  assert.equal(resolveAppServerExecutable("codex", "/launcher"), "codex");
+  assert.equal(
+    resolveAppServerExecutable("./tools/codex", "/launcher"),
+    "/launcher/tools/codex",
+  );
+  assert.equal(resolveAppServerExecutable("/pinned/codex", "/launcher"), "/pinned/codex");
+  assert.equal(codexVersion(relativeNodeExecutable()), process.version);
 });
 
 test("worker auth is checked after app-server shutdown", async () => {
@@ -192,6 +212,35 @@ process.stdin.on("end", () => process.exit(0));
     await client.start();
     const message = await client.waitForNotification("fixture/cwd");
     assert.equal(message.params.cwd, await realpath(codexHome));
+  } finally {
+    await client.stop();
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("app-server resolves a path-containing relative executable before changing cwd", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-relative-bin-fixture-"));
+  const fixturePath = join(codexHome, "fixture.mjs");
+  await writeFile(
+    fixturePath,
+    `
+process.stdout.write(JSON.stringify({ method: "fixture/ready" }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.exit(0));
+`,
+  );
+  const relativeNode = relativeNodeExecutable();
+  assert.equal(isAbsolute(relativeNode), false);
+  const client = new AppServerClient({
+    codexBin: relativeNode,
+    codexArgs: [fixturePath],
+    codexHome,
+    timeoutMs: 1_000,
+  });
+  try {
+    assert.equal(client.codexBin, process.execPath);
+    await client.start();
+    await client.waitForNotification("fixture/ready");
   } finally {
     await client.stop();
     await rm(codexHome, { recursive: true, force: true });

@@ -5,7 +5,7 @@ import { watch } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -67,6 +67,15 @@ export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
   return env;
 }
 
+export function resolveAppServerExecutable(codexBin, baseDirectory = process.cwd()) {
+  if (typeof codexBin !== "string" || codexBin.length === 0 || isAbsolute(codexBin)) {
+    return codexBin;
+  }
+  const containsPathSeparator =
+    codexBin.includes("/") || (sep === "\\" && codexBin.includes("\\"));
+  return containsPathSeparator ? resolve(baseDirectory, codexBin) : codexBin;
+}
+
 export class JsonRpcError extends Error {
   constructor(method, payload) {
     super(`${method} failed: ${payload.message ?? JSON.stringify(payload)}`);
@@ -85,7 +94,7 @@ export class AppServerClient {
     shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   }) {
-    this.codexBin = codexBin;
+    this.codexBin = resolveAppServerExecutable(codexBin);
     this.codexArgs = codexArgs;
     this.codexHome = codexHome;
     this.onRefresh = onRefresh;
@@ -542,17 +551,19 @@ export async function stopAndAssertNoWorkerAuth(client, codexHome) {
 }
 
 export function codexVersion(codexBin) {
-  const result = spawnSync(codexBin, ["--version"], { encoding: "utf8" });
+  const executable = resolveAppServerExecutable(codexBin);
+  const result = spawnSync(executable, ["--version"], { encoding: "utf8" });
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    throw new Error(`failed to run ${codexBin} --version: ${result.stderr}`);
+    throw new Error(`failed to run ${executable} --version: ${result.stderr}`);
   }
   return result.stdout.trim();
 }
 
 export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?? "codex" } = {}) {
+  const executable = resolveAppServerExecutable(codexBin);
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-gate-"));
-  const client = new AppServerClient({ codexBin, codexHome });
+  const client = new AppServerClient({ codexBin: executable, codexHome });
   try {
     await writeProbeConfig(
       codexHome,
@@ -594,6 +605,7 @@ export async function probeExternalAuthRefresh({
   makeDirectory = mkdir,
   startMock = startResponsesMock,
 } = {}) {
+  const executable = resolveAppServerExecutable(codexBin);
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-auth-"));
   let authMonitor;
   let client;
@@ -617,7 +629,7 @@ export async function probeExternalAuthRefresh({
     let refreshCount = 0;
 
     client = new AppServerClient({
-      codexBin,
+      codexBin: executable,
       codexHome,
       onRefresh: async (params) => {
         refreshCount += 1;
@@ -669,7 +681,7 @@ export async function probeExternalAuthRefresh({
     await authMonitor.assertNoAuthObserved();
 
     return {
-      codexVersion: codexVersion(codexBin),
+      codexVersion: codexVersion(executable),
       userAgent: initializeResult.userAgent,
       loginType: loginResult.type,
       threadId: threadResult.thread.id,

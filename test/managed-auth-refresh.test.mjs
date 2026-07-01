@@ -691,6 +691,20 @@ test("pre-dispatch refresh failure is not replaced by post-refresh durability fa
       /synthetic pre-dispatch startup failure/,
     );
     assert.equal(syncCount, 2);
+
+    syncCount = 0;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        codexBin: "codex",
+        syncStagingDirectory: async () => {
+          syncCount += 1;
+          return syncCount < 3;
+        },
+      }),
+      (error) => error.code === "unsafe_codex_binary" && error.retryable === false,
+    );
+    assert.equal(syncCount, 2);
     assert.equal(
       (await readdir(authHome)).some((name) => name === ".portable-auth-refresh-staging"),
       false,
@@ -1040,13 +1054,71 @@ test("adapter failure after rotation preserves the only staged recovery record",
       refreshError = error;
     }
     assert(refreshError instanceof ManagedAuthRefreshError);
-    assert.equal(refreshError.code, "adapter_shutdown_failed");
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
     assert.equal(refreshError.retryable, false);
-    assert.equal(refreshError.recoveryReason, "post_dispatch_outcome_uncertain");
+    assert.equal(refreshError.recoveryReason, "unclassified_adapter_failure");
+    assert.equal(refreshError.cause.code, "adapter_shutdown_failed");
     assert.equal(typeof refreshError.recoveryPath, "string");
     assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unclassified adapter failure fails closed even when staged bytes are unchanged", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          throw new Error("synthetic unclassified adapter failure");
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "refresh_outcome_uncertain");
+    assert.equal(refreshError.retryable, false);
+    assert.equal(refreshError.recoveryReason, "unclassified_adapter_failure");
+    assert.match(refreshError.cause.message, /synthetic unclassified adapter failure/);
+    assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    await assert.rejects(
+      refreshManagedAuthRecord({ authHome }),
+      (error) => error.code === "recovery_required",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("custom adapters cannot spoof internal pre-dispatch error codes", async () => {
+  for (const code of ["unsafe_codex_binary", "lock_lost_before_refresh"]) {
+    const { authHome, root } = await createAuthorityHome();
+    try {
+      let refreshError;
+      try {
+        await refreshManagedAuthRecord({
+          authHome,
+          runRefresh: async () => {
+            throw new ManagedAuthRefreshError(code, "synthetic spoofed adapter failure", {
+              retryable: true,
+            });
+          },
+        });
+      } catch (error) {
+        refreshError = error;
+      }
+      assert.equal(refreshError.code, "refresh_outcome_uncertain");
+      assert.equal(refreshError.retryable, false);
+      assert.equal(refreshError.recoveryReason, "unclassified_adapter_failure");
+      assert.equal(refreshError.cause.code, code);
+      assert.equal((await stat(join(refreshError.recoveryPath, "auth.json"))).isFile(), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

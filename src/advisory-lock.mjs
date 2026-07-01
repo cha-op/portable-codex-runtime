@@ -30,9 +30,12 @@ export function advisoryLockCommand(
   if (platform === "linux") {
     return {
       command: "/usr/bin/flock",
-      // The command form treats a bare "3" as a path. Opening the inherited
-      // descriptor through procfs keeps the secure pre-opened inode while the
-      // flock wrapper owns the lock for the lifetime of the holder process.
+      // The command form treats a bare "3" as a path. On Linux, reopening the
+      // inherited regular-file descriptor through procfs creates a separate
+      // open file description for the same securely pre-opened inode. `flock`
+      // locks that description and `--no-fork` carries it into the holder, so
+      // holder exit releases the lock even while the broker keeps its original,
+      // unlocked descriptor open as an inode-identity guard.
       args: [
         "--exclusive",
         "--nonblock",

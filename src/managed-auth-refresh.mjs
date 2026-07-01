@@ -38,11 +38,7 @@ function markPreDispatchRefreshError(error) {
 }
 
 function isKnownPreDispatchRefreshError(error) {
-  return (
-    error?.code === "lock_lost_before_refresh" ||
-    error?.code === "unsafe_codex_binary" ||
-    (isObjectLike(error) && PRE_DISPATCH_REFRESH_ERRORS.has(error))
-  );
+  return isObjectLike(error) && PRE_DISPATCH_REFRESH_ERRORS.has(error);
 }
 
 function sha256(value) {
@@ -593,6 +589,26 @@ export function managedAuthRefreshErrorMetadata(error) {
   return metadata;
 }
 
+export function managedAuthRefreshFailureReport(error) {
+  if (error instanceof ManagedAuthRefreshError) {
+    return {
+      error: {
+        type: "managed_auth_refresh",
+        ...managedAuthRefreshErrorMetadata(error),
+      },
+      result: "failed",
+    };
+  }
+  return {
+    error: {
+      code: "live_probe_failed",
+      retryable: false,
+      type: "probe_failure",
+    },
+    result: "failed",
+  };
+}
+
 export async function readManagedAuthSnapshot(authHome) {
   ensure(
     typeof constants.O_NOFOLLOW === "number",
@@ -710,11 +726,14 @@ export async function runCodexManagedRefresh({
   signal,
   stagingHome,
 }) {
-  ensure(
-    typeof codexBin === "string" && isAbsolute(codexBin),
-    "unsafe_codex_binary",
-    "managed refresh requires an absolute Codex binary path",
-  );
+  if (!(typeof codexBin === "string" && isAbsolute(codexBin))) {
+    const error = new ManagedAuthRefreshError(
+      "unsafe_codex_binary",
+      "managed refresh requires an absolute Codex binary path",
+    );
+    markPreDispatchRefreshError(error);
+    throw error;
+  }
   const client = createClient({ codexBin, codexHome: stagingHome, timeoutMs: 120_000 });
   let operationError;
   let refreshRequestDispatched = false;
@@ -822,6 +841,7 @@ async function runRefreshWhileLockHeld(lock, operation, recoveryPath) {
       { retryable: true },
     );
     beforeRefresh.cause = error;
+    markPreDispatchRefreshError(beforeRefresh);
     throw beforeRefresh;
   }
   const controller = new AbortController();
@@ -871,6 +891,16 @@ async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, st
   }
 }
 
+/**
+ * Runs one managed credential refresh transaction.
+ *
+ * A custom `runRefresh` adapter must classify every failure after dispatching
+ * `account/read(refreshToken=true)` as a non-retryable
+ * `ManagedAuthRefreshError` with code `refresh_outcome_uncertain`. The default
+ * adapter marks failures proven to occur before dispatch; every other adapter
+ * failure is conservatively wrapped as post-dispatch uncertainty so the
+ * durable staging sentinel cannot be reaped before operator recovery.
+ */
 export async function refreshManagedAuthRecord({
   acquireLock = acquireAuthorityLock,
   authHome,
@@ -936,6 +966,18 @@ export async function refreshManagedAuthRecord({
     // decisive failure and the displaced volume must be recovered directly.
     await assertAuthorityHomeCurrent(authority);
     if (refreshError && isKnownPreDispatchRefreshError(refreshError)) throw refreshError;
+    if (refreshError?.code !== "refresh_outcome_uncertain" && refreshError) {
+      const uncertain = new ManagedAuthRefreshError(
+        "refresh_outcome_uncertain",
+        "refresh adapter failed without proving that account/read was not dispatched",
+        {
+          recoveryPath: stagingHome,
+          recoveryReason: "unclassified_adapter_failure",
+        },
+      );
+      uncertain.cause = refreshError;
+      refreshError = uncertain;
+    }
     try {
       await syncRefreshedStagingAuth(stagingHome, syncStagingDirectory);
     } catch (error) {
