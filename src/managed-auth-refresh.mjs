@@ -412,10 +412,20 @@ async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
   }
 }
 
+async function removeStagingAttempt(path) {
+  await rm(path, { recursive: true, force: true });
+}
+
+async function removeEmptyStagingRoot(path) {
+  await rmdir(path);
+}
+
 async function createStagingHome(
   authority,
   rawAuth,
   {
+    cleanupStagingAttempt = removeStagingAttempt,
+    cleanupStagingRoot = removeEmptyStagingRoot,
     syncStagingDirectory = syncDirectoryPath,
     writeStagingFile = writeFileDurably,
   } = {},
@@ -473,9 +483,53 @@ remote_plugin = false
     );
     return { stagingHome, stagingRoot };
   } catch (error) {
-    if (stagingHome) await rm(stagingHome, { recursive: true, force: true }).catch(() => {});
-    if (stagingRootCreated) await rmdir(stagingRoot).catch(() => {});
-    throw error;
+    let setupError = error;
+    if (!isObjectLike(setupError)) {
+      setupError = new ManagedAuthRefreshError(
+        "staging_setup_failed",
+        "authority staging setup failed",
+      );
+      setupError.cause = error;
+    }
+
+    let retainedAttempt = false;
+    if (stagingHome) {
+      try {
+        await cleanupStagingAttempt(stagingHome);
+      } catch {
+        // Confirm whether the attempt still exists before reporting recovery.
+      }
+      try {
+        await lstat(stagingHome);
+        retainedAttempt = true;
+      } catch (statError) {
+        retainedAttempt = statError?.code !== "ENOENT";
+      }
+    }
+    if (retainedAttempt) {
+      if (!(setupError instanceof ManagedAuthRefreshError) || !Object.isExtensible(setupError)) {
+        const retainedError = new ManagedAuthRefreshError(
+          "staging_setup_failed",
+          "authority staging setup failed and requires recovery",
+        );
+        retainedError.cause = setupError;
+        setupError = retainedError;
+      }
+      setupError.cleanupWarnings = [
+        ...(Array.isArray(setupError.cleanupWarnings) ? setupError.cleanupWarnings : []),
+        "staging_cleanup_failed",
+      ];
+      attachRecoveryPaths(setupError, [stagingHome]);
+    }
+    if (stagingRootCreated && !retainedAttempt) {
+      // An empty staging root is harmless and is not a recovery artifact.
+      try {
+        await cleanupStagingRoot(stagingRoot);
+      } catch {
+        // The next run may safely reuse or remove an empty staging root.
+      }
+    }
+    throw setupError;
   }
 }
 
@@ -687,6 +741,11 @@ export async function readManagedAuthSnapshot(authHome) {
   } catch {
     fail("invalid_auth_record", "authority auth.json is not valid JSON");
   }
+  ensure(
+    auth !== null && typeof auth === "object" && !Array.isArray(auth),
+    "invalid_auth_record",
+    "authority auth.json must contain an object",
+  );
   ensure(auth.auth_mode === "chatgpt", "invalid_auth_record", "authority must use ChatGPT auth");
   ensure(
     typeof auth.tokens?.access_token === "string" && auth.tokens.access_token.length > 0,
@@ -976,6 +1035,8 @@ async function cleanupManagedRefreshArtifacts({ preserveStaging, stagingHome, st
 export async function refreshManagedAuthRecord({
   acquireLock = acquireAuthorityLock,
   authHome,
+  cleanupStagingAttempt = removeStagingAttempt,
+  cleanupStagingRoot = removeEmptyStagingRoot,
   cleanupArtifacts = cleanupManagedRefreshArtifacts,
   codexBin = "codex",
   readCanonicalSource = readManagedAuthSnapshot,
@@ -1019,6 +1080,8 @@ export async function refreshManagedAuthRecord({
     before = await readManagedAuthSnapshot(authorityHome);
     await assertAuthorityHomeCurrent(authority);
     ({ stagingHome, stagingRoot } = await createStagingHome(authority, before.raw, {
+      cleanupStagingAttempt,
+      cleanupStagingRoot,
       syncStagingDirectory,
       writeStagingFile,
     }));

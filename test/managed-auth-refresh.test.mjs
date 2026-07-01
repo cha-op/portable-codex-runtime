@@ -719,6 +719,24 @@ test("non-object JWT payloads are classified as invalid auth records", async () 
   }
 });
 
+test("non-object auth documents are classified as invalid auth records", async () => {
+  for (const document of [null, "scalar", []]) {
+    const { authHome, root } = await createAuthorityHome();
+    try {
+      await writeFile(join(authHome, "auth.json"), `${JSON.stringify(document)}\n`, {
+        mode: 0o600,
+      });
+      await assert.rejects(readManagedAuthSnapshot(authHome), (error) => {
+        assert(error instanceof ManagedAuthRefreshError);
+        assert.equal(error.code, "invalid_auth_record");
+        return true;
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("invalid refresh responses and unchanged access tokens fail closed", async () => {
   const invalid = await createAuthorityHome();
   try {
@@ -1743,6 +1761,58 @@ test("staging setup failure removes a staging root created by this attempt", asy
       /synthetic staging write failure/,
     );
     await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("staging setup cleanup failure reports the retained attempt and gates the next run", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const setupSecret = "synthetic staging config credential secret";
+  const setupError = new Error(setupSecret);
+  let writeCount = 0;
+  try {
+    let refreshError;
+    try {
+      await refreshManagedAuthRecord({
+        authHome,
+        cleanupStagingAttempt: async () => {
+          throw new Error("synthetic attempt cleanup failure");
+        },
+        writeStagingFile: async (path, contents, options) => {
+          writeCount += 1;
+          if (writeCount === 2) throw setupError;
+          await writeFile(path, contents, options);
+        },
+      });
+    } catch (error) {
+      refreshError = error;
+    }
+    assert(refreshError instanceof ManagedAuthRefreshError);
+    assert.equal(refreshError.code, "staging_setup_failed");
+    assert.equal(refreshError.cause, setupError);
+    assert.deepEqual(refreshError.cleanupWarnings, ["staging_cleanup_failed"]);
+    assert.equal((await stat(refreshError.recoveryPath)).isDirectory(), true);
+    const safeReport = JSON.stringify(managedAuthRefreshFailureReport(refreshError));
+    assert.equal(safeReport.includes(setupSecret), false);
+    assert.equal(JSON.parse(safeReport).error.recoveryPath, refreshError.recoveryPath);
+    assert.deepEqual(JSON.parse(safeReport).error.cleanupWarnings, ["staging_cleanup_failed"]);
+    const retainedAttempt = refreshError.recoveryPath;
+
+    let nextRefreshCalled = false;
+    await assert.rejects(
+      refreshManagedAuthRecord({
+        authHome,
+        runRefresh: async () => {
+          nextRefreshCalled = true;
+          return successResponse();
+        },
+      }),
+      (error) =>
+        error.code === "recovery_required" &&
+        error.recoveryPaths.includes(retainedAttempt),
+    );
+    assert.equal(nextRefreshCalled, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
