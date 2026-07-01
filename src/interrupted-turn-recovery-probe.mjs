@@ -458,7 +458,21 @@ function findTailTurn(thread, turnId) {
   return turn;
 }
 
-export function verifyModelWorkspaceContext(requestBody, { previousWorkspace, workspace }) {
+export function assertNewTurnId(turnId, interruptedTurnId) {
+  assert(typeof turnId === "string" && turnId.length > 0, "follow-up turn omitted its ID");
+  assert.notEqual(turnId, interruptedTurnId, "follow-up turn reused the interrupted turn ID");
+  return turnId;
+}
+
+export async function verifyModelWorkspaceContext(
+  requestBody,
+  {
+    canonicalizePath = realpath,
+    previousWorkspace,
+    previousWorkspaceCanonical = previousWorkspace,
+    workspace,
+  },
+) {
   let request;
   try {
     request = JSON.parse(requestBody);
@@ -478,14 +492,22 @@ export function verifyModelWorkspaceContext(requestBody, { previousWorkspace, wo
     }
   }
   assert(contextCwds.length > 0, "follow-up model request omitted workspace context");
+  const [activeWorkspaceCanonical, expectedWorkspaceCanonical] = await Promise.all([
+    canonicalizePath(contextCwds.at(-1)),
+    canonicalizePath(workspace),
+  ]);
   assert.equal(
-    contextCwds.at(-1),
-    workspace,
+    activeWorkspaceCanonical,
+    expectedWorkspaceCanonical,
     "latest model workspace context did not match the resumed workspace",
   );
   const relocated = previousWorkspace !== undefined && previousWorkspace !== workspace;
+  const previousWorkspaceAliases = new Set([
+    previousWorkspace,
+    previousWorkspaceCanonical,
+  ]);
   const historicalWorkspaceRetained =
-    relocated && contextCwds.slice(0, -1).includes(previousWorkspace);
+    relocated && contextCwds.slice(0, -1).some((cwd) => previousWorkspaceAliases.has(cwd));
   if (relocated) {
     assert(
       historicalWorkspaceRetained,
@@ -517,6 +539,7 @@ async function recoverAndInspect({
   coldReadTurnStatus,
   mock,
   previousWorkspace,
+  previousWorkspaceCanonical,
   threadId,
   turnId,
   workspace,
@@ -533,16 +556,18 @@ async function recoverAndInspect({
     threadId,
     input: [{ type: "text", text: "Complete the portable recovery probe.", textElements: [] }],
   });
+  const followUpTurnId = assertNewTurnId(followUpTurn?.turn?.id, turnId);
   const completed = await client.waitForNotification("turn/completed");
-  assert.equal(completed.params.turn.id, followUpTurn.turn.id);
+  assert.equal(completed.params.turn.id, followUpTurnId);
   assert.equal(completed.params.turn.status, "completed");
   await mock.waitForRequest(requestIndex + 1);
   assert.equal(mock.requestCount(), requestIndex + 1, "follow-up turn issued unexpected model requests");
   const followUpRequest = mock.requestBody(requestIndex);
   const markerPresent = followUpRequest.includes("<turn_aborted>");
   assert.equal(markerPresent, expectAbortMarker);
-  const workspaceContext = verifyModelWorkspaceContext(followUpRequest, {
+  const workspaceContext = await verifyModelWorkspaceContext(followUpRequest, {
     previousWorkspace,
+    previousWorkspaceCanonical,
     workspace,
   });
 
@@ -579,6 +604,7 @@ export async function runRecoveryScenario({
     const originalWorkspace = workspace;
     await mkdir(codexHome, { recursive: true, mode: 0o700 });
     await mkdir(workspace, { mode: 0o700 });
+    const originalWorkspaceCanonical = await realpath(workspace);
     await writeFile(join(workspace, "sentinel.txt"), "portable-recovery-sentinel\n", {
       mode: 0o600,
     });
@@ -657,6 +683,7 @@ export async function runRecoveryScenario({
       coldReadTurnStatus: coldReadTurn.status,
       mock,
       previousWorkspace: originalWorkspace,
+      previousWorkspaceCanonical: originalWorkspaceCanonical,
       threadId,
       turnId,
       workspace,

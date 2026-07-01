@@ -19,6 +19,7 @@ import test from "node:test";
 import {
   PINNED_SOURCE_ANALYSIS_COMMIT,
   RECOVERY_SCENARIOS,
+  assertNewTurnId,
   assertProcessGroupTarget,
   assertRecoveryEvidenceSafe,
   copyStoppedTree,
@@ -172,6 +173,16 @@ test("client initialization failure aborts the detached app-server before reject
     (error) => error === initializationFailure,
   );
   assert.deepEqual(calls, ["start", "initialize", "abort"]);
+});
+
+test("follow-up turn identity is present and distinct from the interrupted turn", () => {
+  assert.equal(assertNewTurnId("turn-follow-up", "turn-interrupted"), "turn-follow-up");
+  for (const turnId of [undefined, "", "turn-interrupted"]) {
+    assert.throws(
+      () => assertNewTurnId(turnId, "turn-interrupted"),
+      /omitted its ID|reused the interrupted turn ID/,
+    );
+  }
 });
 
 test("stopped-tree copy preserves a deterministic tree digest", async () => {
@@ -402,9 +413,13 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
   }
 });
 
-test("model workspace evidence distinguishes immutable history from active context", () => {
-  const previousWorkspace = "/session/workspace";
-  const workspace = "/restored-session/workspace";
+test("model workspace evidence distinguishes canonical history from active context", async () => {
+  const previousWorkspace = "/var/session/workspace";
+  const previousWorkspaceCanonical = "/private/var/session/workspace";
+  const workspace = "/var/restored-session/workspace";
+  const workspaceCanonical = "/private/var/restored-session/workspace";
+  const canonicalizePath = async (path) =>
+    path === workspace || path === workspaceCanonical ? workspaceCanonical : path;
   const environmentMessage = (cwd) => ({
     type: "message",
     role: "user",
@@ -417,18 +432,25 @@ test("model workspace evidence distinguishes immutable history from active conte
   });
   const requestBody = JSON.stringify({
     input: [
-      environmentMessage(previousWorkspace),
+      environmentMessage(previousWorkspaceCanonical),
       { type: "message", role: "user", content: [{ type: "input_text", text: "turn" }] },
-      environmentMessage(workspace),
+      environmentMessage(workspaceCanonical),
     ],
   });
   assert.deepEqual(
-    verifyModelWorkspaceContext(requestBody, { previousWorkspace, workspace }),
+    await verifyModelWorkspaceContext(requestBody, {
+      canonicalizePath,
+      previousWorkspace,
+      previousWorkspaceCanonical,
+      workspace,
+    }),
     { activeWorkspaceMatched: true, historicalWorkspaceRetained: true },
   );
-  assert.throws(
-    () => verifyModelWorkspaceContext(requestBody, {
+  await assert.rejects(
+    verifyModelWorkspaceContext(requestBody, {
+      canonicalizePath,
       previousWorkspace,
+      previousWorkspaceCanonical,
       workspace: "/unexpected/workspace",
     }),
     /latest model workspace context did not match/,
