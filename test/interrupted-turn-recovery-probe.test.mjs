@@ -254,6 +254,23 @@ test("stopped-tree copy preserves relocatable relative symlinks", async () => {
   }
 });
 
+test("stopped-tree copy rejects non-UTF-8 symlink targets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-non-utf8-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await symlink(Buffer.from([0x2e, 0x2f, 0x80]), join(source, "non-utf8-link"));
+    await assert.rejects(
+      copyStoppedTree({ ownedRoot: root, source, destination }),
+      /rejects non-UTF-8 symlink targets/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects absolute symlinks into the relocated source tree", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-internal-link-test-"));
   try {

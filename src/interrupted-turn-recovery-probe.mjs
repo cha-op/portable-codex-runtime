@@ -291,6 +291,15 @@ function portableMode(metadata) {
   return metadata.mode & 0o777;
 }
 
+async function readPortableSymlink(path) {
+  const bytes = await readlink(path, { encoding: "buffer" });
+  const target = bytes.toString("utf8");
+  if (!Buffer.from(target, "utf8").equals(bytes)) {
+    throw new Error("stopped-tree copy rejects non-UTF-8 symlink targets");
+  }
+  return { bytes, target };
+}
+
 async function assertPortableSymlink({
   destination,
   destinationRoots,
@@ -337,7 +346,7 @@ async function assertPortableSymlink({
 async function copyTreeEntry(context, source, destination) {
   const metadata = await lstat(source);
   if (metadata.isSymbolicLink()) {
-    const target = await readlink(source);
+    const { target } = await readPortableSymlink(source);
     await assertPortableSymlink({ ...context, source, destination, target });
     await symlink(target, destination);
     return;
@@ -408,7 +417,7 @@ async function updateHashFromFile(hash, path) {
 
 function updateHashFields(hash, fields) {
   for (const field of fields) {
-    const bytes = Buffer.from(String(field));
+    const bytes = Buffer.isBuffer(field) ? field : Buffer.from(String(field));
     hash.update(`${bytes.length}:`);
     hash.update(bytes);
   }
@@ -418,7 +427,8 @@ async function hashTreeEntry(hash, root, path) {
   const metadata = await lstat(path);
   const entryPath = relative(root, path) || ".";
   if (metadata.isSymbolicLink()) {
-    updateHashFields(hash, ["symlink", entryPath, await readlink(path)]);
+    const { bytes } = await readPortableSymlink(path);
+    updateHashFields(hash, ["symlink", entryPath, bytes]);
     return;
   }
   if (metadata.isDirectory()) {

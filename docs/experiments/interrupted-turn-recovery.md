@@ -39,9 +39,9 @@ persisted abort marker from view-only normalization.
 The snapshot scenario copies the entire synthetic session tree, including
 `CODEX_HOME` and workspace, after the killed process has exited. It hashes
 relative paths, entry types, POSIX rwx permission bits, file bytes, and symlink
-targets before and after copy. Portable relative symlinks and external absolute
-links are copied without following them. Absolute links back into the source
-tree, relative links whose meaning changes after relocation, special permission
+targets before and after copy. Portable UTF-8 relative symlinks and external
+absolute links are copied without following them. Absolute links back into the
+source tree, relative links whose meaning changes after relocation, special permission
 bits, hard-linked files, sockets, FIFOs, and devices fail closed. The source tree
 is then deleted and restored under a new absolute path; `thread/resume` receives
 the restored workspace path explicitly. Its runtime `cwd` response and the
@@ -148,11 +148,11 @@ restore interfaces.
 - The implementation targets macOS and Linux process groups, while this live
   evidence records macOS arm64 only. Windows is rejected because a Job Object
   process-tree implementation is not present.
-- Portable relative and existing external absolute symlink targets are preserved
-  exactly; dangling absolute targets, internal absolute targets, and
-  non-relocatable relative targets fail closed. A fixed runtime image must
-  provide every external target, such as a Codex helper path, at a compatible
-  location during copy and after migration.
+- Portable UTF-8 relative and existing external absolute symlink targets are
+  preserved exactly; non-UTF-8 targets, dangling absolute targets, internal
+  absolute targets, and non-relocatable relative targets fail closed. A fixed
+  runtime image must provide every external target, such as a Codex helper path,
+  at a compatible location during copy and after migration.
 - The stopped-tree copy does not preserve ownership, ACLs, extended attributes,
   timestamps, special permission bits, or hard-link topology. Special bits and
   hard links fail closed; the other metadata remains outside this probe and must
