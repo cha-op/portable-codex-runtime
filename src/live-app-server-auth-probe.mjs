@@ -21,6 +21,7 @@ import {
   codexVersion,
   createWorkerAuthMonitor,
   resolveAppServerExecutable,
+  runSequentialCleanup,
   stopAndAssertNoWorkerAuth,
 } from "./app-server-auth-probe.mjs";
 
@@ -207,7 +208,7 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
   const [canonicalParent, canonicalSource, sourceStat] = await Promise.all([
     resolveThroughExistingAncestor(dirname(evidencePath)),
     realpath(sourceAuthPath),
-    stat(sourceAuthPath),
+    stat(sourceAuthPath, { bigint: true }),
   ]);
   const canonicalDestination = join(canonicalParent, basename(evidencePath));
   const canonicalAuthHome = dirname(canonicalSource);
@@ -225,7 +226,7 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
   );
 
   try {
-    const destinationStat = await lstat(canonicalDestination);
+    const destinationStat = await lstat(canonicalDestination, { bigint: true });
     assert.equal(
       destinationStat.isSymbolicLink(),
       false,
@@ -243,7 +244,7 @@ export async function validateEvidenceDestination(path, sourceAuthPath) {
     );
     assert.equal(
       destinationStat.nlink,
-      1,
+      1n,
       "evidence destination must not be hard linked",
     );
   } catch (error) {
@@ -277,7 +278,7 @@ export async function writeEvidenceSafely(
     "safe evidence writes require O_NOFOLLOW support",
   );
   const canonicalDestination = await validateEvidenceDestination(evidencePath, sourceAuthPath);
-  const sourceStat = await stat(sourceAuthPath);
+  const sourceStat = await stat(sourceAuthPath, { bigint: true });
   let handle;
   try {
     handle = await open(
@@ -287,9 +288,9 @@ export async function writeEvidenceSafely(
     );
     await afterOpen?.();
     const [handleStat, currentParent, destinationStat] = await Promise.all([
-      handle.stat(),
+      handle.stat({ bigint: true }),
       realpath(dirname(canonicalDestination)),
-      lstat(canonicalDestination),
+      lstat(canonicalDestination, { bigint: true }),
     ]);
     assert.equal(
       handleStat.dev === sourceStat.dev && handleStat.ino === sourceStat.ino,
@@ -297,7 +298,7 @@ export async function writeEvidenceSafely(
       "evidence destination must not reference the source auth file",
     );
     assert.equal(handleStat.isFile(), true, "evidence destination must be a regular file");
-    assert.equal(handleStat.nlink, 1, "evidence destination must not be hard linked");
+    assert.equal(handleStat.nlink, 1n, "evidence destination must not be hard linked");
     assert.equal(
       currentParent,
       dirname(canonicalDestination),
@@ -346,6 +347,7 @@ export async function probeLiveExternalAuth({
   const workerHome = await mkdtemp(join(tmpdir(), "portable-codex-live-auth-"));
   let authMonitor;
   let client;
+  let primaryFailure;
   try {
     const workspace = join(workerHome, "workspace");
     await makeDirectory(workspace);
@@ -437,12 +439,17 @@ export async function probeLiveExternalAuth({
       ...report,
       evidenceWritten: true,
     };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    try {
-      await client?.stop();
-    } finally {
-      authMonitor?.close();
-      await rm(workerHome, { recursive: true, force: true });
-    }
+    await runSequentialCleanup(
+      [
+        () => client?.stop(),
+        () => authMonitor?.close(),
+        () => rm(workerHome, { recursive: true, force: true }),
+      ],
+      primaryFailure,
+    );
   }
 }

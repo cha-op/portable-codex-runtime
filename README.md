@@ -77,10 +77,11 @@ Set `CODEX_BIN` to test a specific Codex executable:
 CODEX_BIN=/path/to/codex npm test
 ```
 
-A bare executable name such as `codex` is resolved through `PATH`. A relative
-value containing a path separator, such as `./bin/codex`, is resolved against
-the launcher working directory before app-server switches into its isolated
-`CODEX_HOME`.
+A bare executable name such as `codex` is resolved through `PATH`; relative and
+empty `PATH` entries are anchored to the launcher working directory before the
+app-server switches into its isolated `CODEX_HOME`. A relative value containing
+a path separator, such as `./bin/codex`, is likewise resolved against the
+launcher working directory.
 
 ## Live External Auth Probe
 

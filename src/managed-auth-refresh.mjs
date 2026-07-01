@@ -15,7 +15,11 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { AdvisoryLockError, acquireAdvisoryLock } from "./advisory-lock.mjs";
+import {
+  AdvisoryLockError,
+  acquireAdvisoryLock,
+  sameFileIdentity,
+} from "./advisory-lock.mjs";
 import { AppServerClient } from "./app-server-auth-probe.mjs";
 
 const LOCK_FILE = ".portable-auth-refresh.lock";
@@ -28,6 +32,7 @@ const EXPECTED_RPC_AUDIT = [
 ];
 const STAGING_CLEANUP_RETRY_DELAYS_MS = [50, 100, 250, 500, 1_000];
 const PRE_DISPATCH_REFRESH_ERRORS = new WeakSet();
+const EXACT_FILE_IDENTITY = Symbol("exactFileIdentity");
 
 function isObjectLike(value) {
   return value !== null && ["object", "function"].includes(typeof value);
@@ -123,8 +128,14 @@ function rpcAuditMatches(actual) {
   );
 }
 
-function sameFileIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
+function integerAsBigInt(value) {
+  if (typeof value === "bigint") return value;
+  return Number.isSafeInteger(value) ? BigInt(value) : null;
+}
+
+function jsonSafeStatInteger(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) ? numeric : value.toString();
 }
 
 export function authorityDirectoryPermissionsAreSafe(
@@ -138,17 +149,36 @@ export function authorityDirectoryPermissionsAreSafe(
     requiredModeBits = 0,
   },
 ) {
+  const normalizedMode = integerAsBigInt(mode);
+  const normalizedUid = integerAsBigInt(uid);
+  const normalizedBrokerUid = integerAsBigInt(brokerUid);
+  const normalizedChildUid = integerAsBigInt(childUid);
+  const normalizedDisallowedModeBits = integerAsBigInt(disallowedModeBits);
+  const normalizedRequiredModeBits = integerAsBigInt(requiredModeBits);
+  if (
+    normalizedMode === null ||
+    normalizedUid === null ||
+    (brokerUid !== null && normalizedBrokerUid === null) ||
+    normalizedDisallowedModeBits === null ||
+    normalizedRequiredModeBits === null
+  ) {
+    return false;
+  }
   const ownerIsTrusted =
-    brokerUid === null || uid === brokerUid || (allowRootOwner && uid === 0);
+    brokerUid === null ||
+    normalizedUid === normalizedBrokerUid ||
+    (allowRootOwner && normalizedUid === 0n);
   const childOwnerIsTrusted =
-    brokerUid === null || childUid === brokerUid || (allowRootOwner && childUid === 0);
-  const hasDisallowedWrite = (mode & disallowedModeBits) !== 0;
+    brokerUid === null ||
+    normalizedChildUid === normalizedBrokerUid ||
+    (allowRootOwner && normalizedChildUid === 0n);
+  const hasDisallowedWrite = (normalizedMode & normalizedDisallowedModeBits) !== 0n;
   const stickyProtectsTrustedChild =
-    allowStickyShared && (mode & 0o1000) !== 0 && childOwnerIsTrusted;
+    allowStickyShared && (normalizedMode & 0o1000n) !== 0n && childOwnerIsTrusted;
   return (
     isDirectory === true &&
     ownerIsTrusted &&
-    (mode & requiredModeBits) === requiredModeBits &&
+    (normalizedMode & normalizedRequiredModeBits) === normalizedRequiredModeBits &&
     (!hasDisallowedWrite || stickyProtectsTrustedChild)
   );
 }
@@ -186,7 +216,7 @@ async function resolveAuthorityHome(authHome) {
       authorityHome,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
-    const authorityHomeStat = await handle.stat();
+    const authorityHomeStat = await handle.stat({ bigint: true });
     ensure(
       authorityHomeStat.isDirectory(),
       "unsafe_auth_home",
@@ -219,7 +249,7 @@ async function resolveAuthorityHome(authHome) {
     while (true) {
       let ancestorStat;
       try {
-        ancestorStat = await lstat(ancestor);
+        ancestorStat = await lstat(ancestor, { bigint: true });
       } catch {
         fail("unsafe_auth_home", "authority ancestor chain could not be validated");
       }
@@ -252,7 +282,7 @@ async function resolveAuthorityHome(authHome) {
         .map(async (value) => {
           try {
             const path = await realpath(resolve(value));
-            return { path, stat: await lstat(path) };
+            return { path, stat: await lstat(path, { bigint: true }) };
           } catch {
             return null;
           }
@@ -282,7 +312,7 @@ async function assertAuthorityHomeCurrent(authority) {
       authority.path,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
-    const currentStat = await current.stat();
+    const currentStat = await current.stat({ bigint: true });
     ensure(
       currentStat.isDirectory() && sameFileIdentity(currentStat, authority.identity),
       "authority_home_replaced",
@@ -327,7 +357,7 @@ async function findRecoveryArtifacts(authority) {
 
   const stagingRoot = join(authority.path, STAGING_DIRECTORY);
   try {
-    const stagingRootStat = await lstat(stagingRoot);
+    const stagingRootStat = await lstat(stagingRoot, { bigint: true });
     if (!stagingRootStat.isDirectory() || stagingRootStat.isSymbolicLink()) {
       recoveryPaths.push(stagingRoot);
     } else {
@@ -353,6 +383,7 @@ async function writeFileDurably(path, contents, { flag = "wx", mode = 0o600 } = 
   let handle;
   try {
     handle = await open(path, flag, mode);
+    await handle.chmod(mode);
     await handle.writeFile(contents);
     await handle.sync();
   } finally {
@@ -384,9 +415,9 @@ async function syncRefreshedStagingAuth(stagingHome, syncStagingDirectory) {
       join(stagingHome, "auth.json"),
       constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
-    const fileStat = await handle.stat();
+    const fileStat = await handle.stat({ bigint: true });
     ensure(
-      fileStat.isFile() && fileStat.nlink === 1,
+      fileStat.isFile() && fileStat.nlink === 1n,
       "staging_recovery_not_durable",
       "refreshed staging auth must remain a regular single-link file",
       { recoveryPath: stagingHome, recoveryReason: "staging_sync_failed" },
@@ -446,7 +477,7 @@ async function createStagingHome(
       "staging_not_durable",
       "authority filesystem cannot durably record the staging root",
     );
-    const stagingRootStat = await lstat(stagingRoot);
+    const stagingRootStat = await lstat(stagingRoot, { bigint: true });
     ensure(
       stagingRootStat.isDirectory() && !stagingRootStat.isSymbolicLink(),
       "unsafe_staging_path",
@@ -500,7 +531,7 @@ remote_plugin = false
         // Confirm whether the attempt still exists before reporting recovery.
       }
       try {
-        await lstat(stagingHome);
+        await lstat(stagingHome, { bigint: true });
         retainedAttempt = true;
       } catch (statError) {
         retainedAttempt = statError?.code !== "ENOENT";
@@ -566,6 +597,7 @@ async function atomicallyPromoteAuth(
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
+    await handle.chmod(0o600);
     await handle.writeFile(rawAuth);
     await handle.sync();
     await handle.close();
@@ -584,7 +616,10 @@ async function atomicallyPromoteAuth(
     await assertAuthorityHomeCurrent(authority);
     ensure(
       currentSource.authFileFingerprint === expectedSource.authFileFingerprint &&
-        sameFileIdentity(currentSource.fileIdentity, expectedSource.fileIdentity),
+        sameFileIdentity(
+          currentSource[EXACT_FILE_IDENTITY],
+          expectedSource[EXACT_FILE_IDENTITY],
+        ),
       "authority_conflict_after_refresh",
       "canonical authority state changed while the staged refresh was running",
     );
@@ -601,7 +636,7 @@ async function atomicallyPromoteAuth(
       retainTemporary = true;
       const recoveryPaths = [];
       try {
-        await lstat(temporary);
+        await lstat(temporary, { bigint: true });
         recoveryPaths.push(temporary);
       } catch (candidateError) {
         if (candidateError?.code !== "ENOENT") recoveryPaths.push(temporary);
@@ -722,11 +757,11 @@ export async function readManagedAuthSnapshot(authHome) {
       authPath,
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
-    fileStat = await handle.stat();
+    fileStat = await handle.stat({ bigint: true });
     ensure(fileStat.isFile(), "invalid_auth_record", "authority auth.json must be a regular file");
-    ensure(fileStat.nlink === 1, "invalid_auth_record", "authority auth.json must not be hard linked");
+    ensure(fileStat.nlink === 1n, "invalid_auth_record", "authority auth.json must not be hard linked");
     ensure(
-      (fileStat.mode & 0o077) === 0,
+      (fileStat.mode & 0o077n) === 0n,
       "invalid_auth_record",
       "authority auth.json must not be group/world accessible",
     );
@@ -800,14 +835,17 @@ export async function readManagedAuthSnapshot(authHome) {
     "authority auth.json user identities do not match",
   );
 
-  return withSensitiveProperties({
+  const snapshot = withSensitiveProperties({
     authPath,
     expiresAt:
       typeof accessPayload.exp === "number" ? new Date(accessPayload.exp * 1000).toISOString() : null,
     expiresAtUnixSeconds:
       typeof accessPayload.exp === "number" ? accessPayload.exp : null,
-    fileIdentity: { dev: fileStat.dev, ino: fileStat.ino },
-    fileMode: (fileStat.mode & 0o777).toString(8).padStart(4, "0"),
+    fileIdentity: {
+      dev: jsonSafeStatInteger(fileStat.dev),
+      ino: jsonSafeStatInteger(fileStat.ino),
+    },
+    fileMode: (fileStat.mode & 0o777n).toString(8).padStart(4, "0"),
     lastRefreshAt: auth.last_refresh ?? null,
     planType: accessAuth.chatgpt_plan_type ?? idAuth.chatgpt_plan_type ?? null,
   }, {
@@ -820,6 +858,10 @@ export async function readManagedAuthSnapshot(authHome) {
     refreshTokenFingerprint: fingerprint(auth.tokens.refresh_token),
     userId: userIds[0],
   });
+  Object.defineProperty(snapshot, EXACT_FILE_IDENTITY, {
+    value: { dev: fileStat.dev, ino: fileStat.ino },
+  });
+  return snapshot;
 }
 
 export async function runCodexManagedRefresh({
@@ -1336,7 +1378,7 @@ export async function refreshManagedAuthRecord({
       cleanupWarnings.push("staging_cleanup_failed");
       if (stagingHome) {
         try {
-          await lstat(stagingHome);
+          await lstat(stagingHome, { bigint: true });
           if (primaryError && typeof primaryError === "object") {
             attachRecoveryPaths(primaryError, [stagingHome]);
           }

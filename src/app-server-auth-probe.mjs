@@ -5,7 +5,7 @@ import { watch } from "node:fs";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -130,10 +130,21 @@ function releaseAppServerHandles(child, output) {
   return cleanupError;
 }
 
-export function buildWorkerEnvironment(codexHome, sourceEnv = process.env) {
+export function buildWorkerEnvironment(
+  codexHome,
+  sourceEnv = process.env,
+  launcherDirectory = process.cwd(),
+) {
   const env = { CODEX_HOME: codexHome };
   for (const key of WORKER_ENV_KEYS) {
-    if (typeof sourceEnv[key] === "string") env[key] = sourceEnv[key];
+    if (typeof sourceEnv[key] !== "string") continue;
+    env[key] =
+      key === "PATH"
+        ? sourceEnv[key]
+            .split(delimiter)
+            .map((entry) => (isAbsolute(entry) ? entry : resolve(launcherDirectory, entry || ".")))
+            .join(delimiter)
+        : sourceEnv[key];
   }
   return env;
 }
@@ -145,6 +156,40 @@ export function resolveAppServerExecutable(codexBin, baseDirectory = process.cwd
   const containsPathSeparator =
     codexBin.includes("/") || (sep === "\\" && codexBin.includes("\\"));
   return containsPathSeparator ? resolve(baseDirectory, codexBin) : codexBin;
+}
+
+export async function runSequentialCleanup(cleanups, primaryFailure) {
+  let firstCleanupFailure;
+  for (const cleanup of cleanups) {
+    try {
+      await cleanup();
+    } catch (error) {
+      firstCleanupFailure ??= { error };
+    }
+  }
+
+  if (primaryFailure) {
+    const primaryError = primaryFailure.error;
+    if (
+      firstCleanupFailure &&
+      primaryError !== null &&
+      ["object", "function"].includes(typeof primaryError)
+    ) {
+      try {
+        if (!Object.hasOwn(primaryError, "cleanupError")) {
+          Object.defineProperty(primaryError, "cleanupError", {
+            configurable: true,
+            enumerable: false,
+            value: firstCleanupFailure.error,
+          });
+        }
+      } catch {
+        // A frozen primary error still takes precedence over cleanup diagnostics.
+      }
+    }
+    return;
+  }
+  if (firstCleanupFailure) throw firstCleanupFailure.error;
 }
 
 export class JsonRpcError extends Error {
@@ -161,14 +206,17 @@ export class AppServerClient {
     codexBin,
     codexArgs = ["app-server", "--stdio"],
     codexHome,
+    launcherDirectory = process.cwd(),
     onRefresh,
     processControl = DEFAULT_PROCESS_CONTROL,
     shutdownGraceMs = DEFAULT_SHUTDOWN_GRACE_MS,
+    sourceEnv = process.env,
     timeoutMs = DEFAULT_TIMEOUT_MS,
   }) {
-    this.codexBin = resolveAppServerExecutable(codexBin);
+    this.codexBin = resolveAppServerExecutable(codexBin, launcherDirectory);
     this.codexArgs = codexArgs;
     this.codexHome = codexHome;
+    this.environment = buildWorkerEnvironment(codexHome, sourceEnv, launcherDirectory);
     this.onRefresh = onRefresh;
     this.processControl = processControl;
     this.shutdownGraceMs = shutdownGraceMs;
@@ -184,12 +232,10 @@ export class AppServerClient {
   }
 
   async start() {
-    const env = buildWorkerEnvironment(this.codexHome);
-
     this.child = spawn(this.codexBin, this.codexArgs, {
       cwd: this.codexHome,
       detached: process.platform !== "win32",
-      env,
+      env: this.environment,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.exitPromise = once(this.child, "exit");
@@ -663,6 +709,7 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
   const executable = resolveAppServerExecutable(codexBin);
   const codexHome = await mkdtemp(join(tmpdir(), "portable-codex-gate-"));
   const client = new AppServerClient({ codexBin: executable, codexHome });
+  let primaryFailure;
   try {
     await writeProbeConfig(
       codexHome,
@@ -693,9 +740,17 @@ export async function probeExperimentalGate({ codexBin = process.env.CODEX_BIN ?
     assert.match(rejection.message, /experimentalApi capability/);
     await stopAndAssertNoWorkerAuth(client, codexHome);
     return { gated: true, errorMessage: rejection.payload.message };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await client.stop();
-    await rm(codexHome, { recursive: true, force: true });
+    await runSequentialCleanup(
+      [
+        () => client.stop(),
+        () => rm(codexHome, { recursive: true, force: true }),
+      ],
+      primaryFailure,
+    );
   }
 }
 
@@ -709,6 +764,7 @@ export async function probeExternalAuthRefresh({
   let authMonitor;
   let client;
   let mock;
+  let primaryFailure;
   try {
     const workspace = join(codexHome, "workspace");
     await makeDirectory(workspace);
@@ -791,13 +847,19 @@ export async function probeExternalAuthRefresh({
       authJsonCreated: false,
       turnStatus: completed.params.turn.status,
     };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    try {
-      await Promise.all([client?.stop(), mock?.close()]);
-    } finally {
-      authMonitor?.close();
-      await rm(codexHome, { recursive: true, force: true });
-    }
+    await runSequentialCleanup(
+      [
+        () => client?.stop(),
+        () => mock?.close(),
+        () => authMonitor?.close(),
+        () => rm(codexHome, { recursive: true, force: true }),
+      ],
+      primaryFailure,
+    );
   }
 }
 

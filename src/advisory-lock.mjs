@@ -99,6 +99,17 @@ export class AdvisoryLockError extends Error {
   }
 }
 
+export function sameFileIdentity(left, right) {
+  return (
+    typeof left?.dev === "bigint" &&
+    typeof left?.ino === "bigint" &&
+    typeof right?.dev === "bigint" &&
+    typeof right?.ino === "bigint" &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
+}
+
 export async function acquireAdvisoryLock(
   lockPath,
   {
@@ -129,8 +140,8 @@ export async function acquireAdvisoryLock(
       constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       0o600,
     );
-    const fileStat = await handle.stat();
-    if (!fileStat.isFile() || fileStat.nlink !== 1) {
+    const fileStat = await handle.stat({ bigint: true });
+    if (!fileStat.isFile() || fileStat.nlink !== 1n) {
       throw new AdvisoryLockError(
         "unsafe_lock_file",
         "authority lock must be a regular single-link file",
@@ -274,7 +285,7 @@ export async function acquireAdvisoryLock(
       let handleStat;
       let pathHandle;
       try {
-        handleStat = await handle.stat();
+        handleStat = await handle.stat({ bigint: true });
         pathHandle = await open(
           lockPath,
           constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -283,14 +294,13 @@ export async function acquireAdvisoryLock(
         throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
       }
       try {
-        const pathStat = await pathHandle.stat();
+        const pathStat = await pathHandle.stat({ bigint: true });
         if (
           !handleStat.isFile() ||
-          handleStat.nlink !== 1 ||
+          handleStat.nlink !== 1n ||
           !pathStat.isFile() ||
-          pathStat.nlink !== 1 ||
-          pathStat.dev !== handleStat.dev ||
-          pathStat.ino !== handleStat.ino
+          pathStat.nlink !== 1n ||
+          !sameFileIdentity(pathStat, handleStat)
         ) {
           throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
         }

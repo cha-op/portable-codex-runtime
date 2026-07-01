@@ -114,6 +114,13 @@ test("authority directory permission policy accepts only trusted owners and mode
     ),
     false,
   );
+  assert.equal(
+    authorityDirectoryPermissionsAreSafe(
+      { isDirectory: true, mode: 0o40700n, uid: 501n },
+      { brokerUid: 501, disallowedModeBits: 0o077, requiredModeBits: 0o700 },
+    ),
+    true,
+  );
 });
 
 function encodeJwt(payload) {
@@ -241,6 +248,29 @@ test("managed refresh stages Codex writes and atomically promotes verified auth"
     assert.equal((await stat(authorityLockPath(authHome))).isFile(), true);
     await assert.rejects(stat(authorityStagingDirectory(authHome)), /ENOENT/);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("managed refresh restores writable credential modes under a restrictive umask", async () => {
+  const { authHome, root } = await createAuthorityHome();
+  const previousUmask = process.umask(0o200);
+  try {
+    const result = await refreshManagedAuthRecord({
+      authHome,
+      runRefresh: async ({ stagingHome }) => {
+        await replaceStagedAuth(stagingHome);
+        const stagedStat = await stat(join(stagingHome, "auth.json"));
+        assert.equal(stagedStat.mode & 0o777, 0o600);
+        return successResponse();
+      },
+    });
+
+    const promotedStat = await stat(join(authHome, "auth.json"));
+    assert.equal(promotedStat.mode & 0o777, 0o600);
+    assert.equal(result.fileMode, "0600");
+  } finally {
+    process.umask(previousUmask);
     await rm(root, { recursive: true, force: true });
   }
 });

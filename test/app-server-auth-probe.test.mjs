@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -15,6 +15,7 @@ import {
   probeExperimentalGate,
   probeExternalAuthRefresh,
   resolveAppServerExecutable,
+  runSequentialCleanup,
   stopAndAssertNoWorkerAuth,
 } from "../src/app-server-auth-probe.mjs";
 
@@ -69,6 +70,19 @@ test("worker environment preserves standard Windows process variables", () => {
   );
 });
 
+test("worker environment anchors relative PATH entries to the launcher directory", () => {
+  const launcherDirectory = resolve("launcher-root");
+  const absoluteBin = resolve(launcherDirectory, "..", "absolute-bin");
+  assert.equal(
+    buildWorkerEnvironment(
+      "/isolated/codex-home",
+      { PATH: ["./bin", "", absoluteBin].join(delimiter) },
+      launcherDirectory,
+    ).PATH,
+    [resolve(launcherDirectory, "bin"), launcherDirectory, absoluteBin].join(delimiter),
+  );
+});
+
 test("app-server executable resolution preserves PATH commands and freezes relative paths", () => {
   assert.equal(resolveAppServerExecutable("codex", "/launcher"), "codex");
   assert.equal(
@@ -77,6 +91,106 @@ test("app-server executable resolution preserves PATH commands and freezes relat
   );
   assert.equal(resolveAppServerExecutable("/pinned/codex", "/launcher"), "/pinned/codex");
   assert.equal(codexVersion(relativeNodeExecutable()), process.version);
+});
+
+test(
+  "app-server resolves a bare executable from the launcher-relative PATH after changing cwd",
+  { skip: process.platform === "win32" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "portable-codex-relative-path-"));
+    const launcherDirectory = join(root, "launcher");
+    const binDirectory = join(launcherDirectory, "bin");
+    const codexHome = join(root, "isolated-home");
+    const fixturePath = join(root, "fixture.mjs");
+    let client;
+    try {
+      await mkdir(binDirectory, { recursive: true });
+      await mkdir(codexHome);
+      await symlink(process.execPath, join(binDirectory, "codex"));
+      await writeFile(
+        fixturePath,
+        `
+process.stdout.write(JSON.stringify({ method: "fixture/ready" }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.exit(0));
+`,
+      );
+      client = new AppServerClient({
+        codexArgs: [fixturePath],
+        codexBin: "codex",
+        codexHome,
+        launcherDirectory,
+        sourceEnv: { PATH: ["./bin", "/usr/bin", "/bin"].join(delimiter) },
+        timeoutMs: 1_000,
+      });
+      await client.start();
+      await client.waitForNotification("fixture/ready");
+    } finally {
+      await runSequentialCleanup(
+        [
+          () => client?.stop(),
+          () => rm(root, { force: true, recursive: true }),
+        ],
+      );
+    }
+  },
+);
+
+test("sequential cleanup preserves a primary failure and runs every cleanup", async () => {
+  const primaryError = new Error("primary operation failed");
+  const firstCleanupError = new Error("first cleanup failed");
+  const secondCleanupError = new Error("second cleanup failed");
+  const events = [];
+  await assert.rejects(
+    async () => {
+      let primaryFailure;
+      try {
+        throw primaryError;
+      } catch (error) {
+        primaryFailure = { error };
+        throw error;
+      } finally {
+        await runSequentialCleanup(
+          [
+            async () => {
+              events.push("first");
+              throw firstCleanupError;
+            },
+            async () => {
+              events.push("second");
+              throw secondCleanupError;
+            },
+            async () => events.push("third"),
+          ],
+          primaryFailure,
+        );
+      }
+    },
+    (error) => error === primaryError,
+  );
+  assert.deepEqual(events, ["first", "second", "third"]);
+  assert.equal(primaryError.cleanupError, firstCleanupError);
+  assert.equal(Object.prototype.propertyIsEnumerable.call(primaryError, "cleanupError"), false);
+});
+
+test("sequential cleanup fails a successful operation with its first cleanup error", async () => {
+  const firstCleanupError = new Error("first cleanup failed");
+  const events = [];
+  await assert.rejects(
+    runSequentialCleanup([
+      async () => {
+        events.push("first");
+        throw firstCleanupError;
+      },
+      async () => events.push("second"),
+      async () => {
+        events.push("third");
+        throw new Error("later cleanup failed");
+      },
+    ]),
+    (error) => error === firstCleanupError,
+  );
+  assert.deepEqual(events, ["first", "second", "third"]);
 });
 
 test("Linux process-group inspection distinguishes live and zombie-only members", async () => {

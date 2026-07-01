@@ -20,6 +20,7 @@ import {
   AdvisoryLockError,
   acquireAdvisoryLock,
   advisoryLockCommand,
+  sameFileIdentity,
 } from "../src/advisory-lock.mjs";
 
 const HOLDER_FIXTURE = fileURLToPath(new URL("../fixtures/hold-advisory-lock.mjs", import.meta.url));
@@ -35,6 +36,24 @@ const STUBBORN_HOLDER_FIXTURE = fileURLToPath(
 const DELAYED_HOLDER_FIXTURE = fileURLToPath(
   new URL("../fixtures/delayed-advisory-lock-holder.mjs", import.meta.url),
 );
+
+test("file identity comparison preserves large inode precision", () => {
+  const inode = 2n ** 54n;
+  assert.equal(Number(inode), Number(inode + 1n));
+  assert.equal(
+    sameFileIdentity({ dev: 1n, ino: inode }, { dev: 1n, ino: inode + 1n }),
+    false,
+  );
+  assert.equal(
+    sameFileIdentity({ dev: 1n, ino: inode }, { dev: 1n, ino: inode }),
+    true,
+  );
+  assert.equal(sameFileIdentity(undefined, undefined), false);
+  assert.equal(
+    sameFileIdentity({ dev: 1, ino: Number(inode) }, { dev: 1, ino: Number(inode) }),
+    false,
+  );
+});
 
 function waitForLine(child, expected) {
   return new Promise((resolve, reject) => {
