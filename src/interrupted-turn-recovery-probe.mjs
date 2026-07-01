@@ -41,7 +41,7 @@ export const RECOVERY_SCENARIOS = Object.freeze([
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const SENSITIVE_EVIDENCE_PATTERNS = [
-  /(?:^|["'\s])\/(?:Users|home|private|tmp|var\/folders)\//,
+  /(?:^|["'\s])\/[^"'\s]/,
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i,
   /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/,
   /\b(?:sk|sess|rk)-[A-Za-z0-9_-]{8,}\b/,
@@ -103,34 +103,38 @@ export async function startHeldResponsesMock({ timeoutMs = DEFAULT_TIMEOUT_MS } 
   const sockets = new Set();
   const waiters = [];
   const server = createServer(async (request, response) => {
-    const chunks = [];
-    for await (const chunk of request) chunks.push(chunk);
-    const body = Buffer.concat(chunks).toString("utf8");
+    try {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = Buffer.concat(chunks).toString("utf8");
 
-    if (request.method !== "POST" || request.url !== "/v1/responses") {
-      response.writeHead(404, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: { message: "not found" } }));
-      return;
-    }
+      if (request.method !== "POST" || request.url !== "/v1/responses") {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "not found" } }));
+        return;
+      }
 
-    requests.push(body);
-    while (waiters.length > 0) waiters.shift()();
-    response.writeHead(200, {
-      "cache-control": "no-cache",
-      "content-type": "text/event-stream",
-    });
-    if (requests.length === 1) {
-      responses.add(response);
-      response.once("close", () => responses.delete(response));
-      response.write(
-        `event: response.created\ndata: ${JSON.stringify({
-          type: "response.created",
-          response: { id: "resp-held-recovery-probe" },
-        })}\n\n`,
-      );
-      return;
+      requests.push(body);
+      while (waiters.length > 0) waiters.shift()();
+      response.writeHead(200, {
+        "cache-control": "no-cache",
+        "content-type": "text/event-stream",
+      });
+      if (requests.length === 1) {
+        responses.add(response);
+        response.once("close", () => responses.delete(response));
+        response.write(
+          `event: response.created\ndata: ${JSON.stringify({
+            type: "response.created",
+            response: { id: "resp-held-recovery-probe" },
+          })}\n\n`,
+        );
+        return;
+      }
+      response.end(completedSseBody());
+    } catch {
+      response.destroy();
     }
-    response.end(completedSseBody());
   });
   server.on("connection", (socket) => {
     sockets.add(socket);
@@ -230,8 +234,14 @@ export async function terminateAppServer(
   client.stopping = true;
   try {
     // AppServerClient starts the child detached, so its PID is also the process-group ID.
-    killProcess(-pid, signal);
+    try {
+      killProcess(-pid, signal);
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
     exitResult = await withTimeout(client.exitPromise, timeoutMs, `${signal} app-server exit`);
+    // The pinned compatibility scenario requires signal termination, not merely recovery
+    // after an implementation-defined clean exit.
     assert.equal(exitResult[0], null, `app-server exited with code ${exitResult[0]}`);
     assert.equal(exitResult[1], signal, `app-server observed ${exitResult[1]} instead of ${signal}`);
   } catch (error) {
@@ -396,15 +406,23 @@ async function updateHashFromFile(hash, path) {
   await once(input, "end");
 }
 
+function updateHashFields(hash, fields) {
+  for (const field of fields) {
+    const bytes = Buffer.from(String(field));
+    hash.update(`${bytes.length}:`);
+    hash.update(bytes);
+  }
+}
+
 async function hashTreeEntry(hash, root, path) {
   const metadata = await lstat(path);
   const entryPath = relative(root, path) || ".";
   if (metadata.isSymbolicLink()) {
-    hash.update(`symlink\0${entryPath}\0${await readlink(path)}\0`);
+    updateHashFields(hash, ["symlink", entryPath, await readlink(path)]);
     return;
   }
   if (metadata.isDirectory()) {
-    hash.update(`directory\0${entryPath}\0${portableMode(metadata)}\0`);
+    updateHashFields(hash, ["directory", entryPath, portableMode(metadata)]);
     const entries = await readdir(path);
     entries.sort();
     for (const entry of entries) await hashTreeEntry(hash, root, join(path, entry));
@@ -412,9 +430,13 @@ async function hashTreeEntry(hash, root, path) {
   }
   if (!metadata.isFile()) throw new Error("tree digest rejects non-file entries");
   if (metadata.nlink !== 1) throw new Error("tree digest rejects hard-linked files");
-  hash.update(`file\0${entryPath}\0${portableMode(metadata)}\0${metadata.size}\0`);
-  await updateHashFromFile(hash, path);
-  hash.update("\0");
+  updateHashFields(hash, [
+    "file",
+    entryPath,
+    portableMode(metadata),
+    metadata.size,
+    await digestFile(path),
+  ]);
 }
 
 export async function digestTree(root) {

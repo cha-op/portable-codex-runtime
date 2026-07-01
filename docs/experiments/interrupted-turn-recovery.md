@@ -140,8 +140,9 @@ restore interfaces.
 - Background terminal state is intentionally outside the recoverable
   filesystem contract. A checkpoint with a live terminal is not migration
   ready even if all files copy successfully.
-- macOS and Linux process groups are supported. Windows is rejected because a
-  Job Object process-tree implementation is not present.
+- The implementation targets macOS and Linux process groups, while this live
+  evidence records macOS arm64 only. Windows is rejected because a Job Object
+  process-tree implementation is not present.
 - Portable relative and existing external absolute symlink targets are preserved
   exactly; dangling absolute targets, internal absolute targets, and
   non-relocatable relative targets fail closed. A fixed runtime image must

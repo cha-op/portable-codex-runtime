@@ -108,6 +108,22 @@ test("signal termination observes the requested signal and always cleans up", as
   assert.equal(client.stopping, true);
 });
 
+test("signal termination tolerates an already absent process group", async () => {
+  const missingProcessGroup = new Error("missing process group");
+  missingProcessGroup.code = "ESRCH";
+  const result = await terminateAppServer(
+    { child: { pid: 4242 }, exitPromise: Promise.resolve([null, "SIGKILL"]) },
+    "SIGKILL",
+    {
+      abortClient: async () => {},
+      killProcess: () => {
+        throw missingProcessGroup;
+      },
+    },
+  );
+  assert.deepEqual(result, { signal: "SIGKILL" });
+});
+
 test("signal termination preserves the primary failure over cleanup failure", async () => {
   let primary;
   try {
@@ -287,11 +303,11 @@ test("stopped-tree copy rejects absolute links that would become valid in the de
     const source = join(root, "source");
     const destination = join(root, "destination");
     await mkdir(source);
-    await writeFile(join(source, "target"), "sentinel");
-    await symlink(join(destination, "target"), join(source, "future-destination-link"));
+    await writeFile(join(source, "a-target"), "sentinel");
+    await symlink(join(destination, "a-target"), join(source, "z-destination-link"));
     await assert.rejects(
       copyStoppedTree({ ownedRoot: root, source, destination }),
-      /rejects dangling absolute symlinks/,
+      /rejects absolute symlinks into the destination tree/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -366,6 +382,7 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       "sk-secret-sentinel",
       "123e4567-e89b-42d3-a456-426614174000",
       "/var/folders/private-state",
+      "/srv/portable/private-state",
     ]) {
       assert.throws(
         () => assertRecoveryEvidenceSafe({
