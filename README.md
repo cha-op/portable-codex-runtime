@@ -4,10 +4,11 @@ Portable Codex Runtime is an experimental host runtime for moving Codex
 app-server sessions between trusted machines while keeping the execution
 environment, workspace, rollout state, and recovery data explicit.
 
-The current repository focuses on compatibility probes for the authentication
-boundary. The planned runtime keeps refresh tokens in a central auth authority,
-injects short-lived access tokens into session workers, and treats session data
-snapshots separately from monotonic credential state.
+The current repository focuses on compatibility probes for authentication and
+interrupted-turn recovery boundaries. The planned runtime keeps refresh tokens
+in a central auth authority, injects short-lived access tokens into session
+workers, and treats session data snapshots separately from monotonic credential
+state.
 
 ## Status
 
@@ -15,10 +16,49 @@ The runtime architecture is under active development. The current implementation
 proves that the installed Codex app-server supports external ChatGPT access-token
 injection and proves the managed refresh API choreography with an explicitly
 uncontained host probe. Production managed refresh fails closed until a
-per-refresh rootless containment executor is implemented.
+per-refresh rootless containment executor is implemented. A separate loopback
+probe characterizes explicit interruption, process signals, hard kills, and a
+stopped-tree restore without using credentials or a real model turn.
 
 The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
 Codex binary or image digest and rerun these probes before upgrading it.
+
+## Interrupted-Turn Recovery
+
+The recovery probe starts a real Codex app-server against a held localhost
+Responses API mock. It exercises four independent scenarios:
+
+- stable `turn/interrupt`, followed by a cold resume;
+- `SIGTERM` during an active turn;
+- `SIGKILL` during an active turn;
+- `SIGKILL`, a stopped full-tree copy, deletion of the source tree, and restore
+  at a different absolute path.
+
+The probe verifies the explicit thread ID through both `thread/resume` and
+`thread/read`. Explicit interruption persists a model-visible abort marker.
+Signal and hard-kill recovery instead normalizes the stale in-progress turn to
+`interrupted` without inventing that marker. The stopped-tree copy preserves
+regular files, directories, modes, and symlinks without following links; it is
+not an online, atomic, or power-loss-durable snapshot implementation.
+
+Run the deterministic compatibility probe with the exact Codex binary from the
+pinned runtime image:
+
+```bash
+CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
+  npm run probe:turn-recovery
+```
+
+To update the redacted evidence after an intentional runtime upgrade:
+
+```bash
+CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
+  npm run probe:turn-recovery -- --write-evidence
+```
+
+The command does not read `auth.json`, send a real model turn, or use external
+network access. See `docs/experiments/interrupted-turn-recovery.md` for source
+evidence, exact semantics, and storage limitations.
 
 ## Managed Auth Refresh Authority
 

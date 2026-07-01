@@ -2,7 +2,7 @@
 
 - [done] Prove a central auth authority can refresh credentials without a
   normal model turn and preserve the successful method with redacted evidence.
-- [pending] Characterize interrupted and killed Codex turn recovery from the
+- [done] Characterize interrupted and killed Codex turn recovery from the
   pinned runtime and filesystem snapshots.
 - [pending] Define session filesystem, manifest, lease, fencing, and pluggable
   storage contracts for rootless workers.

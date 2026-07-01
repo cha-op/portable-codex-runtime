@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "probe": "interrupted-turn-recovery",
+  "runtime": {
+    "codexVersion": "codex-cli 0.142.4",
+    "codexBinarySha256": "32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5",
+    "sourceAnalysisCommit": "db887d03e1f907467e33271572dffb73bceecd6b",
+    "platform": "darwin",
+    "arch": "arm64"
+  },
+  "backend": {
+    "type": "loopback-held-responses-mock",
+    "realModelTurn": false,
+    "authMaterialUsed": false
+  },
+  "snapshot": {
+    "kind": "stopped-tree-copy",
+    "sourceQuiesced": true,
+    "treeDigestMatched": true,
+    "workspaceDigestMatched": true
+  },
+  "scenarios": [
+    {
+      "kind": "logical_interrupt",
+      "turnMaterialized": true,
+      "terminationObserved": "rpc-interrupt",
+      "originalCompletionObserved": true,
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "present"
+    },
+    {
+      "kind": "sigterm",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGTERM",
+      "originalCompletionObserved": false,
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "absent"
+    },
+    {
+      "kind": "sigkill",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGKILL",
+      "originalCompletionObserved": false,
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "absent"
+    },
+    {
+      "kind": "snapshot_restore",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGKILL",
+      "originalCompletionObserved": false,
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "absent"
+    }
+  ],
+  "result": "passed"
+}

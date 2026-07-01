@@ -1,0 +1,47 @@
+---
+id: 20260701-4a91c7
+title: Interrupted-Turn Recovery Spike
+status: completed
+created: 2026-07-01
+updated: 2026-07-01
+branch: wip/interrupted-turn-recovery
+pr:
+supersedes: []
+superseded_by:
+---
+
+# Interrupted-Turn Recovery Spike
+
+## Summary
+
+- Characterized explicit interruption, `SIGTERM`, `SIGKILL`, and stopped-tree
+  restore behavior through a real Codex app-server and loopback model mock.
+- Preserved a deterministic probe, safety tests, source analysis, and redacted
+  evidence without reading credentials or starting a real model turn.
+
+## Current State
+
+- Explicit `turn/interrupt` persists the model-visible abort marker and reports
+  a terminal interrupted turn.
+- Signal and hard-kill recovery normalize the incomplete turn to interrupted in
+  resume/read views but do not synthesize the missing marker.
+- The same explicit thread ID resumes after the complete session tree is copied
+  only after process exit, removed, and restored at a different absolute path.
+- The copy preserves symlinks without following them and rejects non-filesystem
+  data entries such as sockets and FIFOs.
+- Codex flush is not an fsync barrier, rollout-tail repair remains absent, and
+  background terminals are not filesystem-migratable state.
+
+## Next Steps
+
+- Define session filesystem, manifest, lease, fencing, and pluggable storage
+  contracts in the next serial pull request.
+- Keep stopped-tree compatibility evidence separate from the later production
+  snapshot, differential compression, retention, and restore implementation.
+
+## Evidence
+
+- `docs/experiments/interrupted-turn-recovery.md`
+- `evidence/interrupted-turn-recovery.json`
+- `CODEX_BIN=/opt/homebrew/bin/codex npm test`
+- `CODEX_BIN=/opt/homebrew/bin/codex npm run probe:turn-recovery -- --write-evidence`
