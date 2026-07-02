@@ -824,9 +824,11 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
 }
 
 async function assertPortableSymlink({
+  allowAbsoluteSymlinks,
   destination,
   destinationRoots,
   destinationRootIdentity,
+  forbiddenAbsoluteSymlinkAuthorities,
   inspectSymlinkPath,
   source,
   sourceIdentityKeys,
@@ -835,6 +837,9 @@ async function assertPortableSymlink({
   target,
 }) {
   if (isAbsolute(target)) {
+    if (!allowAbsoluteSymlinks) {
+      throw new Error("stopped-tree copy rejects absolute symlinks by policy");
+    }
     const root = parse(target).root;
     await resolveSymlinkTargetWithoutHiddenTraversal({
       exactPortableNames: false,
@@ -854,6 +859,15 @@ async function assertPortableSymlink({
             "stopped-tree copy rejects absolute symlinks into the destination tree",
           );
         }
+        if (
+          forbiddenAbsoluteSymlinkAuthorities.some((authority) =>
+            pathIsInside(authority.path, candidate),
+          )
+        ) {
+          throw new Error(
+            "stopped-tree copy rejects absolute symlinks into a forbidden authority",
+          );
+        }
       },
       validateMetadata: async (_candidate, metadata) => {
         if (
@@ -865,6 +879,15 @@ async function assertPortableSymlink({
         if (sameFileIdentity(metadata, destinationRootIdentity)) {
           throw new Error(
             "stopped-tree copy rejects absolute symlinks into the destination tree",
+          );
+        }
+        if (
+          forbiddenAbsoluteSymlinkAuthorities.some((authority) =>
+            sameFileIdentity(metadata, authority.identity),
+          )
+        ) {
+          throw new Error(
+            "stopped-tree copy rejects absolute symlinks into a forbidden authority",
           );
         }
       },
@@ -1151,6 +1174,7 @@ export async function copyStoppedTreeBetweenRoots({
   source,
   destinationOwnedRoot,
   destination,
+  allowAbsoluteSymlinks = true,
   allowSourceRootMount = false,
   afterDestinationValidation,
   afterDestinationRootCreated,
@@ -1159,16 +1183,55 @@ export async function copyStoppedTreeBetweenRoots({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  forbiddenAbsoluteSymlinkAuthorities = [],
   inspectOwnedRootAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
   inspectOwnedRootAcl = recoveryPathHasExtendedAcl,
   inspectSymlinkPath = lstat,
   listMountPoints = listCurrentMountPoints,
 }) {
   assert.equal(
+    typeof allowAbsoluteSymlinks,
+    "boolean",
+    "allowAbsoluteSymlinks must be a boolean",
+  );
+  assert.equal(
     typeof allowSourceRootMount,
     "boolean",
     "allowSourceRootMount must be a boolean",
   );
+  assert(
+    Array.isArray(forbiddenAbsoluteSymlinkAuthorities),
+    "forbiddenAbsoluteSymlinkAuthorities must be an array",
+  );
+  const normalizedForbiddenAbsoluteSymlinkAuthorities =
+    forbiddenAbsoluteSymlinkAuthorities.map((authority) => {
+      assert(
+        authority !== null &&
+          typeof authority === "object" &&
+          typeof authority.path === "string" &&
+          isAbsolute(authority.path) &&
+          resolve(authority.path) === authority.path,
+        "forbidden absolute symlink authority must have an absolute normalized path",
+      );
+      const dev =
+        typeof authority.device === "string" &&
+        /^(?:0|[1-9][0-9]*)$/u.test(authority.device)
+          ? BigInt(authority.device)
+          : integerAsBigInt(authority.device);
+      const ino =
+        typeof authority.inode === "string" &&
+        /^[1-9][0-9]*$/u.test(authority.inode)
+          ? BigInt(authority.inode)
+          : integerAsBigInt(authority.inode);
+      assert(
+        dev !== null && dev >= 0n && ino !== null && ino > 0n,
+        "forbidden absolute symlink authority must have a valid identity",
+      );
+      return Object.freeze({
+        identity: Object.freeze({ dev, ino }),
+        path: authority.path,
+      });
+    });
   let sourceOwnedRootAuthority;
   let destinationOwnedRootAuthority;
   let destinationRootHandle;
@@ -1273,6 +1336,7 @@ export async function copyStoppedTreeBetweenRoots({
     await assertDestinationRootCurrent();
     await copyTreeEntry(
       {
+        allowAbsoluteSymlinks,
         assertDestinationRootCurrent,
         afterDestinationDirectoryCreated,
         afterSourceSymlinkValidated,
@@ -1287,6 +1351,8 @@ export async function copyStoppedTreeBetweenRoots({
           ),
         ],
         destinationRootIdentity,
+        forbiddenAbsoluteSymlinkAuthorities:
+          normalizedForbiddenAbsoluteSymlinkAuthorities,
         inspectSymlinkPath,
         sourceIdentityKeys,
         sourceRootIdentity,

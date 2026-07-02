@@ -18,6 +18,7 @@ import test from "node:test";
 
 import {
   FilesystemOperationJournal,
+  operationJournalRecordFilename,
 } from "../src/filesystem-operation-journal.mjs";
 import {
   STOPPED_DIRECTORY_ARTIFACT_VERSION,
@@ -260,6 +261,15 @@ function candidatePath(ownedRoot, operationId, finalPath) {
   );
 }
 
+function publicationId(operationId, finalPath) {
+  return `publication-sha256-${createHash("sha256")
+    .update("portable-codex-stopped-directory-publication\0", "utf8")
+    .update(operationId, "utf8")
+    .update("\0", "utf8")
+    .update(basename(finalPath), "utf8")
+    .digest("hex")}`;
+}
+
 function assertPublicationError(error, code, commitState) {
   assert(error instanceof StoppedDirectoryPublicationError);
   if (code !== undefined) assert.equal(error.code, code);
@@ -325,12 +335,15 @@ test("the default filesystem inspector accepts the supported local test volume",
 });
 
 test("a remote or unapproved filesystem profile is rejected before prepare", async (t) => {
-  const fixture = await createFixture(t, {
-    inspectFilesystem: async () => ({
-      durability: "shared-remote",
-      type: "nfs",
-    }),
+  let fixture;
+  let journalPath;
+  fixture = await createFixture(t, {
+    inspectFilesystem: async (path) =>
+      path === journalPath
+        ? { durability: "local-fsync-rename", type: "test-local" }
+        : { durability: "shared-remote", type: "nfs" },
   });
+  journalPath = await realpath(fixture.journalDirectory);
 
   await assert.rejects(
     fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
@@ -346,6 +359,69 @@ test("a remote or unapproved filesystem profile is rejected before prepare", asy
     null,
   );
   assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("an unsupported journal filesystem is publication-uncertain before prepare", async (t) => {
+  let fixture;
+  let journalPath;
+  fixture = await createFixture(t, {
+    inspectFilesystem: async (path) =>
+      path === journalPath
+        ? { durability: "shared-remote", type: "nfs" }
+        : { durability: "local-fsync-rename", type: "test-local" },
+  });
+  journalPath = await realpath(fixture.journalDirectory);
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "unsupported_publication_filesystem",
+        "uncertain",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("a prepared operation cannot be rebound to a different journal profile", async (t) => {
+  let failAfterJournalPrepared = true;
+  let fixture;
+  let journalPath;
+  let journalType = "journal-local-a";
+  fixture = await createFixture(t, {
+    faults: {
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("sensitive prepared fault");
+      },
+    },
+    inspectFilesystem: async (path) => ({
+      durability: "local-fsync-rename",
+      type: path === journalPath ? journalType : "test-local",
+    }),
+  });
+  journalPath = await realpath(fixture.journalDirectory);
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+
+  failAfterJournalPrepared = false;
+  journalType = "journal-local-b";
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) => assertPublicationError(error, "publication_conflict"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
 });
 
 test("the journal directory cannot be captured inside the source tree", async (t) => {
@@ -380,6 +456,33 @@ test("the journal directory cannot be captured inside the source tree", async (t
       ),
   );
   assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("checkpoint copy rejects absolute symlinks into the journal authority", async (t) => {
+  const fixture = await createFixture(t);
+  const recordPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(CAPTURE_OPERATION_ID),
+  );
+  await symlink(recordPath, join(fixture.sourceDirectory, "journal-record"));
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+
+  const candidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
 });
 
 test("journal authority discovery failure is publication-uncertain", async (t) => {
@@ -1084,6 +1187,81 @@ test("restore rejects payload and manifest tampering against the trusted capture
   assert.equal(await pathExists(fixture.destinationDirectory), false);
 });
 
+test("restore replay rejects a materialized tree outside the trusted artifact proof", async (t) => {
+  let failAfterJournalPrepared = false;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) {
+          throw new Error("sensitive restore prepared fault");
+        }
+      },
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  failAfterJournalPrepared = true;
+  const options = restoreOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+
+  const prepared = (
+    await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })
+  ).record;
+  assert.equal(prepared.state, "prepared");
+  const candidate = candidatePath(
+    fixture.destinationOwnedRoot,
+    RESTORE_OPERATION_ID,
+    fixture.destinationDirectory,
+  );
+  await mkdir(candidate, { mode: 0o700 });
+  await writeFile(join(candidate, "untrusted"), "attacker-controlled\n", {
+    mode: 0o600,
+  });
+  const identity = await lstat(candidate, { bigint: true });
+  const modeledDigest = await digestTree(candidate);
+  const mismatchedManifestDigest =
+    fixture.artifactProof.artifactManifestDigest === "f".repeat(64)
+      ? "e".repeat(64)
+      : "f".repeat(64);
+  await fixture.journal.markMaterialized({
+    binding: prepared.binding,
+    materialization: {
+      contractVersion: 1,
+      artifactManifestDigest: mismatchedManifestDigest,
+      modeledDigest,
+      publicationId: publicationId(
+        RESTORE_OPERATION_ID,
+        fixture.destinationDirectory,
+      ),
+      publicationKind: "restore-destination",
+      stagedRoot: {
+        device: identity.dev.toString(),
+        inode: identity.ino.toString(),
+      },
+    },
+    operationId: prepared.operationId,
+    request: prepared.request,
+    result: prepared.result,
+  });
+  await rm(fixture.artifactDirectory, { force: true, recursive: true });
+  failAfterJournalPrepared = false;
+
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_integrity_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+});
+
 test("restore rejects a reordered manifest even when its supplied digest matches", async (t) => {
   const fixture = await createFixture(t);
   await publishFixtureArtifact(fixture);
@@ -1153,6 +1331,53 @@ test("one operation cannot be rebound to a different filesystem path", async (t)
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "prepared",
+  );
+});
+
+test("coordinator bindings preserve an own __proto__ key for conflict checks", async (t) => {
+  let failAfterJournalPrepared = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("sensitive prepared fault");
+      },
+    },
+  });
+  const firstBinding = binding(
+    "checkpoint",
+    CAPTURE_OPERATION_ID,
+    "volume-001",
+  );
+  Object.defineProperty(firstBinding, "__proto__", {
+    enumerable: true,
+    value: "lane-a",
+  });
+  const first = captureOptions(fixture, { binding: firstBinding });
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(first),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const record = (
+    await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })
+  ).record;
+  assert.equal(record.binding.coordinator.__proto__, "lane-a");
+
+  failAfterJournalPrepared = false;
+  const conflictingBinding = binding(
+    "checkpoint",
+    CAPTURE_OPERATION_ID,
+    "volume-001",
+  );
+  Object.defineProperty(conflictingBinding, "__proto__", {
+    enumerable: true,
+    value: "lane-b",
+  });
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(
+      captureOptions(fixture, { binding: conflictingBinding }),
+    ),
+    (error) => assertPublicationError(error, "publication_conflict"),
   );
 });
 

@@ -1241,6 +1241,99 @@ test("stopped-tree copy rejects absolute symlinks into the relocated source tree
   }
 });
 
+test("stopped-tree copy can reject every absolute symlink by policy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-absolute-policy-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const external = join(root, "external");
+    await mkdir(source);
+    await writeFile(external, "sentinel");
+    await symlink(external, join(source, "absolute-link"));
+
+    await assert.rejects(
+      copyStoppedTree({
+        allowAbsoluteSymlinks: false,
+        destination,
+        ownedRoot: root,
+        source,
+      }),
+      /rejects absolute symlinks by policy/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects absolute symlinks into a forbidden authority", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-forbidden-link-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const forbidden = join(root, "forbidden");
+    await mkdir(source);
+    await mkdir(forbidden);
+    await writeFile(join(forbidden, "record"), "sentinel");
+    await symlink(join(forbidden, "record"), join(source, "authority-record"));
+    const identity = await lstat(forbidden, { bigint: true });
+
+    await assert.rejects(
+      copyStoppedTree({
+        destination,
+        forbiddenAbsoluteSymlinkAuthorities: [{
+          device: identity.dev.toString(),
+          inode: identity.ino.toString(),
+          path: await realpath(forbidden),
+        }],
+        ownedRoot: root,
+        source,
+      }),
+      /rejects absolute symlinks into a forbidden authority/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects identity aliases of forbidden authorities", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "portable-copy-forbidden-alias-test-"),
+  );
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const forbidden = join(root, "forbidden");
+    const alias = join(root, "alias");
+    await mkdir(source);
+    await mkdir(forbidden);
+    await writeFile(join(forbidden, "record"), "sentinel");
+    await symlink(forbidden, alias);
+    await symlink(join(alias, "record"), join(source, "authority-record"));
+    const identity = await lstat(forbidden, { bigint: true });
+
+    await assert.rejects(
+      copyStoppedTree({
+        destination,
+        forbiddenAbsoluteSymlinkAuthorities: [{
+          device: identity.dev.toString(),
+          inode: identity.ino.toString(),
+          path: await realpath(forbidden),
+        }],
+        inspectSymlinkPath: async (path, options) =>
+          path === alias ? identity : lstat(path, options),
+        ownedRoot: root,
+        source,
+      }),
+      /rejects absolute symlinks into a forbidden authority/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree copy rejects canonical aliases of absolute internal symlinks", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-canonical-link-test-"));
   try {

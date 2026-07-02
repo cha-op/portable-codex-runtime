@@ -111,7 +111,7 @@ function ownEnumerableObject(value, code = "invalid_publication_request") {
   } catch {
     fail(code);
   }
-  const normalized = {};
+  const normalized = Object.create(null);
   for (const key of Reflect.ownKeys(descriptors)) {
     ensure(typeof key === "string", code);
     const descriptor = descriptors[key];
@@ -122,7 +122,12 @@ function ownEnumerableObject(value, code = "invalid_publication_request") {
         !Object.hasOwn(descriptor, "set"),
       code,
     );
-    normalized[key] = descriptor.value;
+    Object.defineProperty(normalized, key, {
+      configurable: true,
+      enumerable: true,
+      value: descriptor.value,
+      writable: true,
+    });
   }
   return Object.freeze(normalized);
 }
@@ -324,17 +329,21 @@ async function defaultInspectFilesystem(path) {
   });
 }
 
-async function inspectFilesystem(inspector, path) {
+async function inspectFilesystem(
+  inspector,
+  path,
+  commitState = "not-committed",
+) {
   let raw;
   try {
     raw = await inspector(path);
   } catch {
-    fail("unsupported_publication_filesystem");
+    fail("unsupported_publication_filesystem", commitState);
   }
   try {
     return normalizeFilesystemProfile(raw);
   } catch {
-    fail("unsupported_publication_filesystem");
+    fail("unsupported_publication_filesystem", commitState);
   }
 }
 
@@ -589,7 +598,10 @@ async function readArtifactManifest(path, expectedCheckpoint, expectedProof) {
   });
 }
 
-function validateMaterialization(value, { kind, operationId, finalName }) {
+function validateMaterialization(
+  value,
+  { artifactProof, kind, operationId, finalName },
+) {
   const materialization = exactOptions(value, [
     "contractVersion",
     "artifactManifestDigest",
@@ -607,6 +619,11 @@ function validateMaterialization(value, { kind, operationId, finalName }) {
       DIGEST_PATTERN.test(materialization.modeledDigest) &&
       typeof materialization.artifactManifestDigest === "string" &&
       DIGEST_PATTERN.test(materialization.artifactManifestDigest) &&
+      (kind !== "restore-destination" ||
+        (artifactProof !== null &&
+          materialization.artifactManifestDigest ===
+            artifactProof.artifactManifestDigest &&
+          materialization.modeledDigest === artifactProof.modeledDigest)) &&
       typeof stagedRoot.device === "string" &&
       /^(?:0|[1-9][0-9]*)$/u.test(stagedRoot.device) &&
       typeof stagedRoot.inode === "string" &&
@@ -925,6 +942,11 @@ export class StoppedDirectoryPublication {
 
       publicationMayHaveOccurred = true;
       const journalAuthority = await this.#journal.describeAuthority();
+      const journalFilesystem = await inspectFilesystem(
+        this.#inspectFilesystem,
+        journalAuthority.path,
+        "uncertain",
+      );
       ensure(
         !pathIsAtOrInside(source.path, journalAuthority.path) &&
           !pathIsAtOrInside(candidatePath, journalAuthority.path) &&
@@ -972,6 +994,7 @@ export class StoppedDirectoryPublication {
           const recordedPublication = exactOptions(recordedBinding.publication, [
             "contractVersion",
             "destination",
+            "journal",
             "publicationKind",
             "source",
           ]);
@@ -988,6 +1011,13 @@ export class StoppedDirectoryPublication {
       }
       const publicationBinding = Object.freeze({
         contractVersion: PUBLICATION_CONTRACT_VERSION,
+        journal: Object.freeze({
+          filesystem: journalFilesystem,
+          root: Object.freeze({
+            device: journalAuthority.device,
+            inode: journalAuthority.inode,
+          }),
+        }),
         publicationKind: options.kind,
         source: Object.freeze({
           artifactProof,
@@ -1019,6 +1049,7 @@ export class StoppedDirectoryPublication {
       if (state === "committed") {
         commitState = "committed";
         const materialization = validateMaterialization(prepared.record.materialization, {
+          artifactProof,
           finalName,
           kind: options.kind,
           operationId,
@@ -1068,6 +1099,7 @@ export class StoppedDirectoryPublication {
             candidatePath,
             checkpoint: prepared.record.result.checkpoint,
             finalName,
+            journalAuthority,
             kind: options.kind,
             operationId,
             artifactProof,
@@ -1087,6 +1119,7 @@ export class StoppedDirectoryPublication {
         const materialization = validateMaterialization(
           materialized.record.materialization,
           {
+            artifactProof,
             finalName,
             kind: options.kind,
             operationId,
@@ -1294,6 +1327,7 @@ export class StoppedDirectoryPublication {
     candidatePath,
     checkpoint,
     finalName,
+    journalAuthority,
     kind,
     operationId,
     source,
@@ -1342,9 +1376,11 @@ export class StoppedDirectoryPublication {
       await runFault(this.#faults.afterCandidateCreated);
       const payload = join(candidatePath, "payload");
       await copyStoppedTreeBetweenRoots({
+        allowAbsoluteSymlinks: false,
         allowSourceRootMount: true,
         destination: payload,
         destinationOwnedRoot: candidatePath,
+        forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
         source: source.path,
         sourceOwnedRoot: sourceAuthority.path,
       });
@@ -1358,10 +1394,12 @@ export class StoppedDirectoryPublication {
       );
     } else {
       await copyStoppedTreeBetweenRoots({
+        allowAbsoluteSymlinks: false,
         afterDestinationRootCreated: async () =>
           runFault(this.#faults.afterCandidateCreated),
         destination: candidatePath,
         destinationOwnedRoot: targetAuthority.path,
+        forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
         source: sourceTree,
         sourceOwnedRoot,
       });

@@ -32,8 +32,12 @@ superseded_by:
   recovery evidence rather than deleted speculatively.
 - Restore binds a trusted capture operation ID, payload digest, and canonical
   manifest digest from committed catalogue state; payload and manifest bytes
-  cannot authenticate themselves. Journal topology is pinned and rejected
-  when it would be copied into a source or published tree.
+  cannot authenticate themselves. Materialized restore replay rechecks both
+  recorded digests against that proof before trusting a retained stage.
+- Journal topology is pinned, its approved local-filesystem profile and root
+  identity are durably bound to the operation, and publication rejects all
+  absolute source symlinks so mutable host aliases cannot redirect a portable
+  artefact into the journal authority after validation.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

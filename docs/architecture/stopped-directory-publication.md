@@ -81,9 +81,15 @@ way that collapses their roles.
 The operation journal exposes its pinned canonical directory and device/inode
 identity only to this physical layer. Publication rejects a journal directory
 that is the capture source, lies within the captured source, or lies within a
-retained staging/final tree. The absolute journal path is used only for this
-local topology check and is never persisted in the artefact or operation
-binding.
+retained staging/final tree. Publication rejects every absolute symlink because
+an external path component can change after validation and because host paths
+are not portable; relocatable relative symlinks remain supported. The reusable
+copy primitive also supports explicit path and device/inode deny authorities
+for callers that retain its compatible absolute-link behavior. The journal's
+approved local-filesystem profile and root device/inode are fixed in the
+operation binding so a retry cannot silently move the journal to different
+storage. The absolute journal path is used only for local topology checks and
+is never persisted in the artefact or operation binding.
 
 All operations under one publication-root identity are serialized in-process
 and cross-process by one protected publication lock. This is required even for
@@ -114,8 +120,9 @@ uses the final path.
 One publication attempt holds the publication-root lock and pinned directory
 authority through the complete sequence:
 
-1. validate the exact operation, local filesystem profile, private root,
-   source, final target, and current recovery topology;
+1. validate the exact operation, local filesystem profiles for the source,
+   target, and journal, private roots, source, final target, and current
+   recovery topology;
 2. call `journal.prepare()` to durably fix the operation binding, storage
    request, checkpoint descriptor, and predetermined exact result before any
    physical materialisation begins;
@@ -187,7 +194,9 @@ does not infer a physical result from an incomplete journal transition.
 Exact recovery never changes the operation ID, target, descriptor,
 predetermined result, or materialisation metadata. A different operation ID
 cannot adopt an existing final object even when its payload bytes happen to
-match.
+match. Restore recovery additionally rejects a recorded materialisation whose
+manifest or modeled digest no longer matches the trusted `artifactProof`, even
+if an attacker supplied a staged tree with matching device/inode metadata.
 
 ## Failure and Commit Classification
 
