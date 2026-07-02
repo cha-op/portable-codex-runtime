@@ -54,6 +54,14 @@ superseded_by:
 - Prepared records with an unexpected final tree remain explicit recovery
   inconsistencies rather than rename uncertainty. Host adapters can inject the
   trusted ACL inspection capability used consistently by root pinning and copy.
+- Read-only source/journal/target topology checks now run before publication
+  lock creation and repeat while locked. Every injected callback is followed
+  by pinned root-authority revalidation before further source reads or target
+  writes.
+- Missing or non-directory source leaves are classified only after historical
+  journal discovery, so materialized/committed replay can use its recorded
+  source binding. Restore repeatedly requires the checkpoint bundle root to
+  contain exactly `artifact.json` and `payload/`.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

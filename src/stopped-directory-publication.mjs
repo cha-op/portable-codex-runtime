@@ -271,7 +271,7 @@ function rootIdentity(authority) {
   });
 }
 
-async function inspectDirectDirectory(authority, value, { mustExist = true } = {}) {
+async function inspectDirectSource(authority, value) {
   ensure(
     typeof value === "string" && isAbsolute(value) && resolve(value) === value,
     "invalid_publication_request",
@@ -280,30 +280,181 @@ async function inspectDirectDirectory(authority, value, { mustExist = true } = {
   try {
     parent = await realpath(dirname(value));
   } catch {
-    fail("invalid_publication_request");
+    fail("publication_outcome_uncertain", "uncertain");
   }
   ensure(parent === authority.path, "invalid_publication_request");
   const path = join(parent, assertDirectName(basename(value)));
-  let identity;
+  let observedIdentity;
   try {
-    identity = await lstat(path, { bigint: true });
+    observedIdentity = await lstat(path, { bigint: true });
   } catch (error) {
-    if (!mustExist && error?.code === "ENOENT") {
-      await authority.assertCurrent().catch(() => fail("invalid_publication_request"));
-      return Object.freeze({ identity: null, name: basename(path), path });
+    if (error?.code !== "ENOENT") {
+      fail("publication_outcome_uncertain", "uncertain");
     }
-    fail("invalid_publication_request");
+    observedIdentity = null;
   }
-  ensure(
-    identity.isDirectory() && !identity.isSymbolicLink(),
-    "invalid_publication_request",
-  );
   try {
     await authority.assertCurrent();
   } catch {
-    fail("invalid_publication_request");
+    fail("publication_outcome_uncertain", "uncertain");
   }
-  return Object.freeze({ identity, name: basename(path), path });
+  const isDirectory =
+    observedIdentity !== null &&
+    observedIdentity.isDirectory() &&
+    !observedIdentity.isSymbolicLink();
+  return Object.freeze({
+    identity: isDirectory ? observedIdentity : null,
+    kind: observedIdentity === null ? "missing" : isDirectory ? "directory" : "other",
+    name: basename(path),
+    path,
+  });
+}
+
+async function assertPublicationAuthoritiesCurrent(
+  sourceAuthority,
+  targetAuthority,
+  code = "publication_integrity_failed",
+  commitState = "not-committed",
+) {
+  try {
+    await sourceAuthority.assertCurrent();
+    await targetAuthority.assertCurrent();
+  } catch {
+    fail(code, commitState);
+  }
+}
+
+async function assertPublicationAuthoritiesForState(
+  sourceAuthority,
+  targetAuthority,
+  state,
+) {
+  if (state === "committed") {
+    return assertPublicationAuthoritiesCurrent(
+      sourceAuthority,
+      targetAuthority,
+      "published_state_invalid",
+      "committed",
+    );
+  }
+  if (state === "materialized") {
+    return assertPublicationAuthoritiesCurrent(
+      sourceAuthority,
+      targetAuthority,
+      "publication_outcome_uncertain",
+      "uncertain",
+    );
+  }
+  return assertPublicationAuthoritiesCurrent(
+    sourceAuthority,
+    targetAuthority,
+  );
+}
+
+async function assertPublicationTopology({
+  code = "invalid_publication_request",
+  commitState = "uncertain",
+  journalAuthority,
+  journalIdentity,
+  source,
+  sourceAuthority,
+  targetAuthority,
+}) {
+  await assertPublicationAuthoritiesCurrent(
+    sourceAuthority,
+    targetAuthority,
+    code,
+    commitState,
+  );
+  ensure(
+    pathsAreDisjoint(sourceAuthority.path, journalAuthority.path) &&
+      pathsAreDisjoint(targetAuthority.path, journalAuthority.path) &&
+      !sameFileIdentity(sourceAuthority.identity, journalIdentity) &&
+      !sameFileIdentity(targetAuthority.identity, journalIdentity) &&
+      (source.identity === null ||
+        !sameFileIdentity(source.identity, journalIdentity)),
+    code,
+    commitState,
+  );
+  if (source.identity !== null) {
+    await assertDirectoryIdentity(
+      source.path,
+      source.identity,
+      code,
+      commitState,
+    );
+    let containsAuthorityIdentity;
+    try {
+      containsAuthorityIdentity = await stoppedTreeContainsAnyIdentity(
+        source.path,
+        [targetAuthority.identity, journalIdentity],
+      );
+    } catch {
+      fail(code, commitState);
+    }
+    ensure(
+      !containsAuthorityIdentity,
+      code,
+      commitState,
+    );
+    await assertDirectoryIdentity(
+      source.path,
+      source.identity,
+      code,
+      commitState,
+    );
+  }
+  await assertPublicationAuthoritiesCurrent(
+    sourceAuthority,
+    targetAuthority,
+    code,
+    commitState,
+  );
+}
+
+async function assertPublicationTopologyForState(options, state) {
+  if (state === "unknown") return assertPublicationTopology(options);
+  if (state === "committed") {
+    return assertPublicationTopology({
+      ...options,
+      code: "published_state_invalid",
+      commitState: "committed",
+    });
+  }
+  if (state === "materialized") {
+    return assertPublicationTopology({
+      ...options,
+      code: "publication_outcome_uncertain",
+      commitState: "uncertain",
+    });
+  }
+  return assertPublicationTopology({
+    ...options,
+    code: "publication_integrity_failed",
+    commitState: "not-committed",
+  });
+}
+
+async function assertExactCheckpointBundleRoot(
+  path,
+  code = "publication_integrity_failed",
+  commitState = "not-committed",
+) {
+  let entries;
+  try {
+    entries = await readdir(path, { encoding: "buffer" });
+  } catch {
+    fail(code, commitState);
+  }
+  const artifactName = Buffer.from("artifact.json");
+  const payloadName = Buffer.from("payload");
+  ensure(
+    entries.length === 2 &&
+      entries.some((entry) => entry.equals(artifactName)) &&
+      entries.some((entry) => entry.equals(payloadName)),
+    code,
+    commitState,
+  );
 }
 
 async function inspectPath(
@@ -1011,10 +1162,9 @@ export class StoppedDirectoryPublication {
           !sameFileIdentity(sourceAuthority.identity, targetAuthority.identity),
         "invalid_publication_request",
       );
-      const source = await inspectDirectDirectory(
+      const source = await inspectDirectSource(
         sourceAuthority,
         options.sourceDirectory,
-        { mustExist: false },
       );
       ensure(
         typeof options.finalDirectory === "string" &&
@@ -1043,16 +1193,6 @@ export class StoppedDirectoryPublication {
         "invalid_publication_request",
       );
 
-      try {
-        lock = await this.#acquireLock(
-          join(targetAuthority.path, ".stopped-directory-publication.lock"),
-        );
-        await lock.assertHeld();
-        await targetAuthority.assertCurrent();
-      } catch {
-        fail("publication_outcome_uncertain", "uncertain");
-      }
-
       publicationMayHaveOccurred = true;
       const journalAuthority = await this.#journal.describeAuthority();
       const journalFilesystem = await inspectFilesystem(
@@ -1076,41 +1216,39 @@ export class StoppedDirectoryPublication {
         if (internalErrors.has(error)) throw error;
         fail("invalid_publication_request", "uncertain");
       }
-      ensure(
-        pathsAreDisjoint(sourceAuthority.path, journalAuthority.path) &&
-          pathsAreDisjoint(targetAuthority.path, journalAuthority.path) &&
-          (sourceAuthority.identity.dev.toString() !== journalAuthority.device ||
-            sourceAuthority.identity.ino.toString() !== journalAuthority.inode) &&
-          (targetAuthority.identity.dev.toString() !== journalAuthority.device ||
-            targetAuthority.identity.ino.toString() !== journalAuthority.inode) &&
-          (source.identity === null ||
-            source.identity.dev.toString() !== journalAuthority.device ||
-            source.identity.ino.toString() !== journalAuthority.inode),
-        "invalid_publication_request",
-        "uncertain",
-      );
-      if (source.identity !== null) {
-        let containsAuthorityIdentity;
-        try {
-          containsAuthorityIdentity = await stoppedTreeContainsAnyIdentity(
-            source.path,
-            [targetAuthority.identity, journalIdentity],
-          );
-        } catch {
-          fail("invalid_publication_request", "uncertain");
-        }
-        ensure(
-          !containsAuthorityIdentity,
-          "invalid_publication_request",
-          "uncertain",
+      const publicationTopology = Object.freeze({
+        journalAuthority,
+        journalIdentity,
+        source,
+        sourceAuthority,
+        targetAuthority,
+      });
+      const revalidateLockedTopology = async (state) => {
+        await assertUntrustedLockHeld(lock);
+        await assertPublicationTopologyForState(publicationTopology, state);
+      };
+      await assertPublicationTopology(publicationTopology);
+
+      try {
+        lock = await this.#acquireLock(
+          join(targetAuthority.path, ".stopped-directory-publication.lock"),
         );
+        await lock.assertHeld();
+      } catch {
+        fail("publication_outcome_uncertain", "uncertain");
       }
+      await revalidateLockedTopology("unknown");
       const observed = await this.#journal.read({ operationId });
       publicationMayHaveOccurred = false;
       if (observed.record?.state === "committed") {
         historicalCommitConfirmed = true;
         commitState = "committed";
       }
+      await assertPublicationAuthoritiesForState(
+        sourceAuthority,
+        targetAuthority,
+        observed.record?.state,
+      );
       const observedCandidate = await inspectPath(candidatePath);
       const observedFinal = await inspectPath(finalPath);
       if (observed.record === null) {
@@ -1128,13 +1266,23 @@ export class StoppedDirectoryPublication {
         this.#inspectFilesystem,
         targetAuthority.path,
       );
+      await assertPublicationAuthoritiesForState(
+        sourceAuthority,
+        targetAuthority,
+        observed.record?.state,
+      );
       let sourceFilesystem;
       if (source.identity !== null) {
         sourceFilesystem = await inspectFilesystem(this.#inspectFilesystem, source.path);
+        await assertPublicationAuthoritiesForState(
+          sourceAuthority,
+          targetAuthority,
+          observed.record?.state,
+        );
       } else {
+        if (observed.record === null) fail("invalid_publication_request");
         ensure(
-          observed.record !== null &&
-            ["materialized", "committed"].includes(observed.record.state),
+          ["materialized", "committed"].includes(observed.record.state),
           "publication_recovery_required",
         );
         try {
@@ -1160,6 +1308,7 @@ export class StoppedDirectoryPublication {
           fail("publication_integrity_failed");
         }
       }
+      await revalidateLockedTopology(observed.record?.state ?? "absent");
       const publicationBinding = Object.freeze({
         contractVersion: PUBLICATION_CONTRACT_VERSION,
         journal: Object.freeze({
@@ -1194,8 +1343,10 @@ export class StoppedDirectoryPublication {
       });
       const prepared = await this.#journal.prepare(journalInput);
       const state = prepared.record.state;
+      await revalidateLockedTopology(state);
       if (state === "prepared" && !prepared.replayed) {
         await runFault(this.#faults.afterJournalPrepared);
+        await revalidateLockedTopology(state);
       }
       if (state === "committed") {
         commitState = "committed";
@@ -1252,7 +1403,9 @@ export class StoppedDirectoryPublication {
             checkpoint: prepared.record.result.checkpoint,
             finalName,
             journalAuthority,
+            journalIdentity,
             kind: options.kind,
+            lock,
             operationId,
             artifactProof,
             source,
@@ -1261,6 +1414,7 @@ export class StoppedDirectoryPublication {
           });
           pinnedPublication = created.pinned;
           await runFault(this.#faults.afterCandidateBarrier);
+          await revalidateLockedTopology(state);
           try {
             await assertPinnedPath(
               candidatePath,
@@ -1292,6 +1446,7 @@ export class StoppedDirectoryPublication {
             materialization: created.materialization,
           });
           await runFault(this.#faults.afterMaterialized);
+          await revalidateLockedTopology(materialized.record.state);
         }
 
         const materialization = validateMaterialization(
@@ -1336,7 +1491,7 @@ export class StoppedDirectoryPublication {
             "not-committed",
           );
           await runFault(this.#faults.beforeRename);
-          await assertUntrustedLockHeld(lock);
+          await revalidateLockedTopology(materialized.record.state);
           try {
             await assertPinnedPath(
               candidatePath,
@@ -1378,6 +1533,7 @@ export class StoppedDirectoryPublication {
             fail("publication_outcome_uncertain", "uncertain");
           }
           await runFault(this.#faults.afterRename);
+          await revalidateLockedTopology(materialized.record.state);
         } else {
           publicationMayHaveOccurred = true;
           pinnedPublication = await openPinnedDirectory(finalPath, materialization);
@@ -1407,6 +1563,7 @@ export class StoppedDirectoryPublication {
           fail("publication_outcome_uncertain", "uncertain");
         }
         await runFault(this.#faults.afterParentSync);
+        await revalidateLockedTopology(materialized.record.state);
         try {
           await this.#verifyPublishedTree({
             checkpoint: materialized.record.result.checkpoint,
@@ -1427,7 +1584,9 @@ export class StoppedDirectoryPublication {
           throw error;
         }
         await runFault(this.#faults.afterFinalReadback);
+        await revalidateLockedTopology(materialized.record.state);
         await runFault(this.#faults.beforeCommit);
+        await revalidateLockedTopology(materialized.record.state);
         try {
           await assertPinnedPath(
             finalPath,
@@ -1533,7 +1692,9 @@ export class StoppedDirectoryPublication {
     checkpoint,
     finalName,
     journalAuthority,
+    journalIdentity,
     kind,
+    lock,
     operationId,
     source,
     sourceAuthority,
@@ -1543,6 +1704,18 @@ export class StoppedDirectoryPublication {
     let sourceOwnedRoot = sourceAuthority.path;
     let sourceDigest;
     let artifactManifestDigest;
+    const publicationTopology = Object.freeze({
+      journalAuthority,
+      journalIdentity,
+      source,
+      sourceAuthority,
+      targetAuthority,
+    });
+    const revalidateAfterCallback = async () => {
+      await assertUntrustedLockHeld(lock);
+      await assertPublicationTopologyForState(publicationTopology, "prepared");
+    };
+    await revalidateAfterCallback();
     await assertDirectoryIdentity(
       source.path,
       source.identity,
@@ -1550,6 +1723,7 @@ export class StoppedDirectoryPublication {
       "not-committed",
     );
     if (kind === "restore-destination") {
+      await assertExactCheckpointBundleRoot(source.path);
       const manifest = await readArtifactManifest(
         join(source.path, "artifact.json"),
         checkpoint,
@@ -1559,6 +1733,7 @@ export class StoppedDirectoryPublication {
       sourceOwnedRoot = source.path;
       await syncStoppedTree(source.path, { allowRootMount: true });
       await sourceAuthority.handle.sync();
+      await assertExactCheckpointBundleRoot(source.path);
       const stableManifest = await readArtifactManifest(
         join(source.path, "artifact.json"),
         checkpoint,
@@ -1581,16 +1756,27 @@ export class StoppedDirectoryPublication {
       artifactManifestDigest = sha256("pending-artifact-manifest\0", operationId);
     }
     await runFault(this.#faults.afterSourceBarrier);
+    await revalidateAfterCallback();
     await assertDirectoryIdentity(
       source.path,
       source.identity,
       "publication_integrity_failed",
       "not-committed",
     );
+    if (kind === "restore-destination") {
+      await assertExactCheckpointBundleRoot(source.path);
+    }
 
     if (kind === "checkpoint-artifact") {
       await createPrivateDirectory(candidatePath);
       await runFault(this.#faults.afterCandidateCreated);
+      await revalidateAfterCallback();
+      await assertDirectoryIdentity(
+        source.path,
+        source.identity,
+        "publication_integrity_failed",
+        "not-committed",
+      );
       const payload = join(candidatePath, "payload");
       await copyStoppedTreeBetweenRoots({
         allowAbsoluteSymlinks: false,
@@ -1605,6 +1791,13 @@ export class StoppedDirectoryPublication {
         sourceOwnedRoot: sourceAuthority.path,
       });
       await runFault(this.#faults.afterCopy);
+      await revalidateAfterCallback();
+      await assertDirectoryIdentity(
+        source.path,
+        source.identity,
+        "publication_integrity_failed",
+        "not-committed",
+      );
       const copiedDigest = await digestTree(payload);
       ensure(copiedDigest === sourceDigest, "publication_integrity_failed");
       const manifest = artifactManifest(checkpoint, operationId, copiedDigest);
@@ -1615,8 +1808,17 @@ export class StoppedDirectoryPublication {
     } else {
       await copyStoppedTreeBetweenRoots({
         allowAbsoluteSymlinks: false,
-        afterDestinationRootCreated: async () =>
-          runFault(this.#faults.afterCandidateCreated),
+        afterDestinationRootCreated: async () => {
+          await runFault(this.#faults.afterCandidateCreated);
+          await revalidateAfterCallback();
+          await assertDirectoryIdentity(
+            source.path,
+            source.identity,
+            "publication_integrity_failed",
+            "not-committed",
+          );
+          await assertExactCheckpointBundleRoot(source.path);
+        },
         destination: candidatePath,
         destinationOwnedRoot: targetAuthority.path,
         forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
@@ -1626,6 +1828,14 @@ export class StoppedDirectoryPublication {
         sourceOwnedRoot,
       });
       await runFault(this.#faults.afterCopy);
+      await revalidateAfterCallback();
+      await assertDirectoryIdentity(
+        source.path,
+        source.identity,
+        "publication_integrity_failed",
+        "not-committed",
+      );
+      await assertExactCheckpointBundleRoot(source.path);
     }
 
     await syncStoppedTree(candidatePath);
@@ -1651,6 +1861,7 @@ export class StoppedDirectoryPublication {
         "publication_integrity_failed",
       );
     } else {
+      await assertExactCheckpointBundleRoot(source.path);
       const manifest = await readArtifactManifest(
         join(source.path, "artifact.json"),
         checkpoint,
@@ -1687,15 +1898,7 @@ export class StoppedDirectoryPublication {
   }) {
     try {
       if (kind === "checkpoint-artifact") {
-        const entries = await readdir(path, { encoding: "buffer" });
-        const artifactName = Buffer.from("artifact.json");
-        const payloadName = Buffer.from("payload");
-        ensure(
-          entries.length === 2 &&
-            entries.some((entry) => entry.equals(artifactName)) &&
-            entries.some((entry) => entry.equals(payloadName)),
-          "publication_integrity_failed",
-        );
+        await assertExactCheckpointBundleRoot(path);
         const manifest = await readArtifactManifest(join(path, "artifact.json"), checkpoint);
         const digest = await digestTree(join(path, "payload"));
         ensure(

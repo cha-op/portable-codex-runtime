@@ -130,12 +130,14 @@ uses the final path.
 
 ## Ordered State Machine
 
-One publication attempt holds the publication-root lock and pinned directory
-authority through the complete sequence:
+One publication attempt first performs a read-only topology preflight, then
+holds the publication-root lock and pinned directory authorities through the
+remaining sequence:
 
-1. validate the exact operation, local filesystem profiles for the source,
-   target, and journal, private roots, source, final target, and current
-   recovery topology;
+1. validate the exact operation, journal profile, private roots, source, final
+   target, and current recovery topology before creating the publication lock;
+   after acquiring the lock, repeat the authority, identity, and topology
+   checks before reading or advancing the journal;
 2. call `journal.prepare()` to durably fix the operation binding, storage
    request, checkpoint descriptor, and predetermined exact result before any
    physical materialisation begins;
@@ -143,8 +145,11 @@ authority through the complete sequence:
    tree, fsyncing regular files, and fsyncing directories in post-order so each
    directory is synced only after its descendants; symlink entries are made
    durable by their containing directory; recheck that the source pathname
-   still names the caller-observed root inode both before and after the barrier,
-   and require that same identity when the copy opens its source root;
+   still names the caller-observed root inode and that both owned-root
+   authorities remain current before and after every injected callback, and
+   require that same identity when the copy opens its source root; restore also
+   requires the source bundle root to contain exactly `artifact.json` and
+   `payload/` at each stable readback;
 4. create the operation's deterministic private staging directory with
    exclusive creation and copy either the stopped source into a checkpoint
    bundle or the validated bundle payload into a restore tree;
@@ -252,6 +257,12 @@ deterministic caller error. A malformed persisted materialisation is journal
 integrity failure while uncommitted and `published_state_invalid` when its
 record is already committed; it is never reclassified as a caller argument
 error.
+
+A syntactically valid source leaf that is missing, a file, or a symlink is
+classified only after the journal is read under the publication lock. It is a
+caller error for a new operation and recovery-required for `prepared`, but a
+`materialized` or `committed` replay uses the recorded source binding and does
+not reopen or recopy that leaf.
 
 Production root ACL inspection uses the stopped-tree platform defaults. A host
 adapter that provides an equivalent trusted ACL capability may inject
