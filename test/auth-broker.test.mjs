@@ -221,6 +221,7 @@ let brokerInstanceSequence = 0;
 
 function makeBroker({
   minTokenTtlSeconds = 120,
+  now = () => NOW,
   randomUUID,
   refreshAdapter = async () => refreshedCredential(),
   store = new FakeStore(),
@@ -229,7 +230,7 @@ function makeBroker({
   let sequence = 0;
   return new AuthBroker({
     minTokenTtlSeconds,
-    now: () => NOW,
+    now,
     randomUUID: randomUUID ?? (() => `uuid-${instanceId}-${++sequence}`),
     refreshAdapter,
     store,
@@ -371,6 +372,70 @@ test("caller TTL cannot lower the broker safety floor", async () => {
   assert.equal(grant.generation, "3");
   assert.notEqual(grant.accessToken, ACCESS_TOKEN_1);
   assert.equal(grant.expiresAt, isoAfter(600));
+});
+
+test("invalid clock readings fail closed before returning credentials", async (t) => {
+  for (const [name, now] of [
+    ["NaN", () => Number.NaN],
+    ["negative infinity", () => Number.NEGATIVE_INFINITY],
+    [
+      "throwing clock",
+      () => {
+        throw new Error("private clock failure");
+      },
+    ],
+  ]) {
+    await t.test(name, async () => {
+      const store = new FakeStore();
+      await makeBroker({ store }).installCredential(makeCredential());
+      let refreshCalls = 0;
+      const broker = makeBroker({
+        now,
+        refreshAdapter: async () => {
+          refreshCalls += 1;
+          return refreshedCredential();
+        },
+        store,
+      });
+
+      await expectBrokerError(() => broker.getGrant({ minTtlSeconds: 0 }), "invalid_request");
+      assert.equal(refreshCalls, 0);
+    });
+  }
+});
+
+test("an invalid clock blocks forced and worker refresh before reservation", async () => {
+  const store = new FakeStore({ coordinationKey: "invalid-clock-refresh" });
+  let clock = NOW;
+  let refreshCalls = 0;
+  const broker = makeBroker({
+    now: () => clock,
+    refreshAdapter: async () => {
+      refreshCalls += 1;
+      return refreshedCredential();
+    },
+    store,
+  });
+  await broker.installCredential(makeCredential());
+  await broker.workerLoginParams();
+  clock = Number.NaN;
+
+  await expectBrokerError(() => broker.refreshGrant(), "invalid_request");
+  await expectBrokerError(
+    () =>
+      broker.handleWorkerRefresh({
+        previousAccountId: ACCOUNT_ID,
+        reason: "unauthorized",
+      }),
+    "invalid_request",
+  );
+  assert.equal(refreshCalls, 0);
+  assert.deepEqual(await makeBroker({ store }).snapshot(), {
+    expiresAt: isoAfter(3600),
+    generation: "1",
+    schemaVersion: 1,
+    status: "ready",
+  });
 });
 
 test("a new broker instance reads the durable generation from the store", async () => {
@@ -1471,6 +1536,40 @@ test("worker refresh callbacks stay bound to the account actually issued", async
   );
   assert.equal(refreshCalls, 0);
   assert.equal((await makeBroker({ store }).getGrant()).accountId, "account-2");
+});
+
+test("worker refresh callbacks stay bound to the user actually issued", async () => {
+  const store = new FakeStore({ coordinationKey: "worker-user-binding" });
+  let refreshCalls = 0;
+  const workerBroker = makeBroker({
+    refreshAdapter: async () => {
+      refreshCalls += 1;
+      return refreshedCredential();
+    },
+    store,
+  });
+  await workerBroker.installCredential(makeCredential());
+  await workerBroker.workerLoginParams();
+  const replacement = makeCredential({
+    marker: "access-user-2",
+    refreshToken: "refresh-user-2",
+    userId: "user-2",
+  });
+  await makeBroker({ store }).installCredential(replacement);
+
+  await expectBrokerError(
+    () =>
+      workerBroker.handleWorkerRefresh({
+        previousAccountId: ACCOUNT_ID,
+        reason: "unauthorized",
+      }),
+    "invalid_request",
+  );
+  assert.equal(refreshCalls, 0);
+  assert.equal(
+    JSON.parse((await store.read()).payload).userId,
+    "user-2",
+  );
 });
 
 test("a stale worker callback receives the newer generation without rotating again", async () => {

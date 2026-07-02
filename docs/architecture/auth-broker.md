@@ -132,14 +132,16 @@ This is structural continuity validation, not JWT signature verification; the
 trusted OAuth adapter remains responsible for obtaining tokens from the pinned
 Codex/provider path.
 Ordinary blocked payloads contain only an allowlisted reason. A refresh
-reservation additionally carries a unique non-secret owner ID and a SHA-256
-digest of the source access token. The ID prevents ABA ownership confusion;
-the digest lets a late caller distinguish a changed access credential from a
-trusted pre-dispatch restore. Neither field can be used as a credential. The
-reservation therefore removes the old auth JSON from canonical state before
-OAuth can consume its refresh token. A crash or unreconciled storage failure
-leaves a non-reusable durable block instead of an old credential. The durable store
-generation is the only published generation; the spike's process-local counter
+reservation additionally carries a unique non-secret owner ID and SHA-256
+digests of the source access and refresh tokens. The ID prevents ABA ownership
+confusion; the access digest lets a late caller distinguish a changed access
+credential from a trusted pre-dispatch restore, while both digests fence
+explicit recovery against republishing either source token. None can be used
+as a credential. The reservation therefore removes the old auth JSON from
+canonical state before OAuth can consume its refresh token. A crash or
+unreconciled storage failure leaves a non-reusable durable block instead of an
+old credential. The durable store generation is the only published generation;
+the spike's process-local counter
 is not reused.
 
 `AuthBroker` provides:
@@ -255,9 +257,9 @@ task. It then returns exactly:
 The response never includes the refresh token, ID token, raw auth JSON,
 generation, key ID, or authority storage path. Workers never mount the broker
 state directory and never persist `auth.json`.
-The facade also privately binds callbacks to the account ID actually issued by
-the preceding login response, so an old worker cannot claim a newly installed
-account and receive its access token.
+The facade also privately binds callbacks to the account and user identities
+actually issued by the preceding login response, so an old worker cannot claim
+a newly installed identity and receive its access token.
 
 ## Failure and Recovery Rules
 
@@ -275,6 +277,9 @@ account and receive its access token.
   authority safety TTL
   moves canonical state to `recovery-required` and prevents reuse of the old
   refresh token. A higher caller-specific TTL never changes durable state.
+- Clock reads must be finite numbers; thrown or non-finite readings fail closed
+  before the broker returns a credential or owns a refresh reservation. The
+  candidate TTL is checked again after the remote call using a fresh reading.
 - `refresh_in_progress` is reserved for the credential-free durable reservation
   shape. The same reason from an adapter failure is normalized to
   `adapter_post_dispatch_uncertain` instead of producing malformed state.

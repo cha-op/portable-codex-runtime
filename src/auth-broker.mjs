@@ -189,6 +189,14 @@ function authClaims(payload) {
   return isPlainObject(claims) ? claims : {};
 }
 
+function userIdFromAccessToken(accessToken) {
+  const userId = authClaims(decodeJwtPayload(accessToken)).chatgpt_user_id;
+  if (typeof userId !== "string" || userId.length === 0) {
+    throw new AuthBrokerError("invalid_credential");
+  }
+  return userId;
+}
+
 function matchingClaimValues(values, expected) {
   const present = values.filter((value) => value !== null && value !== undefined);
   return present.length > 0 && present.every((value) => value === expected);
@@ -438,8 +446,19 @@ function parseStoredPayload(rawPayload) {
   return canonical;
 }
 
+function readClock(now) {
+  let currentTime;
+  try {
+    currentTime = now();
+  } catch {
+    throw new AuthBrokerError("invalid_request");
+  }
+  if (!Number.isFinite(currentTime)) throw new AuthBrokerError("invalid_request");
+  return currentTime;
+}
+
 function tokenTtlSeconds(payload, now) {
-  return (parseCanonicalTimestamp(payload.expiresAt) - now()) / 1000;
+  return (parseCanonicalTimestamp(payload.expiresAt) - readClock(now)) / 1000;
 }
 
 function sensitiveGrant(generation, payload) {
@@ -578,6 +597,7 @@ export class AuthBroker {
   #workerAccessToken;
   #workerAccountId;
   #workerGeneration;
+  #workerUserId;
 
   constructor({
     minTokenTtlSeconds = DEFAULT_MIN_TOKEN_TTL_SECONDS,
@@ -611,6 +631,7 @@ export class AuthBroker {
     this.#workerAccessToken = null;
     this.#workerAccountId = null;
     this.#workerGeneration = null;
+    this.#workerUserId = null;
   }
 
   async #readCanonical() {
@@ -1064,6 +1085,7 @@ export class AuthBroker {
         return this.#grantFromCanonical(before);
       }
     }
+    readClock(this.now);
     let attemptId;
     try {
       attemptId = this.randomUUID();
@@ -1120,6 +1142,7 @@ export class AuthBroker {
     this.#workerAccessToken = grant.accessToken;
     this.#workerAccountId = grant.accountId;
     this.#workerGeneration = grant.generation;
+    this.#workerUserId = userIdFromAccessToken(grant.accessToken);
     return {
       accessToken: grant.accessToken,
       chatgptAccountId: grant.accountId,
@@ -1135,6 +1158,7 @@ export class AuthBroker {
       typeof params.previousAccountId !== "string" ||
       params.previousAccountId.length === 0 ||
       this.#workerAccountId === null ||
+      this.#workerUserId === null ||
       params.previousAccountId !== this.#workerAccountId
     ) {
       throw new AuthBrokerError("invalid_request");
@@ -1152,12 +1176,14 @@ export class AuthBroker {
         params.previousAccountId,
       );
       if (joined !== null) {
-        if (joined.accountId !== this.#workerAccountId) {
+        const joinedUserId = userIdFromAccessToken(joined.accessToken);
+        if (joined.accountId !== this.#workerAccountId || joinedUserId !== this.#workerUserId) {
           throw new AuthBrokerError("invalid_request");
         }
         this.#workerAccessToken = joined.accessToken;
         this.#workerAccountId = joined.accountId;
         this.#workerGeneration = joined.generation;
+        this.#workerUserId = joinedUserId;
         return {
           accessToken: joined.accessToken,
           chatgptAccountId: joined.accountId,
@@ -1167,7 +1193,10 @@ export class AuthBroker {
       before = await this.#readCanonical();
     }
     const current = this.#grantFromCanonical(before);
-    if (params.previousAccountId !== current.accountId) {
+    if (
+      params.previousAccountId !== current.accountId ||
+      userIdFromAccessToken(current.accessToken) !== this.#workerUserId
+    ) {
       throw new AuthBrokerError("invalid_request");
     }
     if (this.#workerGeneration === null || this.#workerAccessToken === null) {
@@ -1181,9 +1210,14 @@ export class AuthBroker {
     if (grant.accountId !== params.previousAccountId) {
       throw new AuthBrokerError("invalid_request");
     }
+    const grantUserId = userIdFromAccessToken(grant.accessToken);
+    if (grantUserId !== this.#workerUserId) {
+      throw new AuthBrokerError("invalid_request");
+    }
     this.#workerAccessToken = grant.accessToken;
     this.#workerAccountId = grant.accountId;
     this.#workerGeneration = grant.generation;
+    this.#workerUserId = grantUserId;
     return {
       accessToken: grant.accessToken,
       chatgptAccountId: grant.accountId,
