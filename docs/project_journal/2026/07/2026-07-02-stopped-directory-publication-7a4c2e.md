@@ -61,12 +61,20 @@ superseded_by:
 - Missing or non-directory source leaves are classified only after historical
   journal discovery, so materialized/committed replay can use its recorded
   source binding. Restore repeatedly requires the checkpoint bundle root to
-  contain exactly `artifact.json` and `payload/`.
+  contain exactly `artifact.json` and `payload/`. The binding now records the
+  direct source-leaf device/inode, so prepared replay rejects same-path leaf
+  replacement while later phases reconstruct the durable binding without
+  recopying the source.
 - Materialized recovery remains uncertain until current authority proves a
   candidate-only topology. The journal binds a complete retained-tree identity
   digest; recovery/readback rejects source-retained identity intersections,
   same-byte inode replacement, and candidate/final roots that no longer satisfy
-  current-user-owned `0700` ACL-free private storage.
+  their owner, pinned-mode, and ACL policy. Checkpoint envelopes remain `0700`;
+  restore payload roots retain their modeled mode inside a private `0700`
+  destination authority.
+- A pre-rename callback is treated as publication-uncertain until a held-lock
+  probe proves the staged inode is not visible at the final path, preventing a
+  callback-side rename from being misreported as definitely not committed.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

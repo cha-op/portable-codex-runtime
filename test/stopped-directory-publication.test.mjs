@@ -783,6 +783,57 @@ test("restore publication publishes a raw isolated payload and preserves its art
   );
 });
 
+test("restore preserves a modeled payload-root mode inside private storage", async (t) => {
+  let interruptAfterMaterialized = false;
+  let afterCopyCalls = 0;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterCopy() {
+        afterCopyCalls += 1;
+      },
+      async afterMaterialized() {
+        if (interruptAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  await chmod(fixture.sourceDirectory, 0o755);
+  await publishFixtureArtifact(fixture);
+  assert.equal((await lstat(fixture.artifactDirectory)).mode & 0o777, 0o700);
+  assert.equal(
+    (await lstat(join(fixture.artifactDirectory, "payload"))).mode & 0o777,
+    0o755,
+  );
+  const copyCallsAfterCapture = afterCopyCalls;
+  const options = restoreOptions(fixture);
+  interruptAfterMaterialized = true;
+
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    fixture.destinationOwnedRoot,
+    RESTORE_OPERATION_ID,
+    fixture.destinationDirectory,
+  );
+  assert.equal((await lstat(candidate)).mode & 0o777, 0o755);
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+
+  interruptAfterMaterialized = false;
+  const restored = await fixture.publication.publishRestoreDestination(options);
+  assert.deepEqual(restored.result, options.result);
+  assert.equal(afterCopyCalls, copyCallsAfterCapture + 1);
+  assert.equal((await lstat(fixture.destinationDirectory)).mode & 0o777, 0o755);
+  assert.equal(
+    await digestTree(fixture.destinationDirectory),
+    await digestTree(fixture.sourceDirectory),
+  );
+});
+
 test("an exact committed replay returns the fixed result without recopying", async (t) => {
   let afterCopyCalls = 0;
   const inspectedFilesystems = [];
@@ -907,6 +958,80 @@ test("prepared replay requires a usable source leaf without following symlinks",
       }
     });
   }
+});
+
+test("prepared replay rejects replacement of the recorded source leaf", async (t) => {
+  let failAfterJournalPrepared = true;
+  let afterCopyCalls = 0;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterCopy() {
+        afterCopyCalls += 1;
+      },
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("prepared fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  const sourceIdentity = await lstat(fixture.sourceDirectory, { bigint: true });
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const prepared = await fixture.journal.read({
+    operationId: CAPTURE_OPERATION_ID,
+  });
+  assert.equal(
+    prepared.record.binding.publication.source.directoryIdentity.device,
+    sourceIdentity.dev.toString(),
+  );
+  assert.equal(
+    prepared.record.binding.publication.source.directoryIdentity.inode,
+    sourceIdentity.ino.toString(),
+  );
+
+  await rename(
+    fixture.sourceDirectory,
+    join(fixture.root, "displaced-source-leaf"),
+  );
+  await mkdir(join(fixture.sourceDirectory, "workspace"), {
+    mode: 0o700,
+    recursive: true,
+  });
+  await writeFile(
+    join(fixture.sourceDirectory, "workspace", "README.md"),
+    "replacement\n",
+    { mode: 0o600 },
+  );
+  failAfterJournalPrepared = false;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(afterCopyCalls, 0);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+  assert.equal(
+    await pathExists(
+      candidatePath(
+        fixture.artifactOwnedRoot,
+        CAPTURE_OPERATION_ID,
+        fixture.artifactDirectory,
+      ),
+    ),
+    false,
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
 test("publication accepts trusted ACL inspectors for every owned root", async (t) => {
@@ -1341,6 +1466,73 @@ test("a candidate replacement before rename is definitely not committed", async 
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "materialized",
   );
+});
+
+test("pre-rename callback publication remains outcome-uncertain", async (t) => {
+  for (const throwAfterRename of [false, true]) {
+    await t.test(throwAfterRename ? "callback throws" : "callback returns", async (t) => {
+      let afterCopyCalls = 0;
+      let candidateIdentity;
+      let fixture;
+      fixture = await createFixture(t, {
+        faults: {
+          async afterCopy() {
+            afterCopyCalls += 1;
+          },
+          async beforeRename() {
+            const candidate = candidatePath(
+              fixture.artifactOwnedRoot,
+              CAPTURE_OPERATION_ID,
+              fixture.artifactDirectory,
+            );
+            candidateIdentity = await lstat(candidate, { bigint: true });
+            await rename(candidate, fixture.artifactDirectory);
+            if (throwAfterRename) throw new Error("pre-rename callback fault");
+          },
+        },
+      });
+      const options = captureOptions(fixture);
+
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(options),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_outcome_uncertain",
+            "uncertain",
+          ),
+      );
+      assert.equal(
+        await pathExists(
+          candidatePath(
+            fixture.artifactOwnedRoot,
+            CAPTURE_OPERATION_ID,
+            fixture.artifactDirectory,
+          ),
+        ),
+        false,
+      );
+      const finalIdentity = await lstat(fixture.artifactDirectory, {
+        bigint: true,
+      });
+      assert.equal(finalIdentity.dev, candidateIdentity.dev);
+      assert.equal(finalIdentity.ino, candidateIdentity.ino);
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+          .state,
+        "materialized",
+      );
+
+      const replayed = await fixture.publication.publishCheckpointArtifact(options);
+      assert.deepEqual(replayed.result, options.result);
+      assert.equal(afterCopyCalls, 1);
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+          .state,
+        "committed",
+      );
+    });
+  }
 });
 
 test("candidate mutation after its barrier cannot advance to materialized", async (t) => {
@@ -1997,7 +2189,7 @@ test("lock assertions run before the final candidate durability barrier", async 
   );
 });
 
-test("lock loss in the pre-rename callback prevents publication", async (t) => {
+test("lock loss in the pre-rename callback is publication-uncertain", async (t) => {
   let lockHeld = true;
   let renameCalls = 0;
   const fixture = await createFixture(t, {
@@ -2022,8 +2214,8 @@ test("lock loss in the pre-rename callback prevents publication", async (t) => {
     (error) =>
       assertPublicationError(
         error,
-        "publication_io_failed",
-        "not-committed",
+        "publication_outcome_uncertain",
+        "uncertain",
       ),
   );
   assert.equal(renameCalls, 0);

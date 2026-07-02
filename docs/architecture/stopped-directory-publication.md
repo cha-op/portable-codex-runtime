@@ -139,8 +139,8 @@ remaining sequence:
    after acquiring the lock, repeat the authority, identity, and topology
    checks before reading or advancing the journal;
 2. call `journal.prepare()` to durably fix the operation binding, storage
-   request, checkpoint descriptor, and predetermined exact result before any
-   physical materialisation begins;
+   request, checkpoint descriptor, direct source-leaf device/inode, and
+   predetermined exact result before any physical materialisation begins;
 3. establish the stopped source storage barrier by opening and validating the
    tree, fsyncing regular files, and fsyncing directories in post-order so each
    directory is synced only after its descendants; symlink entries are made
@@ -164,14 +164,18 @@ remaining sequence:
    `journal.markMaterialized()` with the fixed digests and device/inode
    identity encoded as canonical decimal strings plus a domain-separated digest
    of every retained subtree identity; reject any identity shared with the
-   stopped source, and re-open the staging root as current-user-owned, mode
-   `0700`, extended-ACL-free private storage; `materialized` therefore means a
+   stopped source, and re-open the staging root as current-user-owned and
+   extended-ACL-free. Checkpoint bundle envelopes remain mode `0700`; restore
+   payload roots retain and pin their modeled portable mode inside the mode
+   `0700` destination storage authority. `materialized` therefore means a
    complete, durable, unpublished staging object, not merely that copy returned;
 7. revalidate the publication root, lock, held staging inode, and absent final
-   destination; after the last pre-rename callback, reassert the lock and repeat
-   the full staged-tree fsync, publication-parent sync, exact readback, and
-   pinned identity checks, then ask the trusted lock holder to atomically rename
-   staging to final with an absent-destination precondition;
+   destination; treat the last pre-rename callback as publication-uncertain
+   until a held-lock final-path probe proves that the staged inode is not
+   visible there, then repeat the full staged-tree fsync, publication-parent
+   sync, exact readback, and pinned identity checks before asking the trusted
+   lock holder to atomically rename staging to final with an absent-destination
+   precondition;
 8. prove that the final pathname names the held staged inode, fsync the held
    publication parent, and perform exact held-inode, payload-digest, and
    `artifact.json` readback; restore readback verifies the payload digest and
@@ -264,15 +268,20 @@ A syntactically valid source leaf that is missing, a file, or a symlink is
 classified only after the journal is read under the publication lock. It is a
 caller error for a new operation and recovery-required for `prepared`, but a
 `materialized` or `committed` replay uses the recorded source binding and does
-not reopen or recopy that leaf.
+not reopen or recopy that leaf. The binding includes the direct source-leaf
+device/inode: `prepared` replay must still name that exact leaf, while later
+states reconstruct the exact binding from the durable record even if the source
+leaf is gone or replaced.
 
 For a `materialized` replay, physical outcome stays `uncertain` until both
 candidate and final probes succeed and prove candidate-present/final-absent
 under the current target authority. Retained candidate/final verification also
 recomputes the complete subtree-identity digest, rejects any current identity
-intersection with an available stopped source, and revalidates owner, `0700`
-mode, and ACLs. Same-byte inode replacement or permission broadening therefore
-cannot advance to rename or committed replay.
+intersection with an available stopped source, and revalidates owner, pinned
+mode, and ACLs. Checkpoint envelopes require `0700`; restore payload roots use
+their digest-bound portable mode beneath a private `0700` storage authority.
+Same-byte inode replacement or permission broadening therefore cannot advance
+to rename or committed replay.
 
 Production root ACL inspection uses the stopped-tree platform defaults. A host
 adapter that provides an equivalent trusted ACL capability may inject

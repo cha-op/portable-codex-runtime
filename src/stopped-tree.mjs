@@ -251,6 +251,7 @@ async function openPrivateOwnedRootAuthority(
   {
     inspectAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
     inspectRootAcl = recoveryPathHasExtendedAcl,
+    modeledRoot = false,
   } = {},
 ) {
   const requestedRoot = resolve(ownedRoot);
@@ -266,11 +267,16 @@ async function openPrivateOwnedRootAuthority(
     BigInt(currentUid),
     "stopped-tree owned root must be owned by this user",
   );
-  assert.equal(
-    Number(metadata.mode & 0o777n),
-    0o700,
-    "stopped-tree owned root must have mode 0700",
-  );
+  const rootMode = Number(metadata.mode & 0o777n);
+  if (modeledRoot) {
+    assert.equal(
+      metadata.mode & 0o7000n,
+      0n,
+      "stopped-tree modeled root must not have special mode bits",
+    );
+  } else {
+    assert.equal(rootMode, 0o700, "stopped-tree owned root must have mode 0700");
+  }
   const canonicalRoot = await realpath(requestedRoot);
   await assertPathIdentity(
     requestedRoot,
@@ -324,6 +330,7 @@ async function openPrivateOwnedRootAuthority(
       identity: metadata,
       inspectAncestorAcl,
       inspectRootAcl,
+      mode: rootMode,
       path: canonicalRoot,
     };
     authority.assertCurrent = async () => {
@@ -336,7 +343,8 @@ async function openPrivateOwnedRootAuthority(
           sameFileIdentity(current, authority.identity) &&
           sameFileIdentity(held, authority.identity) &&
           current.uid === BigInt(authority.currentUid) &&
-          Number(current.mode & 0o777n) === 0o700,
+          Number(current.mode & 0o777n) === authority.mode &&
+          (current.mode & 0o7000n) === 0n,
         "stopped-tree copy rejects owned-root identity or permission changes",
       );
       await inspectStoppedTreeAcl(
@@ -404,6 +412,41 @@ export async function openStoppedTreeRootAuthority(
       dev: authority.identity.dev,
       ino: authority.identity.ino,
     }),
+    mode: authority.mode,
+    path: authority.path,
+  });
+}
+
+/**
+ * Opens and pins a stopped-tree payload root whose portable mode is part of
+ * the modeled tree. The containing storage authority remains private.
+ */
+export async function openStoppedTreeModeledRootAuthority(
+  modeledRoot,
+  {
+    inspectAncestorAcl,
+    inspectOwnedRootAcl,
+    inspectOwnedRootAncestorAcl,
+    inspectRootAcl,
+  } = {},
+) {
+  const authority = await openPrivateOwnedRootAuthority(modeledRoot, {
+    inspectAncestorAcl:
+      inspectOwnedRootAncestorAcl ??
+      inspectAncestorAcl ??
+      recoveryPathHasUnsafeAncestorAcl,
+    inspectRootAcl:
+      inspectOwnedRootAcl ?? inspectRootAcl ?? recoveryPathHasExtendedAcl,
+    modeledRoot: true,
+  });
+  return Object.freeze({
+    assertCurrent: authority.assertCurrent,
+    handle: authority.handle,
+    identity: Object.freeze({
+      dev: authority.identity.dev,
+      ino: authority.identity.ino,
+    }),
+    mode: authority.mode,
     path: authority.path,
   });
 }
