@@ -158,6 +158,7 @@ async function assertPathAbsent(path) {
 }
 
 async function createFixture(t, publicationOptions = {}) {
+  const { journalFaults, ...stoppedPublicationOptions } = publicationOptions;
   const root = await mkdtemp(
     join(tmpdir(), "stopped-directory-publication-test-"),
   );
@@ -193,6 +194,7 @@ async function createFixture(t, publicationOptions = {}) {
   const journal = new FilesystemOperationJournal({
     directory: journalDirectory,
     acquireLock: simpleLockProvider(),
+    ...(journalFaults === undefined ? {} : { faults: journalFaults }),
     ...TRUSTED_JOURNAL_ACL_INSPECTORS,
   });
   const publication = new StoppedDirectoryPublication({
@@ -202,7 +204,7 @@ async function createFixture(t, publicationOptions = {}) {
       durability: "local-fsync-rename",
       type: "test-local",
     }),
-    ...publicationOptions,
+    ...stoppedPublicationOptions,
   });
   const artifactDirectory = join(artifactOwnedRoot, ARTIFACT_ID);
   const destinationDirectory = join(destinationOwnedRoot, "restored-session");
@@ -1034,6 +1036,67 @@ test("prepared replay rejects replacement of the recorded source leaf", async (t
   assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
+test("prepared topology probe failures remain publication-uncertain", async (t) => {
+  let failAfterJournalPrepared = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("prepared fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  failAfterJournalPrepared = false;
+
+  class TargetBlockingJournal extends FilesystemOperationJournal {
+    async read(readOptions) {
+      const outcome = await super.read(readOptions);
+      if (outcome.record?.state === "prepared") {
+        await chmod(fixture.artifactOwnedRoot, 0o600);
+      }
+      return outcome;
+    }
+  }
+  const blockingJournal = new TargetBlockingJournal({
+    directory: fixture.journalDirectory,
+    acquireLock: simpleLockProvider(),
+    ...TRUSTED_JOURNAL_ACL_INSPECTORS,
+  });
+  const publication = new StoppedDirectoryPublication({
+    journal: blockingJournal,
+    acquireLock: simpleLockProvider(),
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      type: "test-local",
+    }),
+    inspectOwnedRootAcl: async () => false,
+    inspectOwnedRootAncestorAcl: async () => false,
+  });
+
+  try {
+    await assert.rejects(
+      publication.publishCheckpointArtifact(options),
+      (error) =>
+        assertPublicationError(
+          error,
+          "publication_outcome_uncertain",
+          "uncertain",
+        ),
+    );
+  } finally {
+    await chmod(fixture.artifactOwnedRoot, 0o700);
+  }
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+});
+
 test("publication accepts trusted ACL inspectors for every owned root", async (t) => {
   const inspectedRoots = [];
   const inspectedAncestors = [];
@@ -1535,6 +1598,75 @@ test("pre-rename callback publication remains outcome-uncertain", async (t) => {
   }
 });
 
+test("post-candidate-barrier publication remains outcome-uncertain", async (t) => {
+  for (const throwAfterRename of [false, true]) {
+    await t.test(throwAfterRename ? "callback throws" : "callback returns", async (t) => {
+      let afterCopyCalls = 0;
+      let candidateIdentity;
+      let fixture;
+      fixture = await createFixture(t, {
+        faults: {
+          async afterCandidateBarrier() {
+            const candidate = candidatePath(
+              fixture.artifactOwnedRoot,
+              CAPTURE_OPERATION_ID,
+              fixture.artifactDirectory,
+            );
+            candidateIdentity = await lstat(candidate, { bigint: true });
+            await rename(candidate, fixture.artifactDirectory);
+            if (throwAfterRename) throw new Error("candidate callback fault");
+          },
+          async afterCopy() {
+            afterCopyCalls += 1;
+          },
+        },
+      });
+      const options = captureOptions(fixture);
+
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(options),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_outcome_uncertain",
+            "uncertain",
+          ),
+      );
+      assert.equal(
+        await pathExists(
+          candidatePath(
+            fixture.artifactOwnedRoot,
+            CAPTURE_OPERATION_ID,
+            fixture.artifactDirectory,
+          ),
+        ),
+        false,
+      );
+      const finalIdentity = await lstat(fixture.artifactDirectory, {
+        bigint: true,
+      });
+      assert.equal(finalIdentity.dev, candidateIdentity.dev);
+      assert.equal(finalIdentity.ino, candidateIdentity.ino);
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+          .state,
+        "prepared",
+      );
+
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(options),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_outcome_uncertain",
+            "uncertain",
+          ),
+      );
+      assert.equal(afterCopyCalls, 1);
+    });
+  }
+});
+
 test("candidate mutation after its barrier cannot advance to materialized", async (t) => {
   let fixture;
   fixture = await createFixture(t, {
@@ -1977,7 +2109,7 @@ test("a prepared leftover candidate fails closed and is retained", async (t) => 
   assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
-test("a stray final beside a prepared record requires recovery", async (t) => {
+test("a final beside a prepared record is publication-uncertain", async (t) => {
   let failAfterJournalPrepared = true;
   const fixture = await createFixture(t, {
     faults: {
@@ -2000,8 +2132,8 @@ test("a stray final beside a prepared record requires recovery", async (t) => {
     (error) =>
       assertPublicationError(
         error,
-        "publication_recovery_required",
-        "not-committed",
+        "publication_outcome_uncertain",
+        "uncertain",
       ),
   );
   assert.equal(
@@ -2104,6 +2236,61 @@ test("final mutation after readback cannot advance the journal to committed", as
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "materialized",
   );
+});
+
+test("journal commit callbacks cannot bypass final publication readback", async (t) => {
+  for (const hook of ["beforeRename", "beforeLockRelease"]) {
+    await t.test(hook, async (t) => {
+      let armed = false;
+      let fixture;
+      const journalFaults = {
+        async [hook]({ record } = {}) {
+          if (!armed || (record !== undefined && record.state !== "committed")) {
+            return;
+          }
+          await writeFile(
+            join(fixture.artifactDirectory, "payload", "workspace", "README.md"),
+            "journal callback mutation\n",
+            { mode: 0o640 },
+          );
+        },
+      };
+      fixture = await createFixture(t, {
+        faults: {
+          async beforeCommit() {
+            armed = true;
+          },
+        },
+        journalFaults,
+      });
+      const options = captureOptions(fixture);
+
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(options),
+        (error) =>
+          assertPublicationError(
+            error,
+            "published_state_invalid",
+            "committed",
+          ),
+      );
+      armed = false;
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+          .state,
+        "committed",
+      );
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(options),
+        (error) =>
+          assertPublicationError(
+            error,
+            "published_state_invalid",
+            "committed",
+          ),
+      );
+    });
+  }
 });
 
 test("same-byte callback rewrites pass through the final durability barriers", async (t) => {

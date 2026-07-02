@@ -167,7 +167,10 @@ remaining sequence:
    stopped source, and re-open the staging root as current-user-owned and
    extended-ACL-free. Checkpoint bundle envelopes remain mode `0700`; restore
    payload roots retain and pin their modeled portable mode inside the mode
-   `0700` destination storage authority. `materialized` therefore means a
+   `0700` destination storage authority. A callback that can observe this
+   complete candidate is publication-uncertain until a held-lock final-path
+   probe proves that the pinned inode was not published. `materialized`
+   therefore means a
    complete, durable, unpublished staging object, not merely that copy returned;
 7. revalidate the publication root, lock, held staging inode, and absent final
    destination; treat the last pre-rename callback as publication-uncertain
@@ -182,9 +185,11 @@ remaining sequence:
    also verifies it against the source bundle manifest and trusted
    `artifactProof`;
 9. call `journal.commit()` with the exact materialisation metadata and wait for
-   its durable canonical readback, after repeating final-tree fsync,
-   publication-parent sync, identity, and exact digest readback once all
-   fault/test callbacks have returned; and
+   its durable canonical readback and all journal fault/test callbacks to
+   return; while the publication lock and held final inode remain pinned,
+   repeat final-tree fsync, publication-parent sync, candidate absence,
+   authority, identity, and exact digest readback under committed-state error
+   classification; and
 10. only after the committed record is visible may a consumer replay the
     result or a launcher admit the restore destination.
 
@@ -272,6 +277,12 @@ not reopen or recopy that leaf. The binding includes the direct source-leaf
 device/inode: `prepared` replay must still name that exact leaf, while later
 states reconstruct the exact binding from the durable record even if the source
 leaf is gone or replaced.
+
+A `prepared` replay remains publication-uncertain until candidate and final
+probes succeed under the current target authority. A retained candidate is
+recovery-required and definitely not committed once final absence is proven. A
+visible final remains publication-uncertain because an observable-candidate
+callback may have moved the held candidate before `materialized` was recorded.
 
 For a `materialized` replay, physical outcome stays `uncertain` until both
 candidate and final probes succeed and prove candidate-present/final-absent

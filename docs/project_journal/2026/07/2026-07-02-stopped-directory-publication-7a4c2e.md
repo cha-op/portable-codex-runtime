@@ -51,9 +51,12 @@ superseded_by:
   before journal discovery are uncertain while malformed root syntax remains a
   caller error, and malformed persisted materialisation is classified as
   journal or committed-state corruption.
-- Prepared records with an unexpected final tree remain explicit recovery
-  inconsistencies rather than rename uncertainty. Host adapters can inject the
-  trusted ACL inspection capability used consistently by root pinning and copy.
+- Prepared candidate-only inconsistencies remain recovery-required, while a
+  prepared record with a visible final stays publication-uncertain because a
+  complete-candidate callback may have published it. Prepared replay also stays
+  uncertain when current authority cannot complete both topology probes. Host
+  adapters can inject the trusted ACL inspection capability used consistently
+  by root pinning and copy.
 - Read-only source/journal/target topology checks now run before publication
   lock creation and repeat while locked. Every injected callback is followed
   by pinned root-authority revalidation before further source reads or target
@@ -75,6 +78,12 @@ superseded_by:
 - A pre-rename callback is treated as publication-uncertain until a held-lock
   probe proves the staged inode is not visible at the final path, preventing a
   callback-side rename from being misreported as definitely not committed.
+- The same held-lock final-path proof now follows the complete-candidate
+  callback before `materialized`, so a callback-side publication cannot be
+  misreported while the journal remains `prepared`. After journal commit and
+  its own fault callbacks return, publication repeats the full committed tree
+  fsync, parent sync, candidate-absence, identity, mode/ACL, and digest barrier
+  before reporting success.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.
