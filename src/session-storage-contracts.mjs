@@ -1022,18 +1022,24 @@ export function assertStorageMutationResult(value, options) {
     "invalid_storage_mutation",
     "storage mutation result status is unsupported",
   );
+  const targetMatches =
+    Object.keys(expected.target).length === Object.keys(actualRequest.target).length &&
+    Object.keys(expected.target).every(
+      (targetKey) => expected.target[targetKey] === actualRequest.target[targetKey],
+    );
   ensure(
-    Object.keys(expected).every((key) => {
-      if (key !== "target") return expected[key] === actualRequest[key];
-      return (
-        Object.keys(expected.target).length === Object.keys(actualRequest.target).length &&
-        Object.keys(expected.target).every(
-          (targetKey) => expected.target[targetKey] === actualRequest.target[targetKey],
-        )
-      );
-    }),
-    "stale_fence",
+    ["backendId", "contractVersion", "operation", "operationId", "sessionId", "storageId"].every(
+      (key) => expected[key] === actualRequest[key],
+    ) && targetMatches,
+    "invalid_storage_mutation",
     "storage mutation result does not match its request",
+  );
+  ensure(
+    ["fencingEpoch", "holderId", "leaseId"].every(
+      (key) => expected[key] === actualRequest[key],
+    ),
+    "stale_fence",
+    "storage mutation result fence does not match its request",
   );
   return deepFreeze(
     defensiveClone(value, "invalid_storage_mutation", "storage mutation result"),

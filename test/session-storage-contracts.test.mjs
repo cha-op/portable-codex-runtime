@@ -677,6 +677,22 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
         },
         { request },
       ),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        { ...result, operationId: "operation-checkpoint-002" },
+        { request },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        { ...result, fencingEpoch: "9007199254740994" },
+        { request },
+      ),
     assertCode("stale_fence"),
   );
   for (const [operation, target] of [
