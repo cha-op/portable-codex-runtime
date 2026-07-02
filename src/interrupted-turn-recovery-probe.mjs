@@ -535,7 +535,7 @@ function decodeMountTableText(value, label) {
 }
 
 export function parseLinuxMountInfo(value) {
-  return decodeMountTableText(value, "Linux mountinfo")
+  const mountPoints = decodeMountTableText(value, "Linux mountinfo")
     .split("\n")
     .filter((line) => line !== "")
     .map((line) => {
@@ -545,10 +545,12 @@ export function parseLinuxMountInfo(value) {
       assert(isAbsolute(mountPoint), "Linux mountinfo contains a non-absolute path");
       return mountPoint;
     });
+  assert(mountPoints.includes("/"), "Linux mountinfo omitted the root mount");
+  return mountPoints;
 }
 
 export function parseDarwinMountTable(value) {
-  return decodeMountTableText(value, "Darwin mount table")
+  const mountPoints = decodeMountTableText(value, "Darwin mount table")
     .split("\n")
     .filter((line) => line !== "")
     .map((line) => {
@@ -574,6 +576,8 @@ export function parseDarwinMountTable(value) {
       assert(isAbsolute(mountPoint), "Darwin mount table contains a non-absolute path");
       return mountPoint;
     });
+  assert(mountPoints.includes("/"), "Darwin mount table omitted the root mount");
+  return mountPoints;
 }
 
 async function listCurrentMountPoints({

@@ -816,6 +816,16 @@ test("mount table parsing fails closed before lossy UTF-8 decoding", () => {
   );
 });
 
+test("mount table parsing fails closed on empty or incomplete output", () => {
+  for (const value of [Buffer.alloc(0), Buffer.from("\n")]) {
+    assert.throws(() => parseLinuxMountInfo(value), /Linux mountinfo omitted the root mount/);
+    assert.throws(
+      () => parseDarwinMountTable(value),
+      /Darwin mount table omitted the root mount/,
+    );
+  }
+});
+
 test("Linux getfacl parsing distinguishes base and extended ACL entries", () => {
   assert.equal(parseLinuxGetfacl("user::rwx\ngroup::---\nother::---\n"), false);
   assert.equal(
