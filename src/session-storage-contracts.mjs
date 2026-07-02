@@ -423,7 +423,32 @@ export function parseSessionManifest(serialized) {
 }
 
 export function serializeSessionManifest(manifest) {
-  return `${JSON.stringify(assertSessionManifest(manifest), null, 2)}\n`;
+  const value = assertSessionManifest(manifest);
+  const canonical = {
+    schemaVersion: value.schemaVersion,
+    sessionId: value.sessionId,
+    codex: {
+      rootThreadId: value.codex.rootThreadId,
+      sessionId: value.codex.sessionId,
+      ephemeral: value.codex.ephemeral,
+      historyMode: value.codex.historyMode,
+    },
+    runtime: {
+      imageDigest: value.runtime.imageDigest,
+      imageMediaType: value.runtime.imageMediaType,
+      platform: value.runtime.platform,
+      codexVersion: value.runtime.codexVersion,
+      codexSandbox: value.runtime.codexSandbox,
+    },
+    layoutVersion: value.layoutVersion,
+    authMode: value.authMode,
+    agents: {
+      defaultMaxSubagents: value.agents.defaultMaxSubagents,
+      maxSubagents: value.agents.maxSubagents,
+      maxDepth: value.agents.maxDepth,
+    },
+  };
+  return `${JSON.stringify(canonical, null, 2)}\n`;
 }
 
 /**

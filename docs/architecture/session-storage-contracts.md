@@ -96,6 +96,8 @@ The manifest parser rejects unknown or missing fields, accessor properties,
 duplicate JSON object keys, unsupported versions, mutable/ephemeral Codex
 state, non-canonical IDs, tag-like image references, index media types,
 credentials, and unsupported agent limits.
+The serializer rebuilds the validated manifest in the schema order shown above,
+so property insertion order cannot change its canonical UTF-8 bytes.
 
 ## Fixed Worker Layout
 

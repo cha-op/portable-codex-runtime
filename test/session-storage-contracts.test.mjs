@@ -209,6 +209,31 @@ test("session manifest round-trips canonically and rejects duplicate JSON keys",
   const serialized = serializeSessionManifest(manifest);
   assert(serialized.endsWith("\n"));
   assert.deepEqual(parseSessionManifest(serialized), manifest);
+  const reordered = {
+    agents: {
+      maxDepth: manifest.agents.maxDepth,
+      maxSubagents: manifest.agents.maxSubagents,
+      defaultMaxSubagents: manifest.agents.defaultMaxSubagents,
+    },
+    authMode: manifest.authMode,
+    codex: {
+      historyMode: manifest.codex.historyMode,
+      ephemeral: manifest.codex.ephemeral,
+      sessionId: manifest.codex.sessionId,
+      rootThreadId: manifest.codex.rootThreadId,
+    },
+    layoutVersion: manifest.layoutVersion,
+    runtime: {
+      codexSandbox: manifest.runtime.codexSandbox,
+      codexVersion: manifest.runtime.codexVersion,
+      platform: manifest.runtime.platform,
+      imageMediaType: manifest.runtime.imageMediaType,
+      imageDigest: manifest.runtime.imageDigest,
+    },
+    schemaVersion: manifest.schemaVersion,
+    sessionId: manifest.sessionId,
+  };
+  assert.equal(serializeSessionManifest(reordered), serialized);
   const duplicate = serialized.replace(
     '"schemaVersion": 1',
     '"schemaVersion": 9, "schemaVersion": 1',
