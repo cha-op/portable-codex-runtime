@@ -146,14 +146,17 @@ function assertOptionsObject(value, allowedKeys, requiredKeys, code, label) {
     code,
     `${label} contains unexpected or missing fields`,
   );
-  ensure(
-    actual.every((key) => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value");
-    }),
-    code,
-    `${label} fields must be enumerable plain data properties`,
-  );
+  const normalized = Object.create(null);
+  for (const key of actual) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    ensure(
+      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+      code,
+      `${label} fields must be enumerable plain data properties`,
+    );
+    normalized[key] = descriptor.value;
+  }
+  return normalized;
 }
 
 function assertUuid(value, code, label) {
@@ -456,14 +459,13 @@ export function serializeSessionManifest(manifest) {
  * trusted OCI resolver that inspected the descriptor and image configuration.
  */
 export function assertResolvedPlatformImageMatchesManifest(options) {
-  assertOptionsObject(
+  const { manifest, resolution } = assertOptionsObject(
     options,
     ["manifest", "resolution"],
     ["manifest", "resolution"],
     "invalid_image_resolution",
     "platform image resolution options",
   );
-  const { manifest, resolution } = options;
   const sessionManifest = assertSessionManifest(manifest);
   assertExactObject(
     resolution,
@@ -540,14 +542,13 @@ export function assertLeaseGrant(value) {
 }
 
 export function assertLeaseRenewal(previous, next, options) {
-  assertOptionsObject(
+  const { canonical, now } = assertOptionsObject(
     options,
     ["canonical", "now"],
     ["canonical", "now"],
     "invalid_fence",
     "lease renewal options",
   );
-  const { canonical, now } = options;
   const before = assertLeaseGrant(previous);
   const after = assertLeaseGrant(next);
   const current = assertLeaseGrant(canonical);
@@ -579,14 +580,13 @@ export function assertLeaseRenewal(previous, next, options) {
 }
 
 export function assertCanonicalFenceMatch(options) {
-  assertOptionsObject(
+  const { canonical, now, presented } = assertOptionsObject(
     options,
     ["canonical", "now", "presented"],
     ["canonical", "now", "presented"],
     "invalid_fence",
     "canonical fence match options",
   );
-  const { canonical, now, presented } = options;
   const expected = assertLeaseGrant(canonical);
   const actual = assertLeaseGrant(presented);
   ensure(Number.isFinite(now), "invalid_fence", "authority time is invalid");
@@ -842,14 +842,14 @@ export function assertStorageMutationRequest(value) {
  * atomically with the mutation against its authoritative state.
  */
 export function assertStorageMutationMatchesLeaseSnapshot(options) {
-  assertOptionsObject(
-    options,
-    ["allowExpired", "canonicalLease", "now", "request", "storageRef"],
-    ["canonicalLease", "now", "request", "storageRef"],
-    "invalid_storage_mutation",
-    "storage mutation snapshot options",
-  );
-  const { allowExpired = false, canonicalLease, now, request, storageRef } = options;
+  const { allowExpired = false, canonicalLease, now, request, storageRef } =
+    assertOptionsObject(
+      options,
+      ["allowExpired", "canonicalLease", "now", "request", "storageRef"],
+      ["canonicalLease", "now", "request", "storageRef"],
+      "invalid_storage_mutation",
+      "storage mutation snapshot options",
+    );
   ensure(
     typeof allowExpired === "boolean",
     "invalid_storage_mutation",
@@ -888,14 +888,13 @@ export function assertStorageMutationMatchesLeaseSnapshot(options) {
 }
 
 export function assertStorageMutationResult(value, options) {
-  assertOptionsObject(
+  const { request } = assertOptionsObject(
     options,
     ["request"],
     ["request"],
     "invalid_storage_mutation",
     "storage mutation result options",
   );
-  const { request } = options;
   assertExactObject(
     value,
     [
@@ -964,14 +963,13 @@ export function assertStorageMutationResult(value, options) {
  * bind while holding its backend directory authority and canonical fence.
  */
 export function createRootlessWorkerTemplate(options) {
-  assertOptionsObject(
+  const { attachment, lease, manifest, storageRef } = assertOptionsObject(
     options,
     ["attachment", "lease", "manifest", "storageRef"],
     ["attachment", "lease", "manifest", "storageRef"],
     "invalid_worker_template",
     "rootless worker template options",
   );
-  const { attachment, lease, manifest, storageRef } = options;
   const matched = assertAttachmentMatches({ attachment, lease, manifest, storageRef });
   return deepFreeze({
     agentPolicy: matched.manifest.agents,
@@ -1010,14 +1008,13 @@ export function checkpointClassPolicy(value) {
 }
 
 export function assertCheckpointDescriptor(value, options = {}) {
-  assertOptionsObject(
+  const { manifest, storageRef } = assertOptionsObject(
     options,
     ["manifest", "storageRef"],
     [],
     "invalid_checkpoint",
     "checkpoint descriptor options",
   );
-  const { manifest, storageRef } = options;
   assertExactObject(
     value,
     [

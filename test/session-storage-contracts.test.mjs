@@ -873,3 +873,40 @@ test("public option envelopes reject accessors before destructuring", () => {
   );
   assert.equal(reads, 0);
 });
+
+test("public option envelopes ignore inherited optional fields", () => {
+  const descriptor = checkpoint();
+  const canonicalLease = lease();
+  const detach = mutationRequest({ operation: "detach" });
+  const previousAllowExpired = Object.getOwnPropertyDescriptor(
+    Object.prototype,
+    "allowExpired",
+  );
+  const previousManifest = Object.getOwnPropertyDescriptor(Object.prototype, "manifest");
+  try {
+    Object.defineProperty(Object.prototype, "allowExpired", {
+      configurable: true,
+      value: true,
+    });
+    Object.defineProperty(Object.prototype, "manifest", {
+      configurable: true,
+      value: "inherited manifest must be ignored",
+    });
+    assert.throws(
+      () =>
+        assertStorageMutationMatchesLeaseSnapshot({
+          canonicalLease,
+          now: Date.parse(canonicalLease.expiresAt),
+          request: detach,
+          storageRef: storageRef(),
+        }),
+      assertCode("lease_expired"),
+    );
+    assert.deepEqual(assertCheckpointDescriptor(descriptor), descriptor);
+  } finally {
+    if (previousAllowExpired === undefined) delete Object.prototype.allowExpired;
+    else Object.defineProperty(Object.prototype, "allowExpired", previousAllowExpired);
+    if (previousManifest === undefined) delete Object.prototype.manifest;
+    else Object.defineProperty(Object.prototype, "manifest", previousManifest);
+  }
+});
