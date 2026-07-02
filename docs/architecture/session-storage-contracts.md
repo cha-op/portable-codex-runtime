@@ -171,7 +171,10 @@ advance the epoch. Renewal and checkpoint capture do not.
 
 Renewal accepts only the exact canonical lease before its authority expiration
 and retains the same session, lease, holder, and epoch. It cannot resurrect an
-expired lease or renew from a stale control-plane record.
+expired lease or renew from a stale control-plane record. Renewal, canonical
+fence matching, and mutation admission receive the current time explicitly from
+the lease authority or its trusted control-plane clock; a worker host's local
+wall clock must not decide whether authority is still valid.
 
 Every mutating backend request carries the complete writer identity:
 `sessionId`, `leaseId`, `holderId`, `fencingEpoch`, and an idempotent operation

@@ -276,6 +276,19 @@ test("trusted OCI resolution must match the recorded platform manifest", () => {
     }),
     resolution,
   );
+  assert.throws(
+    () => assertResolvedPlatformImageMatchesManifest(),
+    assertCode("invalid_image_resolution"),
+  );
+  assert.throws(
+    () =>
+      assertResolvedPlatformImageMatchesManifest({
+        manifest: sessionManifest(),
+        resolution,
+        trusted: true,
+      }),
+    assertCode("invalid_image_resolution"),
+  );
   for (const invalid of [
     { ...resolution, digest: `sha256:${"b".repeat(64)}` },
     { ...resolution, mediaType: "application/vnd.oci.image.index.v1+json" },
@@ -321,6 +334,14 @@ test("lease renewal preserves the writer fence and extends authority time", () =
     () => assertLeaseRenewal(before, after),
     assertCode("invalid_fence"),
   );
+  assert.throws(
+    () =>
+      assertLeaseRenewal(before, after, {
+        ...renewalOptions,
+        [Symbol("stopProof")]: "not-authority",
+      }),
+    assertCode("invalid_fence"),
+  );
   for (const invalid of [
     lease({ leaseId: "lease-002", expiresAt: "2026-07-02T12:01:00.000Z" }),
     lease({ fencingEpoch: "9007199254740994", expiresAt: "2026-07-02T12:01:00.000Z" }),
@@ -362,6 +383,20 @@ test("canonical fence matching rejects stale writers and expired authority", () 
       now: Date.parse("2026-07-02T12:00:00.000Z"),
     }),
     canonical,
+  );
+  assert.throws(
+    () => assertCanonicalFenceMatch({ canonical, presented: canonical }),
+    assertCode("invalid_fence"),
+  );
+  assert.throws(
+    () =>
+      assertCanonicalFenceMatch({
+        canonical,
+        now: Date.parse("2026-07-02T12:00:00.000Z"),
+        presented: canonical,
+        stopProof: "not-authority",
+      }),
+    assertCode("invalid_fence"),
   );
   assert.throws(
     () =>
@@ -436,6 +471,22 @@ test("rootless worker template is structural and fixed-layout", () => {
   assert.equal(Object.hasOwn(template, "launch"), false);
 
   assert.throws(
+    () => createRootlessWorkerTemplate(),
+    assertCode("invalid_worker_template"),
+  );
+  assert.throws(
+    () =>
+      createRootlessWorkerTemplate({
+        attachment: attachment(),
+        lease: currentLease,
+        manifest: sessionManifest(),
+        storageRef: storageRef(),
+        stopProof: "not-authority",
+      }),
+    assertCode("invalid_worker_template"),
+  );
+
+  assert.throws(
     () => createRootlessWorkerTemplate({
       attachment: attachment({ fencingEpoch: "9007199254740992" }),
       lease: currentLease,
@@ -475,6 +526,21 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
     }),
     request,
   );
+  assert.throws(
+    () => assertStorageMutationMatchesLeaseSnapshot(null),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationMatchesLeaseSnapshot({
+        canonicalLease: lease(),
+        now: Date.parse("2026-07-02T12:00:00.000Z"),
+        request,
+        storageRef: storageRef(),
+        stopProof: "not-authority",
+      }),
+    assertCode("invalid_storage_mutation"),
+  );
   const result = {
     ...request,
     proofId: "proof-checkpoint-001",
@@ -483,6 +549,15 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
   assert.deepEqual(assertStorageMutationResult(result, { request }), result);
   assert.throws(
     () => assertStorageMutationResult(result),
+    assertCode("invalid_storage_mutation"),
+  );
+  const hiddenResultOptions = { request };
+  Object.defineProperty(hiddenResultOptions, "stopProof", {
+    enumerable: false,
+    value: "not-authority",
+  });
+  assert.throws(
+    () => assertStorageMutationResult(result, hiddenResultOptions),
     assertCode("invalid_storage_mutation"),
   );
   assert.throws(
@@ -630,6 +705,19 @@ test("checkpoint descriptor binds immutable session identity but never restores 
   assert.equal(Object.hasOwn(descriptor, "proofId"), false);
   assert.equal(Object.hasOwn(descriptor, "stopProof"), false);
   assert.throws(
+    () => assertCheckpointDescriptor(descriptor, null),
+    assertCode("invalid_checkpoint"),
+  );
+  assert.throws(
+    () =>
+      assertCheckpointDescriptor(descriptor, {
+        manifest: sessionManifest(),
+        storageRef: storageRef(),
+        stopProof: "not-authority",
+      }),
+    assertCode("invalid_checkpoint"),
+  );
+  assert.throws(
     () =>
       assertCheckpointDescriptor(
         checkpoint({ codexThreadId: "019f2100-0000-7000-8000-000000000099" }),
@@ -692,4 +780,25 @@ test("portable record validators reject accessor fields before validation or clo
     assertCode("invalid_storage_attachment"),
   );
   assert.equal(pathReads, 0);
+});
+
+test("public option envelopes reject accessors before destructuring", () => {
+  const options = { manifest: sessionManifest() };
+  let reads = 0;
+  Object.defineProperty(options, "resolution", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return {
+        digest: IMAGE_DIGEST,
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+        platform: "linux/arm64",
+      };
+    },
+  });
+  assert.throws(
+    () => assertResolvedPlatformImageMatchesManifest(options),
+    assertCode("invalid_image_resolution"),
+  );
+  assert.equal(reads, 0);
 });

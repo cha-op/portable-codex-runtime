@@ -130,6 +130,32 @@ function assertExactObject(value, keys, code, label) {
   );
 }
 
+function assertOptionsObject(value, allowedKeys, requiredKeys, code, label) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(value)),
+    code,
+    `${label} must be a plain object`,
+  );
+  const actual = Reflect.ownKeys(value);
+  ensure(
+    actual.every((key) => typeof key === "string" && allowedKeys.includes(key)) &&
+      requiredKeys.every((key) => actual.includes(key)),
+    code,
+    `${label} contains unexpected or missing fields`,
+  );
+  ensure(
+    actual.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value");
+    }),
+    code,
+    `${label} fields must be enumerable plain data properties`,
+  );
+}
+
 function assertUuid(value, code, label) {
   ensure(typeof value === "string" && UUID_PATTERN.test(value), code, `${label} must be a UUID`);
 }
@@ -404,7 +430,15 @@ export function serializeSessionManifest(manifest) {
  * Structural comparison only. The caller must obtain `resolution` from a
  * trusted OCI resolver that inspected the descriptor and image configuration.
  */
-export function assertResolvedPlatformImageMatchesManifest({ manifest, resolution }) {
+export function assertResolvedPlatformImageMatchesManifest(options) {
+  assertOptionsObject(
+    options,
+    ["manifest", "resolution"],
+    ["manifest", "resolution"],
+    "invalid_image_resolution",
+    "platform image resolution options",
+  );
+  const { manifest, resolution } = options;
   const sessionManifest = assertSessionManifest(manifest);
   assertExactObject(
     resolution,
@@ -477,8 +511,9 @@ export function assertLeaseGrant(value) {
 }
 
 export function assertLeaseRenewal(previous, next, options) {
-  assertExactObject(
+  assertOptionsObject(
     options,
+    ["canonical", "now"],
     ["canonical", "now"],
     "invalid_fence",
     "lease renewal options",
@@ -514,7 +549,15 @@ export function assertLeaseRenewal(previous, next, options) {
   return after;
 }
 
-export function assertCanonicalFenceMatch({ canonical, now = Date.now(), presented }) {
+export function assertCanonicalFenceMatch(options) {
+  assertOptionsObject(
+    options,
+    ["canonical", "now", "presented"],
+    ["canonical", "now", "presented"],
+    "invalid_fence",
+    "canonical fence match options",
+  );
+  const { canonical, now, presented } = options;
   const expected = assertLeaseGrant(canonical);
   const actual = assertLeaseGrant(presented);
   ensure(Number.isFinite(now), "invalid_fence", "authority time is invalid");
@@ -763,13 +806,15 @@ export function assertStorageMutationRequest(value) {
  * Structural snapshot comparison only. A backend must repeat this comparison
  * atomically with the mutation against its authoritative state.
  */
-export function assertStorageMutationMatchesLeaseSnapshot({
-  allowExpired = false,
-  canonicalLease,
-  now,
-  request,
-  storageRef,
-}) {
+export function assertStorageMutationMatchesLeaseSnapshot(options) {
+  assertOptionsObject(
+    options,
+    ["allowExpired", "canonicalLease", "now", "request", "storageRef"],
+    ["canonicalLease", "now", "request", "storageRef"],
+    "invalid_storage_mutation",
+    "storage mutation snapshot options",
+  );
+  const { allowExpired = false, canonicalLease, now, request, storageRef } = options;
   ensure(
     typeof allowExpired === "boolean",
     "invalid_storage_mutation",
@@ -808,8 +853,9 @@ export function assertStorageMutationMatchesLeaseSnapshot({
 }
 
 export function assertStorageMutationResult(value, options) {
-  assertExactObject(
+  assertOptionsObject(
     options,
+    ["request"],
     ["request"],
     "invalid_storage_mutation",
     "storage mutation result options",
@@ -882,7 +928,15 @@ export function assertStorageMutationResult(value, options) {
  * prove that the pathname is still pinned; a trusted launcher must perform the
  * bind while holding its backend directory authority and canonical fence.
  */
-export function createRootlessWorkerTemplate({ attachment, lease, manifest, storageRef }) {
+export function createRootlessWorkerTemplate(options) {
+  assertOptionsObject(
+    options,
+    ["attachment", "lease", "manifest", "storageRef"],
+    ["attachment", "lease", "manifest", "storageRef"],
+    "invalid_worker_template",
+    "rootless worker template options",
+  );
+  const { attachment, lease, manifest, storageRef } = options;
   const matched = assertAttachmentMatches({ attachment, lease, manifest, storageRef });
   return deepFreeze({
     agentPolicy: matched.manifest.agents,
@@ -920,7 +974,15 @@ export function checkpointClassPolicy(value) {
   return CHECKPOINT_CLASS_POLICIES[assertCheckpointClass(value)];
 }
 
-export function assertCheckpointDescriptor(value, { manifest, storageRef } = {}) {
+export function assertCheckpointDescriptor(value, options = {}) {
+  assertOptionsObject(
+    options,
+    ["manifest", "storageRef"],
+    [],
+    "invalid_checkpoint",
+    "checkpoint descriptor options",
+  );
+  const { manifest, storageRef } = options;
   assertExactObject(
     value,
     [
