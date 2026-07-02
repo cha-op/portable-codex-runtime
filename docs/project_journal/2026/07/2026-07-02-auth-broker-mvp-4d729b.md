@@ -54,6 +54,9 @@ superseded_by:
   increasing generations, and rejected malformed or non-canonical JWT shapes.
 - Captured validated broker authority configuration in private fields and
   validated grant option envelopes before property or store access.
+- Required lossless UTF-8 account and user identities before persistence or
+  hashing, and versioned a domain-separated code-unit identity digest so legacy
+  recovery fences with ambiguous UTF-8 semantics fail closed.
 - Restored encrypted candidate files to mode `0600` through their open file
   descriptors before writing secrets, independent of the process umask.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file

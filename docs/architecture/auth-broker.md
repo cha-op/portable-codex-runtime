@@ -148,6 +148,13 @@ old credential. The durable store generation is the only published generation;
 the spike's process-local counter
 is not reused.
 
+Account and user identities must round-trip losslessly through UTF-8 before
+canonical persistence or hashing. This rejects unpaired UTF-16 surrogates that
+Node.js would otherwise collapse to the same replacement-character digest.
+Recovery fences identify their digest encoding explicitly and use
+domain-separated SHA-256 over exact UTF-16LE code units. Legacy fences without
+that marker fail closed instead of being interpreted with ambiguous semantics.
+
 `AuthBroker` provides:
 
 - credential installation or explicit reauthentication through CAS;

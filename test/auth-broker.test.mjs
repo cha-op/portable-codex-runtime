@@ -14,6 +14,8 @@ import { EncryptedAuthStateStore } from "../src/encrypted-auth-state-store.mjs";
 
 const NOW = Date.parse("2026-07-03T00:00:00.000Z");
 const ACCOUNT_ID = "account-1";
+const IDENTITY_DIGEST_DOMAIN = "portable-codex-runtime/auth-broker/identity/v1\0";
+const IDENTITY_DIGEST_ENCODING = "sha256-domain-separated-utf16le-v1";
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const USER_ID = "user-1";
 
@@ -150,6 +152,13 @@ function storedReadyPayload(credential) {
   return JSON.stringify({ schemaVersion: 1, status: "ready", ...credential });
 }
 
+function identityDigest(identity) {
+  return createHash("sha256")
+    .update(IDENTITY_DIGEST_DOMAIN, "utf8")
+    .update(Buffer.from(identity, "utf16le"))
+    .digest("hex");
+}
+
 function storedReservationPayload({
   accountId = ACCOUNT_ID,
   accessToken = ACCESS_TOKEN_1,
@@ -161,11 +170,12 @@ function storedReservationPayload({
     schemaVersion: 1,
     status: "recovery-required",
     reason: "refresh_in_progress",
+    identityDigestEncoding: IDENTITY_DIGEST_ENCODING,
     reservationId,
-    sourceAccountIdHash: createHash("sha256").update(accountId, "utf8").digest("hex"),
+    sourceAccountIdHash: identityDigest(accountId),
     sourceAccessTokenHash: createHash("sha256").update(accessToken, "utf8").digest("hex"),
     sourceRefreshTokenHash: createHash("sha256").update(refreshToken, "utf8").digest("hex"),
-    sourceUserIdHash: createHash("sha256").update(userId, "utf8").digest("hex"),
+    sourceUserIdHash: identityDigest(userId),
   });
 }
 
@@ -783,6 +793,31 @@ test("credential metadata must match auth mode and JWT claims", async (t) => {
   }
 });
 
+test("identity fields require a lossless UTF-8 round trip before persistence", async (t) => {
+  for (const field of ["accountId", "userId"]) {
+    await t.test(`unpaired surrogate in ${field}`, async () => {
+      const store = new FakeStore();
+      const broker = makeBroker({ store });
+      await expectBrokerError(
+        () => broker.installCredential(makeCredential({ [field]: `identity-${field}-\ud800` })),
+        "invalid_credential",
+      );
+      assert.equal(store.casCalls.length, 0);
+      assert.equal(store.generation, "0");
+    });
+  }
+
+  await t.test("valid surrogate pairs", async () => {
+    const store = new FakeStore();
+    const broker = makeBroker({ store });
+    await broker.installCredential(
+      makeCredential({ accountId: "account-\ud83d\ude00", userId: "user-\ud83d\ude80" }),
+    );
+    assert.equal(store.casCalls.length, 1);
+    assert.equal(store.generation, "1");
+  });
+});
+
 test("JWTs require canonical compact segments and valid payload UTF-8 before persistence", async (t) => {
   const accessParts = makeCredential().accessToken.split(".");
   const idParts = makeIdToken().split(".");
@@ -938,6 +973,28 @@ test("canonical payload parsing rejects whitespace, reordered fields, and duplic
       const store = new FakeStore();
       store.generation = "1";
       store.payload = scenario.payload;
+      await expectBrokerError(() => makeBroker({ store }).snapshot(), "invalid_store_snapshot");
+    });
+  }
+});
+
+test("blocked recovery fences require the exact identity digest encoding marker", async (t) => {
+  const valid = JSON.parse(storedReservationPayload());
+  const missing = { ...valid };
+  delete missing.identityDigestEncoding;
+  const cases = [
+    { name: "missing", payload: missing },
+    {
+      name: "wrong",
+      payload: { ...valid, identityDigestEncoding: "sha256-domain-separated-utf8-v1" },
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const store = new FakeStore();
+      store.generation = "2";
+      store.payload = JSON.stringify(scenario.payload);
       await expectBrokerError(() => makeBroker({ store }).snapshot(), "invalid_store_snapshot");
     });
   }
@@ -1414,6 +1471,56 @@ test("explicit fenced recovery requires the exact reservation identity", async (
     },
   );
   assert.equal((await broker.getGrant()).accessToken, recovered.accessToken);
+});
+
+test("explicit recovery rejects legacy UTF-8 identity hash collisions", async (t) => {
+  for (const field of ["accountId", "userId"]) {
+    await t.test(field, async () => {
+      const sourceIdentity = `identity-${field}-\ud800`;
+      const replacementIdentity = `identity-${field}-\ufffd`;
+      assert.equal(
+        createHash("sha256").update(sourceIdentity, "utf8").digest("hex"),
+        createHash("sha256").update(replacementIdentity, "utf8").digest("hex"),
+      );
+
+      const store = new FakeStore();
+      const broker = makeBroker({ store });
+      const reservationId = `surrogate-collision-${field}`;
+      store.baseGeneration = "1";
+      store.commitId = `surrogate-collision-commit-${field}`;
+      store.generation = "2";
+      store.payload = JSON.stringify({
+        schemaVersion: 1,
+        status: "recovery-required",
+        reason: "refresh_in_progress",
+        reservationId,
+        sourceAccountIdHash: createHash("sha256")
+          .update(field === "accountId" ? sourceIdentity : ACCOUNT_ID, "utf8")
+          .digest("hex"),
+        sourceAccessTokenHash: createHash("sha256").update(ACCESS_TOKEN_1, "utf8").digest("hex"),
+        sourceRefreshTokenHash: createHash("sha256").update("refresh-1", "utf8").digest("hex"),
+        sourceUserIdHash: createHash("sha256")
+          .update(field === "userId" ? sourceIdentity : USER_ID, "utf8")
+          .digest("hex"),
+      });
+
+      await expectBrokerError(
+        () =>
+          broker.recoverRefreshReservation({
+            credential: makeCredential({
+              [field]: replacementIdentity,
+              marker: `surrogate-collision-replacement-${field}`,
+              refreshToken: `surrogate-collision-refresh-${field}`,
+            }),
+            expectedGeneration: "2",
+            reservationId,
+          }),
+        "invalid_store_snapshot",
+      );
+      assert.equal(store.casCalls.length, 0);
+      assert.equal(store.generation, "2");
+    });
+  }
 });
 
 test("uncertain recovery commit accepts an exact storage-only successor", async () => {

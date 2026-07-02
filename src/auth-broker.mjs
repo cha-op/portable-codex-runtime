@@ -4,6 +4,8 @@ import { TextDecoder, types as utilTypes } from "node:util";
 const AUTH_PAYLOAD_SCHEMA_VERSION = 1;
 const DEFAULT_MIN_TOKEN_TTL_SECONDS = 120;
 const GENERATION_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/u;
+const IDENTITY_DIGEST_DOMAIN = "portable-codex-runtime/auth-broker/identity/v1\0";
+const IDENTITY_DIGEST_ENCODING = "sha256-domain-separated-utf16le-v1";
 const MAX_GENERATION = 18_446_744_073_709_551_615n;
 const MAX_SHARED_REFRESH_RECHECKS = 8;
 const MAX_STORAGE_ONLY_REBASES = 8;
@@ -173,6 +175,17 @@ function parseCanonicalTimestamp(value) {
   return milliseconds;
 }
 
+function losslessUtf8Identity(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Buffer.from(value, "utf8").toString("utf8") !== value
+  ) {
+    throw new AuthBrokerError("invalid_credential");
+  }
+  return value;
+}
+
 function decodeJwtPayload(token) {
   if (typeof token !== "string") throw new AuthBrokerError("invalid_credential");
   const parts = token.split(".");
@@ -288,6 +301,8 @@ function validateReadyCredential(value) {
       throw new AuthBrokerError("invalid_credential");
     }
   }
+  losslessUtf8Identity(value.accountId);
+  losslessUtf8Identity(value.userId);
   if (!(value.planType === null || (typeof value.planType === "string" && value.planType.length > 0))) {
     throw new AuthBrokerError("invalid_credential");
   }
@@ -325,6 +340,7 @@ function readyPayload(credential) {
 function recoveryFence(payload, code = "invalid_store_snapshot") {
   if (
     !isPlainObject(payload) ||
+    payload.identityDigestEncoding !== IDENTITY_DIGEST_ENCODING ||
     typeof payload.reservationId !== "string" ||
     !OPAQUE_ID_PATTERN.test(payload.reservationId) ||
     typeof payload.sourceAccountIdHash !== "string" ||
@@ -339,6 +355,7 @@ function recoveryFence(payload, code = "invalid_store_snapshot") {
     throw new AuthBrokerError(code);
   }
   return {
+    identityDigestEncoding: payload.identityDigestEncoding,
     reservationId: payload.reservationId,
     sourceAccountIdHash: payload.sourceAccountIdHash,
     sourceAccessTokenHash: payload.sourceAccessTokenHash,
@@ -364,7 +381,11 @@ function accessTokenHash(accessToken) {
 }
 
 function identityHash(identity) {
-  return createHash("sha256").update(identity, "utf8").digest("hex");
+  const exactIdentity = losslessUtf8Identity(identity);
+  return createHash("sha256")
+    .update(IDENTITY_DIGEST_DOMAIN, "utf8")
+    .update(Buffer.from(exactIdentity, "utf16le"))
+    .digest("hex");
 }
 
 function refreshTokenValue(credential) {
@@ -383,6 +404,7 @@ function refreshReservationPayload(credential, reservationId) {
     schemaVersion: AUTH_PAYLOAD_SCHEMA_VERSION,
     status: "recovery-required",
     reason: "refresh_in_progress",
+    identityDigestEncoding: IDENTITY_DIGEST_ENCODING,
     reservationId,
     sourceAccountIdHash: identityHash(credential.accountId),
     sourceAccessTokenHash: accessTokenHash(credential.accessToken),
@@ -413,6 +435,7 @@ function validateStoredPayload(payload) {
     assertExactDataObject(
       payload,
       [
+        "identityDigestEncoding",
         "reason",
         "reservationId",
         "schemaVersion",
