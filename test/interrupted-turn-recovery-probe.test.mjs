@@ -49,6 +49,7 @@ import {
   copyStoppedTree as copyStoppedTreeWithAcl,
   copyStoppedTreeBetweenRoots as copyStoppedTreeBetweenRootsWithAcl,
   decodePortablePathBytes,
+  digestStoppedTreeIdentities,
   digestTree,
   inspectLinuxRecoveryAcl,
   openStoppedTreeRootAuthority,
@@ -57,6 +58,7 @@ import {
   parseLinuxMountInfo,
   removeTreeForCleanup,
   stoppedTreeContainsAnyIdentity,
+  stoppedTreesShareAnyIdentity,
   syncStoppedTree,
 } from "../src/stopped-tree.mjs";
 
@@ -1239,6 +1241,39 @@ test("stopped-tree identity scans include nested directory authorities", async (
     assert.equal(
       await stoppedTreeContainsAnyIdentity(source, [outsideIdentity]),
       false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree identity proofs detect subtree aliases and inode replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-tree-identity-proof-test-"));
+  try {
+    const left = join(root, "left");
+    const renamedLeft = join(root, "renamed-left");
+    const right = join(root, "right");
+    await mkdir(left);
+    await mkdir(right);
+    const leftFile = join(left, "data");
+    await writeFile(leftFile, "same bytes\n");
+    await writeFile(join(right, "copy"), "same bytes\n");
+
+    assert.equal(await stoppedTreesShareAnyIdentity(left, right), false);
+    const originalDigest = await digestStoppedTreeIdentities(left);
+    await rename(left, renamedLeft);
+    assert.equal(
+      await digestStoppedTreeIdentities(renamedLeft),
+      originalDigest,
+    );
+    await link(join(renamedLeft, "data"), join(right, "shared"));
+    assert.equal(await stoppedTreesShareAnyIdentity(renamedLeft, right), true);
+
+    await rm(join(renamedLeft, "data"));
+    await writeFile(join(renamedLeft, "data"), "same bytes\n");
+    assert.notEqual(
+      await digestStoppedTreeIdentities(renamedLeft),
+      originalDigest,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -24,10 +24,12 @@ import {
 } from "./session-storage-contracts.mjs";
 import {
   copyStoppedTreeBetweenRoots,
+  digestStoppedTreeIdentities,
   digestTree,
   openStoppedTreeRootAuthority,
   sameFileIdentity,
   stoppedTreeContainsAnyIdentity,
+  stoppedTreesShareAnyIdentity,
   syncStoppedTree,
 } from "./stopped-tree.mjs";
 
@@ -435,6 +437,22 @@ async function assertPublicationTopologyForState(options, state) {
   });
 }
 
+async function assertSourcePublicationIdentityDisjoint(
+  source,
+  publicationPath,
+  code,
+  commitState,
+) {
+  if (source.identity === null) return;
+  let overlaps;
+  try {
+    overlaps = await stoppedTreesShareAnyIdentity(source.path, publicationPath);
+  } catch {
+    fail(code, commitState);
+  }
+  ensure(!overlaps, code, commitState);
+}
+
 async function assertExactCheckpointBundleRoot(
   path,
   code = "publication_integrity_failed",
@@ -824,6 +842,7 @@ function validateMaterialization(
     "publicationId",
     "publicationKind",
     "stagedRoot",
+    "treeIdentityDigest",
   ];
   const materialization = exactOptions(value, keys, keys, code);
   const stagedRoot = exactOptions(
@@ -840,6 +859,8 @@ function validateMaterialization(
       DIGEST_PATTERN.test(materialization.modeledDigest) &&
       typeof materialization.artifactManifestDigest === "string" &&
       DIGEST_PATTERN.test(materialization.artifactManifestDigest) &&
+      typeof materialization.treeIdentityDigest === "string" &&
+      DIGEST_PATTERN.test(materialization.treeIdentityDigest) &&
       (kind !== "restore-destination" ||
         (artifactProof !== null &&
           materialization.artifactManifestDigest ===
@@ -862,6 +883,7 @@ function materializationFor({
   kind,
   modeledDigest,
   operationId,
+  treeIdentityDigest,
 }) {
   return Object.freeze({
     contractVersion: PUBLICATION_CONTRACT_VERSION,
@@ -873,6 +895,7 @@ function materializationFor({
       device: identity.dev.toString(),
       inode: identity.ino.toString(),
     }),
+    treeIdentityDigest,
   });
 }
 
@@ -883,30 +906,35 @@ function identityMatchesMaterialization(identity, materialization) {
   );
 }
 
-async function openPinnedDirectory(path, materialization, committed = false) {
-  let metadata;
-  let handle;
+async function openPinnedDirectory(
+  path,
+  materialization,
+  {
+    committed = false,
+    inspectOwnedRootAcl,
+    inspectOwnedRootAncestorAcl,
+  } = {},
+) {
+  let authority;
   try {
-    metadata = await lstat(path, { bigint: true });
+    authority = await openStoppedTreeRootAuthority(path, {
+      inspectOwnedRootAcl,
+      inspectOwnedRootAncestorAcl,
+    });
+    const metadata = authority.identity;
     ensure(
-      metadata.isDirectory() &&
-        !metadata.isSymbolicLink() &&
-        identityMatchesMaterialization(metadata, materialization),
+      identityMatchesMaterialization(metadata, materialization),
       committed ? "published_state_invalid" : "publication_recovery_required",
       committed ? "committed" : "not-committed",
     );
-    handle = await open(
-      path,
-      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-    );
-    ensure(
-      sameFileIdentity(metadata, await handle.stat({ bigint: true })),
-      committed ? "published_state_invalid" : "publication_recovery_required",
-      committed ? "committed" : "not-committed",
-    );
-    return { handle, identity: metadata };
+    return {
+      handle: authority.handle,
+      identity: metadata,
+      inspectOwnedRootAcl,
+      inspectOwnedRootAncestorAcl,
+    };
   } catch (error) {
-    if (handle) await handle.close().catch(() => {});
+    if (authority) await authority.handle.close().catch(() => {});
     if (internalErrors.has(error)) throw error;
     fail(
       committed ? "published_state_invalid" : "publication_recovery_required",
@@ -916,23 +944,27 @@ async function openPinnedDirectory(path, materialization, committed = false) {
 }
 
 async function assertPinnedPath(path, pinned, code, commitState) {
-  let current;
+  let authority;
   let held;
+  let valid = false;
   try {
-    [current, held] = await Promise.all([
-      lstat(path, { bigint: true }),
-      pinned.handle.stat({ bigint: true }),
-    ]);
+    authority = await openStoppedTreeRootAuthority(path, {
+      inspectOwnedRootAcl: pinned.inspectOwnedRootAcl,
+      inspectOwnedRootAncestorAcl: pinned.inspectOwnedRootAncestorAcl,
+    });
+    held = await pinned.handle.stat({ bigint: true });
+    await authority.assertCurrent();
+    valid =
+      sameFileIdentity(authority.identity, pinned.identity) &&
+      sameFileIdentity(held, pinned.identity);
+  } catch {}
+  let closeFailed = false;
+  try {
+    await authority?.handle.close();
   } catch {
-    fail(code, commitState);
+    closeFailed = true;
   }
-  ensure(
-    current.isDirectory() &&
-      sameFileIdentity(current, pinned.identity) &&
-      sameFileIdentity(held, pinned.identity),
-    code,
-    commitState,
-  );
+  ensure(valid && !closeFailed, code, commitState);
 }
 
 function normalizeJournalError(
@@ -1223,9 +1255,45 @@ export class StoppedDirectoryPublication {
         sourceAuthority,
         targetAuthority,
       });
-      const revalidateLockedTopology = async (state) => {
+      const revalidateLockedTopology = async (
+        state,
+        publicationPath = null,
+        publicationPhase = null,
+      ) => {
         await assertUntrustedLockHeld(lock);
-        await assertPublicationTopologyForState(publicationTopology, state);
+        if (state === "materialized" && publicationPhase === "candidate") {
+          await assertPublicationTopology({
+            ...publicationTopology,
+            code: "publication_recovery_required",
+            commitState: "not-committed",
+          });
+        } else {
+          await assertPublicationTopologyForState(publicationTopology, state);
+        }
+        if (publicationPath !== null) {
+          const code =
+            state === "committed"
+              ? "published_state_invalid"
+              : state === "materialized" && publicationPhase === "candidate"
+                ? "publication_recovery_required"
+                : state === "materialized"
+                ? "publication_outcome_uncertain"
+                : "publication_integrity_failed";
+          const stateClassification =
+            state === "committed"
+              ? "committed"
+              : state === "materialized" && publicationPhase === "candidate"
+                ? "not-committed"
+                : state === "materialized"
+                ? "uncertain"
+                : "not-committed";
+          await assertSourcePublicationIdentityDisjoint(
+            source,
+            publicationPath,
+            code,
+            stateClassification,
+          );
+        }
       };
       await assertPublicationTopology(publicationTopology);
 
@@ -1243,14 +1311,36 @@ export class StoppedDirectoryPublication {
       if (observed.record?.state === "committed") {
         historicalCommitConfirmed = true;
         commitState = "committed";
+      } else if (observed.record?.state === "materialized") {
+        publicationMayHaveOccurred = true;
       }
       await assertPublicationAuthoritiesForState(
         sourceAuthority,
         targetAuthority,
         observed.record?.state,
       );
-      const observedCandidate = await inspectPath(candidatePath);
-      const observedFinal = await inspectPath(finalPath);
+      const topologyProbeCode =
+        observed.record?.state === "committed"
+          ? "published_state_invalid"
+          : observed.record?.state === "materialized"
+            ? "publication_outcome_uncertain"
+            : "publication_io_failed";
+      const topologyProbeState =
+        observed.record?.state === "committed"
+          ? "committed"
+          : observed.record?.state === "materialized"
+            ? "uncertain"
+            : "not-committed";
+      const observedCandidate = await inspectPath(
+        candidatePath,
+        topologyProbeCode,
+        topologyProbeState,
+      );
+      const observedFinal = await inspectPath(
+        finalPath,
+        topologyProbeCode,
+        topologyProbeState,
+      );
       if (observed.record === null) {
         ensure(
           observedCandidate === null && observedFinal === null,
@@ -1261,6 +1351,17 @@ export class StoppedDirectoryPublication {
         ["materialized", "committed"].includes(observed.record.state)
       ) {
         publicationMayHaveOccurred = true;
+      } else if (
+        observed.record.state === "materialized" &&
+        observedCandidate !== null &&
+        observedFinal === null
+      ) {
+        await assertPublicationAuthoritiesForState(
+          sourceAuthority,
+          targetAuthority,
+          observed.record.state,
+        );
+        publicationMayHaveOccurred = false;
       }
       const targetFilesystem = await inspectFilesystem(
         this.#inspectFilesystem,
@@ -1372,7 +1473,12 @@ export class StoppedDirectoryPublication {
           "committed",
         );
         ensure(finalIdentity !== null, "published_state_invalid", "committed");
-        pinnedPublication = await openPinnedDirectory(finalPath, materialization, true);
+        await revalidateLockedTopology(state, finalPath, "final");
+        pinnedPublication = await openPinnedDirectory(finalPath, materialization, {
+          committed: true,
+          inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+          inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+        });
         await this.#verifyPublishedTree({
           checkpoint: prepared.record.result.checkpoint,
           kind: options.kind,
@@ -1414,7 +1520,7 @@ export class StoppedDirectoryPublication {
           });
           pinnedPublication = created.pinned;
           await runFault(this.#faults.afterCandidateBarrier);
-          await revalidateLockedTopology(state);
+          await revalidateLockedTopology(state, candidatePath, "candidate");
           try {
             await assertPinnedPath(
               candidatePath,
@@ -1446,7 +1552,11 @@ export class StoppedDirectoryPublication {
             materialization: created.materialization,
           });
           await runFault(this.#faults.afterMaterialized);
-          await revalidateLockedTopology(materialized.record.state);
+          await revalidateLockedTopology(
+            materialized.record.state,
+            candidatePath,
+            "candidate",
+          );
         }
 
         const materialization = validateMaterialization(
@@ -1465,9 +1575,18 @@ export class StoppedDirectoryPublication {
           "publication_recovery_required",
         );
         if (candidateIdentity !== null) {
+          await revalidateLockedTopology(
+            materialized.record.state,
+            candidatePath,
+            "candidate",
+          );
           pinnedPublication ??= await openPinnedDirectory(
             candidatePath,
             materialization,
+            {
+              inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+              inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+            },
           );
           // A durable materialized record with a mismatched candidate must be
           // reconciled by a trusted recovery path; it is never recopied.
@@ -1491,7 +1610,11 @@ export class StoppedDirectoryPublication {
             "not-committed",
           );
           await runFault(this.#faults.beforeRename);
-          await revalidateLockedTopology(materialized.record.state);
+          await revalidateLockedTopology(
+            materialized.record.state,
+            candidatePath,
+            "candidate",
+          );
           try {
             await assertPinnedPath(
               candidatePath,
@@ -1533,10 +1656,22 @@ export class StoppedDirectoryPublication {
             fail("publication_outcome_uncertain", "uncertain");
           }
           await runFault(this.#faults.afterRename);
-          await revalidateLockedTopology(materialized.record.state);
+          await revalidateLockedTopology(
+            materialized.record.state,
+            finalPath,
+            "final",
+          );
         } else {
           publicationMayHaveOccurred = true;
-          pinnedPublication = await openPinnedDirectory(finalPath, materialization);
+          await revalidateLockedTopology(
+            materialized.record.state,
+            finalPath,
+            "final",
+          );
+          pinnedPublication = await openPinnedDirectory(finalPath, materialization, {
+            inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+            inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+          });
         }
 
         await assertPathAbsent(
@@ -1563,7 +1698,11 @@ export class StoppedDirectoryPublication {
           fail("publication_outcome_uncertain", "uncertain");
         }
         await runFault(this.#faults.afterParentSync);
-        await revalidateLockedTopology(materialized.record.state);
+        await revalidateLockedTopology(
+          materialized.record.state,
+          finalPath,
+          "final",
+        );
         try {
           await this.#verifyPublishedTree({
             checkpoint: materialized.record.result.checkpoint,
@@ -1584,9 +1723,17 @@ export class StoppedDirectoryPublication {
           throw error;
         }
         await runFault(this.#faults.afterFinalReadback);
-        await revalidateLockedTopology(materialized.record.state);
+        await revalidateLockedTopology(
+          materialized.record.state,
+          finalPath,
+          "final",
+        );
         await runFault(this.#faults.beforeCommit);
-        await revalidateLockedTopology(materialized.record.state);
+        await revalidateLockedTopology(
+          materialized.record.state,
+          finalPath,
+          "final",
+        );
         try {
           await assertPinnedPath(
             finalPath,
@@ -1875,6 +2022,18 @@ export class StoppedDirectoryPublication {
     }
     const identity = await lstat(candidatePath, { bigint: true });
     ensure(identity.isDirectory(), "publication_integrity_failed");
+    await assertSourcePublicationIdentityDisjoint(
+      source,
+      candidatePath,
+      "publication_integrity_failed",
+      "not-committed",
+    );
+    let treeIdentityDigest;
+    try {
+      treeIdentityDigest = await digestStoppedTreeIdentities(candidatePath);
+    } catch {
+      fail("publication_integrity_failed");
+    }
     const materialization = materializationFor({
       artifactManifestDigest,
       finalName,
@@ -1882,10 +2041,14 @@ export class StoppedDirectoryPublication {
       kind,
       modeledDigest: copiedDigest,
       operationId,
+      treeIdentityDigest,
     });
     return Object.freeze({
       materialization,
-      pinned: await openPinnedDirectory(candidatePath, materialization),
+      pinned: await openPinnedDirectory(candidatePath, materialization, {
+        inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+        inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+      }),
     });
   }
 
@@ -1897,6 +2060,11 @@ export class StoppedDirectoryPublication {
     path,
   }) {
     try {
+      ensure(
+        (await digestStoppedTreeIdentities(path)) ===
+          materialization.treeIdentityDigest,
+        "publication_integrity_failed",
+      );
       if (kind === "checkpoint-artifact") {
         await assertExactCheckpointBundleRoot(path);
         const manifest = await readArtifactManifest(join(path, "artifact.json"), checkpoint);

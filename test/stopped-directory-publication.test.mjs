@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   access,
+  chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -26,7 +28,10 @@ import {
   StoppedDirectoryPublicationError,
   stoppedDirectoryPublicationCandidateName,
 } from "../src/stopped-directory-publication.mjs";
-import { digestTree } from "../src/stopped-tree.mjs";
+import {
+  digestStoppedTreeIdentities,
+  digestTree,
+} from "../src/stopped-tree.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const THREAD_ID = "019f2100-0000-7000-8000-000000000002";
@@ -958,6 +963,23 @@ test("committed checkpoint replay rejects extra bundle-root entries", async (t) 
   );
 });
 
+test("committed checkpoint replay rejects a non-private bundle root", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  await chmod(fixture.artifactDirectory, 0o755);
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
+  );
+});
+
 test("a missing committed artifact remains classified as committed corruption", async (t) => {
   const fixture = await createFixture(t);
   const options = captureOptions(fixture);
@@ -1057,6 +1079,7 @@ test("malformed committed materialization is committed-state corruption", async 
     publicationId: materialization.publicationId,
     publicationKind: materialization.publicationKind,
     stagedRoot: materialization.stagedRoot,
+    treeIdentityDigest: materialization.treeIdentityDigest,
   };
   await writeFile(recordPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
 
@@ -1410,6 +1433,227 @@ test("a materialized stage-only operation resumes without recopying", async (t) 
   );
 });
 
+test("a non-private materialized candidate cannot be renamed", async (t) => {
+  let failAfterMaterialized = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  await chmod(candidate, 0o755);
+
+  failAfterMaterialized = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("a materialized candidate overlapping the source requires recovery", async (t) => {
+  let failAfterMaterialized = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  await link(
+    join(candidate, "payload", "workspace", "README.md"),
+    join(fixture.sourceDirectory, "workspace", "candidate-alias"),
+  );
+
+  failAfterMaterialized = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("materialized topology stays uncertain until candidate-only is proven", async (t) => {
+  let failAfterMaterialized = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  await rm(candidate, { force: true, recursive: true });
+
+  failAfterMaterialized = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_outcome_uncertain", "uncertain"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("materialized topology probe errors remain publication-uncertain", async (t) => {
+  let failAfterMaterialized = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  failAfterMaterialized = false;
+
+  class TargetBlockingJournal extends FilesystemOperationJournal {
+    async read(readOptions) {
+      const outcome = await super.read(readOptions);
+      if (outcome.record?.state === "materialized") {
+        await chmod(fixture.artifactOwnedRoot, 0o600);
+      }
+      return outcome;
+    }
+  }
+  const blockingJournal = new TargetBlockingJournal({
+    directory: fixture.journalDirectory,
+    acquireLock: simpleLockProvider(),
+    ...TRUSTED_JOURNAL_ACL_INSPECTORS,
+  });
+  const publication = new StoppedDirectoryPublication({
+    journal: blockingJournal,
+    acquireLock: simpleLockProvider(),
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      type: "test-local",
+    }),
+    inspectOwnedRootAcl: async () => false,
+    inspectOwnedRootAncestorAcl: async () => false,
+  });
+
+  try {
+    await assert.rejects(
+      publication.publishCheckpointArtifact(options),
+      (error) =>
+        assertPublicationError(
+          error,
+          "publication_outcome_uncertain",
+          "uncertain",
+        ),
+    );
+  } finally {
+    await chmod(fixture.artifactOwnedRoot, 0o700);
+  }
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("materialized replay rejects same-byte retained-tree inode replacement", async (t) => {
+  let failAfterMaterialized = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  const retainedFile = join(candidate, "payload", "workspace", "README.md");
+  await rm(retainedFile);
+  await writeFile(retainedFile, "portable\n", { mode: 0o640 });
+  await rm(fixture.sourceDirectory, { force: true, recursive: true });
+
+  failAfterMaterialized = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
 test("a materialized final-only operation resumes after post-rename uncertainty", async (t) => {
   let failAfterParentSync = true;
   let afterCopyCalls = 0;
@@ -1464,6 +1708,35 @@ test("a materialized final-only operation resumes after post-rename uncertainty"
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "committed",
+  );
+});
+
+test("a non-private materialized final remains publication-uncertain", async (t) => {
+  let failAfterParentSync = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterParentSync() {
+        if (failAfterParentSync) throw new Error("final-only fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_outcome_uncertain", "uncertain"),
+  );
+  await chmod(fixture.artifactDirectory, 0o755);
+
+  failAfterParentSync = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_outcome_uncertain", "uncertain"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
   );
 });
 
@@ -2009,6 +2282,7 @@ test("restore replay rejects a materialized tree outside the trusted artifact pr
         device: identity.dev.toString(),
         inode: identity.ino.toString(),
       },
+      treeIdentityDigest: await digestStoppedTreeIdentities(candidate),
     },
     operationId: prepared.operationId,
     request: prepared.request,

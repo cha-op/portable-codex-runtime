@@ -162,9 +162,11 @@ remaining sequence:
    tree fsync, publication-parent sync, exact bundle-shape/manifest/payload
    readback, and pinned identity check before calling
    `journal.markMaterialized()` with the fixed digests and device/inode
-   identity encoded as canonical decimal strings; `materialized` therefore
-   means a complete, durable, unpublished staging object, not merely that copy
-   returned;
+   identity encoded as canonical decimal strings plus a domain-separated digest
+   of every retained subtree identity; reject any identity shared with the
+   stopped source, and re-open the staging root as current-user-owned, mode
+   `0700`, extended-ACL-free private storage; `materialized` therefore means a
+   complete, durable, unpublished staging object, not merely that copy returned;
 7. revalidate the publication root, lock, held staging inode, and absent final
    destination; after the last pre-rename callback, reassert the lock and repeat
    the full staged-tree fsync, publication-parent sync, exact readback, and
@@ -263,6 +265,14 @@ classified only after the journal is read under the publication lock. It is a
 caller error for a new operation and recovery-required for `prepared`, but a
 `materialized` or `committed` replay uses the recorded source binding and does
 not reopen or recopy that leaf.
+
+For a `materialized` replay, physical outcome stays `uncertain` until both
+candidate and final probes succeed and prove candidate-present/final-absent
+under the current target authority. Retained candidate/final verification also
+recomputes the complete subtree-identity digest, rejects any current identity
+intersection with an available stopped source, and revalidates owner, `0700`
+mode, and ACLs. Same-byte inode replacement or permission broadening therefore
+cannot advance to rename or committed replay.
 
 Production root ACL inspection uses the stopped-tree platform defaults. A host
 adapter that provides an equivalent trusted ACL capability may inject

@@ -62,6 +62,11 @@ superseded_by:
   journal discovery, so materialized/committed replay can use its recorded
   source binding. Restore repeatedly requires the checkpoint bundle root to
   contain exactly `artifact.json` and `payload/`.
+- Materialized recovery remains uncertain until current authority proves a
+  candidate-only topology. The journal binds a complete retained-tree identity
+  digest; recovery/readback rejects source-retained identity intersections,
+  same-byte inode replacement, and candidate/final roots that no longer satisfy
+  current-user-owned `0700` ACL-free private storage.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

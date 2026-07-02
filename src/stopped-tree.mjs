@@ -644,6 +644,28 @@ export async function stoppedTreeContainsAnyIdentity(path, identities) {
   );
 }
 
+export async function stoppedTreesShareAnyIdentity(left, right) {
+  assert.equal(typeof left, "string", "left stopped tree path must be a string");
+  assert.equal(typeof right, "string", "right stopped tree path must be a string");
+  const leftIdentities = await collectTreeIdentities(left);
+  const rightIdentities = await collectTreeIdentities(right);
+  for (const identity of leftIdentities) {
+    if (rightIdentities.has(identity)) return true;
+  }
+  return false;
+}
+
+export async function digestStoppedTreeIdentities(path) {
+  const identities = [...(await collectTreeIdentities(path))].sort();
+  const hash = createHash("sha256");
+  hash.update("portable-stopped-tree-identities-v1\0", "utf8");
+  for (const identity of identities) {
+    hash.update(`${Buffer.byteLength(identity, "utf8")}:`, "utf8");
+    hash.update(identity, "utf8");
+  }
+  return hash.digest("hex");
+}
+
 async function copyFileContents(sourceHandle, destinationHandle) {
   const buffer = Buffer.allocUnsafe(1024 * 1024);
   let position = 0;
