@@ -286,6 +286,8 @@ export class AppServerClient {
     });
     this.exitPromise = once(this.child, "exit");
     void this.exitPromise.catch(() => {});
+    this.childClosePromise = once(this.child, "close");
+    void this.childClosePromise.catch(() => {});
 
     this.child.once("error", (error) => this.#failAll(error));
     this.child.stdin.on("error", (error) => {
@@ -303,6 +305,8 @@ export class AppServerClient {
     });
 
     this.stdout = createInterface({ input: this.child.stdout });
+    this.stdoutClosePromise = once(this.stdout, "close");
+    void this.stdoutClosePromise.catch(() => {});
     this.stdout.on("line", (line) => {
       if (line.trim() === "") return;
       let message;
@@ -773,9 +777,13 @@ export async function stopAndAssertNoWorkerAuth(client, codexHome) {
   await assertNoWorkerAuth(codexHome, "during shutdown");
 }
 
-export function codexVersion(codexBin) {
+export function codexVersion(codexBin, { cwd, env } = {}) {
   const executable = resolveAppServerExecutable(codexBin);
-  const result = spawnSync(executable, ["--version"], { encoding: "utf8" });
+  const result = spawnSync(executable, ["--version"], {
+    encoding: "utf8",
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(env === undefined ? {} : { env }),
+  });
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(`failed to run ${executable} --version: ${result.stderr}`);

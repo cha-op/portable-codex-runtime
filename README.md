@@ -4,10 +4,11 @@ Portable Codex Runtime is an experimental host runtime for moving Codex
 app-server sessions between trusted machines while keeping the execution
 environment, workspace, rollout state, and recovery data explicit.
 
-The current repository focuses on compatibility probes for the authentication
-boundary. The planned runtime keeps refresh tokens in a central auth authority,
-injects short-lived access tokens into session workers, and treats session data
-snapshots separately from monotonic credential state.
+The current repository focuses on compatibility probes for authentication and
+interrupted-turn recovery boundaries. The planned runtime keeps refresh tokens
+in a central auth authority, injects short-lived access tokens into session
+workers, and treats session data snapshots separately from monotonic credential
+state.
 
 ## Status
 
@@ -15,10 +16,89 @@ The runtime architecture is under active development. The current implementation
 proves that the installed Codex app-server supports external ChatGPT access-token
 injection and proves the managed refresh API choreography with an explicitly
 uncontained host probe. Production managed refresh fails closed until a
-per-refresh rootless containment executor is implemented.
+per-refresh rootless containment executor is implemented. A separate loopback
+probe characterizes explicit interruption, process signals, hard kills, and a
+stopped-tree restore without using credentials or a real model turn.
 
 The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
 Codex binary or image digest and rerun these probes before upgrading it.
+
+## Interrupted-Turn Recovery
+
+The recovery probe starts a real Codex app-server against a held localhost
+Responses API mock. It exercises four independent scenarios:
+
+- stable `turn/interrupt`, followed by a cold resume;
+- `SIGTERM` during an active turn;
+- `SIGKILL` during an active turn;
+- `SIGKILL`, a stopped full-tree copy, deletion of the source tree, and restore
+  at a different absolute path.
+
+The probe verifies the explicit thread ID through both `thread/resume` and
+`thread/read`. Explicit interruption persists a model-visible abort marker.
+Signal and hard-kill recovery instead normalizes the stale in-progress turn to
+`interrupted` without inventing that marker. The stopped-tree copy preserves
+snapshot-user-accessible regular files and directories with their POSIX rwx
+permission bits, plus portable UTF-8 symlink targets without following links.
+Symlink permission bits are outside the modeled digest. Directory names must be
+NFC-normalized. Inaccessible entries, non-ASCII cased names, case-insensitive
+name collisions,
+dangling relative links, relative-link
+case or normalization aliases, traversal through non-directories,
+resolution chains that cross protected trees, non-relocatable links, special
+permission bits,
+hard links (including hard-linked symlinks), sockets, FIFOs, and devices fail
+closed. Ownership, ACLs,
+extended attributes,
+timestamps, and other unmodeled metadata are not preserved or covered by the
+digest. If validation or copy fails after destination creation, the partial
+destination is retained for cleanup by the trusted owner; the helper never
+recursively removes a failure path that another writer could have replaced.
+The copy helper requires exclusive single-writer control of its current-user-
+owned, mode `0700`, extended-ACL-free root. It holds and revalidates that root,
+and requires a trusted owner, permission, identity, and ACL state across the
+complete ancestor chain. Concurrent mutation by another process with the same
+UID is not a supported security boundary.
+It is not an online, atomic, or power-loss-durable snapshot implementation.
+
+Run the deterministic compatibility probe with the exact Codex binary from the
+pinned runtime image:
+
+```bash
+CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
+  npm run probe:turn-recovery
+```
+
+If the system temporary filesystem is mounted `noexec`, set
+`CODEX_RECOVERY_EXEC_ROOT` to an existing absolute directory on an executable
+filesystem with a trusted owner, ancestor chain, and ACL state; the probe
+creates and removes its own mode `0700` subdirectory there.
+The pinned macOS runtime must provide `/bin/ls` and `/sbin/mount`; Linux must
+provide ACL-capable `/usr/bin/getfacl` plus `/proc/self/mountinfo`. The probe
+invokes these fixed inspection surfaces and fails closed when they are absent,
+malformed, or when raw Darwin mount paths contain text that is ambiguous with
+the `mount(8)` output separators. Both platform tables are captured as bytes
+and rejected before parsing if strict UTF-8 decoding would be lossy.
+
+To update the redacted evidence after an intentional runtime upgrade:
+
+```bash
+CODEX_BIN=/absolute/path/from/the-pinned-image/codex \
+  npm run probe:turn-recovery -- --write-evidence
+```
+
+The evidence parent directory must already exist, be owned by the current user,
+and have trusted permissions, ancestors, and ACL state. Evidence publication
+holds and revalidates that directory. A failure before rename retains its
+private temp artifact for trusted-owner cleanup; a failure after rename leaves
+the destination in place and the CLI reports
+`evidence_durability_uncertain` without serializing exception details.
+
+The command provisions no credential input and configures the model provider to
+use the loopback mock. It does not impose OS-level outbound network isolation;
+run it inside a network-isolated container when that stronger evidence is
+required. See `docs/experiments/interrupted-turn-recovery.md` for source
+evidence, exact semantics, and storage limitations.
 
 ## Managed Auth Refresh Authority
 
@@ -64,8 +144,11 @@ Run the full local test suite:
 npm test
 ```
 
-The two app-server integration tests run when `CODEX_BIN` (or `codex` on
-`PATH`) is executable. They are reported as skipped on Node-only CI runners;
+Two external-auth app-server integration tests run when `CODEX_BIN` (or
+`codex` on `PATH`) is executable. The third app-server integration test is the
+full interrupted-turn recovery matrix; it requires `CODEX_BIN` to be an
+explicit absolute path so the probe can bind evidence to that exact binary.
+Unavailable integration tests are reported as skipped on Node-only CI runners;
 the remaining tests still run normally.
 
 The reference host app-server runtime currently supports macOS and Linux process

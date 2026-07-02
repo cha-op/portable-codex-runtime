@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 5,
+  "probe": "interrupted-turn-recovery",
+  "runtime": {
+    "codexVersion": "codex-cli 0.142.4",
+    "codexBinarySha256": "32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5",
+    "binaryExecution": "private-read-only-copy",
+    "sourceAnalysisCommit": "db887d03e1f907467e33271572dffb73bceecd6b",
+    "platform": "darwin",
+    "launcherArch": "arm64"
+  },
+  "backend": {
+    "type": "loopback-held-responses-mock",
+    "realModelTurnConfigured": false,
+    "credentialInputProvisioned": false,
+    "outboundNetworkIsolated": false
+  },
+  "snapshot": {
+    "kind": "stopped-tree-copy",
+    "sourceQuiesced": true,
+    "modeledTreeDigestMatched": true,
+    "workspaceModeledDigestMatched": true,
+    "appServerWorkspaceMatched": true,
+    "historicalWorkspaceRetained": true
+  },
+  "scenarios": [
+    {
+      "kind": "logical_interrupt",
+      "turnMaterialized": true,
+      "terminationObserved": "rpc-interrupt",
+      "originalCompletionObserved": true,
+      "threadReadIsolation": "copy-original-path-absent-held-tree-000",
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "present"
+    },
+    {
+      "kind": "sigterm",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGTERM",
+      "originalCompletionObserved": false,
+      "threadReadIsolation": "copy-original-path-absent-held-tree-000",
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "absent"
+    },
+    {
+      "kind": "sigkill",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGKILL",
+      "originalCompletionObserved": false,
+      "threadReadIsolation": "copy-original-path-absent-held-tree-000",
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "absent"
+    },
+    {
+      "kind": "snapshot_restore",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGKILL",
+      "originalCompletionObserved": false,
+      "threadReadIsolation": "copy-original-path-absent-held-tree-000",
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "tailTurnStatus": "interrupted",
+      "threadReadAgrees": true,
+      "modelAbortMarker": "absent"
+    }
+  ],
+  "result": "passed"
+}
