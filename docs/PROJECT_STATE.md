@@ -12,6 +12,11 @@
   rootless worker template, and checkpoint class contracts define the portable
   data-plane boundary without exposing raw devices to workers or claiming
   metadata-only physical authority.
+- An encrypted canonical auth store and generation-aware broker now provide
+  claim-validated access-token delivery, single-flight refresh, exact commit
+  reconciliation, canonical-path coordination, pre-dispatch recovery
+  reservations, stale-worker suppression, and durable reauth/recovery gates
+  without placing refresh-token state on session volumes.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -24,6 +29,8 @@
   `docs/project_journal/2026/07/2026-07-01-interrupted-turn-recovery-4a91c7.md`
 - Session filesystem and storage contracts:
   `docs/project_journal/2026/07/2026-07-02-session-storage-contracts-7c31e2.md`
+- Auth broker MVP:
+  `docs/project_journal/2026/07/2026-07-02-auth-broker-mvp-4d729b.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
