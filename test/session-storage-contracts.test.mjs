@@ -252,6 +252,11 @@ test("session manifest round-trips canonically and rejects duplicate JSON keys",
 
 test("session manifest rejects mutable identity, credentials, tags, and unsupported layouts", () => {
   const manifest = sessionManifest();
+  const coercingLimit = {
+    [Symbol.toPrimitive]() {
+      throw new Error("agent limit coercion must not execute");
+    },
+  };
   for (const invalid of [
     { ...manifest, authJson: "/session/codex-home/auth.json" },
     { ...manifest, refreshToken: "secret" },
@@ -282,6 +287,7 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
     { ...manifest, layoutVersion: 2 },
     { ...manifest, agents: { ...manifest.agents, defaultMaxSubagents: 11 } },
     { ...manifest, agents: { ...manifest.agents, maxSubagents: 11 } },
+    { ...manifest, agents: { ...manifest.agents, maxSubagents: coercingLimit } },
     { ...manifest, agents: { ...manifest.agents, maxDepth: 3 } },
   ]) {
     assert.throws(() => assertSessionManifest(invalid), assertCode("invalid_session_manifest"));
@@ -458,6 +464,8 @@ test("storage references and attachments contain no host path in portable state"
     attachment({ rootPath: "/" }),
     attachment({ rootPath: "/var/lib/../etc" }),
     attachment({ rootPath: "/var/lib/portable-codex/\0session" }),
+    attachment({ fencingEpoch: "0" }),
+    attachment({ fencingEpoch: "18446744073709551616" }),
     { ...attachment(), rawDevice: "/dev/disk9" },
   ]) {
     assert.throws(() => assertSessionAttachment(invalid), assertCode("invalid_storage_attachment"));
@@ -542,6 +550,12 @@ test("storage backend contract requires directory, exclusivity, fencing, and all
 test("storage mutation envelopes bind operation IDs to the complete writer fence", () => {
   const request = mutationRequest();
   assert.deepEqual(assertStorageMutationRequest(request), request);
+  for (const fencingEpoch of ["0", "18446744073709551616"]) {
+    assert.throws(
+      () => assertStorageMutationRequest({ ...request, fencingEpoch }),
+      assertCode("invalid_storage_mutation"),
+    );
+  }
   assert.deepEqual(
     assertStorageMutationMatchesLeaseSnapshot({
       canonicalLease: lease(),
@@ -753,6 +767,8 @@ test("checkpoint descriptor binds immutable session identity but never restores 
     checkpoint({ codexThreadId: "019f2100-0000-7000-8000-000000000099" }),
     checkpoint({ imageDigest: `sha256:${"b".repeat(64)}` }),
     checkpoint({ storageId: "volume-002" }),
+    checkpoint({ sourceFencingEpoch: "0" }),
+    checkpoint({ sourceFencingEpoch: "18446744073709551616" }),
     { ...checkpoint(), leaseId: "lease-001" },
     { ...checkpoint(), authJson: "forbidden" },
     { ...checkpoint(), gitSummary: { branch: "main" } },

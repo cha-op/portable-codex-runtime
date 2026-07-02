@@ -290,21 +290,21 @@ function assertAgentPolicy(value) {
     "session agent policy",
   );
   ensure(
+    Number.isSafeInteger(value.maxSubagents) && value.maxSubagents === MAX_SUBAGENTS,
+    "invalid_session_manifest",
+    "session subagent hard limit is unsupported",
+  );
+  ensure(
+    Number.isSafeInteger(value.maxDepth) && value.maxDepth === MAX_AGENT_DEPTH,
+    "invalid_session_manifest",
+    "session agent depth limit is unsupported",
+  );
+  ensure(
     Number.isSafeInteger(value.defaultMaxSubagents) &&
       value.defaultMaxSubagents >= 1 &&
       value.defaultMaxSubagents <= value.maxSubagents,
     "invalid_session_manifest",
     "default subagent limit is invalid",
-  );
-  ensure(
-    value.maxSubagents === MAX_SUBAGENTS,
-    "invalid_session_manifest",
-    "session subagent hard limit is unsupported",
-  );
-  ensure(
-    value.maxDepth === MAX_AGENT_DEPTH,
-    "invalid_session_manifest",
-    "session agent depth limit is unsupported",
   );
 }
 
@@ -498,15 +498,19 @@ export function assertResolvedPlatformImageMatchesManifest(options) {
   );
 }
 
-export function parseFencingEpoch(value) {
+function parseFencingEpochForRecord(value, code) {
   ensure(
     typeof value === "string" && /^[1-9][0-9]{0,19}$/u.test(value),
-    "invalid_fence",
+    code,
     "fencing epoch must be a canonical positive decimal string",
   );
   const epoch = BigInt(value);
-  ensure(epoch <= UINT64_MAX, "invalid_fence", "fencing epoch exceeds uint64");
+  ensure(epoch <= UINT64_MAX, code, "fencing epoch exceeds uint64");
   return epoch;
+}
+
+export function parseFencingEpoch(value) {
+  return parseFencingEpochForRecord(value, "invalid_fence");
 }
 
 export function compareFencingEpochs(left, right) {
@@ -530,7 +534,7 @@ export function assertLeaseGrant(value) {
   assertUuid(value.sessionId, "invalid_fence", "lease session ID");
   assertOpaqueId(value.leaseId, "invalid_fence", "lease ID");
   assertOpaqueId(value.holderId, "invalid_fence", "lease holder ID");
-  parseFencingEpoch(value.fencingEpoch);
+  parseFencingEpochForRecord(value.fencingEpoch, "invalid_fence");
   assertIsoTimestamp(value.expiresAt, "invalid_fence", "lease expiration");
   return deepFreeze(defensiveClone(value, "invalid_fence", "lease grant"));
 }
@@ -650,7 +654,7 @@ export function assertSessionAttachment(value) {
   assertOpaqueId(value.holderId, "invalid_storage_attachment", "attachment holder ID");
   assertOpaqueId(value.operationId, "invalid_storage_attachment", "attachment operation ID");
   assertOpaqueId(value.proofId, "invalid_storage_attachment", "attachment proof ID");
-  parseFencingEpoch(value.fencingEpoch);
+  parseFencingEpochForRecord(value.fencingEpoch, "invalid_storage_attachment");
   ensure(
     value.kind === "directory",
     "invalid_storage_attachment",
@@ -810,7 +814,7 @@ export function assertStorageMutationRequest(value) {
   assertOpaqueId(value.leaseId, "invalid_storage_mutation", "mutation lease ID");
   assertOpaqueId(value.holderId, "invalid_storage_mutation", "mutation holder ID");
   assertOpaqueId(value.operationId, "invalid_storage_mutation", "mutation operation ID");
-  parseFencingEpoch(value.fencingEpoch);
+  parseFencingEpochForRecord(value.fencingEpoch, "invalid_storage_mutation");
   ensure(
     ["attach", "checkpoint", "destroy", "detach", "restore"].includes(
       value.operation,
@@ -1049,7 +1053,7 @@ export function assertCheckpointDescriptor(value, options = {}) {
     "invalid_checkpoint",
     "checkpoint image digest is invalid",
   );
-  parseFencingEpoch(value.sourceFencingEpoch);
+  parseFencingEpochForRecord(value.sourceFencingEpoch, "invalid_checkpoint");
   assertCheckpointClass(value.checkpointClass);
   assertIsoTimestamp(value.createdAt, "invalid_checkpoint", "checkpoint creation time");
 
