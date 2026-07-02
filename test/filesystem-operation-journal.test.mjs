@@ -6,7 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
-  readdir,
+  realpath,
   rename,
   rm,
   symlink,
@@ -30,6 +30,10 @@ const ARTIFACT_ID = "artifact-001";
 const OPERATION_ID = "operation-checkpoint-001";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const MODELED_DIGEST = `sha256:${"b".repeat(64)}`;
+
+function operationTemporaryRecordFilename(operationId) {
+  return `.${operationJournalRecordFilename(operationId).slice(0, -5)}.tmp-current`;
+}
 
 const TRUSTED_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
@@ -580,6 +584,18 @@ test("operational collaborators cannot forge public journal errors", async (t) =
     );
   });
 
+  await t.test("temporary-record inspector", async (t) => {
+    const { journal } = await createFixture(t, {
+      inspectTemporaryRecord: async () => {
+        throw new OperationJournalError("operation_conflict", "committed");
+      },
+    });
+    await assert.rejects(
+      prepare(journal),
+      assertJournalError("journal_io_failed", "not-committed"),
+    );
+  });
+
   await t.test("fault hook cannot replay an escaped internal error", async (t) => {
     const { journal } = await createFixture(t, {
       faults: {
@@ -1000,6 +1016,62 @@ test("pre-rename temp sync and before-rename failures are definitely not committ
   }
 });
 
+test("retained recovery evidence is checked by deterministic operation path", async (t) => {
+  const inspectedPaths = [];
+  const { directory, journal } = await createFixture(t, {
+    async inspectTemporaryRecord(path) {
+      inspectedPaths.push(path);
+      try {
+        await lstat(path, { bigint: true });
+        return true;
+      } catch (error) {
+        if (error?.code === "ENOENT") return false;
+        throw error;
+      }
+    },
+  });
+  const otherOperationId = "operation-checkpoint-002";
+  await Promise.all(
+    Array.from({ length: 64 }, (_, index) =>
+      writeFile(
+        join(
+          directory,
+          operationJournalRecordFilename(`historical-operation-${index}`),
+        ),
+        "historical record\n",
+        { flag: "wx", mode: 0o600 },
+      ),
+    ),
+  );
+  await writeFile(
+    join(directory, operationTemporaryRecordFilename(otherOperationId)),
+    "retained recovery evidence\n",
+    { flag: "wx", mode: 0o600 },
+  );
+
+  assert.equal((await journal.read({ operationId: OPERATION_ID })).record, null);
+  const expectedCurrentPath = join(
+    await realpath(directory),
+    operationTemporaryRecordFilename(OPERATION_ID),
+  );
+  assert.deepEqual(inspectedPaths, [
+    expectedCurrentPath,
+    expectedCurrentPath,
+    expectedCurrentPath,
+  ]);
+  await assert.rejects(
+    journal.read({ operationId: otherOperationId }),
+    assertJournalError("journal_recovery_required", "not-committed"),
+  );
+  assert.equal(
+    inspectedPaths.at(-1),
+    join(
+      await realpath(directory),
+      operationTemporaryRecordFilename(otherOperationId),
+    ),
+  );
+});
+
 test("pre-rename publication refuses a canonical record created after an absent read", async (t) => {
   const donor = await createFixture(t);
   await prepare(donor.journal);
@@ -1226,10 +1298,10 @@ test("an exact-byte temp pathname replacement is rejected before rename", async 
     faults: {
       async afterTempSync({ record }) {
         if (record.state !== "committed") return;
-        const prefix = `.${operationJournalRecordFilename(record.operationId).slice(0, -5)}.tmp-`;
-        const matches = (await readdir(directory)).filter((entry) => entry.startsWith(prefix));
-        assert.equal(matches.length, 1);
-        const temporaryPath = join(directory, matches[0]);
+        const temporaryPath = join(
+          directory,
+          operationTemporaryRecordFilename(record.operationId),
+        );
         const exactBytes = await readFile(temporaryPath);
         await rename(temporaryPath, join(root, "original-committed-temp"));
         await writeFile(temporaryPath, exactBytes, { flag: "wx", mode: 0o600 });

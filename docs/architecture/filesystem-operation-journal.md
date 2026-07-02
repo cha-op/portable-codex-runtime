@@ -107,8 +107,8 @@ Every forward transition uses the same publication protocol while holding the
 journal lock and directory authority:
 
 1. read and validate the current canonical state;
-2. create a same-directory private file with `O_EXCL`, `O_NOFOLLOW`, and mode
-   `0600`;
+2. create the operation's deterministic same-directory private temporary path
+   with `O_EXCL`, `O_NOFOLLOW`, and mode `0600`;
 3. write and fsync the complete next canonical JSON record, retaining its open
    file descriptor and device/inode identity;
 4. finish the pre-rename hooks and lock callbacks, revalidate the directory,
@@ -150,6 +150,8 @@ failure happens after a temporary record has been created, the journal retains
 that file as recovery evidence rather than deleting it speculatively. Any later
 `read()` or transition for the same operation then fails with
 `journal_recovery_required` before returning an absent or canonical record.
+The deterministic per-operation path makes this check a direct lookup rather
+than a scan whose cost grows with the journal's permanent record history.
 There is deliberately no public cleanup or automatic-recovery API in this
 slice: a trusted operator recovery path must inspect and resolve the retained
 temporary record before the operation can continue.
@@ -199,7 +201,8 @@ record. It does not prove:
   destination check and POSIX rename; or
 - that the backend operation succeeded.
 
-Injected lock, fault, ACL, random-byte, and directory-sync collaborators are
+Injected lock, fault, ACL, recovery-path inspection, and directory-sync
+collaborators are
 trusted test seams. Production publication uses the default branded advisory
 lock holder. Its destination recheck narrows the final window and prevents a
 stale predecessor from being overwritten after callbacks complete, but it is

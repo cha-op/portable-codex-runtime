@@ -1,6 +1,6 @@
-import { createHash, randomBytes as generateRandomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
@@ -722,23 +722,48 @@ function tempPrefix(operationId) {
   return `.${operationJournalRecordFilename(operationId).slice(0, -5)}.tmp-`;
 }
 
+function temporaryRecordFilename(operationId) {
+  return `${tempPrefix(operationId)}current`;
+}
+
+async function inspectTemporaryRecord(path) {
+  try {
+    await lstat(path, { bigint: true });
+    return true;
+  } catch (error) {
+    if (safeErrorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function assertTemporaryRecordAbsent(
+  authority,
+  operationId,
+  inspectTemporaryRecordPath,
+) {
+  let exists;
+  try {
+    exists = await inspectTemporaryRecordPath(
+      join(authority.path, temporaryRecordFilename(operationId)),
+    );
+  } catch {
+    fail("journal_io_failed");
+  }
+  ensure(typeof exists === "boolean", "journal_io_failed");
+  ensure(!exists, "journal_recovery_required");
+}
+
 async function readCanonicalRecord(
   authority,
   operationId,
   faults,
-  { expectedIdentity } = {},
+  { expectedIdentity, inspectTemporaryRecordPath },
 ) {
   const filename = operationJournalRecordFilename(operationId);
-  const prefix = tempPrefix(operationId);
-  let entries;
-  try {
-    entries = await readdir(authority.path);
-  } catch {
-    fail("journal_io_failed");
-  }
-  ensure(
-    !entries.some((entry) => entry.startsWith(prefix)),
-    "journal_recovery_required",
+  await assertTemporaryRecordAbsent(
+    authority,
+    operationId,
+    inspectTemporaryRecordPath,
   );
   const path = join(authority.path, filename);
   let handle;
@@ -838,16 +863,15 @@ async function assertPathMissing(path) {
   fail("journal_io_failed");
 }
 
-async function assertCanonicalRecordAbsent(authority, operationId) {
-  let entries;
-  try {
-    entries = await readdir(authority.path);
-  } catch {
-    fail("journal_io_failed");
-  }
-  ensure(
-    !entries.some((entry) => entry.startsWith(tempPrefix(operationId))),
-    "journal_recovery_required",
+async function assertCanonicalRecordAbsent(
+  authority,
+  operationId,
+  inspectTemporaryRecordPath,
+) {
+  await assertTemporaryRecordAbsent(
+    authority,
+    operationId,
+    inspectTemporaryRecordPath,
   );
   try {
     await lstat(
@@ -872,18 +896,8 @@ async function assertCanonicalPrecondition({
   temporaryPath,
 }) {
   await authority.assertIdentityCurrent();
-  let entries;
-  try {
-    entries = await readdir(authority.path);
-  } catch {
-    fail("journal_io_failed");
-  }
-  const temporaryName = temporaryPath.slice(authority.path.length + 1);
-  const operationTemps = entries.filter((entry) =>
-    entry.startsWith(tempPrefix(operationId)),
-  );
   ensure(
-    operationTemps.length === 1 && operationTemps[0] === temporaryName,
+    temporaryPath === join(authority.path, temporaryRecordFilename(operationId)),
     "journal_io_failed",
   );
 
@@ -946,21 +960,17 @@ async function writeCanonicalRecord({
   expectedIdentity,
   expectedRecord,
   faults,
+  inspectTemporaryRecordPath,
   lock,
-  randomBytes,
   record,
   syncDirectory,
   trustRenameOutcome,
 }) {
   const filename = operationJournalRecordFilename(record.operationId);
-  let random;
-  try {
-    random = await randomBytes(16);
-  } catch {
-    fail("journal_io_failed");
-  }
-  ensure(Buffer.isBuffer(random) && random.length >= 16, "journal_io_failed");
-  const temporaryPath = join(authority.path, `${tempPrefix(record.operationId)}${random.toString("hex")}`);
+  const temporaryPath = join(
+    authority.path,
+    temporaryRecordFilename(record.operationId),
+  );
   const canonicalPath = join(authority.path, filename);
   const serialized = canonicalBytes(record);
   const serializedSize = BigInt(Buffer.byteLength(serialized, "utf8"));
@@ -1073,7 +1083,10 @@ async function writeCanonicalRecord({
         ...faults,
         afterRecordRead: async () => {},
       },
-      { expectedIdentity: temporaryIdentity },
+      {
+        expectedIdentity: temporaryIdentity,
+        inspectTemporaryRecordPath,
+      },
     );
     ensure(
       readback.record !== null && canonicalEqual(readback.record, record),
@@ -1119,6 +1132,7 @@ async function writeCanonicalRecord({
 async function confirmVisibleRecord({
   authority,
   identity,
+  inspectTemporaryRecordPath,
   lock,
   operationId,
   record,
@@ -1149,7 +1163,7 @@ async function confirmVisibleRecord({
       authority,
       operationId,
       { afterRecordRead: async () => {} },
-      { expectedIdentity: identity },
+      { expectedIdentity: identity, inspectTemporaryRecordPath },
     );
     ensure(
       beforeSync.record !== null && canonicalEqual(beforeSync.record, record),
@@ -1170,7 +1184,7 @@ async function confirmVisibleRecord({
       authority,
       operationId,
       { afterRecordRead: async () => {} },
-      { expectedIdentity: identity },
+      { expectedIdentity: identity, inspectTemporaryRecordPath },
     );
     ensure(
       confirmed.record !== null && canonicalEqual(confirmed.record, record),
@@ -1196,6 +1210,7 @@ async function confirmVisibleRecord({
 async function verifyVisibleRecord({
   authority,
   identity,
+  inspectTemporaryRecordPath,
   lock,
   operationId,
   record,
@@ -1205,6 +1220,7 @@ async function verifyVisibleRecord({
     await confirmVisibleRecord({
       authority,
       identity,
+      inspectTemporaryRecordPath,
       lock,
       operationId,
       record,
@@ -1215,16 +1231,23 @@ async function verifyVisibleRecord({
   try {
     await authority.assertCurrent();
     await runUntrustedIo(() => lock.assertHeld());
-    const confirmed = await readCanonicalRecord(authority, operationId, {
-      afterRecordRead: async () => {},
-    });
+    const confirmed = await readCanonicalRecord(
+      authority,
+      operationId,
+      { afterRecordRead: async () => {} },
+      { inspectTemporaryRecordPath },
+    );
     ensure(
       confirmed.identity === null && confirmed.record === null,
       "invalid_journal_record",
     );
     await authority.assertCurrent();
     await runUntrustedIo(() => lock.assertHeld());
-    await assertCanonicalRecordAbsent(authority, operationId);
+    await assertCanonicalRecordAbsent(
+      authority,
+      operationId,
+      inspectTemporaryRecordPath,
+    );
   } catch {
     fail("journal_commit_outcome_uncertain", "uncertain");
   }
@@ -1269,7 +1292,7 @@ export class FilesystemOperationJournal {
   #faults;
   #inspectAncestorAcl;
   #inspectDirectoryAcl;
-  #randomBytes;
+  #inspectTemporaryRecord;
   #syncDirectory;
   #trustRenameOutcome;
 
@@ -1282,7 +1305,7 @@ export class FilesystemOperationJournal {
         "faults",
         "inspectAncestorAcl",
         "inspectDirectoryAcl",
-        "randomBytes",
+        "inspectTemporaryRecord",
         "syncDirectory",
       ],
       ["directory"],
@@ -1300,14 +1323,15 @@ export class FilesystemOperationJournal {
       normalized.inspectAncestorAcl ?? recoveryPathHasUnsafeAncestorAcl;
     this.#inspectDirectoryAcl =
       normalized.inspectDirectoryAcl ?? recoveryPathHasExtendedAcl;
-    this.#randomBytes = normalized.randomBytes ?? generateRandomBytes;
+    this.#inspectTemporaryRecord =
+      normalized.inspectTemporaryRecord ?? inspectTemporaryRecord;
     this.#syncDirectory = normalized.syncDirectory ?? (async (handle) => handle.sync());
     this.#faults = normalizeFaults(normalized.faults);
     for (const operation of [
       this.#acquireLock,
       this.#inspectAncestorAcl,
       this.#inspectDirectoryAcl,
-      this.#randomBytes,
+      this.#inspectTemporaryRecord,
       this.#syncDirectory,
     ]) {
       ensure(typeof operation === "function", "invalid_journal_request");
@@ -1376,6 +1400,7 @@ export class FilesystemOperationJournal {
         }
         await verifyVisibleRecord({
           authority,
+          inspectTemporaryRecordPath: this.#inspectTemporaryRecord,
           lock,
           syncDirectory: this.#syncDirectory,
           ...completed.verification,
@@ -1419,10 +1444,16 @@ export class FilesystemOperationJournal {
     const normalizedId = assertOperationId(operationId);
     return this.#run(normalizedId, async ({ authority, lock }) => {
       await runUntrustedIo(() => lock.assertHeld());
-      const visible = await readCanonicalRecord(authority, normalizedId, this.#faults);
+      const visible = await readCanonicalRecord(
+        authority,
+        normalizedId,
+        this.#faults,
+        { inspectTemporaryRecordPath: this.#inspectTemporaryRecord },
+      );
       const record = await confirmVisibleRecord({
         authority,
         identity: visible.identity,
+        inspectTemporaryRecordPath: this.#inspectTemporaryRecord,
         lock,
         operationId: normalizedId,
         record: visible.record,
@@ -1462,10 +1493,12 @@ export class FilesystemOperationJournal {
         authority,
         input.operationId,
         this.#faults,
+        { inspectTemporaryRecordPath: this.#inspectTemporaryRecord },
       );
       const existing = await confirmVisibleRecord({
         authority,
         identity: visible.identity,
+        inspectTemporaryRecordPath: this.#inspectTemporaryRecord,
         lock,
         operationId: input.operationId,
         record: visible.record,
@@ -1537,8 +1570,8 @@ export class FilesystemOperationJournal {
         expectedIdentity: visible.identity,
         expectedRecord: existing,
         faults: this.#faults,
+        inspectTemporaryRecordPath: this.#inspectTemporaryRecord,
         lock,
-        randomBytes: this.#randomBytes,
         record,
         syncDirectory: this.#syncDirectory,
         trustRenameOutcome: this.#trustRenameOutcome,

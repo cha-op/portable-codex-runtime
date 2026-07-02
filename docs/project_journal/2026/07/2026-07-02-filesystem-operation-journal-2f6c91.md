@@ -40,6 +40,9 @@ superseded_by:
   A pre-rename temporary record fails closed with `journal_recovery_required`
   until a trusted operator recovery path resolves it; this slice exposes no
   public cleanup API.
+- Each operation uses one deterministic temporary pathname, so retained
+  recovery evidence is detected by direct lookup instead of repeatedly
+  scanning the journal's permanent history.
 - Post-rename, parent-sync, or readback uncertainty is reported as
   `journal_commit_outcome_uncertain` with `commitState: "uncertain"`.
   Lock-release failures use `journal_lock_release_failed` and preserve the
