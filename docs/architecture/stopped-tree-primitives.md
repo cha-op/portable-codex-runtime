@@ -1,0 +1,86 @@
+# Reusable Stopped-Tree Primitives
+
+## Scope
+
+`src/stopped-tree.mjs` contains the reusable filesystem-validation, copy,
+digest, and guarded-cleanup primitives that were originally embedded in the
+interrupted-turn recovery probe. The extraction changes module ownership, not
+filesystem semantics. The probe imports and re-exports its existing public
+surface so current callers retain the same API and failure behaviour.
+
+The probe-compatible public surface is:
+
+- `parseLinuxMountInfo()`;
+- `parseDarwinMountTable()`;
+- `decodePortablePathBytes()`;
+- `assertPortableDirectoryNames()`;
+- `parseLinuxGetfacl()`;
+- `inspectLinuxRecoveryAcl()`;
+- `copyStoppedTree()`;
+- `digestTree()`; and
+- `removeTreeForCleanup()`.
+
+The extracted module also exposes a small set of repository-internal metadata,
+digest, and ACL helpers needed by the probe. Those helpers are not a new stable
+storage-backend contract.
+
+These functions operate only after an external coordinator has stopped the
+writer. They do not stop a process, authenticate stopped-writer evidence, or
+authorise a checkpoint.
+
+## Filesystem Contract
+
+`copyStoppedTree()` requires a current-user-owned, mode `0700`,
+extended-ACL-free owned root with a trusted ancestor chain. Its source and
+destination are direct children of that root. The tree operations hold and
+revalidate filesystem identities, reject mount boundaries, and use no-follow
+opens around copied entries.
+
+Portable trees contain snapshot-user-accessible regular files, directories,
+and supported UTF-8 symlinks. The model preserves regular-file and directory
+POSIX rwx permission bits, file bytes, relative paths, entry types, and symlink
+targets. The digest covers that same model.
+
+The implementation fails closed on unsupported names or aliases, inaccessible
+entries, symlink traversal outside the permitted model, special permission
+bits, hard links, sockets, FIFOs, devices, mount points, and detected identity
+or metadata races. Ownership, ACLs, extended attributes, timestamps, symlink
+permission bits, and hard-link topology are not preserved.
+
+Concurrent mutation by another process with the same UID is outside this
+security boundary. The caller must provide exclusive single-writer control.
+If a copy fails after creating its destination, the partial destination is
+retained; guarded cleanup never assumes that a pathname still names the object
+it previously observed.
+
+## Non-Durable Boundary
+
+These are stopped-tree compatibility primitives, not a snapshot backend. They
+do not provide:
+
+- a storage or filesystem `fsync`/`syncfs` barrier;
+- atomic checkpoint or restore publication;
+- a durable operation journal or operation-ID replay;
+- a durable checkpoint descriptor or backend proof;
+- canonical lease, attachment, or fencing checks;
+- restore destination isolation;
+- crash-consistent capture of a live or fenced writer; or
+- power-loss durability.
+
+`digestTree()` detects differences within the portable tree model; a matching
+digest is not evidence that either tree reached stable storage. Similarly,
+successful `copyStoppedTree()` means that a stopped source was copied under
+the helper's filesystem rules, not that an atomic or durable checkpoint was
+published.
+
+## Integration Boundary
+
+A later stopped-directory backend may compose these primitives with a trusted
+same-process stopped-writer coordinator, an atomic canonical fence recheck, a
+storage barrier, destination isolation, durable idempotency, and an operation
+journal. That backend must return the exact descriptor and mutation envelope
+required by the snapshot and restore core.
+
+The ext4 or filesystem-image backend, differential export, retention,
+encryption, periodic long-goal snapshots, cross-host verification, and Git
+Summary remain separate workstreams.

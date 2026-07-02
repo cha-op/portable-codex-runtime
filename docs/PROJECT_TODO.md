@@ -10,9 +10,13 @@
   tokens without mounting shared refresh-token state.
 - [done] Implement backend-neutral stopped-writer clean checkpoint and restore
   orchestration independently of auth state.
-- [pending] Implement stopped-directory backend conformance, then same-image
-  resume verification, replay-only uncertain-outcome reconciliation, and
-  rollout-tail repair.
+- [done] Extract reusable stopped-tree validation, copy, digest, and guarded
+  cleanup primitives without claiming a durable snapshot backend.
+- [pending] Implement the stopped-directory backend adapter and conformance,
+  including authenticated stop evidence, an fsync barrier, atomic publication,
+  destination isolation, and a durable operation journal with exact replay.
+- [pending] Add replay-only uncertain-outcome reconciliation, then same-image
+  resume verification and rollout-tail repair.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

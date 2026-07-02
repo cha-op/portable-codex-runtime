@@ -26,6 +26,12 @@ The core does not stop writers, prove quiescence, attach or start a worker,
 resume a Codex thread, or implement a physical storage backend. It does not
 turn the checkpoint descriptor into lease or fencing authority.
 
+The reusable stopped-tree primitives provide validated copy, digest, and
+guarded-cleanup mechanics for an already stopped directory tree. They do not
+satisfy the backend obligations below: in particular, they provide no fsync
+barrier, atomic publication, operation journal, or durable replay. See
+`stopped-tree-primitives.md`.
+
 `captureCleanCheckpoint()` and `restoreCleanCheckpoint()` are the orchestration
 entry points. Both reject `graceful-abort` and `crash-prefix` before backend
 dispatch. Successful results contain the deeply frozen validated checkpoint

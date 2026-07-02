@@ -66,6 +66,12 @@ retains the original workspace path, and the redacted evidence records that
 dual-path behavior as booleans. Cold `thread/read` independently confirms the
 recovered tail in a separate app-server process.
 
+The stopped-tree implementation now lives in `src/stopped-tree.mjs`. The probe
+imports and re-exports the existing parsing, pathname, copy, digest, and cleanup
+API, so the extraction does not change this experiment's compatibility claim
+or failure semantics. The reusable module remains non-durable; see
+`docs/architecture/stopped-tree-primitives.md`.
+
 ## Live Result
 
 The complete matrix passed on macOS with an arm64 Node launcher and:
