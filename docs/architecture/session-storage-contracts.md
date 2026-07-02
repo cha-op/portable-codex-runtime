@@ -66,6 +66,7 @@ credential, or Git summary:
   },
   "runtime": {
     "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "imageMediaType": "application/vnd.oci.image.manifest.v1+json",
     "platform": "linux/arm64",
     "codexVersion": "codex-cli 0.142.4",
     "codexSandbox": "danger-full-access"
@@ -80,14 +81,21 @@ credential, or Git summary:
 }
 ```
 
-The image digest identifies the concrete Linux platform manifest, not a tag or
-an architecture-selecting OCI index. The platform is recorded separately.
-Digest pinning establishes content identity; publisher trust and image
-signature policy remain later operational work.
+The image digest and media type declare a concrete Linux platform manifest, not
+a tag or an architecture-selecting OCI index. The platform is recorded
+separately. A record validator cannot inspect registry content, so this
+declaration is not proof: a trusted OCI resolver must inspect the descriptor
+and image configuration, then pass its output through
+`assertResolvedPlatformImageMatchesManifest()` before session creation and each
+launch or restore. That helper only compares the trusted resolution snapshot; it
+does not contact a registry. Digest pinning establishes content identity after
+that check. Publisher trust and image signature policy remain later operational
+work.
 
-The manifest parser rejects unknown or missing fields, duplicate JSON object
-keys, unsupported versions, mutable/ephemeral Codex state, non-canonical IDs,
-tag-like image references, credentials, and unsupported agent limits.
+The manifest parser rejects unknown or missing fields, accessor properties,
+duplicate JSON object keys, unsupported versions, mutable/ephemeral Codex
+state, non-canonical IDs, tag-like image references, index media types,
+credentials, and unsupported agent limits.
 
 ## Fixed Worker Layout
 
@@ -256,6 +264,10 @@ Checkpoint capture is separate from attachment release:
 | `graceful-abort` | Stable `turn/interrupt` result and abort marker; stopped writer; storage barrier | New lease |
 | `crash-prefix` | Process stopped or conclusively fenced; atomic crash-consistent volume capture | Tail repair, then new lease |
 
+The executable policy records this distinction as `writerBoundary: "stopped"`
+for `clean` and `graceful-abort`, and
+`writerBoundary: "stopped-or-fenced"` for `crash-prefix`.
+
 A `crash-prefix` checkpoint must not invent the explicit abort marker seen
 after `turn/interrupt`. Its descriptor records the observed source epoch for
 audit, but the value never becomes canonical authority and the descriptor is
@@ -270,10 +282,11 @@ writable epoch strictly greater than the source epoch and retain physical
 fence evidence through worker admission. These rules belong to adapter
 conformance tests rather than a metadata-only validator.
 
-Checkpoint descriptors intentionally omit lease ID, expiration, host-local
-attachment path, credentials, and Git Summary. Differential export consumes an
-immutable checkpoint in a later pull request; it does not scan the live
-read-write volume.
+Checkpoint descriptors record the source backend and storage ID, but
+intentionally omit lease ID, expiration, host-local attachment path,
+credentials, and Git Summary. Differential export consumes an immutable
+checkpoint in a later pull request; it does not scan the live read-write
+volume.
 
 ## Agent Limits
 

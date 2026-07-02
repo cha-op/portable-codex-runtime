@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_SUBAGENTS,
   MAX_AGENT_DEPTH,
   MAX_SUBAGENTS,
+  PLATFORM_IMAGE_MEDIA_TYPES,
   SESSION_AUTH_MODE,
   SESSION_WORKER_LAYOUT,
   SESSION_WORKER_ROOT,
@@ -16,6 +17,7 @@ import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
   assertLeaseRenewal,
+  assertResolvedPlatformImageMatchesManifest,
   assertSessionAttachment,
   assertSessionManifest,
   assertSessionStorageRef,
@@ -48,6 +50,7 @@ function manifestInput() {
     },
     runtime: {
       imageDigest: IMAGE_DIGEST,
+      imageMediaType: "application/vnd.oci.image.manifest.v1+json",
       platform: "linux/arm64",
       codexVersion: "codex-cli 0.142.4",
       codexSandbox: "danger-full-access",
@@ -105,6 +108,7 @@ function checkpoint(overrides = {}) {
     checkpointId: "checkpoint-001",
     artifactId: "artifact-001",
     backendId: "single-attach-test",
+    storageId: "volume-001",
     sessionId: RUNTIME_SESSION_ID,
     codexThreadId: CODEX_THREAD_ID,
     codexSessionId: CODEX_SESSION_ID,
@@ -177,6 +181,10 @@ test("session manifest captures immutable Codex and runtime identity with fixed 
   assert.equal(MAX_SUBAGENTS, 10);
   assert.equal(MAX_AGENT_DEPTH, 2);
   assert.deepEqual(DEFAULT_AGENT_POLICY, manifest.agents);
+  assert.deepEqual(PLATFORM_IMAGE_MEDIA_TYPES, [
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+  ]);
 });
 
 test("session manifest round-trips canonically and rejects duplicate JSON keys", () => {
@@ -214,6 +222,13 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
       },
     },
     { ...manifest, runtime: { ...manifest.runtime, imageDigest: "runtime:latest" } },
+    {
+      ...manifest,
+      runtime: {
+        ...manifest.runtime,
+        imageMediaType: "application/vnd.oci.image.index.v1+json",
+      },
+    },
     { ...manifest, runtime: { ...manifest.runtime, platform: "darwin/arm64" } },
     {
       ...manifest,
@@ -228,6 +243,35 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
     { ...manifest, agents: { ...manifest.agents, maxDepth: 3 } },
   ]) {
     assert.throws(() => assertSessionManifest(invalid), assertCode("invalid_session_manifest"));
+  }
+});
+
+test("trusted OCI resolution must match the recorded platform manifest", () => {
+  const resolution = {
+    digest: IMAGE_DIGEST,
+    mediaType: "application/vnd.oci.image.manifest.v1+json",
+    platform: "linux/arm64",
+  };
+  assert.deepEqual(
+    assertResolvedPlatformImageMatchesManifest({
+      manifest: sessionManifest(),
+      resolution,
+    }),
+    resolution,
+  );
+  for (const invalid of [
+    { ...resolution, digest: `sha256:${"b".repeat(64)}` },
+    { ...resolution, mediaType: "application/vnd.oci.image.index.v1+json" },
+    { ...resolution, platform: "linux/amd64" },
+  ]) {
+    assert.throws(
+      () =>
+        assertResolvedPlatformImageMatchesManifest({
+          manifest: sessionManifest(),
+          resolution: invalid,
+        }),
+      assertCode("invalid_image_resolution"),
+    );
   }
 });
 
@@ -332,6 +376,7 @@ test("storage references and attachments contain no host path in portable state"
     attachment({ mode: "read-only" }),
     attachment({ rootPath: "/" }),
     attachment({ rootPath: "/var/lib/../etc" }),
+    attachment({ rootPath: "/var/lib/portable-codex/\0session" }),
     { ...attachment(), rawDevice: "/dev/disk9" },
   ]) {
     assert.throws(() => assertSessionAttachment(invalid), assertCode("invalid_storage_attachment"));
@@ -474,9 +519,9 @@ test("checkpoint classes preserve graceful versus crash recovery semantics", () 
   assert.equal(checkpointClassPolicy("graceful-abort").explicitAbortMarker, "required");
   assert.deepEqual(checkpointClassPolicy("crash-prefix"), {
     explicitAbortMarker: "must-not-infer",
-    requiresStoppedWriter: true,
     requiresStorageBarrier: true,
     requiresTailRepair: true,
+    writerBoundary: "stopped-or-fenced",
     writableResume: "after-tail-repair-and-new-lease",
   });
   assert.equal(CHECKPOINT_CLASS_POLICIES.clean.requiresTailRepair, false);
@@ -501,6 +546,7 @@ test("checkpoint descriptor binds immutable session identity but never restores 
   for (const invalid of [
     checkpoint({ codexThreadId: "019f2100-0000-7000-8000-000000000099" }),
     checkpoint({ imageDigest: `sha256:${"b".repeat(64)}` }),
+    checkpoint({ storageId: "volume-002" }),
     { ...checkpoint(), leaseId: "lease-001" },
     { ...checkpoint(), authJson: "forbidden" },
     { ...checkpoint(), gitSummary: { branch: "main" } },
@@ -524,4 +570,33 @@ test("public validators return frozen defensive copies for portable records", ()
   assert(Object.isFrozen(checkedLease));
   assert(Object.isFrozen(assertSessionStorageRef(storageRef())));
   assert(Object.isFrozen(assertSessionAttachment(attachment())));
+});
+
+test("portable record validators reject accessor fields before validation or cloning", () => {
+  const accessorLease = lease();
+  let leaseReads = 0;
+  Object.defineProperty(accessorLease, "fencingEpoch", {
+    enumerable: true,
+    get() {
+      leaseReads += 1;
+      return leaseReads === 1 ? "1" : "0";
+    },
+  });
+  assert.throws(() => assertLeaseGrant(accessorLease), assertCode("invalid_fence"));
+  assert.equal(leaseReads, 0);
+
+  const accessorAttachment = attachment();
+  let pathReads = 0;
+  Object.defineProperty(accessorAttachment, "rootPath", {
+    enumerable: true,
+    get() {
+      pathReads += 1;
+      return pathReads === 1 ? "/safe/path" : "/";
+    },
+  });
+  assert.throws(
+    () => assertSessionAttachment(accessorAttachment),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.equal(pathReads, 0);
 });

@@ -26,10 +26,11 @@ Codex binary or image digest and rerun these probes before upgrading it.
 ## Session Storage Contracts
 
 The runtime now has executable v1 record validators for a secret-free session
-manifest, uint64 fencing epochs, lease/attachment matching, declared storage
-backend capabilities, structural rootless worker directory binds, and recovery
-checkpoint classes. Physical launch, fencing, and snapshot authorization remain
-the responsibility of later concrete adapters and their conformance tests.
+manifest, trusted OCI-resolution matching, uint64 fencing epochs,
+lease/attachment matching, declared storage backend capabilities, structural
+rootless worker directory binds, and recovery checkpoint classes. Physical
+launch, fencing, and snapshot authorization remain the responsibility of later
+concrete adapters and their conformance tests.
 The worker sees one ordinary directory at `/session`; a host storage agent owns
 raw volumes, filesystem images, attach/mount operations, and stale-writer
 fencing. `CODEX_HOME`, `CODEX_SQLITE_HOME`, and the workspace remain on that

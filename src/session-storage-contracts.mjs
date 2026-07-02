@@ -10,6 +10,10 @@ export const SESSION_WORKER_LAYOUT = deepFreeze({
   workspace: "/session/workspace",
 });
 export const SESSION_AUTH_MODE = "external-chatgpt-access-token";
+export const PLATFORM_IMAGE_MEDIA_TYPES = Object.freeze([
+  "application/vnd.oci.image.manifest.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json",
+]);
 export const DEFAULT_MAX_SUBAGENTS = 6;
 export const MAX_SUBAGENTS = 10;
 export const MAX_AGENT_DEPTH = 2;
@@ -26,23 +30,23 @@ export const CHECKPOINT_CLASSES = Object.freeze([
 export const CHECKPOINT_CLASS_POLICIES = deepFreeze({
   clean: {
     explicitAbortMarker: "not-required",
-    requiresStoppedWriter: true,
     requiresStorageBarrier: true,
     requiresTailRepair: false,
+    writerBoundary: "stopped",
     writableResume: "after-new-lease",
   },
   "graceful-abort": {
     explicitAbortMarker: "required",
-    requiresStoppedWriter: true,
     requiresStorageBarrier: true,
     requiresTailRepair: false,
+    writerBoundary: "stopped",
     writableResume: "after-new-lease",
   },
   "crash-prefix": {
     explicitAbortMarker: "must-not-infer",
-    requiresStoppedWriter: true,
     requiresStorageBarrier: true,
     requiresTailRepair: true,
+    writerBoundary: "stopped-or-fenced",
     writableResume: "after-tail-repair-and-new-lease",
   },
 });
@@ -115,6 +119,14 @@ function assertExactObject(value, keys, code, label) {
     actual.length === expected.length && actual.every((key, index) => key === expected[index]),
     code,
     `${label} contains unexpected or missing fields`,
+  );
+  ensure(
+    actual.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor !== undefined && Object.hasOwn(descriptor, "value");
+    }),
+    code,
+    `${label} fields must be plain data properties`,
   );
 }
 
@@ -304,7 +316,7 @@ export function assertSessionManifest(value) {
   );
   assertExactObject(
     value.runtime,
-    ["codexSandbox", "codexVersion", "imageDigest", "platform"],
+    ["codexSandbox", "codexVersion", "imageDigest", "imageMediaType", "platform"],
     "invalid_session_manifest",
     "session runtime",
   );
@@ -313,6 +325,11 @@ export function assertSessionManifest(value) {
       OCI_DIGEST_PATTERN.test(value.runtime.imageDigest),
     "invalid_session_manifest",
     "runtime image must use a concrete lowercase sha256 digest",
+  );
+  ensure(
+    PLATFORM_IMAGE_MEDIA_TYPES.includes(value.runtime.imageMediaType),
+    "invalid_session_manifest",
+    "runtime image media type must describe a platform manifest",
   );
   ensure(
     ["linux/amd64", "linux/arm64"].includes(value.runtime.platform),
@@ -381,6 +398,45 @@ export function parseSessionManifest(serialized) {
 
 export function serializeSessionManifest(manifest) {
   return `${JSON.stringify(assertSessionManifest(manifest), null, 2)}\n`;
+}
+
+/**
+ * Structural comparison only. The caller must obtain `resolution` from a
+ * trusted OCI resolver that inspected the descriptor and image configuration.
+ */
+export function assertResolvedPlatformImageMatchesManifest({ manifest, resolution }) {
+  const sessionManifest = assertSessionManifest(manifest);
+  assertExactObject(
+    resolution,
+    ["digest", "mediaType", "platform"],
+    "invalid_image_resolution",
+    "resolved platform image",
+  );
+  ensure(
+    typeof resolution.digest === "string" && OCI_DIGEST_PATTERN.test(resolution.digest),
+    "invalid_image_resolution",
+    "resolved image digest is invalid",
+  );
+  ensure(
+    PLATFORM_IMAGE_MEDIA_TYPES.includes(resolution.mediaType),
+    "invalid_image_resolution",
+    "resolved image is not a platform manifest",
+  );
+  ensure(
+    ["linux/amd64", "linux/arm64"].includes(resolution.platform),
+    "invalid_image_resolution",
+    "resolved image platform is unsupported",
+  );
+  ensure(
+    resolution.digest === sessionManifest.runtime.imageDigest &&
+      resolution.mediaType === sessionManifest.runtime.imageMediaType &&
+      resolution.platform === sessionManifest.runtime.platform,
+    "invalid_image_resolution",
+    "resolved platform image does not match the session manifest",
+  );
+  return deepFreeze(
+    defensiveClone(resolution, "invalid_image_resolution", "resolved platform image"),
+  );
 }
 
 export function parseFencingEpoch(value) {
@@ -527,6 +583,7 @@ export function assertSessionAttachment(value) {
   );
   ensure(
     typeof value.rootPath === "string" &&
+      !value.rootPath.includes("\0") &&
       isAbsolute(value.rootPath) &&
       resolve(value.rootPath) === value.rootPath &&
       value.rootPath !== parse(value.rootPath).root,
@@ -799,6 +856,7 @@ export function assertCheckpointDescriptor(value, { manifest, storageRef } = {})
       "imageDigest",
       "sessionId",
       "sourceFencingEpoch",
+      "storageId",
     ],
     "invalid_checkpoint",
     "checkpoint descriptor",
@@ -811,6 +869,7 @@ export function assertCheckpointDescriptor(value, { manifest, storageRef } = {})
   assertOpaqueId(value.checkpointId, "invalid_checkpoint", "checkpoint ID");
   assertOpaqueId(value.artifactId, "invalid_checkpoint", "checkpoint artifact ID");
   assertOpaqueId(value.backendId, "invalid_checkpoint", "checkpoint backend ID");
+  assertOpaqueId(value.storageId, "invalid_checkpoint", "checkpoint storage ID");
   assertUuid(value.sessionId, "invalid_checkpoint", "checkpoint session ID");
   assertUuid(value.codexThreadId, "invalid_checkpoint", "checkpoint Codex thread ID");
   assertUuid(value.codexSessionId, "invalid_checkpoint", "checkpoint Codex session-tree ID");
@@ -837,7 +896,9 @@ export function assertCheckpointDescriptor(value, { manifest, storageRef } = {})
   if (storageRef !== undefined) {
     const expectedStorage = assertSessionStorageRef(storageRef);
     ensure(
-      value.sessionId === expectedStorage.sessionId && value.backendId === expectedStorage.backendId,
+      value.sessionId === expectedStorage.sessionId &&
+        value.backendId === expectedStorage.backendId &&
+        value.storageId === expectedStorage.storageId,
       "invalid_checkpoint",
       "checkpoint does not match session storage",
     );

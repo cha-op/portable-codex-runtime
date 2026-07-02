@@ -26,8 +26,8 @@ superseded_by:
 - A rootless worker sees a normal directory at `/session`; host storage agents
   retain raw-device, image, attach, mount, and fencing responsibility.
 - The manifest records the app-server-returned root thread ID and shared Codex
-  session-tree ID, fixed platform OCI digest, persistent history settings,
-  stable layout, external auth mode, and agent limits.
+  session-tree ID, trusted-resolved platform OCI descriptor, persistent history
+  settings, stable layout, external auth mode, and agent limits.
 - Canonical uint64 fencing epochs live in a linearizable control plane. Lease
   expiry alone is not physical fencing, and uncertain attachment state blocks
   automatic migration.
