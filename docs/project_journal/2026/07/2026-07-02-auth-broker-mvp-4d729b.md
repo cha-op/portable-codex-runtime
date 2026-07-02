@@ -34,6 +34,8 @@ superseded_by:
   rereads and made lock-release failure dominate retryable operation errors
   without discarding allowlisted commit-state evidence or permitting another
   broker mutation retry.
+- Classified canonical symlink replacement as non-retryable invalid auth state
+  instead of a transient storage outage.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
   creation, so escape-heavy payloads cannot replace readable state with an
   envelope the store rejects on readback.

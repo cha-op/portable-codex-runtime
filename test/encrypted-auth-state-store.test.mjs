@@ -465,6 +465,21 @@ test("authenticated envelope rejects tampering, wrong authority, and noncanonica
   await assert.rejects(otherAuthority.read(), assertStoreError("authority_binding_mismatch"));
 });
 
+test("canonical symbolic link is invalid state rather than a retryable I/O failure", async (t) => {
+  const fixture = await createStoreFixture(t);
+  await fixture.store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-before-canonical-symlink",
+    payload: PAYLOAD,
+  });
+  const canonicalPath = join(fixture.directory, "auth-state.enc");
+  const targetPath = join(fixture.directory, "auth-state.real");
+  await rename(canonicalPath, targetPath);
+  await symlink("auth-state.real", canonicalPath);
+
+  await assert.rejects(fixture.store.read(), assertStoreError("invalid_auth_state"));
+});
+
 test("missing and invalid key material fail without exposing payloads", async (t) => {
   const keyProvider = createKeyProvider();
   const { store } = await createStoreFixture(t, { keyProvider });

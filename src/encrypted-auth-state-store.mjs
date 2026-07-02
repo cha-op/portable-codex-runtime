@@ -710,6 +710,9 @@ export class EncryptedAuthStateStore {
         return null;
       }
       if (error instanceof AuthStateStoreError) throw error;
+      if (ownDataProperty(error, "code") === "ELOOP") {
+        fail("invalid_auth_state", "auth state canonical path must not be a symbolic link");
+      }
       fail("auth_state_io_failed", "auth state file could not be read");
     } finally {
       await handle?.close().catch(() => {});

@@ -273,7 +273,8 @@ state directory and never persist `auth.json`.
   non-retryable `refresh_outcome_uncertain`.
 - Store recovery artifacts and integrity/configuration failures remain
   operator-recovery or invalid-state errors; they are not downgraded to
-  retryable availability failures.
+  retryable availability failures. A canonical symbolic link rejected by
+  `O_NOFOLLOW` is specifically classified as invalid state, not transient I/O.
 - Reservation conflict reconciliation preserves recovery and integrity error
   classes from its canonical reread. Lock release failure always takes
   precedence over a retryable operation error while retaining whether commit
