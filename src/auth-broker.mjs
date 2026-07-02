@@ -309,7 +309,26 @@ function readyPayload(credential) {
   };
 }
 
-function blockedPayload(status, reason) {
+function recoveryFence(payload, code = "invalid_store_snapshot") {
+  if (
+    !isPlainObject(payload) ||
+    typeof payload.reservationId !== "string" ||
+    !OPAQUE_ID_PATTERN.test(payload.reservationId) ||
+    typeof payload.sourceAccessTokenHash !== "string" ||
+    !SHA256_PATTERN.test(payload.sourceAccessTokenHash) ||
+    typeof payload.sourceRefreshTokenHash !== "string" ||
+    !SHA256_PATTERN.test(payload.sourceRefreshTokenHash)
+  ) {
+    throw new AuthBrokerError(code);
+  }
+  return {
+    reservationId: payload.reservationId,
+    sourceAccessTokenHash: payload.sourceAccessTokenHash,
+    sourceRefreshTokenHash: payload.sourceRefreshTokenHash,
+  };
+}
+
+function blockedPayload(status, reason, reservation) {
   const fallback =
     status === "reauth-required" ? "remote_reauth_required" : "adapter_post_dispatch_uncertain";
   const normalizedReason = safeReason(reason, fallback);
@@ -317,6 +336,7 @@ function blockedPayload(status, reason) {
     schemaVersion: AUTH_PAYLOAD_SCHEMA_VERSION,
     status,
     reason: normalizedReason === "refresh_in_progress" ? fallback : normalizedReason,
+    ...recoveryFence(reservation),
   };
 }
 
@@ -365,20 +385,16 @@ function validateStoredPayload(payload) {
     return { schemaVersion: payload.schemaVersion, status: payload.status, ...credential };
   }
   if (["reauth-required", "recovery-required"].includes(payload.status)) {
-    const isRefreshReservation =
-      payload.status === "recovery-required" && payload.reason === "refresh_in_progress";
     assertExactDataObject(
       payload,
-      isRefreshReservation
-        ? [
-            "reason",
-            "reservationId",
-            "schemaVersion",
-            "sourceAccessTokenHash",
-            "sourceRefreshTokenHash",
-            "status",
-          ]
-        : ["reason", "schemaVersion", "status"],
+      [
+        "reason",
+        "reservationId",
+        "schemaVersion",
+        "sourceAccessTokenHash",
+        "sourceRefreshTokenHash",
+        "status",
+      ],
       "invalid_store_snapshot",
     );
     if (!SAFE_REASONS.has(payload.reason)) {
@@ -388,22 +404,8 @@ function validateStoredPayload(payload) {
       schemaVersion: payload.schemaVersion,
       status: payload.status,
       reason: payload.reason,
+      ...recoveryFence(payload),
     };
-    if (isRefreshReservation) {
-      if (
-        typeof payload.reservationId !== "string" ||
-        !OPAQUE_ID_PATTERN.test(payload.reservationId) ||
-        typeof payload.sourceAccessTokenHash !== "string" ||
-        !SHA256_PATTERN.test(payload.sourceAccessTokenHash) ||
-        typeof payload.sourceRefreshTokenHash !== "string" ||
-        !SHA256_PATTERN.test(payload.sourceRefreshTokenHash)
-      ) {
-        throw new AuthBrokerError("invalid_store_snapshot");
-      }
-      blocked.reservationId = payload.reservationId;
-      blocked.sourceAccessTokenHash = payload.sourceAccessTokenHash;
-      blocked.sourceRefreshTokenHash = payload.sourceRefreshTokenHash;
-    }
     return blocked;
   }
   throw new AuthBrokerError("invalid_store_snapshot");
@@ -770,10 +772,7 @@ export class AuthBroker {
 
   async installCredential(credential) {
     const before = await this.#readCanonical();
-    if (
-      before.payload?.status === "recovery-required" &&
-      before.payload.reason === "refresh_in_progress"
-    ) {
+    if (before.payload !== null && before.payload.status !== "ready") {
       throw this.#blockedError(before);
     }
     const canonical = await this.#compareAndRead(before.generation, readyPayload(credential));
@@ -800,8 +799,7 @@ export class AuthBroker {
     const before = await this.#readCanonical();
     if (
       before.generation !== request.expectedGeneration ||
-      before.payload?.status !== "recovery-required" ||
-      before.payload.reason !== "refresh_in_progress" ||
+      !["reauth-required", "recovery-required"].includes(before.payload?.status) ||
       before.payload.reservationId !== request.reservationId
     ) {
       throw new AuthBrokerError("invalid_request");
@@ -828,9 +826,7 @@ export class AuthBroker {
     if (canonical.payload.status === "ready") snapshot.expiresAt = canonical.payload.expiresAt;
     else {
       snapshot.reason = canonical.payload.reason;
-      if (canonical.payload.reason === "refresh_in_progress") {
-        snapshot.reservationId = canonical.payload.reservationId;
-      }
+      snapshot.reservationId = canonical.payload.reservationId;
     }
     return Object.freeze(snapshot);
   }
@@ -1018,7 +1014,10 @@ export class AuthBroker {
   async #transitionBlocked(before, status, reason) {
     let canonical;
     try {
-      canonical = await this.#commitAfterDispatch(before, blockedPayload(status, reason));
+      canonical = await this.#commitAfterDispatch(
+        before,
+        blockedPayload(status, reason, before.payload),
+      );
     } catch (error) {
       if (error instanceof AuthBrokerError) throw error;
       throw new AuthBrokerError("store_unavailable");

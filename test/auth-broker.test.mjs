@@ -298,18 +298,30 @@ async function expectBrokerError(operation, code, expected = {}) {
   return caught;
 }
 
-function assertReservationSnapshot(snapshot, { generation, reservationId } = {}) {
+function assertFencedBlockedSnapshot(
+  snapshot,
+  { generation, reason, reservationId, status },
+) {
   const actualReservationId = snapshot.reservationId;
   assert.match(actualReservationId, OPAQUE_ID_PATTERN);
   if (reservationId !== undefined) assert.equal(actualReservationId, reservationId);
   assert.deepEqual(snapshot, {
     generation,
-    reason: "refresh_in_progress",
+    reason,
     reservationId: actualReservationId,
     schemaVersion: 1,
-    status: "recovery-required",
+    status,
   });
   return actualReservationId;
+}
+
+function assertReservationSnapshot(snapshot, { generation, reservationId } = {}) {
+  return assertFencedBlockedSnapshot(snapshot, {
+    generation,
+    reason: "refresh_in_progress",
+    reservationId,
+    status: "recovery-required",
+  });
 }
 
 test("TTL hit returns a non-serializable secret grant without refreshing", async () => {
@@ -1157,10 +1169,9 @@ test("invalid refresh candidates durably require recovery", async (t) => {
         reason: scenario.reason,
         status: "recovery-required",
       });
-      assert.deepEqual(await broker.snapshot(), {
+      assertFencedBlockedSnapshot(await broker.snapshot(), {
         generation: "3",
         reason: scenario.reason,
-        schemaVersion: 1,
         status: "recovery-required",
       });
       await expectBrokerError(() => makeBroker({ store }).getGrant(), "recovery_required", {
@@ -1233,8 +1244,71 @@ test("structured refresh failures durably block future grants", async (t) => {
         reason: scenario.reason,
         status: scenario.status,
       });
+      assertFencedBlockedSnapshot(await restarted.snapshot(), {
+        generation: "3",
+        reason: scenario.reason,
+        status: scenario.status,
+      });
     });
   }
+});
+
+test("post-dispatch blocks retain the recovery fence", async () => {
+  const store = new FakeStore();
+  const broker = makeBroker({
+    refreshAdapter: async () => {
+      throw Object.assign(new Error("uncertain post-dispatch result"), {
+        postDispatch: true,
+      });
+    },
+    store,
+  });
+  const original = makeCredential();
+  await broker.installCredential(original);
+  await expectBrokerError(() => broker.refreshGrant(), "recovery_required", {
+    generation: "3",
+    reason: "adapter_post_dispatch_uncertain",
+    status: "recovery-required",
+  });
+  const snapshot = await broker.snapshot();
+  const reservationId = assertFencedBlockedSnapshot(snapshot, {
+    generation: "3",
+    reason: "adapter_post_dispatch_uncertain",
+    status: "recovery-required",
+  });
+
+  await expectBrokerError(() => broker.installCredential(original), "recovery_required", {
+    generation: "3",
+    reason: "adapter_post_dispatch_uncertain",
+    status: "recovery-required",
+  });
+  await expectBrokerError(
+    () =>
+      broker.recoverRefreshReservation({
+        credential: original,
+        expectedGeneration: snapshot.generation,
+        reservationId,
+      }),
+    "invalid_credential",
+    { reason: "access_token_unchanged" },
+  );
+  const recovered = makeCredential({
+    marker: "access-recovered-after-block",
+    refreshToken: "refresh-recovered-after-block",
+  });
+  assert.deepEqual(
+    await broker.recoverRefreshReservation({
+      credential: recovered,
+      expectedGeneration: snapshot.generation,
+      reservationId,
+    }),
+    {
+      expiresAt: isoAfter(3600),
+      generation: "4",
+      schemaVersion: 1,
+      status: "ready",
+    },
+  );
 });
 
 test("permanent refresh failure rebases its block across storage-only rotation", async () => {
@@ -1257,10 +1331,9 @@ test("permanent refresh failure rebases its block across storage-only rotation",
     reason: "invalid_grant",
     status: "reauth-required",
   });
-  assert.deepEqual(await broker.snapshot(), {
+  assertFencedBlockedSnapshot(await broker.snapshot(), {
     generation: "4",
     reason: "invalid_grant",
-    schemaVersion: 1,
     status: "reauth-required",
   });
 });

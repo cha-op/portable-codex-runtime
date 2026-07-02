@@ -131,14 +131,14 @@ token `exp`, account, user, and plan claims to match those top-level fields.
 This is structural continuity validation, not JWT signature verification; the
 trusted OAuth adapter remains responsible for obtaining tokens from the pinned
 Codex/provider path.
-Ordinary blocked payloads contain only an allowlisted reason. A refresh
-reservation additionally carries a unique non-secret owner ID and SHA-256
-digests of the source access and refresh tokens. The ID prevents ABA ownership
-confusion; the access digest lets a late caller distinguish a changed access
-credential from a trusted pre-dispatch restore, while both digests fence
-explicit recovery against republishing either source token. None can be used
-as a credential. The reservation therefore removes the old auth JSON from
-canonical state before OAuth can consume its refresh token. A crash or
+Blocked payloads contain an allowlisted reason plus the refresh reservation's
+unique non-secret owner ID and SHA-256 digests of the source access and refresh
+tokens. The ID prevents ABA ownership confusion; the access digest lets a late
+caller distinguish a changed access credential from a trusted pre-dispatch
+restore, while both digests fence explicit recovery against republishing either
+source token. None can be used as a credential. The reservation therefore
+removes the old auth JSON from canonical state before OAuth can consume its
+refresh token. A crash or
 unreconciled storage failure leaves a non-reusable durable block instead of an
 old credential. The durable store generation is the only published generation;
 the spike's process-local counter
@@ -203,13 +203,13 @@ it cannot mark otherwise valid canonical state as recovery-required. A caller
 whose requirement is still unmet receives non-retryable
 `token_ttl_insufficient` metadata without receiving the credential.
 
-Ordinary `installCredential()` refuses to overwrite an active
-`refresh_in_progress` reservation. Crash recovery is a separate
+Ordinary `installCredential()` refuses to overwrite any recovery-fenced blocked
+state, including terminal post-dispatch failures. Recovery is a separate
 `recoverRefreshReservation()` operation that requires the exact canonical
 generation and reservation owner ID. The credential-free `snapshot()` response
-includes that non-secret owner ID only while the reservation is active, so a
-trusted supervisor can supply both recovery preconditions. Its caller must
-first stop or fence the old broker owner; the library cannot prove external process death.
+includes that non-secret owner ID for every fenced blocked state, so a trusted
+supervisor can supply both recovery preconditions. Its caller must first stop
+or fence the old broker owner; the library cannot prove external process death.
 The replacement must rotate both the source access and refresh tokens, whose
 encrypted reservation hashes prevent accidental republication of the
 potentially consumed credential.
@@ -269,9 +269,9 @@ a newly installed identity and receive its access token.
 - Structured permanent account loss moves canonical state to
   `reauth-required`; all grants remain blocked until credential installation
   commits a newer generation.
-- An active refresh reservation cannot be replaced by ordinary login.
-  Supervisor-fenced crash recovery must match its generation and unique owner
-  ID before publishing replacement credentials.
+- A refresh reservation or any terminal blocked descendant cannot be replaced
+  by ordinary login. Supervisor-fenced recovery must match its generation and
+  unique owner ID before publishing replacement credentials.
 - Any uncertain post-dispatch outcome, invalid refreshed credential, identity
   drift, unchanged access or refresh token, or failure to meet the fixed
   authority safety TTL

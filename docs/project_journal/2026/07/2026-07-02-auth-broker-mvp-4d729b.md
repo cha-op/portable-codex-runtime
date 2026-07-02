@@ -47,6 +47,8 @@ superseded_by:
   explicit crashed-reservation recovery to rotate both source access and
   refresh tokens.
 - Failed closed on thrown or non-finite clock readings before TTL decisions.
+- Preserved recovery fences through terminal post-dispatch states so ordinary
+  login cannot republish either source token after an uncertain refresh.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
   creation, so escape-heavy payloads cannot replace readable state with an
   envelope the store rejects on readback.
