@@ -31,6 +31,9 @@ superseded_by:
   and fails closed.
 - Capture requires an opaque stopped-writer evidence handle that the backend,
   not the core, must authenticate and atomically bind to the mutation.
+- Backend success must echo the complete dispatched checkpoint descriptor, so
+  an operation-ID replay cannot combine an old physical mutation with new
+  descriptor metadata.
 - Writer stop and quiescence evidence, worker launch, Codex resume, concrete
   backends, tail repair, differential export, periodic snapshots, and
   cross-host verification remain outside this completed workstream. A separate

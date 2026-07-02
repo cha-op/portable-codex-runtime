@@ -48,6 +48,13 @@ restore backend receives `{ checkpoint, request }`. These are structural
 snapshots and an opaque evidence capability for the backend transaction, not
 evidence that an earlier core comparison remains current.
 
+Both backend operations must return the exact plain-data
+`{ checkpoint, mutation }` result envelope. The echoed checkpoint must match
+the complete dispatched descriptor, including `createdAt`, image identity,
+source storage, and source fence. The core treats a missing or mismatched echo
+as post-dispatch uncertainty. This prevents a durable operation-ID replay from
+being paired with newly generated descriptor metadata.
+
 For restore, the core validates the manifest, source checkpoint descriptor,
 destination storage, canonical lease snapshot, and exact restore request. The
 source and destination must belong to the same session and backend in this
@@ -68,12 +75,12 @@ Before returning success, a concrete backend must:
 
 - atomically recheck the complete canonical writer fence against the mutation;
 - bind the operation ID to the exact session, storage, checkpoint or artefact
-  target, and writer tuple;
+  target, complete checkpoint descriptor, and writer tuple;
 - for capture, bind that operation to the exact attachment ID and attachment
   proof supplied by the validated attachment snapshot, authenticate the
   stopped-writer evidence handle, and bind it to the same transaction;
 - persist and replay an exact idempotent result without repeating the physical
-  mutation;
+  mutation, including the exact checkpoint descriptor echo;
 - prove that a restore destination is detached and isolated before mutation;
 - establish the required storage barrier for clean capture; and
 - perform the physical capture or restore and return its durable proof.

@@ -124,6 +124,13 @@ function mutationResult(request) {
   };
 }
 
+function backendCheckpointResult(input) {
+  return {
+    checkpoint: input.checkpoint,
+    mutation: mutationResult(input.request),
+  };
+}
+
 function createBackend({
   backendId = "single-attach-test",
   capture,
@@ -143,7 +150,7 @@ function createBackend({
     async captureCheckpoint(input) {
       calls.capture.push(input);
       if (capture) return capture.call(this, input);
-      return mutationResult(input.request);
+      return backendCheckpointResult(input);
     },
     destroySession: operation,
     detachAttachment: operation,
@@ -153,7 +160,7 @@ function createBackend({
     async restoreCheckpoint(input) {
       calls.restore.push(input);
       if (restore) return restore.call(this, input);
-      return mutationResult(input.request);
+      return backendCheckpointResult(input);
     },
   };
   return { backend, calls };
@@ -204,11 +211,13 @@ function assertCoreCode(code) {
 }
 
 test("clean checkpoint capture dispatches exact frozen portable data", async () => {
+  let backendResponse;
   const { backend, calls } = createBackend({
     capture(input) {
       assert.equal(this, backend);
       assert(Object.isFrozen(input));
-      return mutationResult(input.request);
+      backendResponse = backendCheckpointResult(input);
+      return backendResponse;
     },
   });
   const options = captureOptions(backend);
@@ -234,6 +243,8 @@ test("clean checkpoint capture dispatches exact frozen portable data", async () 
   assert(Object.isFrozen(result.checkpoint));
   assert(Object.isFrozen(result.mutation));
   assert(Object.isFrozen(result.mutation.target));
+  assert.notStrictEqual(result.checkpoint, backendResponse.checkpoint);
+  assert.notStrictEqual(result.mutation, backendResponse.mutation);
 
   const serialized = JSON.stringify(result.checkpoint);
   for (const forbidden of [
@@ -250,11 +261,13 @@ test("clean checkpoint capture dispatches exact frozen portable data", async () 
 });
 
 test("clean checkpoint restore requires a newer lease and dispatches exact portable data", async () => {
+  let backendResponse;
   const { backend, calls } = createBackend({
     restore(input) {
       assert.equal(this, backend);
       assert(Object.isFrozen(input));
-      return mutationResult(input.request);
+      backendResponse = backendCheckpointResult(input);
+      return backendResponse;
     },
   });
   const options = restoreOptions(backend);
@@ -273,6 +286,8 @@ test("clean checkpoint restore requires a newer lease and dispatches exact porta
   assert(Object.isFrozen(result.checkpoint));
   assert(Object.isFrozen(result.mutation));
   assert(Object.isFrozen(result.mutation.target));
+  assert.notStrictEqual(result.checkpoint, backendResponse.checkpoint);
+  assert.notStrictEqual(result.mutation, backendResponse.mutation);
 });
 
 test("clean checkpoint restore supports a replacement volume on the same backend", async () => {
@@ -309,6 +324,50 @@ test("explicit retries preserve operation IDs and leave replay to the backend", 
   assert.equal(restoreBackend.calls.restore.length, 2);
   assert.equal(restoreBackend.calls.restore[0].request.operationId, restore.request.operationId);
   assert.equal(restoreBackend.calls.restore[1].request.operationId, restore.request.operationId);
+});
+
+test("capture rejects an idempotent replay whose echoed descriptor belongs to an earlier attempt", async () => {
+  let replayedResult;
+  const { backend, calls } = createBackend({
+    capture(input) {
+      replayedResult ??= backendCheckpointResult(input);
+      return replayedResult;
+    },
+  });
+  const first = captureOptions(backend);
+  const firstResult = await captureCleanCheckpoint(first);
+  assert.equal(firstResult.checkpoint.createdAt, CREATED_AT);
+
+  const second = captureOptions(backend, {
+    createdAt: "2026-07-02T12:00:01.000Z",
+  });
+  assert.equal(second.request.operationId, first.request.operationId);
+  await assert.rejects(
+    () => captureCleanCheckpoint(second),
+    assertCoreCode("checkpoint_outcome_uncertain"),
+  );
+  assert.equal(calls.capture.length, 2);
+  assert.equal(calls.capture[1].checkpoint.createdAt, second.createdAt);
+  assert.equal(replayedResult.checkpoint.createdAt, first.createdAt);
+});
+
+test("restore rejects a backend echo of a different valid source descriptor", async () => {
+  const { backend, calls } = createBackend({
+    restore(input) {
+      return {
+        checkpoint: {
+          ...input.checkpoint,
+          createdAt: "2026-07-02T12:00:01.000Z",
+        },
+        mutation: mutationResult(input.request),
+      };
+    },
+  });
+  await assert.rejects(
+    () => restoreCleanCheckpoint(restoreOptions(backend)),
+    assertCoreCode("restore_outcome_uncertain"),
+  );
+  assert.equal(calls.restore.length, 1);
 });
 
 test("capture rejects identity, fence, backend, operation, time, and class mismatches before dispatch", async (t) => {
@@ -393,11 +452,14 @@ test("capture rejects identity, fence, backend, operation, time, and class misma
 
 test("capture requires an opaque stopped-writer evidence handle before dispatch", async (t) => {
   let evidenceProxyTraps = 0;
+  const revokedEvidence = Proxy.revocable({}, {});
+  revokedEvidence.revoke();
   const invalidEvidence = [
     { name: "undefined", value: undefined },
     { name: "null", value: null },
     { name: "primitive", value: "writer-stopped" },
     { name: "array", value: [] },
+    { name: "revoked proxy", value: revokedEvidence.proxy },
     {
       name: "proxy",
       value: new Proxy(
@@ -584,8 +646,13 @@ test("backend throws and malformed results become sanitized non-retryable uncert
       code: "checkpoint_outcome_uncertain",
       backend: () =>
         createBackend({
-          capture: ({ request }) =>
-            mutationResult({ ...request, holderId: "host-returned-by-stale-writer" }),
+          capture: (input) => ({
+            checkpoint: input.checkpoint,
+            mutation: mutationResult({
+              ...input.request,
+              holderId: "host-returned-by-stale-writer",
+            }),
+          }),
         }),
     },
     {
@@ -606,7 +673,10 @@ test("backend throws and malformed results become sanitized non-retryable uncert
       code: "restore_outcome_uncertain",
       backend: () =>
         createBackend({
-          restore: ({ request }) => mutationResult({ ...request, fencingEpoch: "12" }),
+          restore: (input) => ({
+            checkpoint: input.checkpoint,
+            mutation: mutationResult({ ...input.request, fencingEpoch: "12" }),
+          }),
         }),
     },
   ]) {
@@ -626,6 +696,93 @@ test("backend throws and malformed results become sanitized non-retryable uncert
       assert.equal(caught.message.includes("secret"), false);
       assert(Object.isFrozen(caught));
       assert.equal(instance.calls[scenario.operation].length, 1);
+    });
+  }
+});
+
+test("backend checkpoint result envelopes reject proxies, accessors, extra, and missing fields", async (t) => {
+  for (const operation of ["capture", "restore"]) {
+    for (const shape of ["proxy", "accessor", "extra", "missing"]) {
+      await t.test(`${operation} ${shape}`, async () => {
+        let envelopeTraps = 0;
+        const malformed = (input) => {
+          const valid = backendCheckpointResult(input);
+          if (shape === "proxy") {
+            return new Proxy(valid, {
+              getPrototypeOf() {
+                envelopeTraps += 1;
+                throw new Error("secret result proxy detail");
+              },
+              ownKeys() {
+                envelopeTraps += 1;
+                throw new Error("secret result proxy detail");
+              },
+            });
+          }
+          if (shape === "accessor") {
+            const result = { mutation: valid.mutation };
+            Object.defineProperty(result, "checkpoint", {
+              enumerable: true,
+              get() {
+                envelopeTraps += 1;
+                throw new Error("secret result accessor detail");
+              },
+            });
+            return result;
+          }
+          if (shape === "extra") return { ...valid, extra: "unexpected" };
+          return { checkpoint: valid.checkpoint };
+        };
+        const instance =
+          operation === "capture"
+            ? createBackend({ capture: malformed })
+            : createBackend({ restore: malformed });
+        const invoke =
+          operation === "capture"
+            ? () => captureCleanCheckpoint(captureOptions(instance.backend))
+            : () => restoreCleanCheckpoint(restoreOptions(instance.backend));
+        await assert.rejects(
+          invoke,
+          assertCoreCode(
+            operation === "capture"
+              ? "checkpoint_outcome_uncertain"
+              : "restore_outcome_uncertain",
+          ),
+        );
+        assert.equal(envelopeTraps, 0);
+        assert.equal(instance.calls[operation].length, 1);
+      });
+    }
+  }
+});
+
+test("backend identity getter failures on the comparison read stay pre-dispatch and sanitized", async (t) => {
+  for (const operation of ["capture", "restore"]) {
+    await t.test(operation, async () => {
+      const { backend, calls } = createBackend();
+      let getterReads = 0;
+      Object.defineProperty(backend, "backendId", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterReads += 1;
+          if (getterReads === 1) return "single-attach-test";
+          throw new Error("secret backend identity detail");
+        },
+      });
+
+      const invoke =
+        operation === "capture"
+          ? () => captureCleanCheckpoint(captureOptions(backend))
+          : () => restoreCleanCheckpoint(restoreOptions(backend));
+      await assert.rejects(
+        invoke,
+        (error) =>
+          assertContractCode("invalid_storage_backend")(error) &&
+          !error.message.includes("secret"),
+      );
+      assert.equal(getterReads, 2);
+      assert.equal(calls[operation].length, 0);
     });
   }
 });

@@ -6,6 +6,7 @@ import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
   assertSessionAttachmentMatches,
+  assertSessionManifest,
   assertSessionStorageRef,
   assertStorageBackend,
   assertStorageMutationMatchesLeaseSnapshot,
@@ -142,8 +143,8 @@ function assertStoppedWriterEvidence(value) {
   ensureContract(
     value !== null &&
       typeof value === "object" &&
-      !Array.isArray(value) &&
-      !utilTypes.isProxy(value),
+      !utilTypes.isProxy(value) &&
+      !Array.isArray(value),
     "invalid_checkpoint",
     "stopped writer evidence must be an opaque non-proxy object handle",
   );
@@ -151,10 +152,15 @@ function assertStoppedWriterEvidence(value) {
 }
 
 function assertBackendMatchesStorage(backend, storageRef) {
-  ensureContract(
-    backend.backendId === storageRef.backendId,
+  validateContract(
+    () =>
+      ensureContract(
+        backend.backendId === storageRef.backendId,
+        "invalid_storage_backend",
+        "storage backend does not match canonical storage",
+      ),
     "invalid_storage_backend",
-    "storage backend does not match canonical storage",
+    "storage backend identity is invalid",
   );
 }
 
@@ -174,6 +180,29 @@ function assertCheckpointTarget(request, checkpoint) {
     "invalid_storage_mutation",
     "storage mutation target does not match the checkpoint descriptor",
   );
+}
+
+function assertBackendCheckpointResult(
+  value,
+  { expectedCheckpoint, manifest, request, storageRef },
+) {
+  const envelope = assertExactOptions(
+    value,
+    ["checkpoint", "mutation"],
+    "storage backend checkpoint result",
+  );
+  const checkpointOptions =
+    storageRef === undefined ? { manifest } : { manifest, storageRef };
+  const checkpoint = assertCheckpointDescriptor(envelope.checkpoint, checkpointOptions);
+  ensureContract(
+    Object.keys(expectedCheckpoint).every(
+      (key) => checkpoint[key] === expectedCheckpoint[key],
+    ),
+    "invalid_checkpoint",
+    "storage backend checkpoint result does not match the dispatched descriptor",
+  );
+  const mutation = assertStorageMutationResult(envelope.mutation, { request });
+  return frozenResult(checkpoint, mutation);
 }
 
 function frozenResult(checkpoint, mutation) {
@@ -275,8 +304,12 @@ export async function captureCleanCheckpoint(options) {
         stoppedWriterEvidence: writerEvidence,
       }),
     );
-    const mutation = assertStorageMutationResult(result, { request: mutationRequest });
-    return frozenResult(checkpoint, mutation);
+    return assertBackendCheckpointResult(result, {
+      expectedCheckpoint: checkpoint,
+      manifest: matched.manifest,
+      request: mutationRequest,
+      storageRef: matched.storageRef,
+    });
   } catch {
     throw new SessionSnapshotCoreError("checkpoint_outcome_uncertain");
   }
@@ -299,8 +332,13 @@ export async function restoreCleanCheckpoint(options) {
     "invalid_storage_ref",
     "session storage reference is invalid",
   );
+  const sessionManifest = validateContract(
+    () => assertSessionManifest(manifest),
+    "invalid_session_manifest",
+    "session manifest is invalid",
+  );
   const descriptor = validateContract(
-    () => assertCheckpointDescriptor(checkpoint, { manifest }),
+    () => assertCheckpointDescriptor(checkpoint, { manifest: sessionManifest }),
     "invalid_checkpoint",
     "checkpoint descriptor is invalid",
   );
@@ -342,8 +380,12 @@ export async function restoreCleanCheckpoint(options) {
       storageBackend,
       Object.freeze({ checkpoint: descriptor, request: mutationRequest }),
     );
-    const mutation = assertStorageMutationResult(result, { request: mutationRequest });
-    return frozenResult(descriptor, mutation);
+    return assertBackendCheckpointResult(result, {
+      expectedCheckpoint: descriptor,
+      manifest: sessionManifest,
+      request: mutationRequest,
+      storageRef: undefined,
+    });
   } catch {
     throw new SessionSnapshotCoreError("restore_outcome_uncertain");
   }
