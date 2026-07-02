@@ -43,6 +43,8 @@ superseded_by:
   transactions, classified pre-rename lock replacement as definitely
   uncommitted recovery, and rejected refresh responses that reuse the consumed
   refresh token.
+- Bound worker callbacks to the account actually issued and required explicit
+  crashed-reservation recovery to rotate both source access and refresh tokens.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
   creation, so escape-heavy payloads cannot replace readable state with an
   envelope the store rejects on readback.

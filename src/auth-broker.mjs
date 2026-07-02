@@ -316,6 +316,14 @@ function accessTokenHash(accessToken) {
   return createHash("sha256").update(accessToken, "utf8").digest("hex");
 }
 
+function refreshTokenValue(credential) {
+  return parseAuthJson(credential.authJson, credential).tokens.refresh_token;
+}
+
+function refreshTokenHash(credential) {
+  return createHash("sha256").update(refreshTokenValue(credential), "utf8").digest("hex");
+}
+
 function refreshReservationPayload(credential, reservationId) {
   if (typeof reservationId !== "string" || !OPAQUE_ID_PATTERN.test(reservationId)) {
     throw new AuthBrokerError("store_unavailable");
@@ -326,6 +334,7 @@ function refreshReservationPayload(credential, reservationId) {
     reason: "refresh_in_progress",
     reservationId,
     sourceAccessTokenHash: accessTokenHash(credential.accessToken),
+    sourceRefreshTokenHash: refreshTokenHash(credential),
   };
 }
 
@@ -353,7 +362,14 @@ function validateStoredPayload(payload) {
     assertExactDataObject(
       payload,
       isRefreshReservation
-        ? ["reason", "reservationId", "schemaVersion", "sourceAccessTokenHash", "status"]
+        ? [
+            "reason",
+            "reservationId",
+            "schemaVersion",
+            "sourceAccessTokenHash",
+            "sourceRefreshTokenHash",
+            "status",
+          ]
         : ["reason", "schemaVersion", "status"],
       "invalid_store_snapshot",
     );
@@ -370,12 +386,15 @@ function validateStoredPayload(payload) {
         typeof payload.reservationId !== "string" ||
         !OPAQUE_ID_PATTERN.test(payload.reservationId) ||
         typeof payload.sourceAccessTokenHash !== "string" ||
-        !SHA256_PATTERN.test(payload.sourceAccessTokenHash)
+        !SHA256_PATTERN.test(payload.sourceAccessTokenHash) ||
+        typeof payload.sourceRefreshTokenHash !== "string" ||
+        !SHA256_PATTERN.test(payload.sourceRefreshTokenHash)
       ) {
         throw new AuthBrokerError("invalid_store_snapshot");
       }
       blocked.reservationId = payload.reservationId;
       blocked.sourceAccessTokenHash = payload.sourceAccessTokenHash;
+      blocked.sourceRefreshTokenHash = payload.sourceRefreshTokenHash;
     }
     return blocked;
   }
@@ -557,6 +576,7 @@ function storeCommitMayHaveSucceeded(error) {
 
 export class AuthBroker {
   #workerAccessToken;
+  #workerAccountId;
   #workerGeneration;
 
   constructor({
@@ -589,6 +609,7 @@ export class AuthBroker {
     this.now = now;
     this.randomUUID = randomUUID;
     this.#workerAccessToken = null;
+    this.#workerAccountId = null;
     this.#workerGeneration = null;
   }
 
@@ -763,6 +784,12 @@ export class AuthBroker {
       before.payload.reservationId !== request.reservationId
     ) {
       throw new AuthBrokerError("invalid_request");
+    }
+    if (accessTokenHash(replacement.accessToken) === before.payload.sourceAccessTokenHash) {
+      throw new AuthBrokerError("invalid_credential", { reason: "access_token_unchanged" });
+    }
+    if (refreshTokenHash(replacement) === before.payload.sourceRefreshTokenHash) {
+      throw new AuthBrokerError("invalid_credential", { reason: "refresh_token_reused" });
     }
     const canonical = await this.#compareAndRead(before.generation, replacement);
     return this.#publicSnapshot(canonical);
@@ -1005,8 +1032,7 @@ export class AuthBroker {
       throw new AuthBrokerError("invalid_credential", { reason: "access_token_unchanged" });
     }
     if (
-      parseAuthJson(credential.authJson, credential).tokens.refresh_token ===
-      parseAuthJson(previous.authJson, previous).tokens.refresh_token
+      refreshTokenValue(credential) === refreshTokenValue(previous)
     ) {
       throw new AuthBrokerError("invalid_credential", { reason: "refresh_token_reused" });
     }
@@ -1092,6 +1118,7 @@ export class AuthBroker {
   async workerLoginParams(options) {
     const grant = await this.getGrant(options);
     this.#workerAccessToken = grant.accessToken;
+    this.#workerAccountId = grant.accountId;
     this.#workerGeneration = grant.generation;
     return {
       accessToken: grant.accessToken,
@@ -1106,7 +1133,9 @@ export class AuthBroker {
     if (
       params.reason !== "unauthorized" ||
       typeof params.previousAccountId !== "string" ||
-      params.previousAccountId.length === 0
+      params.previousAccountId.length === 0 ||
+      this.#workerAccountId === null ||
+      params.previousAccountId !== this.#workerAccountId
     ) {
       throw new AuthBrokerError("invalid_request");
     }
@@ -1123,7 +1152,11 @@ export class AuthBroker {
         params.previousAccountId,
       );
       if (joined !== null) {
+        if (joined.accountId !== this.#workerAccountId) {
+          throw new AuthBrokerError("invalid_request");
+        }
         this.#workerAccessToken = joined.accessToken;
+        this.#workerAccountId = joined.accountId;
         this.#workerGeneration = joined.generation;
         return {
           accessToken: joined.accessToken,
@@ -1149,6 +1182,7 @@ export class AuthBroker {
       throw new AuthBrokerError("invalid_request");
     }
     this.#workerAccessToken = grant.accessToken;
+    this.#workerAccountId = grant.accountId;
     this.#workerGeneration = grant.generation;
     return {
       accessToken: grant.accessToken,

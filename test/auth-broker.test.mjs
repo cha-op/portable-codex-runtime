@@ -122,6 +122,7 @@ function storedReadyPayload(credential) {
 
 function storedReservationPayload({
   accessToken = ACCESS_TOKEN_1,
+  refreshToken = "refresh-1",
   reservationId = "stale-reservation-owner",
 } = {}) {
   return JSON.stringify({
@@ -130,6 +131,7 @@ function storedReservationPayload({
     reason: "refresh_in_progress",
     reservationId,
     sourceAccessTokenHash: createHash("sha256").update(accessToken, "utf8").digest("hex"),
+    sourceRefreshTokenHash: createHash("sha256").update(refreshToken, "utf8").digest("hex"),
   });
 }
 
@@ -895,6 +897,26 @@ test("explicit fenced recovery requires the exact reservation identity", async (
     assertReservationSnapshot(recoverySnapshot, { generation: "2", reservationId }),
     reservationId,
   );
+  await expectBrokerError(
+    () =>
+      broker.recoverRefreshReservation({
+        credential: makeCredential({ refreshToken: "refresh-recovered" }),
+        expectedGeneration: recoverySnapshot.generation,
+        reservationId: recoverySnapshot.reservationId,
+      }),
+    "invalid_credential",
+    { reason: "access_token_unchanged" },
+  );
+  await expectBrokerError(
+    () =>
+      broker.recoverRefreshReservation({
+        credential: refreshedCredential({ refreshToken: "refresh-1" }),
+        expectedGeneration: recoverySnapshot.generation,
+        reservationId: recoverySnapshot.reservationId,
+      }),
+    "invalid_credential",
+    { reason: "refresh_token_reused" },
+  );
   assert.deepEqual(
     await broker.recoverRefreshReservation({
       credential: recovered,
@@ -1417,6 +1439,38 @@ test("worker login and unauthorized refresh use exact app-server payloads", asyn
     "userId",
   ]);
   assert.equal(adapterInput.expectedGeneration, "2");
+});
+
+test("worker refresh callbacks stay bound to the account actually issued", async () => {
+  const store = new FakeStore({ coordinationKey: "worker-account-binding" });
+  let refreshCalls = 0;
+  const workerBroker = makeBroker({
+    refreshAdapter: async () => {
+      refreshCalls += 1;
+      return refreshedCredential();
+    },
+    store,
+  });
+  await workerBroker.installCredential(makeCredential());
+  await workerBroker.workerLoginParams();
+  const replacement = makeCredential({
+    accountId: "account-2",
+    marker: "access-account-2",
+    refreshToken: "refresh-account-2",
+    userId: "user-2",
+  });
+  await makeBroker({ store }).installCredential(replacement);
+
+  await expectBrokerError(
+    () =>
+      workerBroker.handleWorkerRefresh({
+        previousAccountId: "account-2",
+        reason: "unauthorized",
+      }),
+    "invalid_request",
+  );
+  assert.equal(refreshCalls, 0);
+  assert.equal((await makeBroker({ store }).getGrant()).accountId, "account-2");
 });
 
 test("a stale worker callback receives the newer generation without rotating again", async () => {

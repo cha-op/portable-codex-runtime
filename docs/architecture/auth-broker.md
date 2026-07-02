@@ -208,6 +208,9 @@ generation and reservation owner ID. The credential-free `snapshot()` response
 includes that non-secret owner ID only while the reservation is active, so a
 trusted supervisor can supply both recovery preconditions. Its caller must
 first stop or fence the old broker owner; the library cannot prove external process death.
+The replacement must rotate both the source access and refresh tokens, whose
+encrypted reservation hashes prevent accidental republication of the
+potentially consumed credential.
 This explicit takeover path preserves re-login recovery without allowing a
 live refresh to acquire a second owner between reservation and dispatch.
 
@@ -252,6 +255,9 @@ task. It then returns exactly:
 The response never includes the refresh token, ID token, raw auth JSON,
 generation, key ID, or authority storage path. Workers never mount the broker
 state directory and never persist `auth.json`.
+The facade also privately binds callbacks to the account ID actually issued by
+the preceding login response, so an old worker cannot claim a newly installed
+account and receive its access token.
 
 ## Failure and Recovery Rules
 
