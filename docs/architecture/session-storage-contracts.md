@@ -1,0 +1,299 @@
+# Session Filesystem and Storage Contracts
+
+## Scope
+
+This document defines the versioned boundary between the portable runtime,
+the storage control plane, a host-local storage backend, and a rootless Codex
+worker. It deliberately does not implement a Podman or Docker launcher, a
+volume driver, a distributed lease database, snapshots, or cross-host restore.
+
+The contract has four independent records:
+
+1. an immutable, secret-free session manifest;
+2. an authoritative lease and fencing record outside the session volume;
+3. a portable storage reference plus a host-local directory attachment; and
+4. an immutable checkpoint descriptor that observes, but never restores,
+   fencing state.
+
+`src/session-storage-contracts.mjs` makes the portable record shapes,
+fencing-number rules, declared backend capability surface, structural worker
+template, and checkpoint classes executable and testable. These pure
+validators do not perform a storage mutation, authorize a launch, stop a
+writer, or prove a physical fence.
+
+## Codex State Basis
+
+The source analysis is pinned to Codex commit
+`db887d03e1f907467e33271572dffb73bceecd6b`.
+
+- `thread/start` does not accept a client-selected thread ID. The runtime must
+  capture the root thread ID returned by app-server and persist it explicitly.
+  See `codex-rs/app-server-protocol/src/protocol/v2/thread.rs`.
+- A root thread's app-server `sessionId` equals its thread ID. Its subagents have
+  distinct thread IDs but retain that shared root `sessionId`. Both semantic
+  fields are recorded in the immutable manifest and v1 requires them to be
+  equal for the root binding. See
+  `codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs`.
+- Normal recovery uses `thread/resume { threadId, cwd }`; the rollout `path`
+  override remains unstable and is not part of this contract. `thread/read`
+  verifies the restored ID, session-tree ID, cwd, and turns.
+- `$CODEX_HOME` contains versioned rollout state and auxiliary indexes. Codex
+  can also place state, log, goal, and memory SQLite databases under
+  `CODEX_SQLITE_HOME`. The worker contract fixes both roots to the session
+  volume and treats their contents, including SQLite WAL/SHM files, as opaque.
+- Persistent sessions require `ephemeral=false`. `legacy` and `paginated` are
+  the currently returned history modes; the selected mode is recorded rather
+  than inferred.
+
+The portable runtime never derives a rollout filename, SQLite filename, or
+date-directory layout from a thread ID. Those remain Codex-owned details tied
+to the fixed runtime image.
+
+## Immutable Session Manifest
+
+The v1 manifest contains no storage locator, host path, lease, fencing epoch,
+credential, or Git summary:
+
+```json
+{
+  "schemaVersion": 1,
+  "sessionId": "019f2100-0000-7000-8000-000000000001",
+  "codex": {
+    "rootThreadId": "019f2100-0000-7000-8000-000000000002",
+    "sessionId": "019f2100-0000-7000-8000-000000000002",
+    "ephemeral": false,
+    "historyMode": "paginated"
+  },
+  "runtime": {
+    "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": "linux/arm64",
+    "codexVersion": "codex-cli 0.142.4",
+    "codexSandbox": "danger-full-access"
+  },
+  "layoutVersion": 1,
+  "authMode": "external-chatgpt-access-token",
+  "agents": {
+    "defaultMaxSubagents": 6,
+    "maxSubagents": 10,
+    "maxDepth": 2
+  }
+}
+```
+
+The image digest identifies the concrete Linux platform manifest, not a tag or
+an architecture-selecting OCI index. The platform is recorded separately.
+Digest pinning establishes content identity; publisher trust and image
+signature policy remain later operational work.
+
+The manifest parser rejects unknown or missing fields, duplicate JSON object
+keys, unsupported versions, mutable/ephemeral Codex state, non-canonical IDs,
+tag-like image references, credentials, and unsupported agent limits.
+
+## Fixed Worker Layout
+
+The storage backend returns a host-local directory only after establishing the
+writer fence. The rootless launcher bind-mounts that directory with private
+propagation:
+
+```text
+host-local fenced directory    rootless worker
+───────────────────────────    ───────────────
+<attachment.rootPath>       -> /session
+                               ├── codex-home
+                               ├── workspace
+                               └── .portable-runtime
+```
+
+The runner-neutral worker template fixes:
+
+- `cwd=/session/workspace`;
+- `CODEX_HOME=/session/codex-home`;
+- `CODEX_SQLITE_HOME=/session/codex-home`;
+- a read-write private bind at `/session`;
+- a rootless container boundary; and
+- Codex `danger-full-access` inside that container.
+
+The worker never receives a raw block device, filesystem image, loop/NBD
+handle, mount capability, storage credential, canonical lease record, or auth
+authority directory. A host storage agent may attach an existing filesystem
+volume or mount an image and then expose its mounted directory. Giving the
+image or raw device directly to the rootless worker violates this contract.
+
+`createRootlessWorkerTemplate()` is deliberately non-authorizing. It checks
+that the manifest, storage reference, lease, and attachment describe the same
+session and returns runner-neutral bind data; it neither checks canonical
+lease authority nor launches a process. A trusted launcher must atomically
+re-read the canonical lease at admission, resolve and inspect the attachment,
+reject `/`, symlinks, non-directories, and paths outside its configured
+attachment root, and keep the directory authority pinned through the actual
+bind. A self-declared `kind: "directory"` or an opaque `proofId` is not enough.
+If the launcher cannot hold that authority through the bind, it must fail
+closed rather than consume this template as an authorization decision.
+
+`auth.json` is forbidden in the persistent worker home. External ChatGPT
+access tokens are delivered through the app-server boundary and are not part
+of the manifest. Because Codex shell snapshots can capture exported
+environment variables, credentials must not be injected as general worker
+environment variables. Session backups still contain sensitive company data
+and require access control and encryption independently of `auth.json`.
+
+## Authoritative Lease and Fencing
+
+The canonical session-to-volume binding lives in one linearizable control
+plane. It is never stored authoritatively under `/session` and is never
+restored from a checkpoint.
+
+A writer grant contains:
+
+```json
+{
+  "contractVersion": 1,
+  "sessionId": "019f2100-0000-7000-8000-000000000001",
+  "leaseId": "lease-001",
+  "holderId": "host-001",
+  "fencingEpoch": "42",
+  "expiresAt": "2026-07-02T12:00:30.000Z"
+}
+```
+
+Fencing epochs are canonical positive decimal strings in the uint64 range.
+Implementations compare them as integers such as `BigInt`, never JavaScript
+`Number`. A new writable acquisition and the start of a force-fence operation
+advance the epoch. Renewal and checkpoint capture do not.
+
+Renewal accepts only the exact canonical lease before its authority expiration
+and retains the same session, lease, holder, and epoch. It cannot resurrect an
+expired lease or renew from a stale control-plane record.
+
+Every mutating backend request carries the complete writer identity:
+`sessionId`, `leaseId`, `holderId`, `fencingEpoch`, and an idempotent operation
+ID. The backend must compare that tuple atomically with its canonical state as
+part of the mutation. Calling `assertCanonicalFenceMatch()` and then performing
+an unrelated write is only structural validation and remains a TOCTOU bug.
+Executable request and result validators bind the operation, operation ID, full
+writer tuple, status, and backend proof. The snapshot comparison helper also
+checks the portable storage reference, but remains non-atomic and
+non-authorizing. A concrete adapter must repeat the storage-reference and
+writer-tuple comparison atomically with its mutation. Its conformance test must
+show that epoch-1 checkpoint, detach, and destroy requests fail after an
+epoch-2 takeover.
+
+Lease expiry closes control-plane admission; it does not prove that a stale
+host stopped writing. Automatic takeover requires either a storage-native
+epoch/reservation that rejects the old writer or verified revocation/detach of
+the old attachment. Without that proof, the session remains `BLOCKED` and a new
+writer must not start.
+
+After expiry, only an exact-owner detach for the unchanged canonical tuple may
+continue as cleanup. Checkpoint, destroy, restore, or other mutations cannot use
+the expired-lease exception. Force-fence is intentionally not represented by
+the generic mutation envelope: a concrete adapter must define a transition
+that identifies the revoked old tuple, advances to a distinct new canonical
+epoch, and returns provider evidence that the old attachment can no longer
+write. Once that transition advances the epoch, even the old detach is stale
+and must not affect the new attachment. A `manual` backend cannot provide this
+proof and therefore cannot automatically fail over.
+
+The canonical lifecycle is:
+
+```mermaid
+stateDiagram-v2
+  [*] --> DETACHED
+  DETACHED --> ATTACHING: CAS allocate lease + higher epoch
+  ATTACHING --> ATTACHED: backend attachment proof
+  ATTACHED --> RELEASING: stop admission and worker
+  RELEASING --> DETACHED: verified detach
+  ATTACHING --> FENCING: ambiguous or expired
+  ATTACHED --> FENCING: expired or forced takeover
+  RELEASING --> FENCING: detach uncertain
+  FENCING --> DETACHED: verified fence
+  ATTACHING --> BLOCKED: state unknown
+  RELEASING --> BLOCKED: state unknown
+  FENCING --> BLOCKED: fence unavailable
+```
+
+An ambiguous attach, detach, or fence never rolls back optimistically to
+`DETACHED`. A force-fence failure retains the advanced epoch and remains
+blocked.
+
+## Storage Backend Contract
+
+A v1 backend exposes these capabilities:
+
+```js
+{
+  normalDirectoryAttachment: true,
+  exclusiveWriterAttachment: true,
+  fencing: "epoch-enforced" | "verified-detach" | "manual",
+  atomicPointInTimeCheckpoint: true | false
+}
+```
+
+It declares implementations of `provisionSession`, `prepareWritableAttachment`,
+`detachAttachment`, `forceFence`, `captureCheckpoint`, `restoreCheckpoint`,
+and `destroySession`. The portable storage reference contains only backend,
+storage, and runtime session IDs. The attachment adds the host-local absolute
+directory path, holder, operation, proof, and exact lease/epoch; it is ephemeral
+and must not be written to the session manifest, checkpoint descriptor, or
+portable evidence. Passing the capability validator confirms only this object
+shape and declaration; backend behavior remains untrusted until the concrete
+adapter passes its conformance suite.
+
+`manual` fencing is a valid declared backend capability for development and
+operator-driven recovery, but it cannot perform automatic failover. A local
+directory backend is single-host development only. NFS or another shared
+filesystem satisfies the read-write contract only when its backend can enforce
+exclusive writer access and revoke or fence a partitioned stale host. A lock
+file or lease record on the same share is not sufficient.
+
+## Checkpoint Classes
+
+Checkpoint capture is separate from attachment release:
+
+| Class | Required boundary | Resume rule |
+| --- | --- | --- |
+| `clean` | No active turn or background terminal; stopped writer; storage barrier | New lease |
+| `graceful-abort` | Stable `turn/interrupt` result and abort marker; stopped writer; storage barrier | New lease |
+| `crash-prefix` | Process stopped or conclusively fenced; atomic crash-consistent volume capture | Tail repair, then new lease |
+
+A `crash-prefix` checkpoint must not invent the explicit abort marker seen
+after `turn/interrupt`. Its descriptor records the observed source epoch for
+audit, but the value never becomes canonical authority and the descriptor is
+not a stop, barrier, or fence proof. This module validates descriptor identity
+only; it does not authorize capture or restore.
+
+A concrete checkpoint adapter must consume writer-stop or physical-fence
+evidence and the matching backend mutation result, require atomic
+crash-consistent capture before emitting `crash-prefix`, and prove tail repair
+before writable resume. A concrete restore adapter must obtain a canonical
+writable epoch strictly greater than the source epoch and retain physical
+fence evidence through worker admission. These rules belong to adapter
+conformance tests rather than a metadata-only validator.
+
+Checkpoint descriptors intentionally omit lease ID, expiration, host-local
+attachment path, credentials, and Git Summary. Differential export consumes an
+immutable checkpoint in a later pull request; it does not scan the live
+read-write volume.
+
+## Agent Limits
+
+The default session-wide subagent limit is 6 and the hard limit is 10. The root
+agent does not consume a subagent slot. Depth is counted as root `0`, child `1`,
+and grandchild `2`; a depth-2 agent cannot spawn another agent. These are
+runtime policy limits, not per-parent multipliers.
+
+## Deferred Implementation
+
+Later pull requests own:
+
+- the auth broker and access-token delivery;
+- Podman/Docker launch and UID/SELinux mapping;
+- concrete local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
+- the linearizable binding database, renewer, idempotency store, and host fence;
+- held-directory launch authority, atomic mutation/fence transitions, provider
+  proofs, and adapter conformance validators;
+- quiesce, sync/freeze, snapshot, restore, rollout-tail repair, and resume
+  verification;
+- differential compression, encryption, retention, and atomic publication;
+- cross-host migration and fault injection; and
+- the read-only Git Summary.
