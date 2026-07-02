@@ -766,22 +766,28 @@ function assertStorageMutationTarget(value, { operation, storageId }) {
     "invalid_storage_mutation",
     "storage mutation target kind is unsupported",
   );
-  if (value.storageId !== undefined) {
-    assertOpaqueId(value.storageId, "invalid_storage_mutation", "target storage ID");
+  const requiredIds = {
+    attach: [["attachmentId", "target attachment ID"]],
+    checkpoint: [
+      ["artifactId", "target artifact ID"],
+      ["checkpointId", "target checkpoint ID"],
+    ],
+    destroy: [["storageId", "target storage ID"]],
+    detach: [["attachmentId", "target attachment ID"]],
+    restore: [
+      ["artifactId", "target artifact ID"],
+      ["checkpointId", "target checkpoint ID"],
+    ],
+  }[operation];
+  for (const [field, label] of requiredIds) {
+    assertOpaqueId(value[field], "invalid_storage_mutation", label);
+  }
+  if (operation === "destroy") {
     ensure(
       value.storageId === storageId,
       "invalid_storage_mutation",
       "storage mutation target does not match storage ID",
     );
-  }
-  if (value.checkpointId !== undefined) {
-    assertOpaqueId(value.checkpointId, "invalid_storage_mutation", "target checkpoint ID");
-  }
-  if (value.artifactId !== undefined) {
-    assertOpaqueId(value.artifactId, "invalid_storage_mutation", "target artifact ID");
-  }
-  if (value.attachmentId !== undefined) {
-    assertOpaqueId(value.attachmentId, "invalid_storage_mutation", "target attachment ID");
   }
 }
 

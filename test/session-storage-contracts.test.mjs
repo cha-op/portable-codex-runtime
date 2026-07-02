@@ -642,6 +642,25 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
   ]) {
     assert.deepEqual(assertStorageMutationRequest(mutationRequest({ operation })).target, target);
   }
+  for (const [operation, field] of [
+    ["attach", "attachmentId"],
+    ["checkpoint", "artifactId"],
+    ["checkpoint", "checkpointId"],
+    ["destroy", "storageId"],
+    ["detach", "attachmentId"],
+    ["restore", "artifactId"],
+    ["restore", "checkpointId"],
+  ]) {
+    const invalid = mutationRequest({ operation });
+    assert.throws(
+      () =>
+        assertStorageMutationRequest({
+          ...invalid,
+          target: { ...invalid.target, [field]: undefined },
+        }),
+      assertCode("invalid_storage_mutation"),
+    );
+  }
   assert.throws(
     () =>
       assertStorageMutationRequest(
