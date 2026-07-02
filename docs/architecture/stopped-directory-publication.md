@@ -80,7 +80,10 @@ owned roots must be distinct and non-nested. Both roots must also be disjoint
 from the journal authority in either ancestor direction. Source, staging,
 final, journal, and lock locations must not otherwise be symlink aliases,
 hard-link aliases, or declared bind-mount aliases in a way that collapses
-their roles.
+their roles. Before journal preparation, publication inventories the complete
+source tree and rejects either the target-root or journal-root identity at any
+source descendant, so an external bind-mount alias cannot turn destination
+creation or journal advancement into a source mutation.
 
 The operation journal exposes its pinned canonical directory and device/inode
 identity only to this physical layer. Publication rejects a journal directory
@@ -149,7 +152,10 @@ authority through the complete sequence:
    post-order, fsync the staging root, and fsync the held publication parent so
    the complete unpublished staging name and contents are durable;
 6. recompute and compare the exact source, staged payload, and manifest
-   digests, revalidate the held staging identity, and call
+   digests and revalidate the held staging identity; after every callback that
+   can observe the candidate, repeat the pinned identity check, complete staged
+   tree fsync, publication-parent sync, exact bundle-shape/manifest/payload
+   readback, and pinned identity check before calling
    `journal.markMaterialized()` with the fixed digests and device/inode
    identity encoded as canonical decimal strings; `materialized` therefore
    means a complete, durable, unpublished staging object, not merely that copy

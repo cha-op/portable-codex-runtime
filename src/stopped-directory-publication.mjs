@@ -27,6 +27,7 @@ import {
   digestTree,
   openStoppedTreeRootAuthority,
   sameFileIdentity,
+  stoppedTreeContainsAnyIdentity,
   syncStoppedTree,
 } from "./stopped-tree.mjs";
 
@@ -1007,6 +1008,22 @@ export class StoppedDirectoryPublication {
         journalAuthority.path,
         "uncertain",
       );
+      let journalIdentity;
+      try {
+        ensure(
+          /^(?:0|[1-9][0-9]*)$/u.test(journalAuthority.device) &&
+            /^[1-9][0-9]*$/u.test(journalAuthority.inode),
+          "invalid_publication_request",
+          "uncertain",
+        );
+        journalIdentity = Object.freeze({
+          dev: BigInt(journalAuthority.device),
+          ino: BigInt(journalAuthority.inode),
+        });
+      } catch (error) {
+        if (internalErrors.has(error)) throw error;
+        fail("invalid_publication_request", "uncertain");
+      }
       ensure(
         pathsAreDisjoint(sourceAuthority.path, journalAuthority.path) &&
           pathsAreDisjoint(targetAuthority.path, journalAuthority.path) &&
@@ -1020,6 +1037,22 @@ export class StoppedDirectoryPublication {
         "invalid_publication_request",
         "uncertain",
       );
+      if (source.identity !== null) {
+        let containsAuthorityIdentity;
+        try {
+          containsAuthorityIdentity = await stoppedTreeContainsAnyIdentity(
+            source.path,
+            [targetAuthority.identity, journalIdentity],
+          );
+        } catch {
+          fail("invalid_publication_request", "uncertain");
+        }
+        ensure(
+          !containsAuthorityIdentity,
+          "invalid_publication_request",
+          "uncertain",
+        );
+      }
       const observed = await this.#journal.read({ operationId });
       publicationMayHaveOccurred = false;
       if (observed.record?.state === "committed") {
@@ -1172,6 +1205,32 @@ export class StoppedDirectoryPublication {
           });
           pinnedPublication = created.pinned;
           await runFault(this.#faults.afterCandidateBarrier);
+          try {
+            await assertPinnedPath(
+              candidatePath,
+              pinnedPublication,
+              "publication_integrity_failed",
+              "not-committed",
+            );
+            await syncStoppedTree(candidatePath);
+            await targetAuthority.assertCurrent();
+            await targetAuthority.handle.sync();
+            await this.#verifyPublishedTree({
+              checkpoint: prepared.record.result.checkpoint,
+              kind: options.kind,
+              materialization: created.materialization,
+              path: candidatePath,
+            });
+            await assertPinnedPath(
+              candidatePath,
+              pinnedPublication,
+              "publication_integrity_failed",
+              "not-committed",
+            );
+          } catch (error) {
+            if (internalErrors.has(error)) throw error;
+            fail("publication_integrity_failed");
+          }
           materialized = await this.#journal.markMaterialized({
             ...journalInput,
             materialization: created.materialization,

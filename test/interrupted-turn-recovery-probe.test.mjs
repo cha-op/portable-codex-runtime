@@ -56,6 +56,7 @@ import {
   parseLinuxGetfacl,
   parseLinuxMountInfo,
   removeTreeForCleanup,
+  stoppedTreeContainsAnyIdentity,
   syncStoppedTree,
 } from "../src/stopped-tree.mjs";
 
@@ -1176,7 +1177,7 @@ test("portable directory names require NFC and reject portable collisions", () =
   }
 });
 
-test("source identity pre-scan failures retain the created destination", async () => {
+test("source identity pre-scan failures occur before destination creation", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-copy-prescan-failure-test-"));
   try {
     const source = join(root, "source");
@@ -1188,7 +1189,7 @@ test("source identity pre-scan failures retain the created destination", async (
       copyStoppedTree({ ownedRoot: root, source, destination }),
       /rejects non-ASCII cased directory names/,
     );
-    await assertRetainedFailedDestination(destination);
+    await assert.rejects(lstat(destination), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1215,6 +1216,30 @@ test("stopped-tree copy can require the caller-observed source identity", async 
       /rejects source root identity changes/,
     );
     await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree identity scans include nested directory authorities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-tree-identity-scan-test-"));
+  try {
+    const source = join(root, "source");
+    const nested = join(source, "nested");
+    const outside = join(root, "outside");
+    await mkdir(nested, { recursive: true });
+    await mkdir(outside);
+    const nestedIdentity = await lstat(nested, { bigint: true });
+    const outsideIdentity = await lstat(outside, { bigint: true });
+
+    assert.equal(
+      await stoppedTreeContainsAnyIdentity(source, [nestedIdentity]),
+      true,
+    );
+    assert.equal(
+      await stoppedTreeContainsAnyIdentity(source, [outsideIdentity]),
+      false,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

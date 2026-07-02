@@ -485,7 +485,10 @@ test("the journal authority cannot also be the publication root", async (t) => {
 
 test("a source identity alias of the journal authority is rejected", async (t) => {
   const fixture = await createFixture(t);
-  const sourceIdentity = await lstat(fixture.sourceDirectory, { bigint: true });
+  const sourceIdentity = await lstat(
+    join(fixture.sourceDirectory, "workspace"),
+    { bigint: true },
+  );
   const journalPath = await realpath(fixture.journalDirectory);
   class SourceAliasedJournal extends FilesystemOperationJournal {
     async describeAuthority() {
@@ -1002,6 +1005,51 @@ test("a candidate replacement before rename is definitely not committed", async 
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "materialized",
   );
+});
+
+test("candidate mutation after its barrier cannot advance to materialized", async (t) => {
+  let fixture;
+  fixture = await createFixture(t, {
+    faults: {
+      async afterCandidateBarrier() {
+        const candidate = candidatePath(
+          fixture.artifactOwnedRoot,
+          CAPTURE_OPERATION_ID,
+          fixture.artifactDirectory,
+        );
+        await writeFile(
+          join(candidate, "payload", "workspace", "README.md"),
+          "mutated after candidate barrier\n",
+          { mode: 0o640 },
+        );
+      },
+    },
+  });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_integrity_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+  assert.equal(
+    await pathExists(
+      candidatePath(
+        fixture.artifactOwnedRoot,
+        CAPTURE_OPERATION_ID,
+        fixture.artifactDirectory,
+      ),
+    ),
+    true,
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
 test("a materialized stage-only operation resumes without recopying", async (t) => {

@@ -33,6 +33,9 @@ nested mounts. A caller may also require the source root to retain an
 already-observed device/inode identity, reject every absolute symlink, or deny
 absolute-link traversal into explicit path and device/inode authorities. These
 are publication-building primitives, not independent backend authority.
+Cross-root copy inventories every source entry identity before it creates the
+destination and rejects a destination-root identity found anywhere in that
+inventory, including a descendant bind-mount alias.
 
 These functions operate only after an external coordinator has stopped the
 writer. They do not stop a process, authenticate stopped-writer evidence, or

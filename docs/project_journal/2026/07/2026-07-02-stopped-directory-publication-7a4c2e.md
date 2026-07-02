@@ -42,6 +42,10 @@ superseded_by:
   roots are distinct and journal-disjoint; source root identity is preserved
   across the barrier and copy; and checkpoint replay requires an exact
   two-entry bundle root.
+- Complete source-tree identity scans reject target or journal bind-mount
+  aliases before journal preparation or destination creation. Candidate state
+  is re-synced and exactly revalidated after its last callback and before the
+  journal may advance to `materialized`.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

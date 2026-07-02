@@ -620,6 +620,30 @@ async function collectTreeIdentities(path, identities = new Set()) {
   }
 }
 
+export async function stoppedTreeContainsAnyIdentity(path, identities) {
+  assert(
+    Array.isArray(identities) && identities.length > 0,
+    "identities must be a non-empty array",
+  );
+  const normalized = identities.map((identity) => {
+    assert(
+      identity !== null &&
+        typeof identity === "object" &&
+        integerAsBigInt(identity.dev) !== null &&
+        integerAsBigInt(identity.ino) !== null,
+      "identity must contain filesystem device and inode values",
+    );
+    return {
+      dev: integerAsBigInt(identity.dev),
+      ino: integerAsBigInt(identity.ino),
+    };
+  });
+  const treeIdentities = await collectTreeIdentities(path);
+  return normalized.some((identity) =>
+    treeIdentities.has(fileIdentityKey(identity)),
+  );
+}
+
 async function copyFileContents(sourceHandle, destinationHandle) {
   const buffer = Buffer.allocUnsafe(1024 * 1024);
   let position = 0;
@@ -1300,6 +1324,15 @@ export async function copyStoppedTreeBetweenRoots({
     await assertNoMountBoundary(canonicalSource, listMountPoints, {
       allowRootMount: allowSourceRootMount,
     });
+    // Scan before destination creation so a destination-root bind alias cannot
+    // mutate the source tree before the overlap is discovered.
+    const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
+    assert(
+      !sourceIdentityKeys.has(
+        fileIdentityKey(destinationOwnedRootAuthority.identity),
+      ),
+      "stopped-tree copy rejects a destination root identity inside the source tree",
+    );
     const canonicalDestination = await assertDirectOwnedPath(
       destinationOwnedRootAuthority,
       destination,
@@ -1342,9 +1375,8 @@ export async function copyStoppedTreeBetweenRoots({
         "stopped-tree copy rejects destination root identity changes",
       );
     };
-    // Index before copying so an absolute link cannot reach a source subtree
-    // through an external bind-mount or other filesystem identity alias.
-    const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
+    // The pre-creation index also prevents absolute links from reaching a
+    // source subtree through an external bind-mount or identity alias.
     await assertDestinationRootCurrent();
     await copyTreeEntry(
       {
