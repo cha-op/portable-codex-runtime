@@ -342,6 +342,12 @@ writable epoch strictly greater than the source epoch and retain physical
 fence evidence through worker admission. These rules belong to adapter
 conformance tests rather than a metadata-only validator.
 
+The backend-neutral snapshot and restore core implements only stopped-writer
+`clean` orchestration over these records. It validates the operation boundary
+and fails closed after uncertain backend dispatch, while the backend retains
+atomic fence recheck, storage barrier, idempotency, and physical mutation
+responsibility. See `snapshot-restore-core.md`.
+
 Checkpoint descriptors record the source backend and storage ID, but
 intentionally omit lease ID, expiration, host-local attachment path,
 credentials, and Git Summary. Differential export consumes an immutable
@@ -365,8 +371,9 @@ Later pull requests own:
 - the linearizable binding database, renewer, idempotency store, and host fence;
 - held-directory launch authority, atomic mutation/fence transitions, provider
   proofs, and adapter conformance validators;
-- quiesce, sync/freeze, snapshot, restore, rollout-tail repair, and resume
-  verification;
+- stopped-directory conformance, graceful-abort evidence, crash-prefix atomic
+  capture, rollout-tail repair, and same-image resume verification;
+- ext4 or filesystem-image physical snapshot and restore;
 - differential compression, encryption, retention, and atomic publication;
 - cross-host migration and fault injection; and
 - the read-only Git Summary.

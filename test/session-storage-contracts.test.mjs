@@ -19,6 +19,7 @@ import {
   assertLeaseRenewal,
   assertResolvedPlatformImageMatchesManifest,
   assertSessionAttachment,
+  assertSessionAttachmentMatches,
   assertSessionManifest,
   assertSessionProvisionRequest,
   assertSessionProvisionResult,
@@ -502,6 +503,15 @@ test("storage references and attachments contain no host path in portable state"
 
 test("rootless worker template is structural and fixed-layout", () => {
   const currentLease = lease();
+  const matched = assertSessionAttachmentMatches({
+    attachment: attachment(),
+    lease: currentLease,
+    manifest: sessionManifest(),
+    storageRef: storageRef(),
+  });
+  assert.equal(matched.attachment.rootPath, attachment().rootPath);
+  assert.equal(matched.lease.fencingEpoch, currentLease.fencingEpoch);
+  assert(Object.isFrozen(matched));
   const template = createRootlessWorkerTemplate({
     attachment: attachment(),
     lease: currentLease,

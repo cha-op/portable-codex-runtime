@@ -762,7 +762,14 @@ export function assertSessionAttachment(value) {
   );
 }
 
-function assertAttachmentMatches({ attachment, lease, manifest, storageRef }) {
+export function assertSessionAttachmentMatches(options) {
+  const { attachment, lease, manifest, storageRef } = assertOptionsObject(
+    options,
+    ["attachment", "lease", "manifest", "storageRef"],
+    ["attachment", "lease", "manifest", "storageRef"],
+    "invalid_storage_attachment",
+    "session attachment match options",
+  );
   const sessionManifest = assertSessionManifest(manifest);
   const storage = assertSessionStorageRef(storageRef);
   const writerLease = assertLeaseGrant(lease);
@@ -779,7 +786,12 @@ function assertAttachmentMatches({ attachment, lease, manifest, storageRef }) {
     "stale_fence",
     "attachment does not match the current session writer fence",
   );
-  return { attachment: mounted, lease: writerLease, manifest: sessionManifest, storageRef: storage };
+  return deepFreeze({
+    attachment: mounted,
+    lease: writerLease,
+    manifest: sessionManifest,
+    storageRef: storage,
+  });
 }
 
 export function assertStorageBackend(value) {
@@ -1059,7 +1071,7 @@ export function createRootlessWorkerTemplate(options) {
     "invalid_worker_template",
     "rootless worker template options",
   );
-  const matched = assertAttachmentMatches({ attachment, lease, manifest, storageRef });
+  const matched = assertSessionAttachmentMatches({ attachment, lease, manifest, storageRef });
   return deepFreeze({
     agentPolicy: matched.manifest.agents,
     auth: {

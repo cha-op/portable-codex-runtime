@@ -17,6 +17,9 @@
   reconciliation, canonical-path coordination, pre-dispatch recovery
   reservations, stale-worker suppression, and durable reauth/recovery gates
   without placing refresh-token state on session volumes.
+- A backend-neutral snapshot and restore core now orchestrates stopped-writer
+  clean checkpoints, requires a newer restore epoch, and fails closed on
+  uncertain backend outcomes without claiming a physical snapshot backend.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -31,6 +34,8 @@
   `docs/project_journal/2026/07/2026-07-02-session-storage-contracts-7c31e2.md`
 - Auth broker MVP:
   `docs/project_journal/2026/07/2026-07-02-auth-broker-mvp-4d729b.md`
+- Snapshot and restore core:
+  `docs/project_journal/2026/07/2026-07-02-snapshot-restore-core-3e8a71.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
