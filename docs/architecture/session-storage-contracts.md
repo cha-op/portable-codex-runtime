@@ -354,6 +354,12 @@ writer-stop evidence or provide a storage barrier, atomic publication, durable
 journal, idempotent replay, or backend adapter. See
 `stopped-tree-primitives.md`.
 
+The filesystem operation journal durably orders exact operation metadata and
+committed-result replay, but its materialisation and result fields remain
+caller-supplied claims. It does not prove the physical artefact, writer stop,
+canonical fence, publication, destination isolation, shared-filesystem
+semantics, or backend success. See `filesystem-operation-journal.md`.
+
 Checkpoint descriptors record the source backend and storage ID, but
 intentionally omit lease ID, expiration, host-local attachment path,
 credentials, and Git Summary. Differential export consumes an immutable
@@ -377,8 +383,9 @@ Later pull requests own:
 - the linearizable binding database, renewer, idempotency store, and host fence;
 - held-directory launch authority, atomic mutation/fence transitions, provider
   proofs, and adapter conformance validators;
-- stopped-directory conformance, graceful-abort evidence, crash-prefix atomic
-  capture, rollout-tail repair, and same-image resume verification;
+- stopped-directory atomic publication, stopped-writer capability, adapter
+  conformance, graceful-abort evidence, crash-prefix atomic capture,
+  rollout-tail repair, and same-image resume verification;
 - ext4 or filesystem-image physical snapshot and restore;
 - differential compression, encryption, retention, and atomic publication;
 - cross-host migration and fault injection; and

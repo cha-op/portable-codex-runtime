@@ -92,6 +92,16 @@ layer still has no fsync barrier, atomic publication, durable operation journal,
 descriptor replay, or storage backend. See
 `docs/architecture/stopped-tree-primitives.md`.
 
+## Durable Filesystem Operation Journal
+
+The host-local journal durably records exact storage operation state through
+`prepared`, `materialized`, and `committed` phases. Canonical copy-on-write
+records use file fsync, held-lock rename, parent-directory fsync, and exact
+readback; committed results can be replayed after restart. The journal records
+caller-supplied state but does not prove physical materialisation, writer stop,
+fence authority, atomic publication, destination isolation, NFS guarantees, or
+backend success. See `docs/architecture/filesystem-operation-journal.md`.
+
 ## Interrupted-Turn Recovery
 
 The recovery probe starts a real Codex app-server against a held localhost

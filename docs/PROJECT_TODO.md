@@ -12,9 +12,13 @@
   orchestration independently of auth state.
 - [done] Extract reusable stopped-tree validation, copy, digest, and guarded
   cleanup primitives without claiming a durable snapshot backend.
-- [pending] Implement the stopped-directory backend adapter and conformance,
-  including authenticated stop evidence, an fsync barrier, atomic publication,
-  destination isolation, and a durable operation journal with exact replay.
+- [done] Implement the durable host-local filesystem operation journal with
+  canonical phase and exact committed-result replay.
+- [pending] Implement stopped-directory storage barriers, atomic artefact and
+  restore publication, and destination isolation against the journal phases.
+- [pending] Implement the same-process stopped-writer capability coordinator.
+- [pending] Compose the journal, publication layer, and stop capability into
+  the stopped-directory backend adapter and conformance suite.
 - [pending] Add replay-only uncertain-outcome reconciliation, then same-image
   resume verification and rollout-tail repair.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by

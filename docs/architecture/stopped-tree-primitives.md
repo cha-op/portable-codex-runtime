@@ -73,6 +73,11 @@ successful `copyStoppedTree()` means that a stopped source was copied under
 the helper's filesystem rules, not that an atomic or durable checkpoint was
 published.
 
+The separate filesystem operation journal can durably record predetermined
+operation phases and results, but it does not add a storage barrier or
+publication semantics to these primitives. See
+`filesystem-operation-journal.md`.
+
 ## Integration Boundary
 
 A later stopped-directory backend may compose these primitives with a trusted
