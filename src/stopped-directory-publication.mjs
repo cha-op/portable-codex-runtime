@@ -844,13 +844,22 @@ export class StoppedDirectoryPublication {
   #acquireLock;
   #faults;
   #inspectFilesystem;
+  #inspectOwnedRootAcl;
+  #inspectOwnedRootAncestorAcl;
   #journal;
   #trustRenameOutcome;
 
   constructor(options) {
     const normalized = exactOptions(
       options,
-      ["acquireLock", "faults", "inspectFilesystem", "journal"],
+      [
+        "acquireLock",
+        "faults",
+        "inspectFilesystem",
+        "inspectOwnedRootAcl",
+        "inspectOwnedRootAncestorAcl",
+        "journal",
+      ],
       ["journal"],
     );
     ensure(
@@ -861,10 +870,16 @@ export class StoppedDirectoryPublication {
     this.#acquireLock = normalized.acquireLock ?? acquireAdvisoryLock;
     this.#trustRenameOutcome = this.#acquireLock === acquireAdvisoryLock;
     this.#inspectFilesystem = normalized.inspectFilesystem ?? defaultInspectFilesystem;
+    this.#inspectOwnedRootAcl = normalized.inspectOwnedRootAcl;
+    this.#inspectOwnedRootAncestorAcl = normalized.inspectOwnedRootAncestorAcl;
     this.#faults = normalizeFaults(normalized.faults);
     ensure(
       typeof this.#acquireLock === "function" &&
-        typeof this.#inspectFilesystem === "function",
+        typeof this.#inspectFilesystem === "function" &&
+        (this.#inspectOwnedRootAcl === undefined ||
+          typeof this.#inspectOwnedRootAcl === "function") &&
+        (this.#inspectOwnedRootAncestorAcl === undefined ||
+          typeof this.#inspectOwnedRootAncestorAcl === "function"),
       "invalid_publication_request",
     );
     Object.freeze(this);
@@ -974,8 +989,18 @@ export class StoppedDirectoryPublication {
         "invalid_publication_request",
       );
       try {
-        sourceAuthority = await openStoppedTreeRootAuthority(options.sourceOwnedRoot);
-        targetAuthority = await openStoppedTreeRootAuthority(options.targetOwnedRoot);
+        const rootAuthorityOptions = {
+          inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+          inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+        };
+        sourceAuthority = await openStoppedTreeRootAuthority(
+          options.sourceOwnedRoot,
+          rootAuthorityOptions,
+        );
+        targetAuthority = await openStoppedTreeRootAuthority(
+          options.targetOwnedRoot,
+          rootAuthorityOptions,
+        );
       } catch {
         fail("publication_outcome_uncertain", "uncertain");
       }
@@ -1093,7 +1118,10 @@ export class StoppedDirectoryPublication {
           observedCandidate === null && observedFinal === null,
           "publication_recovery_required",
         );
-      } else if (observedFinal !== null) {
+      } else if (
+        observedFinal !== null &&
+        ["materialized", "committed"].includes(observed.record.state)
+      ) {
         publicationMayHaveOccurred = true;
       }
       const targetFilesystem = await inspectFilesystem(
@@ -1571,6 +1599,8 @@ export class StoppedDirectoryPublication {
         destinationOwnedRoot: candidatePath,
         forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
         expectedSourceRootIdentity: source.identity,
+        inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+        inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
         source: source.path,
         sourceOwnedRoot: sourceAuthority.path,
       });
@@ -1590,6 +1620,8 @@ export class StoppedDirectoryPublication {
         destination: candidatePath,
         destinationOwnedRoot: targetAuthority.path,
         forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
+        inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+        inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
         source: sourceTree,
         sourceOwnedRoot,
       });

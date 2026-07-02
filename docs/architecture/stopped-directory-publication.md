@@ -253,6 +253,11 @@ integrity failure while uncommitted and `published_state_invalid` when its
 record is already committed; it is never reclassified as a caller argument
 error.
 
+Production root ACL inspection uses the stopped-tree platform defaults. A host
+adapter that provides an equivalent trusted ACL capability may inject
+`inspectOwnedRootAcl` and `inspectOwnedRootAncestorAcl`; the same inspectors are
+used both to pin the publication roots and for cross-root materialisation.
+
 A lock-release or final-handle-close failure preserves the prior commit state.
 In particular, a failure after journal commit is a committed cleanup failure.
 A later missing or corrupt final object also does not downgrade the historical

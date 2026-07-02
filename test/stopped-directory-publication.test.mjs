@@ -718,6 +718,41 @@ test("an exact committed replay returns the fixed result without recopying", asy
   assert.equal(replayedIdentity.ino, artifactIdentity.ino);
 });
 
+test("publication accepts trusted ACL inspectors for every owned root", async (t) => {
+  const inspectedRoots = [];
+  const inspectedAncestors = [];
+  const fixture = await createFixture(t, {
+    async inspectOwnedRootAcl(path) {
+      inspectedRoots.push(path);
+      return false;
+    },
+    async inspectOwnedRootAncestorAcl(path) {
+      inspectedAncestors.push(path);
+      return false;
+    },
+  });
+  const sourceOwnedRoot = await realpath(fixture.sourceOwnedRoot);
+  const artifactOwnedRoot = await realpath(fixture.artifactOwnedRoot);
+
+  const outcome = await fixture.publication.publishCheckpointArtifact(
+    captureOptions(fixture),
+  );
+
+  assert.equal(outcome.result.mutation.status, "checkpoint-created");
+  assert(inspectedRoots.includes(sourceOwnedRoot));
+  assert(inspectedRoots.includes(artifactOwnedRoot));
+  assert(
+    inspectedRoots.includes(
+      candidatePath(
+        artifactOwnedRoot,
+        CAPTURE_OPERATION_ID,
+        fixture.artifactDirectory,
+      ),
+    ),
+  );
+  assert(inspectedAncestors.length > 0);
+});
+
 test("committed checkpoint replay rejects extra bundle-root entries", async (t) => {
   const fixture = await createFixture(t);
   const options = captureOptions(fixture);
@@ -1274,6 +1309,40 @@ test("a prepared leftover candidate fails closed and is retained", async (t) => 
   assert.equal(rereadIdentity.dev, retainedIdentity.dev);
   assert.equal(rereadIdentity.ino, retainedIdentity.ino);
   assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("a stray final beside a prepared record requires recovery", async (t) => {
+  let failAfterJournalPrepared = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("prepared fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  await mkdir(fixture.artifactDirectory, { mode: 0o700 });
+
+  failAfterJournalPrepared = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
 });
 
 test("rename acknowledgement loss keeps a materialized operation recoverable", async (t) => {

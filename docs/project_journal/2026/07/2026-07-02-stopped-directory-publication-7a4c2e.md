@@ -51,6 +51,9 @@ superseded_by:
   before journal discovery are uncertain while malformed root syntax remains a
   caller error, and malformed persisted materialisation is classified as
   journal or committed-state corruption.
+- Prepared records with an unexpected final tree remain explicit recovery
+  inconsistencies rather than rename uncertainty. Host adapters can inject the
+  trusted ACL inspection capability used consistently by root pinning and copy.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.
