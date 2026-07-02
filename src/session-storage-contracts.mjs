@@ -113,20 +113,20 @@ function assertExactObject(value, keys, code, label) {
     code,
     `${label} must be a plain object`,
   );
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
+  const actual = Reflect.ownKeys(value);
   ensure(
-    actual.length === expected.length && actual.every((key, index) => key === expected[index]),
+    actual.length === keys.length &&
+      actual.every((key) => typeof key === "string" && keys.includes(key)),
     code,
     `${label} contains unexpected or missing fields`,
   );
   ensure(
     actual.every((key) => {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      return descriptor !== undefined && Object.hasOwn(descriptor, "value");
+      return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value");
     }),
     code,
-    `${label} fields must be plain data properties`,
+    `${label} fields must be enumerable plain data properties`,
   );
 }
 

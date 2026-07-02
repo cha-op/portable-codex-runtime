@@ -780,6 +780,17 @@ test("portable record validators reject accessor fields before validation or clo
     assertCode("invalid_storage_attachment"),
   );
   assert.equal(pathReads, 0);
+
+  const hiddenLease = lease();
+  Object.defineProperty(hiddenLease, "stopProof", {
+    enumerable: false,
+    value: "not-authority",
+  });
+  assert.throws(() => assertLeaseGrant(hiddenLease), assertCode("invalid_fence"));
+  assert.throws(
+    () => assertLeaseGrant({ ...lease(), [Symbol("authority")]: "not-authority" }),
+    assertCode("invalid_fence"),
+  );
 });
 
 test("public option envelopes reject accessors before destructuring", () => {
