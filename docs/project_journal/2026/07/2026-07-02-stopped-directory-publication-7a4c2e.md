@@ -78,12 +78,13 @@ superseded_by:
 - A pre-rename callback is treated as publication-uncertain until a held-lock
   probe proves the staged inode is not visible at the final path, preventing a
   callback-side rename from being misreported as definitely not committed.
-- The same held-lock final-path proof now follows the complete-candidate
-  callback before `materialized`, so a callback-side publication cannot be
-  misreported while the journal remains `prepared`. After journal commit and
-  its own fault callbacks return, publication repeats the full committed tree
-  fsync, parent sync, candidate-absence, identity, mode/ACL, and digest barrier
-  before reporting success.
+- The same held-lock final-path proof now surrounds the complete-candidate
+  callback, the journal's `materialized` transition callbacks, and the
+  post-materialization callback, so callback-side publication cannot be
+  misreported while the journal is `prepared` or `materialized`. After journal
+  commit and its own fault callbacks return, publication repeats the full
+  committed tree fsync, parent sync, candidate-absence, identity, mode/ACL, and
+  digest barrier before reporting success.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

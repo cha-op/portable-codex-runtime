@@ -1667,6 +1667,104 @@ test("post-candidate-barrier publication remains outcome-uncertain", async (t) =
   }
 });
 
+test("materialization callbacks cannot publish with a not-committed result", async (t) => {
+  for (const callbackKind of ["journal", "publication"]) {
+    for (const throwAfterRename of [false, true]) {
+      await t.test(
+        `${callbackKind} callback ${throwAfterRename ? "throws" : "returns"}`,
+        async (t) => {
+          let afterCopyCalls = 0;
+          let armed = false;
+          let candidateIdentity;
+          let fixture;
+          const publishCandidate = async () => {
+            const candidate = candidatePath(
+              fixture.artifactOwnedRoot,
+              CAPTURE_OPERATION_ID,
+              fixture.artifactDirectory,
+            );
+            candidateIdentity = await lstat(candidate, { bigint: true });
+            await rename(candidate, fixture.artifactDirectory);
+            if (throwAfterRename) throw new Error("materialization callback fault");
+          };
+          const journalFaults =
+            callbackKind === "journal"
+              ? {
+                  async beforeRename({ record }) {
+                    if (armed && record.state === "materialized") {
+                      await publishCandidate();
+                    }
+                  },
+                }
+              : undefined;
+          fixture = await createFixture(t, {
+            faults: {
+              async afterCandidateBarrier() {
+                armed = true;
+              },
+              async afterCopy() {
+                afterCopyCalls += 1;
+              },
+              async afterMaterialized() {
+                if (callbackKind === "publication") await publishCandidate();
+              },
+            },
+            journalFaults,
+          });
+
+          await assert.rejects(
+            fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+            (error) =>
+              assertPublicationError(
+                error,
+                "publication_outcome_uncertain",
+                "uncertain",
+              ),
+          );
+          assert.equal(
+            await pathExists(
+              candidatePath(
+                fixture.artifactOwnedRoot,
+                CAPTURE_OPERATION_ID,
+                fixture.artifactDirectory,
+              ),
+            ),
+            false,
+          );
+          const finalIdentity = await lstat(fixture.artifactDirectory, {
+            bigint: true,
+          });
+          assert.equal(finalIdentity.dev, candidateIdentity.dev);
+          assert.equal(finalIdentity.ino, candidateIdentity.ino);
+          assert.equal(afterCopyCalls, 1);
+          const journalState =
+            callbackKind === "journal" && throwAfterRename
+              ? JSON.parse(
+                  await readFile(
+                    join(
+                      fixture.journalDirectory,
+                      operationJournalRecordFilename(CAPTURE_OPERATION_ID),
+                    ),
+                    "utf8",
+                  ),
+                ).state
+              : (
+                  await fixture.journal.read({
+                    operationId: CAPTURE_OPERATION_ID,
+                  })
+                ).record.state;
+          assert.equal(
+            journalState,
+            callbackKind === "journal" && throwAfterRename
+              ? "prepared"
+              : "materialized",
+          );
+        },
+      );
+    }
+  }
+});
+
 test("candidate mutation after its barrier cannot advance to materialized", async (t) => {
   let fixture;
   fixture = await createFixture(t, {

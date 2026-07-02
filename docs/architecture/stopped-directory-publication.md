@@ -168,8 +168,9 @@ remaining sequence:
    extended-ACL-free. Checkpoint bundle envelopes remain mode `0700`; restore
    payload roots retain and pin their modeled portable mode inside the mode
    `0700` destination storage authority. A callback that can observe this
-   complete candidate is publication-uncertain until a held-lock final-path
-   probe proves that the pinned inode was not published. `materialized`
+   complete candidate, including callbacks inside the journal's materialized
+   transition, is publication-uncertain until a held-lock final-path probe
+   proves that the pinned inode was not published. `materialized`
    therefore means a
    complete, durable, unpublished staging object, not merely that copy returned;
 7. revalidate the publication root, lock, held staging inode, and absent final

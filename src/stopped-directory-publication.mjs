@@ -1338,11 +1338,16 @@ export class StoppedDirectoryPublication {
           );
         }
       };
-      const runCandidateObservableFault = async (operation, pinned) => {
+      const runCandidateObservableOperation = async (
+        operation,
+        pinned,
+        { fault = false } = {},
+      ) => {
         publicationMayHaveOccurred = true;
         let callbackError;
         try {
-          await runFault(operation);
+          if (fault) await runFault(operation);
+          else await operation();
         } catch (error) {
           callbackError = error;
         }
@@ -1657,9 +1662,10 @@ export class StoppedDirectoryPublication {
             targetAuthority,
           });
           pinnedPublication = created.pinned;
-          await runCandidateObservableFault(
+          await runCandidateObservableOperation(
             this.#faults.afterCandidateBarrier,
             pinnedPublication,
+            { fault: true },
           );
           await revalidateLockedTopology(state, candidatePath, "candidate");
           try {
@@ -1688,11 +1694,20 @@ export class StoppedDirectoryPublication {
             if (internalErrors.has(error)) throw error;
             fail("publication_integrity_failed");
           }
-          materialized = await this.#journal.markMaterialized({
-            ...journalInput,
-            materialization: created.materialization,
-          });
-          await runFault(this.#faults.afterMaterialized);
+          await runCandidateObservableOperation(
+            async () => {
+              materialized = await this.#journal.markMaterialized({
+                ...journalInput,
+                materialization: created.materialization,
+              });
+            },
+            pinnedPublication,
+          );
+          await runCandidateObservableOperation(
+            this.#faults.afterMaterialized,
+            pinnedPublication,
+            { fault: true },
+          );
           await revalidateLockedTopology(
             materialized.record.state,
             candidatePath,
@@ -1750,9 +1765,10 @@ export class StoppedDirectoryPublication {
             "publication_recovery_required",
             "not-committed",
           );
-          await runCandidateObservableFault(
+          await runCandidateObservableOperation(
             this.#faults.beforeRename,
             pinnedPublication,
+            { fault: true },
           );
           await revalidateLockedTopology(
             materialized.record.state,
