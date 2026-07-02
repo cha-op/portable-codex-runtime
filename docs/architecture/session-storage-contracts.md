@@ -39,8 +39,14 @@ The source analysis is pinned to Codex commit
   verifies the restored ID, session-tree ID, cwd, and turns.
 - `$CODEX_HOME` contains versioned rollout state and auxiliary indexes. Codex
   can also place state, log, goal, and memory SQLite databases under
-  `CODEX_SQLITE_HOME`. The worker contract fixes both roots to the session
-  volume and treats their contents, including SQLite WAL/SHM files, as opaque.
+  `sqlite_home`. A persisted `config.toml` value takes precedence over
+  `CODEX_SQLITE_HOME`, while app-server startup `--config` values are session
+  flags above user and project configuration. App-server request `config`
+  values are appended after those startup flags. The worker contract therefore
+  supplies the environment fallback, requires the startup CLI override, denies
+  request-level `sqlite_home`, and verifies the effective value. See
+  `codex-rs/core/src/config/mod.rs`, `codex-rs/config/src/loader/mod.rs`, and
+  `codex-rs/app-server/src/config_manager.rs`.
 - Persistent sessions require `ephemeral=false`. `legacy` and `paginated` are
   the currently returned history modes; the selected mode is recorded rather
   than inferred.
@@ -120,6 +126,10 @@ The runner-neutral worker template fixes:
 - `cwd=/session/workspace`;
 - `CODEX_HOME=/session/codex-home`;
 - `CODEX_SQLITE_HOME=/session/codex-home`;
+- a Codex app-server CLI config override fixing
+  `sqlite_home=/session/codex-home`;
+- rejection of request-level `sqlite_home` overrides and an effective-config
+  equality check before accepting work;
 - a read-write `rprivate` bind at `/session`;
 - a rootless container boundary; and
 - Codex `danger-full-access` inside that container.
@@ -140,6 +150,19 @@ attachment root, and keep the directory authority pinned through the actual
 bind. A self-declared `kind: "directory"` or an opaque `proofId` is not enough.
 If the launcher cannot hold that authority through the bind, it must fail
 closed rather than consume this template as an authorization decision.
+
+`CODEX_SQLITE_HOME` is only a fallback: a user-writable
+`/session/codex-home/config.toml` can override it. The trusted launcher must
+serialize `codexConfig.cliOverrides` as typed TOML values passed directly to
+`codex app-server --config`, never as a shell fragment. Its app-server gateway
+must reject every key in `deniedRequestOverrideKeys`, including nested
+`thread/start`, `thread/resume`, or `thread/fork` request configuration, and
+must fail closed unless app-server's effective configuration matches
+`requiredEffectiveValues`.
+This preserves the SQLite databases and their WAL/SHM files inside the
+checkpointed volume even when persisted user configuration requests another
+path. A later concrete launcher must exercise these obligations in conformance
+tests.
 
 `auth.json` is forbidden in the persistent worker home. External ChatGPT
 access tokens are delivered through the app-server boundary and are not part

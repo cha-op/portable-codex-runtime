@@ -25,6 +25,10 @@ superseded_by:
 
 - A rootless worker sees a normal directory at `/session`; host storage agents
   retain raw-device, image, attach, mount, and fencing responsibility.
+- The worker template requires app-server to receive a CLI-level
+  `sqlite_home=/session/codex-home` override, rejects request-level changes,
+  and verifies the effective value so persisted user config cannot move SQLite
+  state outside the checkpointed session volume.
 - The manifest records the app-server-returned root thread ID and shared Codex
   session-tree ID, trusted-resolved platform OCI descriptor, persistent history
   settings, stable layout, external auth mode, and agent limits.

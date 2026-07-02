@@ -33,9 +33,10 @@ launch, fencing, and snapshot authorization remain the responsibility of later
 concrete adapters and their conformance tests.
 The worker sees one ordinary directory at `/session`; a host storage agent owns
 raw volumes, filesystem images, attach/mount operations, and stale-writer
-fencing. `CODEX_HOME`, `CODEX_SQLITE_HOME`, and the workspace remain on that
-single-attached session volume, while auth authority and canonical lease state
-remain outside it.
+fencing. `CODEX_HOME`, the effective Codex `sqlite_home`, and the workspace
+remain on that single-attached session volume. The launcher fixes
+`sqlite_home` through a Codex CLI config override and rejects request-level
+changes; auth authority and canonical lease state remain outside the volume.
 
 The default session policy permits 6 subagents, can be raised to a hard limit
 of 10, and permits nesting through depth 2. Git Summary remains deferred and is

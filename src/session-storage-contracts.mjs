@@ -1066,6 +1066,15 @@ export function createRootlessWorkerTemplate(options) {
       authJsonPolicy: "forbidden",
       mode: matched.manifest.authMode,
     },
+    codexConfig: {
+      cliOverrides: {
+        sqlite_home: SESSION_WORKER_LAYOUT.codexHome,
+      },
+      deniedRequestOverrideKeys: ["sqlite_home"],
+      requiredEffectiveValues: {
+        sqlite_home: SESSION_WORKER_LAYOUT.codexHome,
+      },
+    },
     codexSandbox: matched.manifest.runtime.codexSandbox,
     cwd: SESSION_WORKER_LAYOUT.workspace,
     env: {

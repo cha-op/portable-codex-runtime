@@ -505,6 +505,19 @@ test("rootless worker template is structural and fixed-layout", () => {
     CODEX_HOME: SESSION_WORKER_LAYOUT.codexHome,
     CODEX_SQLITE_HOME: SESSION_WORKER_LAYOUT.codexHome,
   });
+  assert.deepEqual(template.codexConfig, {
+    cliOverrides: {
+      sqlite_home: SESSION_WORKER_LAYOUT.codexHome,
+    },
+    deniedRequestOverrideKeys: ["sqlite_home"],
+    requiredEffectiveValues: {
+      sqlite_home: SESSION_WORKER_LAYOUT.codexHome,
+    },
+  });
+  assert(Object.isFrozen(template.codexConfig));
+  assert(Object.isFrozen(template.codexConfig.cliOverrides));
+  assert(Object.isFrozen(template.codexConfig.deniedRequestOverrideKeys));
+  assert(Object.isFrozen(template.codexConfig.requiredEffectiveValues));
   assert.equal(template.cwd, SESSION_WORKER_LAYOUT.workspace);
   assert.equal(template.rootless, true);
   assert.equal(template.codexSandbox, "danger-full-access");
