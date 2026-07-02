@@ -615,7 +615,7 @@ async function assertPathIdentity(path, expected, message) {
 async function collectTreeIdentities(
   path,
   identities = new Set(),
-  { expectedDevice, stableInodes } = {},
+  { expectedDevice } = {},
 ) {
   const metadata = await lstat(path, { bigint: true });
   if (expectedDevice !== undefined) {
@@ -626,7 +626,6 @@ async function collectTreeIdentities(
     );
   }
   identities.add(fileIdentityKey(metadata));
-  stableInodes?.add(metadata.ino.toString());
   if (!metadata.isDirectory()) {
     await assertPathIdentity(
       path,
@@ -656,7 +655,6 @@ async function collectTreeIdentities(
     for (const entry of entries) {
       await collectTreeIdentities(join(path, entry), identities, {
         expectedDevice,
-        stableInodes,
       });
     }
     assertStableFileMetadata(
@@ -713,7 +711,194 @@ export async function stoppedTreesShareAnyIdentity(left, right) {
   return false;
 }
 
-export async function digestStoppedTreeIdentities(path, filesystemId) {
+function assertPersistentObjectIdentity(value) {
+  let descriptors;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw new Error("persistent object identity is invalid");
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  assert(
+    value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      keys.length === 3 &&
+      keys.every(
+        (key) =>
+          typeof key === "string" &&
+          ["device", "inode", "objectId"].includes(key) &&
+          descriptors[key].enumerable === true &&
+          Object.hasOwn(descriptors[key], "value") &&
+          !Object.hasOwn(descriptors[key], "get") &&
+          !Object.hasOwn(descriptors[key], "set"),
+      ),
+    "persistent object identity is invalid",
+  );
+  const device = descriptors.device.value;
+  const inode = descriptors.inode.value;
+  const objectId = descriptors.objectId.value;
+  assert(
+    typeof device === "string" &&
+      /^(?:0|[1-9][0-9]*)$/u.test(device) &&
+      typeof inode === "string" &&
+      /^[1-9][0-9]*$/u.test(inode) &&
+      typeof objectId === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(objectId),
+    "persistent object identity is invalid",
+  );
+  return Object.freeze({
+    runtimeIdentity: Object.freeze({
+      dev: BigInt(device),
+      ino: BigInt(inode),
+    }),
+    objectId,
+  });
+}
+
+export async function inspectStoppedTreeObjectIdentity(
+  path,
+  inspectPersistentObjectIdentity,
+  expectedIdentity,
+) {
+  assert.equal(
+    typeof inspectPersistentObjectIdentity,
+    "function",
+    "persistent object identity inspector must be a function",
+  );
+  const before = await lstat(path, { bigint: true });
+  if (expectedIdentity !== undefined) {
+    assert(
+      sameFileIdentity(before, expectedIdentity),
+      "persistent object identity path changed before inspection",
+    );
+  }
+  const inspected = assertPersistentObjectIdentity(
+    await inspectPersistentObjectIdentity(path),
+  );
+  assert(
+    sameFileIdentity(inspected.runtimeIdentity, before),
+    "persistent object identity does not match runtime object",
+  );
+  const after = await lstat(path, { bigint: true });
+  assertStableFileMetadata(
+    before,
+    after,
+    "persistent object identity path changed during inspection",
+  );
+  if (expectedIdentity !== undefined) {
+    assert(
+      sameFileIdentity(after, expectedIdentity),
+      "persistent object identity path changed during inspection",
+    );
+  }
+  return inspected.objectId;
+}
+
+function stoppedTreeEntryKind(metadata) {
+  if (metadata.isDirectory()) return "directory";
+  if (metadata.isFile()) return "file";
+  if (metadata.isSymbolicLink()) return "symlink";
+  throw new Error("persistent tree identity rejects unsupported entry type");
+}
+
+async function collectPersistentTreeIdentities({
+  expectedDevice,
+  filesystemId,
+  inspectPersistentObjectIdentity,
+  objectIdentityScheme,
+  objectIds,
+  path,
+  relativePath,
+  tuples,
+}) {
+  const metadata = await lstat(path, { bigint: true });
+  assert.equal(
+    metadata.dev,
+    expectedDevice,
+    "persistent tree identity rejects filesystem boundaries",
+  );
+  const objectId = await inspectStoppedTreeObjectIdentity(
+    path,
+    inspectPersistentObjectIdentity,
+    metadata,
+  );
+  const runtimeIdentity = fileIdentityKey(metadata);
+  const persistentIdentityKey = `${filesystemId}\0${objectIdentityScheme}\0${objectId}`;
+  const runtimeKey = `runtime\0${runtimeIdentity}`;
+  const persistentKey = `persistent\0${persistentIdentityKey}`;
+  const previousRuntimeIdentity = objectIds.get(persistentKey);
+  const previousPersistentIdentity = objectIds.get(runtimeKey);
+  assert(
+    (previousRuntimeIdentity === undefined ||
+      previousRuntimeIdentity === runtimeIdentity) &&
+      (previousPersistentIdentity === undefined ||
+        previousPersistentIdentity === persistentIdentityKey),
+    "persistent object identity aliases distinct runtime objects",
+  );
+  objectIds.set(persistentKey, runtimeIdentity);
+  objectIds.set(runtimeKey, persistentIdentityKey);
+  tuples.push({
+    kind: stoppedTreeEntryKind(metadata),
+    objectId,
+    path: relativePath,
+  });
+  if (!metadata.isDirectory()) return;
+
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  let primaryFailure;
+  try {
+    const heldMetadata = await handle.stat({ bigint: true });
+    assert(
+      heldMetadata.isDirectory() && sameFileIdentity(metadata, heldMetadata),
+      "persistent tree identity directory changed",
+    );
+    const entries = await readPortableDirectory(path);
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "persistent tree identity directory changed",
+    );
+    for (const entry of entries) {
+      await collectPersistentTreeIdentities({
+        expectedDevice,
+        filesystemId,
+        inspectPersistentObjectIdentity,
+        objectIdentityScheme,
+        objectIds,
+        path: join(path, entry),
+        relativePath: relativePath === "" ? entry : `${relativePath}/${entry}`,
+        tuples,
+      });
+    }
+    assertStableFileMetadata(
+      heldMetadata,
+      await handle.stat({ bigint: true }),
+      "persistent tree identity directory changed",
+    );
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "persistent tree identity directory changed",
+    );
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+export async function digestStoppedTreeIdentities(
+  path,
+  filesystemId,
+  objectIdentityScheme,
+  inspectPersistentObjectIdentity,
+  objectIds = new Map(),
+) {
   assert.equal(
     typeof filesystemId,
     "string",
@@ -723,20 +908,39 @@ export async function digestStoppedTreeIdentities(path, filesystemId) {
     /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(filesystemId),
     "stable filesystem identity is invalid",
   );
+  assert(
+    typeof objectIdentityScheme === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(objectIdentityScheme),
+    "object identity scheme is invalid",
+  );
+  assert.equal(
+    typeof inspectPersistentObjectIdentity,
+    "function",
+    "persistent object identity inspector must be a function",
+  );
   const root = await lstat(path, { bigint: true });
-  const stableInodes = new Set();
-  await collectTreeIdentities(path, new Set(), {
+  const tuples = [];
+  await collectPersistentTreeIdentities({
     expectedDevice: root.dev,
-    stableInodes,
+    filesystemId,
+    inspectPersistentObjectIdentity,
+    objectIdentityScheme,
+    objectIds,
+    path,
+    relativePath: "",
+    tuples,
   });
-  const identities = [...stableInodes].sort();
   const hash = createHash("sha256");
-  hash.update("portable-stopped-tree-identities-v2\0", "utf8");
+  hash.update("portable-stopped-tree-object-identities-v1\0", "utf8");
   hash.update(`${Buffer.byteLength(filesystemId, "utf8")}:`, "utf8");
   hash.update(filesystemId, "utf8");
-  for (const identity of identities) {
-    hash.update(`${Buffer.byteLength(identity, "utf8")}:`, "utf8");
-    hash.update(identity, "utf8");
+  hash.update(`${Buffer.byteLength(objectIdentityScheme, "utf8")}:`, "utf8");
+  hash.update(objectIdentityScheme, "utf8");
+  for (const tuple of tuples) {
+    for (const value of [tuple.path, tuple.kind, tuple.objectId]) {
+      hash.update(`${Buffer.byteLength(value, "utf8")}:`, "utf8");
+      hash.update(value, "utf8");
+    }
   }
   return hash.digest("hex");
 }

@@ -96,12 +96,12 @@ an external path component can change after validation and because host paths
 are not portable; relocatable relative symlinks remain supported. The reusable
 copy primitive also supports explicit path and device/inode deny authorities
 for callers that retain its compatible absolute-link behavior. The journal's
-approved local-filesystem profile, trusted filesystem incarnation ID, and root
-inode are fixed in the operation binding so a retry cannot silently move the
-journal to different storage. Raw `st_dev` values remain runtime-only because
-they can change across host attachment or remount. The absolute journal path is
-used only for local topology checks and is never persisted in the artefact or
-operation binding.
+approved local-filesystem profile, trusted filesystem incarnation ID, object
+identity scheme, and root object ID are fixed in the operation binding so a
+retry cannot silently move the journal to different storage. Raw `st_dev` and
+`st_ino` values remain runtime-only because they can change across host
+attachment or remount. The absolute journal path is used only for local
+topology checks and is never persisted in the artefact or operation binding.
 
 The trusted filesystem adapter must supply a `filesystemId` that identifies the
 filesystem incarnation across hosts and remounts, changes after reformat or an
@@ -109,9 +109,21 @@ independent writable clone, and is not derived from a mount ID, device number,
 device pathname, or worker input. Node `statfs` does not expose such an ID, so
 the built-in inspector fails closed and production hosts must inject one (for
 example a filesystem/volume UUID or a control-plane-protected incarnation
-marker). Durable physical identities are `filesystemId + inode`; runtime path,
-fd, alias, and rename guards continue to use the current mount's `st_dev +
-st_ino`.
+marker). The adapter must also name its `objectIdentityScheme` and provide an
+opaque `objectId` for every inspected object. An object ID must remain stable
+for the same object across process restart, host attachment, rename, and
+remount, but must change when an inode is deleted and reused. It must not be
+derived from path, inode, ctime, content, or worker input alone. A native object
+handle or inode-generation identity should be domain-separated and hashed
+before persistence if the raw value could grant authority. The same atomic
+adapter primitive must return a data-only snapshot of the current runtime
+device/inode with the object ID; getters, setters, symbols, and extra fields are
+rejected. The core compares that pair with its held/path pin so a path cannot
+be temporarily swapped to an older object for inspection and then swapped
+back. Durable physical identities are `filesystemId + objectIdentityScheme +
+objectId`; runtime path, fd, alias, and rename
+guards continue to use the current mount's `st_dev + st_ino`. If either stable
+identity capability is unavailable, publication fails closed before prepare.
 
 All operations under one publication-root identity are serialized in-process
 and cross-process by one protected publication lock. This is required even for
@@ -154,9 +166,13 @@ remaining sequence:
    after acquiring the lock, repeat the authority, identity, and topology
    checks before reading or advancing the journal;
 2. call `journal.prepare()` to durably fix the operation binding, storage
-   request, checkpoint descriptor, direct source-leaf filesystem incarnation
-   ID/inode, and
+   request, checkpoint descriptor, source-owned-root filesystem profile and
+   object identity, direct source-leaf filesystem incarnation ID/object ID, and
    predetermined exact result before any physical materialisation begins;
+   because journal read/transition callbacks can observe the publication
+   namespace, pin candidate/final topology before the call and require the same
+   presence and runtime identities afterward before restoring any
+   `not-committed` classification;
 3. establish the stopped source storage barrier by opening and validating the
    tree, fsyncing regular files, and fsyncing directories in post-order so each
    directory is synced only after its descendants; symlink entries are made
@@ -178,8 +194,11 @@ remaining sequence:
    tree fsync, publication-parent sync, exact bundle-shape/manifest/payload
    readback, and pinned identity check before calling
    `journal.markMaterialized()` with the fixed digests and filesystem
-   incarnation ID/inode identity plus a domain-separated digest of every
-   retained subtree inode in that incarnation; reject any runtime identity shared with the
+   incarnation ID/object ID plus a domain-separated digest of every retained
+   entry's relative path, kind, and object ID in that incarnation; reject an
+   object ID that aliases distinct simultaneously visible runtime objects
+   anywhere across journal, source, destination, or retained-tree authorities;
+   reject any runtime identity shared with the
    stopped source, and re-open the staging root as current-user-owned and
    extended-ACL-free. Checkpoint bundle envelopes remain mode `0700`; restore
    payload roots retain and pin their modeled portable mode inside the mode
@@ -209,6 +228,15 @@ remaining sequence:
    classification; and
 10. only after the committed record is visible may a consumer replay the
     result or a launcher admit the restore destination.
+
+The source-leaf and destination-root filesystem profiles and persistent object
+identities are re-read after every callback and at every materialisation,
+rename, and commit boundary. A callback cannot move either path to a different
+filesystem incarnation or object generation while preserving a coincidentally
+equal runtime device/inode. Inspector failures and mismatches are classified by
+the durable state already discovered: committed state is invalid, an outcome
+that may already have published remains uncertain, and a proven pre-publication
+failure requires recovery without claiming a commit.
 
 The source remains externally stopped throughout capture. The publication
 layer detects many identity and metadata changes, but those checks are not a
@@ -291,12 +319,16 @@ classified only after the journal is read under the publication lock. It is a
 caller error for a new operation and recovery-required for `prepared`, but a
 `materialized` or `committed` replay uses the recorded source binding and does
 not reopen or recopy that leaf. The binding includes the direct source-leaf
-filesystem incarnation ID/inode: `prepared` replay must still name that exact leaf, while later
+filesystem incarnation ID/object ID: `prepared` replay must still name that exact leaf, while later
 states reconstruct the exact binding from the durable record even if the source
 leaf is gone or replaced.
 
 A `prepared` replay remains publication-uncertain until candidate and final
-probes succeed under the current target authority. A retained candidate is
+probes succeed under the current target authority. Before either probe may
+downgrade that uncertainty, the current destination filesystem profile, root
+object ID, final name, and derived candidate name must match the durable
+publication binding; a caller cannot redirect the probe to a replacement root
+or alternate name. A retained candidate is
 recovery-required and definitely not committed once final absence is proven. A
 visible final remains publication-uncertain because an observable-candidate
 callback may have moved the held candidate before `materialized` was recorded.
@@ -304,11 +336,11 @@ callback may have moved the held candidate before `materialized` was recorded.
 For a `materialized` replay, physical outcome stays `uncertain` until both
 candidate and final probes succeed and prove candidate-present/final-absent
 under the current target authority. Retained candidate/final verification also
-recomputes the complete subtree-identity digest, rejects any current identity
+recomputes the complete path-bound subtree-object-identity digest, rejects any current identity
 intersection with an available stopped source, and revalidates owner, pinned
 mode, and ACLs. Checkpoint envelopes require `0700`; restore payload roots use
 their digest-bound portable mode beneath a private `0700` storage authority.
-Same-byte inode replacement or permission broadening therefore cannot advance
+Same-byte physical-object replacement, inode reuse, or permission broadening therefore cannot advance
 to rename or committed replay.
 
 Production root ACL inspection uses the stopped-tree platform defaults. A host

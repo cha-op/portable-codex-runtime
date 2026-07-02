@@ -62,6 +62,17 @@ import {
   syncStoppedTree,
 } from "../src/stopped-tree.mjs";
 
+const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
+
+async function inspectTestPersistentObjectIdentity(path) {
+  const metadata = await lstat(path, { bigint: true });
+  return {
+    device: metadata.dev.toString(),
+    inode: metadata.ino.toString(),
+    objectId: `test-object-${metadata.dev}-${metadata.ino}-${metadata.birthtimeNs}`,
+  };
+}
+
 function scenarioReport(kind) {
   return {
     kind,
@@ -1263,14 +1274,26 @@ test("stopped-tree identity proofs detect subtree aliases and inode replacement"
     const originalDigest = await digestStoppedTreeIdentities(
       left,
       "test-filesystem-001",
+      TEST_OBJECT_IDENTITY_SCHEME,
+      inspectTestPersistentObjectIdentity,
     );
     await rename(left, renamedLeft);
     assert.equal(
-      await digestStoppedTreeIdentities(renamedLeft, "test-filesystem-001"),
+      await digestStoppedTreeIdentities(
+        renamedLeft,
+        "test-filesystem-001",
+        TEST_OBJECT_IDENTITY_SCHEME,
+        inspectTestPersistentObjectIdentity,
+      ),
       originalDigest,
     );
     assert.notEqual(
-      await digestStoppedTreeIdentities(renamedLeft, "test-filesystem-002"),
+      await digestStoppedTreeIdentities(
+        renamedLeft,
+        "test-filesystem-002",
+        TEST_OBJECT_IDENTITY_SCHEME,
+        inspectTestPersistentObjectIdentity,
+      ),
       originalDigest,
     );
     await link(join(renamedLeft, "data"), join(right, "shared"));
@@ -1279,7 +1302,12 @@ test("stopped-tree identity proofs detect subtree aliases and inode replacement"
     await rm(join(renamedLeft, "data"));
     await writeFile(join(renamedLeft, "data"), "same bytes\n");
     assert.notEqual(
-      await digestStoppedTreeIdentities(renamedLeft, "test-filesystem-001"),
+      await digestStoppedTreeIdentities(
+        renamedLeft,
+        "test-filesystem-001",
+        TEST_OBJECT_IDENTITY_SCHEME,
+        inspectTestPersistentObjectIdentity,
+      ),
       originalDigest,
     );
   } finally {

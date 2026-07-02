@@ -31,6 +31,7 @@ import {
 import {
   digestStoppedTreeIdentities,
   digestTree,
+  inspectStoppedTreeObjectIdentity,
 } from "../src/stopped-tree.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
@@ -40,11 +41,28 @@ const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
 const CAPTURE_OPERATION_ID = "operation-checkpoint-001";
 const RESTORE_OPERATION_ID = "operation-restore-001";
+const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
 
 const TRUSTED_JOURNAL_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
   inspectDirectoryAcl: async () => false,
 });
+
+async function inspectTestPersistentObjectIdentity(path) {
+  const metadata = await lstat(path, { bigint: true });
+  return {
+    device: metadata.dev.toString(),
+    inode: metadata.ino.toString(),
+    objectId: `test-object-${metadata.dev}-${metadata.ino}-${metadata.birthtimeNs}`,
+  };
+}
+
+async function inspectTestPersistentObjectIdentityAs(path, objectId) {
+  return {
+    ...(await inspectTestPersistentObjectIdentity(path)),
+    objectId,
+  };
+}
 
 function binding(operation, operationId, storageId, overrides = {}) {
   return {
@@ -163,6 +181,7 @@ async function createFixture(t, publicationOptions = {}) {
     const inspectFilesystem = stoppedPublicationOptions.inspectFilesystem;
     stoppedPublicationOptions.inspectFilesystem = async (path) => ({
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       ...(await inspectFilesystem(path)),
     });
   }
@@ -210,8 +229,10 @@ async function createFixture(t, publicationOptions = {}) {
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
     ...stoppedPublicationOptions,
   });
   const artifactDirectory = join(artifactOwnedRoot, ARTIFACT_ID);
@@ -363,6 +384,102 @@ test("candidate names are deterministic, hashed, and path-safe", () => {
   }
 });
 
+test("persistent tree identity binds object generations to relative paths", async (t) => {
+  const fixture = await createFixture(t);
+  const left = join(fixture.sourceDirectory, "workspace", "left.txt");
+  const right = join(fixture.sourceDirectory, "workspace", "right.txt");
+  const temporary = join(fixture.sourceDirectory, "workspace", "temporary.txt");
+  await writeFile(left, "identical\n", { mode: 0o600 });
+  await writeFile(right, "identical\n", { mode: 0o600 });
+  const modeledBefore = await digestTree(fixture.sourceDirectory);
+  const before = await digestStoppedTreeIdentities(
+    fixture.sourceDirectory,
+    "test-filesystem-001",
+    TEST_OBJECT_IDENTITY_SCHEME,
+    inspectTestPersistentObjectIdentity,
+  );
+
+  await rename(left, temporary);
+  await rename(right, left);
+  await rename(temporary, right);
+  const after = await digestStoppedTreeIdentities(
+    fixture.sourceDirectory,
+    "test-filesystem-001",
+    TEST_OBJECT_IDENTITY_SCHEME,
+    inspectTestPersistentObjectIdentity,
+  );
+
+  assert.notEqual(after, before);
+  assert.equal(await digestTree(fixture.sourceDirectory), modeledBefore);
+});
+
+test("persistent tree identity rejects adapter object-ID collisions", async (t) => {
+  const fixture = await createFixture(t);
+  await assert.rejects(
+    digestStoppedTreeIdentities(
+      fixture.sourceDirectory,
+      "test-filesystem-001",
+      TEST_OBJECT_IDENTITY_SCHEME,
+      (path) =>
+        inspectTestPersistentObjectIdentityAs(path, "colliding-object-id"),
+    ),
+    /aliases distinct runtime objects/u,
+  );
+});
+
+test("persistent identity rejects an adapter-side path ABA", async (t) => {
+  const fixture = await createFixture(t);
+  const victim = join(fixture.sourceDirectory, "workspace", "README.md");
+  const oldObject = join(fixture.sourceDirectory, "workspace", "old-object");
+  const displaced = join(fixture.sourceDirectory, "workspace", "displaced");
+  await writeFile(oldObject, "old\n", { mode: 0o600 });
+  const expectedIdentity = await lstat(victim, { bigint: true });
+
+  await assert.rejects(
+    inspectStoppedTreeObjectIdentity(
+      victim,
+      async (path) => {
+        await rename(path, displaced);
+        await rename(oldObject, path);
+        const inspected = await inspectTestPersistentObjectIdentity(path);
+        await rename(path, oldObject);
+        await rename(displaced, path);
+        return inspected;
+      },
+      expectedIdentity,
+    ),
+    /does not match runtime object/u,
+  );
+  assert.equal(await readFile(victim, "utf8"), "portable\n");
+});
+
+test("persistent identity rejects accessor-based adapter results", async (t) => {
+  const fixture = await createFixture(t);
+  const path = join(fixture.sourceDirectory, "workspace", "README.md");
+  const expectedIdentity = await lstat(path, { bigint: true });
+  let getterCalls = 0;
+  const result = {};
+  for (const [key, value] of Object.entries({
+    device: expectedIdentity.dev.toString(),
+    inode: expectedIdentity.ino.toString(),
+    objectId: "changing-object-id",
+  })) {
+    Object.defineProperty(result, key, {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return value;
+      },
+    });
+  }
+
+  await assert.rejects(
+    inspectStoppedTreeObjectIdentity(path, async () => result, expectedIdentity),
+    /persistent object identity is invalid/u,
+  );
+  assert.equal(getterCalls, 0);
+});
+
 test("reserved publication names fail before lock or journal mutation", async (t) => {
   for (const finalName of [
     ".stopped-directory-publication.lock",
@@ -448,6 +565,85 @@ test("the default filesystem inspector fails closed without a stable ID", async 
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
     null,
   );
+});
+
+test("publication fails closed without a persistent object identity provider", async (t) => {
+  const fixture = await createFixture(t, {
+    inspectPersistentObjectIdentity: undefined,
+  });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "unsupported_publication_filesystem",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("publication rejects object-ID collisions across storage authorities", async (t) => {
+  const fixture = await createFixture(t, {
+    inspectPersistentObjectIdentity: (path) =>
+      inspectTestPersistentObjectIdentityAs(path, "colliding-authority-id"),
+  });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "unsupported_publication_filesystem",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("publication rejects multiple object IDs for one staged object", async (t) => {
+  let candidate;
+  let candidateInspections = 0;
+  const fixture = await createFixture(t, {
+    inspectPersistentObjectIdentity: async (path) => {
+      if (path !== candidate) return inspectTestPersistentObjectIdentity(path);
+      candidateInspections += 1;
+      return inspectTestPersistentObjectIdentityAs(
+        path,
+        candidateInspections % 2 === 1 ? "candidate-object-a" : "candidate-object-b",
+      );
+    },
+  });
+  candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_integrity_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(candidateInspections >= 2, true);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
 test("a remote or unapproved filesystem profile is rejected before prepare", async (t) => {
@@ -545,12 +741,133 @@ test("a prepared operation requires stable journal profile continuity", async (t
   );
 });
 
+test("prepared replay requires source-root object identity scheme continuity", async (t) => {
+  let failAfterJournalPrepared = true;
+  let fixture;
+  let sourceRootPath;
+  let sourceRootScheme = "source-root-generation-v1";
+  fixture = await createFixture(t, {
+    faults: {
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("prepared fault");
+      },
+    },
+    inspectFilesystem: async (path) => ({
+      durability: "local-fsync-rename",
+      objectIdentityScheme:
+        path === sourceRootPath
+          ? sourceRootScheme
+          : TEST_OBJECT_IDENTITY_SCHEME,
+      type: "test-local",
+    }),
+  });
+  sourceRootPath = await realpath(fixture.sourceOwnedRoot);
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const prepared = await fixture.journal.read({
+    operationId: CAPTURE_OPERATION_ID,
+  });
+  assert.equal(
+    prepared.record.binding.publication.source.root.objectIdentityScheme,
+    "source-root-generation-v1",
+  );
+  assert.equal(
+    prepared.record.binding.publication.source.rootFilesystem
+      .objectIdentityScheme,
+    "source-root-generation-v1",
+  );
+
+  sourceRootScheme = "source-root-generation-v2";
+  failAfterJournalPrepared = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+});
+
+test("source-root profile failures use durable-state classification", async (t) => {
+  await t.test("prepared", async (t) => {
+    let failAfterJournalPrepared = true;
+    let failSourceRootInspection = false;
+    let fixture;
+    let sourceRootPath;
+    fixture = await createFixture(t, {
+      faults: {
+        async afterJournalPrepared() {
+          if (failAfterJournalPrepared) throw new Error("prepared fault");
+        },
+      },
+      inspectFilesystem: async (path) => {
+        if (failSourceRootInspection && path === sourceRootPath) {
+          throw new Error("source root inspection failed");
+        }
+        return { durability: "local-fsync-rename", type: "test-local" };
+      },
+    });
+    sourceRootPath = await realpath(fixture.sourceOwnedRoot);
+    const options = captureOptions(fixture);
+    await assert.rejects(
+      fixture.publication.publishCheckpointArtifact(options),
+      (error) =>
+        assertPublicationError(error, "publication_io_failed", "not-committed"),
+    );
+    failAfterJournalPrepared = false;
+    failSourceRootInspection = true;
+    await assert.rejects(
+      fixture.publication.publishCheckpointArtifact(options),
+      (error) =>
+        assertPublicationError(
+          error,
+          "publication_recovery_required",
+          "not-committed",
+        ),
+    );
+  });
+
+  await t.test("committed", async (t) => {
+    let failSourceRootInspection = false;
+    let fixture;
+    let sourceRootPath;
+    fixture = await createFixture(t, {
+      inspectFilesystem: async (path) => {
+        if (failSourceRootInspection && path === sourceRootPath) {
+          throw new Error("source root inspection failed");
+        }
+        return { durability: "local-fsync-rename", type: "test-local" };
+      },
+    });
+    sourceRootPath = await realpath(fixture.sourceOwnedRoot);
+    const options = captureOptions(fixture);
+    await fixture.publication.publishCheckpointArtifact(options);
+    failSourceRootInspection = true;
+    await assert.rejects(
+      fixture.publication.publishCheckpointArtifact(options),
+      (error) =>
+        assertPublicationError(error, "published_state_invalid", "committed"),
+    );
+  });
+});
+
 test("committed replay rejects a changed stable filesystem identity", async (t) => {
   let filesystemId = "test-filesystem-001";
   const fixture = await createFixture(t, {
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId,
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
   });
@@ -562,6 +879,50 @@ test("committed replay rejects a changed stable filesystem identity", async (t) 
     fixture.publication.publishCheckpointArtifact(options),
     (error) =>
       assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
+  );
+});
+
+test("committed replay rejects a reused final-root inode generation", async (t) => {
+  let candidate;
+  let finalPath;
+  let finalGeneration = "generation-a";
+  let fixture;
+  fixture = await createFixture(t, {
+    inspectPersistentObjectIdentity: async (path) =>
+      path === finalPath || path === candidate
+        ? inspectTestPersistentObjectIdentityAs(
+            path,
+            `final-root-${finalGeneration}`,
+          )
+        : inspectTestPersistentObjectIdentity(path),
+  });
+  finalPath = join(
+    await realpath(fixture.artifactOwnedRoot),
+    basename(fixture.artifactDirectory),
+  );
+  candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  const runtimeIdentity = await lstat(fixture.artifactDirectory, { bigint: true });
+
+  finalGeneration = "generation-b";
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+
+  assert.equal(
+    (await lstat(fixture.artifactDirectory, { bigint: true })).ino,
+    runtimeIdentity.ino,
   );
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
@@ -588,8 +949,10 @@ test("the journal directory cannot be captured inside the source tree", async (t
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
   });
 
   await assert.rejects(
@@ -661,8 +1024,10 @@ test("a source identity alias of the journal authority is rejected", async (t) =
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
   });
 
   await assert.rejects(
@@ -802,8 +1167,10 @@ test("journal authority discovery failure is publication-uncertain", async (t) =
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
   });
 
   await assert.rejects(
@@ -870,7 +1237,10 @@ test("checkpoint publication creates one durable exact artifact bundle and commi
     materialization: journalRecord.materialization,
   });
   assert.equal(durablePublication.includes('"device"'), false);
+  assert.equal(durablePublication.includes('"inode"'), false);
   assert.equal(durablePublication.includes('"filesystemId"'), true);
+  assert.equal(durablePublication.includes('"objectId"'), true);
+  assert.equal(durablePublication.includes('"objectIdentityScheme"'), true);
   await assertPathAbsent(
     candidatePath(
       fixture.artifactOwnedRoot,
@@ -1123,7 +1493,8 @@ test("prepared replay rejects replacement of the recorded source leaf", async (t
     },
   });
   const options = captureOptions(fixture);
-  const sourceIdentity = await lstat(fixture.sourceDirectory, { bigint: true });
+  const { objectId: sourceObjectId } =
+    await inspectTestPersistentObjectIdentity(fixture.sourceDirectory);
   await assert.rejects(
     fixture.publication.publishCheckpointArtifact(options),
     (error) =>
@@ -1137,8 +1508,8 @@ test("prepared replay rejects replacement of the recorded source leaf", async (t
     "test-filesystem-001",
   );
   assert.equal(
-    prepared.record.binding.publication.source.directoryIdentity.inode,
-    sourceIdentity.ino.toString(),
+    prepared.record.binding.publication.source.directoryIdentity.objectId,
+    sourceObjectId,
   );
 
   await rename(
@@ -1183,6 +1554,186 @@ test("prepared replay rejects replacement of the recorded source leaf", async (t
   assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
+test("prepared replay rejects a reused source-leaf inode generation", async (t) => {
+  let afterCopyCalls = 0;
+  let failAfterJournalPrepared = true;
+  let fixture;
+  let sourcePath;
+  let sourceGeneration = "generation-a";
+  fixture = await createFixture(t, {
+    faults: {
+      async afterCopy() {
+        afterCopyCalls += 1;
+      },
+      async afterJournalPrepared() {
+        if (failAfterJournalPrepared) throw new Error("prepared fault");
+      },
+    },
+    inspectPersistentObjectIdentity: async (path) =>
+      path === sourcePath
+        ? inspectTestPersistentObjectIdentityAs(
+            path,
+            `source-leaf-${sourceGeneration}`,
+          )
+        : inspectTestPersistentObjectIdentity(path),
+  });
+  sourcePath = await realpath(fixture.sourceDirectory);
+  const options = captureOptions(fixture);
+  const runtimeIdentity = await lstat(fixture.sourceDirectory, { bigint: true });
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+
+  sourceGeneration = "generation-b";
+  failAfterJournalPrepared = false;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+
+  assert.equal(
+    (await lstat(fixture.sourceDirectory, { bigint: true })).ino,
+    runtimeIdentity.ino,
+  );
+  assert.equal(afterCopyCalls, 0);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+});
+
+test("source object generation changes after its barrier abort materialization", async (t) => {
+  let fixture;
+  let sourceGeneration = "generation-a";
+  let sourcePath;
+  fixture = await createFixture(t, {
+    faults: {
+      async afterSourceBarrier() {
+        sourceGeneration = "generation-b";
+      },
+    },
+    inspectPersistentObjectIdentity: async (path) =>
+      path === sourcePath
+        ? inspectTestPersistentObjectIdentityAs(
+            path,
+            `source-leaf-${sourceGeneration}`,
+          )
+        : inspectTestPersistentObjectIdentity(path),
+  });
+  sourcePath = await realpath(fixture.sourceDirectory);
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_integrity_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("source filesystem identity changes after its barrier abort materialization", async (t) => {
+  let fixture;
+  let sourceIdentityScheme = "source-generation-v1";
+  let sourcePath;
+  fixture = await createFixture(t, {
+    faults: {
+      async afterSourceBarrier() {
+        sourceIdentityScheme = "source-generation-v2";
+      },
+    },
+    inspectFilesystem: async (path) => ({
+      durability: "local-fsync-rename",
+      objectIdentityScheme:
+        path === sourcePath
+          ? sourceIdentityScheme
+          : TEST_OBJECT_IDENTITY_SCHEME,
+      type: "test-local",
+    }),
+  });
+  sourcePath = await realpath(fixture.sourceDirectory);
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_integrity_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
+test("target persistent identity changes after the source barrier abort publication", async (t) => {
+  for (const change of ["filesystem", "object"]) {
+    await t.test(change, async (t) => {
+      let fixture;
+      let targetFilesystemId = "target-filesystem-a";
+      let targetGeneration = "target-generation-a";
+      let targetRootPath;
+      fixture = await createFixture(t, {
+        faults: {
+          async afterSourceBarrier() {
+            if (change === "filesystem") {
+              targetFilesystemId = "target-filesystem-b";
+            } else {
+              targetGeneration = "target-generation-b";
+            }
+          },
+        },
+        inspectFilesystem: async (path) => ({
+          durability: "local-fsync-rename",
+          filesystemId:
+            path === targetRootPath
+              ? targetFilesystemId
+              : "test-filesystem-001",
+          objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+          type: "test-local",
+        }),
+        inspectPersistentObjectIdentity: async (path) =>
+          path === targetRootPath
+            ? inspectTestPersistentObjectIdentityAs(path, targetGeneration)
+            : inspectTestPersistentObjectIdentity(path),
+      });
+      targetRootPath = await realpath(fixture.artifactOwnedRoot);
+
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_integrity_failed",
+            "not-committed",
+          ),
+      );
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+          .state,
+        "prepared",
+      );
+      assert.equal(await pathExists(fixture.artifactDirectory), false);
+    });
+  }
+});
+
 test("prepared topology probe failures remain publication-uncertain", async (t) => {
   let failAfterJournalPrepared = true;
   const fixture = await createFixture(t, {
@@ -1220,8 +1771,10 @@ test("prepared topology probe failures remain publication-uncertain", async (t) 
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
     inspectOwnedRootAcl: async () => false,
     inspectOwnedRootAncestorAcl: async () => false,
   });
@@ -2077,7 +2630,7 @@ test("a materialized stage-only operation resumes without recopying", async (t) 
       assertPublicationError(error, "publication_io_failed", "not-committed"),
   );
   const candidate = candidatePath(
-    fixture.artifactOwnedRoot,
+    await realpath(fixture.artifactOwnedRoot),
     CAPTURE_OPERATION_ID,
     fixture.artifactDirectory,
   );
@@ -2256,8 +2809,10 @@ test("materialized topology probe errors remain publication-uncertain", async (t
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
     inspectOwnedRootAcl: async () => false,
     inspectOwnedRootAncestorAcl: async () => false,
   });
@@ -2281,7 +2836,7 @@ test("materialized topology probe errors remain publication-uncertain", async (t
   );
 });
 
-test("materialized replay rejects same-byte retained-tree inode replacement", async (t) => {
+test("materialized replay rejects same-byte retained-tree object replacement", async (t) => {
   let failAfterMaterialized = true;
   const fixture = await createFixture(t, {
     faults: {
@@ -2316,6 +2871,61 @@ test("materialized replay rejects same-byte retained-tree inode replacement", as
         "not-committed",
       ),
   );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("materialized replay rejects a reused retained-file inode generation", async (t) => {
+  let failAfterMaterialized = true;
+  let fixture;
+  let retainedFile;
+  let retainedGeneration = "generation-a";
+  fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+    inspectPersistentObjectIdentity: async (path) =>
+      path === retainedFile
+        ? inspectTestPersistentObjectIdentityAs(
+            path,
+            `retained-file-${retainedGeneration}`,
+          )
+        : inspectTestPersistentObjectIdentity(path),
+  });
+  const options = captureOptions(fixture);
+  const candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  retainedFile = join(candidate, "payload", "workspace", "README.md");
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const runtimeIdentity = await lstat(retainedFile, { bigint: true });
+
+  retainedGeneration = "generation-b";
+  failAfterMaterialized = false;
+  await rm(fixture.sourceDirectory, { force: true, recursive: true });
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+
+  assert.equal((await lstat(retainedFile, { bigint: true })).ino, runtimeIdentity.ino);
   assert.equal(await pathExists(candidate), true);
   assert.equal(await pathExists(fixture.artifactDirectory), false);
   assert.equal(
@@ -2378,6 +2988,53 @@ test("a materialized final-only operation resumes after post-rename uncertainty"
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "committed",
+  );
+});
+
+test("a rebound destination root cannot downgrade final-only recovery", async (t) => {
+  let failAfterParentSync = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterParentSync() {
+        if (failAfterParentSync) throw new Error("final-only fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_outcome_uncertain", "uncertain"),
+  );
+
+  const displacedRoot = join(fixture.root, "displaced-artifact-root");
+  await rename(fixture.artifactOwnedRoot, displacedRoot);
+  const durableFinal = join(displacedRoot, basename(fixture.artifactDirectory));
+  await mkdir(fixture.artifactOwnedRoot, { mode: 0o700 });
+  const reboundCandidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  await mkdir(reboundCandidate, { mode: 0o700 });
+  failAfterParentSync = false;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+
+  assert.equal(await pathExists(durableFinal), true);
+  assert.equal(await pathExists(reboundCandidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
   );
 });
 
@@ -2779,8 +3436,10 @@ test("a journal read failure before state discovery is publication-uncertain", a
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
       type: "test-local",
     }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
   });
 
   await assert.rejects(
@@ -2791,6 +3450,70 @@ test("a journal read failure before state discovery is publication-uncertain", a
         "publication_outcome_uncertain",
         "uncertain",
       ),
+  );
+});
+
+test("journal prepare callbacks cannot publish after recovery was downgraded", async (t) => {
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        throw new Error("retain materialized candidate");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  let recordReads = 0;
+  const publishingJournal = new FilesystemOperationJournal({
+    directory: fixture.journalDirectory,
+    acquireLock: simpleLockProvider(),
+    faults: {
+      async afterRecordRead() {
+        recordReads += 1;
+        if (recordReads === 2) {
+          await rename(candidate, fixture.artifactDirectory);
+          throw new Error("journal callback published candidate");
+        }
+      },
+    },
+    ...TRUSTED_JOURNAL_ACL_INSPECTORS,
+  });
+  const publication = new StoppedDirectoryPublication({
+    journal: publishingJournal,
+    acquireLock: simpleLockProvider(),
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+      type: "test-local",
+    }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
+  });
+
+  await assert.rejects(
+    publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+  assert.equal(recordReads, 2);
+  assert.equal(await pathExists(candidate), false);
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
   );
 });
 
@@ -2987,7 +3710,6 @@ test("restore replay rejects a materialized tree outside the trusted artifact pr
   await writeFile(join(candidate, "untrusted"), "attacker-controlled\n", {
     mode: 0o600,
   });
-  const identity = await lstat(candidate, { bigint: true });
   const modeledDigest = await digestTree(candidate);
   const mismatchedManifestDigest =
     fixture.artifactProof.artifactManifestDigest === "f".repeat(64)
@@ -3006,11 +3728,14 @@ test("restore replay rejects a materialized tree outside the trusted artifact pr
       publicationKind: "restore-destination",
       stagedRoot: {
         filesystemId: "test-filesystem-001",
-        inode: identity.ino.toString(),
+        objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+        objectId: (await inspectTestPersistentObjectIdentity(candidate)).objectId,
       },
       treeIdentityDigest: await digestStoppedTreeIdentities(
         candidate,
         "test-filesystem-001",
+        TEST_OBJECT_IDENTITY_SCHEME,
+        inspectTestPersistentObjectIdentity,
       ),
     },
     operationId: prepared.operationId,
@@ -3069,12 +3794,12 @@ test("restore rejects a reordered manifest even when its supplied digest matches
   );
 });
 
-test("one operation cannot be rebound to a different filesystem path", async (t) => {
-  let failAfterJournalPrepared = true;
+test("a prepared operation cannot be downgraded through a rebound final path", async (t) => {
+  let failAfterCandidateBarrier = true;
   const fixture = await createFixture(t, {
     faults: {
-      async afterJournalPrepared() {
-        if (failAfterJournalPrepared) throw new Error("sensitive prepared fault");
+      async afterCandidateBarrier() {
+        if (failAfterCandidateBarrier) throw new Error("sensitive prepared fault");
       },
     },
   });
@@ -3084,7 +3809,13 @@ test("one operation cannot be rebound to a different filesystem path", async (t)
     (error) =>
       assertPublicationError(error, "publication_io_failed", "not-committed"),
   );
-  failAfterJournalPrepared = false;
+  const durableCandidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  await rename(durableCandidate, fixture.artifactDirectory);
+  failAfterCandidateBarrier = false;
   const differentArtifactDirectory = join(
     fixture.artifactOwnedRoot,
     "different-artifact",
@@ -3095,10 +3826,16 @@ test("one operation cannot be rebound to a different filesystem path", async (t)
       ...first,
       artifactDirectory: differentArtifactDirectory,
     }),
-    (error) => assertPublicationError(error, "publication_conflict"),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
   );
 
   assert.equal(await pathExists(differentArtifactDirectory), false);
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "prepared",
