@@ -69,6 +69,9 @@ validated and durably bound to the exact operation, target, and pinned parent
 identity. The private staging name is a deterministic collision-resistant hash
 of the validated operation ID and that final name. A staging name is never a
 portable checkpoint reference and must never be exposed to a worker.
+The exact `.stopped-directory-publication.lock` name and the complete
+`.publication-` staging prefix are reserved implementation namespaces and are
+rejected as caller-selected final names before lock or journal mutation.
 
 ## Filesystem Authority
 
@@ -85,18 +88,30 @@ source tree and rejects either the target-root or journal-root identity at any
 source descendant, so an external bind-mount alias cannot turn destination
 creation or journal advancement into a source mutation.
 
-The operation journal exposes its pinned canonical directory and device/inode
-identity only to this physical layer. Publication rejects a journal directory
+The operation journal exposes its pinned canonical directory and runtime
+device/inode identity only to this physical layer. Publication rejects a journal directory
 that is the capture source, lies within the captured source, or lies within a
 retained staging/final tree. Publication rejects every absolute symlink because
 an external path component can change after validation and because host paths
 are not portable; relocatable relative symlinks remain supported. The reusable
 copy primitive also supports explicit path and device/inode deny authorities
 for callers that retain its compatible absolute-link behavior. The journal's
-approved local-filesystem profile and root device/inode are fixed in the
-operation binding so a retry cannot silently move the journal to different
-storage. The absolute journal path is used only for local topology checks and
-is never persisted in the artefact or operation binding.
+approved local-filesystem profile, trusted filesystem incarnation ID, and root
+inode are fixed in the operation binding so a retry cannot silently move the
+journal to different storage. Raw `st_dev` values remain runtime-only because
+they can change across host attachment or remount. The absolute journal path is
+used only for local topology checks and is never persisted in the artefact or
+operation binding.
+
+The trusted filesystem adapter must supply a `filesystemId` that identifies the
+filesystem incarnation across hosts and remounts, changes after reformat or an
+independent writable clone, and is not derived from a mount ID, device number,
+device pathname, or worker input. Node `statfs` does not expose such an ID, so
+the built-in inspector fails closed and production hosts must inject one (for
+example a filesystem/volume UUID or a control-plane-protected incarnation
+marker). Durable physical identities are `filesystemId + inode`; runtime path,
+fd, alias, and rename guards continue to use the current mount's `st_dev +
+st_ino`.
 
 All operations under one publication-root identity are serialized in-process
 and cross-process by one protected publication lock. This is required even for
@@ -139,7 +154,8 @@ remaining sequence:
    after acquiring the lock, repeat the authority, identity, and topology
    checks before reading or advancing the journal;
 2. call `journal.prepare()` to durably fix the operation binding, storage
-   request, checkpoint descriptor, direct source-leaf device/inode, and
+   request, checkpoint descriptor, direct source-leaf filesystem incarnation
+   ID/inode, and
    predetermined exact result before any physical materialisation begins;
 3. establish the stopped source storage barrier by opening and validating the
    tree, fsyncing regular files, and fsyncing directories in post-order so each
@@ -161,9 +177,9 @@ remaining sequence:
    can observe the candidate, repeat the pinned identity check, complete staged
    tree fsync, publication-parent sync, exact bundle-shape/manifest/payload
    readback, and pinned identity check before calling
-   `journal.markMaterialized()` with the fixed digests and device/inode
-   identity encoded as canonical decimal strings plus a domain-separated digest
-   of every retained subtree identity; reject any identity shared with the
+   `journal.markMaterialized()` with the fixed digests and filesystem
+   incarnation ID/inode identity plus a domain-separated digest of every
+   retained subtree inode in that incarnation; reject any runtime identity shared with the
    stopped source, and re-open the staging root as current-user-owned and
    extended-ACL-free. Checkpoint bundle envelopes remain mode `0700`; restore
    payload roots retain and pin their modeled portable mode inside the mode
@@ -234,7 +250,7 @@ predetermined result, or materialisation metadata. A different operation ID
 cannot adopt an existing final object even when its payload bytes happen to
 match. Restore recovery additionally rejects a recorded materialisation whose
 manifest or modeled digest no longer matches the trusted `artifactProof`, even
-if an attacker supplied a staged tree with matching device/inode metadata.
+if an attacker supplied a staged tree with matching durable identity metadata.
 
 ## Failure and Commit Classification
 
@@ -275,7 +291,7 @@ classified only after the journal is read under the publication lock. It is a
 caller error for a new operation and recovery-required for `prepared`, but a
 `materialized` or `committed` replay uses the recorded source binding and does
 not reopen or recopy that leaf. The binding includes the direct source-leaf
-device/inode: `prepared` replay must still name that exact leaf, while later
+filesystem incarnation ID/inode: `prepared` replay must still name that exact leaf, while later
 states reconstruct the exact binding from the durable record even if the source
 leaf is gone or replaced.
 

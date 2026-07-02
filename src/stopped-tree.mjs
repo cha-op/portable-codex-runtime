@@ -612,9 +612,21 @@ async function assertPathIdentity(path, expected, message) {
   return current;
 }
 
-async function collectTreeIdentities(path, identities = new Set()) {
+async function collectTreeIdentities(
+  path,
+  identities = new Set(),
+  { expectedDevice, stableInodes } = {},
+) {
   const metadata = await lstat(path, { bigint: true });
+  if (expectedDevice !== undefined) {
+    assert.equal(
+      metadata.dev,
+      expectedDevice,
+      "stopped-tree stable identity digest rejects filesystem boundaries",
+    );
+  }
   identities.add(fileIdentityKey(metadata));
+  stableInodes?.add(metadata.ino.toString());
   if (!metadata.isDirectory()) {
     await assertPathIdentity(
       path,
@@ -642,7 +654,10 @@ async function collectTreeIdentities(path, identities = new Set()) {
       "stopped-tree copy rejects source directory identity changes",
     );
     for (const entry of entries) {
-      await collectTreeIdentities(join(path, entry), identities);
+      await collectTreeIdentities(join(path, entry), identities, {
+        expectedDevice,
+        stableInodes,
+      });
     }
     assertStableFileMetadata(
       heldMetadata,
@@ -698,10 +713,27 @@ export async function stoppedTreesShareAnyIdentity(left, right) {
   return false;
 }
 
-export async function digestStoppedTreeIdentities(path) {
-  const identities = [...(await collectTreeIdentities(path))].sort();
+export async function digestStoppedTreeIdentities(path, filesystemId) {
+  assert.equal(
+    typeof filesystemId,
+    "string",
+    "stable filesystem identity must be a string",
+  );
+  assert(
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(filesystemId),
+    "stable filesystem identity is invalid",
+  );
+  const root = await lstat(path, { bigint: true });
+  const stableInodes = new Set();
+  await collectTreeIdentities(path, new Set(), {
+    expectedDevice: root.dev,
+    stableInodes,
+  });
+  const identities = [...stableInodes].sort();
   const hash = createHash("sha256");
-  hash.update("portable-stopped-tree-identities-v1\0", "utf8");
+  hash.update("portable-stopped-tree-identities-v2\0", "utf8");
+  hash.update(`${Buffer.byteLength(filesystemId, "utf8")}:`, "utf8");
+  hash.update(filesystemId, "utf8");
   for (const identity of identities) {
     hash.update(`${Buffer.byteLength(identity, "utf8")}:`, "utf8");
     hash.update(identity, "utf8");

@@ -1260,10 +1260,17 @@ test("stopped-tree identity proofs detect subtree aliases and inode replacement"
     await writeFile(join(right, "copy"), "same bytes\n");
 
     assert.equal(await stoppedTreesShareAnyIdentity(left, right), false);
-    const originalDigest = await digestStoppedTreeIdentities(left);
+    const originalDigest = await digestStoppedTreeIdentities(
+      left,
+      "test-filesystem-001",
+    );
     await rename(left, renamedLeft);
     assert.equal(
-      await digestStoppedTreeIdentities(renamedLeft),
+      await digestStoppedTreeIdentities(renamedLeft, "test-filesystem-001"),
+      originalDigest,
+    );
+    assert.notEqual(
+      await digestStoppedTreeIdentities(renamedLeft, "test-filesystem-002"),
       originalDigest,
     );
     await link(join(renamedLeft, "data"), join(right, "shared"));
@@ -1272,7 +1279,7 @@ test("stopped-tree identity proofs detect subtree aliases and inode replacement"
     await rm(join(renamedLeft, "data"));
     await writeFile(join(renamedLeft, "data"), "same bytes\n");
     assert.notEqual(
-      await digestStoppedTreeIdentities(renamedLeft),
+      await digestStoppedTreeIdentities(renamedLeft, "test-filesystem-001"),
       originalDigest,
     );
   } finally {

@@ -35,9 +35,11 @@ superseded_by:
   cannot authenticate themselves. Materialized restore replay rechecks both
   recorded digests against that proof before trusting a retained stage.
 - Journal topology is pinned, its approved local-filesystem profile and root
-  identity are durably bound to the operation, and publication rejects all
-  absolute source symlinks so mutable host aliases cannot redirect a portable
-  artefact into the journal authority after validation.
+  stable filesystem-incarnation ID/inode are durably bound to the operation,
+  while raw device/inode identities remain runtime-only guards. The trusted
+  adapter must supply that stable ID because Node `statfs` cannot; publication
+  also rejects all absolute source symlinks so mutable host aliases cannot
+  redirect a portable artefact into the journal authority after validation.
 - Public inputs are deeply snapshotted before queueing; source and publication
   roots are distinct and journal-disjoint; source root identity is preserved
   across the barrier and copy; and checkpoint replay requires an exact
@@ -65,9 +67,10 @@ superseded_by:
   journal discovery, so materialized/committed replay can use its recorded
   source binding. Restore repeatedly requires the checkpoint bundle root to
   contain exactly `artifact.json` and `payload/`. The binding now records the
-  direct source-leaf device/inode, so prepared replay rejects same-path leaf
-  replacement while later phases reconstruct the durable binding without
-  recopying the source.
+  direct source-leaf filesystem-incarnation ID/inode, so prepared replay
+  rejects same-path leaf replacement while later phases reconstruct the
+  durable binding without recopying the source. Retained-tree identity digests
+  use that stable filesystem ID plus the inode set, not host-local `st_dev`.
 - Materialized recovery remains uncertain until current authority proves a
   candidate-only topology. The journal binds a complete retained-tree identity
   digest; recovery/readback rejects source-retained identity intersections,
@@ -85,6 +88,11 @@ superseded_by:
   commit and its own fault callbacks return, publication repeats the full
   committed tree fsync, parent sync, candidate-absence, identity, mode/ACL, and
   digest barrier before reporting success.
+- Candidate roots are provisionally pinned immediately after creation, before
+  `afterCandidateCreated` or `afterCopy` can observe them. Those early callbacks
+  use the same held-final probe as later materialization callbacks. The lock
+  name and complete `.publication-` staging prefix are reserved and cannot be
+  selected as artifact or restore final names.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

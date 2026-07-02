@@ -159,6 +159,13 @@ async function assertPathAbsent(path) {
 
 async function createFixture(t, publicationOptions = {}) {
   const { journalFaults, ...stoppedPublicationOptions } = publicationOptions;
+  if (typeof stoppedPublicationOptions.inspectFilesystem === "function") {
+    const inspectFilesystem = stoppedPublicationOptions.inspectFilesystem;
+    stoppedPublicationOptions.inspectFilesystem = async (path) => ({
+      filesystemId: "test-filesystem-001",
+      ...(await inspectFilesystem(path)),
+    });
+  }
   const root = await mkdtemp(
     join(tmpdir(), "stopped-directory-publication-test-"),
   );
@@ -202,6 +209,7 @@ async function createFixture(t, publicationOptions = {}) {
     acquireLock: simpleLockProvider(),
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
     ...stoppedPublicationOptions,
@@ -329,16 +337,117 @@ test("candidate names are deterministic, hashed, and path-safe", () => {
   assert.equal(first.includes("/"), false);
   assert.equal(first.includes("\\"), false);
   assert.equal(first.includes(CAPTURE_OPERATION_ID), false);
+  assert.doesNotThrow(() =>
+    stoppedDirectoryPublicationCandidateName(
+      CAPTURE_OPERATION_ID,
+      ".publication_data",
+    ),
+  );
+  for (const reserved of [
+    ".stopped-directory-publication.lock",
+    ".publication-reserved",
+  ]) {
+    assert.throws(
+      () =>
+        stoppedDirectoryPublicationCandidateName(
+          CAPTURE_OPERATION_ID,
+          reserved,
+        ),
+      (error) =>
+        assertPublicationError(
+          error,
+          "invalid_publication_request",
+          "not-committed",
+        ),
+    );
+  }
 });
 
-test("the default filesystem inspector accepts the supported local test volume", async (t) => {
+test("reserved publication names fail before lock or journal mutation", async (t) => {
+  for (const finalName of [
+    ".stopped-directory-publication.lock",
+    ".publication-reserved",
+  ]) {
+    await t.test(finalName, async (t) => {
+      let publicationLockAcquisitions = 0;
+      const fixture = await createFixture(t, {
+        acquireLock: async (...args) => {
+          publicationLockAcquisitions += 1;
+          return simpleLockProvider()(...args);
+        },
+      });
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(
+          captureOptions(fixture, {
+            artifactDirectory: join(fixture.artifactOwnedRoot, finalName),
+          }),
+        ),
+        (error) =>
+          assertPublicationError(
+            error,
+            "invalid_publication_request",
+            "not-committed",
+          ),
+      );
+      assert.equal(publicationLockAcquisitions, 0);
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+        null,
+      );
+    });
+  }
+});
+
+test("restore destinations share the reserved publication namespace", async (t) => {
+  let publicationLockAcquisitions = 0;
+  const fixture = await createFixture(t, {
+    acquireLock: async (...args) => {
+      publicationLockAcquisitions += 1;
+      return simpleLockProvider()(...args);
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  publicationLockAcquisitions = 0;
+
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(
+      restoreOptions(fixture, {
+        destinationDirectory: join(
+          fixture.destinationOwnedRoot,
+          ".stopped-directory-publication.lock",
+        ),
+      }),
+    ),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+  assert.equal(publicationLockAcquisitions, 0);
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+});
+
+test("the default filesystem inspector fails closed without a stable ID", async (t) => {
   const fixture = await createFixture(t, { inspectFilesystem: undefined });
 
-  const outcome = await fixture.publication.publishCheckpointArtifact(
-    captureOptions(fixture),
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "unsupported_publication_filesystem",
+        "uncertain",
+      ),
   );
-
-  assert.equal(outcome.result.mutation.status, "checkpoint-created");
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
 });
 
 test("a remote or unapproved filesystem profile is rejected before prepare", async (t) => {
@@ -395,7 +504,7 @@ test("an unsupported journal filesystem is publication-uncertain before prepare"
   assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
-test("a prepared operation cannot be rebound to a different journal profile", async (t) => {
+test("a prepared operation requires stable journal profile continuity", async (t) => {
   let failAfterJournalPrepared = true;
   let fixture;
   let journalPath;
@@ -423,11 +532,40 @@ test("a prepared operation cannot be rebound to a different journal profile", as
   journalType = "journal-local-b";
   await assert.rejects(
     fixture.publication.publishCheckpointArtifact(options),
-    (error) => assertPublicationError(error, "publication_conflict"),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
   );
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "prepared",
+  );
+});
+
+test("committed replay rejects a changed stable filesystem identity", async (t) => {
+  let filesystemId = "test-filesystem-001";
+  const fixture = await createFixture(t, {
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      filesystemId,
+      type: "test-local",
+    }),
+  });
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+
+  filesystemId = "test-filesystem-002";
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
   );
 });
 
@@ -449,6 +587,7 @@ test("the journal directory cannot be captured inside the source tree", async (t
     acquireLock: simpleLockProvider(),
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
   });
@@ -521,6 +660,7 @@ test("a source identity alias of the journal authority is rejected", async (t) =
     },
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
   });
@@ -661,6 +801,7 @@ test("journal authority discovery failure is publication-uncertain", async (t) =
     acquireLock: simpleLockProvider(),
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
   });
@@ -724,6 +865,12 @@ test("checkpoint publication creates one durable exact artifact bundle and commi
   assert.deepEqual(journalRecord.result, options.result);
   assert.equal(journalRecord.materialization.modeledDigest, manifest.modeledDigest);
   assert.deepEqual(result.materialization, journalRecord.materialization);
+  const durablePublication = JSON.stringify({
+    binding: journalRecord.binding.publication,
+    materialization: journalRecord.materialization,
+  });
+  assert.equal(durablePublication.includes('"device"'), false);
+  assert.equal(durablePublication.includes('"filesystemId"'), true);
   await assertPathAbsent(
     candidatePath(
       fixture.artifactOwnedRoot,
@@ -986,8 +1133,8 @@ test("prepared replay rejects replacement of the recorded source leaf", async (t
     operationId: CAPTURE_OPERATION_ID,
   });
   assert.equal(
-    prepared.record.binding.publication.source.directoryIdentity.device,
-    sourceIdentity.dev.toString(),
+    prepared.record.binding.publication.source.directoryIdentity.filesystemId,
+    "test-filesystem-001",
   );
   assert.equal(
     prepared.record.binding.publication.source.directoryIdentity.inode,
@@ -1072,6 +1219,7 @@ test("prepared topology probe failures remain publication-uncertain", async (t) 
     acquireLock: simpleLockProvider(),
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
     inspectOwnedRootAcl: async () => false,
@@ -1667,6 +1815,105 @@ test("post-candidate-barrier publication remains outcome-uncertain", async (t) =
   }
 });
 
+test("early candidate callbacks cannot publish with a not-committed result", async (t) => {
+  for (const kind of ["checkpoint", "restore"]) {
+    for (const callbackName of ["afterCandidateCreated", "afterCopy"]) {
+      for (const throwAfterRename of [false, true]) {
+        await t.test(
+          `${kind} ${callbackName} ${throwAfterRename ? "throws" : "returns"}`,
+          async (t) => {
+            let armed = kind === "checkpoint";
+            let callbackCalls = 0;
+            let candidateIdentity;
+            let fixture;
+            const faults = {
+              async [callbackName]() {
+                if (!armed) return;
+                callbackCalls += 1;
+                const operationId =
+                  kind === "checkpoint"
+                    ? CAPTURE_OPERATION_ID
+                    : RESTORE_OPERATION_ID;
+                const ownedRoot =
+                  kind === "checkpoint"
+                    ? fixture.artifactOwnedRoot
+                    : fixture.destinationOwnedRoot;
+                const finalPath =
+                  kind === "checkpoint"
+                    ? fixture.artifactDirectory
+                    : fixture.destinationDirectory;
+                const candidate = candidatePath(
+                  ownedRoot,
+                  operationId,
+                  finalPath,
+                );
+                candidateIdentity = await lstat(candidate, { bigint: true });
+                await rename(candidate, finalPath);
+                if (throwAfterRename) throw new Error("pre-pin callback fault");
+              },
+            };
+            fixture = await createFixture(t, { faults });
+            if (kind === "restore") {
+              await publishFixtureArtifact(fixture);
+              armed = true;
+            }
+            const operationId =
+              kind === "checkpoint" ? CAPTURE_OPERATION_ID : RESTORE_OPERATION_ID;
+            const ownedRoot =
+              kind === "checkpoint"
+                ? fixture.artifactOwnedRoot
+                : fixture.destinationOwnedRoot;
+            const finalPath =
+              kind === "checkpoint"
+                ? fixture.artifactDirectory
+                : fixture.destinationDirectory;
+            const options =
+              kind === "checkpoint"
+                ? captureOptions(fixture)
+                : restoreOptions(fixture);
+            const publish = () =>
+              kind === "checkpoint"
+                ? fixture.publication.publishCheckpointArtifact(options)
+                : fixture.publication.publishRestoreDestination(options);
+
+            await assert.rejects(
+              publish(),
+              (error) =>
+                assertPublicationError(
+                  error,
+                  "publication_outcome_uncertain",
+                  "uncertain",
+                ),
+            );
+            assert.equal(
+              await pathExists(candidatePath(ownedRoot, operationId, finalPath)),
+              false,
+            );
+            const finalIdentity = await lstat(finalPath, { bigint: true });
+            assert.equal(finalIdentity.dev, candidateIdentity.dev);
+            assert.equal(finalIdentity.ino, candidateIdentity.ino);
+            assert.equal(callbackCalls, 1);
+            assert.equal(
+              (await fixture.journal.read({ operationId })).record.state,
+              "prepared",
+            );
+            await assert.rejects(
+              publish(),
+              (error) =>
+                assertPublicationError(
+                  error,
+                  "publication_outcome_uncertain",
+                  "uncertain",
+                ),
+            );
+            assert.equal(callbackCalls, 1);
+          },
+        );
+      }
+    }
+  }
+});
+
 test("materialization callbacks cannot publish with a not-committed result", async (t) => {
   for (const callbackKind of ["journal", "publication"]) {
     for (const throwAfterRename of [false, true]) {
@@ -2008,6 +2255,7 @@ test("materialized topology probe errors remain publication-uncertain", async (t
     acquireLock: simpleLockProvider(),
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
     inspectOwnedRootAcl: async () => false,
@@ -2530,6 +2778,7 @@ test("a journal read failure before state discovery is publication-uncertain", a
     acquireLock: simpleLockProvider(),
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
       type: "test-local",
     }),
   });
@@ -2747,7 +2996,7 @@ test("restore replay rejects a materialized tree outside the trusted artifact pr
   await fixture.journal.markMaterialized({
     binding: prepared.binding,
     materialization: {
-      contractVersion: 1,
+      contractVersion: 2,
       artifactManifestDigest: mismatchedManifestDigest,
       modeledDigest,
       publicationId: publicationId(
@@ -2756,10 +3005,13 @@ test("restore replay rejects a materialized tree outside the trusted artifact pr
       ),
       publicationKind: "restore-destination",
       stagedRoot: {
-        device: identity.dev.toString(),
+        filesystemId: "test-filesystem-001",
         inode: identity.ino.toString(),
       },
-      treeIdentityDigest: await digestStoppedTreeIdentities(candidate),
+      treeIdentityDigest: await digestStoppedTreeIdentities(
+        candidate,
+        "test-filesystem-001",
+      ),
     },
     operationId: prepared.operationId,
     request: prepared.request,
