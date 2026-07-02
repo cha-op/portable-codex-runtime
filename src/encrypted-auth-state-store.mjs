@@ -139,6 +139,23 @@ function validatePayload(payload) {
   return payload;
 }
 
+function aclMetadataSignature(metadata, { includeChangeTime }) {
+  let isDirectory;
+  try {
+    isDirectory = metadata.isDirectory();
+  } catch {
+    fail("invalid_store_directory", "auth state directory metadata is invalid");
+  }
+  const fields = [metadata.dev, metadata.ino, metadata.uid, metadata.gid, metadata.mode];
+  if (includeChangeTime) fields.push(metadata.ctimeNs);
+  ensure(
+    typeof isDirectory === "boolean" && fields.every((value) => typeof value === "bigint"),
+    "invalid_store_directory",
+    "auth state directory metadata is invalid",
+  );
+  return JSON.stringify([isDirectory, ...fields.map((value) => value.toString())]);
+}
+
 function validateSecretKey(key) {
   ensure(
     key instanceof KeyObject && key.type === "secret" && key.symmetricKeySize === 32,
@@ -434,6 +451,7 @@ export class EncryptedAuthStateStore {
       let primaryError;
       try {
         lock = await this.acquireLock(join(directoryGuard.path, LOCK_FILE));
+        this.#invalidateAncestorAclCache(directoryGuard);
         await this.#assertDirectoryCurrent(directoryGuard);
         outcome = await operation(lock, directoryGuard);
       } catch (error) {
@@ -476,9 +494,15 @@ export class EncryptedAuthStateStore {
         constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
       );
       const identity = await handle.stat({ bigint: true });
-      const directoryGuard = { handle, identity, path };
-      await this.#assertDirectoryMetadataSafe(path, identity);
-      await this.#assertDirectoryAncestorsSafe(path, identity.uid);
+      const directoryGuard = {
+        aclCache: new Map(),
+        ancestorAclCacheKeys: new Set(),
+        handle,
+        identity,
+        path,
+      };
+      await this.#assertDirectoryMetadataSafe(directoryGuard, path, identity);
+      await this.#assertDirectoryAncestorsSafe(directoryGuard, path, identity.uid);
       await this.#assertDirectoryCurrent(directoryGuard);
       return directoryGuard;
     } catch {
@@ -487,7 +511,42 @@ export class EncryptedAuthStateStore {
     }
   }
 
-  async #assertDirectoryMetadataSafe(path, metadata) {
+  #invalidateAncestorAclCache(directoryGuard) {
+    for (const cacheKey of directoryGuard.ancestorAclCacheKeys) {
+      directoryGuard.aclCache.delete(cacheKey);
+    }
+    directoryGuard.ancestorAclCacheKeys.clear();
+  }
+
+  async #assertAclSafe({
+    cacheKey,
+    directoryGuard,
+    includeChangeTime,
+    inspect,
+    metadata,
+    path,
+    unsafeMessage,
+  }) {
+    const signature = aclMetadataSignature(metadata, { includeChangeTime });
+    if (directoryGuard.aclCache.get(cacheKey) === signature) return;
+    let hasUnsafeAcl;
+    let currentMetadata;
+    try {
+      hasUnsafeAcl = await inspect(path);
+      currentMetadata = await this.readPathMetadata(path, { bigint: true });
+    } catch {
+      fail("invalid_store_directory", `${unsafeMessage} could not be verified`);
+    }
+    ensure(
+      aclMetadataSignature(currentMetadata, { includeChangeTime }) === signature,
+      "invalid_store_directory",
+      "auth state directory policy metadata changed during ACL inspection",
+    );
+    ensure(hasUnsafeAcl === false, "invalid_store_directory", unsafeMessage);
+    directoryGuard.aclCache.set(cacheKey, signature);
+  }
+
+  async #assertDirectoryMetadataSafe(directoryGuard, path, metadata) {
     const brokerUid = currentBrokerUid();
     ensure(
       authorityDirectoryPermissionsAreSafe(
@@ -506,29 +565,25 @@ export class EncryptedAuthStateStore {
       "invalid_store_directory",
       "auth state directory permissions are unsafe",
     );
-    let hasExtendedAcl;
-    try {
-      hasExtendedAcl = await this.inspectExtendedAcl(path);
-    } catch {
-      fail("invalid_store_directory", "auth state directory ACL could not be verified");
-    }
-    ensure(
-      hasExtendedAcl === false,
-      "invalid_store_directory",
-      "auth state directory has an extended ACL",
-    );
+    await this.#assertAclSafe({
+      cacheKey: JSON.stringify(["directory", path]),
+      directoryGuard,
+      includeChangeTime: true,
+      inspect: this.inspectExtendedAcl,
+      metadata,
+      path,
+      unsafeMessage: "auth state directory has an extended ACL",
+    });
   }
 
-  async #assertDirectoryAncestorsSafe(path, initialChildUid) {
+  async #assertDirectoryAncestorsSafe(directoryGuard, path, initialChildUid) {
     const brokerUid = currentBrokerUid();
     let childUid = initialChildUid;
     let ancestor = dirname(path);
     while (true) {
       let metadata;
-      let hasUnsafeAcl;
       try {
         metadata = await this.readPathMetadata(ancestor, { bigint: true });
-        hasUnsafeAcl = await this.inspectAncestorAcl(ancestor);
       } catch {
         fail("invalid_store_directory", "auth state directory ancestor could not be verified");
       }
@@ -546,10 +601,21 @@ export class EncryptedAuthStateStore {
             childUid,
             disallowedModeBits: 0o022,
           },
-        ) && hasUnsafeAcl === false,
+        ),
         "invalid_store_directory",
         "auth state directory ancestor is unsafe",
       );
+      const cacheKey = JSON.stringify(["ancestor", ancestor]);
+      await this.#assertAclSafe({
+        cacheKey,
+        directoryGuard,
+        includeChangeTime: false,
+        inspect: this.inspectAncestorAcl,
+        metadata,
+        path: ancestor,
+        unsafeMessage: "auth state directory ancestor is unsafe",
+      });
+      directoryGuard.ancestorAclCacheKeys.add(cacheKey);
       if (ancestor === dirname(ancestor)) return;
       childUid = metadata.uid;
       ancestor = dirname(ancestor);
@@ -571,8 +637,16 @@ export class EncryptedAuthStateStore {
         "invalid_store_directory",
         "auth state directory identity changed",
       );
-      await this.#assertDirectoryMetadataSafe(directoryGuard.path, currentMetadata);
-      await this.#assertDirectoryAncestorsSafe(directoryGuard.path, currentMetadata.uid);
+      await this.#assertDirectoryMetadataSafe(
+        directoryGuard,
+        directoryGuard.path,
+        currentMetadata,
+      );
+      await this.#assertDirectoryAncestorsSafe(
+        directoryGuard,
+        directoryGuard.path,
+        currentMetadata.uid,
+      );
     } catch (error) {
       if (error instanceof AuthStateStoreError) throw error;
       fail("invalid_store_directory", "auth state directory identity could not be verified");
@@ -697,7 +771,13 @@ export class EncryptedAuthStateStore {
         ciphertext: ciphertext.toString("base64url"),
         tag: cipher.getAuthTag().toString("base64url"),
       };
-      return { envelope, raw: canonicalJson(envelope, true) };
+      const raw = canonicalJson(envelope, true);
+      ensure(
+        Buffer.byteLength(raw, "utf8") <= MAX_ENVELOPE_BYTES,
+        "invalid_payload",
+        "auth state payload produces an oversized encrypted envelope",
+      );
+      return { envelope, raw };
     } finally {
       plaintext.fill(0);
     }
@@ -807,6 +887,7 @@ export class EncryptedAuthStateStore {
     let handle;
     let phase = "not-renamed";
     try {
+      this.#invalidateAncestorAclCache(directoryGuard);
       await this.#assertDirectoryCurrent(directoryGuard);
       handle = await this.openFile(
         temporary,
@@ -818,12 +899,14 @@ export class EncryptedAuthStateStore {
       await handle.close();
       handle = undefined;
       await this.faults.afterTempSync?.({ temporary });
+      this.#invalidateAncestorAclCache(directoryGuard);
       await this.#assertDirectoryCurrent(directoryGuard);
       await lock.assertHeld();
       phase = "rename-attempted";
       await lock.renameWhileHeld(temporary, canonicalPath);
       phase = "renamed";
       await this.faults.afterRename?.({ canonicalPath });
+      this.#invalidateAncestorAclCache(directoryGuard);
       await this.#assertDirectoryCurrent(directoryGuard);
       await lock.assertHeld();
       await this.syncDirectory({ handle: directoryGuard.handle, path: directoryGuard.path });

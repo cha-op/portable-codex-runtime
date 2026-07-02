@@ -3,6 +3,7 @@ import { createSecretKey } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -13,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -90,6 +91,16 @@ function assertStoreError(code, extra = () => true) {
     error instanceof AuthStateStoreError && error.code === code && extra(error);
 }
 
+function ancestorCount(path) {
+  let count = 0;
+  let ancestor = dirname(path);
+  while (true) {
+    count += 1;
+    if (ancestor === dirname(ancestor)) return count;
+    ancestor = dirname(ancestor);
+  }
+}
+
 test("encrypted store persists exact payload with monotonic CAS and idempotent replay", async (t) => {
   const { directory, store } = await createStoreFixture(t);
   assert.equal(await store.read(), null);
@@ -160,6 +171,152 @@ test("encrypted store persists exact payload with monotonic CAS and idempotent r
   });
   assert.equal(second.generation, "2");
   assert.equal((await store.read()).payload, secondPayload);
+});
+
+test("oversized encrypted envelopes fail before replacing canonical state", async (t) => {
+  let renameCalls = 0;
+  const { directory, store } = await createStoreFixture(t, {
+    acquireLock: async () => ({
+      async assertHeld() {},
+      async release() {},
+      async renameWhileHeld(source, destination) {
+        renameCalls += 1;
+        await rename(source, destination);
+      },
+    }),
+  });
+  const first = await store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-before-oversized-envelope",
+    payload: PAYLOAD,
+  });
+  assert.equal(first.generation, "1");
+  renameCalls = 0;
+
+  await assert.rejects(
+    store.compareAndSwap({
+      expectedGeneration: "1",
+      commitId: "commit-oversized-envelope",
+      payload: "\0".repeat(1024 * 1024),
+    }),
+    assertStoreError("invalid_payload", (error) => error.commitState === undefined),
+  );
+
+  assert.equal(renameCalls, 0);
+  assert.equal(
+    (await readdir(directory)).some((entry) => entry.startsWith(".auth-state.enc.next-")),
+    false,
+  );
+  const current = await store.read();
+  assert.equal(current.generation, "1");
+  assert.equal(current.payload, PAYLOAD);
+});
+
+test("maximum plain ASCII payload remains writable", async (t) => {
+  const { store } = await createStoreFixture(t);
+  const payload = "a".repeat(1024 * 1024);
+
+  const committed = await store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-maximum-ascii-payload",
+    payload,
+  });
+
+  assert.equal(committed.generation, "1");
+  assert.equal((await store.read()).payload, payload);
+});
+
+test("ACL policy evidence is reused only for unchanged metadata in one transaction", async (t) => {
+  const ancestorAclInspections = new Map();
+  let extendedAclInspections = 0;
+  let metadataReads = 0;
+  const fixture = await createStoreFixture(t, {
+    inspectAncestorAcl: async (path) => {
+      ancestorAclInspections.set(path, (ancestorAclInspections.get(path) ?? 0) + 1);
+      return false;
+    },
+    inspectExtendedAcl: async () => {
+      extendedAclInspections += 1;
+      return false;
+    },
+    readPathMetadata: async (...args) => {
+      metadataReads += 1;
+      return lstat(...args);
+    },
+  });
+  const ancestors = ancestorCount(fixture.store.directory);
+  const stableAncestor = dirname(fixture.store.directory);
+
+  assert.equal(await fixture.store.read(), null);
+  assert.equal(extendedAclInspections, 1);
+  assert.equal(ancestorAclInspections.get(stableAncestor), 2);
+  assert.equal(ancestorAclInspections.size, ancestors);
+  assert(metadataReads > ancestors);
+
+  assert.equal(await fixture.store.read(), null);
+  assert.equal(extendedAclInspections, 2);
+  assert.equal(ancestorAclInspections.get(stableAncestor), 4);
+
+  const beforeMutationExtended = extendedAclInspections;
+  const beforeMutationRootInspections = ancestorAclInspections.get(stableAncestor);
+  await fixture.store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-acl-cache-invalidation",
+    payload: PAYLOAD,
+  });
+  assert(extendedAclInspections > beforeMutationExtended);
+  assert(extendedAclInspections - beforeMutationExtended <= 3);
+  assert.equal(
+    ancestorAclInspections.get(stableAncestor) - beforeMutationRootInspections,
+    5,
+  );
+});
+
+test("ACL policy changes are rechecked at commit boundaries", async (t) => {
+  await t.test("authority ACL becomes unsafe before rename", async (t) => {
+    let unsafe = false;
+    const fixture = await createStoreFixture(t, {
+      faults: {
+        afterTempSync() {
+          unsafe = true;
+        },
+      },
+      inspectExtendedAcl: async () => unsafe,
+    });
+
+    await assert.rejects(
+      fixture.store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-unsafe-authority-acl",
+        payload: PAYLOAD,
+      }),
+      assertStoreError("invalid_store_directory"),
+    );
+  });
+
+  await t.test("ancestor ACL becomes unsafe after rename", async (t) => {
+    let unsafe = false;
+    const fixture = await createStoreFixture(t, {
+      faults: {
+        afterRename() {
+          unsafe = true;
+        },
+      },
+      inspectAncestorAcl: async () => unsafe,
+    });
+
+    await assert.rejects(
+      fixture.store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-unsafe-ancestor-acl",
+        payload: PAYLOAD,
+      }),
+      assertStoreError(
+        "commit_outcome_uncertain",
+        (error) => error.commitState === "uncertain" && error.retryable === false,
+      ),
+    );
+  });
 });
 
 test("coordination keys encode directory and authority without delimiter collisions", async (t) => {

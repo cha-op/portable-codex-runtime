@@ -68,10 +68,23 @@ Each compare-and-swap:
 2. holds and revalidates a directory identity guard and advisory transaction
    lock;
 3. reads and authenticates the current canonical generation;
-4. writes a same-directory mode `0600` candidate with a fresh 96-bit nonce;
-5. syncs the candidate, performs the lock-held rename, syncs the held
+4. rejects any final newline-terminated encrypted envelope above the canonical
+   read limit before creating a temporary file;
+5. writes a same-directory mode `0600` candidate with a fresh 96-bit nonce;
+6. syncs the candidate, performs the lock-held rename, syncs the held
    directory, and re-reads the committed record; and
-6. returns only after generation, commit ID, payload, and key ID match.
+7. returns only after generation, commit ID, payload, and key ID match.
+
+Directory and ancestor ACL results are cached only inside one transaction.
+Authority-directory evidence is reused only while its directory type, device,
+inode, owner, group, mode, and nanosecond change time remain identical.
+Ancestor evidence uses the same identity and permission fields but not change
+time, because unrelated sibling activity legitimately changes a shared
+ancestor's timestamp. Ancestor evidence is instead invalidated and rechecked
+after lock acquisition, before candidate creation, immediately before rename,
+and immediately after rename. The cache is never shared across transactions;
+held-directory identity, pathname identity, owner, mode, and ancestor checks
+still run at every fencing point.
 
 Process-local coordination keys encode the constructor-time canonical realpath
 and authority ID as an unambiguous JSON tuple. Filesystem aliases collapse to

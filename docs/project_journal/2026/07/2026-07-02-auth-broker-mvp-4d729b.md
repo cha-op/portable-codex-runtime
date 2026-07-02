@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-02
 updated: 2026-07-02
 branch: wip/auth-broker-mvp
-pr:
+pr: 5
 supersedes: []
 superseded_by:
 ---
@@ -26,6 +26,13 @@ superseded_by:
   tracking so stale callbacks do not consume another refresh token.
 - Separated ordinary credential installation from supervisor-fenced recovery
   of an exact crashed reservation, preventing live reservation takeover.
+- Enforced the canonical encrypted-envelope byte limit before temporary-file
+  creation, so escape-heavy payloads cannot replace readable state with an
+  envelope the store rejects on readback.
+- Reused ACL policy evidence only inside one transaction and only across
+  unchanged authority metadata or explicit ancestor fencing phases, removing
+  repeated subprocess amplification without weakening identity and commit
+  boundary checks.
 - Kept refresh tokens, ID tokens, raw auth JSON, encryption keys, and authority
   paths outside worker protocol responses and session volumes.
 
