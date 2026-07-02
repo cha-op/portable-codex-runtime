@@ -6,6 +6,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rename,
@@ -171,6 +172,35 @@ test("encrypted store persists exact payload with monotonic CAS and idempotent r
   });
   assert.equal(second.generation, "2");
   assert.equal((await store.read()).payload, secondPayload);
+});
+
+test("candidate chmod restores mode 0600 when creation mode is masked", async (t) => {
+  let requestedCandidateMode;
+  let maskedCandidateMode;
+  const { directory, store } = await createStoreFixture(t, {
+    openFile: async (path, flags, mode) => {
+      const candidate = typeof mode === "number" && mode === 0o600;
+      const handle = await open(path, flags, candidate ? 0o000 : mode);
+      if (candidate) {
+        requestedCandidateMode = mode;
+        const metadata = await handle.stat({ bigint: true });
+        maskedCandidateMode = metadata.mode & 0o777n;
+      }
+      return handle;
+    },
+  });
+
+  await store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-masked-candidate-mode",
+    payload: PAYLOAD,
+  });
+
+  assert.equal(requestedCandidateMode, 0o600);
+  assert.equal(maskedCandidateMode, 0n);
+  const canonical = await lstat(join(directory, "auth-state.enc"), { bigint: true });
+  assert.equal(canonical.mode & 0o777n, 0o600n);
+  assert.equal((await store.read()).payload, PAYLOAD);
 });
 
 test("oversized encrypted envelopes fail before replacing canonical state", async (t) => {

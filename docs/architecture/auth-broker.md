@@ -132,11 +132,13 @@ This is structural continuity validation, not JWT signature verification; the
 trusted OAuth adapter remains responsible for obtaining tokens from the pinned
 Codex/provider path.
 Blocked payloads contain an allowlisted reason plus the refresh reservation's
-unique non-secret owner ID and SHA-256 digests of the source access and refresh
-tokens. The ID prevents ABA ownership confusion; the access digest lets a late
-caller distinguish a changed access credential from a trusted pre-dispatch
-restore, while both digests fence explicit recovery against republishing either
-source token. None can be used as a credential. The reservation therefore
+unique non-secret owner ID and SHA-256 digests of the source account, user,
+access-token, and refresh-token identities. The ID prevents ABA ownership
+confusion; the access digest lets a late caller distinguish a changed access
+credential from a trusted pre-dispatch restore, the account and user digests
+preserve identity continuity, and the token digests fence explicit recovery
+against republishing either source token. None can be used as a credential. The
+reservation therefore
 removes the old auth JSON from canonical state before OAuth can consume its
 refresh token. A crash or
 unreconciled storage failure leaves a non-reusable durable block instead of an
@@ -210,8 +212,9 @@ generation and reservation owner ID. The credential-free `snapshot()` response
 includes that non-secret owner ID for every fenced blocked state, so a trusted
 supervisor can supply both recovery preconditions. Its caller must first stop
 or fence the old broker owner; the library cannot prove external process death.
-The replacement must rotate both the source access and refresh tokens, whose
-encrypted reservation hashes prevent accidental republication of the
+The replacement must preserve the source account and user identities while
+rotating both the source access and refresh tokens. The encrypted reservation
+hashes prevent an accidental identity switch or republication of the
 potentially consumed credential.
 This explicit takeover path preserves re-login recovery without allowing a
 live refresh to acquire a second owner between reservation and dispatch.
@@ -284,6 +287,9 @@ a newly installed identity and receive its access token.
   shape. The same reason from an adapter failure is normalized to
   `adapter_post_dispatch_uncertain` instead of producing malformed state.
 - A stale CAS never returns an uncommitted candidate.
+- Reservation acknowledgement reconciliation accepts an exact-payload
+  successor only when its generation strictly advances beyond the attempted
+  predecessor; raw equality without monotonic progress is not ownership proof.
 - A post-dispatch CAS conflict may rebase only across generations whose exact
   broker payload still matches the durable reservation, or accept a later
   storage-only rotation whose exact payload matches the outcome.

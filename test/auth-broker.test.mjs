@@ -121,17 +121,21 @@ function storedReadyPayload(credential) {
 }
 
 function storedReservationPayload({
+  accountId = ACCOUNT_ID,
   accessToken = ACCESS_TOKEN_1,
   refreshToken = "refresh-1",
   reservationId = "stale-reservation-owner",
+  userId = USER_ID,
 } = {}) {
   return JSON.stringify({
     schemaVersion: 1,
     status: "recovery-required",
     reason: "refresh_in_progress",
     reservationId,
+    sourceAccountIdHash: createHash("sha256").update(accountId, "utf8").digest("hex"),
     sourceAccessTokenHash: createHash("sha256").update(accessToken, "utf8").digest("hex"),
     sourceRefreshTokenHash: createHash("sha256").update(refreshToken, "utf8").digest("hex"),
+    sourceUserIdHash: createHash("sha256").update(userId, "utf8").digest("hex"),
   });
 }
 
@@ -561,6 +565,41 @@ test("credential metadata must match auth mode and JWT claims", async (t) => {
   }
 });
 
+test("JWTs require exactly three non-empty compact segments before persistence", async (t) => {
+  const accessParts = makeCredential().accessToken.split(".");
+  const idParts = makeIdToken().split(".");
+  const cases = [
+    {
+      name: "two access-token segments",
+      credential: makeCredential({ accessToken: accessParts.slice(0, 2).join(".") }),
+    },
+    {
+      name: "four access-token segments",
+      credential: makeCredential({ accessToken: [...accessParts, "extra"].join(".") }),
+    },
+    {
+      name: "empty access-token signature",
+      credential: makeCredential({ accessToken: `${accessParts[0]}.${accessParts[1]}.` }),
+    },
+    {
+      name: "empty ID-token header",
+      credential: makeCredential({ idToken: `.${idParts[1]}.${idParts[2]}` }),
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const store = new FakeStore();
+      await expectBrokerError(
+        () => makeBroker({ store }).installCredential(scenario.credential),
+        "invalid_credential",
+      );
+      assert.equal(store.generation, "0");
+      assert.equal(store.casCalls.length, 0);
+    });
+  }
+});
+
 test("store recovery and integrity failures are not reported as retryable outages", async (t) => {
   const cases = [
     { code: "recovery_required", expected: "recovery_required" },
@@ -844,6 +883,67 @@ test("reservation ownership survives a post-CAS storage-only rotation", async ()
   assert.equal(refreshCalls, 1);
 });
 
+test("reservation lost acknowledgement reconciles a storage-only successor before dispatch", async () => {
+  const store = new FakeStore();
+  const lostAcknowledgement = Object.assign(new Error("reservation acknowledgement lost"), {
+    code: "commit_outcome_uncertain",
+    commitState: "uncertain",
+    retryable: false,
+  });
+  let refreshCalls = 0;
+  const broker = makeBroker({
+    refreshAdapter: async ({ expectedGeneration }) => {
+      refreshCalls += 1;
+      assert.equal(expectedGeneration, "3");
+      assert.equal(JSON.parse(store.payload).reason, "refresh_in_progress");
+      return refreshedCredential();
+    },
+    store,
+  });
+  await broker.installCredential(makeCredential());
+  store.afterCommit = async ({ payload }) => {
+    if (JSON.parse(payload).reason !== "refresh_in_progress") return;
+    store.baseGeneration = store.generation;
+    store.generation = (BigInt(store.generation) + 1n).toString();
+    store.commitId = "rotation-after-uncertain-reservation";
+    store.failAfterCommit = lostAcknowledgement;
+    store.afterCommit = null;
+  };
+
+  const grant = await broker.refreshGrant();
+
+  assert.equal(grant.accessToken, ACCESS_TOKEN_2);
+  assert.equal(grant.generation, "4");
+  assert.equal(refreshCalls, 1);
+});
+
+test("reservation reconciliation requires an exact higher-generation successor", async () => {
+  const store = new FakeStore();
+  let refreshCalls = 0;
+  const broker = makeBroker({
+    refreshAdapter: async () => {
+      refreshCalls += 1;
+      return refreshedCredential();
+    },
+    store,
+  });
+  await broker.installCredential(makeCredential());
+  store.compareAndSwap = async ({ expectedGeneration, payload }) => {
+    store.baseGeneration = "0";
+    store.commitId = "same-generation-reservation";
+    store.generation = expectedGeneration;
+    store.payload = payload;
+    throw Object.assign(new Error("unproven same-generation reservation"), {
+      code: "commit_outcome_uncertain",
+      commitState: "uncertain",
+      retryable: false,
+    });
+  };
+
+  await expectBrokerError(() => broker.refreshGrant(), "refresh_outcome_uncertain");
+  assert.equal(refreshCalls, 0);
+});
+
 test("reservation reread preserves recovery and integrity error classes", async (t) => {
   const cases = [
     { code: "lock_release_failed", expected: "recovery_required" },
@@ -977,6 +1077,34 @@ test("explicit fenced recovery requires the exact reservation identity", async (
   await expectBrokerError(
     () =>
       broker.recoverRefreshReservation({
+        credential: makeCredential({
+          accountId: "account-2",
+          marker: "access-recovered-account-2",
+          refreshToken: "refresh-recovered-account-2",
+        }),
+        expectedGeneration: recoverySnapshot.generation,
+        reservationId: recoverySnapshot.reservationId,
+      }),
+    "invalid_credential",
+    { reason: "account_identity_changed" },
+  );
+  await expectBrokerError(
+    () =>
+      broker.recoverRefreshReservation({
+        credential: makeCredential({
+          marker: "access-recovered-user-2",
+          refreshToken: "refresh-recovered-user-2",
+          userId: "user-2",
+        }),
+        expectedGeneration: recoverySnapshot.generation,
+        reservationId: recoverySnapshot.reservationId,
+      }),
+    "invalid_credential",
+    { reason: "user_identity_changed" },
+  );
+  await expectBrokerError(
+    () =>
+      broker.recoverRefreshReservation({
         credential: makeCredential({ refreshToken: "refresh-recovered" }),
         expectedGeneration: recoverySnapshot.generation,
         reservationId: recoverySnapshot.reservationId,
@@ -1008,6 +1136,49 @@ test("explicit fenced recovery requires the exact reservation identity", async (
     },
   );
   assert.equal((await broker.getGrant()).accessToken, recovered.accessToken);
+});
+
+test("uncertain recovery commit accepts an exact storage-only successor", async () => {
+  const store = new FakeStore();
+  const broker = makeBroker({ store });
+  await broker.installCredential(makeCredential());
+  const reservationId = "recovery-rotation-reservation";
+  store.baseGeneration = "1";
+  store.commitId = "crashed-refresh-reservation";
+  store.generation = "2";
+  store.payload = storedReservationPayload({ reservationId });
+  const replacement = makeCredential({
+    marker: "access-recovered-before-rotation",
+    refreshToken: "refresh-recovered-before-rotation",
+  });
+  const lostAcknowledgement = Object.assign(new Error("recovery acknowledgement lost"), {
+    code: "commit_outcome_uncertain",
+    commitState: "uncertain",
+    retryable: false,
+  });
+  store.afterCommit = async ({ payload }) => {
+    if (JSON.parse(payload).status !== "ready") return;
+    store.baseGeneration = store.generation;
+    store.generation = (BigInt(store.generation) + 1n).toString();
+    store.commitId = "rotation-after-uncertain-recovery";
+    store.failAfterCommit = lostAcknowledgement;
+    store.afterCommit = null;
+  };
+
+  assert.deepEqual(
+    await broker.recoverRefreshReservation({
+      credential: replacement,
+      expectedGeneration: "2",
+      reservationId,
+    }),
+    {
+      expiresAt: isoAfter(3600),
+      generation: "4",
+      schemaVersion: 1,
+      status: "ready",
+    },
+  );
+  assert.equal((await broker.getGrant()).accessToken, replacement.accessToken);
 });
 
 test("twenty concurrent callers share one refresh", async () => {

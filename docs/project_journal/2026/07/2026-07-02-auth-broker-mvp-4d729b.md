@@ -49,6 +49,11 @@ superseded_by:
 - Failed closed on thrown or non-finite clock readings before TTL decisions.
 - Preserved recovery fences through terminal post-dispatch states so ordinary
   login cannot republish either source token after an uncertain refresh.
+- Preserved account and user identity fences through explicit reservation
+  recovery, reconciled exact-payload storage rotations only across strictly
+  increasing generations, and rejected malformed non-compact JWT shapes.
+- Restored encrypted candidate files to mode `0600` through their open file
+  descriptors before writing secrets, independent of the process umask.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
   creation, so escape-heavy payloads cannot replace readable state with an
   envelope the store rejects on readback.

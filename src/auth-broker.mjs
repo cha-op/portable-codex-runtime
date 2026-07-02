@@ -174,7 +174,9 @@ function parseCanonicalTimestamp(value) {
 function decodeJwtPayload(token) {
   if (typeof token !== "string") throw new AuthBrokerError("invalid_credential");
   const parts = token.split(".");
-  if (parts.length < 2) throw new AuthBrokerError("invalid_credential");
+  if (parts.length !== 3 || parts.some((part) => part.length === 0)) {
+    throw new AuthBrokerError("invalid_credential");
+  }
   try {
     const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
     if (!isPlainObject(payload)) throw new AuthBrokerError("invalid_credential");
@@ -314,17 +316,23 @@ function recoveryFence(payload, code = "invalid_store_snapshot") {
     !isPlainObject(payload) ||
     typeof payload.reservationId !== "string" ||
     !OPAQUE_ID_PATTERN.test(payload.reservationId) ||
+    typeof payload.sourceAccountIdHash !== "string" ||
+    !SHA256_PATTERN.test(payload.sourceAccountIdHash) ||
     typeof payload.sourceAccessTokenHash !== "string" ||
     !SHA256_PATTERN.test(payload.sourceAccessTokenHash) ||
     typeof payload.sourceRefreshTokenHash !== "string" ||
-    !SHA256_PATTERN.test(payload.sourceRefreshTokenHash)
+    !SHA256_PATTERN.test(payload.sourceRefreshTokenHash) ||
+    typeof payload.sourceUserIdHash !== "string" ||
+    !SHA256_PATTERN.test(payload.sourceUserIdHash)
   ) {
     throw new AuthBrokerError(code);
   }
   return {
     reservationId: payload.reservationId,
+    sourceAccountIdHash: payload.sourceAccountIdHash,
     sourceAccessTokenHash: payload.sourceAccessTokenHash,
     sourceRefreshTokenHash: payload.sourceRefreshTokenHash,
+    sourceUserIdHash: payload.sourceUserIdHash,
   };
 }
 
@@ -344,6 +352,10 @@ function accessTokenHash(accessToken) {
   return createHash("sha256").update(accessToken, "utf8").digest("hex");
 }
 
+function identityHash(identity) {
+  return createHash("sha256").update(identity, "utf8").digest("hex");
+}
+
 function refreshTokenValue(credential) {
   return parseAuthJson(credential.authJson, credential).tokens.refresh_token;
 }
@@ -361,8 +373,10 @@ function refreshReservationPayload(credential, reservationId) {
     status: "recovery-required",
     reason: "refresh_in_progress",
     reservationId,
+    sourceAccountIdHash: identityHash(credential.accountId),
     sourceAccessTokenHash: accessTokenHash(credential.accessToken),
     sourceRefreshTokenHash: refreshTokenHash(credential),
+    sourceUserIdHash: identityHash(credential.userId),
   };
 }
 
@@ -391,8 +405,10 @@ function validateStoredPayload(payload) {
         "reason",
         "reservationId",
         "schemaVersion",
+        "sourceAccountIdHash",
         "sourceAccessTokenHash",
         "sourceRefreshTokenHash",
+        "sourceUserIdHash",
         "status",
       ],
       "invalid_store_snapshot",
@@ -804,14 +820,44 @@ export class AuthBroker {
     ) {
       throw new AuthBrokerError("invalid_request");
     }
+    if (identityHash(replacement.accountId) !== before.payload.sourceAccountIdHash) {
+      throw new AuthBrokerError("invalid_credential", { reason: "account_identity_changed" });
+    }
+    if (identityHash(replacement.userId) !== before.payload.sourceUserIdHash) {
+      throw new AuthBrokerError("invalid_credential", { reason: "user_identity_changed" });
+    }
     if (accessTokenHash(replacement.accessToken) === before.payload.sourceAccessTokenHash) {
       throw new AuthBrokerError("invalid_credential", { reason: "access_token_unchanged" });
     }
     if (refreshTokenHash(replacement) === before.payload.sourceRefreshTokenHash) {
       throw new AuthBrokerError("invalid_credential", { reason: "refresh_token_reused" });
     }
-    const canonical = await this.#compareAndRead(before.generation, replacement);
+    const canonical = await this.#recoverReservationCommit(before, replacement);
     return this.#publicSnapshot(canonical);
+  }
+
+  async #recoverReservationCommit(before, replacement) {
+    const desiredRawPayload = serializeStoredPayload(replacement);
+    try {
+      return await this.#compareAndRead(before.generation, replacement);
+    } catch (error) {
+      if (!(error instanceof AuthBrokerError) || error.code !== "refresh_outcome_uncertain") {
+        throw error;
+      }
+      let latest;
+      try {
+        latest = await this.#readCanonical();
+      } catch {
+        throw error;
+      }
+      if (
+        latest.rawPayload === desiredRawPayload &&
+        generationValue(latest.generation) > generationValue(before.generation)
+      ) {
+        return latest;
+      }
+      throw error;
+    }
   }
 
   #publicSnapshot(canonical) {
@@ -970,7 +1016,10 @@ export class AuthBroker {
           throw error;
         }
         const latest = await this.#readCanonical();
-        if (latest.commitId === commitId && latest.rawPayload === reservationRawPayload) {
+        if (
+          latest.rawPayload === reservationRawPayload &&
+          generationValue(latest.generation) > generationValue(current.generation)
+        ) {
           return latest;
         }
         if (latest.rawPayload !== before.rawPayload) throw error;
