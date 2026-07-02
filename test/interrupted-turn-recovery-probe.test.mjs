@@ -24,26 +24,37 @@ import {
   PINNED_SOURCE_ANALYSIS_COMMIT,
   RECOVERY_SCENARIOS,
   assertNewTurnId,
-  assertPortableDirectoryNames,
+  assertPortableDirectoryNames as recoveryProbeAssertPortableDirectoryNames,
   assertProcessGroupTarget,
   assertRecoveryEvidenceSafe,
-  copyStoppedTree as copyStoppedTreeWithAcl,
+  copyStoppedTree as recoveryProbeCopyStoppedTree,
   createRecoveryLayout,
-  decodePortablePathBytes,
-  digestTree,
+  decodePortablePathBytes as recoveryProbeDecodePortablePathBytes,
+  digestTree as recoveryProbeDigestTree,
   interruptedTurnRecoveryFailureReport,
-  inspectLinuxRecoveryAcl,
-  parseDarwinMountTable,
-  parseLinuxGetfacl,
-  parseLinuxMountInfo,
+  inspectLinuxRecoveryAcl as recoveryProbeInspectLinuxRecoveryAcl,
+  parseDarwinMountTable as recoveryProbeParseDarwinMountTable,
+  parseLinuxGetfacl as recoveryProbeParseLinuxGetfacl,
+  parseLinuxMountInfo as recoveryProbeParseLinuxMountInfo,
   probeInterruptedTurnRecovery,
-  removeTreeForCleanup,
+  removeTreeForCleanup as recoveryProbeRemoveTreeForCleanup,
   runInterruptedTurnRecoveryCli,
   startRecoveryClient,
   terminateAppServer,
   verifyModelWorkspaceContext,
   writeRecoveryEvidence as writeRecoveryEvidenceWithAcl,
 } from "../src/interrupted-turn-recovery-probe.mjs";
+import {
+  assertPortableDirectoryNames,
+  copyStoppedTree as copyStoppedTreeWithAcl,
+  decodePortablePathBytes,
+  digestTree,
+  inspectLinuxRecoveryAcl,
+  parseDarwinMountTable,
+  parseLinuxGetfacl,
+  parseLinuxMountInfo,
+  removeTreeForCleanup,
+} from "../src/stopped-tree.mjs";
 
 function scenarioReport(kind) {
   return {
@@ -308,6 +319,22 @@ test("follow-up turn identity is present and distinct from the interrupted turn"
       () => assertNewTurnId(turnId, "turn-interrupted"),
       /omitted its ID|reused the interrupted turn ID/,
     );
+  }
+});
+
+test("recovery probe preserves stopped-tree export compatibility", () => {
+  for (const [probeExport, stoppedTreeExport] of [
+    [recoveryProbeAssertPortableDirectoryNames, assertPortableDirectoryNames],
+    [recoveryProbeCopyStoppedTree, copyStoppedTreeWithAcl],
+    [recoveryProbeDecodePortablePathBytes, decodePortablePathBytes],
+    [recoveryProbeDigestTree, digestTree],
+    [recoveryProbeInspectLinuxRecoveryAcl, inspectLinuxRecoveryAcl],
+    [recoveryProbeParseDarwinMountTable, parseDarwinMountTable],
+    [recoveryProbeParseLinuxGetfacl, parseLinuxGetfacl],
+    [recoveryProbeParseLinuxMountInfo, parseLinuxMountInfo],
+    [recoveryProbeRemoveTreeForCleanup, removeTreeForCleanup],
+  ]) {
+    assert.equal(probeExport, stoppedTreeExport);
   }
 });
 

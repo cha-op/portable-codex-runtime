@@ -83,6 +83,15 @@ fails closed on every uncertain post-dispatch outcome. Atomic fence rechecks,
 storage barriers, durable idempotency, and physical capture or restore remain
 backend responsibilities. See `docs/architecture/snapshot-restore-core.md`.
 
+## Reusable Stopped-Tree Primitives
+
+The stopped-tree validation, copy, digest, and guarded-cleanup logic is now a
+reusable module rather than probe-owned code. It preserves the probe's strict
+owned-root, mount, pathname, symlink, metadata, and identity-race rules. This
+layer still has no fsync barrier, atomic publication, durable operation journal,
+descriptor replay, or storage backend. See
+`docs/architecture/stopped-tree-primitives.md`.
+
 ## Interrupted-Turn Recovery
 
 The recovery probe starts a real Codex app-server against a held localhost

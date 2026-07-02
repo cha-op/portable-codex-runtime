@@ -348,6 +348,12 @@ and fails closed after uncertain backend dispatch, while the backend retains
 atomic fence recheck, storage barrier, idempotency, and physical mutation
 responsibility. See `snapshot-restore-core.md`.
 
+Reusable stopped-tree copy and digest primitives implement only the portable
+directory mechanics used by the recovery probe. They do not authenticate
+writer-stop evidence or provide a storage barrier, atomic publication, durable
+journal, idempotent replay, or backend adapter. See
+`stopped-tree-primitives.md`.
+
 Checkpoint descriptors record the source backend and storage ID, but
 intentionally omit lease ID, expiration, host-local attachment path,
 credentials, and Git Summary. Differential export consumes an immutable

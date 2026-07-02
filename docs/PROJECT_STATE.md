@@ -20,6 +20,9 @@
 - A backend-neutral snapshot and restore core now orchestrates stopped-writer
   clean checkpoints, requires a newer restore epoch, and fails closed on
   uncertain backend outcomes without claiming a physical snapshot backend.
+- Stopped-tree validation, copy, digest, and guarded cleanup are reusable
+  independently of the recovery probe, without claiming atomic publication or
+  power-loss durability.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -36,6 +39,8 @@
   `docs/project_journal/2026/07/2026-07-02-auth-broker-mvp-4d729b.md`
 - Snapshot and restore core:
   `docs/project_journal/2026/07/2026-07-02-snapshot-restore-core-3e8a71.md`
+- Reusable stopped-tree primitives:
+  `docs/project_journal/2026/07/2026-07-02-stopped-tree-primitives-6d83af.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
