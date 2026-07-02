@@ -191,6 +191,21 @@ async function commit(
   });
 }
 
+test("journal authority description is frozen and identity-pinned", async (t) => {
+  const { directory, journal } = await createFixture(t);
+  const identity = await lstat(directory, { bigint: true });
+
+  const authority = await journal.describeAuthority();
+
+  assert.deepEqual(authority, {
+    device: identity.dev.toString(),
+    inode: identity.ino.toString(),
+    path: await realpath(directory),
+  });
+  assert.equal(Object.isFrozen(authority), true);
+  assert.deepEqual(await journal.describeAuthority(), authority);
+});
+
 test("journal persists canonical prepared, materialized, and committed states", async (t) => {
   const { directory, journal } = await createFixture(t);
   const absent = await journal.read({ operationId: OPERATION_ID });

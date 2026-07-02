@@ -4,11 +4,12 @@ Portable Codex Runtime is an experimental host runtime for moving Codex
 app-server sessions between trusted machines while keeping the execution
 environment, workspace, rollout state, and recovery data explicit.
 
-The current repository focuses on compatibility probes for authentication and
-interrupted-turn recovery boundaries. The planned runtime keeps refresh tokens
-in a central auth authority, injects short-lived access tokens into session
-workers, and treats session data snapshots separately from monotonic credential
-state.
+The current repository combines compatibility probes for authentication and
+interrupted-turn recovery with the storage contracts, journal, and local
+stopped-directory publication foundations needed by later concrete backends.
+The planned runtime keeps refresh tokens in a central auth authority, injects
+short-lived access tokens into session workers, and treats session data
+snapshots separately from monotonic credential state.
 
 ## Status
 
@@ -101,6 +102,28 @@ readback; committed results can be replayed after restart. The journal records
 caller-supplied state but does not prove physical materialisation, writer stop,
 fence authority, atomic publication, destination isolation, NFS guarantees, or
 backend success. See `docs/architecture/filesystem-operation-journal.md`.
+
+## Stopped-Directory Publication
+
+The local stopped-directory publication layer binds that journal to physical
+storage work. It holds one publication-root lock, prepares the exact journal
+record, establishes a post-order source fsync barrier, builds and fsyncs a
+deterministic private stage, records the exact digest and held identity as
+`materialized`, atomically renames only onto an absent final destination,
+fsyncs and reads back the final object, and only then commits the journal.
+
+Checkpoint artefacts are self-describing `artifact.json` plus `payload/`
+bundles. Restore validates the bundle against a trusted capture proof from the
+committed catalogue, then publishes only the payload tree. A visible final path
+remains unusable by consumers and launchers until its exact journal record is
+committed. Partial stages and uncertain final objects are retained as recovery
+evidence.
+
+This boundary supports only an approved local filesystem. NFS, other remote or
+unknown filesystem semantics, canonical fence checks, stopped-writer
+authentication, and non-cooperating same-UID races at the final POSIX rename
+syscall are outside its guarantee. See
+`docs/architecture/stopped-directory-publication.md`.
 
 ## Interrupted-Turn Recovery
 

@@ -1471,6 +1471,15 @@ export class FilesystemOperationJournal {
     });
   }
 
+  async describeAuthority() {
+    const pin = await this.#getDirectoryPin();
+    return Object.freeze({
+      device: pin.identity.dev.toString(),
+      inode: pin.identity.ino.toString(),
+      path: pin.path,
+    });
+  }
+
   async prepare(options) {
     const input = normalizeOperationInput(options);
     return this.#transition(input, "prepared");

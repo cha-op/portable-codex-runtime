@@ -15,6 +15,13 @@ itself.
 - `markMaterialized()` records caller-supplied materialisation metadata; and
 - `commit()` authorises replay of the exact result fixed by `prepare()`.
 
+`describeAuthority()` is a non-transitioning integration helper for the local
+publication layer. It returns the frozen canonical journal-directory path and
+device/inode identity from the same pinned authority used by transitions, so
+the physical layer can reject a journal nested inside a captured or published
+tree. That absolute path is host-local topology data and is never persisted in
+an operation record or checkpoint artefact.
+
 `operationJournalRecordFilename()` maps an operation ID to its canonical
 record filename. The mapping is journal metadata, not an artefact locator or a
 portable checkpoint reference.
@@ -209,8 +216,14 @@ stale predecessor from being overwritten after callbacks complete, but it is
 not a portable kernel compare-and-swap primitive. Exclusive single-writer
 control and the private-directory boundary remain required.
 
-The materialisation metadata and predetermined result are caller-supplied
-claims bound to the operation record. PR #9 must connect journal phases to
-held-directory storage barriers and atomic publication. PR #10 owns the
-same-process stopped-writer capability. PR #11 then composes those pieces into
-the stopped-directory backend and its conformance suite.
+The materialisation metadata and predetermined result remain caller-supplied
+claims when this journal is used alone. The stopped-directory publication layer
+now connects those phases to a held local-directory storage barrier,
+deterministic staging, absent-destination rename, parent sync, and exact final
+readback. A consumer still must use that higher layer rather than infer physical
+success from a journal record alone. See
+`stopped-directory-publication.md`.
+
+PR #10 owns the same-process stopped-writer capability. PR #11 then composes
+that capability, publication, canonical fence authority, and the snapshot core
+into the stopped-directory backend and its conformance suite.

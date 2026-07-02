@@ -14,8 +14,9 @@
   cleanup primitives without claiming a durable snapshot backend.
 - [done] Implement the durable host-local filesystem operation journal with
   canonical phase and exact committed-result replay.
-- [pending] Implement stopped-directory storage barriers, atomic artefact and
-  restore publication, and destination isolation against the journal phases.
+- [done] Implement local stopped-directory storage barriers, deterministic
+  staging, atomic checkpoint-bundle and restore-tree publication, exact
+  readback, and pre-commit consumer isolation against the journal phases.
 - [pending] Implement the same-process stopped-writer capability coordinator.
 - [pending] Compose the journal, publication layer, and stop capability into
   the stopped-directory backend adapter and conformance suite.

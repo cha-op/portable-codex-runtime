@@ -60,8 +60,6 @@ superseded_by:
 
 ## Next Steps
 
-- PR #9: bind the journal to stopped-directory storage barriers and atomic
-  physical publication.
 - PR #10: add the same-process stopped-writer capability coordinator.
 - PR #11: compose the journal, publication layer, and capability into the
   stopped-directory backend conformance slice.
