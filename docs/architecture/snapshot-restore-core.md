@@ -32,6 +32,12 @@ satisfy the backend obligations below: in particular, they provide no fsync
 barrier, atomic publication, operation journal, or durable replay. See
 `stopped-tree-primitives.md`.
 
+The durable filesystem operation journal can fix and replay the exact request,
+checkpoint descriptor, materialisation metadata, and committed result across
+process restart. It does not prove that any physical backend step occurred and
+does not satisfy the core's stop, fence, barrier, publication, or destination
+isolation obligations. See `filesystem-operation-journal.md`.
+
 `captureCleanCheckpoint()` and `restoreCleanCheckpoint()` are the orchestration
 entry points. Both reject `graceful-abort` and `crash-prefix` before backend
 dispatch. Successful results contain the deeply frozen validated checkpoint
@@ -136,15 +142,21 @@ This core does not yet provide:
 These are separate evidence and backend workstreams. In particular, Git state
 is user context and is not part of checkpoint correctness.
 
-## Dependency Order
+## Dependency History and Remaining Order
 
-The next storage work should remain serial at the pull-request boundary:
+The completed foundations and remaining storage work follow the serial
+pull-request order in the runtime delivery plan:
 
-1. backend-neutral snapshot and restore core;
-2. stopped-directory backend conformance;
-3. same-image resume verification and rollout-tail repair;
-4. ext4 or filesystem-image physical backend; and
-5. differential export.
+1. PR #6, backend-neutral snapshot and restore core (completed);
+2. PR #7, reusable stopped-tree primitives (completed);
+3. PR #8, durable filesystem operation journal (completed by this workstream);
+4. PR #9, stopped-directory atomic publication;
+5. PR #10, same-process stopped-writer capability;
+6. PR #11, stopped-directory backend conformance;
+7. replay-only uncertain-result reconciliation, followed by same-image resume
+   verification and rollout-tail repair;
+8. ext4 or filesystem-image physical backend; and
+9. differential export.
 
 This order keeps orchestration semantics testable before selecting a physical
 format, and requires same-image Codex recovery evidence before optimising

@@ -167,6 +167,73 @@ function withRenameOutcome(error, renameOutcome) {
   return error;
 }
 
+function invalidRenameRequest() {
+  return withRenameOutcome(
+    new AdvisoryLockError(
+      "invalid_rename_request",
+      "rename destination precondition is invalid",
+    ),
+    "not-committed",
+  );
+}
+
+function normalizeExpectedDestination(value) {
+  if (value === undefined) return undefined;
+  let keys;
+  let prototype;
+  try {
+    keys = Reflect.ownKeys(value);
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    throw invalidRenameRequest();
+  }
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    ![Object.prototype, null].includes(prototype) ||
+    keys.some((key) => typeof key !== "string")
+  ) {
+    throw invalidRenameRequest();
+  }
+  const normalized = Object.create(null);
+  for (const key of keys) {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      throw invalidRenameRequest();
+    }
+    if (descriptor?.enumerable !== true || !Object.hasOwn(descriptor, "value")) {
+      throw invalidRenameRequest();
+    }
+    normalized[key] = descriptor.value;
+  }
+  const sortedKeys = [...keys].sort();
+  if (
+    normalized.kind === "absent" &&
+    sortedKeys.length === 1 &&
+    sortedKeys[0] === "kind"
+  ) {
+    return Object.freeze({ kind: "absent" });
+  }
+  if (
+    normalized.kind === "present" &&
+    sortedKeys.join("\0") === "dev\0ino\0kind" &&
+    typeof normalized.dev === "string" &&
+    typeof normalized.ino === "string" &&
+    /^(?:0|[1-9][0-9]*)$/u.test(normalized.dev) &&
+    /^(?:0|[1-9][0-9]*)$/u.test(normalized.ino)
+  ) {
+    return Object.freeze({
+      dev: normalized.dev,
+      ino: normalized.ino,
+      kind: "present",
+    });
+  }
+  throw invalidRenameRequest();
+}
+
 function cleanupResourceError(error, operationError) {
   if (operationError === undefined && error instanceof AdvisoryLockError) return error;
   const failure =
@@ -536,6 +603,16 @@ export async function acquireAdvisoryLock(
       void quiesceUncertainCommit(
         "lock holder detected a lock-path change after the atomic rename",
       ).then(pending.reject, pending.reject);
+    } else if (response.code === "destination_changed") {
+      pending.reject(
+        withRenameOutcome(
+          new AdvisoryLockError(
+            "destination_changed",
+            "rename destination changed before the atomic rename",
+          ),
+          "not-committed",
+        ),
+      );
     } else {
       pending.reject(
         new AdvisoryLockError(
@@ -570,7 +647,10 @@ export async function acquireAdvisoryLock(
         throw error;
       }
     },
-    async renameWhileHeld(source, destination) {
+    async renameWhileHeld(source, destination, expectedDestination) {
+      const normalizedExpectedDestination = normalizeExpectedDestination(
+        expectedDestination,
+      );
       const processExited = child.exitCode !== null || child.signalCode !== null;
       const lossSettlement =
         !unavailable && processExited ? beginUnexpectedLoss() : currentQuiescence();
@@ -623,6 +703,13 @@ export async function acquireAdvisoryLock(
       }
 
       const id = nextCommandId++;
+      const commandLine = `${JSON.stringify({
+        action: "rename",
+        destination,
+        expectedDestination: normalizedExpectedDestination,
+        id,
+        source,
+      })}\n`;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pendingCommands.delete(id);
@@ -632,19 +719,22 @@ export async function acquireAdvisoryLock(
           );
         }, timeoutMs);
         pendingCommands.set(id, { reject, resolve, timer });
-        child.stdin.write(
-          `${JSON.stringify({ action: "rename", destination, id, source })}\n`,
-          (error) => {
-            if (!error) return;
-            const pending = pendingCommands.get(id);
-            if (!pending) return;
-            pendingCommands.delete(id);
-            clearTimeout(timer);
-            void quiesceUncertainCommit(
-              "lock holder command channel failed before confirming rename",
-            ).then(reject, reject);
-          },
-        );
+        const rejectWrite = () => {
+          const pending = pendingCommands.get(id);
+          if (!pending) return;
+          pendingCommands.delete(id);
+          clearTimeout(timer);
+          void quiesceUncertainCommit(
+            "lock holder command channel failed before confirming rename",
+          ).then(reject, reject);
+        };
+        try {
+          child.stdin.write(commandLine, (error) => {
+            if (error) rejectWrite();
+          });
+        } catch {
+          rejectWrite();
+        }
       });
     },
     waitForLoss() {

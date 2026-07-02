@@ -4,6 +4,7 @@ import { once } from "node:events";
 import {
   access,
   link,
+  lstat,
   mkdtemp,
   readFile,
   rename,
@@ -235,6 +236,122 @@ test("advisory lock holder performs the final rename while holding the lock", as
     await lock.assertHeld();
   } finally {
     await lock?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock holder rejects a changed rename destination before commit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-destination-"));
+  const path = join(root, "authority.lock");
+  const source = join(root, "candidate.json");
+  const destination = join(root, "current.json");
+  let lock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    await writeFile(destination, "current\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path);
+    await assert.rejects(
+      lock.renameWhileHeld(source, destination, { kind: "absent" }),
+      (error) =>
+        error instanceof AdvisoryLockError &&
+        error.code === "destination_changed" &&
+        error.renameOutcome === "not-committed",
+    );
+    assert.equal(await readFile(source, "utf8"), "candidate\n");
+    assert.equal(await readFile(destination, "utf8"), "current\n");
+    await lock.assertHeld();
+  } finally {
+    await lock?.release().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock holder accepts the exact expected rename destination", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-expected-destination-"));
+  const path = join(root, "authority.lock");
+  const source = join(root, "candidate.json");
+  const destination = join(root, "current.json");
+  let lock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    await writeFile(destination, "current\n", { mode: 0o600 });
+    const expected = await lstat(destination, { bigint: true });
+    lock = await acquireAdvisoryLock(path);
+    await lock.renameWhileHeld(source, destination, {
+      dev: expected.dev.toString(),
+      ino: expected.ino.toString(),
+      kind: "present",
+    });
+    assert.equal(await readFile(destination, "utf8"), "candidate\n");
+    await assert.rejects(access(source), (error) => error.code === "ENOENT");
+    await lock.assertHeld();
+  } finally {
+    await lock?.release().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("advisory lock holder rejects replacement of an expected destination inode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-replaced-destination-"));
+  const path = join(root, "authority.lock");
+  const source = join(root, "candidate.json");
+  const destination = join(root, "current.json");
+  const displaced = join(root, "displaced.json");
+  let lock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    await writeFile(destination, "original\n", { mode: 0o600 });
+    const expected = await lstat(destination, { bigint: true });
+    lock = await acquireAdvisoryLock(path);
+    await rename(destination, displaced);
+    await writeFile(destination, "replacement\n", { mode: 0o600 });
+    await assert.rejects(
+      lock.renameWhileHeld(source, destination, {
+        dev: expected.dev.toString(),
+        ino: expected.ino.toString(),
+        kind: "present",
+      }),
+      (error) =>
+        error instanceof AdvisoryLockError &&
+        error.code === "destination_changed" &&
+        error.renameOutcome === "not-committed",
+    );
+    assert.equal(await readFile(source, "utf8"), "candidate\n");
+    assert.equal(await readFile(destination, "utf8"), "replacement\n");
+    assert.equal(await readFile(displaced, "utf8"), "original\n");
+    await lock.assertHeld();
+  } finally {
+    await lock?.release().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid destination preconditions do not strand a pending rename", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-invalid-destination-"));
+  const path = join(root, "authority.lock");
+  const source = join(root, "candidate.json");
+  const destination = join(root, "current.json");
+  let lock;
+  try {
+    await writeFile(source, "candidate\n", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path, { timeoutMs: 500 });
+    await assert.rejects(
+      lock.renameWhileHeld(source, destination, {
+        dev: 1n,
+        ino: "2",
+        kind: "present",
+      }),
+      (error) =>
+        error instanceof AdvisoryLockError &&
+        error.code === "invalid_rename_request" &&
+        error.renameOutcome === "not-committed",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await lock.assertHeld();
+    await lock.renameWhileHeld(source, destination, { kind: "absent" });
+    assert.equal(await readFile(destination, "utf8"), "candidate\n");
+  } finally {
+    await lock?.release().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });

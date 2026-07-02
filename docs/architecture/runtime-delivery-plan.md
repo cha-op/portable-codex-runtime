@@ -22,35 +22,46 @@ plane.
 
 ## Pull Request Sequence
 
-1. **Auth refresh authority spike**
-   - Determine whether a central authority can refresh ChatGPT credentials
-     without a normal model turn.
-   - Preserve a reproducible successful implementation and redacted evidence.
-   - Verify serialized refresh, generation continuity, worker token injection,
-     and explicit `reauth_required` failure behavior.
-2. **Interrupted and killed turn recovery spike**
-   - Record Codex behavior for logical interruption, `SIGTERM`, `SIGKILL`, and
-     recovery from a filesystem snapshot.
-   - Treat the pinned Codex image as the owner of rollout recovery semantics.
-3. **Session filesystem and storage contracts**
-   - Present a normal directory to the rootless worker.
-   - Define the session manifest, storage backend, lease, and fencing contracts
-     without requiring the worker to attach or mount a raw block device.
-4. **Auth broker MVP**
+1. **PR #1: external-auth compatibility probe**
+   - Prove the pinned app-server's external access-token injection and refresh
+     callback behaviour without persisting worker `auth.json`.
+2. **PR #2: auth refresh authority spike**
+   - Prove a central authority can refresh ChatGPT credentials without a normal
+     model turn and preserve redacted evidence.
+3. **PR #3: interrupted and killed turn recovery spike**
+   - Record Codex behaviour for logical interruption, process signals, hard
+     kills, and stopped-tree recovery.
+4. **PR #4: session filesystem and storage contracts**
+   - Define the session manifest, normal-directory attachment, lease, fencing,
+     backend mutation, and checkpoint descriptor contracts.
+5. **PR #5: auth broker MVP**
    - Implement encrypted canonical auth state, single-flight refresh,
-     generation/CAS semantics, worker token delivery, and reauthentication.
-5. **Snapshot and restore core**
-   - Implement quiescing, filesystem snapshots, manifests, restore, and
-     same-image thread resume verification.
-6. **Differential export and content-addressed storage**
-   - Implement chunking, compression, integrity checks, encryption adapters,
-     atomic manifest publication, and restore verification.
-7. **Cross-host migration end-to-end verification**
-   - Exercise graceful migration and disaster recovery with explicit thread IDs
-     and fencing epochs.
-8. **Fault injection and operational hardening**
-   - Cover stale hosts, interrupted uploads, corrupted chunks, retention, and
-     recovery runbooks.
+     generation/CAS semantics, and worker token delivery.
+6. **PR #6: snapshot and restore core**
+   - Implement backend-neutral stopped-writer clean checkpoint orchestration
+     with exact descriptor/result validation and fail-closed uncertainty.
+7. **PR #7: reusable stopped-tree primitives**
+   - Extract the validated copy, digest, mount, ACL, pathname, and guarded
+     cleanup layer without claiming durable publication.
+8. **PR #8: durable filesystem operation journal**
+   - Persist exact prepared, materialized, and committed operation records and
+     predetermined results with canonical replay after restart.
+9. **PR #9: stopped-directory publication layer**
+   - Bind journal phases to the filesystem storage barrier, physical
+     materialisation, atomic artefact or restore publication, and destination
+     isolation.
+10. **PR #10: same-process stopped-writer capability**
+    - Issue and authenticate a one-use object capability bound to the exact
+      writer incarnation, attachment, and fence without embedding stop
+      mechanics in the storage layer.
+11. **PR #11: stopped-directory backend adapter**
+    - Compose the journal, publication layer, capability, and snapshot core;
+      then run the complete backend conformance and failure-injection matrix.
+
+Later serial pull requests own replay-only uncertain-result reconciliation,
+same-image resume and rollout-tail repair, an ext4 or filesystem-image backend,
+differential export and content-addressed storage, cross-host migration, and
+operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

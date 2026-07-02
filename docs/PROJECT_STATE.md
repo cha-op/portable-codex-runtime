@@ -23,6 +23,9 @@
 - Stopped-tree validation, copy, digest, and guarded cleanup are reusable
   independently of the recovery probe, without claiming atomic publication or
   power-loss durability.
+- A host-local canonical operation journal now durably records exact prepared,
+  materialized, and committed states and replays committed results after
+  restart without claiming that physical backend work occurred.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -41,6 +44,8 @@
   `docs/project_journal/2026/07/2026-07-02-snapshot-restore-core-3e8a71.md`
 - Reusable stopped-tree primitives:
   `docs/project_journal/2026/07/2026-07-02-stopped-tree-primitives-6d83af.md`
+- Durable filesystem operation journal:
+  `docs/project_journal/2026/07/2026-07-02-filesystem-operation-journal-2f6c91.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
