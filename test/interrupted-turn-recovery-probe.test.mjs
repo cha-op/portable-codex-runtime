@@ -1265,7 +1265,7 @@ test(
         copyStoppedTree({ ownedRoot: root, source, destination }),
         /rejects non-UTF-8 directory entry names/,
       );
-      await assertRetainedFailedDestination(destination);
+      await assert.rejects(lstat(destination), /ENOENT/);
       await removeTreeForCleanup(source);
       await assert.rejects(lstat(source), /ENOENT/);
     } finally {
