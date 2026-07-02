@@ -302,13 +302,13 @@ function readyPayload(credential) {
 }
 
 function blockedPayload(status, reason) {
+  const fallback =
+    status === "reauth-required" ? "remote_reauth_required" : "adapter_post_dispatch_uncertain";
+  const normalizedReason = safeReason(reason, fallback);
   return {
     schemaVersion: AUTH_PAYLOAD_SCHEMA_VERSION,
     status,
-    reason: safeReason(
-      reason,
-      status === "reauth-required" ? "remote_reauth_required" : "adapter_post_dispatch_uncertain",
-    ),
+    reason: normalizedReason === "refresh_in_progress" ? fallback : normalizedReason,
   };
 }
 
@@ -499,6 +499,10 @@ function normalizedMinTtl(value, fallback) {
   return ttl;
 }
 
+function callerMinTtl(value, floor) {
+  return Math.max(normalizedMinTtl(value, floor), floor);
+}
+
 function sharedConfigurationMatches(entry, configuration) {
   return (
     entry.minTokenTtlSeconds === configuration.minTokenTtlSeconds &&
@@ -655,7 +659,7 @@ export class AuthBroker {
           }
           break;
         }
-        if (code === "recovery_required") {
+        if (["lock_release_failed", "recovery_required"].includes(code)) {
           throw new AuthBrokerError("recovery_required");
         }
         if (INVALID_STORE_CODES.has(code)) {
@@ -774,7 +778,12 @@ export class AuthBroker {
       status: canonical.payload.status,
     };
     if (canonical.payload.status === "ready") snapshot.expiresAt = canonical.payload.expiresAt;
-    else snapshot.reason = canonical.payload.reason;
+    else {
+      snapshot.reason = canonical.payload.reason;
+      if (canonical.payload.reason === "refresh_in_progress") {
+        snapshot.reservationId = canonical.payload.reservationId;
+      }
+    }
     return Object.freeze(snapshot);
   }
 
@@ -783,7 +792,7 @@ export class AuthBroker {
   }
 
   async getGrant({ minTtlSeconds } = {}) {
-    const ttl = normalizedMinTtl(minTtlSeconds, this.minTokenTtlSeconds);
+    const ttl = callerMinTtl(minTtlSeconds, this.minTokenTtlSeconds);
     let canonical = await this.#readCanonical();
     if (
       canonical.payload?.status === "recovery-required" &&
@@ -807,7 +816,7 @@ export class AuthBroker {
   }
 
   async refreshGrant({ minTtlSeconds } = {}) {
-    const ttl = normalizedMinTtl(minTtlSeconds, this.minTokenTtlSeconds);
+    const ttl = callerMinTtl(minTtlSeconds, this.minTokenTtlSeconds);
     let canonical = await this.#readCanonical();
     if (
       canonical.payload?.status === "recovery-required" &&
@@ -916,12 +925,7 @@ export class AuthBroker {
         ) {
           throw error;
         }
-        let latest;
-        try {
-          latest = await this.#readCanonical();
-        } catch {
-          throw new AuthBrokerError("store_unavailable");
-        }
+        const latest = await this.#readCanonical();
         if (latest.commitId === commitId && latest.rawPayload === reservationRawPayload) {
           return latest;
         }

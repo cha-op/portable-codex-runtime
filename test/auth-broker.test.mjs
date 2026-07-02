@@ -14,6 +14,7 @@ import { EncryptedAuthStateStore } from "../src/encrypted-auth-state-store.mjs";
 
 const NOW = Date.parse("2026-07-03T00:00:00.000Z");
 const ACCOUNT_ID = "account-1";
+const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const USER_ID = "user-1";
 
 function isoAfter(seconds) {
@@ -294,6 +295,20 @@ async function expectBrokerError(operation, code, expected = {}) {
   return caught;
 }
 
+function assertReservationSnapshot(snapshot, { generation, reservationId } = {}) {
+  const actualReservationId = snapshot.reservationId;
+  assert.match(actualReservationId, OPAQUE_ID_PATTERN);
+  if (reservationId !== undefined) assert.equal(actualReservationId, reservationId);
+  assert.deepEqual(snapshot, {
+    generation,
+    reason: "refresh_in_progress",
+    reservationId: actualReservationId,
+    schemaVersion: 1,
+    status: "recovery-required",
+  });
+  return actualReservationId;
+}
+
 test("TTL hit returns a non-serializable secret grant without refreshing", async () => {
   const store = new FakeStore();
   let refreshCalls = 0;
@@ -334,6 +349,26 @@ test("TTL hit returns a non-serializable secret grant without refreshing", async
     schemaVersion: 1,
     status: "ready",
   });
+});
+
+test("caller TTL cannot lower the broker safety floor", async () => {
+  const store = new FakeStore();
+  let refreshCalls = 0;
+  const broker = makeBroker({
+    refreshAdapter: async () => {
+      refreshCalls += 1;
+      return refreshedCredential({ expiresAt: isoAfter(600) });
+    },
+    store,
+  });
+  await broker.installCredential(makeCredential({ expiresAt: isoAfter(30) }));
+
+  const grant = await broker.getGrant({ minTtlSeconds: 0 });
+
+  assert.equal(refreshCalls, 1);
+  assert.equal(grant.generation, "3");
+  assert.notEqual(grant.accessToken, ACCESS_TOKEN_1);
+  assert.equal(grant.expiresAt, isoAfter(600));
 });
 
 test("a new broker instance reads the durable generation from the store", async () => {
@@ -464,6 +499,23 @@ test("store recovery and integrity failures are not reported as retryable outage
       await expectBrokerError(() => makeBroker({ store }).snapshot(), scenario.expected);
     });
   }
+});
+
+test("lock release failure stops mutation retry and requires recovery", async () => {
+  const store = new FakeStore();
+  let casCalls = 0;
+  store.compareAndSwap = async () => {
+    casCalls += 1;
+    throw Object.assign(new Error("synthetic lock release failure"), {
+      code: "lock_release_failed",
+      commitState: "not-committed",
+      retryable: false,
+    });
+  };
+  const broker = makeBroker({ store });
+
+  await expectBrokerError(() => broker.installCredential(makeCredential()), "recovery_required");
+  assert.equal(casCalls, 1);
 });
 
 test("canonical payload parsing rejects whitespace, reordered fields, and duplicate keys", async (t) => {
@@ -676,6 +728,44 @@ test("reservation ownership survives a post-CAS storage-only rotation", async ()
   assert.equal(refreshCalls, 1);
 });
 
+test("reservation reread preserves recovery and integrity error classes", async (t) => {
+  const cases = [
+    { code: "lock_release_failed", expected: "recovery_required" },
+    { code: "invalid_auth_state", expected: "invalid_store_snapshot" },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.code, async () => {
+      const store = new FakeStore();
+      const broker = makeBroker({ store });
+      await broker.installCredential(makeCredential());
+      const read = store.read.bind(store);
+      let refreshReads = 0;
+      let reservationCasCalls = 0;
+      store.read = async () => {
+        refreshReads += 1;
+        if (refreshReads === 3) {
+          throw Object.assign(new Error("reservation reread failed"), {
+            code: scenario.code,
+          });
+        }
+        return read();
+      };
+      store.compareAndSwap = async () => {
+        reservationCasCalls += 1;
+        throw Object.assign(new Error("synthetic reservation conflict"), {
+          code: "generation_conflict",
+          retryable: true,
+        });
+      };
+
+      await expectBrokerError(() => broker.refreshGrant(), scenario.expected);
+      assert.equal(reservationCasCalls, 1);
+      assert.equal(refreshReads, 3);
+    });
+  }
+});
+
 test("foreign reservation in an ABA sequence never grants dispatch ownership", async () => {
   const store = new FakeStore();
   let refreshCalls = 0;
@@ -701,11 +791,9 @@ test("foreign reservation in an ABA sequence never grants dispatch ownership", a
     generation: "4",
   });
   assert.equal(refreshCalls, 0);
-  assert.deepEqual(await broker.snapshot(), {
+  assertReservationSnapshot(await broker.snapshot(), {
     generation: "4",
-    reason: "refresh_in_progress",
-    schemaVersion: 1,
-    status: "recovery-required",
+    reservationId: "foreign-reservation-owner",
   });
 });
 
@@ -765,11 +853,16 @@ test("explicit fenced recovery requires the exact reservation identity", async (
       }),
     "invalid_request",
   );
+  const recoverySnapshot = await broker.snapshot();
+  assert.equal(
+    assertReservationSnapshot(recoverySnapshot, { generation: "2", reservationId }),
+    reservationId,
+  );
   assert.deepEqual(
     await broker.recoverRefreshReservation({
       credential: recovered,
-      expectedGeneration: "2",
-      reservationId,
+      expectedGeneration: recoverySnapshot.generation,
+      reservationId: recoverySnapshot.reservationId,
     }),
     {
       expiresAt: isoAfter(3600),
@@ -974,6 +1067,15 @@ test("structured refresh failures durably block future grants", async (t) => {
       reason: "adapter_post_dispatch_uncertain",
       status: "recovery-required",
     },
+    {
+      code: "refresh_outcome_uncertain",
+      expectedCode: "recovery_required",
+      name: "reservation-only reason is normalized",
+      postDispatch: true,
+      adapterReason: "refresh_in_progress",
+      reason: "adapter_post_dispatch_uncertain",
+      status: "recovery-required",
+    },
   ];
 
   for (const scenario of cases) {
@@ -984,7 +1086,7 @@ test("structured refresh failures durably block future grants", async (t) => {
           throw Object.assign(new Error("adapter details must remain private"), {
             code: scenario.code,
             postDispatch: scenario.postDispatch,
-            reason: scenario.reason,
+            reason: scenario.adapterReason ?? scenario.reason,
           });
         },
         store,
@@ -1106,12 +1208,7 @@ test("post-dispatch commit failure leaves a durable refresh reservation", async 
   await broker.installCredential(makeCredential());
 
   await expectBrokerError(() => broker.refreshGrant(), "refresh_outcome_uncertain");
-  assert.deepEqual(await broker.snapshot(), {
-    generation: "2",
-    reason: "refresh_in_progress",
-    schemaVersion: 1,
-    status: "recovery-required",
-  });
+  assertReservationSnapshot(await broker.snapshot(), { generation: "2" });
   await expectBrokerError(() => makeBroker({ store }).getGrant(), "recovery_required", {
     generation: "2",
     reason: "refresh_in_progress",
@@ -1133,12 +1230,7 @@ test("post-dispatch commit ID failure is non-retryable and preserves reservation
   await broker.installCredential(makeCredential());
 
   await expectBrokerError(() => broker.refreshGrant(), "refresh_outcome_uncertain");
-  assert.deepEqual(await broker.snapshot(), {
-    generation: "2",
-    reason: "refresh_in_progress",
-    schemaVersion: 1,
-    status: "recovery-required",
-  });
+  assertReservationSnapshot(await broker.snapshot(), { generation: "2" });
 });
 
 test("unreconciled uncertain CAS never returns a refreshed credential", async () => {
@@ -1710,12 +1802,7 @@ test("pre-dispatch restore failure preserves the durable reservation", async () 
   await broker.installCredential(makeCredential());
 
   await expectBrokerError(() => broker.refreshGrant(), "refresh_outcome_uncertain");
-  assert.deepEqual(await broker.snapshot(), {
-    generation: "2",
-    reason: "refresh_in_progress",
-    schemaVersion: 1,
-    status: "recovery-required",
-  });
+  assertReservationSnapshot(await broker.snapshot(), { generation: "2" });
 });
 
 test("public errors and metadata redact adapter and credential secrets", async () => {

@@ -25,7 +25,15 @@ superseded_by:
   canonical filesystem identity, and private last-delivered worker credential
   tracking so stale callbacks do not consume another refresh token.
 - Separated ordinary credential installation from supervisor-fenced recovery
-  of an exact crashed reservation, preventing live reservation takeover.
+  of an exact crashed reservation, exposing its non-secret owner ID through
+  recovery metadata while preventing live reservation takeover.
+- Enforced the configured token TTL as an authority floor and reserved
+  `refresh_in_progress` exclusively for structurally valid durable
+  reservations.
+- Preserved recovery/integrity classifications during reservation conflict
+  rereads and made lock-release failure dominate retryable operation errors
+  without discarding allowlisted commit-state evidence or permitting another
+  broker mutation retry.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
   creation, so escape-heavy payloads cannot replace readable state with an
   envelope the store rejects on readback.

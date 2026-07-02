@@ -813,6 +813,178 @@ test("read transaction release failure is not reported as a committed mutation",
   );
 });
 
+test("lock release failure overrides primary errors without losing commit state", async (t) => {
+  await t.test("retryable generation conflict", async (t) => {
+    const fixture = await createStoreFixture(t);
+    await fixture.store.compareAndSwap({
+      expectedGeneration: "0",
+      commitId: "commit-before-release-conflict",
+      payload: PAYLOAD,
+    });
+    const store = new EncryptedAuthStateStore({
+      acquireLock: async () => ({
+        async assertHeld() {},
+        async release() {
+          throw new Error("synthetic release failure");
+        },
+        async renameWhileHeld(source, destination) {
+          await rename(source, destination);
+        },
+      }),
+      authorityId: AUTHORITY_ID,
+      directory: fixture.directory,
+      keyProvider: fixture.keyProvider,
+      ...TRUSTED_ACL_INSPECTORS,
+    });
+
+    await assert.rejects(
+      store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-release-after-conflict",
+        payload: PAYLOAD,
+      }),
+      assertStoreError(
+        "lock_release_failed",
+        (error) => error.commitState === "not-committed" && error.retryable === false,
+      ),
+    );
+  });
+
+  await t.test("uncertain rename acknowledgement", async (t) => {
+    const fixture = await createStoreFixture(t);
+    const store = new EncryptedAuthStateStore({
+      acquireLock: async () => ({
+        async assertHeld() {},
+        async release() {
+          throw new Error("synthetic release failure");
+        },
+        async renameWhileHeld(source, destination) {
+          await rename(source, destination);
+          throw new Error("synthetic lost rename acknowledgement");
+        },
+      }),
+      authorityId: AUTHORITY_ID,
+      directory: fixture.directory,
+      keyProvider: fixture.keyProvider,
+      ...TRUSTED_ACL_INSPECTORS,
+    });
+
+    await assert.rejects(
+      store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-release-after-uncertain-rename",
+        payload: PAYLOAD,
+      }),
+      assertStoreError(
+        "lock_release_failed",
+        (error) => error.commitState === "uncertain" && error.retryable === false,
+      ),
+    );
+  });
+
+  await t.test("hostile inherited commit-state getter", async (t) => {
+    class HostileCommitStateError extends AuthStateStoreError {
+      get commitState() {
+        throw new Error("hostile commit-state getter must not run");
+      }
+    }
+    const fixture = await createStoreFixture(t, {
+      acquireLock: async () => ({
+        async assertHeld() {},
+        async release() {
+          throw new Error("synthetic release failure");
+        },
+        async renameWhileHeld(source, destination) {
+          await rename(source, destination);
+        },
+      }),
+      faults: {
+        afterTempSync() {
+          throw new HostileCommitStateError("synthetic_primary", "synthetic primary failure");
+        },
+      },
+    });
+
+    await assert.rejects(
+      fixture.store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-hostile-primary-state",
+        payload: PAYLOAD,
+      }),
+      assertStoreError(
+        "lock_release_failed",
+        (error) => error.commitState === "not-committed" && error.retryable === false,
+      ),
+    );
+  });
+
+  await t.test("invalid primary commit-state value", async (t) => {
+    const fixture = await createStoreFixture(t, {
+      acquireLock: async () => ({
+        async assertHeld() {},
+        async release() {
+          throw new Error("synthetic release failure");
+        },
+        async renameWhileHeld(source, destination) {
+          await rename(source, destination);
+        },
+      }),
+      faults: {
+        afterTempSync() {
+          throw new AuthStateStoreError("synthetic_primary", "synthetic primary failure", {
+            commitState: "invalid-state",
+          });
+        },
+      },
+    });
+
+    await assert.rejects(
+      fixture.store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-invalid-primary-state",
+        payload: PAYLOAD,
+      }),
+      assertStoreError(
+        "lock_release_failed",
+        (error) => error.commitState === "not-committed" && error.retryable === false,
+      ),
+    );
+  });
+
+  await t.test("untrusted committed primary state", async (t) => {
+    const fixture = await createStoreFixture(t, {
+      acquireLock: async () => ({
+        async assertHeld() {},
+        async release() {
+          throw new Error("synthetic release failure");
+        },
+        async renameWhileHeld(source, destination) {
+          await rename(source, destination);
+        },
+      }),
+      faults: {
+        afterTempSync() {
+          throw new AuthStateStoreError("synthetic_primary", "synthetic primary failure", {
+            commitState: "committed",
+          });
+        },
+      },
+    });
+
+    await assert.rejects(
+      fixture.store.compareAndSwap({
+        expectedGeneration: "0",
+        commitId: "commit-untrusted-committed-state",
+        payload: PAYLOAD,
+      }),
+      assertStoreError(
+        "lock_release_failed",
+        (error) => error.commitState === "not-committed" && error.retryable === false,
+      ),
+    );
+  });
+});
+
 test("process-local coordination serializes competing CAS calls across store instances", async (t) => {
   const fixture = await createStoreFixture(t);
   const secondStore = new EncryptedAuthStateStore({

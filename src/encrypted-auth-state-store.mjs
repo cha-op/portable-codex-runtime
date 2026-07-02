@@ -461,16 +461,20 @@ export class EncryptedAuthStateStore {
         try {
           await lock.release();
         } catch {
-          if (!primaryError) {
-            primaryError = new AuthStateStoreError(
-              "lock_release_failed",
-              "auth state lock release failed after the operation",
-              {
-                commitState: mutation && outcome?.committed ? "committed" : "not-committed",
-                retryable: false,
-              },
-            );
-          }
+          const reportedCommitState = ownDataProperty(primaryError, "commitState");
+          const commitState = ["not-committed", "uncertain"].includes(reportedCommitState)
+            ? reportedCommitState
+            : mutation && outcome?.committed
+              ? "committed"
+              : "not-committed";
+          primaryError = new AuthStateStoreError(
+            "lock_release_failed",
+            "auth state lock release failed after the operation",
+            {
+              commitState,
+              retryable: false,
+            },
+          );
         }
       }
       await directoryGuard.handle.close().catch(() => {});

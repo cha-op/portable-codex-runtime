@@ -185,7 +185,9 @@ reservation in an ABA sequence has a different payload and remains fail-closed.
 A different credential or blocked payload remains a conflict and is never
 overwritten as a storage-only event.
 
-A caller may request a TTL above the fixed authority safety TTL. That
+A caller may request a TTL above the fixed authority safety TTL. A lower
+per-call value is clamped to the authority floor and can never suppress a
+required refresh. The
 caller-specific requirement is checked only after the shared refresh completes;
 it cannot mark otherwise valid canonical state as recovery-required. A caller
 whose requirement is still unmet receives non-retryable
@@ -194,8 +196,10 @@ whose requirement is still unmet receives non-retryable
 Ordinary `installCredential()` refuses to overwrite an active
 `refresh_in_progress` reservation. Crash recovery is a separate
 `recoverRefreshReservation()` operation that requires the exact canonical
-generation and reservation owner ID. Its trusted caller must first stop or
-fence the old broker owner; the library cannot prove external process death.
+generation and reservation owner ID. The credential-free `snapshot()` response
+includes that non-secret owner ID only while the reservation is active, so a
+trusted supervisor can supply both recovery preconditions. Its caller must
+first stop or fence the old broker owner; the library cannot prove external process death.
 This explicit takeover path preserves re-login recovery without allowing a
 live refresh to acquire a second owner between reservation and dispatch.
 
@@ -256,6 +260,9 @@ state directory and never persist `auth.json`.
   drift, unchanged token, or failure to meet the fixed authority safety TTL
   moves canonical state to `recovery-required` and prevents reuse of the old
   refresh token. A higher caller-specific TTL never changes durable state.
+- `refresh_in_progress` is reserved for the credential-free durable reservation
+  shape. The same reason from an adapter failure is normalized to
+  `adapter_post_dispatch_uncertain` instead of producing malformed state.
 - A stale CAS never returns an uncommitted candidate.
 - A post-dispatch CAS conflict may rebase only across generations whose exact
   broker payload still matches the durable reservation, or accept a later
@@ -267,6 +274,14 @@ state directory and never persist `auth.json`.
 - Store recovery artifacts and integrity/configuration failures remain
   operator-recovery or invalid-state errors; they are not downgraded to
   retryable availability failures.
+- Reservation conflict reconciliation preserves recovery and integrity error
+  classes from its canonical reread. Lock release failure always takes
+  precedence over a retryable operation error while retaining whether commit
+  was impossible, completed, or uncertain. Broker mutation paths never retry a
+  CAS after lock release failure, and external commit-state metadata is read as
+  an allowlisted own data property. A primary error may preserve only
+  `not-committed` or `uncertain`; definite `committed` state is derived only
+  from a successful mutation outcome.
 - Errors, snapshots, logs, and test evidence must not serialize tokens, raw
   auth JSON, JWT claims, or upstream error bodies.
 
