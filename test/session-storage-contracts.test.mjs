@@ -481,7 +481,7 @@ test("rootless worker template is structural and fixed-layout", () => {
     storageRef: storageRef(),
   });
   assert.deepEqual(template.mount, {
-    propagation: "private",
+    propagation: "rprivate",
     readOnly: false,
     source: attachment().rootPath,
     target: SESSION_WORKER_ROOT,

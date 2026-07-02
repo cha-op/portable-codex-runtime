@@ -984,7 +984,7 @@ export function createRootlessWorkerTemplate(options) {
       CODEX_SQLITE_HOME: SESSION_WORKER_LAYOUT.codexHome,
     },
     mount: {
-      propagation: "private",
+      propagation: "rprivate",
       readOnly: false,
       source: matched.attachment.rootPath,
       target: SESSION_WORKER_ROOT,

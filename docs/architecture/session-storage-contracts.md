@@ -102,8 +102,8 @@ so property insertion order cannot change its canonical UTF-8 bytes.
 ## Fixed Worker Layout
 
 The storage backend returns a host-local directory only after establishing the
-writer fence. The rootless launcher bind-mounts that directory with private
-propagation:
+writer fence. The rootless launcher bind-mounts that directory with recursively
+private (`rprivate`) propagation:
 
 ```text
 host-local fenced directory    rootless worker
@@ -119,7 +119,7 @@ The runner-neutral worker template fixes:
 - `cwd=/session/workspace`;
 - `CODEX_HOME=/session/codex-home`;
 - `CODEX_SQLITE_HOME=/session/codex-home`;
-- a read-write private bind at `/session`;
+- a read-write `rprivate` bind at `/session`;
 - a rootless container boundary; and
 - Codex `danger-full-access` inside that container.
 
