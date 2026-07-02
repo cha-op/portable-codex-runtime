@@ -29,22 +29,22 @@ export const CHECKPOINT_CLASSES = Object.freeze([
 ]);
 export const CHECKPOINT_CLASS_POLICIES = deepFreeze({
   clean: {
+    captureBoundary: "storage-barrier",
     explicitAbortMarker: "not-required",
-    requiresStorageBarrier: true,
     requiresTailRepair: false,
     writerBoundary: "stopped",
     writableResume: "after-new-lease",
   },
   "graceful-abort": {
+    captureBoundary: "storage-barrier",
     explicitAbortMarker: "required",
-    requiresStorageBarrier: true,
     requiresTailRepair: false,
     writerBoundary: "stopped",
     writableResume: "after-new-lease",
   },
   "crash-prefix": {
+    captureBoundary: "atomic-crash-capture",
     explicitAbortMarker: "must-not-infer",
-    requiresStorageBarrier: true,
     requiresTailRepair: true,
     writerBoundary: "stopped-or-fenced",
     writableResume: "after-tail-repair-and-new-lease",
@@ -661,6 +661,51 @@ export function assertStorageBackend(value) {
   return value;
 }
 
+function assertStorageMutationTarget(value, { operation, storageId }) {
+  const schemas = {
+    attach: ["attachmentId", "kind"],
+    checkpoint: ["artifactId", "checkpointId", "kind"],
+    destroy: ["kind", "storageId"],
+    detach: ["attachmentId", "kind"],
+    restore: ["artifactId", "checkpointId", "kind"],
+  };
+  assertExactObject(
+    value,
+    schemas[operation],
+    "invalid_storage_mutation",
+    "storage mutation target",
+  );
+  const expectedKind = {
+    attach: "attachment",
+    checkpoint: "checkpoint",
+    destroy: "storage",
+    detach: "attachment",
+    restore: "checkpoint",
+  }[operation];
+  ensure(
+    value.kind === expectedKind,
+    "invalid_storage_mutation",
+    "storage mutation target kind is unsupported",
+  );
+  if (value.storageId !== undefined) {
+    assertOpaqueId(value.storageId, "invalid_storage_mutation", "target storage ID");
+    ensure(
+      value.storageId === storageId,
+      "invalid_storage_mutation",
+      "storage mutation target does not match storage ID",
+    );
+  }
+  if (value.checkpointId !== undefined) {
+    assertOpaqueId(value.checkpointId, "invalid_storage_mutation", "target checkpoint ID");
+  }
+  if (value.artifactId !== undefined) {
+    assertOpaqueId(value.artifactId, "invalid_storage_mutation", "target artifact ID");
+  }
+  if (value.attachmentId !== undefined) {
+    assertOpaqueId(value.attachmentId, "invalid_storage_mutation", "target attachment ID");
+  }
+}
+
 export function assertStorageMutationRequest(value) {
   assertExactObject(
     value,
@@ -674,6 +719,7 @@ export function assertStorageMutationRequest(value) {
       "operationId",
       "sessionId",
       "storageId",
+      "target",
     ],
     "invalid_storage_mutation",
     "storage mutation request",
@@ -697,6 +743,10 @@ export function assertStorageMutationRequest(value) {
     "invalid_storage_mutation",
     "storage mutation operation is unsupported",
   );
+  assertStorageMutationTarget(value.target, {
+    operation: value.operation,
+    storageId: value.storageId,
+  });
   return deepFreeze(
     defensiveClone(value, "invalid_storage_mutation", "storage mutation request"),
   );
@@ -760,6 +810,7 @@ export function assertStorageMutationResult(value, { request } = {}) {
       "sessionId",
       "status",
       "storageId",
+      "target",
     ],
     "invalid_storage_mutation",
     "storage mutation result",
@@ -775,6 +826,7 @@ export function assertStorageMutationResult(value, { request } = {}) {
     operationId: value.operationId,
     sessionId: value.sessionId,
     storageId: value.storageId,
+    target: value.target,
   });
   assertOpaqueId(value.proofId, "invalid_storage_mutation", "mutation proof ID");
   ensure(
@@ -789,7 +841,15 @@ export function assertStorageMutationResult(value, { request } = {}) {
     "storage mutation result status is unsupported",
   );
   ensure(
-    Object.keys(expected).every((key) => expected[key] === actualRequest[key]),
+    Object.keys(expected).every((key) => {
+      if (key !== "target") return expected[key] === actualRequest[key];
+      return (
+        Object.keys(expected.target).length === Object.keys(actualRequest.target).length &&
+        Object.keys(expected.target).every(
+          (targetKey) => expected.target[targetKey] === actualRequest.target[targetKey],
+        )
+      );
+    }),
     "stale_fence",
     "storage mutation result does not match its request",
   );
@@ -873,6 +933,11 @@ export function assertCheckpointDescriptor(value, { manifest, storageRef } = {})
   assertUuid(value.sessionId, "invalid_checkpoint", "checkpoint session ID");
   assertUuid(value.codexThreadId, "invalid_checkpoint", "checkpoint Codex thread ID");
   assertUuid(value.codexSessionId, "invalid_checkpoint", "checkpoint Codex session-tree ID");
+  ensure(
+    value.codexThreadId === value.codexSessionId,
+    "invalid_checkpoint",
+    "checkpoint must identify the root Codex thread",
+  );
   ensure(
     typeof value.imageDigest === "string" && OCI_DIGEST_PATTERN.test(value.imageDigest),
     "invalid_checkpoint",

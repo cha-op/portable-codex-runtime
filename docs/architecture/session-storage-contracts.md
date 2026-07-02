@@ -175,16 +175,20 @@ expired lease or renew from a stale control-plane record.
 
 Every mutating backend request carries the complete writer identity:
 `sessionId`, `leaseId`, `holderId`, `fencingEpoch`, and an idempotent operation
-ID. The backend must compare that tuple atomically with its canonical state as
-part of the mutation. Calling `assertCanonicalFenceMatch()` and then performing
-an unrelated write is only structural validation and remains a TOCTOU bug.
-Executable request and result validators bind the operation, operation ID, full
-writer tuple, status, and backend proof. The snapshot comparison helper also
-checks the portable storage reference, but remains non-atomic and
-non-authorizing. A concrete adapter must repeat the storage-reference and
-writer-tuple comparison atomically with its mutation. Its conformance test must
-show that epoch-1 checkpoint, detach, and destroy requests fail after an
-epoch-2 takeover.
+ID. It also carries an operation-specific target: attachment ID for
+attach/detach, checkpoint plus artifact IDs for
+capture/restore, and storage ID for destroy. The backend must bind the operation
+ID to that target and compare the writer tuple atomically with its canonical
+state as part of the mutation. Calling `assertCanonicalFenceMatch()` and then
+performing an unrelated write is only structural validation and remains a
+TOCTOU bug. Executable request and result validators bind the operation, target,
+operation ID, full writer tuple, status, and backend proof. The snapshot
+comparison helper also checks the portable storage reference, but remains
+non-atomic and non-authorizing. A concrete adapter must repeat the
+storage-reference and writer-tuple comparison atomically with its mutation. Its
+conformance test must show that epoch-1 checkpoint, detach, and destroy requests
+fail after an epoch-2 takeover, and that reusing an operation ID with a different
+target fails.
 
 Lease expiry closes control-plane admission; it does not prove that a stale
 host stopped writing. Automatic takeover requires either a storage-native
@@ -192,15 +196,16 @@ epoch/reservation that rejects the old writer or verified revocation/detach of
 the old attachment. Without that proof, the session remains `BLOCKED` and a new
 writer must not start.
 
-After expiry, only an exact-owner detach for the unchanged canonical tuple may
-continue as cleanup. Checkpoint, destroy, restore, or other mutations cannot use
-the expired-lease exception. Force-fence is intentionally not represented by
-the generic mutation envelope: a concrete adapter must define a transition
-that identifies the revoked old tuple, advances to a distinct new canonical
-epoch, and returns provider evidence that the old attachment can no longer
-write. Once that transition advances the epoch, even the old detach is stale
-and must not affect the new attachment. A `manual` backend cannot provide this
-proof and therefore cannot automatically fail over.
+After expiry, only an exact-owner detach for the unchanged canonical tuple and
+explicit attachment target may continue as cleanup. Checkpoint, destroy,
+restore, or other mutations cannot use the expired-lease exception. Force-fence
+is intentionally not represented by the generic mutation envelope: a concrete
+adapter must define a transition that identifies the revoked old tuple,
+advances to a distinct new canonical epoch, and returns provider evidence that
+the old attachment can no longer write. Once that transition advances the
+epoch, even the old detach is stale and must not affect the new attachment. A
+`manual` backend cannot provide this proof and therefore cannot automatically
+fail over.
 
 The canonical lifecycle is:
 
@@ -265,8 +270,9 @@ Checkpoint capture is separate from attachment release:
 | `crash-prefix` | Process stopped or conclusively fenced; atomic crash-consistent volume capture | Tail repair, then new lease |
 
 The executable policy records this distinction as `writerBoundary: "stopped"`
-for `clean` and `graceful-abort`, and
-`writerBoundary: "stopped-or-fenced"` for `crash-prefix`.
+plus `captureBoundary: "storage-barrier"` for `clean` and `graceful-abort`, and
+`writerBoundary: "stopped-or-fenced"` plus
+`captureBoundary: "atomic-crash-capture"` for `crash-prefix`.
 
 A `crash-prefix` checkpoint must not invent the explicit abort marker seen
 after `turn/interrupt`. Its descriptor records the observed source epoch for

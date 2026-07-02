@@ -142,6 +142,22 @@ function storageBackend({ atomicPointInTimeCheckpoint = true } = {}) {
 }
 
 function mutationRequest(overrides = {}) {
+  const operation = overrides.operation ?? "checkpoint";
+  const targets = {
+    attach: { attachmentId: "attachment-001", kind: "attachment" },
+    checkpoint: {
+      artifactId: "artifact-001",
+      checkpointId: "checkpoint-001",
+      kind: "checkpoint",
+    },
+    destroy: { kind: "storage", storageId: "volume-001" },
+    detach: { attachmentId: "attachment-001", kind: "attachment" },
+    restore: {
+      artifactId: "artifact-001",
+      checkpointId: "checkpoint-001",
+      kind: "checkpoint",
+    },
+  };
   return {
     contractVersion: 1,
     backendId: "single-attach-test",
@@ -150,8 +166,9 @@ function mutationRequest(overrides = {}) {
     leaseId: "lease-001",
     holderId: "host-001",
     fencingEpoch: "9007199254740993",
-    operation: "checkpoint",
-    operationId: "operation-checkpoint-001",
+    operation,
+    operationId: `operation-${operation}-001`,
+    target: targets[operation],
     ...overrides,
   };
 }
@@ -465,6 +482,54 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
       assertStorageMutationResult({ ...result, status: "detached" }, { request }),
     assertCode("invalid_storage_mutation"),
   );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        {
+          ...result,
+          target: {
+            artifactId: "artifact-001",
+            checkpointId: "checkpoint-002",
+            kind: "checkpoint",
+          },
+        },
+        { request },
+      ),
+    assertCode("stale_fence"),
+  );
+  for (const [operation, target] of [
+    ["attach", { attachmentId: "attachment-001", kind: "attachment" }],
+    [
+      "checkpoint",
+      {
+        artifactId: "artifact-001",
+        checkpointId: "checkpoint-001",
+        kind: "checkpoint",
+      },
+    ],
+    ["destroy", { kind: "storage", storageId: "volume-001" }],
+    ["detach", { attachmentId: "attachment-001", kind: "attachment" }],
+    [
+      "restore",
+      {
+        artifactId: "artifact-001",
+        checkpointId: "checkpoint-001",
+        kind: "checkpoint",
+      },
+    ],
+  ]) {
+    assert.deepEqual(assertStorageMutationRequest(mutationRequest({ operation })).target, target);
+  }
+  assert.throws(
+    () =>
+      assertStorageMutationRequest(
+        mutationRequest({
+          operation: "detach",
+          target: { attachmentId: "attachment-001", kind: "checkpoint" },
+        }),
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
   const takeover = lease({
     leaseId: "lease-002",
     fencingEpoch: "9007199254740994",
@@ -518,8 +583,8 @@ test("checkpoint classes preserve graceful versus crash recovery semantics", () 
   assert.deepEqual(assertCheckpointClass("clean"), "clean");
   assert.equal(checkpointClassPolicy("graceful-abort").explicitAbortMarker, "required");
   assert.deepEqual(checkpointClassPolicy("crash-prefix"), {
+    captureBoundary: "atomic-crash-capture",
     explicitAbortMarker: "must-not-infer",
-    requiresStorageBarrier: true,
     requiresTailRepair: true,
     writerBoundary: "stopped-or-fenced",
     writableResume: "after-tail-repair-and-new-lease",
@@ -543,6 +608,13 @@ test("checkpoint descriptor binds immutable session identity but never restores 
   assert.equal(Object.hasOwn(descriptor, "expiresAt"), false);
   assert.equal(Object.hasOwn(descriptor, "proofId"), false);
   assert.equal(Object.hasOwn(descriptor, "stopProof"), false);
+  assert.throws(
+    () =>
+      assertCheckpointDescriptor(
+        checkpoint({ codexThreadId: "019f2100-0000-7000-8000-000000000099" }),
+      ),
+    assertCode("invalid_checkpoint"),
+  );
   for (const invalid of [
     checkpoint({ codexThreadId: "019f2100-0000-7000-8000-000000000099" }),
     checkpoint({ imageDigest: `sha256:${"b".repeat(64)}` }),
