@@ -317,6 +317,10 @@ test("lease renewal preserves the writer fence and extends authority time", () =
     now: Date.parse("2026-07-02T12:00:00.000Z"),
   };
   assert.deepEqual(assertLeaseRenewal(before, after, renewalOptions), after);
+  assert.throws(
+    () => assertLeaseRenewal(before, after),
+    assertCode("invalid_fence"),
+  );
   for (const invalid of [
     lease({ leaseId: "lease-002", expiresAt: "2026-07-02T12:01:00.000Z" }),
     lease({ fencingEpoch: "9007199254740994", expiresAt: "2026-07-02T12:01:00.000Z" }),
@@ -478,6 +482,10 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
   };
   assert.deepEqual(assertStorageMutationResult(result, { request }), result);
   assert.throws(
+    () => assertStorageMutationResult(result),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
     () =>
       assertStorageMutationResult({ ...result, status: "detached" }, { request }),
     assertCode("invalid_storage_mutation"),
@@ -556,6 +564,19 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
     }),
     mutationRequest({ operation: "detach" }),
   );
+  for (const allowExpired of ["false", 1]) {
+    assert.throws(
+      () =>
+        assertStorageMutationMatchesLeaseSnapshot({
+          allowExpired,
+          canonicalLease: lease(),
+          now: Date.parse(lease().expiresAt),
+          request: mutationRequest({ operation: "detach" }),
+          storageRef: storageRef(),
+        }),
+      assertCode("invalid_storage_mutation"),
+    );
+  }
   assert.throws(
     () =>
       assertStorageMutationMatchesLeaseSnapshot({

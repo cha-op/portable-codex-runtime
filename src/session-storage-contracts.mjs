@@ -476,7 +476,14 @@ export function assertLeaseGrant(value) {
   return deepFreeze(defensiveClone(value, "invalid_fence", "lease grant"));
 }
 
-export function assertLeaseRenewal(previous, next, { canonical, now } = {}) {
+export function assertLeaseRenewal(previous, next, options) {
+  assertExactObject(
+    options,
+    ["canonical", "now"],
+    "invalid_fence",
+    "lease renewal options",
+  );
+  const { canonical, now } = options;
   const before = assertLeaseGrant(previous);
   const after = assertLeaseGrant(next);
   const current = assertLeaseGrant(canonical);
@@ -763,6 +770,11 @@ export function assertStorageMutationMatchesLeaseSnapshot({
   request,
   storageRef,
 }) {
+  ensure(
+    typeof allowExpired === "boolean",
+    "invalid_storage_mutation",
+    "allowExpired must be a boolean",
+  );
   const mutation = assertStorageMutationRequest(request);
   const canonical = assertLeaseGrant(canonicalLease);
   const storage = assertSessionStorageRef(storageRef);
@@ -795,7 +807,14 @@ export function assertStorageMutationMatchesLeaseSnapshot({
   return mutation;
 }
 
-export function assertStorageMutationResult(value, { request } = {}) {
+export function assertStorageMutationResult(value, options) {
+  assertExactObject(
+    options,
+    ["request"],
+    "invalid_storage_mutation",
+    "storage mutation result options",
+  );
+  const { request } = options;
   assertExactObject(
     value,
     [
