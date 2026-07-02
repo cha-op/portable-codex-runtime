@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   realpath,
   statfs,
 } from "node:fs/promises";
@@ -14,6 +15,7 @@ import { acquireAdvisoryLock } from "./advisory-lock.mjs";
 import {
   FilesystemOperationJournal,
   OperationJournalError,
+  snapshotOperationJournalBinding,
 } from "./filesystem-operation-journal.mjs";
 import {
   assertCheckpointDescriptor,
@@ -248,6 +250,10 @@ function pathIsAtOrInside(root, candidate) {
   return candidate === root || pathIsInside(root, candidate);
 }
 
+function pathsAreDisjoint(left, right) {
+  return !pathIsAtOrInside(left, right) && !pathIsAtOrInside(right, left);
+}
+
 function rootIdentity(authority) {
   return Object.freeze({
     device: authority.identity.dev.toString(),
@@ -301,6 +307,20 @@ async function inspectPath(
     if (error?.code === "ENOENT") return null;
     fail(code, commitState);
   }
+}
+
+async function assertDirectoryIdentity(path, expected, code, commitState) {
+  let current;
+  try {
+    current = await lstat(path, { bigint: true });
+  } catch {
+    fail(code, commitState);
+  }
+  ensure(
+    current.isDirectory() && sameFileIdentity(current, expected),
+    code,
+    commitState,
+  );
 }
 
 async function assertPathAbsent(
@@ -369,6 +389,38 @@ function validateResult(request, value) {
     fail("invalid_publication_request");
   }
   return Object.freeze({ checkpoint, mutation });
+}
+
+function snapshotPublicationQueueInput(kind, normalized) {
+  const operationId = assertOpaqueId(normalized.operationId);
+  let request;
+  try {
+    request = assertStorageMutationRequest(normalized.request);
+  } catch {
+    fail("invalid_publication_request");
+  }
+  ensure(
+    request.operationId === operationId &&
+      ((kind === "checkpoint-artifact" && request.operation === "checkpoint") ||
+        (kind === "restore-destination" && request.operation === "restore")),
+    "invalid_publication_request",
+  );
+  let binding;
+  try {
+    binding = snapshotOperationJournalBinding(normalized.binding);
+  } catch {
+    fail("invalid_publication_request");
+  }
+  return Object.freeze({
+    artifactProof:
+      kind === "restore-destination"
+        ? normalizeArtifactProof(normalized.artifactProof)
+        : null,
+    binding,
+    operationId,
+    request,
+    result: validateResult(request, normalized.result),
+  });
 }
 
 function normalizeArtifactProof(value) {
@@ -810,13 +862,17 @@ export class StoppedDirectoryPublication {
       "sourceDirectory",
       "sourceOwnedRoot",
     ]);
+    const snapshot = snapshotPublicationQueueInput(
+      "checkpoint-artifact",
+      normalized,
+    );
     const publication = {
-      binding: normalized.binding,
+      binding: snapshot.binding,
       finalDirectory: normalized.artifactDirectory,
       kind: "checkpoint-artifact",
-      operationId: normalized.operationId,
-      request: normalized.request,
-      result: normalized.result,
+      operationId: snapshot.operationId,
+      request: snapshot.request,
+      result: snapshot.result,
       sourceDirectory: normalized.sourceDirectory,
       sourceOwnedRoot: normalized.sourceOwnedRoot,
       targetOwnedRoot: normalized.artifactOwnedRoot,
@@ -837,14 +893,18 @@ export class StoppedDirectoryPublication {
       "request",
       "result",
     ]);
+    const snapshot = snapshotPublicationQueueInput(
+      "restore-destination",
+      normalized,
+    );
     const publication = {
-      binding: normalized.binding,
-      artifactProof: normalized.artifactProof,
+      binding: snapshot.binding,
+      artifactProof: snapshot.artifactProof,
       finalDirectory: normalized.destinationDirectory,
       kind: "restore-destination",
-      operationId: normalized.operationId,
-      request: normalized.request,
-      result: normalized.result,
+      operationId: snapshot.operationId,
+      request: snapshot.request,
+      result: snapshot.result,
       sourceDirectory: normalized.artifactDirectory,
       sourceOwnedRoot: normalized.artifactOwnedRoot,
       targetOwnedRoot: normalized.destinationOwnedRoot,
@@ -892,10 +952,10 @@ export class StoppedDirectoryPublication {
         fail("invalid_publication_request");
       }
       ensure(
-        sourceAuthority.path === targetAuthority.path ||
-          (!pathIsInside(sourceAuthority.path, targetAuthority.path) &&
-            !pathIsInside(targetAuthority.path, sourceAuthority.path) &&
-            !sameFileIdentity(sourceAuthority.identity, targetAuthority.identity)),
+        sourceAuthority.path !== targetAuthority.path &&
+          !pathIsInside(sourceAuthority.path, targetAuthority.path) &&
+          !pathIsInside(targetAuthority.path, sourceAuthority.path) &&
+          !sameFileIdentity(sourceAuthority.identity, targetAuthority.identity),
         "invalid_publication_request",
       );
       const source = await inspectDirectDirectory(
@@ -948,9 +1008,12 @@ export class StoppedDirectoryPublication {
         "uncertain",
       );
       ensure(
-        !pathIsAtOrInside(source.path, journalAuthority.path) &&
-          !pathIsAtOrInside(candidatePath, journalAuthority.path) &&
-          !pathIsAtOrInside(finalPath, journalAuthority.path) &&
+        pathsAreDisjoint(sourceAuthority.path, journalAuthority.path) &&
+          pathsAreDisjoint(targetAuthority.path, journalAuthority.path) &&
+          (sourceAuthority.identity.dev.toString() !== journalAuthority.device ||
+            sourceAuthority.identity.ino.toString() !== journalAuthority.inode) &&
+          (targetAuthority.identity.dev.toString() !== journalAuthority.device ||
+            targetAuthority.identity.ino.toString() !== journalAuthority.inode) &&
           (source.identity === null ||
             source.identity.dev.toString() !== journalAuthority.device ||
             source.identity.ino.toString() !== journalAuthority.inode),
@@ -1338,6 +1401,12 @@ export class StoppedDirectoryPublication {
     let sourceOwnedRoot = sourceAuthority.path;
     let sourceDigest;
     let artifactManifestDigest;
+    await assertDirectoryIdentity(
+      source.path,
+      source.identity,
+      "publication_integrity_failed",
+      "not-committed",
+    );
     if (kind === "restore-destination") {
       const manifest = await readArtifactManifest(
         join(source.path, "artifact.json"),
@@ -1370,6 +1439,12 @@ export class StoppedDirectoryPublication {
       artifactManifestDigest = sha256("pending-artifact-manifest\0", operationId);
     }
     await runFault(this.#faults.afterSourceBarrier);
+    await assertDirectoryIdentity(
+      source.path,
+      source.identity,
+      "publication_integrity_failed",
+      "not-committed",
+    );
 
     if (kind === "checkpoint-artifact") {
       await createPrivateDirectory(candidatePath);
@@ -1381,6 +1456,7 @@ export class StoppedDirectoryPublication {
         destination: payload,
         destinationOwnedRoot: candidatePath,
         forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
+        expectedSourceRootIdentity: source.identity,
         source: source.path,
         sourceOwnedRoot: sourceAuthority.path,
       });
@@ -1465,6 +1541,15 @@ export class StoppedDirectoryPublication {
   }) {
     try {
       if (kind === "checkpoint-artifact") {
+        const entries = await readdir(path, { encoding: "buffer" });
+        const artifactName = Buffer.from("artifact.json");
+        const payloadName = Buffer.from("payload");
+        ensure(
+          entries.length === 2 &&
+            entries.some((entry) => entry.equals(artifactName)) &&
+            entries.some((entry) => entry.equals(payloadName)),
+          "publication_integrity_failed",
+        );
         const manifest = await readArtifactManifest(join(path, "artifact.json"), checkpoint);
         const digest = await digestTree(join(path, "payload"));
         ensure(

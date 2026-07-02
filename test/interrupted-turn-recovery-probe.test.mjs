@@ -1194,6 +1194,32 @@ test("source identity pre-scan failures retain the created destination", async (
   }
 });
 
+test("stopped-tree copy can require the caller-observed source identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-expected-source-test-"));
+  try {
+    const source = join(root, "source");
+    const displaced = join(root, "displaced");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    const expectedSourceRootIdentity = await lstat(source, { bigint: true });
+    await rename(source, displaced);
+    await mkdir(source);
+
+    await assert.rejects(
+      copyStoppedTree({
+        destination,
+        expectedSourceRootIdentity,
+        ownedRoot: root,
+        source,
+      }),
+      /rejects source root identity changes/,
+    );
+    await assert.rejects(lstat(destination), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "portable tree operations reject and clean up non-UTF-8 directory entries",
   { skip: platform() !== "linux" },

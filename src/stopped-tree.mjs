@@ -1183,6 +1183,7 @@ export async function copyStoppedTreeBetweenRoots({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  expectedSourceRootIdentity = null,
   forbiddenAbsoluteSymlinkAuthorities = [],
   inspectOwnedRootAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
   inspectOwnedRootAcl = recoveryPathHasExtendedAcl,
@@ -1194,6 +1195,15 @@ export async function copyStoppedTreeBetweenRoots({
     "boolean",
     "allowAbsoluteSymlinks must be a boolean",
   );
+  if (expectedSourceRootIdentity !== null) {
+    assert(
+      expectedSourceRootIdentity !== undefined &&
+        typeof expectedSourceRootIdentity === "object" &&
+        integerAsBigInt(expectedSourceRootIdentity.dev) !== null &&
+        integerAsBigInt(expectedSourceRootIdentity.ino) !== null,
+      "expectedSourceRootIdentity must be a filesystem identity",
+    );
+  }
   assert.equal(
     typeof allowSourceRootMount,
     "boolean",
@@ -1282,7 +1292,9 @@ export async function copyStoppedTreeBetweenRoots({
     const canonicalSourceRoot = await realpath(canonicalSource);
     const sourceRootIdentity = await lstat(canonicalSource, { bigint: true });
     assert(
-      sourceRootIdentity.isDirectory(),
+      sourceRootIdentity.isDirectory() &&
+        (expectedSourceRootIdentity === null ||
+          sameFileIdentity(sourceRootIdentity, expectedSourceRootIdentity)),
       "stopped-tree copy rejects source root identity changes",
     );
     await assertNoMountBoundary(canonicalSource, listMountPoints, {

@@ -29,8 +29,10 @@ The stopped-directory publication layer additionally uses
 `syncStoppedTree()`. The two-root copy retains a pinned authority for each
 private root, rejects root aliases and nesting, and allows a trusted adapter to
 declare the source root itself as its approved mount while still rejecting
-nested mounts. These are publication-building primitives, not independent
-backend authority.
+nested mounts. A caller may also require the source root to retain an
+already-observed device/inode identity, reject every absolute symlink, or deny
+absolute-link traversal into explicit path and device/inode authorities. These
+are publication-building primitives, not independent backend authority.
 
 These functions operate only after an external coordinator has stopped the
 writer. They do not stop a process, authenticate stopped-writer evidence, or

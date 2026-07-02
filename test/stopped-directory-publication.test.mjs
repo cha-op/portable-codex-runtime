@@ -458,6 +458,74 @@ test("the journal directory cannot be captured inside the source tree", async (t
   assert.equal(await pathExists(fixture.artifactDirectory), false);
 });
 
+test("the journal authority cannot also be the publication root", async (t) => {
+  const fixture = await createFixture(t);
+  const artifactDirectory = join(fixture.journalDirectory, "published-artifact");
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(
+      captureOptions(fixture, {
+        artifactDirectory,
+        artifactOwnedRoot: fixture.journalDirectory,
+      }),
+    ),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "uncertain",
+      ),
+  );
+  assert.equal(await pathExists(artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
+});
+
+test("a source identity alias of the journal authority is rejected", async (t) => {
+  const fixture = await createFixture(t);
+  const sourceIdentity = await lstat(fixture.sourceDirectory, { bigint: true });
+  const journalPath = await realpath(fixture.journalDirectory);
+  class SourceAliasedJournal extends FilesystemOperationJournal {
+    async describeAuthority() {
+      return Object.freeze({
+        device: sourceIdentity.dev.toString(),
+        inode: sourceIdentity.ino.toString(),
+        path: journalPath,
+      });
+    }
+  }
+  const journal = new SourceAliasedJournal({
+    directory: fixture.journalDirectory,
+    acquireLock: simpleLockProvider(),
+    ...TRUSTED_JOURNAL_ACL_INSPECTORS,
+  });
+  const publication = new StoppedDirectoryPublication({
+    journal,
+    acquireLock: simpleLockProvider(),
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      type: "test-local",
+    }),
+  });
+
+  await assert.rejects(
+    publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "uncertain",
+      ),
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
+});
+
 test("checkpoint copy rejects absolute symlinks into the journal authority", async (t) => {
   const fixture = await createFixture(t);
   const recordPath = join(
@@ -647,6 +715,25 @@ test("an exact committed replay returns the fixed result without recopying", asy
   assert.equal(replayedIdentity.ino, artifactIdentity.ino);
 });
 
+test("committed checkpoint replay rejects extra bundle-root entries", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  await writeFile(join(fixture.artifactDirectory, "extra"), "unexpected\n", {
+    mode: 0o600,
+  });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
+  );
+});
+
 test("a missing committed artifact remains classified as committed corruption", async (t) => {
   const fixture = await createFixture(t);
   const options = captureOptions(fixture);
@@ -717,10 +804,20 @@ test("exact concurrent retries serialize by publication-root identity", async (t
       },
     },
   });
-  const options = captureOptions(fixture);
+  const mutableBinding = binding(
+    "checkpoint",
+    CAPTURE_OPERATION_ID,
+    "volume-001",
+    { metadata: { lane: "original" } },
+  );
+  const options = captureOptions(fixture, { binding: mutableBinding });
   const first = fixture.publication.publishCheckpointArtifact(options);
   await firstPrepared;
   const second = fixture.publication.publishCheckpointArtifact(options);
+  mutableBinding.metadata.lane = "mutated";
+  options.request.target.checkpointId = "mutated-checkpoint";
+  options.result.checkpoint.checkpointId = "mutated-checkpoint";
+  options.result.mutation.operationId = "mutated-operation";
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(activeLocks, 1);
   releaseFirst();
@@ -731,6 +828,13 @@ test("exact concurrent retries serialize by publication-root identity", async (t
     outcomes.map((outcome) => outcome.replayed).sort(),
     [false, true],
   );
+  const record = (
+    await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })
+  ).record;
+  assert.equal(record.binding.coordinator.metadata.lane, "original");
+  assert.equal(record.request.target.checkpointId, CHECKPOINT_ID);
+  assert.equal(record.result.checkpoint.checkpointId, CHECKPOINT_ID);
+  assert.equal(record.result.mutation.operationId, CAPTURE_OPERATION_ID);
 });
 
 test("an existing final artifact is preserved without replacement", async (t) => {
@@ -751,6 +855,31 @@ test("an existing final artifact is preserved without replacement", async (t) =>
 
   assert.equal(await readFile(sentinel, "utf8"), "preserve\n");
   assert.equal((await lstat(fixture.artifactDirectory)).isDirectory(), true);
+});
+
+test("source and publication roots must be distinct before journaling", async (t) => {
+  const fixture = await createFixture(t);
+  const artifactDirectory = join(fixture.sourceOwnedRoot, "artifact");
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(
+      captureOptions(fixture, {
+        artifactDirectory,
+        artifactOwnedRoot: fixture.sourceOwnedRoot,
+      }),
+    ),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
 });
 
 test("a second operation ID cannot adopt an existing published artifact", async (t) => {
@@ -1378,6 +1507,37 @@ test("coordinator bindings preserve an own __proto__ key for conflict checks", a
       captureOptions(fixture, { binding: conflictingBinding }),
     ),
     (error) => assertPublicationError(error, "publication_conflict"),
+  );
+});
+
+test("checkpoint capture rejects source replacement after its barrier", async (t) => {
+  let fixture;
+  const displaced = "displaced-source";
+  fixture = await createFixture(t, {
+    faults: {
+      async afterSourceBarrier() {
+        await rename(fixture.sourceDirectory, join(fixture.sourceOwnedRoot, displaced));
+        await mkdir(fixture.sourceDirectory, { mode: 0o700 });
+        await writeFile(join(fixture.sourceDirectory, "replacement"), "foreign\n", {
+          mode: 0o600,
+        });
+      },
+    },
+  });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_integrity_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
   );
 });
 

@@ -365,6 +365,20 @@ function canonicalEqual(left, right) {
   return canonicalBytes(left) === canonicalBytes(right);
 }
 
+export function snapshotOperationJournalBinding(value) {
+  const binding = canonicalize(
+    value,
+    "invalid_journal_request",
+    canonicalTraversalState({ bytes: 0, nodes: 0 }),
+  );
+  ensure(
+    binding !== null && typeof binding === "object" && !Array.isArray(binding),
+    "invalid_journal_request",
+  );
+  canonicalBytes(binding);
+  return deepFreeze(binding);
+}
+
 function normalizeResult(value, request, code, budget) {
   const envelope = exactOptions(value, ["checkpoint", "mutation"], ["checkpoint", "mutation"], code);
   let checkpoint;

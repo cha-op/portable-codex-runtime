@@ -38,6 +38,10 @@ superseded_by:
   identity are durably bound to the operation, and publication rejects all
   absolute source symlinks so mutable host aliases cannot redirect a portable
   artefact into the journal authority after validation.
+- Public inputs are deeply snapshotted before queueing; source and publication
+  roots are distinct and journal-disjoint; source root identity is preserved
+  across the barrier and copy; and checkpoint replay requires an exact
+  two-entry bundle root.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

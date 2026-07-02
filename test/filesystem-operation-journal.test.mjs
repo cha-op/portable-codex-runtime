@@ -21,6 +21,7 @@ import {
   OPERATION_JOURNAL_RECORD_VERSION,
   OperationJournalError,
   operationJournalRecordFilename,
+  snapshotOperationJournalBinding,
 } from "../src/filesystem-operation-journal.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
@@ -38,6 +39,19 @@ function operationTemporaryRecordFilename(operationId) {
 const TRUSTED_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
   inspectDirectoryAcl: async () => false,
+});
+
+test("journal binding snapshots detach and freeze nested caller state", () => {
+  const source = {
+    backendId: "single-attach-test",
+    metadata: { lane: "original" },
+  };
+  const snapshot = snapshotOperationJournalBinding(source);
+  source.metadata.lane = "mutated";
+
+  assert.equal(snapshot.metadata.lane, "original");
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.metadata), true);
 });
 
 function binding(overrides = {}) {

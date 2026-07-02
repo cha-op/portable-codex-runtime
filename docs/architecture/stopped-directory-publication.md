@@ -50,7 +50,9 @@ permission bits, and supported symlink targets.
 
 Restore validates the bundle manifest and copies only `payload/`. Its final
 published directory is the restored payload tree itself; `artifact.json` is
-not inserted into the session filesystem.
+not inserted into the session filesystem. Checkpoint bundle verification
+requires the root to contain exactly `artifact.json` and `payload/`; an extra
+root entry is committed-state corruption rather than ignored metadata.
 
 Restore does not trust the bundle to authenticate itself. The caller must
 supply the capture operation ID, portable payload digest, and canonical
@@ -73,10 +75,12 @@ portable checkpoint reference and must never be exposed to a worker.
 The publication root is a current-user-owned, mode `0700`, extended-ACL-free
 directory with a trusted ancestor chain. The implementation opens and pins the
 root by canonical path plus device/inode identity and revalidates its held
-directory handle around every mutation and callback. Source, staging, final,
-journal, and lock locations must not be ancestors, descendants, symlink
-aliases, hard-link aliases, or declared bind-mount aliases of one another in a
-way that collapses their roles.
+directory handle around every mutation and callback. Source and publication
+owned roots must be distinct and non-nested. Both roots must also be disjoint
+from the journal authority in either ancestor direction. Source, staging,
+final, journal, and lock locations must not otherwise be symlink aliases,
+hard-link aliases, or declared bind-mount aliases in a way that collapses
+their roles.
 
 The operation journal exposes its pinned canonical directory and device/inode
 identity only to this physical layer. Publication rejects a journal directory
@@ -101,6 +105,12 @@ publication-root lock -> filesystem operation journal lock
 ```
 
 No code path may acquire these locks in the opposite order.
+
+The public call synchronously validates and defensively snapshots the complete
+coordinator binding, storage request, checkpoint result, and restore proof
+before its first asynchronous publication-root lookup or queue wait. Caller
+mutation after invocation therefore cannot change the later durable journal
+record.
 
 The source and destination trees reject nested mount points. A backend that
 permits the declared source root itself to be a mounted volume must distinguish
@@ -129,7 +139,9 @@ authority through the complete sequence:
 3. establish the stopped source storage barrier by opening and validating the
    tree, fsyncing regular files, and fsyncing directories in post-order so each
    directory is synced only after its descendants; symlink entries are made
-   durable by their containing directory;
+   durable by their containing directory; recheck that the source pathname
+   still names the caller-observed root inode both before and after the barrier,
+   and require that same identity when the copy opens its source root;
 4. create the operation's deterministic private staging directory with
    exclusive creation and copy either the stopped source into a checkpoint
    bundle or the validated bundle payload into a restore tree;
