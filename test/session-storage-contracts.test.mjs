@@ -19,6 +19,7 @@ import {
   assertLeaseRenewal,
   assertResolvedPlatformImageMatchesManifest,
   assertSessionAttachment,
+  assertSessionAttachmentMatches,
   assertSessionManifest,
   assertSessionProvisionRequest,
   assertSessionProvisionResult,
@@ -502,6 +503,15 @@ test("storage references and attachments contain no host path in portable state"
 
 test("rootless worker template is structural and fixed-layout", () => {
   const currentLease = lease();
+  const matched = assertSessionAttachmentMatches({
+    attachment: attachment(),
+    lease: currentLease,
+    manifest: sessionManifest(),
+    storageRef: storageRef(),
+  });
+  assert.equal(matched.attachment.rootPath, attachment().rootPath);
+  assert.equal(matched.lease.fencingEpoch, currentLease.fencingEpoch);
+  assert(Object.isFrozen(matched));
   const template = createRootlessWorkerTemplate({
     attachment: attachment(),
     lease: currentLease,
@@ -954,6 +964,36 @@ test("portable record validators reject accessor fields before validation or clo
     () => assertLeaseGrant({ ...lease(), [Symbol("authority")]: "not-authority" }),
     assertCode("invalid_fence"),
   );
+});
+
+test("portable record validators reject hostile proxies without invoking traps", () => {
+  let traps = 0;
+  const forged = new SessionStorageContractError(
+    "forged_contract_error",
+    "secret forged contract detail",
+  );
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        traps += 1;
+        throw forged;
+      },
+      ownKeys() {
+        traps += 1;
+        throw forged;
+      },
+    },
+  );
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+
+  assert.throws(() => assertSessionManifest(hostile), assertCode("invalid_session_manifest"));
+  assert.throws(
+    () => assertSessionManifest(revoked.proxy),
+    assertCode("invalid_session_manifest"),
+  );
+  assert.equal(traps, 0);
 });
 
 test("public option envelopes reject accessors before destructuring", () => {

@@ -73,6 +73,16 @@ not part of checkpoint correctness. See
 `docs/architecture/session-storage-contracts.md` for the state machine,
 backend interface, NFS/image constraints, and Codex source basis.
 
+## Snapshot and Restore Core
+
+The backend-neutral core orchestrates stopped-writer `clean` checkpoint
+capture and restore. It validates the manifest, storage, attachment, lease,
+and operation request, returns a portable descriptor only after a definite
+backend result, requires a restore epoch greater than the source epoch, and
+fails closed on every uncertain post-dispatch outcome. Atomic fence rechecks,
+storage barriers, durable idempotency, and physical capture or restore remain
+backend responsibilities. See `docs/architecture/snapshot-restore-core.md`.
+
 ## Interrupted-Turn Recovery
 
 The recovery probe starts a real Codex app-server against a held localhost

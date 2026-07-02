@@ -1,4 +1,5 @@
 import { isAbsolute, parse, resolve } from "node:path";
+import { types as utilTypes } from "node:util";
 
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
@@ -104,42 +105,59 @@ function defensiveClone(value, code, label) {
   }
 }
 
-function assertExactObject(value, keys, code, label) {
+function inspectPlainDataObject(value, code, label) {
+  if (
+    utilTypes.isProxy(value) ||
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    fail(code, `${label} must be a plain object`);
+  }
+  let prototype;
+  let actual;
+  try {
+    prototype = Object.getPrototypeOf(value);
+    actual = Reflect.ownKeys(value);
+  } catch {
+    fail(code, `${label} must be a plain object`);
+  }
   ensure(
-    value !== null &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      [Object.prototype, null].includes(Object.getPrototypeOf(value)),
+    [Object.prototype, null].includes(prototype),
     code,
     `${label} must be a plain object`,
   );
-  const actual = Reflect.ownKeys(value);
+  return actual;
+}
+
+function plainDataDescriptor(value, key, code, label) {
+  let descriptor;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    fail(code, `${label} fields must be enumerable plain data properties`);
+  }
+  ensure(
+    descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+    code,
+    `${label} fields must be enumerable plain data properties`,
+  );
+  return descriptor;
+}
+
+function assertExactObject(value, keys, code, label) {
+  const actual = inspectPlainDataObject(value, code, label);
   ensure(
     actual.length === keys.length &&
       actual.every((key) => typeof key === "string" && keys.includes(key)),
     code,
     `${label} contains unexpected or missing fields`,
   );
-  ensure(
-    actual.every((key) => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value");
-    }),
-    code,
-    `${label} fields must be enumerable plain data properties`,
-  );
+  for (const key of actual) plainDataDescriptor(value, key, code, label);
 }
 
 function assertOptionsObject(value, allowedKeys, requiredKeys, code, label) {
-  ensure(
-    value !== null &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      [Object.prototype, null].includes(Object.getPrototypeOf(value)),
-    code,
-    `${label} must be a plain object`,
-  );
-  const actual = Reflect.ownKeys(value);
+  const actual = inspectPlainDataObject(value, code, label);
   ensure(
     actual.every((key) => typeof key === "string" && allowedKeys.includes(key)) &&
       requiredKeys.every((key) => actual.includes(key)),
@@ -148,12 +166,7 @@ function assertOptionsObject(value, allowedKeys, requiredKeys, code, label) {
   );
   const normalized = Object.create(null);
   for (const key of actual) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    ensure(
-      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
-      code,
-      `${label} fields must be enumerable plain data properties`,
-    );
+    const descriptor = plainDataDescriptor(value, key, code, label);
     normalized[key] = descriptor.value;
   }
   return normalized;
@@ -762,7 +775,14 @@ export function assertSessionAttachment(value) {
   );
 }
 
-function assertAttachmentMatches({ attachment, lease, manifest, storageRef }) {
+export function assertSessionAttachmentMatches(options) {
+  const { attachment, lease, manifest, storageRef } = assertOptionsObject(
+    options,
+    ["attachment", "lease", "manifest", "storageRef"],
+    ["attachment", "lease", "manifest", "storageRef"],
+    "invalid_storage_attachment",
+    "session attachment match options",
+  );
   const sessionManifest = assertSessionManifest(manifest);
   const storage = assertSessionStorageRef(storageRef);
   const writerLease = assertLeaseGrant(lease);
@@ -779,7 +799,12 @@ function assertAttachmentMatches({ attachment, lease, manifest, storageRef }) {
     "stale_fence",
     "attachment does not match the current session writer fence",
   );
-  return { attachment: mounted, lease: writerLease, manifest: sessionManifest, storageRef: storage };
+  return deepFreeze({
+    attachment: mounted,
+    lease: writerLease,
+    manifest: sessionManifest,
+    storageRef: storage,
+  });
 }
 
 export function assertStorageBackend(value) {
@@ -1059,7 +1084,7 @@ export function createRootlessWorkerTemplate(options) {
     "invalid_worker_template",
     "rootless worker template options",
   );
-  const matched = assertAttachmentMatches({ attachment, lease, manifest, storageRef });
+  const matched = assertSessionAttachmentMatches({ attachment, lease, manifest, storageRef });
   return deepFreeze({
     agentPolicy: matched.manifest.agents,
     auth: {
