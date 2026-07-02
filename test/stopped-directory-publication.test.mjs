@@ -754,6 +754,98 @@ test("a missing committed artifact remains classified as committed corruption", 
   );
 });
 
+test("a missing publication root cannot downgrade committed replay", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  await rm(fixture.artifactOwnedRoot, { force: true, recursive: true });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+});
+
+test("a missing source root cannot downgrade committed replay", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+});
+
+test("malformed owned-root paths remain caller errors", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact({
+      ...options,
+      sourceOwnedRoot: "relative-source-root",
+    }),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact({
+      ...options,
+      artifactOwnedRoot: "relative-artifact-root",
+    }),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+});
+
+test("malformed committed materialization is committed-state corruption", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  const recordPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(CAPTURE_OPERATION_ID),
+  );
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  const materialization = record.materialization;
+  record.materialization = {
+    artifactManifestDigest: materialization.artifactManifestDigest,
+    contractVersion: materialization.contractVersion,
+    extra: true,
+    modeledDigest: materialization.modeledDigest,
+    publicationId: materialization.publicationId,
+    publicationKind: materialization.publicationKind,
+    stagedRoot: materialization.stagedRoot,
+  };
+  await writeFile(recordPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+});
+
 test("successful publication and committed replay release their publication locks", async (t) => {
   let releases = 0;
   const fixture = await createFixture(t, {
@@ -1273,6 +1365,117 @@ test("final mutation after readback cannot advance the journal to committed", as
         "uncertain",
       ),
   );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("same-byte callback rewrites pass through the final durability barriers", async (t) => {
+  let fixture;
+  fixture = await createFixture(t, {
+    faults: {
+      async beforeRename() {
+        const candidate = candidatePath(
+          fixture.artifactOwnedRoot,
+          CAPTURE_OPERATION_ID,
+          fixture.artifactDirectory,
+        );
+        await writeFile(
+          join(candidate, "payload", "workspace", "README.md"),
+          "portable\n",
+          { mode: 0o640 },
+        );
+      },
+      async beforeCommit() {
+        await writeFile(
+          join(fixture.artifactDirectory, "payload", "workspace", "README.md"),
+          "portable\n",
+          { mode: 0o640 },
+        );
+      },
+    },
+  });
+
+  const outcome = await fixture.publication.publishCheckpointArtifact(
+    captureOptions(fixture),
+  );
+  assert.equal(outcome.result.mutation.status, "checkpoint-created");
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
+  );
+});
+
+test("lock assertions run before the final candidate durability barrier", async (t) => {
+  let fixture;
+  let assertions = 0;
+  const baseLockProvider = simpleLockProvider();
+  fixture = await createFixture(t, {
+    acquireLock: async (...args) => {
+      const lock = await baseLockProvider(...args);
+      return {
+        ...lock,
+        async assertHeld() {
+          assertions += 1;
+          if (assertions !== 2) return;
+          const candidate = candidatePath(
+            fixture.artifactOwnedRoot,
+            CAPTURE_OPERATION_ID,
+            fixture.artifactDirectory,
+          );
+          await writeFile(
+            join(candidate, "payload", "workspace", "README.md"),
+            "portable\n",
+            { mode: 0o640 },
+          );
+        },
+      };
+    },
+  });
+
+  const outcome = await fixture.publication.publishCheckpointArtifact(
+    captureOptions(fixture),
+  );
+  assert.equal(outcome.result.mutation.status, "checkpoint-created");
+  assert.equal(assertions, 2);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
+  );
+});
+
+test("lock loss in the pre-rename callback prevents publication", async (t) => {
+  let lockHeld = true;
+  let renameCalls = 0;
+  const fixture = await createFixture(t, {
+    acquireLock: async () => ({
+      async assertHeld() {
+        if (!lockHeld) throw new Error("lock lost");
+      },
+      async release() {},
+      async renameWhileHeld() {
+        renameCalls += 1;
+      },
+    }),
+    faults: {
+      async beforeRename() {
+        lockHeld = false;
+      },
+    },
+  });
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_io_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(renameCalls, 0);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
     "materialized",

@@ -46,6 +46,11 @@ superseded_by:
   aliases before journal preparation or destination creation. Candidate state
   is re-synced and exactly revalidated after its last callback and before the
   journal may advance to `materialized`.
+- The last pre-rename and pre-commit callbacks are followed by complete tree
+  and parent durability barriers plus exact readback. Unavailable private roots
+  before journal discovery are uncertain while malformed root syntax remains a
+  caller error, and malformed persisted materialisation is classified as
+  journal or committed-state corruption.
 - Restart classification combines journal phase with deterministic staging and
   final topology. Rename, parent-sync, final-readback, and journal-commit
   uncertainty never downgrade to a pre-commit I/O failure.

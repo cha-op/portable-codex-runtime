@@ -161,16 +161,19 @@ authority through the complete sequence:
    means a complete, durable, unpublished staging object, not merely that copy
    returned;
 7. revalidate the publication root, lock, held staging inode, and absent final
-   destination, then ask the trusted lock holder to atomically rename staging
-   to final with an absent-destination precondition;
+   destination; after the last pre-rename callback, reassert the lock and repeat
+   the full staged-tree fsync, publication-parent sync, exact readback, and
+   pinned identity checks, then ask the trusted lock holder to atomically rename
+   staging to final with an absent-destination precondition;
 8. prove that the final pathname names the held staged inode, fsync the held
    publication parent, and perform exact held-inode, payload-digest, and
    `artifact.json` readback; restore readback verifies the payload digest and
    also verifies it against the source bundle manifest and trusted
    `artifactProof`;
 9. call `journal.commit()` with the exact materialisation metadata and wait for
-   its durable canonical readback, after repeating final identity and digest
-   readback once all fault/test callbacks have returned; and
+   its durable canonical readback, after repeating final-tree fsync,
+   publication-parent sync, identity, and exact digest readback once all
+   fault/test callbacks have returned; and
 10. only after the committed record is visible may a consumer replay the
     result or a launcher admit the restore destination.
 
@@ -240,6 +243,15 @@ confirm the journal commit is uncertain. Once physical publication has
 occurred, even a journal failure proven not to have advanced from
 `materialized` does not make the overall storage operation
 `not-committed`: the visible side effect requires reconciliation.
+
+If a syntactically valid replay cannot open or resolve the source/publication
+private roots before reading historical journal state, it is `uncertain`, not
+`not-committed`: an unavailable root cannot prove that an earlier exact
+operation did not commit. A non-absolute or non-normalized root remains a
+deterministic caller error. A malformed persisted materialisation is journal
+integrity failure while uncommitted and `published_state_invalid` when its
+record is already committed; it is never reclassified as a caller argument
+error.
 
 A lock-release or final-handle-close failure preserves the prior commit state.
 In particular, a failure after journal commit is a committed cleanup failure.

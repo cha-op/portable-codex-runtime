@@ -135,11 +135,16 @@ function ownEnumerableObject(value, code = "invalid_publication_request") {
   return Object.freeze(normalized);
 }
 
-function exactOptions(value, allowed, required = allowed) {
-  const options = ownEnumerableObject(value);
+function exactOptions(
+  value,
+  allowed,
+  required = allowed,
+  code = "invalid_publication_request",
+) {
+  const options = ownEnumerableObject(value, code);
   const keys = Object.keys(options);
-  ensure(keys.every((key) => allowed.includes(key)), "invalid_publication_request");
-  ensure(required.every((key) => Object.hasOwn(options, key)), "invalid_publication_request");
+  ensure(keys.every((key) => allowed.includes(key)), code);
+  ensure(required.every((key) => Object.hasOwn(options, key)), code);
   return options;
 }
 
@@ -235,11 +240,15 @@ async function publicationQueueKey(root) {
   try {
     const path = await realpath(root);
     const identity = await lstat(path, { bigint: true });
-    ensure(identity.isDirectory(), "invalid_publication_request");
+    ensure(
+      identity.isDirectory(),
+      "publication_outcome_uncertain",
+      "uncertain",
+    );
     return `${identity.dev.toString()}\0${identity.ino.toString()}`;
   } catch (error) {
     if (internalErrors.has(error)) throw error;
-    fail("invalid_publication_request");
+    fail("publication_outcome_uncertain", "uncertain");
   }
 }
 
@@ -653,17 +662,25 @@ async function readArtifactManifest(path, expectedCheckpoint, expectedProof) {
 
 function validateMaterialization(
   value,
-  { artifactProof, kind, operationId, finalName },
+  { artifactProof, committed = false, kind, operationId, finalName },
 ) {
-  const materialization = exactOptions(value, [
+  const code = committed ? "published_state_invalid" : "publication_integrity_failed";
+  const commitState = committed ? "committed" : "not-committed";
+  const keys = [
     "contractVersion",
     "artifactManifestDigest",
     "modeledDigest",
     "publicationId",
     "publicationKind",
     "stagedRoot",
-  ]);
-  const stagedRoot = exactOptions(materialization.stagedRoot, ["device", "inode"]);
+  ];
+  const materialization = exactOptions(value, keys, keys, code);
+  const stagedRoot = exactOptions(
+    materialization.stagedRoot,
+    ["device", "inode"],
+    ["device", "inode"],
+    code,
+  );
   ensure(
     materialization.contractVersion === PUBLICATION_CONTRACT_VERSION &&
       materialization.publicationKind === kind &&
@@ -681,7 +698,8 @@ function validateMaterialization(
       /^(?:0|[1-9][0-9]*)$/u.test(stagedRoot.device) &&
       typeof stagedRoot.inode === "string" &&
       /^[1-9][0-9]*$/u.test(stagedRoot.inode),
-    "publication_integrity_failed",
+    code,
+    commitState,
   );
   return materialization;
 }
@@ -946,11 +964,20 @@ export class StoppedDirectoryPublication {
     let historicalCommitConfirmed = false;
     let commitState = "not-committed";
     try {
+      ensure(
+        typeof options.sourceOwnedRoot === "string" &&
+          isAbsolute(options.sourceOwnedRoot) &&
+          resolve(options.sourceOwnedRoot) === options.sourceOwnedRoot &&
+          typeof options.targetOwnedRoot === "string" &&
+          isAbsolute(options.targetOwnedRoot) &&
+          resolve(options.targetOwnedRoot) === options.targetOwnedRoot,
+        "invalid_publication_request",
+      );
       try {
         sourceAuthority = await openStoppedTreeRootAuthority(options.sourceOwnedRoot);
         targetAuthority = await openStoppedTreeRootAuthority(options.targetOwnedRoot);
       } catch {
-        fail("invalid_publication_request");
+        fail("publication_outcome_uncertain", "uncertain");
       }
       ensure(
         sourceAuthority.path !== targetAuthority.path &&
@@ -1146,6 +1173,7 @@ export class StoppedDirectoryPublication {
         commitState = "committed";
         const materialization = validateMaterialization(prepared.record.materialization, {
           artifactProof,
+          committed: true,
           finalName,
           kind: options.kind,
           operationId,
@@ -1280,14 +1308,32 @@ export class StoppedDirectoryPublication {
             "not-committed",
           );
           await runFault(this.#faults.beforeRename);
-          await targetAuthority.assertCurrent();
           await assertUntrustedLockHeld(lock);
-          await assertPinnedPath(
-            candidatePath,
-            pinnedPublication,
-            "publication_recovery_required",
-            "not-committed",
-          );
+          try {
+            await assertPinnedPath(
+              candidatePath,
+              pinnedPublication,
+              "publication_recovery_required",
+              "not-committed",
+            );
+            await syncStoppedTree(candidatePath);
+            await targetAuthority.assertCurrent();
+            await targetAuthority.handle.sync();
+            await this.#verifyPublishedTree({
+              checkpoint: materialized.record.result.checkpoint,
+              kind: options.kind,
+              materialization,
+              path: candidatePath,
+            });
+            await assertPinnedPath(
+              candidatePath,
+              pinnedPublication,
+              "publication_recovery_required",
+              "not-committed",
+            );
+          } catch {
+            fail("publication_recovery_required");
+          }
           publicationMayHaveOccurred = true;
           try {
             await lock.renameWhileHeld(candidatePath, finalPath, { kind: "absent" });
@@ -1355,6 +1401,15 @@ export class StoppedDirectoryPublication {
         await runFault(this.#faults.afterFinalReadback);
         await runFault(this.#faults.beforeCommit);
         try {
+          await assertPinnedPath(
+            finalPath,
+            pinnedPublication,
+            "publication_outcome_uncertain",
+            "uncertain",
+          );
+          await syncStoppedTree(finalPath);
+          await targetAuthority.assertCurrent();
+          await targetAuthority.handle.sync();
           await this.#verifyPublishedTree({
             checkpoint: materialized.record.result.checkpoint,
             kind: options.kind,
