@@ -36,6 +36,13 @@ superseded_by:
   broker mutation retry.
 - Classified canonical symlink replacement as non-retryable invalid auth state
   instead of a transient storage outage.
+- Required a successful held-directory sync before public reads or exact CAS
+  replays can publish visible state, preventing a rename without proven
+  directory durability from reaching workers or a restarted broker.
+- Pinned the authority directory identity and canonical path across
+  transactions, classified pre-rename lock replacement as definitely
+  uncommitted recovery, and rejected refresh responses that reuse the consumed
+  refresh token.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
   creation, so escape-heavy payloads cannot replace readable state with an
   envelope the store rejects on readback.

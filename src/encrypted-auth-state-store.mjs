@@ -4,7 +4,13 @@ import {
   createDecipheriv,
   randomBytes,
 } from "node:crypto";
-import { constants, realpathSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
+  realpathSync,
+} from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
@@ -35,6 +41,7 @@ const MAX_ENVELOPE_BYTES = 2 * 1024 * 1024;
 const MAX_GENERATION = 18_446_744_073_709_551_615n;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
 const NEXT_PREFIX = `.${CANONICAL_FILE}.next-`;
+const pinnedAuthorityDirectories = new Map();
 const UNSAFE_LOCK_CODES = new Set([
   "lock_cleanup_failed",
   "lock_lost",
@@ -218,19 +225,26 @@ async function defaultSyncDirectory({ handle }) {
 function wrapExternalError(error, phase) {
   const code = ownDataProperty(error, "code");
   const renameOutcome = ownDataProperty(error, "renameOutcome");
+  if (phase === "rename-attempted" && renameOutcome === "not-committed") {
+    if (UNSAFE_LOCK_CODES.has(code)) {
+      return new AuthStateStoreError(
+        "recovery_required",
+        "auth state advisory lock requires operator recovery",
+        { commitState: "not-committed", retryable: false },
+      );
+    }
+    return new AuthStateStoreError(
+      "auth_state_io_failed",
+      "auth state storage operation failed before commit",
+      { commitState: "not-committed", retryable: false },
+    );
+  }
   if (
     phase === "rename-attempted" ||
     phase === "renamed" ||
     phase === "synced" ||
     code === "lock_commit_uncertain"
   ) {
-    if (phase === "rename-attempted" && renameOutcome === "not-committed") {
-      return new AuthStateStoreError(
-        "auth_state_io_failed",
-        "auth state storage operation failed before commit",
-        { commitState: "not-committed", retryable: false },
-      );
-    }
     return new AuthStateStoreError(
       "commit_outcome_uncertain",
       "auth state commit outcome is uncertain",
@@ -274,6 +288,8 @@ export class AuthStateStoreError extends Error {
 }
 
 export class EncryptedAuthStateStore {
+  #directoryIdentity;
+
   constructor({
     acquireLock = (lockPath) => acquireAdvisoryLock(lockPath),
     authorityId,
@@ -305,12 +321,50 @@ export class EncryptedAuthStateStore {
     ensure(typeof acquireLock === "function", "invalid_lock_provider", "lock provider is invalid");
 
     this.authorityId = authorityId;
+    let directoryHandle;
+    let directoryIdentity;
     try {
       this.directory = realpathSync(resolve(directory));
+      ensure(
+        typeof constants.O_DIRECTORY === "number" && typeof constants.O_NOFOLLOW === "number",
+        "invalid_store_directory",
+        "secure directory open flags are unavailable",
+      );
+      directoryHandle = openSync(
+        this.directory,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      directoryIdentity = fstatSync(directoryHandle, { bigint: true });
+      ensure(
+        directoryIdentity.isDirectory(),
+        "invalid_store_directory",
+        "auth state directory is invalid",
+      );
     } catch {
       fail("invalid_store_directory", "auth state directory could not be canonicalized");
+    } finally {
+      if (directoryHandle !== undefined) {
+        try {
+          closeSync(directoryHandle);
+        } catch {
+          fail("invalid_store_directory", "auth state directory identity could not be pinned");
+        }
+      }
     }
     this.coordinationKey = JSON.stringify([this.directory, authorityId]);
+    const pinnedIdentity = pinnedAuthorityDirectories.get(this.coordinationKey);
+    ensure(
+      pinnedIdentity === undefined || sameFileIdentity(directoryIdentity, pinnedIdentity),
+      "invalid_store_directory",
+      "auth state directory identity changed",
+    );
+    if (pinnedIdentity === undefined) {
+      const identity = Object.freeze({ dev: directoryIdentity.dev, ino: directoryIdentity.ino });
+      pinnedAuthorityDirectories.set(this.coordinationKey, identity);
+      this.#directoryIdentity = identity;
+    } else {
+      this.#directoryIdentity = pinnedIdentity;
+    }
     this.keyProvider = keyProvider;
     this.acquireLock = acquireLock;
     this.faults = faults;
@@ -329,6 +383,7 @@ export class EncryptedAuthStateStore {
       await this.#assertNoRecoveryArtifacts(directoryGuard);
       await lock.assertHeld();
       const current = await this.#readCanonical({ allowMissing: true, directoryGuard });
+      await this.#proveDirectoryDurable(lock, directoryGuard);
       return {
         committed: false,
         value: current ? resultFromRecord(current.record, current.envelope.keyId, false) : null,
@@ -357,6 +412,7 @@ export class EncryptedAuthStateStore {
           "auth state replay generation does not match",
           { retryable: true },
         );
+        await this.#proveDirectoryDurable(lock, directoryGuard);
         return {
           committed: false,
           value: resultFromRecord(current.record, current.envelope.keyId, true),
@@ -410,6 +466,7 @@ export class EncryptedAuthStateStore {
           "auth state replay generation does not match",
           { retryable: true },
         );
+        await this.#proveDirectoryDurable(lock, directoryGuard);
         return {
           committed: false,
           value: resultFromRecord(current.record, current.envelope.keyId, true),
@@ -493,11 +550,21 @@ export class EncryptedAuthStateStore {
     let handle;
     try {
       path = await this.realPath(this.directory);
+      ensure(
+        path === this.directory,
+        "invalid_store_directory",
+        "auth state directory canonical path changed",
+      );
       handle = await this.openFile(
         path,
         constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
       );
       const identity = await handle.stat({ bigint: true });
+      ensure(
+        sameFileIdentity(identity, this.#directoryIdentity),
+        "invalid_store_directory",
+        "auth state directory identity changed",
+      );
       const directoryGuard = {
         aclCache: new Map(),
         ancestorAclCacheKeys: new Set(),
@@ -520,6 +587,15 @@ export class EncryptedAuthStateStore {
       directoryGuard.aclCache.delete(cacheKey);
     }
     directoryGuard.ancestorAclCacheKeys.clear();
+  }
+
+  async #proveDirectoryDurable(lock, directoryGuard) {
+    this.#invalidateAncestorAclCache(directoryGuard);
+    await this.#assertDirectoryCurrent(directoryGuard);
+    await lock.assertHeld();
+    await this.syncDirectory({ handle: directoryGuard.handle, path: directoryGuard.path });
+    await this.#assertDirectoryCurrent(directoryGuard);
+    await lock.assertHeld();
   }
 
   async #assertAclSafe({

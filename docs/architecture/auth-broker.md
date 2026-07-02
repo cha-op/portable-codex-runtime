@@ -76,6 +76,11 @@ Each compare-and-swap:
 7. returns only after generation, commit ID, payload, and key ID match.
 
 Directory and ancestor ACL results are cached only inside one transaction.
+The authority directory's device and inode are pinned from a constructor-time
+`O_NOFOLLOW` directory descriptor and shared by same-process stores with the
+same coordination key. Every transaction requires both that identity and the
+constructor-time canonical path; replacement, remount, or runtime symlink
+drift fails closed before lock acquisition.
 Authority-directory evidence is reused only while its directory type, device,
 inode, owner, group, mode, and nanosecond change time remain identical.
 Ancestor evidence uses the same identity and permission fields but not change
@@ -96,6 +101,9 @@ is a replay. Any changed content or precondition is a conflict. Orphan
 promotion candidates block both reads and writes for operator recovery; they
 are never promoted or deleted by age. Once rename may have happened, every
 unproven failure is non-retryable `commit_outcome_uncertain`.
+Public reads and exact CAS or rotation replays sync the held directory again
+before returning. Visibility of a renamed canonical file therefore never
+substitutes for directory-sync proof, including after a fresh broker starts.
 
 Key rotation is itself a generation-incrementing CAS. The old key must remain
 available until the new envelope has passed directory sync and canonical
@@ -168,8 +176,8 @@ closed instead of sharing or starting a second refresh:
 4. Call the injected refresh adapter with the in-memory credential, reserved
    generation, and opaque attempt ID.
 5. Validate exact credential shape, ChatGPT auth mode, JWT identity/plan/expiry
-   claims, account and user continuity, a changed access token, and the fixed
-   authority safety TTL.
+   claims, account and user continuity, changed access and refresh tokens, and
+   the fixed authority safety TTL.
 6. CAS the candidate or blocked outcome into generation `N+2`.
 7. Re-read canonical encrypted state and require the exact generation, commit
    ID, and serialized payload before returning a token grant.
@@ -257,7 +265,8 @@ state directory and never persist `auth.json`.
   Supervisor-fenced crash recovery must match its generation and unique owner
   ID before publishing replacement credentials.
 - Any uncertain post-dispatch outcome, invalid refreshed credential, identity
-  drift, unchanged token, or failure to meet the fixed authority safety TTL
+  drift, unchanged access or refresh token, or failure to meet the fixed
+  authority safety TTL
   moves canonical state to `recovery-required` and prevents reuse of the old
   refresh token. A higher caller-specific TTL never changes durable state.
 - `refresh_in_progress` is reserved for the credential-free durable reservation
@@ -268,9 +277,10 @@ state directory and never persist `auth.json`.
   broker payload still matches the durable reservation, or accept a later
   storage-only rotation whose exact payload matches the outcome.
 - A lost commit acknowledgement is reconciled by canonical commit ID and
-  payload replay using the same CAS attempt; it never triggers a second OAuth
-  refresh automatically. If the exact commit cannot be proven, the result is
-  non-retryable `refresh_outcome_uncertain`.
+  payload replay using the same CAS attempt and a successful held-directory
+  sync proof; it never triggers a second OAuth refresh automatically. If the
+  exact durable commit cannot be proven, the result is non-retryable
+  `refresh_outcome_uncertain`.
 - Store recovery artifacts and integrity/configuration failures remain
   operator-recovery or invalid-state errors; they are not downgraded to
   retryable availability failures. A canonical symbolic link rejected by

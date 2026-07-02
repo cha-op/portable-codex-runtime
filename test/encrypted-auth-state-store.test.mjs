@@ -249,13 +249,13 @@ test("ACL policy evidence is reused only for unchanged metadata in one transacti
 
   assert.equal(await fixture.store.read(), null);
   assert.equal(extendedAclInspections, 1);
-  assert.equal(ancestorAclInspections.get(stableAncestor), 2);
+  assert.equal(ancestorAclInspections.get(stableAncestor), 3);
   assert.equal(ancestorAclInspections.size, ancestors);
   assert(metadataReads > ancestors);
 
   assert.equal(await fixture.store.read(), null);
   assert.equal(extendedAclInspections, 2);
-  assert.equal(ancestorAclInspections.get(stableAncestor), 4);
+  assert.equal(ancestorAclInspections.get(stableAncestor), 6);
 
   const beforeMutationExtended = extendedAclInspections;
   const beforeMutationRootInspections = ancestorAclInspections.get(stableAncestor);
@@ -597,6 +597,53 @@ test("post-rename failure is uncertain and a clean reread observes the committed
   assert.equal(current.payload, PAYLOAD);
 });
 
+test("visible CAS replay and reads require a successful directory sync proof", async (t) => {
+  let allowDirectorySync = true;
+  let syncCalls = 0;
+  const fixture = await createStoreFixture(t, {
+    async syncDirectory({ handle }) {
+      syncCalls += 1;
+      if (!allowDirectorySync) throw new Error("synthetic pre-sync failure");
+      await handle.sync();
+    },
+  });
+  await fixture.store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-001",
+    payload: PAYLOAD,
+  });
+  allowDirectorySync = false;
+  const request = {
+    expectedGeneration: "1",
+    commitId: "commit-unproven-directory-sync",
+    payload: `${PAYLOAD} `,
+  };
+
+  await assert.rejects(
+    fixture.store.compareAndSwap(request),
+    assertStoreError(
+      "commit_outcome_uncertain",
+      (error) => error.commitState === "uncertain" && error.retryable === false,
+    ),
+  );
+  const callsAfterRename = syncCalls;
+  await assert.rejects(
+    fixture.store.compareAndSwap(request),
+    assertStoreError("auth_state_io_failed"),
+  );
+  assert(syncCalls > callsAfterRename);
+  await assert.rejects(fixture.store.read(), assertStoreError("auth_state_io_failed"));
+
+  allowDirectorySync = true;
+  const replay = await fixture.store.compareAndSwap(request);
+  assert.equal(replay.generation, "2");
+  assert.equal(replay.replayed, true);
+  const current = await fixture.store.read();
+  assert.equal(current.generation, "2");
+  assert.equal(current.commitId, request.commitId);
+  assert.equal(current.payload, request.payload);
+});
+
 test("post-rename readback key failure is normalized to an uncertain commit", async (t) => {
   const backingKeyProvider = createKeyProvider();
   let rejectKeyReads = false;
@@ -693,6 +740,49 @@ test("rename provider can explicitly prove that promotion did not occur", async 
   );
 });
 
+test("pre-rename lock replacement is recovery-required and definitely not committed", async (t) => {
+  const fixture = await createStoreFixture(t);
+  await fixture.store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-001",
+    payload: PAYLOAD,
+  });
+  const canonicalPath = join(fixture.directory, "auth-state.enc");
+  const before = await readFile(canonicalPath, "utf8");
+  const replacedLockStore = new EncryptedAuthStateStore({
+    acquireLock: async () => ({
+      async assertHeld() {},
+      async release() {},
+      async renameWhileHeld() {
+        const error = Object.assign(new Error("synthetic lock replacement"), {
+          code: "lock_replaced",
+          renameOutcome: "not-committed",
+        });
+        throw error;
+      },
+    }),
+    authorityId: AUTHORITY_ID,
+    directory: fixture.directory,
+    keyProvider: fixture.keyProvider,
+    ...TRUSTED_ACL_INSPECTORS,
+  });
+
+  await assert.rejects(
+    replacedLockStore.compareAndSwap({
+      expectedGeneration: "1",
+      commitId: "commit-lock-replaced-before-rename",
+      payload: `${PAYLOAD} `,
+    }),
+    assertStoreError(
+      "recovery_required",
+      (error) => error.commitState === "not-committed" && error.retryable === false,
+    ),
+  );
+  assert.equal(await readFile(canonicalPath, "utf8"), before);
+  const entries = await readdir(fixture.directory);
+  assert.equal(entries.some((entry) => entry.startsWith(".auth-state.enc.next-")), true);
+});
+
 test("hostile external error accessors are normalized without reading them", async (t) => {
   const secret = "hostile-store-error-secret";
   const hostile = {};
@@ -764,14 +854,90 @@ test("directory replacement before rename fails closed", async (t) => {
     }),
     assertStoreError("invalid_store_directory"),
   );
-  const replacementStore = new EncryptedAuthStateStore({
-    acquireLock: simpleLockProvider(),
-    authorityId: AUTHORITY_ID,
-    directory: fixture.directory,
-    keyProvider: fixture.keyProvider,
-    ...TRUSTED_ACL_INSPECTORS,
+  assert.throws(
+    () =>
+      new EncryptedAuthStateStore({
+        acquireLock: simpleLockProvider(),
+        authorityId: AUTHORITY_ID,
+        directory: fixture.directory,
+        keyProvider: fixture.keyProvider,
+        ...TRUSTED_ACL_INSPECTORS,
+      }),
+    assertStoreError("invalid_store_directory"),
+  );
+});
+
+test("directory identity is pinned across transactions", async (t) => {
+  let lockAcquisitions = 0;
+  const fixture = await createStoreFixture(t, {
+    acquireLock: async (...args) => {
+      lockAcquisitions += 1;
+      return simpleLockProvider()(...args);
+    },
   });
-  assert.equal(await replacementStore.read(), null);
+  await fixture.store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-001",
+    payload: PAYLOAD,
+  });
+  const acquisitionsBeforeReplacement = lockAcquisitions;
+  const displaced = `${fixture.directory}.displaced`;
+  await rename(fixture.directory, displaced);
+  await mkdir(fixture.directory, { mode: 0o700 });
+  await chmod(fixture.directory, 0o700);
+
+  await assert.rejects(fixture.store.read(), assertStoreError("invalid_store_directory"));
+  assert.equal(lockAcquisitions, acquisitionsBeforeReplacement);
+  assert.throws(
+    () =>
+      new EncryptedAuthStateStore({
+        acquireLock: simpleLockProvider(),
+        authorityId: AUTHORITY_ID,
+        directory: fixture.directory,
+        keyProvider: fixture.keyProvider,
+        ...TRUSTED_ACL_INSPECTORS,
+      }),
+    assertStoreError("invalid_store_directory"),
+  );
+});
+
+test("constructor-time directory identity protects the first transaction", async (t) => {
+  let lockAcquisitions = 0;
+  const fixture = await createStoreFixture(t, {
+    acquireLock: async (...args) => {
+      lockAcquisitions += 1;
+      return simpleLockProvider()(...args);
+    },
+  });
+  const displaced = `${fixture.directory}.displaced`;
+  await rename(fixture.directory, displaced);
+  await mkdir(fixture.directory, { mode: 0o700 });
+  await chmod(fixture.directory, 0o700);
+
+  await assert.rejects(fixture.store.read(), assertStoreError("invalid_store_directory"));
+  assert.equal(lockAcquisitions, 0);
+});
+
+test("runtime canonical-path drift is rejected before lock acquisition", async (t) => {
+  let lockAcquisitions = 0;
+  const fixture = await createStoreFixture(t, {
+    acquireLock: async (...args) => {
+      lockAcquisitions += 1;
+      return simpleLockProvider()(...args);
+    },
+  });
+  await fixture.store.compareAndSwap({
+    expectedGeneration: "0",
+    commitId: "commit-001",
+    payload: PAYLOAD,
+  });
+  const acquisitionsBeforeDrift = lockAcquisitions;
+  const displaced = `${fixture.directory}.displaced`;
+  await rename(fixture.directory, displaced);
+  await symlink(displaced, fixture.directory);
+
+  await assert.rejects(fixture.store.read(), assertStoreError("invalid_store_directory"));
+  assert.equal(lockAcquisitions, acquisitionsBeforeDrift);
 });
 
 test("unsafe directory or ancestor ACL is rejected before acquiring the lock", async (t) => {

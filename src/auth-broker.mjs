@@ -1004,6 +1004,12 @@ export class AuthBroker {
     if (credential.accessToken === previous.accessToken) {
       throw new AuthBrokerError("invalid_credential", { reason: "access_token_unchanged" });
     }
+    if (
+      parseAuthJson(credential.authJson, credential).tokens.refresh_token ===
+      parseAuthJson(previous.authJson, previous).tokens.refresh_token
+    ) {
+      throw new AuthBrokerError("invalid_credential", { reason: "refresh_token_reused" });
+    }
     if (tokenTtlSeconds(credential, this.now) < minTtlSeconds) {
       throw new AuthBrokerError("invalid_credential", { reason: "token_ttl_insufficient" });
     }

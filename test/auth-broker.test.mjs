@@ -661,12 +661,12 @@ test("real encrypted store replays a refresh after post-rename acknowledgement l
   const broker = makeBroker({
     refreshAdapter: async () => {
       refreshCalls += 1;
+      failNextDirectorySync = true;
       return refreshedCredential();
     },
     store,
   });
   await broker.installCredential(makeCredential());
-  failNextDirectorySync = true;
 
   const grant = await broker.refreshGrant();
 
@@ -674,6 +674,43 @@ test("real encrypted store replays a refresh after post-rename acknowledgement l
   assert.equal(grant.accessToken, ACCESS_TOKEN_2);
   assert.equal(refreshCalls, 1);
   assert.equal((await store.read()).generation, "3");
+});
+
+test("real encrypted store never publishes a refresh before directory sync is proven", async (t) => {
+  const { createStore } = await createEncryptedStoreFixture(t);
+  let allowDirectorySync = true;
+  const store = createStore({
+    async syncDirectory({ handle }) {
+      if (!allowDirectorySync) throw new Error("simulated pre-sync failure");
+      await handle.sync();
+    },
+  });
+  let refreshCalls = 0;
+  const broker = makeBroker({
+    refreshAdapter: async () => {
+      refreshCalls += 1;
+      allowDirectorySync = false;
+      return refreshedCredential();
+    },
+    store,
+  });
+  await broker.installCredential(makeCredential());
+
+  await expectBrokerError(() => broker.refreshGrant(), "refresh_outcome_uncertain");
+  assert.equal(refreshCalls, 1);
+  await expectBrokerError(
+    () => makeBroker({ store }).getGrant({ minTtlSeconds: 0 }),
+    "store_unavailable",
+  );
+
+  allowDirectorySync = true;
+  const proven = await makeBroker({
+    refreshAdapter: async () => assert.fail("directory proof must not redispatch OAuth"),
+    store,
+  }).getGrant({ minTtlSeconds: 0 });
+  assert.equal(proven.generation, "3");
+  assert.equal(proven.accessToken, ACCESS_TOKEN_2);
+  assert.equal(refreshCalls, 1);
 });
 
 test("refresh rebases across a concurrent storage-only key rotation", async (t) => {
@@ -1006,6 +1043,11 @@ test("invalid refresh candidates durably require recovery", async (t) => {
       name: "access token is unchanged",
       candidate: makeCredential({ refreshToken: "refresh-2" }),
       reason: "access_token_unchanged",
+    },
+    {
+      name: "refresh token is unchanged",
+      candidate: refreshedCredential({ refreshToken: "refresh-1" }),
+      reason: "refresh_token_reused",
     },
     {
       name: "token lifetime is too short",

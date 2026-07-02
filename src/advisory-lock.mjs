@@ -157,6 +157,16 @@ function withCause(error, cause) {
   return error;
 }
 
+function withRenameOutcome(error, renameOutcome) {
+  if (!Object.hasOwn(error, "renameOutcome")) {
+    Object.defineProperty(error, "renameOutcome", {
+      configurable: true,
+      value: renameOutcome,
+    });
+  }
+  return error;
+}
+
 function cleanupResourceError(error, operationError) {
   if (operationError === undefined && error instanceof AdvisoryLockError) return error;
   const failure =
@@ -517,7 +527,10 @@ export async function acquireAdvisoryLock(
     if (response.ok === true) pending.resolve();
     else if (response.code === "lock_replaced") {
       void failLockReplacement(
-        new AdvisoryLockError("lock_replaced", "authority lock path changed"),
+        withRenameOutcome(
+          new AdvisoryLockError("lock_replaced", "authority lock path changed"),
+          "not-committed",
+        ),
       ).then(pending.resolve, pending.reject);
     } else if (response.code === "lock_commit_uncertain") {
       void quiesceUncertainCommit(
@@ -582,7 +595,7 @@ export async function acquireAdvisoryLock(
         await assertLockPathIdentity(lockPath, handle);
       } catch (error) {
         if (error instanceof AdvisoryLockError && error.code === "lock_replaced") {
-          return failLockReplacement(error);
+          return failLockReplacement(withRenameOutcome(error, "not-committed"));
         }
         throw error;
       }
