@@ -83,14 +83,15 @@ credential, or Git summary:
 
 The image digest and media type declare a concrete Linux platform manifest, not
 a tag or an architecture-selecting OCI index. The platform is recorded
-separately. A record validator cannot inspect registry content, so this
-declaration is not proof: a trusted OCI resolver must inspect the descriptor
-and image configuration, then pass its output through
+separately. A record validator cannot inspect registry content or execute the
+image, so this declaration is not proof: a trusted runtime probe must inspect
+the descriptor and image configuration, measure `codex --version` from the
+exact image, and then pass all four values through
 `assertResolvedPlatformImageMatchesManifest()` before session creation and each
-launch or restore. That helper only compares the trusted resolution snapshot; it
-does not contact a registry. Digest pinning establishes content identity after
-that check. Publisher trust and image signature policy remain later operational
-work.
+launch or restore. That helper only compares the trusted probe snapshot; it
+does not contact a registry or execute a container. Digest pinning establishes
+content identity after that check. Publisher trust and image signature policy
+remain later operational work.
 
 The manifest parser rejects unknown or missing fields, accessor properties,
 duplicate JSON object keys, unsupported versions, mutable/ephemeral Codex
@@ -178,7 +179,23 @@ fence matching, and mutation admission receive the current time explicitly from
 the lease authority or its trusted control-plane clock; a worker host's local
 wall clock must not decide whether authority is still valid.
 
-Every mutating backend request carries the complete writer identity:
+Provisioning is the only storage mutation outside the writer-fenced envelope.
+It runs before writer lease allocation under control-plane authority. Its
+secret-free request binds an idempotent operation ID to the backend and runtime
+session ID; its result echoes that tuple and returns the new storage ID plus an
+opaque backend proof. Before reporting success, a concrete adapter must
+atomically persist the operation ID, canonical request, and complete result.
+An exact retry must replay the original storage ID, proof ID, status, and full
+result without invoking the provider allocation again; reuse for a different
+backend or session must fail closed. Adapter conformance tests must cover both a
+lost-response retry and a conflicting operation-ID reuse. Neither the request
+nor result contains or creates writer authority, and successful provisioning
+does not authorize attachment or launch. The optional `previousResult` input to
+`assertSessionProvisionResult()` makes the exact replay comparison executable
+when an adapter loads its persisted idempotency record.
+
+Every writer-authorized mutating backend request after provisioning carries the
+complete writer identity:
 `sessionId`, `leaseId`, `holderId`, `fencingEpoch`, and an idempotent operation
 ID. It also carries an operation-specific target: attachment ID for
 attach/detach, checkpoint plus artifact IDs for
@@ -256,6 +273,12 @@ and must not be written to the session manifest, checkpoint descriptor, or
 portable evidence. Passing the capability validator confirms only this object
 shape and declaration; backend behavior remains untrusted until the concrete
 adapter passes its conformance suite.
+
+`assertSessionProvisionRequest()` and `assertSessionProvisionResult()` define
+the separate control-plane provisioning boundary. The remaining attachment,
+checkpoint, restore, detach, and destroy operations use the writer-fenced
+mutation envelope. A backend must not treat a provisioning proof as a lease,
+attachment proof, or launch authorization.
 
 `manual` fencing is a valid declared backend capability for development and
 operator-driven recovery, but it cannot perform automatic failover. A local

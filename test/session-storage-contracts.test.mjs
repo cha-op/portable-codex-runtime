@@ -20,6 +20,8 @@ import {
   assertResolvedPlatformImageMatchesManifest,
   assertSessionAttachment,
   assertSessionManifest,
+  assertSessionProvisionRequest,
+  assertSessionProvisionResult,
   assertSessionStorageRef,
   assertStorageBackend,
   assertStorageMutationMatchesLeaseSnapshot,
@@ -138,6 +140,16 @@ function storageBackend({ atomicPointInTimeCheckpoint = true } = {}) {
     prepareWritableAttachment: operation,
     provisionSession: operation,
     restoreCheckpoint: operation,
+  };
+}
+
+function provisionRequest(overrides = {}) {
+  return {
+    contractVersion: 1,
+    backendId: "single-attach-test",
+    sessionId: RUNTIME_SESSION_ID,
+    operationId: "operation-provision-001",
+    ...overrides,
   };
 }
 
@@ -296,6 +308,7 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
 
 test("trusted OCI resolution must match the recorded platform manifest", () => {
   const resolution = {
+    codexVersion: "codex-cli 0.142.4",
     digest: IMAGE_DIGEST,
     mediaType: "application/vnd.oci.image.manifest.v1+json",
     platform: "linux/arm64",
@@ -324,6 +337,7 @@ test("trusted OCI resolution must match the recorded platform manifest", () => {
     { ...resolution, digest: `sha256:${"b".repeat(64)}` },
     { ...resolution, mediaType: "application/vnd.oci.image.index.v1+json" },
     { ...resolution, platform: "linux/amd64" },
+    { ...resolution, codexVersion: "codex-cli 9.9.9" },
   ]) {
     assert.throws(
       () =>
@@ -544,6 +558,52 @@ test("storage backend contract requires directory, exclusivity, fencing, and all
         capabilities: { ...backend.capabilities, exclusiveWriterAttachment: false },
       }),
     assertCode("invalid_storage_backend"),
+  );
+});
+
+test("storage provisioning is an idempotent control-plane mutation without writer authority", () => {
+  const request = provisionRequest();
+  assert.deepEqual(assertSessionProvisionRequest(request), request);
+  assert.equal(Object.hasOwn(request, "leaseId"), false);
+  assert.equal(Object.hasOwn(request, "fencingEpoch"), false);
+  const result = {
+    ...request,
+    proofId: "proof-provision-001",
+    status: "provisioned",
+    storageId: "volume-001",
+  };
+  assert.deepEqual(assertSessionProvisionResult(result, { request }), result);
+  assert.deepEqual(
+    assertSessionProvisionResult(result, { previousResult: result, request }),
+    result,
+  );
+  assert.throws(
+    () => assertSessionProvisionResult(result),
+    assertCode("invalid_storage_provision"),
+  );
+  assert.throws(
+    () =>
+      assertSessionProvisionResult(
+        { ...result, operationId: "operation-provision-002" },
+        { request },
+      ),
+    assertCode("invalid_storage_provision"),
+  );
+  assert.throws(
+    () =>
+      assertSessionProvisionResult(
+        { ...result, storageId: "volume-002" },
+        { previousResult: result, request },
+      ),
+    assertCode("invalid_storage_provision"),
+  );
+  assert.throws(
+    () => assertSessionProvisionRequest({ ...request, leaseId: "lease-001" }),
+    assertCode("invalid_storage_provision"),
+  );
+  assert.throws(
+    () => assertStorageMutationRequest({ ...mutationRequest(), operation: "provision" }),
+    assertCode("invalid_storage_mutation"),
   );
 });
 

@@ -456,7 +456,8 @@ export function serializeSessionManifest(manifest) {
 
 /**
  * Structural comparison only. The caller must obtain `resolution` from a
- * trusted OCI resolver that inspected the descriptor and image configuration.
+ * trusted runtime probe that inspected the descriptor and image configuration
+ * and measured the Codex version from the exact image.
  */
 export function assertResolvedPlatformImageMatchesManifest(options) {
   const { manifest, resolution } = assertOptionsObject(
@@ -469,7 +470,7 @@ export function assertResolvedPlatformImageMatchesManifest(options) {
   const sessionManifest = assertSessionManifest(manifest);
   assertExactObject(
     resolution,
-    ["digest", "mediaType", "platform"],
+    ["codexVersion", "digest", "mediaType", "platform"],
     "invalid_image_resolution",
     "resolved platform image",
   );
@@ -489,9 +490,17 @@ export function assertResolvedPlatformImageMatchesManifest(options) {
     "resolved image platform is unsupported",
   );
   ensure(
+    typeof resolution.codexVersion === "string" &&
+      resolution.codexVersion.length <= 128 &&
+      CODEX_VERSION_PATTERN.test(resolution.codexVersion),
+    "invalid_image_resolution",
+    "resolved Codex version is invalid",
+  );
+  ensure(
     resolution.digest === sessionManifest.runtime.imageDigest &&
       resolution.mediaType === sessionManifest.runtime.imageMediaType &&
-      resolution.platform === sessionManifest.runtime.platform,
+      resolution.platform === sessionManifest.runtime.platform &&
+      resolution.codexVersion === sessionManifest.runtime.codexVersion,
     "invalid_image_resolution",
     "resolved platform image does not match the session manifest",
   );
@@ -618,6 +627,80 @@ export function assertSessionStorageRef(value) {
   assertOpaqueId(value.storageId, "invalid_storage_ref", "storage ID");
   assertUuid(value.sessionId, "invalid_storage_ref", "storage session ID");
   return deepFreeze(defensiveClone(value, "invalid_storage_ref", "session storage reference"));
+}
+
+export function assertSessionProvisionRequest(value) {
+  assertExactObject(
+    value,
+    ["backendId", "contractVersion", "operationId", "sessionId"],
+    "invalid_storage_provision",
+    "session provision request",
+  );
+  ensure(
+    value.contractVersion === STORAGE_CONTRACT_VERSION,
+    "invalid_storage_provision",
+    "storage provision contract version is unsupported",
+  );
+  assertOpaqueId(value.backendId, "invalid_storage_provision", "provision backend ID");
+  assertUuid(value.sessionId, "invalid_storage_provision", "provision session ID");
+  assertOpaqueId(value.operationId, "invalid_storage_provision", "provision operation ID");
+  return deepFreeze(
+    defensiveClone(value, "invalid_storage_provision", "session provision request"),
+  );
+}
+
+export function assertSessionProvisionResult(value, options) {
+  const { previousResult, request } = assertOptionsObject(
+    options,
+    ["previousResult", "request"],
+    ["request"],
+    "invalid_storage_provision",
+    "session provision result options",
+  );
+  assertExactObject(
+    value,
+    [
+      "backendId",
+      "contractVersion",
+      "operationId",
+      "proofId",
+      "sessionId",
+      "status",
+      "storageId",
+    ],
+    "invalid_storage_provision",
+    "session provision result",
+  );
+  const expected = assertSessionProvisionRequest(request);
+  const actualRequest = assertSessionProvisionRequest({
+    backendId: value.backendId,
+    contractVersion: value.contractVersion,
+    operationId: value.operationId,
+    sessionId: value.sessionId,
+  });
+  assertOpaqueId(value.storageId, "invalid_storage_provision", "provisioned storage ID");
+  assertOpaqueId(value.proofId, "invalid_storage_provision", "provision proof ID");
+  ensure(
+    value.status === "provisioned",
+    "invalid_storage_provision",
+    "storage provision result status is unsupported",
+  );
+  ensure(
+    Object.keys(expected).every((key) => expected[key] === actualRequest[key]),
+    "invalid_storage_provision",
+    "storage provision result does not match its request",
+  );
+  if (previousResult !== undefined) {
+    const previous = assertSessionProvisionResult(previousResult, { request });
+    ensure(
+      Object.keys(previous).every((key) => previous[key] === value[key]),
+      "invalid_storage_provision",
+      "storage provision retry does not replay its original result",
+    );
+  }
+  return deepFreeze(
+    defensiveClone(value, "invalid_storage_provision", "session provision result"),
+  );
 }
 
 export function assertSessionAttachment(value) {
