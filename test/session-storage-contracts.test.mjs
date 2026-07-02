@@ -966,6 +966,36 @@ test("portable record validators reject accessor fields before validation or clo
   );
 });
 
+test("portable record validators reject hostile proxies without invoking traps", () => {
+  let traps = 0;
+  const forged = new SessionStorageContractError(
+    "forged_contract_error",
+    "secret forged contract detail",
+  );
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        traps += 1;
+        throw forged;
+      },
+      ownKeys() {
+        traps += 1;
+        throw forged;
+      },
+    },
+  );
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+
+  assert.throws(() => assertSessionManifest(hostile), assertCode("invalid_session_manifest"));
+  assert.throws(
+    () => assertSessionManifest(revoked.proxy),
+    assertCode("invalid_session_manifest"),
+  );
+  assert.equal(traps, 0);
+});
+
 test("public option envelopes reject accessors before destructuring", () => {
   const options = { manifest: sessionManifest() };
   let reads = 0;

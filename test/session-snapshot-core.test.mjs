@@ -787,6 +787,75 @@ test("backend identity getter failures on the comparison read stay pre-dispatch 
   }
 });
 
+test("hostile backend thrown values cannot bypass pre-dispatch error sanitization", async (t) => {
+  for (const operation of ["capture", "restore"]) {
+    await t.test(operation, async () => {
+      let hostileTraps = 0;
+      const hostile = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            hostileTraps += 1;
+            throw new Error("secret hostile backend error detail");
+          },
+        },
+      );
+      const { backend, calls } = createBackend();
+      Object.defineProperty(backend, "backendId", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          throw hostile;
+        },
+      });
+
+      const invoke =
+        operation === "capture"
+          ? () => captureCleanCheckpoint(captureOptions(backend))
+          : () => restoreCleanCheckpoint(restoreOptions(backend));
+      await assert.rejects(
+        invoke,
+        (error) =>
+          assertContractCode("invalid_storage_backend")(error) &&
+          !error.message.includes("secret"),
+      );
+      assert.equal(hostileTraps, 0);
+      assert.equal(calls[operation].length, 0);
+    });
+  }
+});
+
+test("backend getters cannot forge public contract errors", async (t) => {
+  for (const operation of ["capture", "restore"]) {
+    await t.test(operation, async () => {
+      const { backend, calls } = createBackend();
+      Object.defineProperty(backend, "backendId", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          throw new SessionStorageContractError(
+            "forged_backend_error",
+            "secret forged backend detail",
+          );
+        },
+      });
+
+      const invoke =
+        operation === "capture"
+          ? () => captureCleanCheckpoint(captureOptions(backend))
+          : () => restoreCleanCheckpoint(restoreOptions(backend));
+      await assert.rejects(
+        invoke,
+        (error) =>
+          assertContractCode("invalid_storage_backend")(error) &&
+          !error.message.includes("secret") &&
+          !error.message.includes("forged"),
+      );
+      assert.equal(calls[operation].length, 0);
+    });
+  }
+});
+
 test("backend operation getter failures on the dispatch read stay pre-dispatch and sanitized", async (t) => {
   for (const operation of ["capture", "restore"]) {
     await t.test(operation, async () => {

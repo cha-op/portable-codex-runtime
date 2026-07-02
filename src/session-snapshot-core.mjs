@@ -96,7 +96,22 @@ function validateContract(operation, code, message) {
   try {
     return operation();
   } catch (error) {
-    if (error instanceof SessionStorageContractError) throw error;
+    let isContractError = false;
+    try {
+      isContractError = error instanceof SessionStorageContractError;
+    } catch {
+      // Hostile external thrown values are normalized to the fixed contract error.
+    }
+    if (isContractError) throw error;
+    failContract(code, message);
+  }
+}
+
+function validateExternalOperation(operation, code, message) {
+  try {
+    return operation();
+  } catch {
+    // Operational collaborators cannot forge or leak public contract errors.
     failContract(code, message);
   }
 }
@@ -114,7 +129,7 @@ function assertCleanCheckpointClass(value) {
 }
 
 function checkedBackend(value) {
-  return validateContract(
+  return validateExternalOperation(
     () => assertStorageBackend(value),
     "invalid_storage_backend",
     "storage backend is invalid",
@@ -122,7 +137,7 @@ function checkedBackend(value) {
 }
 
 function checkedBackendMethod(backend, method) {
-  return validateContract(
+  return validateExternalOperation(
     () => {
       const operation = backend[method];
       ensureContract(
@@ -152,7 +167,7 @@ function assertStoppedWriterEvidence(value) {
 }
 
 function assertBackendMatchesStorage(backend, storageRef) {
-  validateContract(
+  validateExternalOperation(
     () =>
       ensureContract(
         backend.backendId === storageRef.backendId,
