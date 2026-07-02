@@ -47,6 +47,10 @@ superseded_by:
 - Public journal failures are frozen `OperationJournalError` values with a
   fixed code, tri-state `commitState`, and `retryable: false`; the canonical
   schema version is exported as `OPERATION_JOURNAL_RECORD_VERSION`.
+- Calls are process-locally serialized by canonical journal directory, future
+  record versions are classified before applying the v1 schema, and generic
+  token/API-key fields plus recognised provider credential forms are rejected
+  before publication.
 - The journal does not prove physical materialisation, writer stop, fence
   authority, publication, destination isolation, NFS guarantees, or backend
   success.

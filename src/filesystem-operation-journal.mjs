@@ -26,10 +26,14 @@ const MAX_CANONICAL_DEPTH = 24;
 const MAX_CANONICAL_NODES = 8_192;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SENSITIVE_KEY_PATTERN =
-  /(?:auth(?:json)?|credential|password|secret|(?:access|refresh|id)[_-]?token)/iu;
+  /(?:api[_-]?key|auth(?:json)?|credential|password|private[_-]?key|secret|token)/iu;
 const SENSITIVE_VALUE_PATTERNS = Object.freeze([
   /\b(?:sk|sess|rk)-[A-Za-z0-9_-]{8,}\b/u,
   /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/u,
+  /\b(?:AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{20,})\b/u,
+  /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/u,
+  /\bBearer[ \t]+[0-9A-Za-z._~+/-]{8,}={0,2}\b/iu,
+  /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/u,
 ]);
 const RECORD_KEYS = Object.freeze([
   "recordVersion",
@@ -492,13 +496,28 @@ function parseRecord(bytes) {
   } catch {
     fail("invalid_journal_record");
   }
-  const options = exactOptions(value, RECORD_KEYS, RECORD_KEYS, "invalid_journal_record");
+  const parsedKeys = inspectPlainObject(value, "invalid_journal_record");
+  let versionDescriptor;
+  try {
+    versionDescriptor = Object.getOwnPropertyDescriptor(value, "recordVersion");
+  } catch {
+    fail("invalid_journal_record");
+  }
   ensure(
-    options.recordVersion === OPERATION_JOURNAL_RECORD_VERSION,
-    options.recordVersion === undefined
-      ? "invalid_journal_record"
-      : "unsupported_journal_record",
+    parsedKeys.includes("recordVersion") &&
+      versionDescriptor?.enumerable === true &&
+      Object.hasOwn(versionDescriptor, "value"),
+    "invalid_journal_record",
   );
+  ensure(
+    Number.isSafeInteger(versionDescriptor.value) && versionDescriptor.value > 0,
+    "invalid_journal_record",
+  );
+  ensure(
+    versionDescriptor.value === OPERATION_JOURNAL_RECORD_VERSION,
+    "unsupported_journal_record",
+  );
+  const options = exactOptions(value, RECORD_KEYS, RECORD_KEYS, "invalid_journal_record");
   ensure(Object.hasOwn(STATE_REVISIONS, options.state), "invalid_journal_record");
   ensure(options.revision === STATE_REVISIONS[options.state], "invalid_journal_record");
   const normalized = normalizeOperationInput(
@@ -1326,7 +1345,7 @@ export class FilesystemOperationJournal {
 
   async #run(operationId, operation) {
     const pin = await this.#getDirectoryPin();
-    const queueKey = `${pin.path}\0${operationId}`;
+    const queueKey = `${pin.identity.dev.toString()}\0${pin.identity.ino.toString()}`;
     return runQueued(queueKey, async () => {
       const authority = await openDirectoryAuthority(pin.path, {
         expectedPin: pin,

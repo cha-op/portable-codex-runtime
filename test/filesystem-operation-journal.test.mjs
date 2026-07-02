@@ -628,8 +628,25 @@ test("noncanonical, deeply nested, cyclic, and oversized inputs fail before publ
   const cases = [
     prepareOptions({ binding: binding({ label: "\ud800" }) }),
     prepareOptions({ binding: binding({ accessToken: "forbidden" }) }),
+    prepareOptions({ binding: binding({ apiKey: "forbidden" }) }),
+    prepareOptions({ binding: binding({ githubToken: "forbidden" }) }),
+    prepareOptions({ binding: binding({ private_key: "forbidden" }) }),
+    prepareOptions({ binding: binding({ token: "forbidden" }) }),
     prepareOptions({ binding: binding({ opaque: "sk-sensitive1234" }) }),
     prepareOptions({ binding: binding({ opaque: "eyJheader123.payload.signature" }) }),
+    prepareOptions({ binding: binding({ opaque: `AIza${"a".repeat(32)}` }) }),
+    prepareOptions({ binding: binding({ opaque: `ghp_${"b".repeat(32)}` }) }),
+    prepareOptions({
+      binding: binding({ opaque: `github_pat_${"c".repeat(32)}` }),
+    }),
+    prepareOptions({ binding: binding({ opaque: `AKIA${"C".repeat(16)}` }) }),
+    prepareOptions({ binding: binding({ opaque: `xoxb-${"d".repeat(24)}` }) }),
+    prepareOptions({ binding: binding({ opaque: "Bearer opaquecredential" }) }),
+    prepareOptions({
+      binding: binding({
+        opaque: "-----BEGIN " + "ENCRYPTED PRIVATE KEY-----",
+      }),
+    }),
     prepareOptions({ binding: binding({ deep }) }),
     prepareOptions({ binding: cyclic }),
     prepareOptions({ binding: binding({ values: hugeSparseArray }) }),
@@ -704,6 +721,16 @@ test("corrupt, reordered, duplicate-key, unsupported, and oversized records fail
       name: "unsupported version",
       expected: "unsupported_journal_record",
       mutate: (raw) => raw.replace('{"recordVersion":1,', '{"recordVersion":2,'),
+    },
+    {
+      name: "malformed version",
+      expected: "invalid_journal_record",
+      mutate: (raw) => raw.replace('{"recordVersion":1,', '{"recordVersion":null,'),
+    },
+    {
+      name: "unsupported future schema",
+      expected: "unsupported_journal_record",
+      mutate: () => '{"recordVersion":2,"futureField":true}\n',
     },
     {
       name: "oversized record",
@@ -877,6 +904,39 @@ test("concurrent first calls share one directory pin attempt", async (t) => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(inspectionCalls, 1);
   releaseFirstInspection();
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results.map(({ record }) => record), [null, null]);
+});
+
+test("different operation IDs serialize through one real directory lock", async (t) => {
+  let enterFirstRead;
+  let releaseFirstRead;
+  let readCalls = 0;
+  const firstReadEntered = new Promise((resolve) => {
+    enterFirstRead = resolve;
+  });
+  const firstReadReleased = new Promise((resolve) => {
+    releaseFirstRead = resolve;
+  });
+  const { journal } = await createFixture(t, {
+    faults: {
+      async afterRecordRead() {
+        readCalls += 1;
+        if (readCalls === 1) {
+          enterFirstRead();
+          await firstReadReleased;
+        }
+      },
+    },
+    useDefaultLock: true,
+  });
+
+  const first = journal.read({ operationId: OPERATION_ID });
+  await firstReadEntered;
+  const second = journal.read({ operationId: "operation-checkpoint-002" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(readCalls, 1);
+  releaseFirstRead();
   const results = await Promise.all([first, second]);
   assert.deepEqual(results.map(({ record }) => record), [null, null]);
 });

@@ -79,8 +79,12 @@ source fence.
 Each state is a canonical, strictly validated plain-data record. Unknown,
 missing, accessor, proxy, non-enumerable, or otherwise non-canonical fields
 fail closed. Secret-bearing key names and recognised token forms are rejected;
-credentials never belong in an operation binding or result. JSON property
-order and bytes are deterministic. One normalised operation envelope shares a
+this includes generic token fields, API-key fields, common provider token
+prefixes, bearer credentials, and private-key markers. Credentials never
+belong in an operation binding or result. The record version is inspected
+before the v1 field set, so a future schema is reported as unsupported rather
+than corrupt. JSON property order and bytes are deterministic. One normalised
+operation envelope shares a
 maximum budget of 8,192 value nodes and 512 KiB of cumulative canonical
 component bytes across its request, binding, result, and materialisation; each
 component also has a maximum nesting depth of 24. These limits are enforced
@@ -91,6 +95,13 @@ successful use of a journal instance pins that directory's canonical path and
 device/inode identity for every later call. Symlinks, hard links, unsafe
 permissions, unsafe ACLs, directory identity changes, and record replacement
 are rejected.
+
+All calls in one process are serialized by the pinned journal directory's
+device/inode identity, not by pathname or operation ID, because the directory
+has one advisory lock. This also coalesces aliases such as bind-mount paths and
+keeps independent operation IDs from turning ordinary local concurrency into a
+non-retryable lock conflict. Cross-process callers still require the same
+single-writer coordination boundary and default advisory lock.
 
 Every forward transition uses the same publication protocol while holding the
 journal lock and directory authority:
