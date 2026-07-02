@@ -22,7 +22,37 @@ function isoAfter(seconds) {
 }
 
 function encodeJwt(payload) {
-  return `${Buffer.from("{}").toString("base64url")}.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.signature`;
+  return [
+    Buffer.from("{}").toString("base64url"),
+    Buffer.from(JSON.stringify(payload)).toString("base64url"),
+    Buffer.from("signature").toString("base64url"),
+  ].join(".");
+}
+
+function nonCanonicalBase64UrlAlias(segment) {
+  const decoded = Buffer.from(segment, "base64url");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  for (const replacement of alphabet) {
+    const candidate = `${segment.slice(0, -1)}${replacement}`;
+    if (
+      candidate !== segment &&
+      Buffer.from(candidate, "base64url").equals(decoded) &&
+      Buffer.from(candidate, "base64url").toString("base64url") === segment
+    ) {
+      return candidate;
+    }
+  }
+  assert.fail(`test segment has no non-canonical base64url alias: ${segment}`);
+}
+
+function jwtWithInvalidUtf8Marker(token, marker) {
+  const parts = token.split(".");
+  const payload = Buffer.from(parts[1], "base64url");
+  const markerOffset = payload.indexOf(Buffer.from(marker, "utf8"));
+  assert.notEqual(markerOffset, -1);
+  payload[markerOffset] = 0xff;
+  parts[1] = payload.toString("base64url");
+  return parts.join(".");
 }
 
 function makeAccessToken({
@@ -565,9 +595,14 @@ test("credential metadata must match auth mode and JWT claims", async (t) => {
   }
 });
 
-test("JWTs require exactly three non-empty compact segments before persistence", async (t) => {
+test("JWTs require canonical compact segments and valid payload UTF-8 before persistence", async (t) => {
   const accessParts = makeCredential().accessToken.split(".");
   const idParts = makeIdToken().split(".");
+  const idPayload = JSON.parse(Buffer.from(idParts[1], "base64url").toString("utf8"));
+  const idTokenWithIgnoredMarker = encodeJwt({
+    ...idPayload,
+    ignored: "id-invalid-utf8-marker",
+  });
   const cases = [
     {
       name: "two access-token segments",
@@ -584,6 +619,61 @@ test("JWTs require exactly three non-empty compact segments before persistence",
     {
       name: "empty ID-token header",
       credential: makeCredential({ idToken: `.${idParts[1]}.${idParts[2]}` }),
+    },
+    {
+      name: "padded access-token payload",
+      credential: makeCredential({
+        accessToken: `${accessParts[0]}.${accessParts[1]}=.${accessParts[2]}`,
+      }),
+    },
+    {
+      name: "non-base64url access-token signature",
+      credential: makeCredential({
+        accessToken: `${accessParts[0]}.${accessParts[1]}.signature!`,
+      }),
+    },
+    {
+      name: "non-canonical access-token payload",
+      credential: makeCredential({
+        accessToken: [
+          accessParts[0],
+          nonCanonicalBase64UrlAlias(accessParts[1]),
+          accessParts[2],
+        ].join("."),
+      }),
+    },
+    {
+      name: "invalid UTF-8 access-token payload",
+      credential: makeCredential({
+        accessToken: jwtWithInvalidUtf8Marker(makeAccessToken(), "access-1"),
+      }),
+    },
+    {
+      name: "padded ID-token header",
+      credential: makeCredential({
+        idToken: `${idParts[0]}=.${idParts[1]}.${idParts[2]}`,
+      }),
+    },
+    {
+      name: "non-base64url ID-token signature",
+      credential: makeCredential({
+        idToken: `${idParts[0]}.${idParts[1]}.signature!`,
+      }),
+    },
+    {
+      name: "non-canonical ID-token signature",
+      credential: makeCredential({
+        idToken: `${idParts[0]}.${idParts[1]}.${nonCanonicalBase64UrlAlias("YQ")}`,
+      }),
+    },
+    {
+      name: "invalid UTF-8 ID-token payload",
+      credential: makeCredential({
+        idToken: jwtWithInvalidUtf8Marker(
+          idTokenWithIgnoredMarker,
+          "id-invalid-utf8-marker",
+        ),
+      }),
     },
   ];
 

@@ -1,4 +1,5 @@
 import { createHash, randomUUID as systemRandomUUID } from "node:crypto";
+import { TextDecoder } from "node:util";
 
 const AUTH_PAYLOAD_SCHEMA_VERSION = 1;
 const DEFAULT_MIN_TOKEN_TTL_SECONDS = 120;
@@ -6,6 +7,7 @@ const GENERATION_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/u;
 const MAX_GENERATION = 18_446_744_073_709_551_615n;
 const MAX_SHARED_REFRESH_RECHECKS = 8;
 const MAX_STORAGE_ONLY_REBASES = 8;
+const JWT_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const SINGLEFLIGHT = new Map();
@@ -178,7 +180,16 @@ function decodeJwtPayload(token) {
     throw new AuthBrokerError("invalid_credential");
   }
   try {
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    const decoded = parts.map((part) => {
+      if (!JWT_SEGMENT_PATTERN.test(part)) throw new AuthBrokerError("invalid_credential");
+      const bytes = Buffer.from(part, "base64url");
+      if (bytes.toString("base64url") !== part) {
+        throw new AuthBrokerError("invalid_credential");
+      }
+      return bytes;
+    });
+    const payloadText = new TextDecoder("utf-8", { fatal: true }).decode(decoded[1]);
+    const payload = JSON.parse(payloadText);
     if (!isPlainObject(payload)) throw new AuthBrokerError("invalid_credential");
     return payload;
   } catch {

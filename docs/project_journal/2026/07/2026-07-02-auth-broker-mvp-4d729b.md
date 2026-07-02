@@ -51,7 +51,7 @@ superseded_by:
   login cannot republish either source token after an uncertain refresh.
 - Preserved account and user identity fences through explicit reservation
   recovery, reconciled exact-payload storage rotations only across strictly
-  increasing generations, and rejected malformed non-compact JWT shapes.
+  increasing generations, and rejected malformed or non-canonical JWT shapes.
 - Restored encrypted candidate files to mode `0600` through their open file
   descriptors before writing secrets, independent of the process umask.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file

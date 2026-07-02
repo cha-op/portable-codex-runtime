@@ -128,6 +128,8 @@ cross-checked access token, account ID, user ID, plan type, and canonical
 expiration timestamp.
 The broker decodes both JWT payloads and requires `auth_mode: "chatgpt"`, access
 token `exp`, account, user, and plan claims to match those top-level fields.
+Every JWT segment must use canonical unpadded base64url, and payload decoding
+rejects invalid UTF-8 instead of normalising it.
 This is structural continuity validation, not JWT signature verification; the
 trusted OAuth adapter remains responsible for obtaining tokens from the pinned
 Codex/provider path.
