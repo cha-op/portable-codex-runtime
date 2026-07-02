@@ -23,6 +23,35 @@ stopped-tree restore without using credentials or a real model turn.
 The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
 Codex binary or image digest and rerun these probes before upgrading it.
 
+## Auth Broker MVP
+
+The runtime now includes an encrypted canonical auth-state store and a broker
+state machine. AES-256-GCM envelopes bind authority, key ID, monotonic uint64
+generation, base generation, commit ID, operation, and payload. Compare-and-
+swap publication uses a private directory, advisory lock, same-directory
+rename, directory sync, canonical readback, and exact idempotent replay after a
+lost acknowledgement.
+
+The broker structurally cross-checks ChatGPT auth mode plus decoded access/ID
+JWT identity, plan, and expiration claims; coalesces compatible refreshes;
+publishes only an exactly re-read committed generation; and durably blocks
+reauthentication or uncertain post-dispatch states. Before OAuth dispatch it
+replaces `ready` state with a credential-free durable recovery reservation.
+Its unique owner ID prevents ABA dispatch races, while a one-way source-token
+digest distinguishes a completed concurrent refresh from a safe restore. A
+crash or failed outcome commit therefore cannot expose or reuse the consumed
+old refresh token. Canonical realpath identity collapses local filesystem
+aliases, and key rotation can advance the envelope generation without
+discarding an already-produced outcome. A per-worker facade privately
+remembers the last delivered generation and access token, so a stale `401` receives a genuinely
+newer credential while a same-token state change does not suppress a required
+refresh. Workers receive only the access token, account ID, and plan type
+through the pinned experimental app-server protocol.
+Ordinary login cannot overwrite an active refresh reservation; explicit crash
+recovery requires its exact generation and owner ID after the supervisor has
+fenced the old broker process.
+See `docs/architecture/auth-broker.md` for the security and recovery contract.
+
 ## Session Storage Contracts
 
 The runtime now has executable v1 record validators for a secret-free session

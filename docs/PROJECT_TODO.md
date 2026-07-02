@@ -6,7 +6,7 @@
   pinned runtime and filesystem snapshots.
 - [done] Define session filesystem, manifest, lease, fencing, and pluggable
   storage contracts for rootless workers.
-- [pending] Implement the central auth broker so session workers receive access
+- [done] Implement the central auth broker so session workers receive access
   tokens without mounting shared refresh-token state.
 - [pending] Implement filesystem snapshots, differential compression, retention,
   and cross-host restore verification independently of auth state.

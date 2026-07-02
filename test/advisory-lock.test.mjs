@@ -938,6 +938,7 @@ test("prequeue lock replacement quiesces existing holder commands before exact r
     }
     assert(replacementError instanceof AdvisoryLockError);
     assert.equal(replacementError.code, "lock_replaced");
+    assert.equal(replacementError.renameOutcome, "not-committed");
     assert.equal(firstSettled, true);
     const firstError = await first;
     assert(firstError instanceof AdvisoryLockError);
@@ -985,7 +986,11 @@ test("holder rejects a lock replacement in the final controlled rename window", 
     await writeFile(continueMarker, "continue\n", { mode: 0o600 });
 
     await assert.rejects(renameAttempt, (error) => {
-      return error instanceof AdvisoryLockError && error.code === "lock_replaced";
+      return (
+        error instanceof AdvisoryLockError &&
+        error.code === "lock_replaced" &&
+        error.renameOutcome === "not-committed"
+      );
     });
     assert.equal(await readFile(source, "utf8"), "candidate\n");
     assert.equal(await readFile(destination, "utf8"), "canonical\n");

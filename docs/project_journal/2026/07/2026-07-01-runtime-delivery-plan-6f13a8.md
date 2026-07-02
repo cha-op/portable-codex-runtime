@@ -22,16 +22,16 @@ superseded_by:
 ## Current State
 
 - The external `chatgptAuthTokens` consumer boundary is already proven.
-- Auth refresh authority, interrupted-turn recovery, and session storage
-  contract workstreams are complete.
-- The next serial workstream is the auth broker MVP.
+- Auth refresh authority, interrupted-turn recovery, session storage contracts,
+  and the auth broker MVP are complete.
+- The next serial workstream is the snapshot and restore core.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Implement the auth broker without mounting refresh-token state into workers.
-- Continue to keep snapshot/export implementation separate from auth state.
+- Implement quiescing, filesystem snapshots, manifests, restore, and same-image
+  thread resume verification independently of auth state.
 
 ## Evidence
 
