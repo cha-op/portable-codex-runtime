@@ -420,6 +420,194 @@ test("caller TTL cannot lower the broker safety floor", async () => {
   assert.equal(grant.expiresAt, isoAfter(600));
 });
 
+test("grant options reject malformed envelopes before getters or store reads", async (t) => {
+  const scenarioFactories = [
+    ["null", () => ({ options: null })],
+    ["primitive", () => ({ options: "invalid" })],
+    ["extra field", () => ({ options: { unexpected: true } })],
+    ["symbol field", () => ({ options: { [Symbol("unexpected")]: true } })],
+    [
+      "non-enumerable field",
+      () => {
+        const options = {};
+        Object.defineProperty(options, "minTtlSeconds", { value: 0 });
+        return { options };
+      },
+    ],
+    [
+      "accessor field",
+      () => {
+        let getterReads = 0;
+        const options = {};
+        Object.defineProperty(options, "minTtlSeconds", {
+          enumerable: true,
+          get() {
+            getterReads += 1;
+            throw new Error("private option getter");
+          },
+        });
+        return {
+          assertSideEffects: () => assert.equal(getterReads, 0),
+          options,
+        };
+      },
+    ],
+    [
+      "hostile proxy",
+      () => {
+        let proxyTrapCalls = 0;
+        const options = new Proxy(
+          {},
+          {
+            get() {
+              proxyTrapCalls += 1;
+              throw new Error("private proxy property");
+            },
+            getOwnPropertyDescriptor() {
+              proxyTrapCalls += 1;
+              throw new Error("private proxy descriptor");
+            },
+            getPrototypeOf() {
+              proxyTrapCalls += 1;
+              throw new Error("private proxy prototype");
+            },
+            ownKeys() {
+              proxyTrapCalls += 1;
+              throw new Error("private proxy shape");
+            },
+          },
+        );
+        return {
+          assertSideEffects: () => assert.equal(proxyTrapCalls, 0),
+          options,
+        };
+      },
+    ],
+  ];
+
+  for (const method of ["getGrant", "refreshGrant"]) {
+    await t.test(method, async (methodTest) => {
+      for (const [name, createScenario] of scenarioFactories) {
+        await methodTest.test(name, async () => {
+          const scenario = createScenario();
+          const store = new FakeStore();
+          const read = store.read.bind(store);
+          let storeReads = 0;
+          let refreshCalls = 0;
+          store.read = async () => {
+            storeReads += 1;
+            return read();
+          };
+          const broker = makeBroker({
+            refreshAdapter: async () => {
+              refreshCalls += 1;
+              return refreshedCredential();
+            },
+            store,
+          });
+
+          await expectBrokerError(() => broker[method](scenario.options), "invalid_request");
+          assert.equal(storeReads, 0);
+          assert.equal(refreshCalls, 0);
+          scenario.assertSideEffects?.();
+        });
+      }
+    });
+  }
+});
+
+test("grant options ignore inherited minTtlSeconds values", async () => {
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, "minTtlSeconds");
+  let inheritedReads = 0;
+  Object.defineProperty(Object.prototype, "minTtlSeconds", {
+    configurable: true,
+    get() {
+      inheritedReads += 1;
+      throw new Error("inherited option must not be read");
+    },
+  });
+  try {
+    for (const method of ["getGrant", "refreshGrant"]) {
+      const broker = makeBroker();
+      await expectBrokerError(() => broker[method]({}), "uninitialized", {
+        generation: "0",
+      });
+    }
+    assert.equal(inheritedReads, 0);
+  } finally {
+    if (previous === undefined) delete Object.prototype.minTtlSeconds;
+    else Object.defineProperty(Object.prototype, "minTtlSeconds", previous);
+  }
+});
+
+test("post-construction shadows cannot alter fixed broker security configuration", async () => {
+  const store = new FakeStore({ coordinationKey: "fixed-security-config" });
+  const foreignStore = new FakeStore({ coordinationKey: "foreign-security-config" });
+  let clockCalls = 0;
+  let fixedAdapterCalls = 0;
+  let mutatedAdapterCalls = 0;
+  let uuidCalls = 0;
+  const adapter = {
+    async refresh() {
+      fixedAdapterCalls += 1;
+      return refreshedCredential();
+    },
+  };
+  const broker = new AuthBroker({
+    minTokenTtlSeconds: 120,
+    now: () => {
+      clockCalls += 1;
+      return NOW;
+    },
+    randomUUID: () => `fixed-config-uuid-${++uuidCalls}`,
+    refreshAdapter: adapter,
+    store,
+  });
+  const securityFields = [
+    "coordinationKey",
+    "minTokenTtlSeconds",
+    "now",
+    "randomUUID",
+    "refreshAdapter",
+    "refreshAdapterIdentity",
+    "refreshAdapterOwner",
+    "store",
+  ];
+  for (const field of securityFields) assert.equal(Object.hasOwn(broker, field), false);
+
+  Object.assign(broker, {
+    coordinationKey: foreignStore.coordinationKey,
+    minTokenTtlSeconds: 0,
+    now: () => Number.NaN,
+    randomUUID: () => {
+      throw new Error("shadow UUID source");
+    },
+    refreshAdapter: async () => {
+      mutatedAdapterCalls += 1;
+      return refreshedCredential({ marker: "shadow-adapter" });
+    },
+    refreshAdapterIdentity: Symbol("shadow-adapter-identity"),
+    refreshAdapterOwner: Object.freeze({}),
+    store: foreignStore,
+  });
+  adapter.refresh = async () => {
+    mutatedAdapterCalls += 1;
+    return refreshedCredential({ marker: "mutated-adapter" });
+  };
+
+  await broker.installCredential(makeCredential({ expiresAt: isoAfter(30) }));
+  const grant = await broker.getGrant({ minTtlSeconds: 0 });
+
+  assert.equal(grant.accessToken, ACCESS_TOKEN_2);
+  assert.equal(grant.generation, "3");
+  assert.equal(store.generation, "3");
+  assert.equal(foreignStore.generation, "0");
+  assert.equal(fixedAdapterCalls, 1);
+  assert.equal(mutatedAdapterCalls, 0);
+  assert.equal(uuidCalls, 4);
+  assert.ok(clockCalls > 0);
+});
+
 test("invalid clock readings fail closed before returning credentials", async (t) => {
   for (const [name, now] of [
     ["NaN", () => Number.NaN],
@@ -1325,6 +1513,69 @@ test("two broker objects with the same coordination key coalesce refresh", async
   assert.equal(refreshCalls, 1);
   assert.deepEqual(grants.map((grant) => grant.generation), ["3", "3"]);
   assert.deepEqual(grants.map((grant) => grant.accessToken), [ACCESS_TOKEN_2, ACCESS_TOKEN_2]);
+});
+
+test("two brokers with the same object adapter owner and method coalesce refresh", async () => {
+  const store = new FakeStore({ coordinationKey: "shared-object-adapter" });
+  let refreshCalls = 0;
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const adapter = {
+    async refresh() {
+      refreshCalls += 1;
+      await refreshGate;
+      return refreshedCredential();
+    },
+  };
+  const first = makeBroker({ refreshAdapter: adapter, store });
+  const second = makeBroker({ refreshAdapter: adapter, store });
+  await first.installCredential(makeCredential());
+
+  const pending = [first.refreshGrant(), second.refreshGrant()];
+  await waitFor(() => refreshCalls === 1);
+  releaseRefresh();
+  const grants = await Promise.all(pending);
+
+  assert.equal(refreshCalls, 1);
+  assert.deepEqual(grants.map((grant) => grant.generation), ["3", "3"]);
+  assert.deepEqual(grants.map((grant) => grant.accessToken), [ACCESS_TOKEN_2, ACCESS_TOKEN_2]);
+});
+
+test("object adapter method replacement is incompatible with an active shared refresh", async () => {
+  const store = new FakeStore({ coordinationKey: "replaced-object-adapter-method" });
+  let firstRefreshCalls = 0;
+  let secondRefreshCalls = 0;
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const adapter = {
+    async refresh() {
+      firstRefreshCalls += 1;
+      await refreshGate;
+      return refreshedCredential();
+    },
+  };
+  const first = makeBroker({ refreshAdapter: adapter, store });
+  adapter.refresh = async () => {
+    secondRefreshCalls += 1;
+    return refreshedCredential({ marker: "replacement-adapter-method" });
+  };
+  const second = makeBroker({ refreshAdapter: adapter, store });
+  await first.installCredential(makeCredential());
+
+  const pending = first.refreshGrant();
+  await waitFor(() => firstRefreshCalls === 1);
+  await expectBrokerError(() => second.refreshGrant(), "invalid_request");
+  releaseRefresh();
+  const grant = await pending;
+
+  assert.equal(grant.accessToken, ACCESS_TOKEN_2);
+  assert.equal(grant.generation, "3");
+  assert.equal(firstRefreshCalls, 1);
+  assert.equal(secondRefreshCalls, 0);
 });
 
 test("caller TTL is checked after shared refresh without durably blocking the authority", async () => {

@@ -171,7 +171,16 @@ transport.
 All broker objects targeting the same store coordination key and compatible
 fixed authority configuration share one process-local in-flight refresh.
 Concurrent objects with different fixed safety TTLs or adapter identities fail
-closed instead of sharing or starting a second refresh:
+closed instead of sharing or starting a second refresh. Object adapters are
+identified by both their owner object and captured unbound refresh method, so
+replacing that method cannot merge incompatible brokers:
+
+The store reference, coordination key, refresh adapter identity, TTL floor,
+clock, and opaque-ID source are captured in private fields at construction.
+Later public-property shadowing cannot change that authority configuration.
+Grant option envelopes are validated as plain own-data objects before any
+property or store access, so malformed accessors and proxies stay inside the
+broker's fixed `invalid_request` error boundary.
 
 1. Read and decrypt canonical `ready(N)`.
 2. Return it without refresh when the access token meets the configured

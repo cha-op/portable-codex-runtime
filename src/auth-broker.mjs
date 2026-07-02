@@ -1,5 +1,5 @@
 import { createHash, randomUUID as systemRandomUUID } from "node:crypto";
-import { TextDecoder } from "node:util";
+import { TextDecoder, types as utilTypes } from "node:util";
 
 const AUTH_PAYLOAD_SCHEMA_VERSION = 1;
 const DEFAULT_MIN_TOKEN_TTL_SECONDS = 120;
@@ -570,9 +570,40 @@ function callerMinTtl(value, floor) {
   return Math.max(normalizedMinTtl(value, floor), floor);
 }
 
+function grantMinTtlOption(options) {
+  if (options === undefined) return undefined;
+  try {
+    if (
+      options === null ||
+      typeof options !== "object" ||
+      utilTypes.isProxy(options) ||
+      Array.isArray(options)
+    ) {
+      throw new AuthBrokerError("invalid_request");
+    }
+    const prototype = Object.getPrototypeOf(options);
+    if (![Object.prototype, null].includes(prototype)) {
+      throw new AuthBrokerError("invalid_request");
+    }
+    const keys = Reflect.ownKeys(options);
+    if (keys.length === 0) return undefined;
+    if (keys.length !== 1 || keys[0] !== "minTtlSeconds") {
+      throw new AuthBrokerError("invalid_request");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(options, "minTtlSeconds");
+    if (!(descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"))) {
+      throw new AuthBrokerError("invalid_request");
+    }
+    return descriptor.value;
+  } catch {
+    throw new AuthBrokerError("invalid_request");
+  }
+}
+
 function sharedConfigurationMatches(entry, configuration) {
   return (
     entry.minTokenTtlSeconds === configuration.minTokenTtlSeconds &&
+    entry.refreshAdapterOwner === configuration.refreshAdapterOwner &&
     entry.refreshAdapterIdentity === configuration.refreshAdapterIdentity
   );
 }
@@ -623,6 +654,14 @@ function storeCommitMayHaveSucceeded(error) {
 }
 
 export class AuthBroker {
+  #coordinationKey;
+  #minTokenTtlSeconds;
+  #now;
+  #randomUUID;
+  #refreshAdapter;
+  #refreshAdapterIdentity;
+  #refreshAdapterOwner;
+  #store;
   #workerAccessToken;
   #workerAccountId;
   #workerGeneration;
@@ -635,28 +674,58 @@ export class AuthBroker {
     refreshAdapter,
     store,
   }) {
+    let compareAndSwap;
+    let coordinationKey;
+    let read;
+    try {
+      compareAndSwap = store?.compareAndSwap;
+      coordinationKey = store?.coordinationKey;
+      read = store?.read;
+    } catch {
+      throw new AuthBrokerError("invalid_request");
+    }
     if (
       !store ||
-      typeof store.read !== "function" ||
-      typeof store.compareAndSwap !== "function" ||
-      store.coordinationKey === undefined ||
-      store.coordinationKey === null
+      typeof read !== "function" ||
+      typeof compareAndSwap !== "function" ||
+      coordinationKey === undefined ||
+      coordinationKey === null
     ) {
       throw new AuthBrokerError("invalid_request");
     }
-    const refreshAdapterIdentity = refreshAdapter;
-    const adapter =
-      typeof refreshAdapter === "function" ? refreshAdapter : refreshAdapter?.refresh?.bind(refreshAdapter);
+    let adapter;
+    let refreshAdapterIdentity;
+    let refreshAdapterOwner = null;
+    if (typeof refreshAdapter === "function") {
+      adapter = refreshAdapter;
+      refreshAdapterIdentity = refreshAdapter;
+    } else {
+      let refreshMethod;
+      try {
+        refreshMethod = refreshAdapter?.refresh;
+      } catch {
+        throw new AuthBrokerError("invalid_request");
+      }
+      if (typeof refreshMethod === "function") {
+        adapter = refreshMethod.bind(refreshAdapter);
+        refreshAdapterIdentity = refreshMethod;
+        refreshAdapterOwner = refreshAdapter;
+      }
+    }
     if (typeof adapter !== "function" || typeof now !== "function" || typeof randomUUID !== "function") {
       throw new AuthBrokerError("invalid_request");
     }
-    this.store = store;
-    this.coordinationKey = store.coordinationKey;
-    this.refreshAdapter = adapter;
-    this.refreshAdapterIdentity = refreshAdapterIdentity;
-    this.minTokenTtlSeconds = normalizedMinTtl(minTokenTtlSeconds, DEFAULT_MIN_TOKEN_TTL_SECONDS);
-    this.now = now;
-    this.randomUUID = randomUUID;
+    this.#store = store;
+    this.#coordinationKey = coordinationKey;
+    this.#refreshAdapter = adapter;
+    this.#refreshAdapterIdentity = refreshAdapterIdentity;
+    this.#refreshAdapterOwner = refreshAdapterOwner;
+    this.#minTokenTtlSeconds = normalizedMinTtl(
+      minTokenTtlSeconds,
+      DEFAULT_MIN_TOKEN_TTL_SECONDS,
+    );
+    this.#now = now;
+    this.#randomUUID = randomUUID;
     this.#workerAccessToken = null;
     this.#workerAccountId = null;
     this.#workerGeneration = null;
@@ -666,7 +735,7 @@ export class AuthBroker {
   async #readCanonical() {
     let record;
     try {
-      record = await this.store.read();
+      record = await this.#store.read();
     } catch (error) {
       throw storeReadError(error);
     }
@@ -706,7 +775,7 @@ export class AuthBroker {
     let commitId = requestedCommitId;
     if (commitId === undefined) {
       try {
-        commitId = this.randomUUID();
+        commitId = this.#randomUUID();
       } catch {
         throw new AuthBrokerError(
           postDispatch ? "refresh_outcome_uncertain" : "store_unavailable",
@@ -719,7 +788,7 @@ export class AuthBroker {
     let mayHaveCommitted = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        result = await this.store.compareAndSwap(request);
+        result = await this.#store.compareAndSwap(request);
         break;
       } catch (error) {
         const code = ownDataProperty(error, "code");
@@ -892,8 +961,8 @@ export class AuthBroker {
     return this.#publicSnapshot(await this.#readCanonical());
   }
 
-  async getGrant({ minTtlSeconds } = {}) {
-    const ttl = callerMinTtl(minTtlSeconds, this.minTokenTtlSeconds);
+  async getGrant(options) {
+    const ttl = callerMinTtl(grantMinTtlOption(options), this.#minTokenTtlSeconds);
     let canonical = await this.#readCanonical();
     if (
       canonical.payload?.status === "recovery-required" &&
@@ -906,7 +975,7 @@ export class AuthBroker {
     if (canonical.payload === null || canonical.payload.status !== "ready") {
       return this.#grantFromCanonical(canonical);
     }
-    if (tokenTtlSeconds(canonical.payload, this.now) >= ttl) {
+    if (tokenTtlSeconds(canonical.payload, this.#now) >= ttl) {
       return this.#grantFromCanonical(canonical);
     }
     return this.#refreshShared(ttl, {
@@ -916,8 +985,8 @@ export class AuthBroker {
     });
   }
 
-  async refreshGrant({ minTtlSeconds } = {}) {
-    const ttl = callerMinTtl(minTtlSeconds, this.minTokenTtlSeconds);
+  async refreshGrant(options) {
+    const ttl = callerMinTtl(grantMinTtlOption(options), this.#minTokenTtlSeconds);
     let canonical = await this.#readCanonical();
     if (
       canonical.payload?.status === "recovery-required" &&
@@ -932,7 +1001,7 @@ export class AuthBroker {
         accessTokenHash(canonical.payload.accessToken) !== reservation.sourceAccessTokenHash
       ) {
         const concurrentGrant = this.#grantFromCanonical(canonical);
-        if (tokenTtlSeconds(concurrentGrant, this.now) < ttl) {
+        if (tokenTtlSeconds(concurrentGrant, this.#now) < ttl) {
           throw new AuthBrokerError("token_ttl_insufficient", {
             generation: concurrentGrant.generation,
             reason: "token_ttl_insufficient",
@@ -959,10 +1028,11 @@ export class AuthBroker {
   ) {
     for (let attempt = 0; attempt < MAX_SHARED_REFRESH_RECHECKS; attempt += 1) {
       const grant = await sharedRefresh(
-        this.coordinationKey,
+        this.#coordinationKey,
         {
-          minTokenTtlSeconds: this.minTokenTtlSeconds,
-          refreshAdapterIdentity: this.refreshAdapterIdentity,
+          minTokenTtlSeconds: this.#minTokenTtlSeconds,
+          refreshAdapterIdentity: this.#refreshAdapterIdentity,
+          refreshAdapterOwner: this.#refreshAdapterOwner,
         },
         () => this.#refreshOnce({ expectedAccessToken, expectedAccountId, expectedGeneration }),
       );
@@ -972,7 +1042,7 @@ export class AuthBroker {
       if (expectedAccessToken !== null && grant.accessToken === expectedAccessToken) {
         continue;
       }
-      if (tokenTtlSeconds(grant, this.now) < minTtlSeconds) {
+      if (tokenTtlSeconds(grant, this.#now) < minTtlSeconds) {
         throw new AuthBrokerError("token_ttl_insufficient", {
           generation: grant.generation,
           reason: "token_ttl_insufficient",
@@ -984,16 +1054,17 @@ export class AuthBroker {
   }
 
   async #joinActiveRefresh(minTtlSeconds, expectedAccountId = null) {
-    const task = joinSharedRefresh(this.coordinationKey, {
-      minTokenTtlSeconds: this.minTokenTtlSeconds,
-      refreshAdapterIdentity: this.refreshAdapterIdentity,
+    const task = joinSharedRefresh(this.#coordinationKey, {
+      minTokenTtlSeconds: this.#minTokenTtlSeconds,
+      refreshAdapterIdentity: this.#refreshAdapterIdentity,
+      refreshAdapterOwner: this.#refreshAdapterOwner,
     });
     if (task === null) return null;
     const grant = await task;
     if (expectedAccountId !== null && grant.accountId !== expectedAccountId) {
       throw new AuthBrokerError("invalid_request");
     }
-    if (tokenTtlSeconds(grant, this.now) < minTtlSeconds) {
+    if (tokenTtlSeconds(grant, this.#now) < minTtlSeconds) {
       throw new AuthBrokerError("token_ttl_insufficient", {
         generation: grant.generation,
         reason: "token_ttl_insufficient",
@@ -1009,7 +1080,7 @@ export class AuthBroker {
     for (let attempt = 0; attempt < MAX_STORAGE_ONLY_REBASES; attempt += 1) {
       let commitId;
       try {
-        commitId = this.randomUUID();
+        commitId = this.#randomUUID();
       } catch {
         throw new AuthBrokerError("store_unavailable");
       }
@@ -1116,7 +1187,7 @@ export class AuthBroker {
     ) {
       throw new AuthBrokerError("invalid_credential", { reason: "refresh_token_reused" });
     }
-    if (tokenTtlSeconds(credential, this.now) < minTtlSeconds) {
+    if (tokenTtlSeconds(credential, this.#now) < minTtlSeconds) {
       throw new AuthBrokerError("invalid_credential", { reason: "token_ttl_insufficient" });
     }
     return credential;
@@ -1144,17 +1215,17 @@ export class AuthBroker {
         return this.#grantFromCanonical(before);
       }
     }
-    readClock(this.now);
+    readClock(this.#now);
     let attemptId;
     try {
-      attemptId = this.randomUUID();
+      attemptId = this.#randomUUID();
     } catch {
       throw new AuthBrokerError("store_unavailable");
     }
     const reservation = await this.#reserveRefresh(before, attemptId);
     let candidate;
     try {
-      candidate = await this.refreshAdapter({
+      candidate = await this.#refreshAdapter({
         credential: credentialFields(before.payload),
         expectedGeneration: reservation.generation,
         attemptId,
@@ -1183,7 +1254,7 @@ export class AuthBroker {
       credential = this.#validateRefreshCandidate(
         before.payload,
         candidate,
-        this.minTokenTtlSeconds,
+        this.#minTokenTtlSeconds,
       );
     } catch (error) {
       return this.#transitionBlocked(
@@ -1231,7 +1302,7 @@ export class AuthBroker {
         throw new AuthBrokerError("invalid_request");
       }
       const joined = await this.#joinActiveRefresh(
-        this.minTokenTtlSeconds,
+        this.#minTokenTtlSeconds,
         params.previousAccountId,
       );
       if (joined !== null) {
@@ -1261,7 +1332,7 @@ export class AuthBroker {
     if (this.#workerGeneration === null || this.#workerAccessToken === null) {
       throw new AuthBrokerError("invalid_request");
     }
-    const grant = await this.#refreshShared(this.minTokenTtlSeconds, {
+    const grant = await this.#refreshShared(this.#minTokenTtlSeconds, {
       expectedAccessToken: this.#workerAccessToken,
       expectedAccountId: params.previousAccountId,
       expectedGeneration: this.#workerGeneration,

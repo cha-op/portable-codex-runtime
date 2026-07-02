@@ -52,6 +52,8 @@ superseded_by:
 - Preserved account and user identity fences through explicit reservation
   recovery, reconciled exact-payload storage rotations only across strictly
   increasing generations, and rejected malformed or non-canonical JWT shapes.
+- Captured validated broker authority configuration in private fields and
+  validated grant option envelopes before property or store access.
 - Restored encrypted candidate files to mode `0600` through their open file
   descriptors before writing secrets, independent of the process umask.
 - Enforced the canonical encrypted-envelope byte limit before temporary-file
