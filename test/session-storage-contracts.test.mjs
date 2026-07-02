@@ -296,6 +296,20 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
         codexVersion: `codex-cli 1.2.3-${"a".repeat(128)}`,
       },
     },
+    {
+      ...manifest,
+      runtime: {
+        ...manifest.runtime,
+        codexVersion: "codex-cli 0.142.4+builder01.corp.internal",
+      },
+    },
+    {
+      ...manifest,
+      runtime: {
+        ...manifest.runtime,
+        codexVersion: "codex-cli 0.142.4-sk-secret-sentinel",
+      },
+    },
     { ...manifest, layoutVersion: 2 },
     { ...manifest, agents: { ...manifest.agents, defaultMaxSubagents: 11 } },
     { ...manifest, agents: { ...manifest.agents, maxSubagents: 11 } },

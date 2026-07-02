@@ -95,9 +95,12 @@ the descriptor and image configuration, measure `codex --version` from the
 exact image, and then pass all four values through
 `assertResolvedPlatformImageMatchesManifest()` before session creation and each
 launch or restore. That helper only compares the trusted probe snapshot; it
-does not contact a registry or execute a container. Digest pinning establishes
-content identity after that check. Publisher trust and image signature policy
-remain later operational work.
+does not contact a registry or execute a container. Before validation, the
+trusted probe must reduce the raw version output to the allowlisted
+`codex-cli x.y.z` core form; prerelease and build suffixes are rejected so
+internal build labels or token-like text cannot enter portable metadata. The
+image digest retains exact content identity after that sanitized comparison.
+Publisher trust and image signature policy remain later operational work.
 
 The manifest parser rejects unknown or missing fields, accessor properties,
 duplicate JSON object keys, unsupported versions, mutable/ephemeral Codex

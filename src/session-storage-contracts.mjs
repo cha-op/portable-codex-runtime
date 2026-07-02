@@ -57,7 +57,7 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
-const CODEX_VERSION_PATTERN = /^codex-cli [0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$/u;
+const CODEX_VERSION_PATTERN = /^codex-cli [0-9]+\.[0-9]+\.[0-9]+$/u;
 const JSON_STRING_AT_PATTERN =
   /"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"/y;
 const JSON_PRIMITIVE_AT_PATTERN =
