@@ -61,8 +61,8 @@ const TypeErrorConstructor = TypeError;
 
 const consumeCapabilityIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.consumeCapability;
-const publishCheckpointArtifactIntrinsic =
-  StoppedDirectoryPublication.prototype.publishCheckpointArtifact;
+const publishFreshCheckpointArtifactIntrinsic =
+  StoppedDirectoryPublication.prototype.publishFreshCheckpointArtifact;
 const publishRestoreDestinationIntrinsic =
   StoppedDirectoryPublication.prototype.publishRestoreDestination;
 
@@ -1338,7 +1338,7 @@ export class StoppedDirectoryBackend {
                     resolved,
                   );
                   const publicationOutcome = await callIntrinsic(
-                    publishCheckpointArtifactIntrinsic,
+                    publishFreshCheckpointArtifactIntrinsic,
                     this.#publication,
                     [
                       exactFrozenRecord({
@@ -1359,6 +1359,7 @@ export class StoppedDirectoryBackend {
                     request.request,
                     "checkpoint-artifact",
                   );
+                  ensureUncertain(outcome.replayed === false);
                   const artifactProof = exactFrozenRecord({
                     artifactManifestDigest:
                       outcome.materialization.artifactManifestDigest,

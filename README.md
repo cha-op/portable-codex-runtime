@@ -121,7 +121,10 @@ records use file fsync, held-lock rename, parent-directory fsync, and exact
 readback; committed results can be replayed after restart. The journal records
 caller-supplied state but does not prove physical materialisation, writer stop,
 fence authority, atomic publication, destination isolation, NFS guarantees, or
-backend success. See `docs/architecture/filesystem-operation-journal.md`.
+backend success. Its fresh-prepare operation atomically rejects every existing
+phase when a higher layer must prove that an operation started inside the
+current authority transaction. See
+`docs/architecture/filesystem-operation-journal.md`.
 
 ## Stopped-Directory Publication
 
@@ -158,10 +161,13 @@ Capture consumes the exact stopped-writer capability once. While the
 coordinator callback is active, the mutation authority holds the canonical
 fence and admission guard, reserves a predetermined result, runs publication
 exactly once, and durably finalizes the catalogue before returning that same
-completion. Restore applies the same protocol to a newer fence, trusted
-artefact proof, and isolated detached destination. Runtime collaborator
-failures are fixed path-free uncertainty; the adapter performs no internal
-retry, speculative cleanup, or replacement-coordinator recovery.
+completion. Capture publication must atomically start from an absent journal
+operation; it never adopts an earlier prepared, materialized, or committed
+artifact as proof of the current stop. Restore applies the same protocol to a
+newer fence, trusted artefact proof, and isolated detached destination, while
+retaining exact committed replay. Runtime collaborator failures are fixed
+path-free uncertainty; the adapter performs no internal retry, speculative
+cleanup, or replacement-coordinator recovery.
 
 The adapter advertises normal directory attachments, exclusive writers,
 `fencing: "manual"`, and

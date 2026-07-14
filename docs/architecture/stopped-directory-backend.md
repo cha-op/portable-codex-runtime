@@ -132,7 +132,8 @@ Capture follows one authority chain:
 5. Let the authority reserve the exact request, descriptor, and predetermined
    `{ checkpoint, mutation }` result before it invokes `publish`.
 6. Validate the complete authority context while its fence and admission guard
-   is still held, then call `publishCheckpointArtifact()`.
+   is still held, then call `publishFreshCheckpointArtifact()`. Its atomic
+   journal preparation accepts only an `absent` operation ID.
 7. Return the publication completion to the authority, which must durably
    finalize the catalogue and return that same object before backend success.
 
@@ -165,10 +166,13 @@ process/writer/stop correlation IDs. It contains no capability, writer handle,
 absolute path, or credential.
 
 The frozen completion contains `artifactProof`, `materialization`,
-`replayed`, and `result`. A committed replay may return the exact durable
-result without a new physical mutation, but it still occurs inside this
-currently authorized one-use transaction and must validate the committed
-publication object. It is not the later replay-only reconciliation API.
+`replayed`, and `result`. A successful normal capture always has
+`replayed: false`. Any pre-existing `prepared`, `materialized`, or `committed`
+journal phase conflicts with fresh preparation and becomes terminal backend
+uncertainty; serialized reservation and process/writer/stop correlation IDs
+are not proof that an earlier artifact was created after the current writer
+stop. Exact replay belongs to a later authenticated reconciliation API, not a
+new stopped-writer capability.
 
 ## Restore Transaction
 
@@ -250,6 +254,12 @@ one-use capability. The backend performs no internal retry, coordinator
 replacement, speculative cleanup, or reconciliation. Retained staging,
 published objects, and durable reservations remain evidence for an operator or
 the later replay-only reconciliation path.
+
+In particular, the normal capture path never adopts or advances an earlier
+publication phase. The fresh journal transition is atomic with respect to the
+canonical journal lock, so a record inserted after the publication preflight
+also fails closed before source materialisation. Restore remains idempotently
+replayable under its newer destination fence and trusted artifact proof.
 
 ## Storage and Fencing Boundary
 

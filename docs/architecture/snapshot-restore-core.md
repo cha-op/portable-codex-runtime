@@ -125,21 +125,21 @@ A new or resumable physical mutation path must additionally:
 - establish the required storage barrier for clean capture; and
 - perform the physical capture or restore and durably commit its proof.
 
-A committed replay performs no new physical mutation and therefore does not
-repeat the source barrier or capture. Inside the same capability-consumption
-callback, it must validate both the exact committed journal binding and the
-published final object's topology, persistent identity, modeled digest, and
-other committed-state invariants before returning the durable result. A journal
-record alone is not replay authority.
-
-One stopped-directory backend dispatch may resume an exact pre-existing
-`prepared` or `materialized` operation inside its one consumption callback.
-If that callback then fails or becomes uncertain, the writer and capability
-are terminal: this layer has no transition that mints another capability for
-the same writer incarnation. It stays blocked for the later dedicated
+A normal clean-capture dispatch must atomically start a fresh durable operation
+inside its capability-consumption callback. It may not adopt or advance an
+earlier `prepared`, `materialized`, or `committed` publication: journal
+bindings and serialized correlation IDs do not prove that the earlier bytes
+were captured after the current writer stop. Such state makes the current
+writer and capability terminal and stays blocked for the later authenticated
 reconciliation path. The backend captures one designated coordinator in
 trusted state and does not instantiate a replacement coordinator as a retry
 mechanism.
+
+Restore may replay an exact committed destination publication because the
+current path separately proves a newer destination fence, detached isolation,
+and a trusted immutable checkpoint proof. Capture replay requires a future
+durable attempt-provenance record plus committed-object verification; a journal
+record alone is not replay authority.
 
 The backend, rather than the core, defines the physical checkpoint and restore
 mechanism. A filesystem copy, image snapshot, reflink, volume-provider

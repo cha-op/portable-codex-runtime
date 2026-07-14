@@ -400,6 +400,59 @@ test("exact replay returns the canonical state without rewriting it", async (t) 
   assert.equal((await lstat(recordPath, { bigint: true })).ino, committedIdentity.ino);
 });
 
+test("fresh preparation rejects every durable operation phase without rewriting it", async (t) => {
+  const { directory, journal } = await createFixture(t);
+  const recordPath = join(directory, operationJournalRecordFilename(OPERATION_ID));
+  const phases = [
+    async () => prepare(journal),
+    async () => markMaterialized(journal),
+    async () => commit(journal),
+  ];
+
+  for (const advance of phases) {
+    const durable = await advance();
+    const identity = await lstat(recordPath, { bigint: true });
+
+    await assert.rejects(
+      journal.prepareFresh(prepareOptions()),
+      assertJournalError("operation_already_started", "not-committed"),
+    );
+
+    assert.deepEqual(
+      (await journal.read({ operationId: OPERATION_ID })).record,
+      durable.record,
+    );
+    const after = await lstat(recordPath, { bigint: true });
+    assert.equal(after.dev, identity.dev);
+    assert.equal(after.ino, identity.ino);
+    assert.equal(after.birthtimeNs, identity.birthtimeNs);
+  }
+});
+
+test("concurrent fresh preparations admit exactly one durable starter", async (t) => {
+  const { journal } = await createFixture(t);
+
+  const attempts = await Promise.allSettled([
+    journal.prepareFresh(prepareOptions()),
+    journal.prepareFresh(prepareOptions()),
+  ]);
+  const fulfilled = attempts.filter(({ status }) => status === "fulfilled");
+  const rejected = attempts.filter(({ status }) => status === "rejected");
+
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(
+    assertJournalError("operation_already_started", "not-committed")(
+      rejected[0].reason,
+    ),
+    true,
+  );
+  assert.deepEqual(
+    (await journal.read({ operationId: OPERATION_ID })).record,
+    fulfilled[0].value.record,
+  );
+});
+
 test("replays requesting an earlier exact phase observe progressed canonical state", async (t) => {
   const { journal } = await createFixture(t);
   await prepare(journal);

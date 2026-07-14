@@ -53,9 +53,15 @@ superseded_by:
 - Resolver construction rejects async, bound, and native-code functions
   without executing the function or reading spoofable metadata; callers use a
   source-backed synchronous closure when binding is required.
-- Exact committed-result replay inside a currently authorized transaction is
-  supported. Replay-only reconciliation after uncertainty or fence turnover
-  remains a separate workstream.
+- Normal capture uses an atomic fresh journal preparation. Pre-existing
+  `prepared`, `materialized`, and `committed` phases all fail closed without
+  recopy, rename, catalogue finalization, or capability reuse; serialized
+  journal bindings do not authenticate when the existing artifact was
+  captured. Restore retains exact committed-result replay under its newer
+  destination fence and trusted artifact proof.
+- Capture replay-only reconciliation after uncertainty or fence turnover
+  remains a separate workstream and requires durable authenticated attempt
+  provenance rather than another stopped-writer capability.
 - The mutation-authority/catalogue seam and its conformance contract are part
   of this completed slice. A production linearizable database, catalogue,
   lease service, and launcher admission implementation remain deferred.

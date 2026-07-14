@@ -36,8 +36,10 @@
 - A v1 stopped-directory backend now composes that one-use capability with a
   durable mutation-authority/catalogue seam and local publication. It delegates
   lifecycle operations, guards exact predetermined capture/restore results,
-  and fails closed on callback or finalization uncertainty while declaring
-  local-filesystem and manual-fencing limits.
+  atomically starts normal capture from an absent journal operation, and fails
+  closed on pre-existing publication state, callback uncertainty, or
+  finalization uncertainty while declaring local-filesystem and manual-fencing
+  limits.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers

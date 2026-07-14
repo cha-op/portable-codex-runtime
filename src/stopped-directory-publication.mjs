@@ -35,6 +35,10 @@ import {
   syncStoppedTree,
 } from "./stopped-tree.mjs";
 
+const journalPrepareFreshIntrinsic =
+  FilesystemOperationJournal.prototype.prepareFresh;
+const reflectApply = Reflect.apply;
+
 export const STOPPED_DIRECTORY_ARTIFACT_VERSION = 1;
 
 const PUBLICATION_CONTRACT_VERSION = 2;
@@ -1191,7 +1195,10 @@ function normalizeJournalError(
       : publicationMayHaveOccurred
         ? "uncertain"
         : "not-committed";
-  if (error.code === "operation_conflict") {
+  if (
+    error.code === "operation_conflict" ||
+    error.code === "operation_already_started"
+  ) {
     return createPublicationError("publication_conflict", commitState);
   }
   if (error.code === "journal_recovery_required") {
@@ -1288,6 +1295,14 @@ export class StoppedDirectoryPublication {
   }
 
   async publishCheckpointArtifact(options) {
+    return this.#publishCheckpointArtifact(options, false);
+  }
+
+  async publishFreshCheckpointArtifact(options) {
+    return this.#publishCheckpointArtifact(options, true);
+  }
+
+  async #publishCheckpointArtifact(options, requireFreshOperation) {
     const normalized = exactOptions(options, [
       "artifactDirectory",
       "artifactOwnedRoot",
@@ -1308,6 +1323,7 @@ export class StoppedDirectoryPublication {
       kind: "checkpoint-artifact",
       operationId: snapshot.operationId,
       request: snapshot.request,
+      requireFreshOperation,
       result: snapshot.result,
       sourceDirectory: normalized.sourceDirectory,
       sourceOwnedRoot: normalized.sourceOwnedRoot,
@@ -1340,6 +1356,7 @@ export class StoppedDirectoryPublication {
       kind: "restore-destination",
       operationId: snapshot.operationId,
       request: snapshot.request,
+      requireFreshOperation: false,
       result: snapshot.result,
       sourceDirectory: normalized.artifactDirectory,
       sourceOwnedRoot: normalized.artifactOwnedRoot,
@@ -2207,7 +2224,11 @@ export class StoppedDirectoryPublication {
         }
       };
       const prepared = await runJournalObservableOperation(() =>
-        this.#journal.prepare(journalInput),
+        options.requireFreshOperation
+          ? reflectApply(journalPrepareFreshIntrinsic, this.#journal, [
+              journalInput,
+            ])
+          : this.#journal.prepare(journalInput),
       );
       const state = prepared.record.state;
       await revalidateLockedTopology(state);

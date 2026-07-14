@@ -295,18 +295,20 @@ the catalogue before success. The finite issuer-scope ownership contract still
 applies; the lifecycle owner disposes the coordinator only after canonical
 teardown and safe writer retirement.
 
-An exact committed-result replay performs no new physical mutation. Inside the
-same one-use callback, the stopped-directory backend verifies both the exact
-committed journal binding and the published final object's topology, persistent
-identity, and modeled digest before returning the durable result. A journal
-record alone is not replay authority.
+The normal stopped-directory capture path atomically requires a fresh journal
+operation inside this one-use callback. It never adopts or advances a
+pre-existing `prepared`, `materialized`, or `committed` publication because
+serialized journal bindings and correlation IDs do not prove that earlier
+bytes were captured after this writer stop. A conflicting durable phase makes
+the callback terminally uncertain; this coordinator has no transition that
+mints another capability for the same writer incarnation.
 
-The single current dispatch may resume an exact pre-existing `prepared` or
-`materialized` operation. After callback failure or uncertainty, however, this
-coordinator has no transition that mints another capability for the same writer
-incarnation. The operation remains blocked for the later dedicated
-reconciliation path; neither the old capability nor a newly instantiated
-coordinator may be used to re-dispatch it.
+Exact capture replay remains blocked for a later dedicated reconciliation path
+that authenticates durable attempt provenance and validates the committed
+publication object. Neither the old capability nor a newly instantiated
+coordinator may be used to re-dispatch it. Restore replay is a separate path
+guarded by a newer destination fence, detached isolation, and trusted artifact
+proof.
 
 The capability itself is intentionally absent from journal records,
 checkpoint descriptors, manifests, snapshot archives, and control-plane

@@ -67,6 +67,7 @@ const ERROR_MESSAGES = Object.freeze({
   invalid_journal_record: "Operation journal record is invalid",
   unsupported_journal_record: "Operation journal record version is unsupported",
   operation_conflict: "Operation ID is already bound to a different operation",
+  operation_already_started: "Operation ID already has durable state",
   invalid_state_transition: "Operation journal state transition is invalid",
   journal_io_failed: "Operation journal I/O failed before commit",
   journal_commit_outcome_uncertain: "Operation journal commit outcome is uncertain",
@@ -1543,6 +1544,11 @@ export class FilesystemOperationJournal {
     return this.#transition(input, "prepared");
   }
 
+  async prepareFresh(options) {
+    const input = normalizeOperationInput(options);
+    return this.#transition(input, "prepared", { requireAbsent: true });
+  }
+
   async markMaterialized(options) {
     const input = normalizeOperationInput(options, { materializationRequired: true });
     return this.#transition(input, "materialized");
@@ -1553,7 +1559,7 @@ export class FilesystemOperationJournal {
     return this.#transition(input, "committed");
   }
 
-  async #transition(input, requestedState) {
+  async #transition(input, requestedState, { requireAbsent = false } = {}) {
     return this.#run(input.operationId, async ({ authority, lock }) => {
       await runUntrustedIo(() => lock.assertHeld());
       const visible = await readCanonicalRecord(
@@ -1576,6 +1582,9 @@ export class FilesystemOperationJournal {
         operationId: input.operationId,
         record: existing,
       };
+      if (requireAbsent && existing !== null) {
+        fail("operation_already_started");
+      }
       if (existing !== null) {
         ensure(sameOperation(existing, input), "operation_conflict");
       }

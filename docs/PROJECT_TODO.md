@@ -22,8 +22,9 @@
 - [done] Compose the journal, publication layer, one-use stop capability, and
   durable mutation-authority/catalogue seam into the stopped-directory backend
   adapter and conformance suite.
-- [pending] Add replay-only uncertain-outcome reconciliation, then same-image
-  resume verification and rollout-tail repair.
+- [pending] Add authenticated durable capture-attempt provenance and replay-only
+  uncertain-outcome reconciliation, then same-image resume verification and
+  rollout-tail repair.
 - [pending] Implement the production linearizable lease, reservation,
   catalogue, and launcher-admission authority behind the validated backend
   seam.

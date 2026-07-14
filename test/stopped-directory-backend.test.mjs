@@ -29,7 +29,10 @@ import {
   assertStorageBackend,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
-import { StoppedDirectoryPublication } from "../src/stopped-directory-publication.mjs";
+import {
+  StoppedDirectoryPublication,
+  stoppedDirectoryPublicationCandidateName,
+} from "../src/stopped-directory-publication.mjs";
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
   StoppedWriterCapabilityCoordinator,
@@ -462,6 +465,7 @@ async function createFixture(t, options = {}) {
           "publication must remain inside the mutation-authority guard",
         );
         observation.events.push("publication:prepared");
+        await options.publicationFaults?.afterJournalPrepared?.();
       },
       afterCopy: async () => {
         assert.equal(
@@ -472,6 +476,17 @@ async function createFixture(t, options = {}) {
           "copy must remain inside the mutation-authority guard",
         );
         observation.events.push("publication:copied");
+        await options.publicationFaults?.afterCopy?.();
+      },
+      afterMaterialized: async () => {
+        assert.equal(
+          observation.captureGuard ||
+            observation.restoreGuard ||
+            observation.preseeding,
+          true,
+          "materialization must remain inside the mutation-authority guard",
+        );
+        await options.publicationFaults?.afterMaterialized?.();
       },
     },
     inspectFilesystem: async () => ({
@@ -874,6 +889,40 @@ function captureDispatchInput(fixture, capability, overrides = {}) {
   };
 }
 
+function capturePublicationOptions(fixture) {
+  const captureRequest = mutationRequest("checkpoint", fixture.writerLease);
+  return {
+    artifactDirectory: fixture.artifactDirectory,
+    artifactOwnedRoot: fixture.artifactOwnedRoot,
+    binding: {
+      attachmentId: fixture.writerAttachment.attachmentId,
+      attachmentOperationId: fixture.writerAttachment.operationId,
+      attachmentProofId: fixture.writerAttachment.proofId,
+      checkpoint: checkpoint(),
+      contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
+      processIncarnationId: PROCESS_INCARNATION_ID,
+      reservationId: RESERVATION_ID,
+      stopOperationId: STOP_OPERATION_ID,
+      writerIncarnationId: WRITER_INCARNATION_ID,
+    },
+    operationId: CAPTURE_OPERATION_ID,
+    request: captureRequest,
+    result: fixedResult(checkpoint(), captureRequest),
+    sourceDirectory: fixture.sourceDirectory,
+    sourceOwnedRoot: fixture.sourceOwnedRoot,
+  };
+}
+
+function captureCandidatePath(fixture) {
+  return join(
+    fixture.artifactOwnedRoot,
+    stoppedDirectoryPublicationCandidateName(
+      CAPTURE_OPERATION_ID,
+      ARTIFACT_ID,
+    ),
+  );
+}
+
 function restoreCoreOptions(fixture, overrides = {}) {
   return {
     backend: fixture.backend,
@@ -1072,6 +1121,32 @@ test("restore requires a newer current fence, trusted proof, and detached destin
     "authority:restore:start",
     "publication:prepared",
     "publication:copied",
+    "authority:restore:finalized",
+    "authority:restore:end",
+  ]);
+
+  const destinationBeforeReplay = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  fixture.observation.events.length = 0;
+  const replay = await restoreCleanCheckpoint(options);
+  const replayCompletion = fixture.mutation.state.restoreFinalizations[1];
+  const destinationAfterReplay = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+
+  assert.deepEqual(replay, result);
+  assert.equal(fixture.mutation.state.restoreRuns, 2);
+  assert.equal(fixture.mutation.state.restoreFinalizations.length, 2);
+  assert.equal(replayCompletion.replayed, true);
+  assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
+  assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
+  assert.equal(
+    destinationAfterReplay.birthtimeNs,
+    destinationBeforeReplay.birthtimeNs,
+  );
+  assert.deepEqual(fixture.observation.events, [
+    "authority:restore:start",
     "authority:restore:finalized",
     "authority:restore:end",
   ]);
@@ -1883,68 +1958,103 @@ test("runtime collaborator failures become fixed path-free uncertainty", async (
   assert.equal(fixture.mutation.state.captureRuns, 1);
 });
 
-test("a preseeded committed capture replays through the one designated capability", async (t) => {
-  const fixture = await createFixture(t);
-  const captureRequest = mutationRequest("checkpoint", fixture.writerLease);
-  const predeterminedResult = fixedResult(checkpoint(), captureRequest);
-  fixture.observation.preseeding = true;
-  let preseeded;
-  try {
-    preseeded = await fixture.publication.publishCheckpointArtifact({
-      artifactDirectory: fixture.artifactDirectory,
-      artifactOwnedRoot: fixture.artifactOwnedRoot,
-      binding: {
-        attachmentId: fixture.writerAttachment.attachmentId,
-        attachmentOperationId: fixture.writerAttachment.operationId,
-        attachmentProofId: fixture.writerAttachment.proofId,
-        checkpoint: checkpoint(),
-        contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
-        processIncarnationId: PROCESS_INCARNATION_ID,
-        reservationId: RESERVATION_ID,
-        stopOperationId: STOP_OPERATION_ID,
-        writerIncarnationId: WRITER_INCARNATION_ID,
-      },
-      operationId: CAPTURE_OPERATION_ID,
-      request: captureRequest,
-      result: predeterminedResult,
-      sourceDirectory: fixture.sourceDirectory,
-      sourceOwnedRoot: fixture.sourceOwnedRoot,
+test("pre-existing capture phases cannot satisfy a new stopped-writer capability", async (t) => {
+  for (const phase of ["prepared", "materialized", "committed"]) {
+    await t.test(phase, async (t) => {
+      let seedFaultEnabled = phase !== "committed";
+      const fixture = await createFixture(t, {
+        publicationFaults: {
+          async afterJournalPrepared() {
+            if (phase === "prepared" && seedFaultEnabled) {
+              throw new Error("prepared capture seed fault");
+            }
+          },
+          async afterMaterialized() {
+            if (phase === "materialized" && seedFaultEnabled) {
+              throw new Error("materialized capture seed fault");
+            }
+          },
+        },
+      });
+      const publicationOptions = capturePublicationOptions(fixture);
+      fixture.observation.preseeding = true;
+      try {
+        if (phase === "committed") {
+          await fixture.publication.publishCheckpointArtifact(
+            publicationOptions,
+          );
+        } else {
+          await assert.rejects(
+            fixture.publication.publishCheckpointArtifact(publicationOptions),
+            (error) =>
+              error?.code === "publication_io_failed" &&
+              error.commitState === "not-committed",
+          );
+        }
+      } finally {
+        fixture.observation.preseeding = false;
+      }
+      seedFaultEnabled = false;
+
+      const journalBefore = await fixture.journal.read({
+        operationId: CAPTURE_OPERATION_ID,
+      });
+      assert.equal(journalBefore.record.state, phase);
+      const candidate = captureCandidatePath(fixture);
+      const durablePath =
+        phase === "materialized"
+          ? candidate
+          : phase === "committed"
+            ? fixture.artifactDirectory
+            : null;
+      const durableIdentity =
+        durablePath === null ? null : await lstat(durablePath, { bigint: true });
+      if (phase !== "prepared") {
+        await rm(fixture.sourceDirectory, { force: true, recursive: true });
+      }
+      fixture.observation.events.length = 0;
+
+      const capability = await issueCapability(fixture);
+      const options = captureCoreOptions(fixture, capability);
+      await assert.rejects(
+        () => captureCleanCheckpoint(options),
+        (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+      );
+
+      assert.equal(fixture.stopCalls, 1);
+      assert.equal(fixture.resolverCalls, 1);
+      assert.equal(fixture.mutation.state.captureRuns, 1);
+      assert.equal(
+        fixture.mutation.state.captureCallbackCompletions.length,
+        0,
+      );
+      assert.equal(fixture.mutation.state.captureFinalizations.length, 0);
+      assert.deepEqual(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+        journalBefore.record,
+      );
+      if (durablePath === null) {
+        assert.equal(await pathExists(candidate), false);
+        assert.equal(await pathExists(fixture.artifactDirectory), false);
+      } else {
+        const after = await lstat(durablePath, { bigint: true });
+        assert.equal(after.dev, durableIdentity.dev);
+        assert.equal(after.ino, durableIdentity.ino);
+        assert.equal(after.birthtimeNs, durableIdentity.birthtimeNs);
+      }
+      assert.deepEqual(fixture.observation.events, [
+        "resolver",
+        "authority:capture:start",
+        "authority:capture:end",
+      ]);
+
+      await assert.rejects(
+        () => captureCleanCheckpoint(options),
+        (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+      );
+      assert.equal(fixture.resolverCalls, 2);
+      assert.equal(fixture.mutation.state.captureRuns, 1);
+      assert.equal(fixture.mutation.state.captureFinalizations.length, 0);
     });
-  } finally {
-    fixture.observation.preseeding = false;
   }
-  assert.equal(preseeded.replayed, false);
-  assert.equal(
-    fixture.observation.events.includes("publication:copied"),
-    true,
-  );
-  const artifactBefore = await lstat(fixture.artifactDirectory, { bigint: true });
-  await rm(fixture.sourceDirectory, { force: true, recursive: true });
-  fixture.observation.events.length = 0;
-
-  const capability = await issueCapability(fixture);
-  const replay = await captureCleanCheckpoint(
-    captureCoreOptions(fixture, capability),
-  );
-  const artifactAfter = await lstat(fixture.artifactDirectory, { bigint: true });
-  const completion = fixture.mutation.state.captureFinalizations[0];
-
-  assert.deepEqual(replay, predeterminedResult);
-  assert.equal(fixture.stopCalls, 1);
-  assert.equal(fixture.resolverCalls, 1);
-  assert.equal(fixture.mutation.state.captureRuns, 1);
-  assert.equal(fixture.mutation.state.captureFinalizations.length, 1);
-  assert.equal(completion.replayed, true);
-  assert.deepEqual(completion.materialization, preseeded.materialization);
-  assert.equal(artifactAfter.dev, artifactBefore.dev);
-  assert.equal(artifactAfter.ino, artifactBefore.ino);
-  assert.equal(artifactAfter.birthtimeNs, artifactBefore.birthtimeNs);
-  assert.equal(
-    fixture.observation.events.includes("publication:prepared"),
-    false,
-  );
-  assert.equal(
-    fixture.observation.events.includes("publication:copied"),
-    false,
-  );
 });
