@@ -676,10 +676,102 @@ async function collectTreeIdentities(
   }
 }
 
-export async function stoppedTreeContainsAnyIdentity(path, identities) {
+async function treeContainsAnyIdentity(
+  path,
+  identityKeys,
+  visitedDirectories = new Set(),
+  { expectedDevice } = {},
+) {
+  const metadata = await lstat(path, { bigint: true });
+  const treeDevice = expectedDevice ?? metadata.dev;
+  assert.equal(
+    metadata.dev,
+    treeDevice,
+    "stopped-tree identity scan rejects filesystem boundaries",
+  );
+  const identityKey = fileIdentityKey(metadata);
+  if (identityKeys.has(identityKey)) return true;
+  if (!metadata.isDirectory()) {
+    await assertPathIdentity(
+      path,
+      metadata,
+      "stopped-tree identity scan rejects entry identity changes",
+    );
+    return false;
+  }
+  if (visitedDirectories.has(identityKey)) {
+    await assertPathIdentity(
+      path,
+      metadata,
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    return false;
+  }
+  visitedDirectories.add(identityKey);
+
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  let primaryFailure;
+  try {
+    const heldMetadata = await handle.stat({ bigint: true });
+    assert(
+      heldMetadata.isDirectory() && sameFileIdentity(metadata, heldMetadata),
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    const entries = await readPortableDirectory(path);
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    let containsIdentity = false;
+    for (const entry of entries) {
+      containsIdentity = await treeContainsAnyIdentity(
+        join(path, entry),
+        identityKeys,
+        visitedDirectories,
+        { expectedDevice: treeDevice },
+      );
+      if (containsIdentity) break;
+    }
+    assertStableFileMetadata(
+      heldMetadata,
+      await handle.stat({ bigint: true }),
+      "stopped-tree identity scan rejects directory metadata changes",
+    );
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    return containsIdentity;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+export async function stoppedTreeContainsAnyIdentity(
+  path,
+  identities,
+  {
+    allowRootMount = true,
+    listMountPoints = listCurrentMountPoints,
+  } = {},
+) {
   assert(
     Array.isArray(identities) && identities.length > 0,
     "identities must be a non-empty array",
+  );
+  assert.equal(typeof allowRootMount, "boolean", "allowRootMount must be a boolean");
+  assert.equal(
+    typeof listMountPoints,
+    "function",
+    "listMountPoints must be a function",
   );
   const normalized = identities.map((identity) => {
     assert(
@@ -694,10 +786,11 @@ export async function stoppedTreeContainsAnyIdentity(path, identities) {
       ino: integerAsBigInt(identity.ino),
     };
   });
-  const treeIdentities = await collectTreeIdentities(path);
-  return normalized.some((identity) =>
-    treeIdentities.has(fileIdentityKey(identity)),
-  );
+  await assertNoMountBoundary(path, listMountPoints, { allowRootMount });
+  const identityKeys = new Set(normalized.map(fileIdentityKey));
+  const containsIdentity = await treeContainsAnyIdentity(path, identityKeys);
+  await assertNoMountBoundary(path, listMountPoints, { allowRootMount });
+  return containsIdentity;
 }
 
 export async function stoppedTreesShareAnyIdentity(left, right) {
@@ -1520,14 +1613,21 @@ export async function copyStoppedTreeBetweenRoots({
     "boolean",
     "allowAbsoluteSymlinks must be a boolean",
   );
+  let normalizedExpectedSourceRootIdentity = null;
   if (expectedSourceRootIdentity !== null) {
+    const expectedDevice = integerAsBigInt(expectedSourceRootIdentity?.dev);
+    const expectedInode = integerAsBigInt(expectedSourceRootIdentity?.ino);
     assert(
       expectedSourceRootIdentity !== undefined &&
         typeof expectedSourceRootIdentity === "object" &&
-        integerAsBigInt(expectedSourceRootIdentity.dev) !== null &&
-        integerAsBigInt(expectedSourceRootIdentity.ino) !== null,
+        expectedDevice !== null &&
+        expectedInode !== null,
       "expectedSourceRootIdentity must be a filesystem identity",
     );
+    normalizedExpectedSourceRootIdentity = Object.freeze({
+      dev: expectedDevice,
+      ino: expectedInode,
+    });
   }
   assert.equal(
     typeof allowSourceRootMount,
@@ -1618,8 +1718,11 @@ export async function copyStoppedTreeBetweenRoots({
     const sourceRootIdentity = await lstat(canonicalSource, { bigint: true });
     assert(
       sourceRootIdentity.isDirectory() &&
-        (expectedSourceRootIdentity === null ||
-          sameFileIdentity(sourceRootIdentity, expectedSourceRootIdentity)),
+        (normalizedExpectedSourceRootIdentity === null ||
+          sameFileIdentity(
+            sourceRootIdentity,
+            normalizedExpectedSourceRootIdentity,
+          )),
       "stopped-tree copy rejects source root identity changes",
     );
     await assertNoMountBoundary(canonicalSource, listMountPoints, {

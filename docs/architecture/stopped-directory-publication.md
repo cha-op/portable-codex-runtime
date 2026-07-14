@@ -87,6 +87,15 @@ their roles. Before journal preparation, publication inventories the complete
 source tree and rejects either the target-root or journal-root identity at any
 source descendant, so an external bind-mount alias cannot turn destination
 creation or journal advancement into a source mutation.
+Mount-table boundaries are checked before and after each recursive identity
+scan; the declared tree root may itself be an approved mount, but any nested
+mount fails before inventory begins. Publication always inventories the
+journal tree for source-root and target-root identities; `absent` and
+`prepared` states also check the current source-leaf identity. Each scan stops
+before descending into a matching directory. This rejects a publication root
+exposed as a journal descendant through a bind alias without walking the
+aliased publication tree, while `materialized` and `committed` replay need not
+inspect a caller's replacement source leaf.
 
 The operation journal exposes its pinned canonical directory and runtime
 device/inode identity only to this physical layer. Publication rejects a journal directory
@@ -136,6 +145,27 @@ publication-root lock -> filesystem operation journal lock
 
 No code path may acquire these locks in the opposite order.
 
+The trusted publication-root provisioner must create the exported
+`.stopped-directory-publication.lock` path before the root is exposed to a
+worker or used as a publication target. It must be an empty regular file owned
+by the runtime UID, have one link and exact mode `0600`, and be made durable by
+fsyncing both the file and its parent directory. Existing roots are upgraded
+only while detached and quiescent. The publish path acquires this inode with
+`requireExisting: true`: it never creates, chmods, truncates, unlinks, or
+repairs the lock path. On macOS the `lockf` executor also uses `-n`, so a
+concurrent unlink cannot recreate the path. A missing or unsafe provisioned
+lock fails closed as `publication_outcome_uncertain`.
+An injected `acquireLock(path, { requireExisting: true })` implementation is a
+trusted adapter and must preserve the same no-mutation and existing-inode
+contract rather than ignoring the option.
+
+The trusted storage adapter maps each publication-owned operation target to
+one publication root; callers cannot select an alternate root for the same
+operation. Every journal transition for such an operation goes through this
+publication layer while the mapped root lock is held. Direct journal
+transitions or alternate-root attempts are outside the protocol because they
+would bypass the state-hint serialization boundary.
+
 The public call synchronously validates and defensively snapshots the complete
 coordinator binding, storage request, checkpoint result, and restore proof
 before its first asynchronous publication-root lookup or queue wait. Caller
@@ -157,14 +187,19 @@ uses the final path.
 
 ## Ordered State Machine
 
-One publication attempt first performs a read-only topology preflight, then
-holds the publication-root lock and pinned directory authorities through the
-remaining sequence:
+One publication attempt first performs a read-only root-only topology
+preflight, then holds the publication-root lock and pinned directory
+authorities through the durable-state preflight and remaining sequence:
 
-1. validate the exact operation, journal profile, private roots, source, final
-   target, and current recovery topology before creating the publication lock;
-   after acquiring the lock, repeat the authority, identity, and topology
-   checks before reading or advancing the journal;
+1. validate the exact operation, journal profile, private roots, direct source
+   location, final target, and root-only recovery topology; acquire the
+   preprovisioned publication lock without changing its inode or metadata, then
+   repeat root-only authority and topology checks; while that lock remains
+   held, obtain a lock-free, fault-callback-free journal state hint and inspect
+   and recursively validate the live source leaf only when the hint is `absent`
+   or `prepared`; perform the authoritative locked journal read, reject any
+   state regression, and revalidate the live source only if the authoritative
+   state still requires it;
 2. call `journal.prepare()` to durably fix the operation binding, storage
    request, checkpoint descriptor, source-owned-root filesystem profile and
    object identity, direct source-leaf filesystem incarnation ID/object ID, and
@@ -173,15 +208,18 @@ remaining sequence:
    namespace, pin candidate/final topology before the call and require the same
    presence and runtime identities afterward before restoring any
    `not-committed` classification;
-3. establish the stopped source storage barrier by opening and validating the
-   tree, fsyncing regular files, and fsyncing directories in post-order so each
+3. for a fresh or prepared operation, establish the stopped source storage
+   barrier by opening and validating the tree, fsyncing regular files, and
+   fsyncing directories in post-order so each
    directory is synced only after its descendants; symlink entries are made
    durable by their containing directory; recheck that the source pathname
    still names the caller-observed root inode and that both owned-root
    authorities remain current before and after every injected callback, and
    require that same identity when the copy opens its source root; restore also
    requires the source bundle root to contain exactly `artifact.json` and
-   `payload/` at each stable readback;
+   `payload/` at each stable readback; materialized and committed replay instead
+   use the recorded source binding and never open, inventory, or inspect the
+   caller's current replacement source leaf;
 4. create the operation's deterministic private staging directory with
    exclusive creation and copy either the stopped source into a checkpoint
    bundle or the validated bundle payload into a restore tree;

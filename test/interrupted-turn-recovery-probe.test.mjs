@@ -1234,6 +1234,31 @@ test("stopped-tree copy can require the caller-observed source identity", async 
   }
 });
 
+test("stopped-tree copy accepts a numeric caller-observed source identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-copy-numeric-source-test-"));
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source);
+    await writeFile(join(source, "data"), "portable\n");
+    const identity = await lstat(source);
+
+    await copyStoppedTree({
+      destination,
+      expectedSourceRootIdentity: {
+        dev: identity.dev,
+        ino: identity.ino,
+      },
+      ownedRoot: root,
+      source,
+    });
+
+    assert.equal(await readFile(join(destination, "data"), "utf8"), "portable\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("stopped-tree identity scans include nested directory authorities", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-tree-identity-scan-test-"));
   try {
@@ -1252,6 +1277,50 @@ test("stopped-tree identity scans include nested directory authorities", async (
     assert.equal(
       await stoppedTreeContainsAnyIdentity(source, [outsideIdentity]),
       false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree identity scans reject nested mounts before inventory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-tree-mount-scan-test-"));
+  try {
+    const source = join(root, "source");
+    const nestedMount = join(source, "nested-mount");
+    const outside = join(root, "outside");
+    await mkdir(nestedMount, { recursive: true });
+    await mkdir(outside);
+    await writeFile(join(nestedMount, "nonportable-\u00c9"), "blocked\n");
+    const outsideIdentity = await lstat(outside, { bigint: true });
+
+    await assert.rejects(
+      stoppedTreeContainsAnyIdentity(source, [outsideIdentity], {
+        allowRootMount: true,
+        listMountPoints: async () => ["/", nestedMount],
+      }),
+      /rejects nested mount points/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree identity scans allow a root mount and short-circuit matches", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-tree-short-scan-test-"));
+  try {
+    const source = join(root, "source");
+    const matched = join(source, "matched");
+    await mkdir(matched, { recursive: true });
+    await writeFile(join(matched, "nonportable-\u00c9"), "unread\n");
+    const matchedIdentity = await lstat(matched, { bigint: true });
+
+    assert.equal(
+      await stoppedTreeContainsAnyIdentity(source, [matchedIdentity], {
+        allowRootMount: true,
+        listMountPoints: async () => ["/", source],
+      }),
+      true,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

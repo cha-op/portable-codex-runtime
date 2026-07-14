@@ -3,7 +3,7 @@ id: 20260702-7a4c2e
 title: Stopped-Directory Publication
 status: completed
 created: 2026-07-02
-updated: 2026-07-02
+updated: 2026-07-14
 branch: wip/stopped-tree-publication
 pr: 9
 supersedes: []
@@ -59,6 +59,10 @@ superseded_by:
   aliases before journal preparation or destination creation. Candidate state
   is re-synced and exactly revalidated after its last callback and before the
   journal may advance to `materialized`.
+- Identity scans now reject nested mounts before recursion, repeat the mount
+  check after the scan, and short-circuit before entering a directory whose
+  identity already proves an alias. The journal tree is checked in the reverse
+  direction for bind-aliased source and publication roots.
 - The last pre-rename and pre-commit callbacks are followed by complete tree
   and parent durability barriers plus exact readback. Unavailable private roots
   before journal discovery are uncertain while malformed root syntax remains a
@@ -73,10 +77,15 @@ superseded_by:
   a rebound caller root or name cannot hide an older final. Host
   adapters can inject the trusted ACL inspection capability used consistently
   by root pinning and copy.
-- Read-only source/journal/target topology checks now run before publication
-  lock creation and repeat while locked. Every injected callback is followed
-  by pinned root-authority revalidation before further source reads or target
-  writes.
+- Root-only source/journal/target topology checks run before publication-lock
+  acquisition and repeat while locked. The trusted provisioner creates and
+  durably syncs the fixed `0600` single-link lock inode before exposing the
+  root; publication acquires it existing-only without creating or repairing
+  filesystem metadata. The journal lock follows the same preprovisioned,
+  existing-only contract, so authoritative reads cannot create metadata
+  through an undetected alias. Recursive source topology checks then run while
+  the publication lock is held. Every injected callback is followed by pinned
+  root-authority revalidation before further source reads or target writes.
 - Missing or non-directory source leaves are classified only after historical
   journal discovery, so materialized/committed replay can use its recorded
   source binding. Restore repeatedly requires the checkpoint bundle root to
@@ -93,9 +102,16 @@ superseded_by:
   their owner, pinned-mode, and ACL policy. Checkpoint envelopes remain `0700`;
   restore payload roots retain their modeled mode inside a private `0700`
   destination authority.
+- A lock-free, fault-callback-free journal state hint now selects the source
+  preflight while the outer publication lock is already held. The locked
+  authoritative read must be monotonic relative to that hint. Materialized and
+  committed replay retain an unobserved source descriptor, so an ordinary
+  replacement directory is neither opened nor sent to filesystem or
+  persistent-object inspectors.
 - A pre-rename callback is treated as publication-uncertain until a held-lock
-  probe proves the staged inode is not visible at the final path, preventing a
-  callback-side rename from being misreported as definitely not committed.
+  probe proves the final path remains absent. Any callback-created final entry,
+  including a fresh inode unrelated to the staged candidate, therefore cannot
+  be misreported as definitely not committed.
 - The same held-lock final-path proof now surrounds the complete-candidate
   callback, the journal's `materialized` transition callbacks, and the
   post-materialization callback, so callback-side publication cannot be
@@ -103,7 +119,7 @@ superseded_by:
   commit and its own fault callbacks return, publication repeats the full
   committed tree fsync, parent sync, candidate-absence, identity, mode/ACL, and
   digest barrier before reporting success.
-- Journal prepare/replay calls are also treated as observable namespace
+- Journal read, prepare, and replay calls are also treated as observable namespace
   boundaries: candidate/final presence and runtime identities are pinned before
   the call and must be unchanged afterward before a prior `not-committed`
   classification can be restored.

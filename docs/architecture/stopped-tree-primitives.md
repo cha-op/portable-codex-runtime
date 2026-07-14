@@ -36,6 +36,12 @@ are publication-building primitives, not independent backend authority.
 Cross-root copy inventories every source entry identity before it creates the
 destination and rejects a destination-root identity found anywhere in that
 inventory, including a descendant bind-mount alias.
+`stoppedTreeContainsAnyIdentity()` provides the corresponding targeted proof:
+it validates the mount table before recursion, permits an explicitly approved
+root mount, rejects nested mounts and cross-device entries, stops before
+opening a directory whose identity already matches, and repeats the mount
+check after the scan. Its injectable mount-table reader is a trusted test and
+platform-adapter seam.
 
 These functions operate only after an external coordinator has stopped the
 writer. They do not stop a process, authenticate stopped-writer evidence, or

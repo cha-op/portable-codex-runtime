@@ -8,12 +8,25 @@ mutation request, complete checkpoint descriptor, predetermined final result,
 and later materialisation metadata without performing the storage operation
 itself.
 
-`FilesystemOperationJournal` exposes four transitions:
+`FilesystemOperationJournal` exposes four authoritative operations:
 
 - `read()` observes the canonical record or the implicit `absent` state;
 - `prepare()` creates the first exact operation record;
 - `markMaterialized()` records caller-supplied materialisation metadata; and
 - `commit()` authorises replay of the exact result fixed by `prepare()`.
+
+`readStateHint()` is a separate read-only planning primitive. It opens and
+validates the canonical record without acquiring the journal lock and without
+running observable journal fault callbacks. Trusted directory-ACL and
+temporary-record inspectors still execute to validate the read. Publication
+uses that hint only after acquiring its preprovisioned publication-root lock,
+to decide whether the caller's current source leaf must be inspected before an
+authoritative journal read. A hint never authorises replay or a state
+transition: the caller must perform an authoritative locked `read()` and prove
+that the durable state did not move backwards before relying on it. Every
+transition for a publication-owned operation ID must go through the
+publication layer and therefore hold that same publication-root lock. A
+forward transition outside that ownership boundary is unsupported.
 
 `describeAuthority()` is a non-transitioning integration helper for the local
 publication layer. It returns the frozen canonical journal-directory path and
@@ -32,7 +45,19 @@ Failure and Restart Semantics; constructing that type in an injected
 collaborator does not let the collaborator forge an internally trusted journal
 outcome.
 
-Reads and transitions return a deeply frozen `{ record, replayed }` envelope.
+`OPERATION_JOURNAL_LOCK_NAME` exposes the fixed `.operation-journal.lock`
+provisioning name. Before the journal directory is exposed to a worker or used
+by a journal instance, the trusted provisioner creates that empty regular file
+with one link, runtime effective-UID ownership, and exact mode `0600`, then
+fsyncs both the file and journal directory. Existing directories are upgraded
+only while detached and quiescent. Journal calls acquire the inode with
+`requireExisting: true`; they never create, chmod, truncate, unlink, or repair
+it. A missing or unsafe lock fails closed as journal I/O failure.
+An injected `acquireLock(path, { requireExisting: true })` implementation is a
+trusted adapter and must preserve that existing-only, no-mutation contract.
+
+Reads, state hints, and transitions return a deeply frozen
+`{ record, replayed }` envelope.
 An absent read has `record: null`; a transition sets `replayed: true` only when
 it returns an already-published exact state without rewriting the record.
 
@@ -108,7 +133,7 @@ device/inode identity, not by pathname or operation ID, because the directory
 has one advisory lock. This also coalesces aliases such as bind-mount paths and
 keeps independent operation IDs from turning ordinary local concurrency into a
 non-retryable lock conflict. Cross-process callers still require the same
-single-writer coordination boundary and default advisory lock.
+single-writer coordination boundary and preprovisioned default advisory lock.
 
 Every forward transition uses the same publication protocol while holding the
 journal lock and directory authority:
@@ -191,6 +216,15 @@ exact result, while only a committed record authorises it for backend replay.
 An earlier state tells the future backend which durable journal phase was
 reached. The journal does not itself continue, roll back, or reconcile the
 physical operation.
+
+`readStateHint()` deliberately omits the journal lock, fault-callback
+execution, record fsync, parent fsync, and durable readback performed by
+`read()`. It is
+safe only inside an outer serialization boundary that owns all relevant state
+transitions, as a monotonic planning hint followed by an authoritative locked
+read. A temporary-record conflict, malformed record, directory-authority
+change, or other ambiguous observation fails closed instead of guessing a
+state.
 
 ## Explicit Non-Guarantees
 

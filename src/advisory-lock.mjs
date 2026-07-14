@@ -10,7 +10,12 @@ const HOLDER_PATH = fileURLToPath(new URL("./advisory-lock-holder.mjs", import.m
 
 export function advisoryLockCommand(
   platform = process.platform,
-  { holderArgs = [], holderPath = HOLDER_PATH, lockPath } = {},
+  {
+    holderArgs = [],
+    holderPath = HOLDER_PATH,
+    lockPath,
+    requireExisting = false,
+  } = {},
 ) {
   if (
     ["darwin", "linux"].includes(platform) &&
@@ -31,6 +36,7 @@ export function advisoryLockCommand(
       args: [
         "-k",
         "-s",
+        ...(requireExisting ? ["-n"] : []),
         "-t",
         "0",
         "-w",
@@ -284,7 +290,26 @@ export function sameFileIdentity(left, right) {
   );
 }
 
-async function assertLockPathIdentity(lockPath, handle) {
+function effectiveUid() {
+  if (typeof process.geteuid === "function") return BigInt(process.geteuid());
+  if (typeof process.getuid === "function") return BigInt(process.getuid());
+  return null;
+}
+
+function isSafeLockFile(stat, requireExisting) {
+  const ownerUid = requireExisting ? effectiveUid() : null;
+  return (
+    stat.isFile() &&
+    stat.nlink === 1n &&
+    (!requireExisting ||
+      (stat.size === 0n &&
+        Number(stat.mode & 0o7777n) === 0o600 &&
+        ownerUid !== null &&
+        stat.uid === ownerUid))
+  );
+}
+
+async function assertLockPathIdentity(lockPath, handle, requireExisting) {
   let handleStat;
   let pathHandle;
   try {
@@ -299,10 +324,8 @@ async function assertLockPathIdentity(lockPath, handle) {
   try {
     const pathStat = await pathHandle.stat({ bigint: true });
     if (
-      !handleStat.isFile() ||
-      handleStat.nlink !== 1n ||
-      !pathStat.isFile() ||
-      pathStat.nlink !== 1n ||
+      !isSafeLockFile(handleStat, requireExisting) ||
+      !isSafeLockFile(pathStat, requireExisting) ||
       !sameFileIdentity(pathStat, handleStat)
     ) {
       throw new AdvisoryLockError("lock_replaced", "authority lock path changed");
@@ -319,6 +342,7 @@ export async function acquireAdvisoryLock(
     holderArgs = [],
     holderPath = HOLDER_PATH,
     platform = process.platform,
+    requireExisting = false,
     releaseGraceMs = 2_000,
     signalGraceMs = 2_000,
     stopProcess = stopLockProcess,
@@ -326,10 +350,17 @@ export async function acquireAdvisoryLock(
     startupTimeoutMs = timeoutMs,
   } = {},
 ) {
+  if (typeof requireExisting !== "boolean") {
+    throw new AdvisoryLockError(
+      "unsafe_lock_file",
+      "requireExisting must be a boolean",
+    );
+  }
   const { command, args, conflictExitCode } = advisoryLockCommand(platform, {
     holderArgs,
     holderPath,
     lockPath,
+    requireExisting,
   });
   if (typeof constants.O_NOFOLLOW !== "number") {
     throw new AdvisoryLockError(
@@ -342,17 +373,20 @@ export async function acquireAdvisoryLock(
   try {
     handle = await open(
       lockPath,
-      constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      constants.O_RDWR |
+        (requireExisting ? 0 : constants.O_CREAT) |
+        constants.O_NOFOLLOW |
+        constants.O_NONBLOCK,
       0o600,
     );
     const fileStat = await handle.stat({ bigint: true });
-    if (!fileStat.isFile() || fileStat.nlink !== 1n) {
+    if (!isSafeLockFile(fileStat, requireExisting)) {
       throw new AdvisoryLockError(
         "unsafe_lock_file",
         "authority lock must be a regular single-link file",
       );
     }
-    await handle.chmod(0o600);
+    if (!requireExisting) await handle.chmod(0o600);
   } catch (error) {
     await handle?.close().catch(() => {});
     if (error instanceof AdvisoryLockError) throw error;
@@ -411,7 +445,7 @@ export async function acquireAdvisoryLock(
     // macOS path mode opens the lock independently after the secure broker
     // pre-open. Revalidate immediately after the holder proves lock acquisition
     // so any pathname swap fails closed before the lock object is returned.
-    await assertLockPathIdentity(lockPath, handle);
+    await assertLockPathIdentity(lockPath, handle, requireExisting);
   } catch (error) {
     let cleanupError;
     try {
@@ -639,7 +673,7 @@ export async function acquireAdvisoryLock(
         );
       }
       try {
-        await assertLockPathIdentity(lockPath, handle);
+        await assertLockPathIdentity(lockPath, handle, requireExisting);
       } catch (error) {
         if (error instanceof AdvisoryLockError && error.code === "lock_replaced") {
           return failLockReplacement(error);
@@ -672,7 +706,7 @@ export async function acquireAdvisoryLock(
       }
 
       try {
-        await assertLockPathIdentity(lockPath, handle);
+        await assertLockPathIdentity(lockPath, handle, requireExisting);
       } catch (error) {
         if (error instanceof AdvisoryLockError && error.code === "lock_replaced") {
           return failLockReplacement(withRenameOutcome(error, "not-committed"));
