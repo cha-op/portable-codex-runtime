@@ -30,6 +30,9 @@
   post-order source barrier, deterministic durable staging, checkpoint bundles
   or payload-only restores, atomic absent-destination rename, exact final
   readback, and pre-commit consumer isolation.
+- A same-process stopped-writer coordinator now converts one trusted, fully
+  joined writer stop into one object-identity capability for one snapshot
+  callback without making protocol events or serialized fields into authority.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -52,6 +55,8 @@
   `docs/project_journal/2026/07/2026-07-02-filesystem-operation-journal-2f6c91.md`
 - Stopped-directory publication:
   `docs/project_journal/2026/07/2026-07-02-stopped-directory-publication-7a4c2e.md`
+- Same-process stopped-writer capability:
+  `docs/project_journal/2026/07/2026-07-14-stopped-writer-capability-8c4e2a.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

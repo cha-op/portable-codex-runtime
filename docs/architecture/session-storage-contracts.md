@@ -334,6 +334,21 @@ audit, but the value never becomes canonical authority and the descriptor is
 not a stop, barrier, or fence proof. This module validates descriptor identity
 only; it does not authorize capture or restore.
 
+For stopped-directory `clean` capture, the same-process stopped-writer
+coordinator converts one trusted stop into one opaque capability for one
+snapshot callback. Its private binding covers the exact process and writer
+incarnations, complete attachment, writer fence tuple, and stop operation. The
+capability is authenticated by object identity, never by portable fields, and
+is not written to this contract's records. See
+`stopped-writer-capability.md`.
+
+`turn/completed`, `ShutdownComplete`, `thread/closed`, thread unsubscribe, and
+rollout flush are lifecycle observations rather than writer-stop authority.
+The trusted stop operation must join the complete container, cgroup, or VM
+writer boundary, or use a future Codex shutdown API that propagates failures
+and joins every persistence writer. A process-group exit that permits detached
+writers to survive is insufficient.
+
 A concrete checkpoint adapter must consume writer-stop or physical-fence
 evidence and the matching backend mutation result, require atomic
 crash-consistent capture before emitting `crash-prefix`, and prove tail repair
@@ -394,9 +409,8 @@ Later pull requests own:
 - the linearizable binding database, renewer, idempotency store, and host fence;
 - held-directory launch authority, atomic mutation/fence transitions, provider
   proofs, and adapter conformance validators;
-- stopped-writer capability, stopped-directory adapter conformance,
-  graceful-abort evidence, crash-prefix atomic capture, rollout-tail repair,
-  and same-image resume verification;
+- stopped-directory adapter conformance, graceful-abort evidence, crash-prefix
+  atomic capture, rollout-tail repair, and same-image resume verification;
 - ext4 or filesystem-image physical snapshot and restore;
 - differential compression, encryption, retention, and atomic publication;
 - cross-host migration and fault injection; and

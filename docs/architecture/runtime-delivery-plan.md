@@ -51,18 +51,19 @@ plane.
      private staging, atomic checkpoint-bundle or restore-tree publication,
      exact readback, and pre-commit consumer isolation.
 10. **PR #10: same-process stopped-writer capability**
-    - Issue and authenticate a one-use object capability bound to the exact
-      writer incarnation, attachment, and fence without embedding stop
-      mechanics in the storage layer.
+    - Convert one trusted, fully joined writer stop into one same-process,
+      one-use object capability bound to the exact process and writer
+      incarnations, attachment, fence, and stop operation; consume it around
+      one snapshot callback without embedding stop mechanics in storage.
 11. **PR #11: stopped-directory backend adapter**
     - Compose the journal, publication layer, capability, and snapshot core;
       then run the complete backend conformance and failure-injection matrix.
 
-The sequence through PR #9 is complete. Later serial pull requests begin with
-the same-process stopped-writer capability and backend adapter, then own
-replay-only uncertain-result reconciliation, same-image resume and rollout-tail
-repair, an ext4 or filesystem-image backend, differential export and
-content-addressed storage, cross-host migration, and operational hardening.
+The sequence through PR #10 is complete. Later serial pull requests begin with
+the stopped-directory backend adapter, then own replay-only uncertain-result
+reconciliation, same-image resume and rollout-tail repair, an ext4 or
+filesystem-image backend, differential export and content-addressed storage,
+cross-host migration, and operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

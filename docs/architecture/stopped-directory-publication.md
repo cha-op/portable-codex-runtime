@@ -20,11 +20,12 @@ and guarded-cleanup rules. It adds the storage barriers, deterministic private
 staging, atomic final-name publication, exact readback, and journal ordering
 that those primitives deliberately omit.
 
-PR #10 owns authentication of a one-use same-process stopped-writer
-capability. PR #11 owns the canonical fence recheck, attachment and destination
-state, backend mutation envelope, and snapshot-core composition. This layer
-must not accept an arbitrary object or callback as proof that a writer stopped,
-that a restore destination is detached, or that a fence is current.
+The PR #10 same-process coordinator authenticates one trusted writer stop and
+consumes its one-use capability around one snapshot callback. PR #11 owns the
+canonical fence recheck, attachment and destination state, backend mutation
+envelope, idempotent replay, and snapshot-core composition. This layer must not
+accept an arbitrary object or callback as proof that a writer stopped, that a
+restore destination is detached, or that a fence is current.
 
 ## Publication Objects
 
@@ -281,8 +282,10 @@ failure requires recovery without claiming a commit.
 
 The source remains externally stopped throughout capture. The publication
 layer detects many identity and metadata changes, but those checks are not a
-substitute for the PR #10 stopped-writer capability or the PR #11 atomic fence
-recheck.
+substitute for the same-process stopped-writer capability or the PR #11 atomic
+fence recheck. The future backend must run this complete publication attempt
+inside the capability's single consumption callback and must not restart the
+writer until that callback settles.
 
 The staged tree, its manifest, and the final tree are never deleted
 speculatively after a failure. Retained objects are recovery evidence. Cleanup

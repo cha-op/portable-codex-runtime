@@ -17,7 +17,8 @@
 - [done] Implement local stopped-directory storage barriers, deterministic
   staging, atomic checkpoint-bundle and restore-tree publication, exact
   readback, and pre-commit consumer isolation against the journal phases.
-- [pending] Implement the same-process stopped-writer capability coordinator.
+- [done] Implement the same-process stopped-writer capability coordinator with
+  one trusted stop, one object-identity capability, and one snapshot callback.
 - [pending] Compose the journal, publication layer, and stop capability into
   the stopped-directory backend adapter and conformance suite.
 - [pending] Add replay-only uncertain-outcome reconciliation, then same-image
