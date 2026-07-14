@@ -386,6 +386,16 @@ self-reported digest as authority. This remains a local physical primitive
 rather than stopped-writer or canonical-fence authority. See
 `stopped-directory-publication.md`.
 
+The stopped-directory backend composes that primitive with one-use
+same-process stopped-writer authority and a durable mutation-authority/catalogue
+seam. Capture and restore reserve exact predetermined results, hold canonical
+fence and attachment/launcher admission guards across publication, and finalize
+durable state before success. Lifecycle operations still delegate to a
+same-`backendId` storage backend. The adapter declares manual fencing and no
+atomic point-in-time checkpoint; its production authority database and any
+shared-filesystem implementation remain deferred. See
+`stopped-directory-backend.md`.
+
 Checkpoint descriptors record the source backend and storage ID, but
 intentionally omit lease ID, expiration, host-local attachment path,
 credentials, and Git Summary. Differential export consumes an immutable
@@ -403,14 +413,14 @@ runtime policy limits, not per-parent multipliers.
 
 Later pull requests own:
 
-- the auth broker and access-token delivery;
 - Podman/Docker launch and UID/SELinux mapping;
-- concrete local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
+- production local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
 - the linearizable binding database, renewer, idempotency store, and host fence;
-- held-directory launch authority, atomic mutation/fence transitions, provider
-  proofs, and adapter conformance validators;
-- stopped-directory adapter conformance, graceful-abort evidence, crash-prefix
-  atomic capture, rollout-tail repair, and same-image resume verification;
+- production held-directory launch authority, provider-specific mutation/fence
+  transitions, proofs, and conformance validators beyond the stopped-directory
+  adapter;
+- graceful-abort evidence, crash-prefix atomic capture, rollout-tail repair,
+  and same-image resume verification;
 - ext4 or filesystem-image physical snapshot and restore;
 - differential compression, encryption, retention, and atomic publication;
 - cross-host migration and fault injection; and

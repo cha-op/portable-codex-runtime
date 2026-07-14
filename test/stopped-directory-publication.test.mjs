@@ -3252,6 +3252,164 @@ test("a materialized stage-only operation resumes without recopying", async (t) 
   );
 });
 
+test("fresh checkpoint publication rejects every pre-existing journal phase", async (t) => {
+  for (const phase of ["prepared", "materialized", "committed"]) {
+    await t.test(phase, async (t) => {
+      let seedFaultEnabled = phase !== "committed";
+      let afterCopyCalls = 0;
+      const fixture = await createFixture(t, {
+        faults: {
+          async afterCopy() {
+            afterCopyCalls += 1;
+          },
+          async afterJournalPrepared() {
+            if (phase === "prepared" && seedFaultEnabled) {
+              throw new Error("prepared seed fault");
+            }
+          },
+          async afterMaterialized() {
+            if (phase === "materialized" && seedFaultEnabled) {
+              throw new Error("materialized seed fault");
+            }
+          },
+        },
+      });
+      const options = captureOptions(fixture);
+
+      if (phase === "committed") {
+        await fixture.publication.publishCheckpointArtifact(options);
+      } else {
+        await assert.rejects(
+          fixture.publication.publishCheckpointArtifact(options),
+          (error) =>
+            assertPublicationError(
+              error,
+              "publication_io_failed",
+              "not-committed",
+            ),
+        );
+      }
+      seedFaultEnabled = false;
+
+      const before = await fixture.journal.read({
+        operationId: CAPTURE_OPERATION_ID,
+      });
+      assert.equal(before.record.state, phase);
+      const candidate = candidatePath(
+        fixture.artifactOwnedRoot,
+        CAPTURE_OPERATION_ID,
+        fixture.artifactDirectory,
+      );
+      const durablePath =
+        phase === "materialized"
+          ? candidate
+          : phase === "committed"
+            ? fixture.artifactDirectory
+            : null;
+      const durableIdentity =
+        durablePath === null ? null : await lstat(durablePath, { bigint: true });
+      const copyCallsBeforeFreshAttempt = afterCopyCalls;
+
+      await assert.rejects(
+        fixture.publication.publishFreshCheckpointArtifact(options),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_conflict",
+            phase === "committed" ? "committed" : "not-committed",
+          ),
+      );
+
+      assert.deepEqual(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+        before.record,
+      );
+      assert.equal(afterCopyCalls, copyCallsBeforeFreshAttempt);
+      if (durablePath === null) {
+        assert.equal(await pathExists(candidate), false);
+        assert.equal(await pathExists(fixture.artifactDirectory), false);
+      } else {
+        const after = await lstat(durablePath, { bigint: true });
+        assert.equal(after.dev, durableIdentity.dev);
+        assert.equal(after.ino, durableIdentity.ino);
+        assert.equal(after.birthtimeNs, durableIdentity.birthtimeNs);
+      }
+
+      const replay = await fixture.publication.publishCheckpointArtifact(options);
+      assert.equal(replay.replayed, phase === "committed");
+      assert.equal(afterCopyCalls, 1);
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+          .state,
+        "committed",
+      );
+    });
+  }
+});
+
+test("fresh checkpoint publication closes the authoritative read-to-prepare race", async (t) => {
+  let armCompetingPrepare = false;
+  let competingInput;
+  let competingPreparePromise;
+  const fixture = await createFixture(t, {
+    journalFaults: {
+      async afterRecordRead({ record }) {
+        if (!armCompetingPrepare || record !== null) return;
+        armCompetingPrepare = false;
+        competingPreparePromise = competingInput.journal.prepare(
+          competingInput.options,
+        );
+        void competingPreparePromise.catch(() => undefined);
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  const competingJournal = new FilesystemOperationJournal({
+    directory: fixture.journalDirectory,
+    acquireLock: simpleLockProvider(),
+    ...TRUSTED_JOURNAL_ACL_INSPECTORS,
+  });
+  competingInput = {
+    journal: competingJournal,
+    options: {
+      binding: { competingStarter: true },
+      operationId: CAPTURE_OPERATION_ID,
+      request: options.request,
+      result: options.result,
+    },
+  };
+  armCompetingPrepare = true;
+
+  await assert.rejects(
+    fixture.publication.publishFreshCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_conflict",
+        "not-committed",
+      ),
+  );
+
+  assert.notEqual(competingPreparePromise, undefined);
+  await competingPreparePromise;
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+      .state,
+    "prepared",
+  );
+  assert.equal(
+    await pathExists(
+      candidatePath(
+        fixture.artifactOwnedRoot,
+        CAPTURE_OPERATION_ID,
+        fixture.artifactDirectory,
+      ),
+    ),
+    false,
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+});
+
 test("a non-private materialized candidate cannot be renamed", async (t) => {
   let failAfterMaterialized = true;
   const fixture = await createFixture(t, {

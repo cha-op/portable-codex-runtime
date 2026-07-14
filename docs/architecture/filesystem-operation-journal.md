@@ -8,10 +8,12 @@ mutation request, complete checkpoint descriptor, predetermined final result,
 and later materialisation metadata without performing the storage operation
 itself.
 
-`FilesystemOperationJournal` exposes four authoritative operations:
+`FilesystemOperationJournal` exposes five authoritative operations:
 
 - `read()` observes the canonical record or the implicit `absent` state;
 - `prepare()` creates the first exact operation record;
+- `prepareFresh()` atomically creates the first record only when the
+  authoritative state is still `absent`;
 - `markMaterialized()` records caller-supplied materialisation metadata; and
 - `commit()` authorises replay of the exact result fixed by `prepare()`.
 
@@ -96,6 +98,14 @@ operation, session, backend, target, and request semantics. `materialized` and
 allocate or replace result fields. An exact retry returns the existing
 canonical state and result without rewriting the record.
 
+`prepareFresh()` has the same successful transition as `prepare()`, but its
+authoritative journal-lock transaction rejects every existing canonical
+phase, including an exact `prepared`, `materialized`, or `committed` record.
+The absent check and prepared-record publication therefore have no unlocked
+read/prepare window. This primitive lets a caller prove that one operation ID
+started inside its current authority transaction; it does not make later
+physical work or the caller's authority trustworthy by itself.
+
 Reuse of an operation ID with any different binding, request, descriptor,
 predetermined result, or materialisation metadata fails as a conflict. For
 checkpoint capture, descriptor storage and source epoch must match the capture
@@ -167,8 +177,8 @@ Every public failure is a frozen `OperationJournalError` with a fixed `code`, a
 - `invalid_journal_request`, `invalid_journal_directory`,
   `invalid_journal_record`, and `unsupported_journal_record` for rejected input
   or durable state;
-- `operation_conflict` and `invalid_state_transition` for operation-state
-  mismatches;
+- `operation_conflict`, `operation_already_started`, and
+  `invalid_state_transition` for operation-state mismatches;
 - `journal_io_failed` for a failure known not to have committed a transition;
 - `journal_commit_outcome_uncertain` when rename may have occurred but durable
   confirmation did not complete;
@@ -213,7 +223,7 @@ uncertainty is therefore either durably confirmed or remains an uncertain
 failure. A read may reveal `prepared`, `materialized`, or `committed` after a
 caller previously observed uncertainty. Every phase retains the predetermined
 exact result, while only a committed record authorises it for backend replay.
-An earlier state tells the future backend which durable journal phase was
+An earlier state tells the composed backend which durable journal phase was
 reached. The journal does not itself continue, roll back, or reconcile the
 physical operation.
 
@@ -258,6 +268,7 @@ readback. A consumer still must use that higher layer rather than infer physical
 success from a journal record alone. See
 `stopped-directory-publication.md`.
 
-PR #10 owns the same-process stopped-writer capability. PR #11 then composes
-that capability, publication, canonical fence authority, and the snapshot core
-into the stopped-directory backend and its conformance suite.
+The stopped-directory backend now composes the same-process stopped-writer
+capability, publication, durable canonical-fence authority, and the snapshot
+core. The journal remains evidence rather than authority when used outside
+that composition. See `stopped-directory-backend.md`.

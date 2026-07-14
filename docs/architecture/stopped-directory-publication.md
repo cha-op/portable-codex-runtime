@@ -20,12 +20,22 @@ and guarded-cleanup rules. It adds the storage barriers, deterministic private
 staging, atomic final-name publication, exact readback, and journal ordering
 that those primitives deliberately omit.
 
-The PR #10 same-process coordinator authenticates one trusted writer stop and
-consumes its one-use capability around one snapshot callback. PR #11 owns the
-canonical fence recheck, attachment and destination state, backend mutation
-envelope, idempotent replay, and snapshot-core composition. This layer must not
-accept an arbitrary object or callback as proof that a writer stopped, that a
-restore destination is detached, or that a fence is current.
+The same-process coordinator authenticates one trusted writer stop and consumes
+its one-use capability around one snapshot callback. The stopped-directory
+backend owns the canonical fence recheck, attachment and destination state,
+backend mutation envelope, fresh capture admission, restore replay, and
+snapshot-core composition. This layer must not accept an arbitrary object or
+callback as proof that a writer stopped, that a restore destination is
+detached, or that a fence is current.
+
+The publication object exposes two checkpoint entry points with different
+authority contracts. `publishCheckpointArtifact()` is the replay-capable
+physical primitive for a trusted reconciliation workflow.
+`publishFreshCheckpointArtifact()` atomically requires the journal operation
+to begin at `absent` and is the only checkpoint entry point used by the normal
+stopped-directory capture backend. Restore keeps its replay-capable entry
+point because it copies from an already trusted immutable checkpoint into a
+currently fenced, detached destination.
 
 ## Publication Objects
 
@@ -61,9 +71,9 @@ manifest-byte digest from a trusted committed capture record or catalogue.
 Those fields form the `artifactProof`, are bound into the restore journal
 record, and must match both `artifact.json` and the payload before any restore
 candidate is created. Simultaneously changing payload bytes and the manifest's
-self-reported digest therefore cannot create a valid restore input. PR #11 is
-responsible for obtaining this proof from canonical backend state rather than
-from worker-controlled storage.
+self-reported digest therefore cannot create a valid restore input. The
+stopped-directory backend obtains this proof from canonical mutation-authority
+state rather than worker-controlled storage.
 
 The trusted adapter supplies an absolute final path whose direct-child name is
 validated and durably bound to the exact operation, target, and pinned parent
@@ -204,10 +214,15 @@ authorities through the durable-state preflight and remaining sequence:
    or `prepared`; perform the authoritative locked journal read, reject any
    state regression, and revalidate the live source only if the authoritative
    state still requires it;
-2. call `journal.prepare()` to durably fix the operation binding, storage
-   request, checkpoint descriptor, source-owned-root filesystem profile and
-   object identity, direct source-leaf filesystem incarnation ID/object ID, and
-   predetermined exact result before any physical materialisation begins;
+2. call `journal.prepare()` for replay-capable publication, or atomically call
+   `journal.prepareFresh()` for a fresh checkpoint capture, to durably fix the
+   operation binding, storage request, checkpoint descriptor,
+   source-owned-root filesystem profile and object identity, direct
+   source-leaf filesystem incarnation ID/object ID, and predetermined exact
+   result before any physical materialisation begins; `prepareFresh()` rejects
+   every pre-existing journal phase under the journal lock, so an earlier
+   artifact cannot be relabelled as the result of the current stopped-writer
+   callback;
    because journal read/transition callbacks can observe the publication
    namespace, pin candidate/final topology before the call and require the same
    presence and runtime identities afterward before restoring any
@@ -271,6 +286,15 @@ authorities through the durable-state preflight and remaining sequence:
 10. only after the committed record is visible may a consumer replay the
     result or a launcher admit the restore destination.
 
+The ordered recovery behavior above belongs to the replay-capable primitive.
+A fresh checkpoint invocation never resumes `prepared`, `materialized`, or
+`committed`: `prepareFresh()` returns a conflict before physical work, the
+backend reports terminal uncertainty, and retained state remains evidence for
+a future authenticated reconciliation path. A successful fresh invocation
+returns `replayed: false`, but that output flag is not the freshness proof; the
+proof is the journal's atomic absent-to-prepared transition inside the current
+publication call.
+
 The source-leaf and destination-root filesystem profiles and persistent object
 identities are re-read after every callback and at every materialisation,
 rename, and commit boundary. A callback cannot move either path to a different
@@ -282,10 +306,12 @@ failure requires recovery without claiming a commit.
 
 The source remains externally stopped throughout capture. The publication
 layer detects many identity and metadata changes, but those checks are not a
-substitute for the same-process stopped-writer capability or the PR #11 atomic
-fence recheck. The future backend must run this complete publication attempt
-inside the capability's single consumption callback and must not restart the
-writer until that callback settles.
+substitute for the same-process stopped-writer capability or an atomic
+canonical-fence recheck. The stopped-directory backend runs this complete
+publication attempt inside the capability's single consumption callback and
+the mutation authority's fence/admission guard. The writer must not restart
+until that callback and durable authority finalization settle. See
+`stopped-directory-backend.md`.
 
 The staged tree, its manifest, and the final tree are never deleted
 speculatively after a failure. Retained objects are recovery evidence. Cleanup
@@ -302,10 +328,10 @@ The journal state and physical topology must be interpreted together:
 | `absent` | absent | absent | A fresh operation may start. |
 | `absent` | present | any | Unowned evidence; trusted recovery is required. |
 | `absent` | absent | present | The target is foreign or unexplained; it is never adopted. |
-| `prepared` | absent | absent | Materialisation may restart only under fresh caller authority. |
+| `prepared` | absent | absent | Materialisation may restart only through the replay-capable primitive under trusted reconciliation authority. |
 | `prepared` | present | absent | The stage may be partial; normal publication fails with recovery required. |
 | `prepared` | any | present | Publication may have escaped its recorded phase; recovery is required. |
-| `materialized` | present | absent | Verify the recorded digest and identity before publishing under fresh authority. |
+| `materialized` | present | absent | The replay-capable primitive may verify and publish only under trusted reconciliation authority. |
 | `materialized` | absent | present | Rename may have completed; verify final, fsync its parent, and then commit. |
 | `materialized` | present | present | The physical state is inconsistent; recovery is required. |
 | `materialized` | absent | absent | The durable stage is missing; trusted recovery is required and prior publication remains uncertain. |
@@ -438,3 +464,9 @@ does not implement an atomic live-volume `crash-prefix` snapshot, rollout-tail
 repair, same-image Codex resume verification, differential compression,
 content-addressed storage, encryption, retention, periodic long-goal capture,
 cross-host migration, or Git Summary.
+
+The composed stopped-directory backend does not widen this physical boundary:
+it advertises manual fencing and no atomic point-in-time checkpoint. Its
+durable authority seam supplies canonical admission and catalogue ordering,
+while a production database and any NFS/shared-filesystem implementation
+remain separate work.

@@ -26,9 +26,10 @@ PIDs, process start times, thread IDs, Codex session IDs, rollout paths, and
 installation IDs are not substitutes for either incarnation.
 
 The coordinator does not implement a canonical lease database, storage
-barrier, publication, durable idempotency, or cross-process recovery. PR #11
-composes this capability with the stopped-directory publication layer and an
-atomic canonical fence recheck.
+barrier, publication, durable idempotency, or cross-process recovery. The
+stopped-directory backend composes this capability with local publication and
+a durable mutation-authority seam that atomically guards the canonical fence
+and admission boundary. See `stopped-directory-backend.md`.
 
 ## Trusted Stop Boundary
 
@@ -127,9 +128,9 @@ reentrantly and then let the interrupted registration overwrite that decision.
 
 The fence binding uses the immutable writer identity tuple rather than lease
 expiration. A lease renewal may extend `expiresAt` without creating a new
-writer incarnation. PR #11 must still use the trusted authority clock and
-atomically confirm that the canonical lease is current when it performs a new
-physical mutation.
+writer incarnation. The stopped-directory backend still uses the trusted
+authority clock and atomically confirms that the canonical lease is current
+when it performs a new physical mutation.
 
 ## Coordinator API
 
@@ -285,27 +286,29 @@ collaborator details or retrying.
 ## Backend Composition
 
 The snapshot core continues to pass the capability through unchanged. The
-stopped-directory backend in PR #11 must close over the designated coordinator,
-resolve the current writer incarnation from trusted runtime state, and call
-`consumeCapability()` around the complete backend path. A new or resumable
-mutation callback must include the atomic canonical fence recheck, exact
-operation binding, storage barrier, publication, and durable result commit.
-That backend must also preserve the finite issuer-scope ownership contract and
-dispose its coordinator only after canonical lifecycle teardown and safe writer
-retirement.
+stopped-directory backend closes over the designated coordinator, resolves the
+current writer incarnation from trusted runtime state, and calls
+`consumeCapability()` around the complete capture path. Its mutation authority
+durably reserves the exact operation and predetermined result, holds the
+canonical fence and admission guard across storage publication, and finalizes
+the catalogue before success. The finite issuer-scope ownership contract still
+applies; the lifecycle owner disposes the coordinator only after canonical
+teardown and safe writer retirement.
 
-An exact committed-result replay performs no new physical mutation. Inside the
-same one-use callback, PR #11 must verify both the exact committed journal
-binding and the published final object's topology, persistent identity, and
-modeled digest before returning the durable result. A journal record alone is
-not replay authority.
+The normal stopped-directory capture path atomically requires a fresh journal
+operation inside this one-use callback. It never adopts or advances a
+pre-existing `prepared`, `materialized`, or `committed` publication because
+serialized journal bindings and correlation IDs do not prove that earlier
+bytes were captured after this writer stop. A conflicting durable phase makes
+the callback terminally uncertain; this coordinator has no transition that
+mints another capability for the same writer incarnation.
 
-The single current dispatch may resume an exact pre-existing `prepared` or
-`materialized` operation. After callback failure or uncertainty, however, this
-coordinator has no transition that mints another capability for the same writer
-incarnation. The operation remains blocked for the later dedicated
-reconciliation path; neither the old capability nor a newly instantiated
-coordinator may be used to re-dispatch it.
+Exact capture replay remains blocked for a later dedicated reconciliation path
+that authenticates durable attempt provenance and validates the committed
+publication object. Neither the old capability nor a newly instantiated
+coordinator may be used to re-dispatch it. Restore replay is a separate path
+guarded by a newer destination fence, detached isolation, and trusted artifact
+proof.
 
 The capability itself is intentionally absent from journal records,
 checkpoint descriptors, manifests, snapshot archives, and control-plane
@@ -318,7 +321,6 @@ same-process authority.
 This layer does not provide:
 
 - canonical lease or attachment admission;
-- stopped-directory backend conformance;
 - replay-only reconciliation after uncertain outcomes;
 - graceful-abort or live `crash-prefix` evidence;
 - a joined Codex persistence-writer shutdown API;

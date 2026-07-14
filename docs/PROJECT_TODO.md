@@ -19,10 +19,15 @@
   readback, and pre-commit consumer isolation against the journal phases.
 - [done] Implement the same-process stopped-writer capability coordinator with
   one trusted stop, one object-identity capability, and one snapshot callback.
-- [pending] Compose the journal, publication layer, and stop capability into
-  the stopped-directory backend adapter and conformance suite.
-- [pending] Add replay-only uncertain-outcome reconciliation, then same-image
-  resume verification and rollout-tail repair.
+- [done] Compose the journal, publication layer, one-use stop capability, and
+  durable mutation-authority/catalogue seam into the stopped-directory backend
+  adapter and conformance suite.
+- [pending] Add authenticated durable capture-attempt provenance and replay-only
+  uncertain-outcome reconciliation, then same-image resume verification and
+  rollout-tail repair.
+- [pending] Implement the production linearizable lease, reservation,
+  catalogue, and launcher-admission authority behind the validated backend
+  seam.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

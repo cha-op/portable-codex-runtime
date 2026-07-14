@@ -110,10 +110,11 @@ post-order fsync barrier, deterministic private staging, atomic final-name
 publication, exact readback, and the durable operation journal. The primitives
 remain non-durable when called independently.
 
-PR #10 supplies the trusted same-process stopped-writer capability. PR #11
-must compose that capability and this publication layer with an atomic
-canonical fence recheck and return the exact descriptor and mutation envelope
-required by the snapshot and restore core.
+The stopped-directory backend now composes the trusted same-process
+stopped-writer capability and this publication layer with the durable
+mutation-authority fence/admission guard. It returns the exact descriptor and
+mutation envelope required by the snapshot and restore core. See
+`stopped-directory-backend.md`.
 
 The ext4 or filesystem-image backend, differential export, retention,
 encryption, periodic long-goal snapshots, cross-host verification, and Git
