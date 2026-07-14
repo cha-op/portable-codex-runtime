@@ -22,6 +22,17 @@ storage-barrier authority. A declaration in a request, or merely supplying an
 arbitrary object, is not evidence that a process stopped or that the
 filesystem is quiescent.
 
+The same-process stopped-writer coordinator supplies the concrete handle for
+the stopped-directory backend. It authenticates the exact original object by
+private `WeakMap` identity and permits one capability to wrap one snapshot
+callback. The handle cannot be reconstructed from serialized data and is never
+portable checkpoint metadata. See `stopped-writer-capability.md`.
+
+`turn/completed`, `ShutdownComplete`, `thread/closed`, thread unsubscribe, and
+rollout flush are not writer-stop proofs. Production issuance requires a
+fully joined container, cgroup, or VM writer boundary, or a future Codex
+shutdown result that propagates failures and joins every persistence writer.
+
 The core does not stop writers, prove quiescence, attach or start a worker,
 resume a Codex thread, or implement a physical storage backend. It does not
 turn the checkpoint descriptor into lease or fencing authority.
@@ -89,19 +100,38 @@ provider operation.
 
 ## Backend Obligations
 
-Before returning success, a concrete backend must:
+Before returning success on any path, a concrete backend must:
 
-- atomically recheck the complete canonical writer fence against the mutation;
 - bind the operation ID to the exact session, storage, checkpoint or artefact
   target, complete checkpoint descriptor, and writer tuple;
 - for capture, bind that operation to the exact attachment ID and attachment
-  proof supplied by the validated attachment snapshot, authenticate the
-  stopped-writer evidence handle, and bind it to the same transaction;
-- persist and replay an exact idempotent result without repeating the physical
-  mutation, including the exact checkpoint descriptor echo;
+  proof supplied by the validated attachment snapshot, authenticate and consume
+  the stopped-writer evidence handle, and bind it to the same callback; and
+- return the exact checkpoint descriptor and durable mutation result for that
+  binding.
+
+A new or resumable physical mutation path must additionally:
+
+- atomically recheck the complete canonical writer fence against the mutation;
 - prove that a restore destination is detached and isolated before mutation;
 - establish the required storage barrier for clean capture; and
-- perform the physical capture or restore and return its durable proof.
+- perform the physical capture or restore and durably commit its proof.
+
+A committed replay performs no new physical mutation and therefore does not
+repeat the source barrier or capture. Inside the same capability-consumption
+callback, it must validate both the exact committed journal binding and the
+published final object's topology, persistent identity, modeled digest, and
+other committed-state invariants before returning the durable result. A journal
+record alone is not replay authority.
+
+The single current PR #11 dispatch may resume an exact pre-existing `prepared`
+or `materialized` operation inside its one consumption callback. If that
+callback then fails or becomes uncertain, the writer and capability are
+terminal: this layer has no transition that mints another capability for the
+same writer incarnation. It stays blocked for the later dedicated
+reconciliation path. PR #11 must capture one designated coordinator in trusted
+backend state and must not instantiate a replacement coordinator as a retry
+mechanism.
 
 The backend, rather than the core, defines the physical checkpoint and restore
 mechanism. A filesystem copy, image snapshot, reflink, volume-provider
@@ -157,7 +187,7 @@ pull-request order in the runtime delivery plan:
 2. PR #7, reusable stopped-tree primitives (completed);
 3. PR #8, durable filesystem operation journal (completed);
 4. PR #9, stopped-directory atomic publication (completed);
-5. PR #10, same-process stopped-writer capability;
+5. PR #10, same-process stopped-writer capability (completed);
 6. PR #11, stopped-directory backend conformance;
 7. replay-only uncertain-result reconciliation, followed by same-image resume
    verification and rollout-tail repair;

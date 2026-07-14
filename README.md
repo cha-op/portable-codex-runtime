@@ -5,8 +5,9 @@ app-server sessions between trusted machines while keeping the execution
 environment, workspace, rollout state, and recovery data explicit.
 
 The current repository combines compatibility probes for authentication and
-interrupted-turn recovery with the storage contracts, journal, and local
-stopped-directory publication foundations needed by later concrete backends.
+interrupted-turn recovery with the storage contracts, journal, local
+stopped-directory publication, and same-process stopped-writer authority needed
+by later concrete backends.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -83,6 +84,25 @@ backend result, requires a restore epoch greater than the source epoch, and
 fails closed on every uncertain post-dispatch outcome. Atomic fence rechecks,
 storage barriers, durable idempotency, and physical capture or restore remain
 backend responsibilities. See `docs/architecture/snapshot-restore-core.md`.
+
+## Same-Process Stopped-Writer Capability
+
+The runtime can convert one trusted, fully joined writer stop into one
+same-process object capability for one snapshot callback. Private object
+identity binds the capability to the exact process and writer incarnations,
+complete attachment, writer fence, and stop operation. The original reference
+may be delegated inside the issuing process, but serialization or
+identity-breaking clones produce inert lookalikes and cannot transfer authority
+to another host. Stop or snapshot uncertainty is terminal for that writer and
+capability, which are never reused to re-dispatch the callback.
+
+Codex lifecycle events such as `turn/completed`, `ShutdownComplete`, and
+`thread/closed` are observations rather than writer-stop proof. Production use
+requires a supervisor that joins the complete container, cgroup, or VM writer
+boundary, or a future Codex shutdown path that joins every persistence writer.
+Canonical fence rechecks, durable idempotency, and physical publication remain
+backend responsibilities. See
+`docs/architecture/stopped-writer-capability.md`.
 
 ## Reusable Stopped-Tree Primitives
 

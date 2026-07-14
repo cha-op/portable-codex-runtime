@@ -10,6 +10,10 @@ import {
   SessionStorageContractError,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
+import {
+  STOPPED_WRITER_STOP_CONFIRMED,
+  StoppedWriterCapabilityCoordinator,
+} from "../src/stopped-writer-capability.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const THREAD_ID = "019f2100-0000-7000-8000-000000000002";
@@ -258,6 +262,78 @@ test("clean checkpoint capture dispatches exact frozen portable data", async () 
   ]) {
     assert.equal(serialized.includes(forbidden), false);
   }
+});
+
+test("clean checkpoint core passes an exact one-use stopped-writer capability to the backend", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  const canonicalLease = lease();
+  const writerAttachment = attachment(canonicalLease);
+  const processIncarnationId = "process-incarnation-001";
+  const writerIncarnationId = "writer-incarnation-001";
+  const stopOperationId = "stop-operation-001";
+  let stopCalls = 0;
+  let snapshotCalls = 0;
+
+  const writer = coordinator.registerWriter({
+    attachment: writerAttachment,
+    canonicalLease,
+    processIncarnationId,
+    stopWriter(binding) {
+      stopCalls += 1;
+      assert(Object.isFrozen(binding));
+      assert.equal(binding.stopOperationId, stopOperationId);
+      return STOPPED_WRITER_STOP_CONFIRMED;
+    },
+    writerIncarnationId,
+  });
+  const capability = await coordinator.stopAndIssueCapability({
+    processIncarnationId,
+    stopOperationId,
+    writer,
+    writerIncarnationId,
+  });
+
+  const { backend, calls } = createBackend({
+    capture(input) {
+      assert.strictEqual(input.stoppedWriterEvidence, capability);
+      return coordinator.consumeCapability({
+        attachment: input.attachment,
+        canonicalLease,
+        capability: input.stoppedWriterEvidence,
+        processIncarnationId,
+        runSnapshot(binding) {
+          snapshotCalls += 1;
+          assert(Object.isFrozen(binding));
+          assert.equal(binding.writerIncarnationId, writerIncarnationId);
+          return backendCheckpointResult(input);
+        },
+        stopOperationId,
+        writer,
+        writerIncarnationId,
+      });
+    },
+  });
+  const options = captureOptions(backend, {
+    attachment: writerAttachment,
+    canonicalLease,
+    stoppedWriterEvidence: capability,
+  });
+
+  const result = await captureCleanCheckpoint(options);
+  assert.deepEqual(result, {
+    checkpoint: checkpoint({ sourceFencingEpoch: "11" }),
+    mutation: mutationResult(options.request),
+  });
+  assert.equal(stopCalls, 1);
+  assert.equal(snapshotCalls, 1);
+  assert.equal(calls.capture.length, 1);
+
+  await assert.rejects(
+    () => captureCleanCheckpoint(options),
+    assertCoreCode("checkpoint_outcome_uncertain"),
+  );
+  assert.equal(calls.capture.length, 2);
+  assert.equal(snapshotCalls, 1);
 });
 
 test("clean checkpoint restore requires a newer lease and dispatches exact portable data", async () => {
