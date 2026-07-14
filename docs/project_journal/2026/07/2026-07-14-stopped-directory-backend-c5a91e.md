@@ -38,7 +38,9 @@ superseded_by:
   artefact.
 - Restore requires a newer canonical fence, trusted committed artefact proof,
   an isolated detached destination, and the same guarded predetermined-result
-  protocol before publishing a payload-only destination.
+  protocol before publishing a payload-only destination. Direct restore calls
+  reject non-newer request epochs before mutation-authority admission while
+  retaining the guarded canonical-fence recheck.
 - Each authority operation must await exactly one callback and durably finalize
   the catalogue or destination before returning the exact callback completion.
   Zero, multiple, late, or substituted callback results fail closed. The
@@ -48,6 +50,9 @@ superseded_by:
 - Deterministic request-shape failures occur before collaborator dispatch.
   Runtime collaborator failures are frozen, non-retryable, path-free backend
   uncertainty, and capture uncertainty terminally consumes the capability.
+- Resolver construction rejects async, bound, and native-code functions
+  without executing the function or reading spoofable metadata; callers use a
+  source-backed synchronous closure when binding is required.
 - Exact committed-result replay inside a currently authorized transaction is
   supported. Replay-only reconciliation after uncertainty or fence turnover
   remains a separate workstream.

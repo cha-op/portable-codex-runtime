@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1469,6 +1478,138 @@ test("constructor rejects an async stopped-writer resolver before invocation", a
   assert.equal(resolverCalls, 0);
 });
 
+test("constructor rejects opaque native and bound stopped-writer resolvers", async (t) => {
+  const calls = {
+    arrow: 0,
+    async: 0,
+    asyncGenerator: 0,
+    generator: 0,
+    sync: 0,
+  };
+  function syncResolver() {
+    calls.sync += 1;
+  }
+  const arrowResolver = () => {
+    calls.arrow += 1;
+  };
+  async function asyncResolver() {
+    calls.async += 1;
+  }
+  function* generatorResolver() {
+    calls.generator += 1;
+  }
+  async function* asyncGeneratorResolver() {
+    calls.asyncGenerator += 1;
+  }
+  const scenarios = [
+    ["bound sync", syncResolver.bind(undefined)],
+    ["bound arrow", arrowResolver.bind(undefined)],
+    ["bound async", asyncResolver.bind(undefined)],
+    ["bound generator", generatorResolver.bind(undefined)],
+    ["bound async generator", asyncGeneratorResolver.bind(undefined)],
+    ["native builtin", Math.max],
+  ];
+
+  for (const [name, resolveStoppedWriter] of scenarios) {
+    await t.test(name, async (t) => {
+      await assert.rejects(
+        () => createFixture(t, { resolveStoppedWriter }),
+        (error) =>
+          assertBackendError(
+            error,
+            "invalid_stopped_directory_backend_request",
+          ),
+      );
+    });
+  }
+  assert.deepEqual(calls, {
+    arrow: 0,
+    async: 0,
+    asyncGenerator: 0,
+    generator: 0,
+    sync: 0,
+  });
+});
+
+test("constructor rejects a disguised bound async resolver without metadata access", async (t) => {
+  let bodyCalls = 0;
+  let getterReads = 0;
+  async function asyncResolver() {
+    bodyCalls += 1;
+  }
+  const resolveStoppedWriter = asyncResolver.bind(undefined);
+  Object.setPrototypeOf(resolveStoppedWriter, Function.prototype);
+  for (const key of ["constructor", "name", "toString", Symbol.toStringTag]) {
+    Object.defineProperty(resolveStoppedWriter, key, {
+      configurable: true,
+      get() {
+        getterReads += 1;
+        throw new Error("resolver metadata must remain opaque");
+      },
+    });
+  }
+
+  await assert.rejects(
+    () => createFixture(t, { resolveStoppedWriter }),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
+  assert.equal(bodyCalls, 0);
+  assert.equal(getterReads, 0);
+});
+
+test("constructor rejects a bound proxied async resolver without target access", async (t) => {
+  let bodyCalls = 0;
+  let targetTraps = 0;
+  const target = new Proxy(
+    async function asyncResolver() {
+      bodyCalls += 1;
+    },
+    {
+      apply(operation, thisValue, args) {
+        targetTraps += 1;
+        return Reflect.apply(operation, thisValue, args);
+      },
+      get(operation, key, receiver) {
+        targetTraps += 1;
+        return Reflect.get(operation, key, receiver);
+      },
+    },
+  );
+  const resolveStoppedWriter = Reflect.apply(
+    Function.prototype.bind,
+    target,
+    [undefined],
+  );
+  targetTraps = 0;
+
+  await assert.rejects(
+    () => createFixture(t, { resolveStoppedWriter }),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
+  assert.equal(bodyCalls, 0);
+  assert.equal(targetTraps, 0);
+});
+
+test("source-backed resolvers may contain native-code text", async (t) => {
+  const fixture = await createFixture(t, {
+    resolveStoppedWriterFactory: ({ resolveDefault }) =>
+      function resolveStoppedWriter(input) {
+        const diagnosticText = "[native code]";
+        assert.equal(diagnosticText.length, 13);
+        return resolveDefault(input);
+      },
+  });
+  const capability = await issueCapability(fixture);
+  const options = captureCoreOptions(fixture, capability);
+
+  const result = await captureCleanCheckpoint(options);
+
+  assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+  assert.equal(fixture.resolverCalls, 1);
+});
+
 test("a rejected native resolver Promise is observed without consuming authority", async (t) => {
   const unhandledRejections = [];
   const onUnhandledRejection = (reason, promise) => {
@@ -1604,6 +1745,40 @@ test("deterministic invalid inputs fail before resolver, authority, publication,
   await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
   assert.equal(fixture.resolverCalls, 1);
   assert.equal(fixture.mutation.state.captureRuns, 1);
+});
+
+test("direct restore rejects non-newer epochs before authority admission", async (t) => {
+  const fixture = await createFixture(t);
+
+  for (const fencingEpoch of ["11", "10"]) {
+    await t.test(`epoch ${fencingEpoch}`, async () => {
+      await assert.rejects(
+        () =>
+          fixture.backend.restoreCheckpoint({
+            checkpoint: checkpoint(),
+            request: mutationRequest(
+              "restore",
+              restoreLease({ fencingEpoch }),
+            ),
+          }),
+        (error) =>
+          assertBackendError(
+            error,
+            "invalid_stopped_directory_backend_request",
+          ),
+      );
+    });
+  }
+
+  assert.equal(fixture.resolverCalls, 0);
+  assert.equal(fixture.mutation.state.captureRuns, 0);
+  assert.equal(fixture.mutation.state.restoreRuns, 0);
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+  assert.deepEqual(await readdir(fixture.journalDirectory), []);
+  assert.equal(
+    fixture.observation.events.includes("publication:prepared"),
+    false,
+  );
 });
 
 test("runtime collaborator failures become fixed path-free uncertainty", async (t) => {

@@ -29,6 +29,7 @@ const BigIntConstructor = BigInt;
 const DateConstructor = Date;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
+const functionToStringIntrinsic = Function.prototype.toString;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
@@ -93,6 +94,8 @@ const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const NUL_PATTERN = /\0/u;
+const NATIVE_FUNCTION_SOURCE_PATTERN =
+  /\{\s*\[\s*native\s+code\s*\]\s*\}\s*$/u;
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 
 const ATTACHMENT_RECORD_KEYS = objectFreeze([
@@ -386,6 +389,13 @@ function assertTrustedFunction(value, failure = failInvalid) {
 function assertTrustedSynchronousFunction(value, failure = failInvalid) {
   const operation = assertTrustedFunction(value, failure);
   if (isAsyncFunctionValue(operation)) failure();
+  let source;
+  try {
+    source = callIntrinsic(functionToStringIntrinsic, operation, []);
+  } catch {
+    failure();
+  }
+  if (regexpTest(NATIVE_FUNCTION_SOURCE_PATTERN, source)) failure();
   return operation;
 }
 
@@ -691,7 +701,9 @@ function normalizeRestoreRequest(value, backendId) {
       request.operation === "restore" &&
       request.target.kind === "checkpoint" &&
       request.target.checkpointId === checkpoint.checkpointId &&
-      request.target.artifactId === checkpoint.artifactId,
+      request.target.artifactId === checkpoint.artifactId &&
+      parseFencingEpoch(request.fencingEpoch, failInvalid) >
+        parseFencingEpoch(checkpoint.sourceFencingEpoch, failInvalid),
   );
   return exactFrozenRecord({ checkpoint, request });
 }

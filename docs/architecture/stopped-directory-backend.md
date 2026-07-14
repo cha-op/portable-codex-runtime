@@ -89,13 +89,17 @@ It resolves trusted runtime state to exactly:
 }
 ```
 
-An `AsyncFunction` resolver is rejected during backend construction. If an
-ordinary resolver nevertheless returns a same-realm native Promise, the
-backend observes that Promise only through its safe local await boundary so a
-rejection cannot become process-level unhandled state, then fails the capture
-as uncertain without using the fulfillment value. The backend never invokes
-an unsafe thenable or Promise constructor path; the resolver retains rejection
-observation ownership for any unsafe asynchronous value it returns.
+An `AsyncFunction` resolver is rejected during backend construction. Bound and
+native-code functions are also rejected because JavaScript does not expose a
+bound target that can be safely classified without executing it or reading
+spoofable metadata. Callers that need binding must supply an explicit
+source-backed synchronous closure. If an ordinary resolver nevertheless
+returns a same-realm native Promise, the backend observes that Promise only
+through its safe local await boundary so a rejection cannot become
+process-level unhandled state, then fails the capture as uncertain without
+using the fulfillment value. The backend never invokes an unsafe thenable or
+Promise constructor path; the resolver retains rejection observation
+ownership for any unsafe asynchronous value it returns.
 
 The supplied stopped-writer evidence remains the original process-local object
 capability. The resolver record supplies the matching writer handle and
@@ -172,6 +176,10 @@ Restore invokes `mutationAuthority.runRestore(admission, publish)`. Its
 frozen admission contains the exact checkpoint and request. The authority
 must reserve their predetermined result and hold a newer canonical writer
 fence plus destination admission guard while it invokes the callback.
+Before authority admission, the backend deterministically rejects a request
+whose fencing epoch is not strictly newer than the checkpoint source epoch.
+The authority must still revalidate the actual current canonical fence inside
+its guarded transaction.
 
 The authority invokes `publish(context)` exactly once with:
 
