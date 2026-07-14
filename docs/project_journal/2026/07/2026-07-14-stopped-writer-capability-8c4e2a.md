@@ -48,6 +48,12 @@ superseded_by:
   IDs rather than an observable serialized composite key, so inherited
   `Array.prototype.toJSON` or `Object.prototype.toJSON` mutations cannot bypass
   single-writer or fencing checks.
+- Coordinators serve a finite issuer scope rather than a process-wide stream of
+  ephemeral IDs. Terminal `dispose()` succeeds only after every writer safely
+  retires, permanently closes the instance, and releases retained slot, writer,
+  and capability containers. Uncertain writers can never retire or satisfy
+  disposal; after external canonical fencing and teardown, their bounded owner
+  abandons the coordinator and drops all related references.
 - `turn/completed`, `ShutdownComplete`, `thread/closed`, thread unsubscribe,
   and rollout flush are not writer-stop proof. Production issuance requires a
   fully joined container, cgroup, or VM writer boundary, or a future Codex

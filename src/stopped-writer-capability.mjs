@@ -356,7 +356,11 @@ function frozenCallbackBinding(record) {
 }
 
 export class StoppedWriterCapabilityCoordinator {
+  #activeWriters = 0;
+
   #capabilities = new WeakMapConstructor();
+
+  #disposed = false;
 
   #slots = new MapConstructor();
 
@@ -368,6 +372,7 @@ export class StoppedWriterCapabilityCoordinator {
   }
 
   registerWriter(options) {
+    ensure(!this.#disposed, "writer_state_conflict");
     const {
       attachment: attachmentValue,
       canonicalLease,
@@ -423,10 +428,12 @@ export class StoppedWriterCapabilityCoordinator {
     };
     weakMapSet(this.#writers, writer, record);
     slot.current = record;
+    this.#activeWriters += 1;
     return writer;
   }
 
   async stopAndIssueCapability(options) {
+    ensure(!this.#disposed, "writer_state_conflict");
     const {
       processIncarnationId,
       stopOperationId: stopValue,
@@ -476,6 +483,7 @@ export class StoppedWriterCapabilityCoordinator {
   }
 
   async consumeCapability(options) {
+    ensure(!this.#disposed, "stopped_writer_capability_rejected");
     const normalized = assertExactOptions(options, [
       "attachment",
       "canonicalLease",
@@ -578,6 +586,7 @@ export class StoppedWriterCapabilityCoordinator {
   }
 
   revokeWriter(options) {
+    ensure(!this.#disposed, "writer_state_conflict");
     const { processIncarnationId, writer, writerIncarnationId } =
       assertExactOptions(options, [
         "processIncarnationId",
@@ -607,6 +616,7 @@ export class StoppedWriterCapabilityCoordinator {
   }
 
   retireWriter(options) {
+    ensure(!this.#disposed, "writer_state_conflict");
     const { processIncarnationId, writer, writerIncarnationId } =
       assertExactOptions(options, [
         "processIncarnationId",
@@ -628,6 +638,17 @@ export class StoppedWriterCapabilityCoordinator {
     record.state = "retired";
     slot.current = null;
     slot.lastFencingEpoch = record.writerFence.fencingEpoch;
+    this.#activeWriters -= 1;
+  }
+
+  dispose(...args) {
+    ensure(!this.#disposed, "writer_state_conflict");
+    ensure(args.length === 0, "invalid_stopped_writer_request");
+    ensure(this.#activeWriters === 0, "writer_state_conflict");
+    this.#disposed = true;
+    this.#capabilities = new WeakMapConstructor();
+    this.#slots = new MapConstructor();
+    this.#writers = new WeakMapConstructor();
   }
 
   #authenticateWriter(writer, processValue, writerValue) {

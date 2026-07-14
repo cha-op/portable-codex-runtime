@@ -971,6 +971,216 @@ test("retirement releases a storage slot only for a strictly newer fence", async
   assertOpaqueHandle(replacement);
 });
 
+test("dispose requires safe retirement and permanently closes the issuer", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  let snapshotCalls = 0;
+  let stopCalls = 0;
+  const fixture = await readyCapability({
+    coordinator,
+    stopWriter: async () => {
+      stopCalls += 1;
+      return STOPPED_WRITER_STOP_CONFIRMED;
+    },
+  });
+
+  syncCapabilityError(
+    () => coordinator.dispose(),
+    "writer_state_conflict",
+  );
+  await coordinator.consumeCapability(
+    consumeOptions(fixture.writer, fixture.capability, {
+      runSnapshot: async () => {
+        snapshotCalls += 1;
+        return "captured";
+      },
+    }),
+  );
+  coordinator.retireWriter(writerOptions(fixture.writer));
+  syncCapabilityError(
+    () => coordinator.dispose("unexpected"),
+    "invalid_stopped_writer_request",
+  );
+  assert.equal(coordinator.dispose(), undefined);
+
+  let inputTraps = 0;
+  const hostileOptions = new Proxy(
+    {},
+    {
+      get() {
+        inputTraps += 1;
+        throw new Error("disposed coordinator must not inspect input");
+      },
+      getPrototypeOf() {
+        inputTraps += 1;
+        throw new Error("disposed coordinator must not inspect input");
+      },
+      ownKeys() {
+        inputTraps += 1;
+        throw new Error("disposed coordinator must not inspect input");
+      },
+    },
+  );
+  syncCapabilityError(
+    () => coordinator.registerWriter(hostileOptions),
+    "writer_state_conflict",
+  );
+  await rejectedCapabilityError(
+    () => coordinator.stopAndIssueCapability(hostileOptions),
+    "writer_state_conflict",
+  );
+  await rejectedCapabilityError(
+    () => coordinator.consumeCapability(hostileOptions),
+    "stopped_writer_capability_rejected",
+  );
+  syncCapabilityError(
+    () => coordinator.revokeWriter(hostileOptions),
+    "writer_state_conflict",
+  );
+  syncCapabilityError(
+    () => coordinator.retireWriter(hostileOptions),
+    "writer_state_conflict",
+  );
+  syncCapabilityError(
+    () => coordinator.dispose(),
+    "writer_state_conflict",
+  );
+  assert.equal(inputTraps, 0);
+  assert.equal(stopCalls, 1);
+  assert.equal(snapshotCalls, 1);
+});
+
+test("dispose refuses running and uncertain writer scopes", async (t) => {
+  await t.test("running writer", () => {
+    const coordinator = new StoppedWriterCapabilityCoordinator();
+    const writer = coordinator.registerWriter(registerOptions());
+    syncCapabilityError(
+      () => coordinator.dispose(),
+      "writer_state_conflict",
+    );
+    coordinator.revokeWriter(writerOptions(writer));
+    syncCapabilityError(
+      () => coordinator.dispose(),
+      "writer_state_conflict",
+    );
+  });
+
+  await t.test("stop-uncertain writer", async () => {
+    const coordinator = new StoppedWriterCapabilityCoordinator();
+    const writer = coordinator.registerWriter(
+      registerOptions({
+        stopWriter: async () => {
+          throw new Error("uncertain stop");
+        },
+      }),
+    );
+    await rejectedCapabilityError(
+      () => coordinator.stopAndIssueCapability(stopOptions(writer)),
+      "writer_stop_outcome_uncertain",
+    );
+    syncCapabilityError(
+      () => coordinator.dispose(),
+      "writer_state_conflict",
+    );
+  });
+
+  await t.test("snapshot-uncertain writer", async () => {
+    const fixture = await readyCapability();
+    await rejectedCapabilityError(
+      () =>
+        fixture.coordinator.consumeCapability(
+          consumeOptions(fixture.writer, fixture.capability, {
+            runSnapshot: async () => {
+              throw new Error("uncertain snapshot");
+            },
+          }),
+        ),
+      "snapshot_outcome_uncertain",
+    );
+    syncCapabilityError(
+      () => fixture.coordinator.dispose(),
+      "writer_state_conflict",
+    );
+  });
+});
+
+test("dispose releases a high-churn finite issuer scope", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  const entries = [];
+  for (let index = 0; index < 128; index += 1) {
+    const id = index.toString(16).padStart(4, "0");
+    const sessionId = `019f2100-0000-7000-8000-${index
+      .toString(16)
+      .padStart(12, "0")}`;
+    const writerLease = lease({
+      holderId: `host-${id}`,
+      leaseId: `lease-${id}`,
+      sessionId,
+    });
+    const mounted = attachment(writerLease, {
+      attachmentId: `attachment-${id}`,
+      operationId: `operation-attach-${id}`,
+      proofId: `proof-attachment-${id}`,
+      rootPath: `/var/lib/portable-codex/churn-${id}`,
+      storageId: `volume-${id}`,
+    });
+    const processIncarnationId = `process-${id}`;
+    const stopOperationId = `stop-${id}`;
+    const writerIncarnationId = `writer-${id}`;
+    const fixture = await readyCapability({
+      coordinator,
+      mounted,
+      processIncarnationId,
+      stopOperationId,
+      writerIncarnationId,
+      writerLease,
+    });
+    entries.push({
+      fixture,
+      id,
+      mounted,
+      processIncarnationId,
+      stopOperationId,
+      writerIncarnationId,
+      writerLease,
+    });
+  }
+
+  syncCapabilityError(
+    () => coordinator.dispose(),
+    "writer_state_conflict",
+  );
+  for (const [index, entry] of entries.entries()) {
+    const result = await coordinator.consumeCapability({
+      attachment: entry.mounted,
+      canonicalLease: entry.writerLease,
+      capability: entry.fixture.capability,
+      processIncarnationId: entry.processIncarnationId,
+      runSnapshot: async () => entry.id,
+      stopOperationId: entry.stopOperationId,
+      writer: entry.fixture.writer,
+      writerIncarnationId: entry.writerIncarnationId,
+    });
+    assert.equal(result, entry.id);
+    coordinator.retireWriter({
+      processIncarnationId: entry.processIncarnationId,
+      writer: entry.fixture.writer,
+      writerIncarnationId: entry.writerIncarnationId,
+    });
+    if (index === 63) {
+      syncCapabilityError(
+        () => coordinator.dispose(),
+        "writer_state_conflict",
+      );
+    }
+  }
+
+  assert.equal(coordinator.dispose(), undefined);
+  syncCapabilityError(
+    () => coordinator.registerWriter(registerOptions()),
+    "writer_state_conflict",
+  );
+});
+
 test("slot identity is session, backend, and storage rather than attachment ID", () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
   const first = coordinator.registerWriter(registerOptions());

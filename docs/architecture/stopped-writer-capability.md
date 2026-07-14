@@ -89,11 +89,14 @@ coordinator or writer incarnation is invalid even when every portable data
 field is byte-for-byte equal.
 
 The trusted runtime must construct exactly one designated coordinator for a
-live issuer scope, retain it for the complete writer lifecycle, and close the
-backend over that exact instance. The one-stop, one-capability guarantees are
-scoped to this designated issuer. Another coordinator has independent private
-state and cannot authenticate authority at the designated backend; creating one
-as a retry mechanism is a trusted-runtime misconfiguration, not a recovery
+finite live issuer scope, retain it for every writer lifecycle in that scope,
+and close the backend over that exact instance. A scope should normally be one
+session/storage lineage, or another explicitly bounded set of slots; one
+process-wide coordinator must not absorb an unbounded stream of ephemeral
+session or storage IDs. The one-stop, one-capability guarantees are scoped to
+this designated issuer. Another coordinator has independent private state and
+cannot authenticate authority at the designated backend; creating one as a
+retry mechanism is a trusted-runtime misconfiguration, not a recovery
 transition.
 
 The complete attachment is defensively snapshotted through the storage
@@ -118,7 +121,8 @@ The public surface is deliberately narrow:
 - invoke that stop operation exactly once and issue exactly one capability;
 - consume that capability exactly once around one snapshot callback; and
 - revoke the writer or its unconsumed capability, then retire a safely stopped
-  terminal writer before a higher-fence incarnation can occupy its slot.
+  terminal writer before a higher-fence incarnation can occupy its slot; and
+- dispose the finite issuer only after every writer in it has retired.
 
 Conceptually, the lifecycle is:
 
@@ -229,6 +233,20 @@ record or capability. `retireWriter()` releases a safely stopped terminal slot;
 the replacement must carry a strictly higher fencing epoch, and all old
 capabilities remain invalid forever.
 
+An open coordinator deliberately retains each retired slot's last fencing
+epoch so a stale replacement cannot erase that monotonic history. The lifecycle
+owner must call terminal `dispose()` when the finite issuer scope ends and every
+writer has safely retired. Disposal permanently closes that instance and drops
+its slot, writer, and capability containers; every later entry point fails
+before reading caller input or dispatching a callback. It does not authorize a
+new coordinator for an unfinished mutation. A new issuer scope must first pass
+the external canonical fence admission, and the owner must also drop any
+backend closure over the disposed instance. A stop- or snapshot-uncertain scope
+can never satisfy `dispose()` because its writer cannot safely retire. After
+canonical fencing and scope teardown resolve outside this primitive, the owner
+abandons that bounded coordinator without successful disposal and drops it
+together with every backend closure and remaining handle.
+
 ## Hostile Inputs and Public Errors
 
 Public option envelopes and portable binding data accept only exact plain data
@@ -252,6 +270,9 @@ resolve the current writer incarnation from trusted runtime state, and call
 `consumeCapability()` around the complete backend path. A new or resumable
 mutation callback must include the atomic canonical fence recheck, exact
 operation binding, storage barrier, publication, and durable result commit.
+That backend must also preserve the finite issuer-scope ownership contract and
+dispose its coordinator only after canonical lifecycle teardown and safe writer
+retirement.
 
 An exact committed-result replay performs no new physical mutation. Inside the
 same one-use callback, PR #11 must verify both the exact committed journal
