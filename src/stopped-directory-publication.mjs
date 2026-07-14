@@ -563,6 +563,55 @@ async function assertPublicationTopologyForState(options, state) {
   });
 }
 
+async function assertCommittedVerificationTopology({
+  code = "published_state_invalid",
+  commitState = "committed",
+  journalAuthority,
+  journalIdentity,
+  listMountPoints,
+  targetAuthority,
+}) {
+  try {
+    await targetAuthority.assertCurrent();
+  } catch {
+    fail(code, commitState);
+  }
+  ensure(
+    pathsAreDisjoint(targetAuthority.path, journalAuthority.path) &&
+      !sameFileIdentity(targetAuthority.identity, journalIdentity),
+    code,
+    commitState,
+  );
+  await assertDirectoryIdentity(
+    journalAuthority.path,
+    journalIdentity,
+    code,
+    commitState,
+  );
+  let journalContainsTargetIdentity;
+  try {
+    journalContainsTargetIdentity = await stoppedTreeContainsAnyIdentity(
+      journalAuthority.path,
+      [targetAuthority.identity],
+      { allowRootMount: true, listMountPoints },
+    );
+  } catch {
+    fail(code, commitState);
+  }
+  ensure(!journalContainsTargetIdentity, code, commitState);
+  await assertDirectoryIdentity(
+    journalAuthority.path,
+    journalIdentity,
+    code,
+    commitState,
+  );
+  try {
+    await targetAuthority.assertCurrent();
+  } catch {
+    fail(code, commitState);
+  }
+}
+
 async function assertSourcePublicationIdentityDisjoint(
   source,
   publicationPath,
@@ -625,18 +674,15 @@ function samePathObservation(left, right) {
   );
 }
 
-async function inspectPublicationNamespace(candidatePath, finalPath) {
+async function inspectPublicationNamespace(
+  candidatePath,
+  finalPath,
+  code = "publication_outcome_uncertain",
+  commitState = "uncertain",
+) {
   return Object.freeze({
-    candidate: await inspectPath(
-      candidatePath,
-      "publication_outcome_uncertain",
-      "uncertain",
-    ),
-    final: await inspectPath(
-      finalPath,
-      "publication_outcome_uncertain",
-      "uncertain",
-    ),
+    candidate: await inspectPath(candidatePath, code, commitState),
+    final: await inspectPath(finalPath, code, commitState),
   });
 }
 
@@ -1292,6 +1338,506 @@ export class StoppedDirectoryPublication {
       "invalid_publication_request",
     );
     Object.freeze(this);
+  }
+
+  async verifyCommittedCheckpointArtifact(options) {
+    const normalized = exactOptions(options, [
+      "artifactDirectory",
+      "artifactOwnedRoot",
+      "binding",
+      "operationId",
+      "request",
+      "result",
+    ]);
+    const snapshot = snapshotPublicationQueueInput(
+      "checkpoint-artifact",
+      normalized,
+    );
+    const expected = snapshotOperationJournalBinding({
+      binding: snapshot.binding,
+      request: snapshot.request,
+      result: snapshot.result,
+    });
+    const verification = {
+      expected,
+      finalDirectory: normalized.artifactDirectory,
+      operationId: snapshot.operationId,
+      targetOwnedRoot: normalized.artifactOwnedRoot,
+    };
+    const queueKey = await publicationQueueKey(verification.targetOwnedRoot);
+    return runPublicationQueued(queueKey, () =>
+      this.#verifyCommittedCheckpointArtifact(verification),
+    );
+  }
+
+  async #verifyCommittedCheckpointArtifact(options) {
+    const operationId = options.operationId;
+    let targetAuthority;
+    let lock;
+    let pinnedPublication;
+    let primaryError;
+    let successfulOutcome;
+    let historicalCommitConfirmed = false;
+    let commitState = "uncertain";
+    try {
+      ensure(
+        typeof options.targetOwnedRoot === "string" &&
+          isAbsolute(options.targetOwnedRoot) &&
+          resolve(options.targetOwnedRoot) === options.targetOwnedRoot &&
+          typeof options.finalDirectory === "string" &&
+          isAbsolute(options.finalDirectory) &&
+          resolve(options.finalDirectory) === options.finalDirectory,
+        "invalid_publication_request",
+      );
+      try {
+        targetAuthority = await openStoppedTreeRootAuthority(
+          options.targetOwnedRoot,
+          {
+            inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+            inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+          },
+        );
+      } catch {
+        fail("publication_outcome_uncertain", "uncertain");
+      }
+      let finalParent;
+      try {
+        finalParent = await realpath(dirname(options.finalDirectory));
+      } catch {
+        fail("publication_outcome_uncertain", "uncertain");
+      }
+      ensure(
+        finalParent === targetAuthority.path,
+        "invalid_publication_request",
+      );
+      const finalName = assertPublicationFinalName(
+        basename(options.finalDirectory),
+      );
+      const finalPath = join(finalParent, finalName);
+      const candidateName = stoppedDirectoryPublicationCandidateName(
+        operationId,
+        finalName,
+      );
+      const candidatePath = join(finalParent, candidateName);
+
+      let journalAuthority;
+      try {
+        journalAuthority = await this.#journal.describeAuthority();
+      } catch {
+        fail("publication_outcome_uncertain", "uncertain");
+      }
+      let journalIdentity;
+      try {
+        ensure(
+          /^(?:0|[1-9][0-9]*)$/u.test(journalAuthority.device) &&
+            /^[1-9][0-9]*$/u.test(journalAuthority.inode),
+          "publication_outcome_uncertain",
+          "uncertain",
+        );
+        journalIdentity = Object.freeze({
+          dev: BigInt(journalAuthority.device),
+          ino: BigInt(journalAuthority.inode),
+        });
+      } catch (error) {
+        if (internalErrors.has(error)) throw error;
+        fail("publication_outcome_uncertain", "uncertain");
+      }
+      await assertCommittedVerificationTopology({
+        code: "publication_outcome_uncertain",
+        commitState: "uncertain",
+        journalAuthority,
+        journalIdentity,
+        listMountPoints: this.#listMountPoints,
+        targetAuthority,
+      });
+      try {
+        lock = await this.#acquireLock(
+          join(targetAuthority.path, STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME),
+          { requireExisting: true },
+        );
+        await lock.assertHeld();
+      } catch {
+        fail("publication_outcome_uncertain", "uncertain");
+      }
+      const assertLockHeld = async (code, state) => {
+        try {
+          await lock.assertHeld();
+        } catch {
+          fail(code, state);
+        }
+      };
+      await assertLockHeld("publication_outcome_uncertain", "uncertain");
+      await assertCommittedVerificationTopology({
+        code: "publication_outcome_uncertain",
+        commitState: "uncertain",
+        journalAuthority,
+        journalIdentity,
+        listMountPoints: this.#listMountPoints,
+        targetAuthority,
+      });
+      const namespaceBeforeJournalRead = await inspectPublicationNamespace(
+        candidatePath,
+        finalPath,
+      );
+      let observed;
+      try {
+        observed = await this.#journal.read({ operationId });
+      } catch {
+        fail("publication_outcome_uncertain", "uncertain");
+      }
+      const state = observed.record?.state ?? "absent";
+      ensure(
+        Object.hasOwn(PUBLICATION_STATE_RANK, state),
+        "publication_outcome_uncertain",
+        "uncertain",
+      );
+      if (state === "committed") {
+        historicalCommitConfirmed = true;
+        commitState = "committed";
+      }
+      const postReadCode = historicalCommitConfirmed
+        ? "published_state_invalid"
+        : "publication_outcome_uncertain";
+      const postReadCommitState = historicalCommitConfirmed
+        ? "committed"
+        : "uncertain";
+      await assertLockHeld(postReadCode, postReadCommitState);
+      try {
+        await targetAuthority.assertCurrent();
+      } catch {
+        fail(postReadCode, postReadCommitState);
+      }
+      const namespaceAfterJournalRead = await inspectPublicationNamespace(
+        candidatePath,
+        finalPath,
+        postReadCode,
+        postReadCommitState,
+      );
+      ensure(
+        samePublicationNamespace(
+          namespaceBeforeJournalRead,
+          namespaceAfterJournalRead,
+        ),
+        postReadCode,
+        postReadCommitState,
+      );
+      if (state !== "committed") {
+        const candidatePresent = namespaceAfterJournalRead.candidate !== null;
+        const finalPresent = namespaceAfterJournalRead.final !== null;
+        if (
+          state === "materialized" &&
+          !(candidatePresent && !finalPresent)
+        ) {
+          fail("publication_outcome_uncertain", "uncertain");
+        }
+        if (state === "prepared" && finalPresent) {
+          fail("publication_outcome_uncertain", "uncertain");
+        }
+        fail("publication_recovery_required", "not-committed");
+      }
+
+      const record = observed.record;
+      let recordedBinding;
+      let recordedPublication;
+      let recordedDestination;
+      let recordedDestinationFilesystem;
+      let recordedDestinationRoot;
+      let recordedJournal;
+      let recordedJournalFilesystem;
+      let recordedJournalRoot;
+      try {
+        recordedBinding = exactOptions(record.binding, [
+          "coordinator",
+          "publication",
+        ]);
+        recordedPublication = exactOptions(recordedBinding.publication, [
+          "contractVersion",
+          "destination",
+          "journal",
+          "publicationKind",
+          "source",
+        ]);
+        recordedDestination = exactOptions(recordedPublication.destination, [
+          "candidateName",
+          "filesystem",
+          "name",
+          "root",
+        ]);
+        recordedJournal = exactOptions(recordedPublication.journal, [
+          "filesystem",
+          "root",
+        ]);
+        const recordedSource = exactOptions(recordedPublication.source, [
+          "artifactProof",
+          "directoryIdentity",
+          "filesystem",
+          "name",
+          "root",
+          "rootFilesystem",
+        ]);
+        recordedDestinationFilesystem = normalizeFilesystemProfile(
+          recordedDestination.filesystem,
+        );
+        recordedDestinationRoot = parseFileIdentityRecord(
+          recordedDestination.root,
+        );
+        recordedJournalFilesystem = normalizeFilesystemProfile(
+          recordedJournal.filesystem,
+        );
+        recordedJournalRoot = parseFileIdentityRecord(recordedJournal.root);
+        const recordedSourceFilesystem = normalizeFilesystemProfile(
+          recordedSource.filesystem,
+        );
+        const recordedSourceDirectoryIdentity = parseFileIdentityRecord(
+          recordedSource.directoryIdentity,
+        );
+        const recordedSourceRootFilesystem = normalizeFilesystemProfile(
+          recordedSource.rootFilesystem,
+        );
+        const recordedSourceRoot = parseFileIdentityRecord(recordedSource.root);
+        ensure(
+          recordedPublication.contractVersion ===
+              PUBLICATION_CONTRACT_VERSION &&
+            recordedPublication.publicationKind === "checkpoint-artifact" &&
+            recordedDestination.name === finalName &&
+            recordedDestination.candidateName === candidateName &&
+            recordedSource.artifactProof === null &&
+            assertDirectName(recordedSource.name) === recordedSource.name &&
+            recordedSourceDirectoryIdentity.filesystemId ===
+              recordedSourceFilesystem.filesystemId &&
+            recordedSourceDirectoryIdentity.objectIdentityScheme ===
+              recordedSourceFilesystem.objectIdentityScheme &&
+            recordedSourceRoot.filesystemId ===
+              recordedSourceRootFilesystem.filesystemId &&
+            recordedSourceRoot.objectIdentityScheme ===
+              recordedSourceRootFilesystem.objectIdentityScheme,
+          "published_state_invalid",
+          "committed",
+        );
+      } catch {
+        fail("published_state_invalid", "committed");
+      }
+      ensure(
+        sameCanonicalValue(
+          recordedBinding.coordinator,
+          options.expected.binding,
+        ) &&
+          sameCanonicalValue(record.request, options.expected.request) &&
+          sameCanonicalValue(record.result, options.expected.result),
+        "publication_conflict",
+        "committed",
+      );
+
+      const observedObjectIdentities = new Map();
+      const sameFilesystemProfile = (left, right) =>
+        left.durability === right.durability &&
+        left.filesystemId === right.filesystemId &&
+        left.objectIdentityScheme === right.objectIdentityScheme &&
+        left.type === right.type;
+      const persistentIdentityMatches = (recorded, objectId, filesystem) =>
+        recorded.filesystemId === filesystem.filesystemId &&
+        recorded.objectIdentityScheme === filesystem.objectIdentityScheme &&
+        recorded.objectId === objectId;
+      const journalFilesystem = await inspectFilesystem(
+        this.#inspectFilesystem,
+        journalAuthority.path,
+        "published_state_invalid",
+        "committed",
+      );
+      const journalRootObjectId = await inspectBoundObjectIdentity(
+        this.#inspectPersistentObjectIdentity,
+        observedObjectIdentities,
+        journalAuthority.path,
+        journalIdentity,
+        journalFilesystem,
+        "published_state_invalid",
+        "committed",
+      );
+      const targetFilesystem = await inspectFilesystem(
+        this.#inspectFilesystem,
+        targetAuthority.path,
+        "published_state_invalid",
+        "committed",
+      );
+      const targetRootObjectId = await inspectBoundObjectIdentity(
+        this.#inspectPersistentObjectIdentity,
+        observedObjectIdentities,
+        targetAuthority.path,
+        targetAuthority.identity,
+        targetFilesystem,
+        "published_state_invalid",
+        "committed",
+      );
+      const stableJournalFilesystem = await inspectFilesystem(
+        this.#inspectFilesystem,
+        journalAuthority.path,
+        "published_state_invalid",
+        "committed",
+      );
+      const stableTargetFilesystem = await inspectFilesystem(
+        this.#inspectFilesystem,
+        targetAuthority.path,
+        "published_state_invalid",
+        "committed",
+      );
+      ensure(
+        sameFilesystemProfile(journalFilesystem, stableJournalFilesystem) &&
+          sameFilesystemProfile(targetFilesystem, stableTargetFilesystem) &&
+          sameFilesystemProfile(recordedJournalFilesystem, journalFilesystem) &&
+          sameFilesystemProfile(
+            recordedDestinationFilesystem,
+            targetFilesystem,
+          ) &&
+          persistentIdentityMatches(
+            recordedJournalRoot,
+            journalRootObjectId,
+            journalFilesystem,
+          ) &&
+          persistentIdentityMatches(
+            recordedDestinationRoot,
+            targetRootObjectId,
+            targetFilesystem,
+          ),
+        "published_state_invalid",
+        "committed",
+      );
+      await assertLockHeld("published_state_invalid", "committed");
+      await assertCommittedVerificationTopology({
+        journalAuthority,
+        journalIdentity,
+        listMountPoints: this.#listMountPoints,
+        targetAuthority,
+      });
+      const currentCandidate = await inspectPath(
+        candidatePath,
+        "published_state_invalid",
+        "committed",
+      );
+      const currentFinal = await inspectPath(
+        finalPath,
+        "published_state_invalid",
+        "committed",
+      );
+      ensure(
+        namespaceAfterJournalRead.candidate === null &&
+          currentCandidate === null &&
+          namespaceAfterJournalRead.final !== null &&
+          currentFinal !== null &&
+          sameFileIdentity(namespaceAfterJournalRead.final, currentFinal),
+        "published_state_invalid",
+        "committed",
+      );
+      const materialization = validateMaterialization(record.materialization, {
+        artifactProof: null,
+        committed: true,
+        finalName,
+        kind: "checkpoint-artifact",
+        operationId,
+      });
+      pinnedPublication = await openPinnedDirectory(
+        finalPath,
+        materialization,
+        {
+          committed: true,
+          filesystem: targetFilesystem,
+          inspectPersistentObjectIdentity:
+            this.#inspectPersistentObjectIdentity,
+          observedObjectIdentities,
+          inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
+          inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+        },
+      );
+      ensure(
+        sameFileIdentity(pinnedPublication.identity, currentFinal),
+        "published_state_invalid",
+        "committed",
+      );
+      await assertPinnedPath(
+        finalPath,
+        pinnedPublication,
+        "published_state_invalid",
+        "committed",
+      );
+      await syncStoppedTree(finalPath, {
+        listMountPoints: this.#listMountPoints,
+      });
+      await targetAuthority.assertCurrent();
+      await targetAuthority.handle.sync();
+      await this.#verifyPublishedTree({
+        artifactProof: Object.freeze({
+          artifactManifestDigest: materialization.artifactManifestDigest,
+          captureOperationId: operationId,
+          modeledDigest: materialization.modeledDigest,
+        }),
+        checkpoint: record.result.checkpoint,
+        committed: true,
+        kind: "checkpoint-artifact",
+        materialization,
+        observedObjectIdentities,
+        path: finalPath,
+      });
+      await assertPinnedPath(
+        finalPath,
+        pinnedPublication,
+        "published_state_invalid",
+        "committed",
+      );
+      await assertPathAbsent(
+        candidatePath,
+        "published_state_invalid",
+        "committed",
+      );
+      await assertLockHeld("published_state_invalid", "committed");
+      successfulOutcome = Object.freeze({
+        materialization: record.materialization,
+        replayed: true,
+        result: record.result,
+      });
+    } catch (error) {
+      if (internalErrors.has(error)) {
+        primaryError =
+          historicalCommitConfirmed && error.commitState !== "committed"
+            ? createPublicationError(error.code, "committed")
+            : error;
+      } else if (error instanceof OperationJournalError) {
+        primaryError = createPublicationError(
+          historicalCommitConfirmed
+            ? "published_state_invalid"
+            : "publication_outcome_uncertain",
+          historicalCommitConfirmed ? "committed" : "uncertain",
+        );
+      } else {
+        primaryError = createPublicationError(
+          historicalCommitConfirmed
+            ? "published_state_invalid"
+            : "publication_outcome_uncertain",
+          historicalCommitConfirmed ? "committed" : "uncertain",
+        );
+      }
+      commitState = primaryError.commitState;
+    }
+
+    let cleanupFailed = false;
+    for (const operation of [
+      () => pinnedPublication?.handle.close(),
+      () => lock?.release(),
+      () => targetAuthority?.handle.close(),
+    ]) {
+      try {
+        await operation();
+      } catch {
+        cleanupFailed = true;
+      }
+    }
+    if (cleanupFailed) {
+      throw createPublicationError(
+        "publication_lock_release_failed",
+        commitState,
+      );
+    }
+    if (primaryError) throw primaryError;
+    if (successfulOutcome !== undefined) return successfulOutcome;
+    fail("publication_io_failed");
   }
 
   async publishCheckpointArtifact(options) {
@@ -2977,6 +3523,7 @@ export class StoppedDirectoryPublication {
   }
 
   async #verifyPublishedTree({
+    artifactProof,
     checkpoint,
     committed = false,
     kind,
@@ -2999,7 +3546,11 @@ export class StoppedDirectoryPublication {
       );
       if (kind === "checkpoint-artifact") {
         await assertExactCheckpointBundleRoot(path);
-        const manifest = await readArtifactManifest(join(path, "artifact.json"), checkpoint);
+        const manifest = await readArtifactManifest(
+          join(path, "artifact.json"),
+          checkpoint,
+          artifactProof,
+        );
         const digest = await digestTree(join(path, "payload"), {
           listMountPoints: this.#listMountPoints,
         });

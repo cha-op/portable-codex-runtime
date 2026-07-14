@@ -28,14 +28,17 @@ snapshot-core composition. This layer must not accept an arbitrary object or
 callback as proof that a writer stopped, that a restore destination is
 detached, or that a fence is current.
 
-The publication object exposes two checkpoint entry points with different
+The publication object exposes three checkpoint entry points with different
 authority contracts. `publishCheckpointArtifact()` is the replay-capable
-physical primitive for a trusted reconciliation workflow.
+physical primitive reserved for explicit trusted repair workflows.
 `publishFreshCheckpointArtifact()` atomically requires the journal operation
 to begin at `absent` and is the only checkpoint entry point used by the normal
-stopped-directory capture backend. Restore keeps its replay-capable entry
-point because it copies from an already trusted immutable checkpoint into a
-currently fenced, detached destination.
+stopped-directory capture backend. `verifyCommittedCheckpointArtifact()` is a
+source-free, transition-free verifier used by automatic capture
+reconciliation; it accepts only the exact already committed journal record and
+final artefact. Restore keeps its replay-capable entry point because it copies
+from an already trusted immutable checkpoint into a currently fenced, detached
+destination.
 
 ## Publication Objects
 
@@ -286,14 +289,46 @@ authorities through the durable-state preflight and remaining sequence:
 10. only after the committed record is visible may a consumer replay the
     result or a launcher admit the restore destination.
 
-The ordered recovery behavior above belongs to the replay-capable primitive.
+The ordered recovery behavior above belongs to the replay-capable publication
+primitive.
 A fresh checkpoint invocation never resumes `prepared`, `materialized`, or
 `committed`: `prepareFresh()` returns a conflict before physical work, the
 backend reports terminal uncertainty, and retained state remains evidence for
-a future authenticated reconciliation path. A successful fresh invocation
-returns `replayed: false`, but that output flag is not the freshness proof; the
-proof is the journal's atomic absent-to-prepared transition inside the current
-publication call.
+an authenticated reconciliation or explicit repair path. A successful fresh
+invocation returns `replayed: false`, but that output flag is not the freshness
+proof; the proof is the journal's atomic absent-to-prepared transition inside
+the current publication call.
+
+## Committed-Only Capture Reconciliation
+
+`verifyCommittedCheckpointArtifact()` is intentionally not a mode of the
+ordered publication state machine. Its exact input contains the artefact path,
+owned root, authenticated expected coordinator binding, operation ID, original
+request, and predetermined result. It accepts no source path, writer, lease,
+attachment, clock, or stopped-writer capability.
+
+Under the same publication-root lock, the verifier pins the target and journal
+authorities, snapshots candidate/final topology around the canonical journal
+read, and requires `state: "committed"`. It byte-exactly matches the operation,
+request, result, and coordinator binding supplied by the higher mutation
+authority. It parses the recorded source binding for integrity but never opens,
+stats, inventories, syncs, or copies the old source root or leaf.
+
+The verifier then requires an absent candidate and the exact recorded final
+object, revalidates target and journal filesystem/object identity, checks the
+committed materialisation record, pins and syncs the final tree, and repeats
+the exact bundle shape, manifest, payload, modeled digest, tree-identity digest,
+mode, ACL, mount, and capture-operation checks. Success returns only the frozen
+recorded result and materialisation with `replayed: true`.
+
+The verifier calls the read-only `journal.describeAuthority()` and
+`journal.read()` methods. It never calls `prepare()`, `prepareFresh()`,
+`markMaterialized()`, or `commit()`, and it never creates, copies, renames,
+deletes, or repairs an artefact. `absent`, `prepared`, and `materialized`
+therefore remain non-success states even when their retained bytes appear
+complete. Automatic reconciliation cannot turn partial evidence into authority;
+a distinct operator repair design would need separate policy, provenance, and
+audit controls.
 
 The source-leaf and destination-root filesystem profiles and persistent object
 identities are re-read after every callback and at every materialisation,
@@ -328,11 +363,11 @@ The journal state and physical topology must be interpreted together:
 | `absent` | absent | absent | A fresh operation may start. |
 | `absent` | present | any | Unowned evidence; trusted recovery is required. |
 | `absent` | absent | present | The target is foreign or unexplained; it is never adopted. |
-| `prepared` | absent | absent | Materialisation may restart only through the replay-capable primitive under trusted reconciliation authority. |
+| `prepared` | absent | absent | Automatic reconciliation rejects it; only an explicit trusted repair workflow may consider restarting materialisation. |
 | `prepared` | present | absent | The stage may be partial; normal publication fails with recovery required. |
 | `prepared` | any | present | Publication may have escaped its recorded phase; recovery is required. |
-| `materialized` | present | absent | The replay-capable primitive may verify and publish only under trusted reconciliation authority. |
-| `materialized` | absent | present | Rename may have completed; verify final, fsync its parent, and then commit. |
+| `materialized` | present | absent | Automatic reconciliation rejects it; only an explicit trusted repair workflow may consider publication. |
+| `materialized` | absent | present | Rename may have completed, but automatic reconciliation does not commit it. |
 | `materialized` | present | present | The physical state is inconsistent; recovery is required. |
 | `materialized` | absent | absent | The durable stage is missing; trusted recovery is required and prior publication remains uncertain. |
 | `committed` | absent | present | Verify the exact final object and replay without copying or rewriting. |

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
   CHECKPOINT_CLASS_POLICIES,
   DEFAULT_AGENT_POLICY,
   DEFAULT_MAX_SUBAGENTS,
@@ -13,6 +14,7 @@ import {
   SESSION_WORKER_ROOT,
   SessionStorageContractError,
   assertCanonicalFenceMatch,
+  assertCheckpointCaptureReconciliationBackend,
   assertCheckpointClass,
   assertCheckpointDescriptor,
   assertLeaseGrant,
@@ -596,6 +598,39 @@ test("storage backend contract requires directory, exclusivity, fencing, and all
       }),
     assertCode("invalid_storage_backend"),
   );
+});
+
+test("checkpoint capture reconciliation is an optional versioned backend extension", () => {
+  const base = storageBackend();
+  assert.equal(CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION, 1);
+  assert.equal(assertStorageBackend(base), base);
+  assert.throws(
+    () => assertCheckpointCaptureReconciliationBackend(base),
+    assertCode("invalid_storage_backend"),
+  );
+
+  const reconcileCheckpointCapture = async () => {};
+  const extended = {
+    ...base,
+    captureReconciliationContractVersion:
+      CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
+    reconcileCheckpointCapture,
+  };
+  assert.equal(assertStorageBackend(extended), extended);
+  assert.equal(
+    assertCheckpointCaptureReconciliationBackend(extended),
+    extended,
+  );
+
+  for (const invalid of [
+    { ...extended, captureReconciliationContractVersion: 2 },
+    { ...extended, reconcileCheckpointCapture: undefined },
+  ]) {
+    assert.throws(
+      () => assertCheckpointCaptureReconciliationBackend(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+  }
 });
 
 test("storage provisioning is an idempotent control-plane mutation without writer authority", () => {

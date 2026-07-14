@@ -7,7 +7,8 @@ environment, workspace, rollout state, and recovery data explicit.
 The current repository combines compatibility probes for authentication and
 interrupted-turn recovery with the storage contracts, journal, local
 stopped-directory publication, same-process stopped-writer authority, and a
-composed stopped-directory backend for guarded clean capture and restore.
+composed stopped-directory backend for guarded clean capture, committed-result
+reconciliation, and restore.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -85,6 +86,12 @@ fails closed on every uncertain post-dispatch outcome. Atomic fence rechecks,
 storage barriers, durable idempotency, and physical capture or restore remain
 backend responsibilities. See `docs/architecture/snapshot-restore-core.md`.
 
+An optional versioned backend extension also lets the core reconcile the exact
+original clean-capture request after lease expiry or fence turnover. That path
+has no writer, lease, attachment, clock, or stopped-writer capability input: it
+can only validate a result already committed by authenticated durable attempt
+state and the physical backend.
+
 ## Same-Process Stopped-Writer Capability
 
 The runtime can convert one trusted, fully joined writer stop into one
@@ -142,6 +149,12 @@ remains unusable by consumers and launchers until its exact journal record is
 committed. Partial stages and uncertain final objects are retained as recovery
 evidence.
 
+The committed-checkpoint verifier is deliberately narrower than publication.
+It accepts no source path and performs no journal transition: it reads and
+exactly validates an already committed record and final artefact. `prepared`
+and `materialized` operations remain operator evidence and are never advanced
+by automatic reconciliation.
+
 This boundary supports only an approved local filesystem. NFS, other remote or
 unknown filesystem semantics, canonical fence checks, stopped-writer
 authentication, and non-cooperating same-UID races at the final POSIX rename
@@ -150,12 +163,13 @@ syscall are outside its guarantee. See
 
 ## Stopped-Directory Backend
 
-The v1 stopped-directory backend composes the same-process capability, a
+The v2 stopped-directory backend composes the same-process capability, a
 durable mutation-authority and catalogue seam, and local publication into the
 snapshot core's storage-backend contract. It owns only `captureCheckpoint`
-and `restoreCheckpoint`; provision, writable attachment preparation, detach,
-force-fence, and destroy operations delegate to a validated lifecycle backend
-with the same backend ID.
+and `restoreCheckpoint` in the base contract, and exposes the optional v1
+`reconcileCheckpointCapture` extension. Provision, writable attachment
+preparation, detach, force-fence, and destroy operations delegate to a
+validated lifecycle backend with the same backend ID.
 
 Capture consumes the exact stopped-writer capability once. While the
 coordinator callback is active, the mutation authority holds the canonical
@@ -168,6 +182,13 @@ newer fence, trusted artefact proof, and isolated detached destination, while
 retaining exact committed replay. Runtime collaborator failures are fixed
 path-free uncertainty; the adapter performs no internal retry, speculative
 cleanup, or replacement-coordinator recovery.
+
+Before normal publication, the authority durably creates an authenticated
+capture-attempt record whose opaque attempt ID is included in the v2 journal
+binding. A separate authority method can later load that exact record and ask
+the backend to verify only its committed artefact. It never consumes another
+stopped-writer capability, reads the old mutable source, or advances an
+uncommitted journal phase.
 
 The adapter advertises normal directory attachments, exclusive writers,
 `fencing: "manual"`, and

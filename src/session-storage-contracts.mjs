@@ -4,6 +4,7 @@ import { types as utilTypes } from "node:util";
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
 export const STORAGE_CONTRACT_VERSION = 1;
+export const CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION = 1;
 export const SESSION_WORKER_ROOT = "/session";
 export const SESSION_WORKER_LAYOUT = deepFreeze({
   codexHome: "/session/codex-home",
@@ -846,6 +847,22 @@ export function assertStorageBackend(value) {
     );
   }
   return value;
+}
+
+/**
+ * Optional operator-plane extension for reconciling one exact checkpoint
+ * capture attempt. This is not part of the base storage backend method set.
+ */
+export function assertCheckpointCaptureReconciliationBackend(value) {
+  const backend = assertStorageBackend(value);
+  ensure(
+    backend.captureReconciliationContractVersion ===
+      CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION &&
+      typeof backend.reconcileCheckpointCapture === "function",
+    "invalid_storage_backend",
+    "storage backend does not support checkpoint capture reconciliation",
+  );
+  return backend;
 }
 
 function assertStorageMutationTarget(value, { operation, storageId }) {

@@ -59,9 +59,10 @@ superseded_by:
   journal bindings do not authenticate when the existing artifact was
   captured. Restore retains exact committed-result replay under its newer
   destination fence and trusted artifact proof.
-- Capture replay-only reconciliation after uncertainty or fence turnover
-  remains a separate workstream and requires durable authenticated attempt
-  provenance rather than another stopped-writer capability.
+- Capture reconciliation after uncertainty or fence turnover is implemented by
+  the separate committed-only workstream recorded in
+  `2026-07-14-capture-reconciliation-91eac4.md`; it uses durable authenticated
+  attempt provenance rather than another stopped-writer capability.
 - The mutation-authority/catalogue seam and its conformance contract are part
   of this completed slice. A production linearizable database, catalogue,
   lease service, and launcher admission implementation remain deferred.
@@ -73,8 +74,7 @@ superseded_by:
 
 ## Next Steps
 
-- Add replay-only uncertain-result reconciliation, then verify same-image
-  resume and rollout-tail repair.
+- Verify same-image resume and rollout-tail repair.
 - Implement an ext4 or filesystem-image backend before differential export,
   content-addressed storage, retention, and cross-host migration verification.
 - Replace the conformance mutation authority with a production linearizable

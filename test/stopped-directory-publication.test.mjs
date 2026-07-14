@@ -170,6 +170,35 @@ function simpleLockProvider({ onRelease, renamePath = rename } = {}) {
   });
 }
 
+function armableJournalClass(guard) {
+  const rejectIfArmed = (name) => {
+    if (!guard.armed) return;
+    guard.calls.push(name);
+    throw new Error(`unexpected journal transition: ${name}`);
+  };
+  return class ArmableOperationJournal extends FilesystemOperationJournal {
+    async prepare(options) {
+      rejectIfArmed("prepare");
+      return super.prepare(options);
+    }
+
+    async prepareFresh(options) {
+      rejectIfArmed("prepareFresh");
+      return super.prepareFresh(options);
+    }
+
+    async markMaterialized(options) {
+      rejectIfArmed("markMaterialized");
+      return super.markMaterialized(options);
+    }
+
+    async commit(options) {
+      rejectIfArmed("commit");
+      return super.commit(options);
+    }
+  };
+}
+
 async function pathExists(path) {
   try {
     await lstat(path);
@@ -185,7 +214,11 @@ async function assertPathAbsent(path) {
 }
 
 async function createFixture(t, publicationOptions = {}) {
-  const { journalFaults, ...stoppedPublicationOptions } = publicationOptions;
+  const {
+    JournalClass = FilesystemOperationJournal,
+    journalFaults,
+    ...stoppedPublicationOptions
+  } = publicationOptions;
   if (typeof stoppedPublicationOptions.inspectFilesystem === "function") {
     const inspectFilesystem = stoppedPublicationOptions.inspectFilesystem;
     stoppedPublicationOptions.inspectFilesystem = async (path) => ({
@@ -226,7 +259,7 @@ async function createFixture(t, publicationOptions = {}) {
   );
   await symlink("README.md", join(sourceDirectory, "workspace", "current"));
 
-  const journal = new FilesystemOperationJournal({
+  const journal = new JournalClass({
     directory: journalDirectory,
     acquireLock: simpleLockProvider(),
     ...(journalFaults === undefined ? {} : { faults: journalFaults }),
@@ -277,6 +310,18 @@ function captureOptions(fixture, overrides = {}) {
     sourceDirectory: fixture.sourceDirectory,
     artifactOwnedRoot: fixture.artifactOwnedRoot,
     artifactDirectory: fixture.artifactDirectory,
+    ...overrides,
+  };
+}
+
+function committedVerificationOptions(fixture, published, overrides = {}) {
+  return {
+    artifactDirectory: fixture.artifactDirectory,
+    artifactOwnedRoot: fixture.artifactOwnedRoot,
+    binding: published.binding,
+    operationId: published.operationId,
+    request: published.request,
+    result: published.result,
     ...overrides,
   };
 }
@@ -1785,6 +1830,216 @@ test("an exact committed replay returns the fixed result without recopying", asy
   const replayedIdentity = await lstat(fixture.artifactDirectory, { bigint: true });
   assert.equal(replayedIdentity.dev, artifactIdentity.dev);
   assert.equal(replayedIdentity.ino, artifactIdentity.ino);
+});
+
+test("committed verification is source-independent and never transitions the journal", async (t) => {
+  const guard = { armed: false, calls: [] };
+  const fixture = await createFixture(t, {
+    JournalClass: armableJournalClass(guard),
+  });
+  const options = captureOptions(fixture);
+  const published = await fixture.publication.publishCheckpointArtifact(options);
+  const journalBefore = await fixture.journal.read({
+    operationId: CAPTURE_OPERATION_ID,
+  });
+  const artifactBefore = await lstat(fixture.artifactDirectory, {
+    bigint: true,
+  });
+  guard.armed = true;
+  await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedCheckpointArtifact({
+      ...committedVerificationOptions(fixture, options),
+      sourceDirectory: fixture.sourceDirectory,
+    }),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+
+  const verified = await fixture.publication.verifyCommittedCheckpointArtifact(
+    committedVerificationOptions(fixture, options),
+  );
+
+  assert.deepEqual(verified.result, published.result);
+  assert.deepEqual(verified.materialization, published.materialization);
+  assert.equal(verified.replayed, true);
+  assert.equal(Object.isFrozen(verified), true);
+  assert.equal(Object.isFrozen(verified.materialization), true);
+  assert.equal(Object.isFrozen(verified.result), true);
+  assert.deepEqual(guard.calls, []);
+  assert.deepEqual(
+    await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID }),
+    journalBefore,
+  );
+  const artifactAfter = await lstat(fixture.artifactDirectory, {
+    bigint: true,
+  });
+  assert.equal(artifactAfter.dev, artifactBefore.dev);
+  assert.equal(artifactAfter.ino, artifactBefore.ino);
+});
+
+test("committed verification preserves commit state when its lock fails after journal read", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  let publicationLockLost = false;
+  let lockAssertions = 0;
+  const journal = new FilesystemOperationJournal({
+    directory: fixture.journalDirectory,
+    acquireLock: simpleLockProvider(),
+    faults: {
+      async beforeLockRelease({ operationId }) {
+        if (operationId === CAPTURE_OPERATION_ID) publicationLockLost = true;
+      },
+    },
+    ...TRUSTED_JOURNAL_ACL_INSPECTORS,
+  });
+  const publication = new StoppedDirectoryPublication({
+    journal,
+    acquireLock: async () => ({
+      async assertHeld() {
+        lockAssertions += 1;
+        if (publicationLockLost) throw new Error("publication lock was lost");
+      },
+      async release() {},
+    }),
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+      type: "test-local",
+    }),
+    inspectPersistentObjectIdentity: inspectTestPersistentObjectIdentity,
+    ...TRUSTED_PUBLICATION_ACL_INSPECTORS,
+    ...TRUSTED_PUBLICATION_MOUNT_INSPECTOR,
+  });
+  await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+
+  await assert.rejects(
+    publication.verifyCommittedCheckpointArtifact(
+      committedVerificationOptions(fixture, options),
+    ),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(publicationLockLost, true);
+  assert.equal(lockAssertions >= 3, true);
+});
+
+test("committed verification refuses non-committed phases without advancing state", async (t) => {
+  for (const phase of ["absent", "prepared", "materialized"]) {
+    await t.test(phase, async (t) => {
+      const guard = { armed: false, calls: [] };
+      let seedFaultEnabled = phase !== "absent";
+      const faults =
+        phase === "prepared"
+          ? {
+              async afterJournalPrepared() {
+                if (seedFaultEnabled) throw new Error("retain prepared state");
+              },
+            }
+          : phase === "materialized"
+            ? {
+                async afterMaterialized() {
+                  if (seedFaultEnabled) throw new Error("retain materialized state");
+                },
+              }
+            : {};
+      const fixture = await createFixture(t, {
+        JournalClass: armableJournalClass(guard),
+        faults,
+      });
+      const options = captureOptions(fixture);
+      if (phase !== "absent") {
+        await assert.rejects(
+          fixture.publication.publishCheckpointArtifact(options),
+          (error) => assertPublicationError(error),
+        );
+      }
+      seedFaultEnabled = false;
+      const candidate = candidatePath(
+        fixture.artifactOwnedRoot,
+        CAPTURE_OPERATION_ID,
+        fixture.artifactDirectory,
+      );
+      const recordBefore = await fixture.journal.read({
+        operationId: CAPTURE_OPERATION_ID,
+      });
+      const candidateBefore = await pathExists(candidate);
+      const finalBefore = await pathExists(fixture.artifactDirectory);
+      guard.armed = true;
+      await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+
+      await assert.rejects(
+        fixture.publication.verifyCommittedCheckpointArtifact(
+          committedVerificationOptions(fixture, options),
+        ),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_recovery_required",
+            "not-committed",
+          ),
+      );
+
+      assert.deepEqual(guard.calls, []);
+      assert.deepEqual(
+        await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID }),
+        recordBefore,
+      );
+      assert.equal(await pathExists(candidate), candidateBefore);
+      assert.equal(await pathExists(fixture.artifactDirectory), finalBefore);
+    });
+  }
+});
+
+test("committed verification rejects binding, result, and artifact tampering", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedCheckpointArtifact(
+      committedVerificationOptions(fixture, options, {
+        binding: { ...options.binding, storageId: "volume-other" },
+      }),
+    ),
+    (error) =>
+      assertPublicationError(error, "publication_conflict", "committed"),
+  );
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedCheckpointArtifact(
+      committedVerificationOptions(fixture, options, {
+        result: {
+          ...options.result,
+          mutation: {
+            ...options.result.mutation,
+            proofId: "proof-checkpoint-other",
+          },
+        },
+      }),
+    ),
+    (error) =>
+      assertPublicationError(error, "publication_conflict", "committed"),
+  );
+
+  await writeFile(join(fixture.artifactDirectory, "unexpected"), "tampered\n", {
+    mode: 0o600,
+  });
+  await assert.rejects(
+    fixture.publication.verifyCommittedCheckpointArtifact(
+      committedVerificationOptions(fixture, options),
+    ),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
 });
 
 test("committed replay does not inspect a replacement source directory", async (t) => {

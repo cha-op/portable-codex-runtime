@@ -59,15 +59,16 @@ The stopped-directory backend composes that physical layer with the
 same-process capability and a durable mutation-authority/catalogue seam. Its
 authority must reserve the exact predetermined result, hold the canonical
 fence and admission guard across publication, and durably finalize before
-success. It is a manual-fencing local-filesystem backend; the production
-authority database and replay-only reconciliation remain separate work. See
-`stopped-directory-backend.md`.
+success. Its optional capture-reconciliation extension authenticates a durable
+attempt and verifies only an already committed artefact without another writer
+stop. It is a manual-fencing local-filesystem backend; the production authority
+database remains separate work. See `stopped-directory-backend.md`.
 
-`captureCleanCheckpoint()` and `restoreCleanCheckpoint()` are the orchestration
-entry points. Both reject `graceful-abort` and `crash-prefix` before backend
-dispatch. Successful results contain the deeply frozen validated checkpoint
-descriptor and exact storage mutation result; neither result gains new
-authority fields.
+`captureCleanCheckpoint()`, `reconcileCleanCheckpointCapture()`, and
+`restoreCleanCheckpoint()` are the orchestration entry points. All three reject
+`graceful-abort` and `crash-prefix` before backend dispatch. Successful results
+contain the deeply frozen validated checkpoint descriptor and exact storage
+mutation result; neither result gains new authority fields.
 
 ## Orchestration Boundary
 
@@ -84,6 +85,15 @@ The capture backend receives the validated
 restore backend receives `{ checkpoint, request }`. These are structural
 snapshots and an opaque evidence capability for the backend transaction, not
 evidence that an earlier core comparison remains current.
+
+Capture reconciliation also receives `{ checkpoint, request }`, but only after
+the core validates the optional backend extension and proves that the original
+checkpoint request exactly names the descriptor's backend, storage, session,
+source fencing epoch, checkpoint ID, and artefact ID. It intentionally performs
+no current-lease or expiry check: the recovery use case begins after the old
+lease may have expired or authority may have moved. The backend's trusted
+mutation authority, not those serialized fields, must load the canonical
+durable attempt and authorize committed-result verification.
 
 Both backend operations must return the exact plain-data
 `{ checkpoint, mutation }` result envelope. The echoed checkpoint must match
@@ -137,9 +147,11 @@ mechanism.
 
 Restore may replay an exact committed destination publication because the
 current path separately proves a newer destination fence, detached isolation,
-and a trusted immutable checkpoint proof. Capture replay requires a future
-durable attempt-provenance record plus committed-object verification; a journal
-record alone is not replay authority.
+and a trusted immutable checkpoint proof. Capture replay requires an
+authenticated durable attempt-provenance record plus committed-object
+verification; a journal record alone is not replay authority. The
+reconciliation extension supplies that narrow path and cannot create, copy,
+rename, materialize, or commit an artefact.
 
 The backend, rather than the core, defines the physical checkpoint and restore
 mechanism. A filesystem copy, image snapshot, reflink, volume-provider
@@ -160,13 +172,12 @@ non-retryable `checkpoint_outcome_uncertain` and
 `restore_outcome_uncertain` classes. Backend exception details and credentials
 are not copied into public errors.
 
-This first core deliberately exposes no replay-only reconciliation entry point.
-Calling capture or restore again still performs the normal current-fence and
-lease-expiration checks before dispatch, so it cannot reconcile a completed
-operation after authority has expired or moved. A later API must query or
-replay an exact durable result under the same operation ID without executing a
-new mutation. Until then, uncertainty remains non-retryable at this layer and
-requires backend-specific operator reconciliation.
+Reconciliation uncertainty is exposed only as the fixed, non-retryable
+`checkpoint_reconciliation_outcome_uncertain` class. The core dispatches the
+exact original request once and never falls back to normal capture, changes the
+operation ID, supplies a replacement capability, or infers success from a
+checkpoint descriptor. A backend without the versioned optional extension is
+rejected before dispatch.
 
 ## Explicitly Deferred Work
 
@@ -174,7 +185,8 @@ This core does not yet provide:
 
 - evidence for a graceful `turn/interrupt` abort boundary;
 - atomic `crash-prefix` capture or rollout-tail repair;
-- replay-only reconciliation after an uncertain result and fence turnover;
+- repair or automatic continuation of `prepared` or `materialized` capture
+  attempts;
 - an ext4 or filesystem-image physical backend;
 - differential compression, content-addressed storage, encryption, retention,
   or atomic remote publication;
@@ -196,10 +208,10 @@ pull-request order in the runtime delivery plan:
 4. PR #9, stopped-directory atomic publication (completed);
 5. PR #10, same-process stopped-writer capability (completed);
 6. PR #11, stopped-directory backend conformance (completed);
-7. replay-only uncertain-result reconciliation, followed by same-image resume
-   verification and rollout-tail repair;
-8. ext4 or filesystem-image physical backend; and
-9. differential export.
+7. PR #12, authenticated committed-result reconciliation (completed);
+8. same-image resume verification and rollout-tail repair;
+9. ext4 or filesystem-image physical backend; and
+10. differential export.
 
 This order keeps orchestration semantics testable before selecting a physical
 format, and requires same-image Codex recovery evidence before optimising

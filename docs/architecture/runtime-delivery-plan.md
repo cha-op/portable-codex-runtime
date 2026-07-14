@@ -60,11 +60,14 @@ plane.
       add a durable mutation-authority/catalogue seam and atomic fresh-capture
       admission; then run the complete backend conformance and
       failure-injection matrix.
+12. **PR #12: committed capture reconciliation**
+    - Bind normal capture to authenticated durable attempt provenance and add a
+      source-free, committed-only reconciliation path that cannot advance
+      `prepared` or `materialized` publication state.
 
-The sequence through PR #11 is complete. Later serial pull requests begin with
-authenticated durable capture-attempt provenance and replay-only
-uncertain-result reconciliation, then own same-image resume and rollout-tail
-repair, a production linearizable lease/reservation/catalogue and
+The sequence through PR #12 is complete. Later serial pull requests begin with
+same-image resume and rollout-tail repair, then own a production linearizable
+lease/reservation/catalogue and
 launcher-admission implementation, an ext4 or filesystem-image backend,
 differential export and content-addressed storage, cross-host migration, and
 operational hardening.
