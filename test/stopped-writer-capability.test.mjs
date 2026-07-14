@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { types as utilTypes } from "node:util";
+import { runInNewContext } from "node:vm";
 
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
@@ -450,7 +451,141 @@ test("snapshot callback failure is sanitized, consumes authority, and is termina
   }
 });
 
-test("stateful then access after callback settlement is terminal uncertainty", async (t) => {
+test("direct callable thenables are rejected before coordinator assimilation", async () => {
+  const fixture = await readyCapability();
+  let thenCalls = 0;
+  const result = {
+    then(resolve) {
+      thenCalls += 1;
+      resolve("false-success");
+    },
+  };
+
+  await rejectedCapabilityError(
+    () =>
+      fixture.coordinator.consumeCapability(
+        consumeOptions(fixture.writer, fixture.capability, {
+          runSnapshot: () => result,
+        }),
+      ),
+    "snapshot_outcome_uncertain",
+  );
+  assert.equal(thenCalls, 0);
+  await rejectedCapabilityError(
+    () =>
+      fixture.coordinator.consumeCapability(
+        consumeOptions(fixture.writer, fixture.capability),
+      ),
+    "stopped_writer_capability_rejected",
+  );
+  syncCapabilityError(
+    () => fixture.coordinator.retireWriter(writerOptions(fixture.writer)),
+    "writer_state_conflict",
+  );
+});
+
+test("coordinator awaits only Promise values with a safe constructor path", async (t) => {
+  await t.test("captured Promise constructor", async () => {
+    const fixture = await readyCapability();
+    const expected = Object.freeze({ status: "checkpoint-created" });
+    const returned = await fixture.coordinator.consumeCapability(
+      consumeOptions(fixture.writer, fixture.capability, {
+        runSnapshot: () => Promise.resolve(expected),
+      }),
+    );
+    assert.strictEqual(returned, expected);
+  });
+
+  let constructorReads = 0;
+  let prototypeTraps = 0;
+  class ForeignPromise extends Promise {}
+  const scenarios = [
+    {
+      name: "constructor accessor",
+      create() {
+        return Object.defineProperty(Promise.resolve("unsafe"), "constructor", {
+          configurable: true,
+          get() {
+            constructorReads += 1;
+            return Promise;
+          },
+        });
+      },
+    },
+    {
+      name: "handled rejection with a constructor accessor",
+      create() {
+        const value = Promise.reject(
+          new Error("snapshot-secret-owned-rejection"),
+        );
+        value.catch(() => undefined);
+        return Object.defineProperty(value, "constructor", {
+          configurable: true,
+          get() {
+            constructorReads += 1;
+            throw new Error("snapshot-secret-constructor-accessor");
+          },
+        });
+      },
+    },
+    {
+      name: "foreign constructor data",
+      create() {
+        return Object.defineProperty(Promise.resolve("unsafe"), "constructor", {
+          configurable: true,
+          value: ForeignPromise,
+        });
+      },
+    },
+    {
+      name: "Promise subclass",
+      create: () => ForeignPromise.resolve("unsafe"),
+    },
+    {
+      name: "cross-realm Promise",
+      create: () => runInNewContext('Promise.resolve("unsafe")'),
+    },
+    {
+      name: "proxy constructor chain",
+      create() {
+        const value = Promise.resolve("unsafe");
+        const prototype = new Proxy(Object.getPrototypeOf(value), {
+          getOwnPropertyDescriptor() {
+            prototypeTraps += 1;
+            throw new Error("constructor proxy must remain opaque");
+          },
+          getPrototypeOf() {
+            prototypeTraps += 1;
+            throw new Error("constructor proxy must remain opaque");
+          },
+        });
+        Object.setPrototypeOf(value, prototype);
+        return value;
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const fixture = await readyCapability();
+      await rejectedCapabilityError(
+        () =>
+          fixture.coordinator.consumeCapability(
+            consumeOptions(fixture.writer, fixture.capability, {
+              runSnapshot: scenario.create,
+            }),
+          ),
+        "snapshot_outcome_uncertain",
+        ["snapshot-secret", STORAGE_ID],
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+  }
+  assert.equal(constructorReads, 0);
+  assert.equal(prototypeTraps, 0);
+});
+
+test("direct stateful then access is rejected before assimilation", async (t) => {
   for (const inherited of [false, true]) {
     await t.test(inherited ? "inherited then accessor" : "own then accessor", async () => {
       const fixture = await readyCapability();
@@ -478,7 +613,7 @@ test("stateful then access after callback settlement is terminal uncertainty", a
         "snapshot_outcome_uncertain",
         ["snapshot-secret", "/private/source", STORAGE_ID],
       );
-      assert.equal(thenReads, 1);
+      assert.equal(thenReads, 0);
       await rejectedCapabilityError(
         () =>
           fixture.coordinator.consumeCapability(
@@ -529,7 +664,7 @@ test("then access cannot install a callable data descriptor for async return", a
     () =>
       fixture.coordinator.consumeCapability(
         consumeOptions(fixture.writer, fixture.capability, {
-          runSnapshot: () => result,
+          runSnapshot: () => Promise.resolve(result),
         }),
       ),
     "snapshot_outcome_uncertain",
@@ -573,6 +708,7 @@ test("callback intrinsic poisoning cannot bypass result assimilation checks", as
     getOwnPropertyDescriptor: Object.getOwnPropertyDescriptor,
     getPrototypeOf: Object.getPrototypeOf,
     hasOwn: Object.hasOwn,
+    isPromise: utilTypes.isPromise,
     isProxy: utilTypes.isProxy,
     reflectApply: Reflect.apply,
     weakSetAdd: WeakSet.prototype.add,
@@ -593,6 +729,7 @@ test("callback intrinsic poisoning cannot bypass result assimilation checks", as
     Object.getOwnPropertyDescriptor = originals.getOwnPropertyDescriptor;
     Object.getPrototypeOf = originals.getPrototypeOf;
     Object.hasOwn = originals.hasOwn;
+    utilTypes.isPromise = originals.isPromise;
     utilTypes.isProxy = originals.isProxy;
     Reflect.apply = originals.reflectApply;
     WeakSet.prototype.add = originals.weakSetAdd;
@@ -607,36 +744,6 @@ test("callback intrinsic poisoning cannot bypass result assimilation checks", as
       get(target, key, receiver) {
         if (key !== "then") return Reflect.get(target, key, receiver);
         thenReads += 1;
-        if (thenReads > 1) {
-          throw new Error("snapshot-secret-second-assimilation /private/source");
-        }
-        originals.defineProperty(Error.prototype, "name", {
-          configurable: true,
-          set() {
-            throw new Error("snapshot-secret-error-setter /private/source");
-          },
-        });
-        Object.defineProperty = () => {
-          throw new Error("snapshot-secret-define-property /private/source");
-        };
-        Object.freeze = () => {
-          throw new Error("snapshot-secret-freeze /private/source");
-        };
-        Object.getOwnPropertyDescriptor = () => undefined;
-        Object.getPrototypeOf = () => null;
-        Object.hasOwn = () => {
-          throw new Error("snapshot-secret-has-own /private/source");
-        };
-        utilTypes.isProxy = () => false;
-        Reflect.apply = () => {
-          throw new Error("snapshot-secret-reflect-apply /private/source");
-        };
-        WeakSet.prototype.add = () => {
-          throw new Error("snapshot-secret-weak-set-add /private/source");
-        };
-        WeakSet.prototype.has = () => {
-          throw new Error("snapshot-secret-weak-set-has /private/source");
-        };
         return undefined;
       },
       getOwnPropertyDescriptor() {
@@ -654,7 +761,37 @@ test("callback intrinsic poisoning cannot bypass result assimilation checks", as
   try {
     await fixture.coordinator.consumeCapability(
       consumeOptions(fixture.writer, fixture.capability, {
-        runSnapshot: () => result,
+        runSnapshot: () => {
+          originals.defineProperty(Error.prototype, "name", {
+            configurable: true,
+            set() {
+              throw new Error("snapshot-secret-error-setter /private/source");
+            },
+          });
+          Object.defineProperty = () => {
+            throw new Error("snapshot-secret-define-property /private/source");
+          };
+          Object.freeze = () => {
+            throw new Error("snapshot-secret-freeze /private/source");
+          };
+          Object.getOwnPropertyDescriptor = () => undefined;
+          Object.getPrototypeOf = () => null;
+          Object.hasOwn = () => {
+            throw new Error("snapshot-secret-has-own /private/source");
+          };
+          utilTypes.isPromise = () => false;
+          utilTypes.isProxy = () => false;
+          Reflect.apply = () => {
+            throw new Error("snapshot-secret-reflect-apply /private/source");
+          };
+          WeakSet.prototype.add = () => {
+            throw new Error("snapshot-secret-weak-set-add /private/source");
+          };
+          WeakSet.prototype.has = () => {
+            throw new Error("snapshot-secret-weak-set-has /private/source");
+          };
+          return result;
+        },
       }),
     );
   } catch (error) {
@@ -668,7 +805,7 @@ test("callback intrinsic poisoning cannot bypass result assimilation checks", as
     "/private/source",
     STORAGE_ID,
   ]);
-  assert.equal(thenReads, 1);
+  assert.equal(thenReads, 0);
   assert.equal(prototypeInspectionTraps, 0);
   await rejectedCapabilityError(
     () =>

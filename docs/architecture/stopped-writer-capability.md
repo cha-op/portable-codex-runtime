@@ -199,13 +199,27 @@ Callback success reaches `CONSUMED`. Callback failure, cancellation,
 revocation after dispatch, an abnormal thenable, or a proxy or generator-object
 result is terminal uncertainty: the callback may have changed storage, the
 capability is never reusable, and the coordinator does not synthesize success.
-After the callback settles, an object or function result is accepted only when
-every object traversed before the nearest `then` descriptor is non-proxy and
-that descriptor, if present, is a non-callable data descriptor. Such a data
-property safely shadows higher prototypes. This descriptor-only check runs
-through module-captured intrinsics without invoking accessors and prevents the
-async method return from performing a second, stateful thenable assimilation
-after recording successful consumption.
+Before its first coordinator-owned `await`, the coordinator inspects the
+callback's direct return without invoking accessors. A non-Promise object is
+accepted only when every object traversed before the nearest `then` descriptor
+is non-proxy and that descriptor, if present, is a non-callable data descriptor.
+A branded Promise is accepted only when its nearest `constructor` descriptor
+is a data descriptor containing the module-captured Promise intrinsic. This
+keeps `await` on the exact-Promise path, so it attaches a settlement observer
+without reading a hostile `then` value. After the callback settles, the
+descriptor-only `then` check runs again and prevents the async method return
+from performing a second, stateful thenable assimilation after recording
+successful consumption.
+
+The trusted backend callback must normalize Promise subclasses, cross-realm
+Promises, and Promises with accessor or foreign `constructor` descriptors
+inside its own async boundary before returning. ECMAScript provides no
+accessor-free way to attach a rejection observer to such a contract-violating
+Promise. The coordinator therefore reports terminal uncertainty without
+touching its hooks, while ownership of any underlying rejection remains with
+the callback. A conforming callback's accepted Promise may itself assimilate a
+thenable before the coordinator observes the fulfillment value; that Promise
+chain remains inside the trusted backend boundary.
 Stop failure is likewise terminal because it may have partially quiesced the
 writer.
 

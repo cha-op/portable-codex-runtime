@@ -35,11 +35,15 @@ superseded_by:
 - Public inputs reject hostile proxies and accessors before dispatch. Public
   errors are fixed, frozen, non-retryable, and omit collaborator details and
   private binding data.
-- Callback results cannot trigger a second stateful thenable assimilation after
-  successful consumption. Module-captured intrinsics reject every proxy
-  traversed before the nearest `then` descriptor and reject accessor or
-  callable `then` values while preserving non-callable data descriptors;
-  violations become terminal uncertainty before success is recorded.
+- Callback results cannot trigger coordinator-owned custom thenable
+  assimilation. Before the first `await`, module-captured intrinsics accept
+  only descriptor-safe non-Promise values or branded Promises whose nearest
+  `constructor` data descriptor names the captured Promise intrinsic. Promise
+  subclasses, cross-realm Promises, and accessor or foreign constructors must
+  be normalized and owned by the trusted backend callback. The descriptor-only
+  `then` check runs again after settlement so the async return cannot perform a
+  second stateful assimilation after recording success; violations become
+  terminal uncertainty.
 - Attachment slots use nested intrinsic `Map` lookups over validated primitive
   IDs rather than an observable serialized composite key, so inherited
   `Array.prototype.toJSON` or `Object.prototype.toJSON` mutations cannot bypass

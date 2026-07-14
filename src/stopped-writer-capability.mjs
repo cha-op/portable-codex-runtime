@@ -12,6 +12,7 @@ const arrayIsArray = Array.isArray;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const MapConstructor = Map;
+const PromiseConstructor = Promise;
 const objectCreate = Object.create;
 const objectDefineProperty = Object.defineProperty;
 const objectFreeze = Object.freeze;
@@ -26,6 +27,7 @@ const regexpTestIntrinsic = RegExp.prototype.test;
 const {
   isGeneratorFunction: isGeneratorFunctionValue,
   isGeneratorObject: isGeneratorObjectValue,
+  isPromise: isPromiseValue,
   isProxy: isProxyValue,
 } = utilTypes;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
@@ -284,6 +286,34 @@ function isSafeAsyncReturnValue(value) {
   return true;
 }
 
+function isSafeCoordinatorAwaitValue(value) {
+  if (isProxyValue(value) || isGeneratorObjectValue(value)) return false;
+  if (!isPromiseValue(value)) return isSafeAsyncReturnValue(value);
+
+  let current = value;
+  while (current !== null) {
+    if (isProxyValue(current)) return false;
+    let descriptor;
+    try {
+      descriptor = objectGetOwnPropertyDescriptor(current, "constructor");
+    } catch {
+      return false;
+    }
+    if (descriptor !== undefined) {
+      return (
+        objectHasOwn(descriptor, "value") &&
+        descriptor.value === PromiseConstructor
+      );
+    }
+    try {
+      current = objectGetPrototypeOf(current);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 function makeOpaqueHandle() {
   return objectFreeze(objectCreate(null));
 }
@@ -496,11 +526,24 @@ export class StoppedWriterCapabilityCoordinator {
 
       capabilityRecord.state = "consuming";
       record.state = "consuming";
-      let result;
+      let pendingResult;
       try {
-        result = await reflectApply(runSnapshot, undefined, [
+        pendingResult = reflectApply(runSnapshot, undefined, [
           frozenCallbackBinding(record),
         ]);
+      } catch {
+        capabilityRecord.state = "consumed";
+        record.state = "snapshot-uncertain";
+        throw makeError("snapshot_outcome_uncertain");
+      }
+      if (!isSafeCoordinatorAwaitValue(pendingResult)) {
+        capabilityRecord.state = "consumed";
+        record.state = "snapshot-uncertain";
+        throw makeError("snapshot_outcome_uncertain");
+      }
+      let result;
+      try {
+        result = await pendingResult;
       } catch {
         capabilityRecord.state = "consumed";
         record.state = "snapshot-uncertain";
