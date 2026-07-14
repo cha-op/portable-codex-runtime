@@ -37,6 +37,10 @@ superseded_by:
   snapshots built with coordinator-captured intrinsics before shared contract
   validation. Validator return objects and later caller mutations cannot alter
   the registered binding.
+- Registration rechecks disposal after shared validation. Fencing epochs use a
+  coordinator-local captured parser/comparator, followed by a slot ownership
+  recheck, so reentrant global poisoning cannot strand a writer on a disposed
+  issuer or overwrite a concurrently occupied retired slot.
 - Public inputs reject hostile proxies and accessors before dispatch. Public
   errors are fixed, frozen, non-retryable, and omit collaborator details and
   private binding data.

@@ -110,6 +110,14 @@ path, storage and backend IDs, session and fence fields, kind, and mode.
 Comparing only the attachment ID would permit detach, reattach, or
 identifier-reuse ABA.
 
+Registration rechecks terminal coordinator state after shared validation and
+before reading or changing slot state. Fencing epochs are parsed and compared
+only with module-captured `RegExp` and `BigInt` intrinsics, and an existing slot
+is rechecked immediately after comparison. A poisoned shared validator or
+process global therefore cannot dispose the coordinator or occupy a retired
+slot reentrantly and then let the interrupted registration overwrite that
+decision.
+
 The fence binding uses the immutable writer identity tuple rather than lease
 expiration. A lease renewal may extend `expiresAt` without creating a new
 writer incarnation. PR #11 must still use the trusted authority clock and

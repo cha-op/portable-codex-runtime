@@ -3,12 +3,12 @@ import { types as utilTypes } from "node:util";
 import {
   assertLeaseGrant,
   assertSessionAttachment,
-  compareFencingEpochs,
 } from "./session-storage-contracts.mjs";
 
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
+const BigIntConstructor = BigInt;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const MapConstructor = Map;
@@ -77,6 +77,8 @@ function weakSetHas(value, entry) {
   return callIntrinsic(weakSetHasIntrinsic, value, [entry]);
 }
 
+const UINT64_MAX = 18_446_744_073_709_551_615n;
+const FENCING_EPOCH_PATTERN = /^[1-9][0-9]{0,19}$/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const ATTACHMENT_KEYS = objectFreeze([
   "attachmentId",
@@ -224,6 +226,22 @@ function assertOpaqueId(value) {
     "invalid_stopped_writer_request",
   );
   return value;
+}
+
+function parseFencingEpoch(value) {
+  ensure(
+    typeof value === "string" && regexpTest(FENCING_EPOCH_PATTERN, value),
+    "invalid_stopped_writer_request",
+  );
+  const epoch = BigIntConstructor(value);
+  ensure(epoch <= UINT64_MAX, "invalid_stopped_writer_request");
+  return epoch;
+}
+
+function compareFencingEpochs(left, right) {
+  const leftEpoch = parseFencingEpoch(left);
+  const rightEpoch = parseFencingEpoch(right);
+  return leftEpoch < rightEpoch ? -1 : leftEpoch > rightEpoch ? 1 : 0;
 }
 
 function assertTrustedCallback(value) {
@@ -438,6 +456,7 @@ export class StoppedWriterCapabilityCoordinator {
       attachmentValue,
       canonicalLease,
     );
+    ensure(!this.#disposed, "writer_state_conflict");
     const existing = findSlot(this.#slots, attachment);
     if (existing?.current !== null && existing?.current !== undefined) {
       fail("writer_state_conflict");
@@ -453,6 +472,10 @@ export class StoppedWriterCapabilityCoordinator {
         fail("invalid_stopped_writer_request");
       }
       ensure(comparison > 0, "writer_state_conflict");
+    }
+    ensure(!this.#disposed, "writer_state_conflict");
+    if (existing !== undefined) {
+      ensure(existing.current === null, "writer_state_conflict");
     }
 
     const writer = makeOpaqueHandle();

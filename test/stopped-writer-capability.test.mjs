@@ -1156,6 +1156,122 @@ test("retirement releases a storage slot only for a strictly newer fence", async
   assertOpaqueHandle(replacement);
 });
 
+test("reentrant higher-fence registration cannot replace the only live slot writer", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  const first = await readyCapability({ coordinator });
+  await coordinator.consumeCapability(
+    consumeOptions(first.writer, first.capability, {
+      runSnapshot: () => "initial-captured",
+    }),
+  );
+  coordinator.retireWriter(writerOptions(first.writer));
+
+  const outerLease = lease({
+    fencingEpoch: "9007199254740994",
+    holderId: "host-outer",
+    leaseId: "lease-outer",
+  });
+  const outerAttachment = attachment(outerLease, {
+    attachmentId: "attachment-outer",
+    operationId: "operation-outer",
+    proofId: "proof-outer",
+  });
+  const innerLease = lease({
+    fencingEpoch: "9007199254740995",
+    holderId: "host-inner",
+    leaseId: "lease-inner",
+  });
+  const innerAttachment = attachment(innerLease, {
+    attachmentId: "attachment-inner",
+    operationId: "operation-inner",
+    proofId: "proof-inner",
+  });
+  const originalBigInt = globalThis.BigInt;
+  let bigIntCalls = 0;
+  let innerStopCalls = 0;
+  let innerWriter;
+  let outerStopCalls = 0;
+  let outerWriter;
+
+  try {
+    globalThis.BigInt = (value) => {
+      bigIntCalls += 1;
+      if (bigIntCalls === 3) {
+        globalThis.BigInt = originalBigInt;
+        innerWriter = coordinator.registerWriter(
+          registerOptions({
+            attachment: innerAttachment,
+            canonicalLease: innerLease,
+            processIncarnationId: "process-incarnation-inner",
+            stopWriter: () => {
+              innerStopCalls += 1;
+              return STOPPED_WRITER_STOP_CONFIRMED;
+            },
+            writerIncarnationId: "writer-incarnation-inner",
+          }),
+        );
+      }
+      return originalBigInt(value);
+    };
+    outerWriter = coordinator.registerWriter(
+      registerOptions({
+        attachment: outerAttachment,
+        canonicalLease: outerLease,
+        processIncarnationId: "process-incarnation-outer",
+        stopWriter: () => {
+          outerStopCalls += 1;
+          return STOPPED_WRITER_STOP_CONFIRMED;
+        },
+        writerIncarnationId: "writer-incarnation-outer",
+      }),
+    );
+  } finally {
+    globalThis.BigInt = originalBigInt;
+  }
+
+  assert.equal(bigIntCalls, 2);
+  assert.equal(innerWriter, undefined);
+  assertOpaqueHandle(outerWriter);
+  assert.equal(innerStopCalls, 0);
+  const outerStopOperationId = "stop-operation-outer";
+  const outerCapability = await coordinator.stopAndIssueCapability(
+    stopOptions(outerWriter, {
+      processIncarnationId: "process-incarnation-outer",
+      stopOperationId: outerStopOperationId,
+      writerIncarnationId: "writer-incarnation-outer",
+    }),
+  );
+  assert.equal(outerStopCalls, 1);
+  let snapshotCalls = 0;
+  const outerConsumeOptions = consumeOptions(outerWriter, outerCapability, {
+    attachment: outerAttachment,
+    canonicalLease: outerLease,
+    processIncarnationId: "process-incarnation-outer",
+    runSnapshot: () => {
+      snapshotCalls += 1;
+      return "outer-captured";
+    },
+    stopOperationId: outerStopOperationId,
+    writerIncarnationId: "writer-incarnation-outer",
+  });
+  assert.equal(
+    await coordinator.consumeCapability(outerConsumeOptions),
+    "outer-captured",
+  );
+  await rejectedCapabilityError(
+    () => coordinator.consumeCapability(outerConsumeOptions),
+    "stopped_writer_capability_rejected",
+  );
+  assert.equal(snapshotCalls, 1);
+  coordinator.retireWriter(
+    writerOptions(outerWriter, {
+      processIncarnationId: "process-incarnation-outer",
+      writerIncarnationId: "writer-incarnation-outer",
+    }),
+  );
+  assert.equal(coordinator.dispose(), undefined);
+});
+
 test("dispose requires safe retirement and permanently closes the issuer", async () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
   let snapshotCalls = 0;
@@ -1860,6 +1976,64 @@ test("registration owns a frozen binding snapshot despite poisoned clone and fre
     "stopped_writer_capability_rejected",
   );
   assert.equal(snapshotCalls, 0);
+});
+
+test("disposal reentrancy during registration validation remains terminal", async (t) => {
+  const originalStructuredClone = globalThis.structuredClone;
+
+  for (const [name, disposeOnCloneCall] of [
+    ["attachment validation", 1],
+    ["lease validation", 2],
+  ]) {
+    await t.test(name, () => {
+      const coordinator = new StoppedWriterCapabilityCoordinator();
+      let disposeCalls = 0;
+      let outerWriter;
+      let poisonCalls = 0;
+      let stopCalls = 0;
+
+      try {
+        globalThis.structuredClone = (value) => {
+          poisonCalls += 1;
+          if (poisonCalls === disposeOnCloneCall) {
+            assert.equal(coordinator.dispose(), undefined);
+            disposeCalls += 1;
+            globalThis.structuredClone = originalStructuredClone;
+          }
+          return originalStructuredClone(value);
+        };
+        syncCapabilityError(
+          () => {
+            outerWriter = coordinator.registerWriter(
+              registerOptions({
+                stopWriter: () => {
+                  stopCalls += 1;
+                  return STOPPED_WRITER_STOP_CONFIRMED;
+                },
+              }),
+            );
+          },
+          "writer_state_conflict",
+        );
+      } finally {
+        globalThis.structuredClone = originalStructuredClone;
+      }
+
+      assert.equal(poisonCalls, disposeOnCloneCall);
+      assert.equal(disposeCalls, 1);
+      assert.equal(outerWriter, undefined);
+      assert.equal(stopCalls, 0);
+      syncCapabilityError(
+        () => coordinator.registerWriter(registerOptions()),
+        "writer_state_conflict",
+      );
+      syncCapabilityError(
+        () => coordinator.dispose(),
+        "writer_state_conflict",
+      );
+      assert.equal(stopCalls, 0);
+    });
+  }
 });
 
 test("public option envelopes reject hostile values without invoking traps", async (t) => {
