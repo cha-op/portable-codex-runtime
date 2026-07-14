@@ -41,7 +41,10 @@ superseded_by:
   protocol before publishing a payload-only destination.
 - Each authority operation must await exactly one callback and durably finalize
   the catalogue or destination before returning the exact callback completion.
-  Zero, multiple, late, or substituted callback results fail closed.
+  Zero, multiple, late, or substituted callback results fail closed. The
+  backend observes every callback Promise rejection without replacing the
+  Promise returned to the authority, so discarded or late calls cannot escape
+  as process-level unhandled rejections.
 - Deterministic request-shape failures occur before collaborator dispatch.
   Runtime collaborator failures are frozen, non-retryable, path-free backend
   uncertainty, and capture uncertainty terminally consumes the capability.

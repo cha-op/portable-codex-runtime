@@ -565,6 +565,17 @@ function createMutationAuthority(fixture, options = {}) {
             state.background.push(pending.catch(() => undefined));
             return Object.freeze({ ignored: true });
           }
+          case "discard-invalid": {
+            void publish(Object.freeze({}));
+            return Object.freeze({ ignored: true });
+          }
+          case "late-unobserved": {
+            setImmediate(() => {
+              void publish(context);
+              options.onCaptureLatePublishIssued?.();
+            });
+            return Object.freeze({ ignored: true });
+          }
           case "throw":
             throw new Error(
               "runtime secret Bearer sensitive-token-value at /company/private/session",
@@ -625,6 +636,17 @@ function createMutationAuthority(fixture, options = {}) {
           case "early": {
             const pending = publish(context);
             state.background.push(pending.catch(() => undefined));
+            return Object.freeze({ ignored: true });
+          }
+          case "discard-invalid-throw": {
+            void publish(Object.freeze({}));
+            throw new Error("authority discarded an invalid callback");
+          }
+          case "late-unobserved": {
+            setImmediate(() => {
+              void publish(context);
+              options.onRestoreLatePublishIssued?.();
+            });
             return Object.freeze({ ignored: true });
           }
           case "substituted": {
@@ -1126,6 +1148,131 @@ test("restore authority callback cardinality and awaited identity fail closed", 
       assert.equal(fixture.mutation.state.restoreRuns, 1);
       assert.equal(fixture.mutation.state.restoreFinalizations.length, 0);
     });
+  }
+});
+
+test("backend observes discarded callback rejections", async (t) => {
+  const unhandledRejections = [];
+  const onUnhandledRejection = (reason, promise) => {
+    unhandledRejections.push({ promise, reason });
+  };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    await t.test("capture discarded before authority return", async (t) => {
+      const fixture = await createFixture(t, {
+        captureMode: "discard-invalid",
+      });
+      const capability = await issueCapability(fixture);
+
+      await assert.rejects(
+        () =>
+          fixture.backend.captureCheckpoint(
+            captureDispatchInput(fixture, capability),
+          ),
+        assertBackendError,
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(unhandledRejections, []);
+      assert.equal(
+        fixture.observation.events.includes("publication:prepared"),
+        false,
+      );
+      assert.equal(fixture.mutation.state.captureRuns, 1);
+    });
+
+    await t.test("restore discarded before authority throw", async (t) => {
+      const fixture = await createFixture(t, {
+        restoreMode: "discard-invalid-throw",
+      });
+      const capability = await issueCapability(fixture);
+      await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+      const publicationEventsBeforeRestore = fixture.observation.events.filter(
+        (event) => event.startsWith("publication:"),
+      ).length;
+
+      await assert.rejects(
+        () =>
+          fixture.backend.restoreCheckpoint(restoreDispatchInput(fixture)),
+        assertBackendError,
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(unhandledRejections, []);
+      assert.equal(
+        fixture.observation.events.filter((event) =>
+          event.startsWith("publication:"),
+        ).length,
+        publicationEventsBeforeRestore,
+      );
+      assert.equal(fixture.mutation.state.restoreRuns, 1);
+    });
+
+    await t.test("capture invoked after authority return", async (t) => {
+      const issued = deferred();
+      const fixture = await createFixture(t, {
+        captureMode: "late-unobserved",
+        onCaptureLatePublishIssued: issued.resolve,
+      });
+      const capability = await issueCapability(fixture);
+      const input = captureDispatchInput(fixture, capability);
+
+      await assert.rejects(
+        () => fixture.backend.captureCheckpoint(input),
+        assertBackendError,
+      );
+      await issued.promise;
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(unhandledRejections, []);
+      assert.equal(
+        fixture.observation.events.includes("publication:prepared"),
+        false,
+      );
+      assert.equal(fixture.mutation.state.captureRuns, 1);
+
+      await assert.rejects(
+        () => fixture.backend.captureCheckpoint(input),
+        assertBackendError,
+      );
+      assert.equal(fixture.mutation.state.captureRuns, 1);
+    });
+
+    await t.test("restore invoked after authority return", async (t) => {
+      const issued = deferred();
+      const fixture = await createFixture(t, {
+        onRestoreLatePublishIssued: issued.resolve,
+        restoreMode: "late-unobserved",
+      });
+      const capability = await issueCapability(fixture);
+      await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+      const publicationEventsBeforeRestore = fixture.observation.events.filter(
+        (event) => event.startsWith("publication:"),
+      ).length;
+
+      await assert.rejects(
+        () =>
+          fixture.backend.restoreCheckpoint(restoreDispatchInput(fixture)),
+        assertBackendError,
+      );
+      await issued.promise;
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(unhandledRejections, []);
+      assert.equal(
+        fixture.observation.events.filter((event) =>
+          event.startsWith("publication:"),
+        ).length,
+        publicationEventsBeforeRestore,
+      );
+      assert.equal(fixture.mutation.state.restoreRuns, 1);
+    });
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandledRejection);
   }
 });
 

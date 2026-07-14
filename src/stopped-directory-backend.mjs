@@ -987,12 +987,12 @@ function isSafeAuthorityPromise(value) {
   return false;
 }
 
-async function observeSafePromiseRejection(value) {
+async function observeSafeNativePromiseRejection(value) {
   try {
     await value;
   } catch {
-    // The resolver violated its synchronous contract. Observation prevents an
-    // owned native rejection from escaping after the backend fails closed.
+    // This side observer contains a same-realm native rejection without
+    // replacing the original Promise or changing its settlement.
   }
 }
 
@@ -1002,7 +1002,7 @@ async function runAuthorityMethod(authority, method, admission, publish) {
   let callbackResult;
   let open = true;
 
-  const guardedPublish = async (context) => {
+  const runGuardedPublish = async (context) => {
     callbackCalls += 1;
     if (!open || callbackCalls !== 1) failUncertain();
     const result = await publish(context);
@@ -1010,6 +1010,11 @@ async function runAuthorityMethod(authority, method, admission, publish) {
     callbackResult = result;
     callbackCompleted = true;
     return result;
+  };
+  const guardedPublish = (context) => {
+    const pending = runGuardedPublish(context);
+    void observeSafeNativePromiseRejection(pending);
+    return pending;
   };
 
   try {
@@ -1274,7 +1279,7 @@ export class StoppedDirectoryBackend {
       ]);
       if (isPromiseValue(resolution)) {
         if (isSafeAuthorityPromise(resolution)) {
-          void observeSafePromiseRejection(resolution);
+          void observeSafeNativePromiseRejection(resolution);
         }
         failUncertain();
       }

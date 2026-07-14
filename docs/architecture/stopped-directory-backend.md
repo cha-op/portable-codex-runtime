@@ -210,6 +210,10 @@ zero times, more than once, after the authority method has returned, or
 returning a substituted completion object fails closed as uncertain. The
 authority guard must span the callback's complete asynchronous lifetime and
 durable finalization; fence, attach, or launcher admission cannot cross it.
+The backend attaches a local rejection observer to every native callback
+Promise before returning that same Promise unchanged to the authority. This
+contains ignored or late callback rejections without changing the identity or
+settlement observed by an authority that correctly awaits the callback.
 
 Each authority method must return a native Promise whose prototype-chain
 `constructor` resolves through an own data property to the backend realm's
