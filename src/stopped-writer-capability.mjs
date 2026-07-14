@@ -9,7 +9,6 @@ import {
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
-const jsonStringify = JSON.stringify;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const MapConstructor = Map;
@@ -289,12 +288,31 @@ function makeOpaqueHandle() {
   return objectFreeze(objectCreate(null));
 }
 
-function slotKey(attachment) {
-  return jsonStringify([
-    attachment.sessionId,
-    attachment.backendId,
-    attachment.storageId,
-  ]);
+function findSlot(slots, attachment) {
+  const backendSlots = mapGet(slots, attachment.sessionId);
+  if (backendSlots === undefined) return undefined;
+  const storageSlots = mapGet(backendSlots, attachment.backendId);
+  if (storageSlots === undefined) return undefined;
+  return mapGet(storageSlots, attachment.storageId);
+}
+
+function createSlot(slots, attachment) {
+  let backendSlots = mapGet(slots, attachment.sessionId);
+  if (backendSlots === undefined) {
+    backendSlots = new MapConstructor();
+    mapSet(slots, attachment.sessionId, backendSlots);
+  }
+  let storageSlots = mapGet(backendSlots, attachment.backendId);
+  if (storageSlots === undefined) {
+    storageSlots = new MapConstructor();
+    mapSet(backendSlots, attachment.backendId, storageSlots);
+  }
+  const slot = {
+    current: null,
+    lastFencingEpoch: undefined,
+  };
+  mapSet(storageSlots, attachment.storageId, slot);
+  return slot;
 }
 
 function frozenCallbackBinding(record) {
@@ -340,8 +358,7 @@ export class StoppedWriterCapabilityCoordinator {
       attachmentValue,
       canonicalLease,
     );
-    const key = slotKey(attachment);
-    const existing = mapGet(this.#slots, key);
+    const existing = findSlot(this.#slots, attachment);
     if (existing?.current !== null && existing?.current !== undefined) {
       fail("writer_state_conflict");
     }
@@ -359,13 +376,14 @@ export class StoppedWriterCapabilityCoordinator {
     }
 
     const writer = makeOpaqueHandle();
+    const slot = existing ?? createSlot(this.#slots, attachment);
     const record = {
       attachment,
       capabilityRecord: null,
       handle: writer,
       processIncarnationId,
       revocationRequested: false,
-      slotKey: key,
+      slot,
       state: "running",
       stopEstablished: false,
       stopOperationId: null,
@@ -374,10 +392,7 @@ export class StoppedWriterCapabilityCoordinator {
       writerIncarnationId,
     };
     weakMapSet(this.#writers, writer, record);
-    mapSet(this.#slots, key, {
-      current: record,
-      lastFencingEpoch: existing?.lastFencingEpoch,
-    });
+    slot.current = record;
     return writer;
   }
 
@@ -565,7 +580,7 @@ export class StoppedWriterCapabilityCoordinator {
         (record.state === "revoked" && record.stopEstablished),
       "writer_state_conflict",
     );
-    const slot = mapGet(this.#slots, record.slotKey);
+    const { slot } = record;
     ensure(slot?.current === record, "writer_state_conflict");
     record.state = "retired";
     slot.current = null;

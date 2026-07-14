@@ -40,6 +40,10 @@ superseded_by:
   traversed before the nearest `then` descriptor and reject accessor or
   callable `then` values while preserving non-callable data descriptors;
   violations become terminal uncertainty before success is recorded.
+- Attachment slots use nested intrinsic `Map` lookups over validated primitive
+  IDs rather than an observable serialized composite key, so inherited
+  `Array.prototype.toJSON` or `Object.prototype.toJSON` mutations cannot bypass
+  single-writer or fencing checks.
 - `turn/completed`, `ShutdownComplete`, `thread/closed`, thread unsubscribe,
   and rollout flush are not writer-stop proof. Production issuance requires a
   fully joined container, cgroup, or VM writer boundary, or a future Codex

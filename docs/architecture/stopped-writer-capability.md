@@ -77,6 +77,10 @@ strongly referenced in a `Map` so losing a handle fails closed instead of
 silently releasing the slot. The lifecycle owner must retain the handles needed
 for explicit revocation and retirement. Public properties, a random token
 string, a symbol brand, or a serialized envelope are not accepted as authority.
+Slot identity is stored in nested `Map` instances keyed directly by the validated
+session, backend, and storage ID strings. It never serializes a composite object,
+so inherited `toJSON` hooks or other prototype mutations cannot change a slot
+lookup or admit a second writer.
 
 JSON, `structuredClone`, a worker message, object spread, or any other copying
 mechanism can at most create an inert lookalike. Only the exact original object

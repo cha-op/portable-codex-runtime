@@ -874,6 +874,56 @@ test("slot identity is session, backend, and storage rather than attachment ID",
   assertOpaqueHandle(otherStorage);
 });
 
+test("slot lookup is immune to inherited toJSON poisoning", async (t) => {
+  for (const [name, prototype] of [
+    ["Array.prototype", Array.prototype],
+    ["Object.prototype", Object.prototype],
+  ]) {
+    await t.test(name, () => {
+      const original = Object.getOwnPropertyDescriptor(prototype, "toJSON");
+      const coordinator = new StoppedWriterCapabilityCoordinator();
+      coordinator.registerWriter(registerOptions());
+      let toJSONCalls = 0;
+      Object.defineProperty(prototype, "toJSON", {
+        configurable: true,
+        value() {
+          toJSONCalls += 1;
+          return [`poisoned-${name}-${toJSONCalls}`];
+        },
+        writable: true,
+      });
+      try {
+        const newerLease = lease({
+          fencingEpoch: "9007199254740994",
+          holderId: "host-002",
+          leaseId: "lease-002",
+        });
+        syncCapabilityError(
+          () =>
+            coordinator.registerWriter(
+              registerOptions({
+                attachment: attachment(newerLease, {
+                  attachmentId: "attachment-002",
+                }),
+                canonicalLease: newerLease,
+                processIncarnationId: "process-incarnation-002",
+                writerIncarnationId: "writer-incarnation-002",
+              }),
+            ),
+          "writer_state_conflict",
+        );
+        assert.equal(toJSONCalls, 0);
+      } finally {
+        if (original === undefined) {
+          delete prototype.toJSON;
+        } else {
+          Object.defineProperty(prototype, "toJSON", original);
+        }
+      }
+    });
+  }
+});
+
 test("serialized, cloned, wrapped, and foreign capabilities are rejected", async (t) => {
   await t.test("structured clone", async () => {
     const fixture = await readyCapability();
