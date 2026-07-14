@@ -33,6 +33,11 @@
 - A same-process stopped-writer coordinator now converts one trusted, fully
   joined writer stop into one object-identity capability for one snapshot
   callback without making protocol events or serialized fields into authority.
+- A v1 stopped-directory backend now composes that one-use capability with a
+  durable mutation-authority/catalogue seam and local publication. It delegates
+  lifecycle operations, guards exact predetermined capture/restore results,
+  and fails closed on callback or finalization uncertainty while declaring
+  local-filesystem and manual-fencing limits.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -57,6 +62,8 @@
   `docs/project_journal/2026/07/2026-07-02-stopped-directory-publication-7a4c2e.md`
 - Same-process stopped-writer capability:
   `docs/project_journal/2026/07/2026-07-14-stopped-writer-capability-8c4e2a.md`
+- Stopped-directory backend:
+  `docs/project_journal/2026/07/2026-07-14-stopped-directory-backend-c5a91e.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

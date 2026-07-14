@@ -57,13 +57,15 @@ plane.
       one snapshot callback without embedding stop mechanics in storage.
 11. **PR #11: stopped-directory backend adapter**
     - Compose the journal, publication layer, capability, and snapshot core;
-      then run the complete backend conformance and failure-injection matrix.
+      add a durable mutation-authority/catalogue seam; then run the complete
+      backend conformance and failure-injection matrix.
 
-The sequence through PR #10 is complete. Later serial pull requests begin with
-the stopped-directory backend adapter, then own replay-only uncertain-result
-reconciliation, same-image resume and rollout-tail repair, an ext4 or
-filesystem-image backend, differential export and content-addressed storage,
-cross-host migration, and operational hardening.
+The sequence through PR #11 is complete. Later serial pull requests begin with
+replay-only uncertain-result reconciliation, then own same-image resume and
+rollout-tail repair, a production linearizable lease/reservation/catalogue and
+launcher-admission implementation, an ext4 or filesystem-image backend,
+differential export and content-addressed storage, cross-host migration, and
+operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

@@ -55,6 +55,14 @@ exact readback boundary. It still does not authenticate stopped-writer
 evidence, atomically recheck a canonical fence, or implement the backend
 contract. See `stopped-directory-publication.md`.
 
+The stopped-directory backend composes that physical layer with the
+same-process capability and a durable mutation-authority/catalogue seam. Its
+authority must reserve the exact predetermined result, hold the canonical
+fence and admission guard across publication, and durably finalize before
+success. It is a manual-fencing local-filesystem backend; the production
+authority database and replay-only reconciliation remain separate work. See
+`stopped-directory-backend.md`.
+
 `captureCleanCheckpoint()` and `restoreCleanCheckpoint()` are the orchestration
 entry points. Both reject `graceful-abort` and `crash-prefix` before backend
 dispatch. Successful results contain the deeply frozen validated checkpoint
@@ -124,13 +132,13 @@ published final object's topology, persistent identity, modeled digest, and
 other committed-state invariants before returning the durable result. A journal
 record alone is not replay authority.
 
-The single current PR #11 dispatch may resume an exact pre-existing `prepared`
-or `materialized` operation inside its one consumption callback. If that
-callback then fails or becomes uncertain, the writer and capability are
-terminal: this layer has no transition that mints another capability for the
-same writer incarnation. It stays blocked for the later dedicated
-reconciliation path. PR #11 must capture one designated coordinator in trusted
-backend state and must not instantiate a replacement coordinator as a retry
+One stopped-directory backend dispatch may resume an exact pre-existing
+`prepared` or `materialized` operation inside its one consumption callback.
+If that callback then fails or becomes uncertain, the writer and capability
+are terminal: this layer has no transition that mints another capability for
+the same writer incarnation. It stays blocked for the later dedicated
+reconciliation path. The backend captures one designated coordinator in
+trusted state and does not instantiate a replacement coordinator as a retry
 mechanism.
 
 The backend, rather than the core, defines the physical checkpoint and restore
@@ -167,7 +175,6 @@ This core does not yet provide:
 - evidence for a graceful `turn/interrupt` abort boundary;
 - atomic `crash-prefix` capture or rollout-tail repair;
 - replay-only reconciliation after an uncertain result and fence turnover;
-- a stopped-directory backend and its conformance suite;
 - an ext4 or filesystem-image physical backend;
 - differential compression, content-addressed storage, encryption, retention,
   or atomic remote publication;
@@ -188,7 +195,7 @@ pull-request order in the runtime delivery plan:
 3. PR #8, durable filesystem operation journal (completed);
 4. PR #9, stopped-directory atomic publication (completed);
 5. PR #10, same-process stopped-writer capability (completed);
-6. PR #11, stopped-directory backend conformance;
+6. PR #11, stopped-directory backend conformance (completed);
 7. replay-only uncertain-result reconciliation, followed by same-image resume
    verification and rollout-tail repair;
 8. ext4 or filesystem-image physical backend; and

@@ -6,8 +6,8 @@ environment, workspace, rollout state, and recovery data explicit.
 
 The current repository combines compatibility probes for authentication and
 interrupted-turn recovery with the storage contracts, journal, local
-stopped-directory publication, and same-process stopped-writer authority needed
-by later concrete backends.
+stopped-directory publication, same-process stopped-writer authority, and a
+composed stopped-directory backend for guarded clean capture and restore.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -144,6 +144,33 @@ unknown filesystem semantics, canonical fence checks, stopped-writer
 authentication, and non-cooperating same-UID races at the final POSIX rename
 syscall are outside its guarantee. See
 `docs/architecture/stopped-directory-publication.md`.
+
+## Stopped-Directory Backend
+
+The v1 stopped-directory backend composes the same-process capability, a
+durable mutation-authority and catalogue seam, and local publication into the
+snapshot core's storage-backend contract. It owns only `captureCheckpoint`
+and `restoreCheckpoint`; provision, writable attachment preparation, detach,
+force-fence, and destroy operations delegate to a validated lifecycle backend
+with the same backend ID.
+
+Capture consumes the exact stopped-writer capability once. While the
+coordinator callback is active, the mutation authority holds the canonical
+fence and admission guard, reserves a predetermined result, runs publication
+exactly once, and durably finalizes the catalogue before returning that same
+completion. Restore applies the same protocol to a newer fence, trusted
+artefact proof, and isolated detached destination. Runtime collaborator
+failures are fixed path-free uncertainty; the adapter performs no internal
+retry, speculative cleanup, or replacement-coordinator recovery.
+
+The adapter advertises normal directory attachments, exclusive writers,
+`fencing: "manual"`, and
+`atomicPointInTimeCheckpoint: false`. It is therefore a trusted local
+filesystem development and conformance backend, not an NFS, live-volume, or
+automatic failover implementation. The durable authority interface and
+conformance tests are part of this slice; a production linearizable database
+and catalogue remain separate work. See
+`docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery
 

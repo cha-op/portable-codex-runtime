@@ -213,7 +213,7 @@ uncertainty is therefore either durably confirmed or remains an uncertain
 failure. A read may reveal `prepared`, `materialized`, or `committed` after a
 caller previously observed uncertainty. Every phase retains the predetermined
 exact result, while only a committed record authorises it for backend replay.
-An earlier state tells the future backend which durable journal phase was
+An earlier state tells the composed backend which durable journal phase was
 reached. The journal does not itself continue, roll back, or reconcile the
 physical operation.
 
@@ -258,6 +258,7 @@ readback. A consumer still must use that higher layer rather than infer physical
 success from a journal record alone. See
 `stopped-directory-publication.md`.
 
-PR #10 owns the same-process stopped-writer capability. PR #11 then composes
-that capability, publication, canonical fence authority, and the snapshot core
-into the stopped-directory backend and its conformance suite.
+The stopped-directory backend now composes the same-process stopped-writer
+capability, publication, durable canonical-fence authority, and the snapshot
+core. The journal remains evidence rather than authority when used outside
+that composition. See `stopped-directory-backend.md`.

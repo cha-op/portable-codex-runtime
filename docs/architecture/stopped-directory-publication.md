@@ -20,12 +20,13 @@ and guarded-cleanup rules. It adds the storage barriers, deterministic private
 staging, atomic final-name publication, exact readback, and journal ordering
 that those primitives deliberately omit.
 
-The PR #10 same-process coordinator authenticates one trusted writer stop and
-consumes its one-use capability around one snapshot callback. PR #11 owns the
-canonical fence recheck, attachment and destination state, backend mutation
-envelope, idempotent replay, and snapshot-core composition. This layer must not
-accept an arbitrary object or callback as proof that a writer stopped, that a
-restore destination is detached, or that a fence is current.
+The same-process coordinator authenticates one trusted writer stop and consumes
+its one-use capability around one snapshot callback. The stopped-directory
+backend owns the canonical fence recheck, attachment and destination state,
+backend mutation envelope, idempotent committed-result replay, and
+snapshot-core composition. This layer must not accept an arbitrary object or
+callback as proof that a writer stopped, that a restore destination is
+detached, or that a fence is current.
 
 ## Publication Objects
 
@@ -61,9 +62,9 @@ manifest-byte digest from a trusted committed capture record or catalogue.
 Those fields form the `artifactProof`, are bound into the restore journal
 record, and must match both `artifact.json` and the payload before any restore
 candidate is created. Simultaneously changing payload bytes and the manifest's
-self-reported digest therefore cannot create a valid restore input. PR #11 is
-responsible for obtaining this proof from canonical backend state rather than
-from worker-controlled storage.
+self-reported digest therefore cannot create a valid restore input. The
+stopped-directory backend obtains this proof from canonical mutation-authority
+state rather than worker-controlled storage.
 
 The trusted adapter supplies an absolute final path whose direct-child name is
 validated and durably bound to the exact operation, target, and pinned parent
@@ -282,10 +283,12 @@ failure requires recovery without claiming a commit.
 
 The source remains externally stopped throughout capture. The publication
 layer detects many identity and metadata changes, but those checks are not a
-substitute for the same-process stopped-writer capability or the PR #11 atomic
-fence recheck. The future backend must run this complete publication attempt
-inside the capability's single consumption callback and must not restart the
-writer until that callback settles.
+substitute for the same-process stopped-writer capability or an atomic
+canonical-fence recheck. The stopped-directory backend runs this complete
+publication attempt inside the capability's single consumption callback and
+the mutation authority's fence/admission guard. The writer must not restart
+until that callback and durable authority finalization settle. See
+`stopped-directory-backend.md`.
 
 The staged tree, its manifest, and the final tree are never deleted
 speculatively after a failure. Retained objects are recovery evidence. Cleanup
@@ -438,3 +441,9 @@ does not implement an atomic live-volume `crash-prefix` snapshot, rollout-tail
 repair, same-image Codex resume verification, differential compression,
 content-addressed storage, encryption, retention, periodic long-goal capture,
 cross-host migration, or Git Summary.
+
+The composed stopped-directory backend does not widen this physical boundary:
+it advertises manual fencing and no atomic point-in-time checkpoint. Its
+durable authority seam supplies canonical admission and catalogue ordering,
+while a production database and any NFS/shared-filesystem implementation
+remain separate work.
