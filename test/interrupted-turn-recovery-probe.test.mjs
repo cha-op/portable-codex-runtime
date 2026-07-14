@@ -554,6 +554,54 @@ test("stopped-tree sync rejects file replacement races and propagates fsync fail
   }
 });
 
+test("stopped-tree sync repeats the injected mount check after traversal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-sync-mount-race-test-"));
+  try {
+    const mounted = join(root, "mounted");
+    await mkdir(mounted, { mode: 0o700 });
+    await writeFile(join(mounted, "sentinel"), "preserve", { mode: 0o600 });
+    let inspections = 0;
+    const listMountPoints = async () => {
+      inspections += 1;
+      return inspections === 1 ? [] : [mounted];
+    };
+
+    await assert.rejects(
+      syncStoppedTree(root, {
+        listMountPoints,
+        syncDirectory: async () => {},
+        syncFile: async () => {},
+      }),
+      /rejects nested mount points/,
+    );
+    assert.equal(inspections, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("tree digest repeats the injected mount check after traversal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-digest-mount-race-test-"));
+  try {
+    const mounted = join(root, "mounted");
+    await mkdir(mounted, { mode: 0o700 });
+    await writeFile(join(mounted, "sentinel"), "preserve", { mode: 0o600 });
+    let inspections = 0;
+    const listMountPoints = async () => {
+      inspections += 1;
+      return inspections === 1 ? [] : [mounted];
+    };
+
+    await assert.rejects(
+      digestTree(root, { listMountPoints }),
+      /rejects nested mount points/,
+    );
+    assert.equal(inspections, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("portable tree root mounts require explicit opt-in while nested mounts remain rejected", async () => {
   const root = await mkdtemp(join(tmpdir(), "portable-root-mount-opt-in-test-"));
   try {
@@ -897,6 +945,17 @@ test("portable tree operations reject declared nested mount boundaries", async (
       /rejects nested mount points/,
     );
     await assert.rejects(
+      digestStoppedTreeIdentities(
+        source,
+        "test-filesystem-001",
+        TEST_OBJECT_IDENTITY_SCHEME,
+        inspectTestPersistentObjectIdentity,
+        new Map(),
+        { listMountPoints },
+      ),
+      /rejects nested mount points/,
+    );
+    await assert.rejects(
       copyStoppedTree({ ownedRoot: root, source, destination, listMountPoints }),
       /rejects nested mount points/,
     );
@@ -906,6 +965,38 @@ test("portable tree operations reject declared nested mount boundaries", async (
       /rejects nested mount points/,
     );
     assert.equal(await readFile(join(mounted, "sentinel"), "utf8"), "preserve");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("persistent tree identity digest repeats the injected mount check after scanning", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "portable-identity-digest-mount-race-test-"),
+  );
+  try {
+    const source = join(root, "source");
+    const mounted = join(source, "mounted");
+    await mkdir(mounted, { recursive: true });
+    await writeFile(join(mounted, "sentinel"), "preserve");
+    let inspections = 0;
+    const listMountPoints = async () => {
+      inspections += 1;
+      return inspections === 1 ? [] : [mounted];
+    };
+
+    await assert.rejects(
+      digestStoppedTreeIdentities(
+        source,
+        "test-filesystem-001",
+        TEST_OBJECT_IDENTITY_SCHEME,
+        inspectTestPersistentObjectIdentity,
+        new Map(),
+        { listMountPoints },
+      ),
+      /rejects nested mount points/,
+    );
+    assert.equal(inspections, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1513,6 +1604,93 @@ test("stopped-tree copy rejects identity aliases of forbidden authorities", asyn
         }],
         inspectSymlinkPath: async (path, options) =>
           path === alias ? identity : lstat(path, options),
+        ownedRoot: root,
+        source,
+      }),
+      /rejects absolute symlinks into a forbidden authority/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects hard-link aliases of forbidden authority descendants", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "portable-copy-forbidden-hard-link-test-"),
+  );
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const forbidden = join(root, "forbidden");
+    const external = join(root, "external");
+    await mkdir(source);
+    await mkdir(forbidden);
+    await mkdir(external);
+    const forbiddenRecord = join(forbidden, "record");
+    const externalAlias = join(external, "record-alias");
+    await writeFile(forbiddenRecord, "sentinel");
+    await link(forbiddenRecord, externalAlias);
+    await symlink(externalAlias, join(source, "authority-record"));
+    const identity = await lstat(forbidden, { bigint: true });
+
+    await assert.rejects(
+      copyStoppedTree({
+        destination,
+        forbiddenAbsoluteSymlinkAuthorities: [{
+          device: identity.dev.toString(),
+          inode: identity.ino.toString(),
+          path: await realpath(forbidden),
+        }],
+        ownedRoot: root,
+        source,
+      }),
+      /rejects absolute symlinks into a forbidden authority/,
+    );
+    await assertRetainedFailedDestination(destination);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stopped-tree copy rejects bind aliases of forbidden authority descendants", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "portable-copy-forbidden-bind-alias-test-"),
+  );
+  try {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    const forbidden = join(root, "forbidden");
+    const forbiddenSubtree = join(forbidden, "subtree");
+    const forbiddenRecord = join(forbiddenSubtree, "record");
+    const externalAlias = join(root, "external-alias");
+    const externalRecord = join(externalAlias, "record");
+    await mkdir(source);
+    await mkdir(forbidden);
+    await mkdir(forbiddenSubtree);
+    await mkdir(externalAlias);
+    await writeFile(forbiddenRecord, "sentinel");
+    await writeFile(externalRecord, "decoy");
+    await symlink(externalRecord, join(source, "authority-record"));
+    const identity = await lstat(forbidden, { bigint: true });
+    const subtreeIdentity = await lstat(forbiddenSubtree, { bigint: true });
+    const recordIdentity = await lstat(forbiddenRecord, { bigint: true });
+    const canonicalExternalAlias = await realpath(externalAlias);
+    const canonicalExternalRecord = await realpath(externalRecord);
+
+    await assert.rejects(
+      copyStoppedTree({
+        destination,
+        forbiddenAbsoluteSymlinkAuthorities: [{
+          device: identity.dev.toString(),
+          inode: identity.ino.toString(),
+          path: await realpath(forbidden),
+        }],
+        inspectSymlinkPath: async (path, options) => {
+          if (path === canonicalExternalAlias) return subtreeIdentity;
+          if (path === canonicalExternalRecord) return recordIdentity;
+          return lstat(path, options);
+        },
         ownedRoot: root,
         source,
       }),

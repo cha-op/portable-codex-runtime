@@ -35,7 +35,11 @@ absolute-link traversal into explicit path and device/inode authorities. These
 are publication-building primitives, not independent backend authority.
 Cross-root copy inventories every source entry identity before it creates the
 destination and rejects a destination-root identity found anywhere in that
-inventory, including a descendant bind-mount alias.
+inventory, including a descendant bind-mount alias. When absolute links are
+enabled with forbidden authorities, it likewise inventories every authority
+root and descendant identity before destination mutation, rejects traversal
+through hard-link or bind aliases of any inventoried descendant, and requires
+the authority inventory and mount boundaries to remain stable through copy.
 `stoppedTreeContainsAnyIdentity()` provides the corresponding targeted proof:
 it validates the mount table before recursion, permits an explicitly approved
 root mount, rejects nested mounts and cross-device entries, stops before

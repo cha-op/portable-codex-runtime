@@ -1081,6 +1081,284 @@ test("a journal descendant mount is rejected before publication mutation", async
   );
 });
 
+test("the injected mount inspector rejects a candidate descendant mount after copy", async (t) => {
+  let exposeCandidateMount = false;
+  let candidateMount;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterCopy() {
+        exposeCandidateMount = true;
+      },
+    },
+    listMountPoints: async () =>
+      exposeCandidateMount ? ["/", candidateMount] : ["/"],
+  });
+  const candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  candidateMount = join(candidate, "payload", "workspace");
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_io_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+});
+
+test("the injected mount inspector reaches candidate copy before traversal", async (t) => {
+  let exposeCandidateMount = false;
+  let candidateMount;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterCandidateCreated() {
+        exposeCandidateMount = true;
+      },
+    },
+    listMountPoints: async () =>
+      exposeCandidateMount ? ["/", candidateMount] : ["/"],
+  });
+  const candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  candidateMount = join(candidate, "payload", "workspace");
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_io_failed",
+        "not-committed",
+      ),
+  );
+  assert.equal(await pathExists(join(candidate, "payload")), true);
+  assert.equal(await pathExists(join(candidate, "payload", "workspace")), false);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "prepared",
+  );
+});
+
+test("the injected mount inspector reaches materialized candidate sync", async (t) => {
+  let failAfterMaterialized = true;
+  let exposeCandidateMount = false;
+  let candidateMount;
+  let candidateRoot;
+  let candidateIdentityVisitedAfterBeforeRename = false;
+  let mountChecksAfterBeforeRename = 0;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) throw new Error("materialized fixture fault");
+      },
+      async beforeRename() {
+        exposeCandidateMount = true;
+      },
+    },
+    inspectPersistentObjectIdentity: async (path) => {
+      const identity = await inspectTestPersistentObjectIdentity(path);
+      if (
+        exposeCandidateMount &&
+        (path === candidateRoot || path.startsWith(`${candidateRoot}/`))
+      ) {
+        candidateIdentityVisitedAfterBeforeRename = true;
+      }
+      return identity;
+    },
+    listMountPoints: async () => {
+      if (!exposeCandidateMount) return ["/"];
+      mountChecksAfterBeforeRename += 1;
+      // Materialized replay performs two journal-topology checks, then the
+      // candidate sync pre-check. The fourth call is the sync post-check.
+      return mountChecksAfterBeforeRename === 4
+        ? ["/", candidateMount]
+        : ["/"];
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    await realpath(fixture.artifactOwnedRoot),
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  candidateRoot = candidate;
+  candidateMount = join(candidate, "payload", "workspace");
+  failAfterMaterialized = false;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+  assert.equal(mountChecksAfterBeforeRename, 4);
+  assert.equal(candidateIdentityVisitedAfterBeforeRename, false);
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("the injected mount inspector rejects a final descendant mount after rename", async (t) => {
+  let exposeFinalMount = false;
+  let finalMount;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterParentSync() {
+        exposeFinalMount = true;
+      },
+    },
+    listMountPoints: async () =>
+      exposeFinalMount ? ["/", finalMount] : ["/"],
+  });
+  finalMount = join(fixture.artifactDirectory, "payload", "workspace");
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("committed replay rejects a final descendant mount from the injected inspector", async (t) => {
+  let exposeFinalMount = false;
+  let finalMount;
+  const fixture = await createFixture(t, {
+    listMountPoints: async () =>
+      exposeFinalMount ? ["/", finalMount] : ["/"],
+  });
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  finalMount = join(fixture.artifactDirectory, "payload", "workspace");
+  exposeFinalMount = true;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "committed",
+  );
+});
+
+test("committed replay passes the mount inspector to the identity digest", async (t) => {
+  let replaying = false;
+  let exposeIdentityDigestMount = false;
+  let identityDigestTrigger;
+  let identityDigestMount;
+  let mountChecksAfterTrigger = 0;
+  const fixture = await createFixture(t, {
+    inspectPersistentObjectIdentity: async (path) => {
+      const identity = await inspectTestPersistentObjectIdentity(path);
+      if (replaying && path === identityDigestTrigger) {
+        exposeIdentityDigestMount = true;
+      }
+      return identity;
+    },
+    listMountPoints: async () => {
+      if (!exposeIdentityDigestMount) return ["/"];
+      mountChecksAfterTrigger += 1;
+      return ["/", identityDigestMount];
+    },
+  });
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  const publishedRoot = await realpath(fixture.artifactDirectory);
+  identityDigestTrigger = join(
+    publishedRoot,
+    "payload",
+    "workspace",
+    "README.md",
+  );
+  // This sibling is inside the identity-digest root but outside the modeled
+  // payload, so only the identity-digest mount check can reject it.
+  identityDigestMount = join(publishedRoot, "artifact.json");
+  replaying = true;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(exposeIdentityDigestMount, true);
+  assert.equal(mountChecksAfterTrigger, 1);
+});
+
+test("committed replay passes the mount inspector to the modeled digest", async (t) => {
+  let replaying = false;
+  let modeledDigestArmed = false;
+  let modeledDigestTrigger;
+  let modeledDigestMount;
+  let mountChecksAfterTrigger = 0;
+  const fixture = await createFixture(t, {
+    inspectPersistentObjectIdentity: async (path) => {
+      const identity = await inspectTestPersistentObjectIdentity(path);
+      if (replaying && path === modeledDigestTrigger) modeledDigestArmed = true;
+      return identity;
+    },
+    listMountPoints: async () => {
+      if (!modeledDigestArmed) return ["/"];
+      mountChecksAfterTrigger += 1;
+      return mountChecksAfterTrigger === 1 ? ["/"] : ["/", modeledDigestMount];
+    },
+  });
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  const publishedRoot = await realpath(fixture.artifactDirectory);
+  modeledDigestTrigger = join(
+    publishedRoot,
+    "payload",
+    "workspace",
+    "README.md",
+  );
+  modeledDigestMount = join(publishedRoot, "payload", "workspace");
+  replaying = true;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(modeledDigestArmed, true);
+  assert.equal(mountChecksAfterTrigger, 2);
+});
+
 test("the journal authority cannot also be the publication root", async (t) => {
   const fixture = await createFixture(t);
   const artifactDirectory = join(fixture.journalDirectory, "published-artifact");
@@ -3078,12 +3356,65 @@ test("materialized topology stays uncertain until candidate-only is proven", asy
     fixture.artifactDirectory,
   );
   await rm(candidate, { force: true, recursive: true });
+  assert.equal(await pathExists(candidate), false);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
 
   failAfterMaterialized = false;
   await assert.rejects(
     fixture.publication.publishCheckpointArtifact(options),
     (error) =>
       assertPublicationError(error, "publication_outcome_uncertain", "uncertain"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+});
+
+test("missing materialized paths stay uncertain after a prior rename", async (t) => {
+  let failAfterRename = true;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterRename() {
+        if (failAfterRename) throw new Error("rename fault");
+      },
+    },
+  });
+  const options = captureOptions(fixture);
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+  const candidate = candidatePath(
+    fixture.artifactOwnedRoot,
+    CAPTURE_OPERATION_ID,
+    fixture.artifactDirectory,
+  );
+  assert.equal(await pathExists(candidate), false);
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,
+    "materialized",
+  );
+
+  await rm(fixture.artifactDirectory, { force: true, recursive: true });
+  assert.equal(await pathExists(candidate), false);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  failAfterRename = false;
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
   );
   assert.equal(
     (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record.state,

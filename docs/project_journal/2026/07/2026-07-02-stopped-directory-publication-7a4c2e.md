@@ -51,6 +51,11 @@ superseded_by:
   already-discovered durable state.
   Publication also rejects all absolute source symlinks so mutable host aliases cannot
   redirect a portable artefact into the journal authority after validation.
+- The reusable cross-root copy primitive inventories every explicit forbidden
+  authority root and descendant before destination mutation, rejects hard-link
+  and bind aliases of those descendants during absolute-link traversal, and
+  requires the inventory and mount boundaries to remain stable through copy.
+  Publication itself continues to disable absolute links.
 - Public inputs are deeply snapshotted before queueing; source and publication
   roots are distinct and journal-disjoint; source root identity is preserved
   across the barrier and copy; and checkpoint replay requires an exact
@@ -86,6 +91,10 @@ superseded_by:
   through an undetected alias. Recursive source topology checks then run while
   the publication lock is held. Every injected callback is followed by pinned
   root-authority revalidation before further source reads or target writes.
+- The adapter's injected mount inspector is used consistently by source,
+  candidate, and final copy, sync, modeled-digest, persistent-identity-digest,
+  and source/publication disjointness checks, including replay after observable
+  callbacks; staged verification never falls back to another host mount table.
 - Missing or non-directory source leaves are classified only after historical
   journal discovery, so materialized/committed replay can use its recorded
   source binding. Restore repeatedly requires the checkpoint bundle root to
@@ -102,6 +111,9 @@ superseded_by:
   their owner, pinned-mode, and ACL policy. Checkpoint envelopes remain `0700`;
   restore payload roots retain their modeled mode inside a private `0700`
   destination authority.
+  If both candidate and final are absent, trusted recovery is required while
+  commit state remains uncertain because a prior rename followed by final
+  deletion cannot be excluded.
 - A lock-free, fault-callback-free journal state hint now selects the source
   preflight while the outer publication lock is already held. The locked
   authoritative read must be monotonic relative to that hint. Materialized and

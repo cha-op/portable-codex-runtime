@@ -564,11 +564,15 @@ async function assertSourcePublicationIdentityDisjoint(
   publicationPath,
   code,
   commitState,
+  listMountPoints,
 ) {
   if (source.identity === null) return;
   let overlaps;
   try {
-    overlaps = await stoppedTreesShareAnyIdentity(source.path, publicationPath);
+    overlaps = await stoppedTreesShareAnyIdentity(source.path, publicationPath, {
+      allowLeftRootMount: true,
+      listMountPoints,
+    });
   } catch {
     fail(code, commitState);
   }
@@ -1522,6 +1526,7 @@ export class StoppedDirectoryPublication {
             publicationPath,
             code,
             stateClassification,
+            this.#listMountPoints,
           );
         }
       };
@@ -2171,7 +2176,9 @@ export class StoppedDirectoryPublication {
             "published_state_invalid",
             "committed",
           );
-          await syncStoppedTree(finalPath);
+          await syncStoppedTree(finalPath, {
+            listMountPoints: this.#listMountPoints,
+          });
           await targetAuthority.assertCurrent();
           await targetAuthority.handle.sync();
           await this.#verifyPublishedTree({
@@ -2266,7 +2273,9 @@ export class StoppedDirectoryPublication {
               "publication_integrity_failed",
               "not-committed",
             );
-            await syncStoppedTree(candidatePath);
+            await syncStoppedTree(candidatePath, {
+              listMountPoints: this.#listMountPoints,
+            });
             await targetAuthority.assertCurrent();
             await targetAuthority.handle.sync();
             await this.#verifyPublishedTree({
@@ -2376,7 +2385,9 @@ export class StoppedDirectoryPublication {
               "publication_recovery_required",
               "not-committed",
             );
-            await syncStoppedTree(candidatePath);
+            await syncStoppedTree(candidatePath, {
+              listMountPoints: this.#listMountPoints,
+            });
             await targetAuthority.assertCurrent();
             await targetAuthority.handle.sync();
             await this.#verifyPublishedTree({
@@ -2500,7 +2511,9 @@ export class StoppedDirectoryPublication {
             "publication_outcome_uncertain",
             "uncertain",
           );
-          await syncStoppedTree(finalPath);
+          await syncStoppedTree(finalPath, {
+            listMountPoints: this.#listMountPoints,
+          });
           await targetAuthority.assertCurrent();
           await targetAuthority.handle.sync();
           await this.#verifyPublishedTree({
@@ -2721,7 +2734,10 @@ export class StoppedDirectoryPublication {
       );
       sourceTree = join(source.path, "payload");
       sourceOwnedRoot = source.path;
-      await syncStoppedTree(source.path, { allowRootMount: true });
+      await syncStoppedTree(source.path, {
+        allowRootMount: true,
+        listMountPoints: this.#listMountPoints,
+      });
       await sourceAuthority.handle.sync();
       await assertExactCheckpointBundleRoot(source.path);
       const stableManifest = await readArtifactManifest(
@@ -2733,16 +2749,24 @@ export class StoppedDirectoryPublication {
         stableManifest.digest === manifest.digest,
         "publication_integrity_failed",
       );
-      sourceDigest = await digestTree(sourceTree);
+      sourceDigest = await digestTree(sourceTree, {
+        listMountPoints: this.#listMountPoints,
+      });
       ensure(
         sourceDigest === manifest.manifest.modeledDigest,
         "publication_integrity_failed",
       );
       artifactManifestDigest = manifest.digest;
     } else {
-      await syncStoppedTree(source.path, { allowRootMount: true });
+      await syncStoppedTree(source.path, {
+        allowRootMount: true,
+        listMountPoints: this.#listMountPoints,
+      });
       await sourceAuthority.handle.sync();
-      sourceDigest = await digestTree(source.path, { allowRootMount: true });
+      sourceDigest = await digestTree(source.path, {
+        allowRootMount: true,
+        listMountPoints: this.#listMountPoints,
+      });
       artifactManifestDigest = sha256("pending-artifact-manifest\0", operationId);
     }
     await runFault(this.#faults.afterSourceBarrier);
@@ -2768,13 +2792,16 @@ export class StoppedDirectoryPublication {
         expectedSourceRootIdentity: source.identity,
         inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
         inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+        listMountPoints: this.#listMountPoints,
         source: source.path,
         sourceOwnedRoot: sourceAuthority.path,
       });
       await runObservableCandidateFault(this.#faults.afterCopy);
       await revalidateAfterCallback();
       await assertSourcePersistentIdentity();
-      const copiedDigest = await digestTree(payload);
+      const copiedDigest = await digestTree(payload, {
+        listMountPoints: this.#listMountPoints,
+      });
       ensure(copiedDigest === sourceDigest, "publication_integrity_failed");
       const manifest = artifactManifest(checkpoint, operationId, copiedDigest);
       artifactManifestDigest = await writeArtifactManifest(
@@ -2796,6 +2823,7 @@ export class StoppedDirectoryPublication {
         forbiddenAbsoluteSymlinkAuthorities: [journalAuthority],
         inspectOwnedRootAcl: this.#inspectOwnedRootAcl,
         inspectOwnedRootAncestorAcl: this.#inspectOwnedRootAncestorAcl,
+        listMountPoints: this.#listMountPoints,
         source: sourceTree,
         sourceOwnedRoot,
       });
@@ -2805,13 +2833,18 @@ export class StoppedDirectoryPublication {
       await assertExactCheckpointBundleRoot(source.path);
     }
 
-    await syncStoppedTree(candidatePath);
+    await syncStoppedTree(candidatePath, {
+      listMountPoints: this.#listMountPoints,
+    });
     await targetAuthority.handle.sync();
     const modeledPath =
       kind === "checkpoint-artifact" ? join(candidatePath, "payload") : candidatePath;
-    const copiedDigest = await digestTree(modeledPath);
+    const copiedDigest = await digestTree(modeledPath, {
+      listMountPoints: this.#listMountPoints,
+    });
     const sourceDigestAfterCopy = await digestTree(sourceTree, {
       allowRootMount: kind === "checkpoint-artifact",
+      listMountPoints: this.#listMountPoints,
     });
     await assertSourcePersistentIdentity();
     ensure(
@@ -2857,6 +2890,7 @@ export class StoppedDirectoryPublication {
       candidatePath,
       "publication_integrity_failed",
       "not-committed",
+      this.#listMountPoints,
     );
     let treeIdentityDigest;
     let objectId;
@@ -2876,6 +2910,7 @@ export class StoppedDirectoryPublication {
         targetFilesystem.objectIdentityScheme,
         this.#inspectPersistentObjectIdentity,
         observedObjectIdentities,
+        { listMountPoints: this.#listMountPoints },
       );
     } catch {
       fail("publication_integrity_failed");
@@ -2936,6 +2971,7 @@ export class StoppedDirectoryPublication {
           materialization.stagedRoot.objectIdentityScheme,
           this.#inspectPersistentObjectIdentity,
           observedObjectIdentities,
+          { listMountPoints: this.#listMountPoints },
         )) ===
           materialization.treeIdentityDigest,
         "publication_integrity_failed",
@@ -2943,7 +2979,9 @@ export class StoppedDirectoryPublication {
       if (kind === "checkpoint-artifact") {
         await assertExactCheckpointBundleRoot(path);
         const manifest = await readArtifactManifest(join(path, "artifact.json"), checkpoint);
-        const digest = await digestTree(join(path, "payload"));
+        const digest = await digestTree(join(path, "payload"), {
+          listMountPoints: this.#listMountPoints,
+        });
         ensure(
           manifest.digest === materialization.artifactManifestDigest &&
             manifest.manifest.modeledDigest === materialization.modeledDigest &&
@@ -2952,7 +2990,9 @@ export class StoppedDirectoryPublication {
         );
       } else {
         ensure(
-          (await digestTree(path)) === materialization.modeledDigest,
+          (await digestTree(path, {
+            listMountPoints: this.#listMountPoints,
+          })) === materialization.modeledDigest,
           "publication_integrity_failed",
         );
       }

@@ -176,7 +176,10 @@ The source and destination trees reject nested mount points. A backend that
 permits the declared source root itself to be a mounted volume must distinguish
 that approved root mount from mounts below it and must pin the applicable mount
 namespace and filesystem profile. Device equality alone does not prove that
-two paths share safe rename or durability semantics.
+two paths share safe rename or durability semantics. The same injected mount
+inspector governs copy, sync, modeled digest, persistent-identity digest, and
+source/publication disjointness checks for source, candidate, and final trees;
+none of those checks may fall back to a different host mount table.
 
 For restore, the final pathname must be absent and must remain outside worker
 admission while staging and commit are in progress. It must not identify an
@@ -302,7 +305,7 @@ The journal state and physical topology must be interpreted together:
 | `materialized` | present | absent | Verify the recorded digest and identity before publishing under fresh authority. |
 | `materialized` | absent | present | Rename may have completed; verify final, fsync its parent, and then commit. |
 | `materialized` | present | present | The physical state is inconsistent; recovery is required. |
-| `materialized` | absent | absent | The durable stage is missing; recovery is required. |
+| `materialized` | absent | absent | The durable stage is missing; trusted recovery is required and prior publication remains uncertain. |
 | `committed` | absent | present | Verify the exact final object and replay without copying or rewriting. |
 | `committed` | present | any | Committed state contains unexplained recovery evidence and fails closed. |
 | `committed` | absent | absent or invalid | The operation remains committed, but its published object is damaged or lost. |
