@@ -99,12 +99,16 @@ cannot authenticate authority at the designated backend; creating one as a
 retry mechanism is a trusted-runtime misconfiguration, not a recovery
 transition.
 
-The complete attachment is defensively snapshotted through the storage
-contract validator before registration. Consumption compares the private
-snapshot, not a caller-mutated object. The binding includes the attachment ID,
-proof ID, operation ID, root path, storage and backend IDs, session and fence
-fields, kind, and mode. Comparing only the attachment ID would permit detach,
-reattach, or identifier-reuse ABA.
+The complete attachment and lease are copied first into exact, flat, frozen
+records with coordinator-captured intrinsics. The storage contract validators
+receive those private records only for pass/fail validation; their returned
+objects are never retained as authority. Consumption compares the private
+snapshot, not a caller-mutated object; poisoned clone or freeze operations
+inside a shared validator therefore cannot substitute a caller-owned authority
+record. The binding includes the attachment ID, proof ID, operation ID, root
+path, storage and backend IDs, session and fence fields, kind, and mode.
+Comparing only the attachment ID would permit detach, reattach, or
+identifier-reuse ABA.
 
 The fence binding uses the immutable writer identity tuple rather than lease
 expiration. A lease renewal may extend `expiresAt` without creating a new
@@ -203,27 +207,28 @@ Callback success reaches `CONSUMED`. Callback failure, cancellation,
 revocation after dispatch, an abnormal thenable, or a proxy or generator-object
 result is terminal uncertainty: the callback may have changed storage, the
 capability is never reusable, and the coordinator does not synthesize success.
-Before its first coordinator-owned `await`, the coordinator inspects the
-callback's direct return without invoking accessors. A non-Promise object is
-accepted only when every object traversed before the nearest `then` descriptor
-is non-proxy and that descriptor, if present, is a non-callable data descriptor.
-A branded Promise is accepted only when its nearest `constructor` descriptor
-is a data descriptor containing the module-captured Promise intrinsic. This
-keeps `await` on the exact-Promise path, so it attaches a settlement observer
-without reading a hostile `then` value. After the callback settles, the
-descriptor-only `then` check runs again and prevents the async method return
-from performing a second, stateful thenable assimilation after recording
-successful consumption.
+Both the stop callback and snapshot callback are checked before their first
+coordinator-owned `await`. The coordinator inspects each direct return without
+invoking accessors. A non-Promise object is accepted only when every object
+traversed before the nearest `then` descriptor is non-proxy and that descriptor,
+if present, is a non-callable data descriptor. A branded Promise is accepted
+only when its nearest `constructor` descriptor is a data descriptor containing
+the module-captured Promise intrinsic. This keeps `await` on the exact-Promise
+path, so it attaches a settlement observer without reading a hostile `then`
+value. After the snapshot callback settles, the descriptor-only `then` check
+runs again and prevents the async method return from performing a second,
+stateful thenable assimilation after recording successful consumption.
 
-The trusted backend callback must normalize Promise subclasses, cross-realm
-Promises, and Promises with accessor or foreign `constructor` descriptors
-inside its own async boundary before returning. ECMAScript provides no
-accessor-free way to attach a rejection observer to such a contract-violating
-Promise. The coordinator therefore reports terminal uncertainty without
-touching its hooks, while ownership of any underlying rejection remains with
-the callback. A conforming callback's accepted Promise may itself assimilate a
-thenable before the coordinator observes the fulfillment value; that Promise
-chain remains inside the trusted backend boundary.
+Trusted stop and snapshot callbacks must normalize Promise subclasses,
+cross-realm Promises, and Promises with accessor or foreign `constructor`
+descriptors inside their own async boundary before returning. ECMAScript
+provides no accessor-free way to attach a rejection observer to such a
+contract-violating Promise. The coordinator therefore reports terminal
+uncertainty without touching its hooks, while ownership of any underlying
+rejection remains with the callback. A conforming callback's accepted Promise
+may itself assimilate a thenable before the coordinator observes the
+fulfillment value; that Promise chain remains inside the trusted backend
+boundary.
 Stop failure is likewise terminal because it may have partially quiesced the
 writer.
 
@@ -302,5 +307,7 @@ This layer does not provide:
 - replay-only reconciliation after uncertain outcomes;
 - graceful-abort or live `crash-prefix` evidence;
 - a joined Codex persistence-writer shutdown API;
-- cross-process, cross-host, or restartable stop capabilities; or
-- physical storage fencing against an uncontained stale writer.
+- cross-process, cross-host, or restartable stop capabilities;
+- physical storage fencing against an uncontained stale writer; or
+- system-wide intrinsic hardening of shared storage-contract validators beyond
+  this coordinator's independently owned authority snapshots.

@@ -390,6 +390,191 @@ test("stop callback requires the exact confirmation sentinel", async (t) => {
   assert.equal(generatorBodyCalls, 0);
 });
 
+test("stop callback direct thenables are rejected before coordinator assimilation", async (t) => {
+  const scenarios = [
+    {
+      name: "own callable then",
+      create(hooks) {
+        return {
+          then(resolve) {
+            hooks.thenCalls += 1;
+            resolve(STOPPED_WRITER_STOP_CONFIRMED);
+          },
+        };
+      },
+    },
+    {
+      name: "inherited callable then",
+      create(hooks) {
+        const owner = Object.defineProperty({}, "then", {
+          value(resolve) {
+            hooks.thenCalls += 1;
+            resolve(STOPPED_WRITER_STOP_CONFIRMED);
+          },
+        });
+        return Object.create(owner);
+      },
+    },
+    {
+      name: "own then accessor",
+      create(hooks) {
+        return Object.defineProperty({}, "then", {
+          get() {
+            hooks.thenReads += 1;
+            return (resolve) => {
+              hooks.thenCalls += 1;
+              resolve(STOPPED_WRITER_STOP_CONFIRMED);
+            };
+          },
+        });
+      },
+    },
+    {
+      name: "inherited then accessor",
+      create(hooks) {
+        const owner = Object.defineProperty({}, "then", {
+          get() {
+            hooks.thenReads += 1;
+            return (resolve) => {
+              hooks.thenCalls += 1;
+              resolve(STOPPED_WRITER_STOP_CONFIRMED);
+            };
+          },
+        });
+        return Object.create(owner);
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const coordinator = new StoppedWriterCapabilityCoordinator();
+      const hooks = { thenCalls: 0, thenReads: 0 };
+      let stopCalls = 0;
+      const writer = coordinator.registerWriter(
+        registerOptions({
+          stopWriter: () => {
+            stopCalls += 1;
+            return scenario.create(hooks);
+          },
+        }),
+      );
+
+      await rejectedCapabilityError(
+        () => coordinator.stopAndIssueCapability(stopOptions(writer)),
+        "writer_stop_outcome_uncertain",
+      );
+      assert.equal(stopCalls, 1);
+      assert.equal(hooks.thenReads, 0);
+      assert.equal(hooks.thenCalls, 0);
+      await rejectedCapabilityError(
+        () => coordinator.stopAndIssueCapability(stopOptions(writer)),
+        "writer_state_conflict",
+      );
+      assert.equal(stopCalls, 1);
+      syncCapabilityError(
+        () => coordinator.retireWriter(writerOptions(writer)),
+        "writer_state_conflict",
+      );
+      syncCapabilityError(
+        () => coordinator.dispose(),
+        "writer_state_conflict",
+      );
+    });
+  }
+});
+
+test("generator-shaped stop results reject inherited then without assimilation", async (t) => {
+  const scenarios = [
+    {
+      name: "generator result",
+      createStopWriter(hooks) {
+        function* stopResult() {
+          hooks.bodyCalls += 1;
+          return STOPPED_WRITER_STOP_CONFIRMED;
+        }
+        Object.defineProperty(stopResult.prototype, "then", {
+          value(resolve) {
+            hooks.thenCalls += 1;
+            resolve(STOPPED_WRITER_STOP_CONFIRMED);
+          },
+        });
+        return () => stopResult();
+      },
+    },
+    {
+      name: "bound generator callback",
+      createStopWriter(hooks) {
+        function* stopWriter() {
+          hooks.bodyCalls += 1;
+          return STOPPED_WRITER_STOP_CONFIRMED;
+        }
+        Object.defineProperty(stopWriter.prototype, "then", {
+          value(resolve) {
+            hooks.thenCalls += 1;
+            resolve(STOPPED_WRITER_STOP_CONFIRMED);
+          },
+        });
+        return stopWriter.bind(null);
+      },
+    },
+    {
+      name: "bound async-generator callback",
+      createStopWriter(hooks) {
+        async function* stopWriter() {
+          hooks.bodyCalls += 1;
+          return STOPPED_WRITER_STOP_CONFIRMED;
+        }
+        Object.defineProperty(stopWriter.prototype, "then", {
+          value(resolve) {
+            hooks.thenCalls += 1;
+            resolve(STOPPED_WRITER_STOP_CONFIRMED);
+          },
+        });
+        return stopWriter.bind(null);
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const coordinator = new StoppedWriterCapabilityCoordinator();
+      const hooks = { bodyCalls: 0, thenCalls: 0 };
+      const writer = coordinator.registerWriter(
+        registerOptions({ stopWriter: scenario.createStopWriter(hooks) }),
+      );
+
+      await rejectedCapabilityError(
+        () => coordinator.stopAndIssueCapability(stopOptions(writer)),
+        "writer_stop_outcome_uncertain",
+      );
+      assert.equal(hooks.bodyCalls, 0);
+      assert.equal(hooks.thenCalls, 0);
+      await rejectedCapabilityError(
+        () => coordinator.stopAndIssueCapability(stopOptions(writer)),
+        "writer_state_conflict",
+      );
+    });
+  }
+});
+
+test("stop callback accepts a native Promise resolving the exact sentinel", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  let stopCalls = 0;
+  const writer = coordinator.registerWriter(
+    registerOptions({
+      stopWriter: () => {
+        stopCalls += 1;
+        return Promise.resolve(STOPPED_WRITER_STOP_CONFIRMED);
+      },
+    }),
+  );
+
+  const capability = await coordinator.stopAndIssueCapability(stopOptions(writer));
+  assertOpaqueHandle(capability);
+  assert.equal(stopCalls, 1);
+});
+
 test("snapshot callback failure is sanitized, consumes authority, and is terminal", async (t) => {
   for (const scenario of [
     {
@@ -1553,6 +1738,128 @@ test("registration snapshots caller-owned attachment and lease records", async (
     }),
   );
   assert.equal(snapshotCalls, 1);
+});
+
+test("registration owns a frozen binding snapshot despite poisoned clone and freeze globals", async () => {
+  const originalStructuredClone = globalThis.structuredClone;
+  const originalFreeze = Object.freeze;
+
+  const registerFixture = () => {
+    const coordinator = new StoppedWriterCapabilityCoordinator();
+    const callerLease = lease();
+    const callerAttachment = attachment(callerLease);
+    const expectedLease = originalStructuredClone(callerLease);
+    const expectedAttachment = originalStructuredClone(callerAttachment);
+    const observed = { snapshotBinding: null, stopBinding: null };
+    let writer;
+
+    try {
+      globalThis.structuredClone = (value) => value;
+      Object.freeze = (value) => value;
+      writer = coordinator.registerWriter(
+        registerOptions({
+          attachment: callerAttachment,
+          canonicalLease: callerLease,
+          stopWriter(binding) {
+            observed.stopBinding = binding;
+            return Promise.resolve(STOPPED_WRITER_STOP_CONFIRMED);
+          },
+        }),
+      );
+    } finally {
+      globalThis.structuredClone = originalStructuredClone;
+      Object.freeze = originalFreeze;
+    }
+
+    return {
+      callerAttachment,
+      callerLease,
+      coordinator,
+      expectedAttachment,
+      expectedLease,
+      observed,
+      writer,
+    };
+  };
+
+  const mutateCallerBinding = (fixture) => {
+    fixture.callerLease.fencingEpoch = "9007199254740994";
+    fixture.callerLease.holderId = "host-mutated";
+    fixture.callerLease.leaseId = "lease-mutated";
+    fixture.callerAttachment.attachmentId = "attachment-mutated";
+    fixture.callerAttachment.backendId = "backend-mutated";
+    fixture.callerAttachment.fencingEpoch = "9007199254740994";
+    fixture.callerAttachment.holderId = "host-mutated";
+    fixture.callerAttachment.leaseId = "lease-mutated";
+    fixture.callerAttachment.operationId = "operation-mutated";
+    fixture.callerAttachment.proofId = "proof-mutated";
+    fixture.callerAttachment.rootPath = "/var/lib/portable-codex/mutated";
+    fixture.callerAttachment.storageId = "storage-mutated";
+  };
+
+  const assertOriginalFrozenBinding = (binding, fixture) => {
+    assert.notEqual(binding, null);
+    assert.equal(Object.isFrozen(binding), true);
+    assert.equal(Object.isFrozen(binding.attachment), true);
+    assert.equal(Object.isFrozen(binding.writerFence), true);
+    assert.equal(Object.getPrototypeOf(binding.attachment), null);
+    assert.notStrictEqual(binding.attachment, fixture.callerAttachment);
+    assert.deepEqual({ ...binding.attachment }, fixture.expectedAttachment);
+    assert.deepEqual(
+      { ...binding.writerFence },
+      {
+        contractVersion: fixture.expectedLease.contractVersion,
+        fencingEpoch: fixture.expectedLease.fencingEpoch,
+        holderId: fixture.expectedLease.holderId,
+        leaseId: fixture.expectedLease.leaseId,
+        sessionId: fixture.expectedLease.sessionId,
+      },
+    );
+    assert.throws(() => {
+      binding.attachment.rootPath = "/binding-mutation-must-fail";
+    }, TypeError);
+  };
+
+  const accepted = registerFixture();
+  mutateCallerBinding(accepted);
+  const acceptedCapability = await accepted.coordinator.stopAndIssueCapability(
+    stopOptions(accepted.writer),
+  );
+  assertOriginalFrozenBinding(accepted.observed.stopBinding, accepted);
+  const result = await accepted.coordinator.consumeCapability(
+    consumeOptions(accepted.writer, acceptedCapability, {
+      attachment: accepted.expectedAttachment,
+      canonicalLease: accepted.expectedLease,
+      runSnapshot(binding) {
+        accepted.observed.snapshotBinding = binding;
+        return "captured";
+      },
+    }),
+  );
+  assert.equal(result, "captured");
+  assertOriginalFrozenBinding(accepted.observed.snapshotBinding, accepted);
+
+  const rejected = registerFixture();
+  mutateCallerBinding(rejected);
+  const rejectedCapability = await rejected.coordinator.stopAndIssueCapability(
+    stopOptions(rejected.writer),
+  );
+  assertOriginalFrozenBinding(rejected.observed.stopBinding, rejected);
+  let snapshotCalls = 0;
+  await rejectedCapabilityError(
+    () =>
+      rejected.coordinator.consumeCapability(
+        consumeOptions(rejected.writer, rejectedCapability, {
+          attachment: rejected.callerAttachment,
+          canonicalLease: rejected.callerLease,
+          runSnapshot() {
+            snapshotCalls += 1;
+          },
+        }),
+      ),
+    "stopped_writer_capability_rejected",
+  );
+  assert.equal(snapshotCalls, 0);
 });
 
 test("public option envelopes reject hostile values without invoking traps", async (t) => {

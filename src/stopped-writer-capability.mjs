@@ -78,8 +78,31 @@ function weakSetHas(value, entry) {
 }
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const ATTACHMENT_KEYS = objectFreeze([
+  "attachmentId",
+  "backendId",
+  "contractVersion",
+  "fencingEpoch",
+  "holderId",
+  "kind",
+  "leaseId",
+  "mode",
+  "operationId",
+  "proofId",
+  "rootPath",
+  "sessionId",
+  "storageId",
+]);
 const FENCE_KEYS = objectFreeze([
   "contractVersion",
+  "fencingEpoch",
+  "holderId",
+  "leaseId",
+  "sessionId",
+]);
+const LEASE_KEYS = objectFreeze([
+  "contractVersion",
+  "expiresAt",
   "fencingEpoch",
   "holderId",
   "leaseId",
@@ -178,7 +201,8 @@ function assertExactOptions(value, keys) {
   );
 
   const normalized = objectCreate(null);
-  for (const key of actual) {
+  for (let index = 0; index < actual.length; index += 1) {
+    const key = actual[index];
     let descriptor;
     try {
       descriptor = objectGetOwnPropertyDescriptor(value, key);
@@ -212,12 +236,33 @@ function assertTrustedCallback(value) {
   return value;
 }
 
+function validatedFlatSnapshot(value, keys, validator) {
+  const snapshot = assertExactOptions(value, keys);
+  ensure(
+    arrayEvery(
+      keys,
+      (key) =>
+        snapshot[key] === null ||
+        (typeof snapshot[key] !== "object" &&
+          typeof snapshot[key] !== "function"),
+    ),
+    "invalid_stopped_writer_request",
+  );
+  objectFreeze(snapshot);
+  reflectApply(validator, undefined, [snapshot]);
+  return snapshot;
+}
+
 function normalizeBinding(attachmentValue, leaseValue) {
   let attachment;
   let lease;
   try {
-    attachment = assertSessionAttachment(attachmentValue);
-    lease = assertLeaseGrant(leaseValue);
+    attachment = validatedFlatSnapshot(
+      attachmentValue,
+      ATTACHMENT_KEYS,
+      assertSessionAttachment,
+    );
+    lease = validatedFlatSnapshot(leaseValue, LEASE_KEYS, assertLeaseGrant);
   } catch {
     fail("invalid_stopped_writer_request");
   }
@@ -457,7 +502,14 @@ export class StoppedWriterCapabilityCoordinator {
     record.stopOperationId = stopOperationId;
     const binding = frozenCallbackBinding(record);
     try {
-      const stopResult = await reflectApply(record.stopWriter, undefined, [binding]);
+      const pendingStopResult = reflectApply(record.stopWriter, undefined, [
+        binding,
+      ]);
+      ensure(
+        isSafeCoordinatorAwaitValue(pendingStopResult),
+        "writer_stop_outcome_uncertain",
+      );
+      const stopResult = await pendingStopResult;
       ensure(
         stopResult === STOPPED_WRITER_STOP_CONFIRMED,
         "writer_stop_outcome_uncertain",

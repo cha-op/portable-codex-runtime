@@ -30,8 +30,13 @@ superseded_by:
   reentrant or concurrent consumption are terminal and never re-dispatch the
   callback.
 - Stop issuance requires the exact exported confirmation sentinel after the
-  trusted callback joins the writer boundary; generator-shaped callbacks or
-  results cannot silently synthesize success.
+  trusted callback joins the writer boundary. Its direct return is rejected
+  before coordinator-owned thenable assimilation, so generator-shaped or
+  custom-thenable results cannot silently synthesize success.
+- Attachment and lease authority is retained only from exact, flat, frozen
+  snapshots built with coordinator-captured intrinsics before shared contract
+  validation. Validator return objects and later caller mutations cannot alter
+  the registered binding.
 - Public inputs reject hostile proxies and accessors before dispatch. Public
   errors are fixed, frozen, non-retryable, and omit collaborator details and
   private binding data.
