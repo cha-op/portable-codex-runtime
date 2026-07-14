@@ -3606,17 +3606,20 @@ test("fresh checkpoint publication closes the authoritative read-to-prepare race
   let armCompetingPrepare = false;
   let competingInput;
   let competingPreparePromise;
+  class ReadToPrepareRaceJournal extends FilesystemOperationJournal {
+    async read(options) {
+      const observed = await super.read(options);
+      if (!armCompetingPrepare || observed.record !== null) return observed;
+      armCompetingPrepare = false;
+      competingPreparePromise = competingInput.journal.prepare(
+        competingInput.options,
+      );
+      await competingPreparePromise;
+      return observed;
+    }
+  }
   const fixture = await createFixture(t, {
-    journalFaults: {
-      async afterRecordRead({ record }) {
-        if (!armCompetingPrepare || record !== null) return;
-        armCompetingPrepare = false;
-        competingPreparePromise = competingInput.journal.prepare(
-          competingInput.options,
-        );
-        void competingPreparePromise.catch(() => undefined);
-      },
-    },
+    JournalClass: ReadToPrepareRaceJournal,
   });
   const options = captureOptions(fixture);
   const competingJournal = new FilesystemOperationJournal({
