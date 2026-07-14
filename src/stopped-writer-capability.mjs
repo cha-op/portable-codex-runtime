@@ -456,6 +456,7 @@ export class StoppedWriterCapabilityCoordinator {
       attachmentValue,
       canonicalLease,
     );
+    parseFencingEpoch(writerFence.fencingEpoch);
     ensure(!this.#disposed, "writer_state_conflict");
     const existing = findSlot(this.#slots, attachment);
     if (existing?.current !== null && existing?.current !== undefined) {

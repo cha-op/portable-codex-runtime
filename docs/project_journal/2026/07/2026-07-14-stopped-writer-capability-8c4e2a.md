@@ -38,9 +38,11 @@ superseded_by:
   validation. Validator return objects and later caller mutations cannot alter
   the registered binding.
 - Registration rechecks disposal after shared validation. Fencing epochs use a
-  coordinator-local captured parser/comparator, followed by a slot ownership
-  recheck, so reentrant global poisoning cannot strand a writer on a disposed
-  issuer or overwrite a concurrently occupied retired slot.
+  coordinator-local captured parser for every registration, including a fresh
+  slot, and a captured comparator plus slot ownership recheck for retired
+  slots. Reentrant global poisoning therefore cannot admit an out-of-range
+  epoch, strand a writer on a disposed issuer, or overwrite a concurrently
+  occupied retired slot.
 - Public inputs reject hostile proxies and accessors before dispatch. Public
   errors are fixed, frozen, non-retryable, and omit collaborator details and
   private binding data.

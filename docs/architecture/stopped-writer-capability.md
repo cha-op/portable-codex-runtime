@@ -111,12 +111,13 @@ Comparing only the attachment ID would permit detach, reattach, or
 identifier-reuse ABA.
 
 Registration rechecks terminal coordinator state after shared validation and
-before reading or changing slot state. Fencing epochs are parsed and compared
-only with module-captured `RegExp` and `BigInt` intrinsics, and an existing slot
-is rechecked immediately after comparison. A poisoned shared validator or
-process global therefore cannot dispose the coordinator or occupy a retired
-slot reentrantly and then let the interrupted registration overwrite that
-decision.
+before reading or changing slot state. Every registered fencing epoch,
+including the first writer for a fresh slot, is unconditionally parsed with
+module-captured `RegExp` and `BigInt` intrinsics; retired-slot comparisons use
+the same captured path, and an existing slot is rechecked immediately after
+comparison. A poisoned shared validator or process global therefore cannot
+admit an out-of-range epoch, dispose the coordinator, or occupy a retired slot
+reentrantly and then let the interrupted registration overwrite that decision.
 
 The fence binding uses the immutable writer identity tuple rather than lease
 expiration. A lease renewal may extend `expiresAt` without creating a new

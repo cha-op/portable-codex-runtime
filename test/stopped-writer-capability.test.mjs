@@ -1272,6 +1272,44 @@ test("reentrant higher-fence registration cannot replace the only live slot writ
   assert.equal(coordinator.dispose(), undefined);
 });
 
+test("fresh-slot registration validates fencing epochs with captured intrinsics", () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  const invalidLease = lease({
+    fencingEpoch: "18446744073709551616",
+  });
+  const invalidAttachment = attachment(invalidLease);
+  const originalBigInt = globalThis.BigInt;
+  let bigIntCalls = 0;
+  let stopCalls = 0;
+
+  try {
+    globalThis.BigInt = () => {
+      bigIntCalls += 1;
+      return 1n;
+    };
+    syncCapabilityError(
+      () =>
+        coordinator.registerWriter(
+          registerOptions({
+            attachment: invalidAttachment,
+            canonicalLease: invalidLease,
+            stopWriter: () => {
+              stopCalls += 1;
+              return STOPPED_WRITER_STOP_CONFIRMED;
+            },
+          }),
+        ),
+      "invalid_stopped_writer_request",
+    );
+  } finally {
+    globalThis.BigInt = originalBigInt;
+  }
+
+  assert.equal(bigIntCalls, 2);
+  assert.equal(stopCalls, 0);
+  assert.equal(coordinator.dispose(), undefined);
+});
+
 test("dispose requires safe retirement and permanently closes the issuer", async () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
   let snapshotCalls = 0;
