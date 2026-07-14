@@ -950,11 +950,11 @@ test("lifecycle delegation contains collaborator errors without leaking details"
     "destroySession",
   ];
   const secretPath = "/company/private/lifecycle/session-001";
-  const secretToken = "Bearer lifecycle-secret-value";
+  const collaboratorMarker = "lifecycle-collaborator-error-marker";
   const fail = (backend, method, input) => {
     assert.strictEqual(backend, lifecycle.backend);
     lifecycle.calls.push({ input, method });
-    throw new Error(`${secretToken} at ${secretPath} for ${method}`);
+    throw new Error(`${collaboratorMarker} at ${secretPath} for ${method}`);
   };
   for (let index = 0; index < methods.length; index += 1) {
     const method = methods[index];
@@ -981,7 +981,7 @@ test("lifecycle delegation contains collaborator errors without leaking details"
     );
     const rendered = `${observed.message}\n${observed.stack}`;
     assert.equal(rendered.includes(secretPath), false);
-    assert.equal(rendered.includes(secretToken), false);
+    assert.equal(rendered.includes(collaboratorMarker), false);
   }
   assert.deepEqual(
     lifecycle.calls,
