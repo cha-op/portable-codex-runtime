@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { types as utilTypes } from "node:util";
 
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
@@ -447,6 +448,239 @@ test("snapshot callback failure is sanitized, consumes authority, and is termina
       );
     });
   }
+});
+
+test("stateful then access after callback settlement is terminal uncertainty", async (t) => {
+  for (const inherited of [false, true]) {
+    await t.test(inherited ? "inherited then accessor" : "own then accessor", async () => {
+      const fixture = await readyCapability();
+      let thenReads = 0;
+      const owner = {};
+      Object.defineProperty(owner, "then", {
+        configurable: true,
+        get() {
+          thenReads += 1;
+          if (thenReads > 1) {
+            throw new Error("snapshot-secret-second-then /private/source");
+          }
+          return undefined;
+        },
+      });
+      const result = inherited ? Object.create(owner) : owner;
+
+      await rejectedCapabilityError(
+        () =>
+          fixture.coordinator.consumeCapability(
+            consumeOptions(fixture.writer, fixture.capability, {
+              runSnapshot: () => result,
+            }),
+          ),
+        "snapshot_outcome_uncertain",
+        ["snapshot-secret", "/private/source", STORAGE_ID],
+      );
+      assert.equal(thenReads, 1);
+      await rejectedCapabilityError(
+        () =>
+          fixture.coordinator.consumeCapability(
+            consumeOptions(fixture.writer, fixture.capability),
+        ),
+        "stopped_writer_capability_rejected",
+      );
+      syncCapabilityError(
+        () => fixture.coordinator.retireWriter(writerOptions(fixture.writer)),
+        "writer_state_conflict",
+      );
+      const newerLease = lease({ fencingEpoch: "9007199254740994" });
+      syncCapabilityError(
+        () =>
+          fixture.coordinator.registerWriter(
+            registerOptions({
+              attachment: attachment(newerLease),
+              canonicalLease: newerLease,
+            }),
+          ),
+        "writer_state_conflict",
+      );
+    });
+  }
+});
+
+test("then access cannot install a callable data descriptor for async return", async () => {
+  const fixture = await readyCapability();
+  let callableThenCalls = 0;
+  let thenReads = 0;
+  const result = {};
+  Object.defineProperty(result, "then", {
+    configurable: true,
+    get() {
+      thenReads += 1;
+      Object.defineProperty(result, "then", {
+        configurable: true,
+        value() {
+          callableThenCalls += 1;
+          throw new Error("snapshot-secret-callable-then /private/source");
+        },
+      });
+      return undefined;
+    },
+  });
+
+  await rejectedCapabilityError(
+    () =>
+      fixture.coordinator.consumeCapability(
+        consumeOptions(fixture.writer, fixture.capability, {
+          runSnapshot: () => result,
+        }),
+      ),
+    "snapshot_outcome_uncertain",
+    ["snapshot-secret", "/private/source", STORAGE_ID],
+  );
+  assert.equal(thenReads, 1);
+  assert.equal(callableThenCalls, 0);
+  syncCapabilityError(
+    () => fixture.coordinator.retireWriter(writerOptions(fixture.writer)),
+    "writer_state_conflict",
+  );
+});
+
+test("non-callable data then descriptors preserve callback result identity", async (t) => {
+  for (const inherited of [false, true]) {
+    await t.test(inherited ? "inherited data descriptor" : "own data descriptor", async () => {
+      const fixture = await readyCapability();
+      const owner = Object.defineProperty({}, "then", { value: null });
+      const result = inherited
+        ? Object.assign(Object.create(Object.freeze(owner)), {
+            status: "checkpoint-created",
+          })
+        : Object.assign(owner, { status: "checkpoint-created" });
+      Object.freeze(result);
+
+      const returned = await fixture.coordinator.consumeCapability(
+        consumeOptions(fixture.writer, fixture.capability, {
+          runSnapshot: () => result,
+        }),
+      );
+      assert.strictEqual(returned, result);
+    });
+  }
+});
+
+test("callback intrinsic poisoning cannot bypass result assimilation checks", async () => {
+  const originals = {
+    defineProperty: Object.defineProperty,
+    errorNameDescriptor: Object.getOwnPropertyDescriptor(Error.prototype, "name"),
+    freeze: Object.freeze,
+    getOwnPropertyDescriptor: Object.getOwnPropertyDescriptor,
+    getPrototypeOf: Object.getPrototypeOf,
+    hasOwn: Object.hasOwn,
+    isProxy: utilTypes.isProxy,
+    reflectApply: Reflect.apply,
+    weakSetAdd: WeakSet.prototype.add,
+    weakSetHas: WeakSet.prototype.has,
+  };
+  const restore = () => {
+    Object.defineProperty = originals.defineProperty;
+    if (originals.errorNameDescriptor === undefined) {
+      delete Error.prototype.name;
+    } else {
+      originals.defineProperty(
+        Error.prototype,
+        "name",
+        originals.errorNameDescriptor,
+      );
+    }
+    Object.freeze = originals.freeze;
+    Object.getOwnPropertyDescriptor = originals.getOwnPropertyDescriptor;
+    Object.getPrototypeOf = originals.getPrototypeOf;
+    Object.hasOwn = originals.hasOwn;
+    utilTypes.isProxy = originals.isProxy;
+    Reflect.apply = originals.reflectApply;
+    WeakSet.prototype.add = originals.weakSetAdd;
+    WeakSet.prototype.has = originals.weakSetHas;
+  };
+  const fixture = await readyCapability();
+  let prototypeInspectionTraps = 0;
+  let thenReads = 0;
+  const poisonedPrototype = new Proxy(
+    {},
+    {
+      get(target, key, receiver) {
+        if (key !== "then") return Reflect.get(target, key, receiver);
+        thenReads += 1;
+        if (thenReads > 1) {
+          throw new Error("snapshot-secret-second-assimilation /private/source");
+        }
+        originals.defineProperty(Error.prototype, "name", {
+          configurable: true,
+          set() {
+            throw new Error("snapshot-secret-error-setter /private/source");
+          },
+        });
+        Object.defineProperty = () => {
+          throw new Error("snapshot-secret-define-property /private/source");
+        };
+        Object.freeze = () => {
+          throw new Error("snapshot-secret-freeze /private/source");
+        };
+        Object.getOwnPropertyDescriptor = () => undefined;
+        Object.getPrototypeOf = () => null;
+        Object.hasOwn = () => {
+          throw new Error("snapshot-secret-has-own /private/source");
+        };
+        utilTypes.isProxy = () => false;
+        Reflect.apply = () => {
+          throw new Error("snapshot-secret-reflect-apply /private/source");
+        };
+        WeakSet.prototype.add = () => {
+          throw new Error("snapshot-secret-weak-set-add /private/source");
+        };
+        WeakSet.prototype.has = () => {
+          throw new Error("snapshot-secret-weak-set-has /private/source");
+        };
+        return undefined;
+      },
+      getOwnPropertyDescriptor() {
+        prototypeInspectionTraps += 1;
+        return undefined;
+      },
+      getPrototypeOf() {
+        prototypeInspectionTraps += 1;
+        return null;
+      },
+    },
+  );
+  const result = Object.create(poisonedPrototype);
+  let caught;
+  try {
+    await fixture.coordinator.consumeCapability(
+      consumeOptions(fixture.writer, fixture.capability, {
+        runSnapshot: () => result,
+      }),
+    );
+  } catch (error) {
+    caught = error;
+  } finally {
+    restore();
+  }
+
+  assertCapabilityError(caught, "snapshot_outcome_uncertain", [
+    "snapshot-secret",
+    "/private/source",
+    STORAGE_ID,
+  ]);
+  assert.equal(thenReads, 1);
+  assert.equal(prototypeInspectionTraps, 0);
+  await rejectedCapabilityError(
+    () =>
+      fixture.coordinator.consumeCapability(
+        consumeOptions(fixture.writer, fixture.capability),
+      ),
+    "stopped_writer_capability_rejected",
+  );
+  syncCapabilityError(
+    () => fixture.coordinator.retireWriter(writerOptions(fixture.writer)),
+    "writer_state_conflict",
+  );
 });
 
 test("generator-shaped snapshot results are terminal uncertainty", async (t) => {

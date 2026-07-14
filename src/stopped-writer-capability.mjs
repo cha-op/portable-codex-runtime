@@ -6,8 +6,78 @@ import {
   compareFencingEpochs,
 } from "./session-storage-contracts.mjs";
 
+const arrayEveryIntrinsic = Array.prototype.every;
+const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayIsArray = Array.isArray;
+const jsonStringify = JSON.stringify;
+const mapGetIntrinsic = Map.prototype.get;
+const mapSetIntrinsic = Map.prototype.set;
+const MapConstructor = Map;
+const objectCreate = Object.create;
+const objectDefineProperty = Object.defineProperty;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const objectKeys = Object.keys;
+const objectPrototype = Object.prototype;
+const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
+const regexpTestIntrinsic = RegExp.prototype.test;
+const {
+  isGeneratorFunction: isGeneratorFunctionValue,
+  isGeneratorObject: isGeneratorObjectValue,
+  isProxy: isProxyValue,
+} = utilTypes;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakMapConstructor = WeakMap;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+const WeakSetConstructor = WeakSet;
+
+function callIntrinsic(intrinsic, receiver, args) {
+  return reflectApply(intrinsic, receiver, args);
+}
+
+function arrayEvery(value, callback) {
+  return callIntrinsic(arrayEveryIntrinsic, value, [callback]);
+}
+
+function arrayIncludes(value, candidate) {
+  return callIntrinsic(arrayIncludesIntrinsic, value, [candidate]);
+}
+
+function mapGet(value, key) {
+  return callIntrinsic(mapGetIntrinsic, value, [key]);
+}
+
+function mapSet(value, key, entry) {
+  return callIntrinsic(mapSetIntrinsic, value, [key, entry]);
+}
+
+function regexpTest(value, candidate) {
+  return callIntrinsic(regexpTestIntrinsic, value, [candidate]);
+}
+
+function weakMapGet(value, key) {
+  return callIntrinsic(weakMapGetIntrinsic, value, [key]);
+}
+
+function weakMapSet(value, key, entry) {
+  return callIntrinsic(weakMapSetIntrinsic, value, [key, entry]);
+}
+
+function weakSetAdd(value, entry) {
+  return callIntrinsic(weakSetAddIntrinsic, value, [entry]);
+}
+
+function weakSetHas(value, entry) {
+  return callIntrinsic(weakSetHasIntrinsic, value, [entry]);
+}
+
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
-const FENCE_KEYS = Object.freeze([
+const FENCE_KEYS = objectFreeze([
   "contractVersion",
   "fencingEpoch",
   "holderId",
@@ -15,33 +85,49 @@ const FENCE_KEYS = Object.freeze([
   "sessionId",
 ]);
 
-const ERROR_MESSAGES = Object.freeze({
+const ERROR_MESSAGES = objectFreeze({
   invalid_stopped_writer_request: "Stopped-writer request is invalid",
   snapshot_outcome_uncertain: "Snapshot callback outcome is uncertain",
   stopped_writer_capability_rejected: "Stopped-writer capability was rejected",
   writer_state_conflict: "Writer incarnation state conflicts with the request",
   writer_stop_outcome_uncertain: "Writer stop outcome is uncertain",
 });
-const INTERNAL_ERRORS = new WeakSet();
+const INTERNAL_ERRORS = new WeakSetConstructor();
 
-export const STOPPED_WRITER_STOP_CONFIRMED = Object.freeze(Object.create(null));
+export const STOPPED_WRITER_STOP_CONFIRMED = objectFreeze(objectCreate(null));
 
 export class StoppedWriterCapabilityError extends Error {
   constructor(code) {
-    if (!Object.hasOwn(ERROR_MESSAGES, code)) {
+    if (!objectHasOwn(ERROR_MESSAGES, code)) {
       throw new TypeError("unsupported stopped-writer capability error code");
     }
-    super(ERROR_MESSAGES[code]);
-    this.name = "StoppedWriterCapabilityError";
-    this.code = code;
-    this.retryable = false;
-    Object.defineProperty(this, "stack", {
+    const message = ERROR_MESSAGES[code];
+    super(message);
+    objectDefineProperty(this, "name", {
+      configurable: true,
+      enumerable: true,
+      value: "StoppedWriterCapabilityError",
+      writable: true,
+    });
+    objectDefineProperty(this, "code", {
+      configurable: true,
+      enumerable: true,
+      value: code,
+      writable: true,
+    });
+    objectDefineProperty(this, "retryable", {
+      configurable: true,
+      enumerable: true,
+      value: false,
+      writable: true,
+    });
+    objectDefineProperty(this, "stack", {
       configurable: false,
       enumerable: false,
-      value: `${this.name}: ${this.message}`,
+      value: `StoppedWriterCapabilityError: ${message}`,
       writable: false,
     });
-    Object.freeze(this);
+    objectFreeze(this);
   }
 }
 
@@ -51,7 +137,7 @@ function fail(code) {
 
 function makeError(code) {
   const error = new StoppedWriterCapabilityError(code);
-  INTERNAL_ERRORS.add(error);
+  weakSetAdd(INTERNAL_ERRORS, error);
   return error;
 }
 
@@ -61,10 +147,10 @@ function ensure(condition, code) {
 
 function assertExactOptions(value, keys) {
   if (
-    utilTypes.isProxy(value) ||
+    isProxyValue(value) ||
     value === null ||
     typeof value !== "object" ||
-    Array.isArray(value)
+    arrayIsArray(value)
   ) {
     fail("invalid_stopped_writer_request");
   }
@@ -72,31 +158,34 @@ function assertExactOptions(value, keys) {
   let prototype;
   let actual;
   try {
-    prototype = Object.getPrototypeOf(value);
-    actual = Reflect.ownKeys(value);
+    prototype = objectGetPrototypeOf(value);
+    actual = reflectOwnKeys(value);
   } catch {
     fail("invalid_stopped_writer_request");
   }
   ensure(
-    [Object.prototype, null].includes(prototype),
+    prototype === objectPrototype || prototype === null,
     "invalid_stopped_writer_request",
   );
   ensure(
     actual.length === keys.length &&
-      actual.every((key) => typeof key === "string" && keys.includes(key)),
+      arrayEvery(
+        actual,
+        (key) => typeof key === "string" && arrayIncludes(keys, key),
+      ),
     "invalid_stopped_writer_request",
   );
 
-  const normalized = Object.create(null);
+  const normalized = objectCreate(null);
   for (const key of actual) {
     let descriptor;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(value, key);
+      descriptor = objectGetOwnPropertyDescriptor(value, key);
     } catch {
       fail("invalid_stopped_writer_request");
     }
     ensure(
-      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
       "invalid_stopped_writer_request",
     );
     normalized[key] = descriptor.value;
@@ -106,7 +195,7 @@ function assertExactOptions(value, keys) {
 
 function assertOpaqueId(value) {
   ensure(
-    typeof value === "string" && OPAQUE_ID_PATTERN.test(value),
+    typeof value === "string" && regexpTest(OPAQUE_ID_PATTERN, value),
     "invalid_stopped_writer_request",
   );
   return value;
@@ -115,8 +204,8 @@ function assertOpaqueId(value) {
 function assertTrustedCallback(value) {
   ensure(
     typeof value === "function" &&
-      !utilTypes.isProxy(value) &&
-      !utilTypes.isGeneratorFunction(value),
+      !isProxyValue(value) &&
+      !isGeneratorFunctionValue(value),
     "invalid_stopped_writer_request",
   );
   return value;
@@ -138,7 +227,7 @@ function normalizeBinding(attachmentValue, leaseValue) {
       attachment.fencingEpoch === lease.fencingEpoch,
     "invalid_stopped_writer_request",
   );
-  const writerFence = Object.freeze({
+  const writerFence = objectFreeze({
     contractVersion: lease.contractVersion,
     fencingEpoch: lease.fencingEpoch,
     holderId: lease.holderId,
@@ -149,24 +238,59 @@ function normalizeBinding(attachmentValue, leaseValue) {
 }
 
 function sameFlatRecord(left, right) {
-  const leftKeys = Object.keys(left);
-  const rightKeys = Object.keys(right);
+  const leftKeys = objectKeys(left);
+  const rightKeys = objectKeys(right);
   return (
     leftKeys.length === rightKeys.length &&
-    leftKeys.every((key) => Object.hasOwn(right, key) && left[key] === right[key])
+    arrayEvery(
+      leftKeys,
+      (key) => objectHasOwn(right, key) && left[key] === right[key],
+    )
   );
 }
 
 function sameFence(left, right) {
-  return FENCE_KEYS.every((key) => left[key] === right[key]);
+  return arrayEvery(FENCE_KEYS, (key) => left[key] === right[key]);
+}
+
+function isSafeAsyncReturnValue(value) {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return true;
+  }
+
+  let current = value;
+  while (current !== null) {
+    if (isProxyValue(current)) return false;
+    let descriptor;
+    try {
+      descriptor = objectGetOwnPropertyDescriptor(current, "then");
+    } catch {
+      return false;
+    }
+    if (descriptor !== undefined) {
+      return (
+        objectHasOwn(descriptor, "value") &&
+        typeof descriptor.value !== "function"
+      );
+    }
+    try {
+      current = objectGetPrototypeOf(current);
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 function makeOpaqueHandle() {
-  return Object.freeze(Object.create(null));
+  return objectFreeze(objectCreate(null));
 }
 
 function slotKey(attachment) {
-  return JSON.stringify([
+  return jsonStringify([
     attachment.sessionId,
     attachment.backendId,
     attachment.storageId,
@@ -174,7 +298,7 @@ function slotKey(attachment) {
 }
 
 function frozenCallbackBinding(record) {
-  return Object.freeze({
+  return objectFreeze({
     attachment: record.attachment,
     processIncarnationId: record.processIncarnationId,
     stopOperationId: record.stopOperationId,
@@ -184,15 +308,15 @@ function frozenCallbackBinding(record) {
 }
 
 export class StoppedWriterCapabilityCoordinator {
-  #capabilities = new WeakMap();
+  #capabilities = new WeakMapConstructor();
 
-  #slots = new Map();
+  #slots = new MapConstructor();
 
-  #writers = new WeakMap();
+  #writers = new WeakMapConstructor();
 
   constructor(...args) {
     ensure(args.length === 0, "invalid_stopped_writer_request");
-    Object.freeze(this);
+    objectFreeze(this);
   }
 
   registerWriter(options) {
@@ -217,7 +341,7 @@ export class StoppedWriterCapabilityCoordinator {
       canonicalLease,
     );
     const key = slotKey(attachment);
-    const existing = this.#slots.get(key);
+    const existing = mapGet(this.#slots, key);
     if (existing?.current !== null && existing?.current !== undefined) {
       fail("writer_state_conflict");
     }
@@ -249,8 +373,8 @@ export class StoppedWriterCapabilityCoordinator {
       writerFence,
       writerIncarnationId,
     };
-    this.#writers.set(writer, record);
-    this.#slots.set(key, {
+    weakMapSet(this.#writers, writer, record);
+    mapSet(this.#slots, key, {
       current: record,
       lastFencingEpoch: existing?.lastFencingEpoch,
     });
@@ -281,7 +405,7 @@ export class StoppedWriterCapabilityCoordinator {
     record.stopOperationId = stopOperationId;
     const binding = frozenCallbackBinding(record);
     try {
-      const stopResult = await Reflect.apply(record.stopWriter, undefined, [binding]);
+      const stopResult = await reflectApply(record.stopWriter, undefined, [binding]);
       ensure(
         stopResult === STOPPED_WRITER_STOP_CONFIRMED,
         "writer_stop_outcome_uncertain",
@@ -302,7 +426,7 @@ export class StoppedWriterCapabilityCoordinator {
     };
     record.capabilityRecord = capabilityRecord;
     record.state = "issued";
-    this.#capabilities.set(capability, capabilityRecord);
+    weakMapSet(this.#capabilities, capability, capabilityRecord);
     return capability;
   }
 
@@ -317,7 +441,10 @@ export class StoppedWriterCapabilityCoordinator {
       "writer",
       "writerIncarnationId",
     ]);
-    const capabilityRecord = this.#capabilities.get(normalized.capability);
+    const capabilityRecord = weakMapGet(
+      this.#capabilities,
+      normalized.capability,
+    );
     if (
       capabilityRecord === undefined ||
       capabilityRecord.state !== "issued"
@@ -329,7 +456,7 @@ export class StoppedWriterCapabilityCoordinator {
     try {
       ensure(
         normalized.writer === record.handle &&
-          this.#writers.get(normalized.writer) === record,
+          weakMapGet(this.#writers, normalized.writer) === record,
         "stopped_writer_capability_rejected",
       );
       ensure(
@@ -356,7 +483,7 @@ export class StoppedWriterCapabilityCoordinator {
       record.state = "consuming";
       let result;
       try {
-        result = await Reflect.apply(runSnapshot, undefined, [
+        result = await reflectApply(runSnapshot, undefined, [
           frozenCallbackBinding(record),
         ]);
       } catch {
@@ -366,8 +493,9 @@ export class StoppedWriterCapabilityCoordinator {
       }
       if (
         record.revocationRequested ||
-        utilTypes.isProxy(result) ||
-        utilTypes.isGeneratorObject(result)
+        isProxyValue(result) ||
+        isGeneratorObjectValue(result) ||
+        !isSafeAsyncReturnValue(result)
       ) {
         capabilityRecord.state = "consumed";
         record.state = "snapshot-uncertain";
@@ -378,7 +506,7 @@ export class StoppedWriterCapabilityCoordinator {
       return result;
     } catch (error) {
       if (
-        INTERNAL_ERRORS.has(error) &&
+        weakSetHas(INTERNAL_ERRORS, error) &&
         error.code === "snapshot_outcome_uncertain"
       ) {
         throw error;
@@ -408,7 +536,8 @@ export class StoppedWriterCapabilityCoordinator {
       return;
     }
     ensure(
-      ["running", "stopping", "issued", "stop-uncertain"].includes(
+      arrayIncludes(
+        ["running", "stopping", "issued", "stop-uncertain"],
         record.state,
       ),
       "writer_state_conflict",
@@ -436,7 +565,7 @@ export class StoppedWriterCapabilityCoordinator {
         (record.state === "revoked" && record.stopEstablished),
       "writer_state_conflict",
     );
-    const slot = this.#slots.get(record.slotKey);
+    const slot = mapGet(this.#slots, record.slotKey);
     ensure(slot?.current === record, "writer_state_conflict");
     record.state = "retired";
     slot.current = null;
@@ -447,12 +576,12 @@ export class StoppedWriterCapabilityCoordinator {
     if (
       writer === null ||
       typeof writer !== "object" ||
-      Array.isArray(writer) ||
-      utilTypes.isProxy(writer)
+      arrayIsArray(writer) ||
+      isProxyValue(writer)
     ) {
       fail("writer_state_conflict");
     }
-    const record = this.#writers.get(writer);
+    const record = weakMapGet(this.#writers, writer);
     ensure(record !== undefined, "writer_state_conflict");
     let processIncarnationId;
     let writerIncarnationId;
@@ -471,7 +600,7 @@ export class StoppedWriterCapabilityCoordinator {
   }
 }
 
-Object.freeze(StoppedWriterCapabilityCoordinator.prototype);
-Object.freeze(StoppedWriterCapabilityCoordinator);
-Object.freeze(StoppedWriterCapabilityError.prototype);
-Object.freeze(StoppedWriterCapabilityError);
+objectFreeze(StoppedWriterCapabilityCoordinator.prototype);
+objectFreeze(StoppedWriterCapabilityCoordinator);
+objectFreeze(StoppedWriterCapabilityError.prototype);
+objectFreeze(StoppedWriterCapabilityError);

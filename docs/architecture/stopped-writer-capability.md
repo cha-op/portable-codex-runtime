@@ -195,6 +195,13 @@ Callback success reaches `CONSUMED`. Callback failure, cancellation,
 revocation after dispatch, an abnormal thenable, or a proxy or generator-object
 result is terminal uncertainty: the callback may have changed storage, the
 capability is never reusable, and the coordinator does not synthesize success.
+After the callback settles, an object or function result is accepted only when
+every object traversed before the nearest `then` descriptor is non-proxy and
+that descriptor, if present, is a non-callable data descriptor. Such a data
+property safely shadows higher prototypes. This descriptor-only check runs
+through module-captured intrinsics without invoking accessors and prevents the
+async method return from performing a second, stateful thenable assimilation
+after recording successful consumption.
 Stop failure is likewise terminal because it may have partially quiesced the
 writer.
 

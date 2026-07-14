@@ -35,6 +35,11 @@ superseded_by:
 - Public inputs reject hostile proxies and accessors before dispatch. Public
   errors are fixed, frozen, non-retryable, and omit collaborator details and
   private binding data.
+- Callback results cannot trigger a second stateful thenable assimilation after
+  successful consumption. Module-captured intrinsics reject every proxy
+  traversed before the nearest `then` descriptor and reject accessor or
+  callable `then` values while preserving non-callable data descriptors;
+  violations become terminal uncertainty before success is recorded.
 - `turn/completed`, `ShutdownComplete`, `thread/closed`, thread unsubscribe,
   and rollout flush are not writer-stop proof. Production issuance requires a
   fully joined container, cgroup, or VM writer boundary, or a future Codex
