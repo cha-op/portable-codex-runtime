@@ -366,12 +366,35 @@ function createLifecycleBackend() {
 }
 
 function assertBackendError(error, code = "stopped_directory_backend_outcome_uncertain") {
+  const messages = {
+    invalid_stopped_directory_backend_request:
+      "Stopped-directory backend request is invalid",
+    stopped_directory_backend_outcome_uncertain:
+      "Stopped-directory backend outcome is uncertain",
+  };
   assert(error instanceof StoppedDirectoryBackendError);
+  assert.strictEqual(
+    Object.getPrototypeOf(error),
+    StoppedDirectoryBackendError.prototype,
+  );
+  assert.equal(error.name, "StoppedDirectoryBackendError");
   assert.equal(error.code, code);
+  assert.equal(error.message, messages[code]);
   assert.equal(error.retryable, false);
+  assert.equal(
+    error.stack,
+    `StoppedDirectoryBackendError: ${messages[code]}`,
+  );
   assert.equal(Object.isFrozen(error), true);
-  assert.equal(Object.hasOwn(error, "cause"), false);
-  assert.equal(Object.hasOwn(error, "details"), false);
+  const ownKeys = Reflect.ownKeys(error);
+  assert.equal(ownKeys.every((key) => typeof key === "string"), true);
+  assert.deepEqual([...ownKeys].sort(), [
+    "code",
+    "message",
+    "name",
+    "retryable",
+    "stack",
+  ]);
   return true;
 }
 
@@ -914,6 +937,55 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
       }),
     (error) =>
       assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
+});
+
+test("lifecycle delegation contains collaborator errors without leaking details", async (t) => {
+  const lifecycle = createLifecycleBackend();
+  const methods = [
+    "provisionSession",
+    "prepareWritableAttachment",
+    "detachAttachment",
+    "forceFence",
+    "destroySession",
+  ];
+  const secretPath = "/company/private/lifecycle/session-001";
+  const secretToken = "Bearer lifecycle-secret-value";
+  const fail = (backend, method, input) => {
+    assert.strictEqual(backend, lifecycle.backend);
+    lifecycle.calls.push({ input, method });
+    throw new Error(`${secretToken} at ${secretPath} for ${method}`);
+  };
+  for (let index = 0; index < methods.length; index += 1) {
+    const method = methods[index];
+    lifecycle.backend[method] =
+      index % 2 === 0
+        ? function failSynchronously(input) {
+            return fail(this, method, input);
+          }
+        : async function failAsynchronously(input) {
+            return fail(this, method, input);
+          };
+  }
+  const fixture = await createFixture(t, { lifecycle });
+
+  for (const method of methods) {
+    const input = Object.freeze({ method });
+    let observed;
+    await assert.rejects(
+      () => fixture.backend[method](input),
+      (error) => {
+        observed = error;
+        return assertBackendError(error);
+      },
+    );
+    const rendered = `${observed.message}\n${observed.stack}`;
+    assert.equal(rendered.includes(secretPath), false);
+    assert.equal(rendered.includes(secretToken), false);
+  }
+  assert.deepEqual(
+    lifecycle.calls,
+    methods.map((method) => ({ input: Object.freeze({ method }), method })),
   );
 });
 
