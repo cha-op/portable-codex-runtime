@@ -1310,6 +1310,46 @@ test("fresh-slot registration validates fencing epochs with captured intrinsics"
   assert.equal(coordinator.dispose(), undefined);
 });
 
+test("registration validation ignores RegExp exec prototype poisoning", () => {
+  const originalExec = RegExp.prototype.exec;
+  let poisonedExecCalls = 0;
+
+  try {
+    RegExp.prototype.exec = () => {
+      poisonedExecCalls += 1;
+      return ["poisoned-match"];
+    };
+
+    const identityCoordinator = new StoppedWriterCapabilityCoordinator();
+    syncCapabilityError(
+      () =>
+        identityCoordinator.registerWriter(
+          registerOptions({ processIncarnationId: "" }),
+        ),
+      "invalid_stopped_writer_request",
+    );
+    assert.equal(poisonedExecCalls, 0);
+    assert.equal(identityCoordinator.dispose(), undefined);
+
+    const fenceCoordinator = new StoppedWriterCapabilityCoordinator();
+    const invalidLease = lease({ fencingEpoch: "-1" });
+    syncCapabilityError(
+      () =>
+        fenceCoordinator.registerWriter(
+          registerOptions({
+            attachment: attachment(invalidLease),
+            canonicalLease: invalidLease,
+          }),
+        ),
+      "invalid_stopped_writer_request",
+    );
+    assert(poisonedExecCalls > 0);
+    assert.equal(fenceCoordinator.dispose(), undefined);
+  } finally {
+    RegExp.prototype.exec = originalExec;
+  }
+});
+
 test("dispose requires safe retirement and permanently closes the issuer", async () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
   let snapshotCalls = 0;

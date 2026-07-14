@@ -23,7 +23,7 @@ const objectKeys = Object.keys;
 const objectPrototype = Object.prototype;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
-const regexpTestIntrinsic = RegExp.prototype.test;
+const regexpExecIntrinsic = RegExp.prototype.exec;
 const {
   isGeneratorFunction: isGeneratorFunctionValue,
   isGeneratorObject: isGeneratorObjectValue,
@@ -58,7 +58,7 @@ function mapSet(value, key, entry) {
 }
 
 function regexpTest(value, candidate) {
-  return callIntrinsic(regexpTestIntrinsic, value, [candidate]);
+  return callIntrinsic(regexpExecIntrinsic, value, [candidate]) !== null;
 }
 
 function weakMapGet(value, key) {
