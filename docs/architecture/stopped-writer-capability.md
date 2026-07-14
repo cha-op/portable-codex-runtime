@@ -105,8 +105,14 @@ receive those private records only for pass/fail validation; their returned
 objects are never retained as authority. Consumption compares the private
 snapshot, not a caller-mutated object; poisoned clone or freeze operations
 inside a shared validator therefore cannot substitute a caller-owned authority
-record. The binding includes the attachment ID, proof ID, operation ID, root
-path, storage and backend IDs, session and fence fields, kind, and mode.
+record. The coordinator also revalidates the owned record's contract versions,
+identifiers, fencing epochs, canonical lease timestamp, attachment kind and
+mode, and canonical non-root path with module-captured primitives. Shared
+contract validators remain an additional compatibility check, but poisoning
+their mutable `RegExp`, `Date`, or `String` prototype paths cannot admit a
+malformed authority record. The binding includes the attachment ID, proof ID,
+operation ID, root path, storage and backend IDs, session and fence fields,
+kind, and mode.
 Comparing only the attachment ID would permit detach, reattach, or
 identifier-reuse ABA.
 

@@ -36,7 +36,9 @@ superseded_by:
 - Attachment and lease authority is retained only from exact, flat, frozen
   snapshots built with coordinator-captured intrinsics before shared contract
   validation. Validator return objects and later caller mutations cannot alter
-  the registered binding.
+  the registered binding. The coordinator independently revalidates every
+  authority field, timestamp, and root path with captured primitives, so
+  poisoned shared-validator prototype paths cannot admit malformed records.
 - Registration rechecks disposal after shared validation. Fencing epochs use a
   coordinator-local captured parser for every registration, including a fresh
   slot, and a captured comparator plus slot ownership recheck for retired

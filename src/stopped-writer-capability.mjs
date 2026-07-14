@@ -1,6 +1,12 @@
+import {
+  isAbsolute as pathIsAbsoluteExport,
+  parse as pathParseExport,
+  resolve as pathResolveExport,
+} from "node:path";
 import { types as utilTypes } from "node:util";
 
 import {
+  STORAGE_CONTRACT_VERSION,
   assertLeaseGrant,
   assertSessionAttachment,
 } from "./session-storage-contracts.mjs";
@@ -9,6 +15,9 @@ const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const BigIntConstructor = BigInt;
+const DateConstructor = Date;
+const dateParseIntrinsic = Date.parse;
+const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const MapConstructor = Map;
@@ -21,6 +30,10 @@ const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectKeys = Object.keys;
 const objectPrototype = Object.prototype;
+const numberIsFinite = Number.isFinite;
+const pathIsAbsoluteIntrinsic = pathIsAbsoluteExport;
+const pathParseIntrinsic = pathParseExport;
+const pathResolveIntrinsic = pathResolveExport;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -36,6 +49,7 @@ const WeakMapConstructor = WeakMap;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
 const WeakSetConstructor = WeakSet;
+const TypeErrorConstructor = TypeError;
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
@@ -79,7 +93,10 @@ function weakSetHas(value, entry) {
 
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 const FENCING_EPOCH_PATTERN = /^[1-9][0-9]{0,19}$/u;
+const NUL_PATTERN = /\0/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const ATTACHMENT_KEYS = objectFreeze([
   "attachmentId",
   "backendId",
@@ -124,8 +141,10 @@ export const STOPPED_WRITER_STOP_CONFIRMED = objectFreeze(objectCreate(null));
 
 export class StoppedWriterCapabilityError extends Error {
   constructor(code) {
-    if (!objectHasOwn(ERROR_MESSAGES, code)) {
-      throw new TypeError("unsupported stopped-writer capability error code");
+    if (typeof code !== "string" || !objectHasOwn(ERROR_MESSAGES, code)) {
+      throw new TypeErrorConstructor(
+        "unsupported stopped-writer capability error code",
+      );
     }
     const message = ERROR_MESSAGES[code];
     super(message);
@@ -228,6 +247,14 @@ function assertOpaqueId(value) {
   return value;
 }
 
+function assertUuid(value) {
+  ensure(
+    typeof value === "string" && regexpTest(UUID_PATTERN, value),
+    "invalid_stopped_writer_request",
+  );
+  return value;
+}
+
 function parseFencingEpoch(value) {
   ensure(
     typeof value === "string" && regexpTest(FENCING_EPOCH_PATTERN, value),
@@ -242,6 +269,60 @@ function compareFencingEpochs(left, right) {
   const leftEpoch = parseFencingEpoch(left);
   const rightEpoch = parseFencingEpoch(right);
   return leftEpoch < rightEpoch ? -1 : leftEpoch > rightEpoch ? 1 : 0;
+}
+
+function assertIsoTimestamp(value) {
+  ensure(typeof value === "string", "invalid_stopped_writer_request");
+  let timestamp;
+  let canonical;
+  try {
+    timestamp = callIntrinsic(dateParseIntrinsic, DateConstructor, [value]);
+    canonical = callIntrinsic(
+      dateToISOStringIntrinsic,
+      new DateConstructor(timestamp),
+      [],
+    );
+  } catch {
+    fail("invalid_stopped_writer_request");
+  }
+  ensure(
+    numberIsFinite(timestamp) && canonical === value,
+    "invalid_stopped_writer_request",
+  );
+}
+
+function assertOwnedBinding(attachment, lease) {
+  ensure(
+    attachment.contractVersion === STORAGE_CONTRACT_VERSION &&
+      lease.contractVersion === STORAGE_CONTRACT_VERSION,
+    "invalid_stopped_writer_request",
+  );
+  assertUuid(attachment.sessionId);
+  assertUuid(lease.sessionId);
+  assertOpaqueId(attachment.attachmentId);
+  assertOpaqueId(attachment.backendId);
+  assertOpaqueId(attachment.holderId);
+  assertOpaqueId(attachment.leaseId);
+  assertOpaqueId(attachment.operationId);
+  assertOpaqueId(attachment.proofId);
+  assertOpaqueId(attachment.storageId);
+  assertOpaqueId(lease.holderId);
+  assertOpaqueId(lease.leaseId);
+  parseFencingEpoch(attachment.fencingEpoch);
+  parseFencingEpoch(lease.fencingEpoch);
+  assertIsoTimestamp(lease.expiresAt);
+  ensure(
+    attachment.kind === "directory" && attachment.mode === "read-write",
+    "invalid_stopped_writer_request",
+  );
+  ensure(
+    typeof attachment.rootPath === "string" &&
+      !regexpTest(NUL_PATTERN, attachment.rootPath) &&
+      pathIsAbsoluteIntrinsic(attachment.rootPath) &&
+      pathResolveIntrinsic(attachment.rootPath) === attachment.rootPath &&
+      attachment.rootPath !== pathParseIntrinsic(attachment.rootPath).root,
+    "invalid_stopped_writer_request",
+  );
 }
 
 function assertTrustedCallback(value) {
@@ -284,6 +365,7 @@ function normalizeBinding(attachmentValue, leaseValue) {
   } catch {
     fail("invalid_stopped_writer_request");
   }
+  assertOwnedBinding(attachment, lease);
   ensure(
     attachment.sessionId === lease.sessionId &&
       attachment.leaseId === lease.leaseId &&

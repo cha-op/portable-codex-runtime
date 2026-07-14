@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import test from "node:test";
 import { types as utilTypes } from "node:util";
 import { runInNewContext } from "node:vm";
@@ -201,6 +203,38 @@ async function readyCapability({
     writerIncarnationId,
   };
 }
+
+test("error constructor rejects hostile codes without coercion", () => {
+  const secret = "hostile-code-secret";
+  let traps = 0;
+  const proxy = new Proxy(
+    {},
+    {
+      get() {
+        traps += 1;
+        throw new Error(secret);
+      },
+    },
+  );
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+
+  for (const code of [proxy, revoked.proxy, {}, Symbol("invalid-code")]) {
+    assert.throws(
+      () => new StoppedWriterCapabilityError(code),
+      (error) => {
+        assert(error instanceof TypeError);
+        assert.equal(
+          error.message,
+          "unsupported stopped-writer capability error code",
+        );
+        assert.equal(String(error).includes(secret), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(traps, 0);
+});
 
 test("stops one exact writer and returns a one-use opaque capability", async () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
@@ -1345,8 +1379,127 @@ test("registration validation ignores RegExp exec prototype poisoning", () => {
     );
     assert(poisonedExecCalls > 0);
     assert.equal(fenceCoordinator.dispose(), undefined);
+
+    const bindingScenarios = [
+      [{ attachmentId: "" }, {}],
+      [{ backendId: "" }, {}],
+      [{ operationId: "" }, {}],
+      [{ proofId: "" }, {}],
+      [{ storageId: "" }, {}],
+      [{}, { holderId: "" }],
+      [{}, { leaseId: "" }],
+      [{}, { sessionId: "" }],
+    ];
+    for (const [attachmentOverrides, leaseOverrides] of bindingScenarios) {
+      const invalidLease = lease(leaseOverrides);
+      const coordinator = new StoppedWriterCapabilityCoordinator();
+      const before = poisonedExecCalls;
+      syncCapabilityError(
+        () =>
+          coordinator.registerWriter(
+            registerOptions({
+              attachment: attachment(invalidLease, attachmentOverrides),
+              canonicalLease: invalidLease,
+            }),
+          ),
+        "invalid_stopped_writer_request",
+      );
+      assert(poisonedExecCalls > before);
+      assert.equal(coordinator.dispose(), undefined);
+    }
   } finally {
     RegExp.prototype.exec = originalExec;
+  }
+});
+
+test("registration independently validates timestamps", () => {
+  const originalDateParse = Date.parse;
+  const originalDateToISOString = Date.prototype.toISOString;
+  let poisonedDateCalls = 0;
+
+  try {
+    Date.parse = () => {
+      poisonedDateCalls += 1;
+      return 0;
+    };
+    Date.prototype.toISOString = () => "not-a-timestamp";
+
+    const timestampLease = lease({ expiresAt: "not-a-timestamp" });
+    const timestampCoordinator = new StoppedWriterCapabilityCoordinator();
+    syncCapabilityError(
+      () =>
+        timestampCoordinator.registerWriter(
+          registerOptions({
+            attachment: attachment(timestampLease),
+            canonicalLease: timestampLease,
+          }),
+        ),
+      "invalid_stopped_writer_request",
+    );
+    assert(poisonedDateCalls > 0);
+    assert.equal(timestampCoordinator.dispose(), undefined);
+  } finally {
+    Date.parse = originalDateParse;
+    Date.prototype.toISOString = originalDateToISOString;
+  }
+});
+
+test("registration independently rejects NUL root paths", () => {
+  const originalIncludes = String.prototype.includes;
+  let poisonedIncludesCalls = 0;
+
+  try {
+    String.prototype.includes = () => {
+      poisonedIncludesCalls += 1;
+      return false;
+    };
+    const coordinator = new StoppedWriterCapabilityCoordinator();
+    syncCapabilityError(
+      () =>
+        coordinator.registerWriter(
+          registerOptions({
+            attachment: attachment(lease(), {
+              rootPath: "/var/lib/portable-codex/\0session-001",
+            }),
+          }),
+        ),
+      "invalid_stopped_writer_request",
+    );
+    assert(poisonedIncludesCalls > 0);
+    assert.equal(coordinator.dispose(), undefined);
+  } finally {
+    String.prototype.includes = originalIncludes;
+  }
+});
+
+test("registration captures path validators before builtin ESM synchronization", () => {
+  const originalResolve = path.resolve;
+  let poisonedResolveCalls = 0;
+
+  try {
+    path.resolve = (value) => {
+      poisonedResolveCalls += 1;
+      return value;
+    };
+    syncBuiltinESMExports();
+
+    const coordinator = new StoppedWriterCapabilityCoordinator();
+    syncCapabilityError(
+      () =>
+        coordinator.registerWriter(
+          registerOptions({
+            attachment: attachment(lease(), {
+              rootPath: "/var/lib/../etc",
+            }),
+          }),
+        ),
+      "invalid_stopped_writer_request",
+    );
+    assert(poisonedResolveCalls > 0);
+    assert.equal(coordinator.dispose(), undefined);
+  } finally {
+    path.resolve = originalResolve;
+    syncBuiltinESMExports();
   }
 });
 
