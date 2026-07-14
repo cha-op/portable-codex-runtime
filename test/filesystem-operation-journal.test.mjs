@@ -18,9 +18,11 @@ import test from "node:test";
 
 import {
   FilesystemOperationJournal,
+  OPERATION_JOURNAL_LOCK_NAME,
   OPERATION_JOURNAL_RECORD_VERSION,
   OperationJournalError,
   operationJournalRecordFilename,
+  snapshotOperationJournalBinding,
 } from "../src/filesystem-operation-journal.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
@@ -38,6 +40,19 @@ function operationTemporaryRecordFilename(operationId) {
 const TRUSTED_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
   inspectDirectoryAcl: async () => false,
+});
+
+test("journal binding snapshots detach and freeze nested caller state", () => {
+  const source = {
+    backendId: "single-attach-test",
+    metadata: { lane: "original" },
+  };
+  const snapshot = snapshotOperationJournalBinding(source);
+  source.metadata.lane = "mutated";
+
+  assert.equal(snapshot.metadata.lane, "original");
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.metadata), true);
 });
 
 function binding(overrides = {}) {
@@ -156,6 +171,9 @@ async function createFixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), "filesystem-operation-journal-test-"));
   const directory = join(root, "journal");
   await mkdir(directory, { mode: 0o700 });
+  await writeFile(join(directory, OPERATION_JOURNAL_LOCK_NAME), "", {
+    mode: 0o600,
+  });
   t.after(() => rm(root, { force: true, recursive: true }));
   const journal = new FilesystemOperationJournal({
     directory,
@@ -190,6 +208,91 @@ async function commit(
     result: fixedResult,
   });
 }
+
+test("journal authority description is frozen and identity-pinned", async (t) => {
+  const { directory, journal } = await createFixture(t);
+  const identity = await lstat(directory, { bigint: true });
+
+  const authority = await journal.describeAuthority();
+
+  assert.deepEqual(authority, {
+    device: identity.dev.toString(),
+    inode: identity.ino.toString(),
+    path: await realpath(directory),
+  });
+  assert.equal(Object.isFrozen(authority), true);
+  assert.deepEqual(await journal.describeAuthority(), authority);
+});
+
+test("default journal requires a preprovisioned lock without creating it", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "filesystem-journal-lock-test-"));
+  const directory = join(root, "journal");
+  const lockPath = join(directory, OPERATION_JOURNAL_LOCK_NAME);
+  await mkdir(directory, { mode: 0o700 });
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const journal = new FilesystemOperationJournal({
+    directory,
+    ...TRUSTED_ACL_INSPECTORS,
+  });
+
+  await assert.rejects(
+    journal.read({ operationId: OPERATION_ID }),
+    assertJournalError("journal_io_failed", "not-committed"),
+  );
+  await assert.rejects(lstat(lockPath), (error) => error?.code === "ENOENT");
+});
+
+test("journal lock acquisition requests an existing-only authority", async (t) => {
+  let acquisitionOptions;
+  const baseLockProvider = simpleLockProvider();
+  const { journal } = await createFixture(t, {
+    acquireLock: async (path, options) => {
+      acquisitionOptions = options;
+      return baseLockProvider(path, options);
+    },
+  });
+
+  assert.equal((await journal.read({ operationId: OPERATION_ID })).record, null);
+  assert.deepEqual(acquisitionOptions, { requireExisting: true });
+});
+
+test("journal state hints do not acquire locks or run journal fault callbacks", async (t) => {
+  let lockAcquisitions = 0;
+  let recordReadCallbacks = 0;
+  let lockReleaseCallbacks = 0;
+  const baseLockProvider = simpleLockProvider();
+  const { journal } = await createFixture(t, {
+    acquireLock: async (...args) => {
+      lockAcquisitions += 1;
+      return baseLockProvider(...args);
+    },
+    faults: {
+      async afterRecordRead() {
+        recordReadCallbacks += 1;
+      },
+      async beforeLockRelease() {
+        lockReleaseCallbacks += 1;
+      },
+    },
+  });
+
+  const absent = await journal.readStateHint({ operationId: OPERATION_ID });
+  assert.equal(absent.record, null);
+  assert.equal(lockAcquisitions, 0);
+  assert.equal(recordReadCallbacks, 0);
+  assert.equal(lockReleaseCallbacks, 0);
+
+  await prepare(journal);
+  lockAcquisitions = 0;
+  recordReadCallbacks = 0;
+  lockReleaseCallbacks = 0;
+  const prepared = await journal.readStateHint({ operationId: OPERATION_ID });
+  assert.equal(prepared.record.state, "prepared");
+  assert.equal(prepared.replayed, false);
+  assert.equal(lockAcquisitions, 0);
+  assert.equal(recordReadCallbacks, 0);
+  assert.equal(lockReleaseCallbacks, 0);
+});
 
 test("journal persists canonical prepared, materialized, and committed states", async (t) => {
   const { directory, journal } = await createFixture(t);
@@ -1257,7 +1360,7 @@ test("the default lock can prove a pre-rename lock replacement did not commit", 
     useDefaultLock: true,
     faults: {
       async beforeRename() {
-        const lockPath = join(directory, ".operation-journal.lock");
+        const lockPath = join(directory, OPERATION_JOURNAL_LOCK_NAME);
         await rename(lockPath, join(root, "original-operation-journal.lock"));
         await writeFile(lockPath, "replacement lock\n", { mode: 0o600 });
         await chmod(lockPath, 0o600);

@@ -26,6 +26,10 @@
 - A host-local canonical operation journal now durably records exact prepared,
   materialized, and committed states and replays committed results after
   restart without claiming that physical backend work occurred.
+- A local stopped-directory publication layer now binds journal phases to a
+  post-order source barrier, deterministic durable staging, checkpoint bundles
+  or payload-only restores, atomic absent-destination rename, exact final
+  readback, and pre-commit consumer isolation.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -46,6 +50,8 @@
   `docs/project_journal/2026/07/2026-07-02-stopped-tree-primitives-6d83af.md`
 - Durable filesystem operation journal:
   `docs/project_journal/2026/07/2026-07-02-filesystem-operation-journal-2f6c91.md`
+- Stopped-directory publication:
+  `docs/project_journal/2026/07/2026-07-02-stopped-directory-publication-7a4c2e.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

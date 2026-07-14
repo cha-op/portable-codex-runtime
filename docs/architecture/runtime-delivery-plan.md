@@ -47,9 +47,9 @@ plane.
    - Persist exact prepared, materialized, and committed operation records and
      predetermined results with canonical replay after restart.
 9. **PR #9: stopped-directory publication layer**
-   - Bind journal phases to the filesystem storage barrier, physical
-     materialisation, atomic artefact or restore publication, and destination
-     isolation.
+   - Bind journal phases to a local filesystem storage barrier, deterministic
+     private staging, atomic checkpoint-bundle or restore-tree publication,
+     exact readback, and pre-commit consumer isolation.
 10. **PR #10: same-process stopped-writer capability**
     - Issue and authenticate a one-use object capability bound to the exact
       writer incarnation, attachment, and fence without embedding stop
@@ -58,10 +58,11 @@ plane.
     - Compose the journal, publication layer, capability, and snapshot core;
       then run the complete backend conformance and failure-injection matrix.
 
-Later serial pull requests own replay-only uncertain-result reconciliation,
-same-image resume and rollout-tail repair, an ext4 or filesystem-image backend,
-differential export and content-addressed storage, cross-host migration, and
-operational hardening.
+The sequence through PR #9 is complete. Later serial pull requests begin with
+the same-process stopped-writer capability and backend adapter, then own
+replay-only uncertain-result reconciliation, same-image resume and rollout-tail
+repair, an ext4 or filesystem-image backend, differential export and
+content-addressed storage, cross-host migration, and operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
   access,
+  chmod,
   link,
   lstat,
   mkdtemp,
@@ -190,6 +191,66 @@ test("advisory lock rejects concurrent holders and can be reacquired", async () 
   } finally {
     await first?.release();
     await second?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("existing-only advisory locks neither create nor repair the lock file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-existing-"));
+  const path = join(root, "authority.lock");
+  let lock;
+  try {
+    await assert.rejects(
+      acquireAdvisoryLock(path, { requireExisting: true }),
+      (error) =>
+        error instanceof AdvisoryLockError && error.code === "unsafe_lock_file",
+    );
+    await assert.rejects(access(path), (error) => error.code === "ENOENT");
+
+    await writeFile(path, "", { mode: 0o644 });
+    await chmod(path, 0o644);
+    await assert.rejects(
+      acquireAdvisoryLock(path, { requireExisting: true }),
+      (error) =>
+        error instanceof AdvisoryLockError && error.code === "unsafe_lock_file",
+    );
+    assert.equal(Number((await lstat(path, { bigint: true })).mode & 0o777n), 0o644);
+
+    await chmod(path, 0o600);
+    await writeFile(path, "foreign\n", { mode: 0o600 });
+    await assert.rejects(
+      acquireAdvisoryLock(path, { requireExisting: true }),
+      (error) =>
+        error instanceof AdvisoryLockError && error.code === "unsafe_lock_file",
+    );
+    assert.equal(await readFile(path, "utf8"), "foreign\n");
+
+    await writeFile(path, "", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path, { requireExisting: true });
+    await lock.assertHeld();
+    assert.equal(Number((await lstat(path, { bigint: true })).mode & 0o777n), 0o600);
+  } finally {
+    await lock?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("existing-only advisory locks detect protection changes while held", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-advisory-protection-"));
+  const path = join(root, "authority.lock");
+  let lock;
+  try {
+    await writeFile(path, "", { mode: 0o600 });
+    lock = await acquireAdvisoryLock(path, { requireExisting: true });
+    await chmod(path, 0o644);
+    await assert.rejects(
+      lock.assertHeld(),
+      (error) =>
+        error instanceof AdvisoryLockError && error.code === "lock_replaced",
+    );
+    assert.equal(Number((await lstat(path, { bigint: true })).mode & 0o777n), 0o644);
+  } finally {
+    await lock?.release().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -424,6 +485,13 @@ test("advisory lock backends use independent lock descriptions", () => {
     ],
     conflictExitCode: 75,
   });
+  assert.deepEqual(
+    advisoryLockCommand("darwin", {
+      lockPath: protectedLockPath,
+      requireExisting: true,
+    }).args.slice(0, 7),
+    ["-k", "-s", "-n", "-t", "0", "-w", protectedLockPath],
+  );
 });
 
 test("holder exit one is a runtime failure rather than lock contention", async () => {

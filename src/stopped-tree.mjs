@@ -251,6 +251,7 @@ async function openPrivateOwnedRootAuthority(
   {
     inspectAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
     inspectRootAcl = recoveryPathHasExtendedAcl,
+    modeledRoot = false,
   } = {},
 ) {
   const requestedRoot = resolve(ownedRoot);
@@ -266,11 +267,16 @@ async function openPrivateOwnedRootAuthority(
     BigInt(currentUid),
     "stopped-tree owned root must be owned by this user",
   );
-  assert.equal(
-    Number(metadata.mode & 0o777n),
-    0o700,
-    "stopped-tree owned root must have mode 0700",
-  );
+  const rootMode = Number(metadata.mode & 0o777n);
+  if (modeledRoot) {
+    assert.equal(
+      metadata.mode & 0o7000n,
+      0n,
+      "stopped-tree modeled root must not have special mode bits",
+    );
+  } else {
+    assert.equal(rootMode, 0o700, "stopped-tree owned root must have mode 0700");
+  }
   const canonicalRoot = await realpath(requestedRoot);
   await assertPathIdentity(
     requestedRoot,
@@ -324,6 +330,7 @@ async function openPrivateOwnedRootAuthority(
       identity: metadata,
       inspectAncestorAcl,
       inspectRootAcl,
+      mode: rootMode,
       path: canonicalRoot,
     };
     authority.assertCurrent = async () => {
@@ -336,7 +343,8 @@ async function openPrivateOwnedRootAuthority(
           sameFileIdentity(current, authority.identity) &&
           sameFileIdentity(held, authority.identity) &&
           current.uid === BigInt(authority.currentUid) &&
-          Number(current.mode & 0o777n) === 0o700,
+          Number(current.mode & 0o777n) === authority.mode &&
+          (current.mode & 0o7000n) === 0n,
         "stopped-tree copy rejects owned-root identity or permission changes",
       );
       await inspectStoppedTreeAcl(
@@ -374,6 +382,73 @@ async function openPrivateOwnedRootAuthority(
   } finally {
     if (primaryFailure) await runSequentialCleanup([() => handle.close()], primaryFailure);
   }
+}
+
+/**
+ * Opens and pins a private stopped-tree root. The caller owns the returned
+ * authority handle and must close `authority.handle`.
+ */
+export async function openStoppedTreeRootAuthority(
+  ownedRoot,
+  {
+    inspectAncestorAcl,
+    inspectOwnedRootAcl,
+    inspectOwnedRootAncestorAcl,
+    inspectRootAcl,
+  } = {},
+) {
+  const authority = await openPrivateOwnedRootAuthority(ownedRoot, {
+    inspectAncestorAcl:
+      inspectOwnedRootAncestorAcl ??
+      inspectAncestorAcl ??
+      recoveryPathHasUnsafeAncestorAcl,
+    inspectRootAcl:
+      inspectOwnedRootAcl ?? inspectRootAcl ?? recoveryPathHasExtendedAcl,
+  });
+  return Object.freeze({
+    assertCurrent: authority.assertCurrent,
+    handle: authority.handle,
+    identity: Object.freeze({
+      dev: authority.identity.dev,
+      ino: authority.identity.ino,
+    }),
+    mode: authority.mode,
+    path: authority.path,
+  });
+}
+
+/**
+ * Opens and pins a stopped-tree payload root whose portable mode is part of
+ * the modeled tree. The containing storage authority remains private.
+ */
+export async function openStoppedTreeModeledRootAuthority(
+  modeledRoot,
+  {
+    inspectAncestorAcl,
+    inspectOwnedRootAcl,
+    inspectOwnedRootAncestorAcl,
+    inspectRootAcl,
+  } = {},
+) {
+  const authority = await openPrivateOwnedRootAuthority(modeledRoot, {
+    inspectAncestorAcl:
+      inspectOwnedRootAncestorAcl ??
+      inspectAncestorAcl ??
+      recoveryPathHasUnsafeAncestorAcl,
+    inspectRootAcl:
+      inspectOwnedRootAcl ?? inspectRootAcl ?? recoveryPathHasExtendedAcl,
+    modeledRoot: true,
+  });
+  return Object.freeze({
+    assertCurrent: authority.assertCurrent,
+    handle: authority.handle,
+    identity: Object.freeze({
+      dev: authority.identity.dev,
+      ino: authority.identity.ino,
+    }),
+    mode: authority.mode,
+    path: authority.path,
+  });
 }
 
 function pathIsInside(root, candidate) {
@@ -469,7 +544,12 @@ async function listCurrentMountPoints({
   }
 }
 
-async function assertNoMountBoundary(path, listMountPoints) {
+async function assertNoMountBoundary(
+  path,
+  listMountPoints,
+  { allowRootMount = false } = {},
+) {
+  assert.equal(typeof allowRootMount, "boolean", "allowRootMount must be a boolean");
   const root = await realpath(path);
   let mountPoints;
   try {
@@ -486,7 +566,10 @@ async function assertNoMountBoundary(path, listMountPoints) {
     } catch {
       candidate = resolve(mountPoint);
     }
-    if (candidate === root || pathIsInside(root, candidate)) {
+    if (
+      (!allowRootMount && candidate === root) ||
+      (candidate !== root && pathIsInside(root, candidate))
+    ) {
       throw new Error("portable tree rejects nested mount points");
     }
   }
@@ -529,8 +612,19 @@ async function assertPathIdentity(path, expected, message) {
   return current;
 }
 
-async function collectTreeIdentities(path, identities = new Set()) {
+async function collectTreeIdentities(
+  path,
+  identities = new Set(),
+  { expectedDevice } = {},
+) {
   const metadata = await lstat(path, { bigint: true });
+  if (expectedDevice !== undefined) {
+    assert.equal(
+      metadata.dev,
+      expectedDevice,
+      "stopped-tree stable identity digest rejects filesystem boundaries",
+    );
+  }
   identities.add(fileIdentityKey(metadata));
   if (!metadata.isDirectory()) {
     await assertPathIdentity(
@@ -559,7 +653,9 @@ async function collectTreeIdentities(path, identities = new Set()) {
       "stopped-tree copy rejects source directory identity changes",
     );
     for (const entry of entries) {
-      await collectTreeIdentities(join(path, entry), identities);
+      await collectTreeIdentities(join(path, entry), identities, {
+        expectedDevice,
+      });
     }
     assertStableFileMetadata(
       heldMetadata,
@@ -578,6 +674,459 @@ async function collectTreeIdentities(path, identities = new Set()) {
   } finally {
     await runSequentialCleanup([() => handle.close()], primaryFailure);
   }
+}
+
+function identitySetsEqual(left, right) {
+  if (left.size !== right.size) return false;
+  for (const identity of left) {
+    if (!right.has(identity)) return false;
+  }
+  return true;
+}
+
+async function collectForbiddenAuthorityIdentityKeys(
+  authorities,
+  listMountPoints,
+) {
+  const identities = new Set();
+  for (const authority of authorities) {
+    const before = await lstat(authority.path, { bigint: true });
+    assert(
+      before.isDirectory() && sameFileIdentity(before, authority.identity),
+      "stopped-tree copy rejects forbidden authority identity changes",
+    );
+    await assertNoMountBoundary(authority.path, listMountPoints, {
+      allowRootMount: true,
+    });
+    const authorityIdentities = await collectTreeIdentities(
+      authority.path,
+      new Set(),
+      { expectedDevice: authority.identity.dev },
+    );
+    await assertNoMountBoundary(authority.path, listMountPoints, {
+      allowRootMount: true,
+    });
+    const after = await assertPathIdentity(
+      authority.path,
+      authority.identity,
+      "stopped-tree copy rejects forbidden authority identity changes",
+    );
+    assert(
+      after.isDirectory(),
+      "stopped-tree copy rejects forbidden authority identity changes",
+    );
+    for (const identity of authorityIdentities) identities.add(identity);
+  }
+  return identities;
+}
+
+async function treeContainsAnyIdentity(
+  path,
+  identityKeys,
+  visitedDirectories = new Set(),
+  { expectedDevice } = {},
+) {
+  const metadata = await lstat(path, { bigint: true });
+  const treeDevice = expectedDevice ?? metadata.dev;
+  assert.equal(
+    metadata.dev,
+    treeDevice,
+    "stopped-tree identity scan rejects filesystem boundaries",
+  );
+  const identityKey = fileIdentityKey(metadata);
+  if (identityKeys.has(identityKey)) return true;
+  if (!metadata.isDirectory()) {
+    await assertPathIdentity(
+      path,
+      metadata,
+      "stopped-tree identity scan rejects entry identity changes",
+    );
+    return false;
+  }
+  if (visitedDirectories.has(identityKey)) {
+    await assertPathIdentity(
+      path,
+      metadata,
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    return false;
+  }
+  visitedDirectories.add(identityKey);
+
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  let primaryFailure;
+  try {
+    const heldMetadata = await handle.stat({ bigint: true });
+    assert(
+      heldMetadata.isDirectory() && sameFileIdentity(metadata, heldMetadata),
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    const entries = await readPortableDirectory(path);
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    let containsIdentity = false;
+    for (const entry of entries) {
+      containsIdentity = await treeContainsAnyIdentity(
+        join(path, entry),
+        identityKeys,
+        visitedDirectories,
+        { expectedDevice: treeDevice },
+      );
+      if (containsIdentity) break;
+    }
+    assertStableFileMetadata(
+      heldMetadata,
+      await handle.stat({ bigint: true }),
+      "stopped-tree identity scan rejects directory metadata changes",
+    );
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree identity scan rejects directory identity changes",
+    );
+    return containsIdentity;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+export async function stoppedTreeContainsAnyIdentity(
+  path,
+  identities,
+  {
+    allowRootMount = true,
+    listMountPoints = listCurrentMountPoints,
+  } = {},
+) {
+  assert(
+    Array.isArray(identities) && identities.length > 0,
+    "identities must be a non-empty array",
+  );
+  assert.equal(typeof allowRootMount, "boolean", "allowRootMount must be a boolean");
+  assert.equal(
+    typeof listMountPoints,
+    "function",
+    "listMountPoints must be a function",
+  );
+  const normalized = identities.map((identity) => {
+    assert(
+      identity !== null &&
+        typeof identity === "object" &&
+        integerAsBigInt(identity.dev) !== null &&
+        integerAsBigInt(identity.ino) !== null,
+      "identity must contain filesystem device and inode values",
+    );
+    return {
+      dev: integerAsBigInt(identity.dev),
+      ino: integerAsBigInt(identity.ino),
+    };
+  });
+  await assertNoMountBoundary(path, listMountPoints, { allowRootMount });
+  const identityKeys = new Set(normalized.map(fileIdentityKey));
+  const containsIdentity = await treeContainsAnyIdentity(path, identityKeys);
+  await assertNoMountBoundary(path, listMountPoints, { allowRootMount });
+  return containsIdentity;
+}
+
+export async function stoppedTreesShareAnyIdentity(
+  left,
+  right,
+  {
+    allowLeftRootMount = false,
+    allowRightRootMount = false,
+    listMountPoints = listCurrentMountPoints,
+  } = {},
+) {
+  assert.equal(typeof left, "string", "left stopped tree path must be a string");
+  assert.equal(typeof right, "string", "right stopped tree path must be a string");
+  assert.equal(
+    typeof allowLeftRootMount,
+    "boolean",
+    "allowLeftRootMount must be a boolean",
+  );
+  assert.equal(
+    typeof allowRightRootMount,
+    "boolean",
+    "allowRightRootMount must be a boolean",
+  );
+  assert.equal(
+    typeof listMountPoints,
+    "function",
+    "listMountPoints must be a function",
+  );
+  await assertNoMountBoundary(left, listMountPoints, {
+    allowRootMount: allowLeftRootMount,
+  });
+  await assertNoMountBoundary(right, listMountPoints, {
+    allowRootMount: allowRightRootMount,
+  });
+  const leftIdentities = await collectTreeIdentities(left);
+  const rightIdentities = await collectTreeIdentities(right);
+  await assertNoMountBoundary(left, listMountPoints, {
+    allowRootMount: allowLeftRootMount,
+  });
+  await assertNoMountBoundary(right, listMountPoints, {
+    allowRootMount: allowRightRootMount,
+  });
+  for (const identity of leftIdentities) {
+    if (rightIdentities.has(identity)) return true;
+  }
+  return false;
+}
+
+function assertPersistentObjectIdentity(value) {
+  let descriptors;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw new Error("persistent object identity is invalid");
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  assert(
+    value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      keys.length === 3 &&
+      keys.every(
+        (key) =>
+          typeof key === "string" &&
+          ["device", "inode", "objectId"].includes(key) &&
+          descriptors[key].enumerable === true &&
+          Object.hasOwn(descriptors[key], "value") &&
+          !Object.hasOwn(descriptors[key], "get") &&
+          !Object.hasOwn(descriptors[key], "set"),
+      ),
+    "persistent object identity is invalid",
+  );
+  const device = descriptors.device.value;
+  const inode = descriptors.inode.value;
+  const objectId = descriptors.objectId.value;
+  assert(
+    typeof device === "string" &&
+      /^(?:0|[1-9][0-9]*)$/u.test(device) &&
+      typeof inode === "string" &&
+      /^[1-9][0-9]*$/u.test(inode) &&
+      typeof objectId === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(objectId),
+    "persistent object identity is invalid",
+  );
+  return Object.freeze({
+    runtimeIdentity: Object.freeze({
+      dev: BigInt(device),
+      ino: BigInt(inode),
+    }),
+    objectId,
+  });
+}
+
+export async function inspectStoppedTreeObjectIdentity(
+  path,
+  inspectPersistentObjectIdentity,
+  expectedIdentity,
+) {
+  assert.equal(
+    typeof inspectPersistentObjectIdentity,
+    "function",
+    "persistent object identity inspector must be a function",
+  );
+  const before = await lstat(path, { bigint: true });
+  if (expectedIdentity !== undefined) {
+    assert(
+      sameFileIdentity(before, expectedIdentity),
+      "persistent object identity path changed before inspection",
+    );
+  }
+  const inspected = assertPersistentObjectIdentity(
+    await inspectPersistentObjectIdentity(path),
+  );
+  assert(
+    sameFileIdentity(inspected.runtimeIdentity, before),
+    "persistent object identity does not match runtime object",
+  );
+  const after = await lstat(path, { bigint: true });
+  assertStableFileMetadata(
+    before,
+    after,
+    "persistent object identity path changed during inspection",
+  );
+  if (expectedIdentity !== undefined) {
+    assert(
+      sameFileIdentity(after, expectedIdentity),
+      "persistent object identity path changed during inspection",
+    );
+  }
+  return inspected.objectId;
+}
+
+function stoppedTreeEntryKind(metadata) {
+  if (metadata.isDirectory()) return "directory";
+  if (metadata.isFile()) return "file";
+  if (metadata.isSymbolicLink()) return "symlink";
+  throw new Error("persistent tree identity rejects unsupported entry type");
+}
+
+async function collectPersistentTreeIdentities({
+  expectedDevice,
+  filesystemId,
+  inspectPersistentObjectIdentity,
+  objectIdentityScheme,
+  objectIds,
+  path,
+  relativePath,
+  tuples,
+}) {
+  const metadata = await lstat(path, { bigint: true });
+  assert.equal(
+    metadata.dev,
+    expectedDevice,
+    "persistent tree identity rejects filesystem boundaries",
+  );
+  const objectId = await inspectStoppedTreeObjectIdentity(
+    path,
+    inspectPersistentObjectIdentity,
+    metadata,
+  );
+  const runtimeIdentity = fileIdentityKey(metadata);
+  const persistentIdentityKey = `${filesystemId}\0${objectIdentityScheme}\0${objectId}`;
+  const runtimeKey = `runtime\0${runtimeIdentity}`;
+  const persistentKey = `persistent\0${persistentIdentityKey}`;
+  const previousRuntimeIdentity = objectIds.get(persistentKey);
+  const previousPersistentIdentity = objectIds.get(runtimeKey);
+  assert(
+    (previousRuntimeIdentity === undefined ||
+      previousRuntimeIdentity === runtimeIdentity) &&
+      (previousPersistentIdentity === undefined ||
+        previousPersistentIdentity === persistentIdentityKey),
+    "persistent object identity aliases distinct runtime objects",
+  );
+  objectIds.set(persistentKey, runtimeIdentity);
+  objectIds.set(runtimeKey, persistentIdentityKey);
+  tuples.push({
+    kind: stoppedTreeEntryKind(metadata),
+    objectId,
+    path: relativePath,
+  });
+  if (!metadata.isDirectory()) return;
+
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  let primaryFailure;
+  try {
+    const heldMetadata = await handle.stat({ bigint: true });
+    assert(
+      heldMetadata.isDirectory() && sameFileIdentity(metadata, heldMetadata),
+      "persistent tree identity directory changed",
+    );
+    const entries = await readPortableDirectory(path);
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "persistent tree identity directory changed",
+    );
+    for (const entry of entries) {
+      await collectPersistentTreeIdentities({
+        expectedDevice,
+        filesystemId,
+        inspectPersistentObjectIdentity,
+        objectIdentityScheme,
+        objectIds,
+        path: join(path, entry),
+        relativePath: relativePath === "" ? entry : `${relativePath}/${entry}`,
+        tuples,
+      });
+    }
+    assertStableFileMetadata(
+      heldMetadata,
+      await handle.stat({ bigint: true }),
+      "persistent tree identity directory changed",
+    );
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "persistent tree identity directory changed",
+    );
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+export async function digestStoppedTreeIdentities(
+  path,
+  filesystemId,
+  objectIdentityScheme,
+  inspectPersistentObjectIdentity,
+  objectIds = new Map(),
+  {
+    allowRootMount = false,
+    listMountPoints = listCurrentMountPoints,
+  } = {},
+) {
+  assert.equal(
+    typeof filesystemId,
+    "string",
+    "stable filesystem identity must be a string",
+  );
+  assert(
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(filesystemId),
+    "stable filesystem identity is invalid",
+  );
+  assert(
+    typeof objectIdentityScheme === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(objectIdentityScheme),
+    "object identity scheme is invalid",
+  );
+  assert.equal(
+    typeof inspectPersistentObjectIdentity,
+    "function",
+    "persistent object identity inspector must be a function",
+  );
+  assert.equal(typeof allowRootMount, "boolean", "allowRootMount must be a boolean");
+  assert.equal(
+    typeof listMountPoints,
+    "function",
+    "listMountPoints must be a function",
+  );
+  await assertNoMountBoundary(path, listMountPoints, { allowRootMount });
+  const root = await lstat(path, { bigint: true });
+  const tuples = [];
+  await collectPersistentTreeIdentities({
+    expectedDevice: root.dev,
+    filesystemId,
+    inspectPersistentObjectIdentity,
+    objectIdentityScheme,
+    objectIds,
+    path,
+    relativePath: "",
+    tuples,
+  });
+  await assertNoMountBoundary(path, listMountPoints, { allowRootMount });
+  const hash = createHash("sha256");
+  hash.update("portable-stopped-tree-object-identities-v1\0", "utf8");
+  hash.update(`${Buffer.byteLength(filesystemId, "utf8")}:`, "utf8");
+  hash.update(filesystemId, "utf8");
+  hash.update(`${Buffer.byteLength(objectIdentityScheme, "utf8")}:`, "utf8");
+  hash.update(objectIdentityScheme, "utf8");
+  for (const tuple of tuples) {
+    for (const value of [tuple.path, tuple.kind, tuple.objectId]) {
+      hash.update(`${Buffer.byteLength(value, "utf8")}:`, "utf8");
+      hash.update(value, "utf8");
+    }
+  }
+  return hash.digest("hex");
 }
 
 async function copyFileContents(sourceHandle, destinationHandle) {
@@ -784,9 +1333,12 @@ async function resolveSymlinkTargetWithoutHiddenTraversal({
 }
 
 async function assertPortableSymlink({
+  allowAbsoluteSymlinks,
   destination,
   destinationRoots,
   destinationRootIdentity,
+  forbiddenAbsoluteSymlinkAuthorities,
+  forbiddenAbsoluteSymlinkIdentityKeys,
   inspectSymlinkPath,
   source,
   sourceIdentityKeys,
@@ -795,6 +1347,9 @@ async function assertPortableSymlink({
   target,
 }) {
   if (isAbsolute(target)) {
+    if (!allowAbsoluteSymlinks) {
+      throw new Error("stopped-tree copy rejects absolute symlinks by policy");
+    }
     const root = parse(target).root;
     await resolveSymlinkTargetWithoutHiddenTraversal({
       exactPortableNames: false,
@@ -814,6 +1369,15 @@ async function assertPortableSymlink({
             "stopped-tree copy rejects absolute symlinks into the destination tree",
           );
         }
+        if (
+          forbiddenAbsoluteSymlinkAuthorities.some((authority) =>
+            pathIsInside(authority.path, candidate),
+          )
+        ) {
+          throw new Error(
+            "stopped-tree copy rejects absolute symlinks into a forbidden authority",
+          );
+        }
       },
       validateMetadata: async (_candidate, metadata) => {
         if (
@@ -825,6 +1389,11 @@ async function assertPortableSymlink({
         if (sameFileIdentity(metadata, destinationRootIdentity)) {
           throw new Error(
             "stopped-tree copy rejects absolute symlinks into the destination tree",
+          );
+        }
+        if (forbiddenAbsoluteSymlinkIdentityKeys.has(fileIdentityKey(metadata))) {
+          throw new Error(
+            "stopped-tree copy rejects absolute symlinks into a forbidden authority",
           );
         }
       },
@@ -1106,10 +1675,13 @@ export async function removeTreeForCleanup(
   await removeTreeEntryForCleanup(path);
 }
 
-export async function copyStoppedTree({
-  ownedRoot,
+export async function copyStoppedTreeBetweenRoots({
+  sourceOwnedRoot,
   source,
+  destinationOwnedRoot,
   destination,
+  allowAbsoluteSymlinks = true,
+  allowSourceRootMount = false,
   afterDestinationValidation,
   afterDestinationRootCreated,
   afterDestinationDirectoryCreated,
@@ -1117,21 +1689,115 @@ export async function copyStoppedTree({
   afterSourceDirectoryOpen,
   beforeSourceOpen,
   checkAccess = access,
+  expectedSourceRootIdentity = null,
+  forbiddenAbsoluteSymlinkAuthorities = [],
   inspectOwnedRootAncestorAcl = recoveryPathHasUnsafeAncestorAcl,
   inspectOwnedRootAcl = recoveryPathHasExtendedAcl,
   inspectSymlinkPath = lstat,
   listMountPoints = listCurrentMountPoints,
 }) {
-  const ownedRootAuthority = await openPrivateOwnedRootAuthority(ownedRoot, {
-    inspectAncestorAcl: inspectOwnedRootAncestorAcl,
-    inspectRootAcl: inspectOwnedRootAcl,
-  });
+  assert.equal(
+    typeof allowAbsoluteSymlinks,
+    "boolean",
+    "allowAbsoluteSymlinks must be a boolean",
+  );
+  let normalizedExpectedSourceRootIdentity = null;
+  if (expectedSourceRootIdentity !== null) {
+    const expectedDevice = integerAsBigInt(expectedSourceRootIdentity?.dev);
+    const expectedInode = integerAsBigInt(expectedSourceRootIdentity?.ino);
+    assert(
+      expectedSourceRootIdentity !== undefined &&
+        typeof expectedSourceRootIdentity === "object" &&
+        expectedDevice !== null &&
+        expectedInode !== null,
+      "expectedSourceRootIdentity must be a filesystem identity",
+    );
+    normalizedExpectedSourceRootIdentity = Object.freeze({
+      dev: expectedDevice,
+      ino: expectedInode,
+    });
+  }
+  assert.equal(
+    typeof allowSourceRootMount,
+    "boolean",
+    "allowSourceRootMount must be a boolean",
+  );
+  assert(
+    Array.isArray(forbiddenAbsoluteSymlinkAuthorities),
+    "forbiddenAbsoluteSymlinkAuthorities must be an array",
+  );
+  const normalizedForbiddenAbsoluteSymlinkAuthorities =
+    forbiddenAbsoluteSymlinkAuthorities.map((authority) => {
+      assert(
+        authority !== null &&
+          typeof authority === "object" &&
+          typeof authority.path === "string" &&
+          isAbsolute(authority.path) &&
+          resolve(authority.path) === authority.path,
+        "forbidden absolute symlink authority must have an absolute normalized path",
+      );
+      const dev =
+        typeof authority.device === "string" &&
+        /^(?:0|[1-9][0-9]*)$/u.test(authority.device)
+          ? BigInt(authority.device)
+          : integerAsBigInt(authority.device);
+      const ino =
+        typeof authority.inode === "string" &&
+        /^[1-9][0-9]*$/u.test(authority.inode)
+          ? BigInt(authority.inode)
+          : integerAsBigInt(authority.inode);
+      assert(
+        dev !== null && dev >= 0n && ino !== null && ino > 0n,
+        "forbidden absolute symlink authority must have a valid identity",
+      );
+      return Object.freeze({
+        identity: Object.freeze({ dev, ino }),
+        path: authority.path,
+      });
+    });
+  let sourceOwnedRootAuthority;
+  let destinationOwnedRootAuthority;
   let destinationRootHandle;
   let destinationRootIdentity;
   let primaryFailure;
   try {
+    sourceOwnedRootAuthority = await openPrivateOwnedRootAuthority(sourceOwnedRoot, {
+      inspectAncestorAcl: inspectOwnedRootAncestorAcl,
+      inspectRootAcl: inspectOwnedRootAcl,
+    });
+    destinationOwnedRootAuthority = await openPrivateOwnedRootAuthority(
+      destinationOwnedRoot,
+      {
+        inspectAncestorAcl: inspectOwnedRootAncestorAcl,
+        inspectRootAcl: inspectOwnedRootAcl,
+      },
+    );
+    const rootsShareRequestedPath =
+      resolve(sourceOwnedRoot) === resolve(destinationOwnedRoot);
+    if (!rootsShareRequestedPath) {
+      assert(
+        !sameFileIdentity(
+          sourceOwnedRootAuthority.identity,
+          destinationOwnedRootAuthority.identity,
+        ),
+        "stopped-tree copy rejects distinct owned-root identity aliases",
+      );
+    }
+    if (sourceOwnedRootAuthority.path !== destinationOwnedRootAuthority.path) {
+      assert(
+        !pathIsInside(
+          sourceOwnedRootAuthority.path,
+          destinationOwnedRootAuthority.path,
+        ) &&
+          !pathIsInside(
+            destinationOwnedRootAuthority.path,
+            sourceOwnedRootAuthority.path,
+          ),
+        "stopped-tree copy rejects nested owned roots",
+      );
+    }
     const canonicalSource = await assertDirectOwnedPath(
-      ownedRootAuthority,
+      sourceOwnedRootAuthority,
       source,
       "source",
       { mustExist: true },
@@ -1139,21 +1805,47 @@ export async function copyStoppedTree({
     const canonicalSourceRoot = await realpath(canonicalSource);
     const sourceRootIdentity = await lstat(canonicalSource, { bigint: true });
     assert(
-      sourceRootIdentity.isDirectory(),
+      sourceRootIdentity.isDirectory() &&
+        (normalizedExpectedSourceRootIdentity === null ||
+          sameFileIdentity(
+            sourceRootIdentity,
+            normalizedExpectedSourceRootIdentity,
+          )),
       "stopped-tree copy rejects source root identity changes",
     );
-    await assertNoMountBoundary(canonicalSource, listMountPoints);
+    await assertNoMountBoundary(canonicalSource, listMountPoints, {
+      allowRootMount: allowSourceRootMount,
+    });
+    // Scan before destination creation so a destination-root bind alias cannot
+    // mutate the source tree before the overlap is discovered.
+    const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
+    assert(
+      !sourceIdentityKeys.has(
+        fileIdentityKey(destinationOwnedRootAuthority.identity),
+      ),
+      "stopped-tree copy rejects a destination root identity inside the source tree",
+    );
+    const forbiddenAbsoluteSymlinkIdentityKeys =
+      allowAbsoluteSymlinks &&
+      normalizedForbiddenAbsoluteSymlinkAuthorities.length > 0
+        ? await collectForbiddenAuthorityIdentityKeys(
+            normalizedForbiddenAbsoluteSymlinkAuthorities,
+            listMountPoints,
+          )
+        : new Set();
     const canonicalDestination = await assertDirectOwnedPath(
-      ownedRootAuthority,
+      destinationOwnedRootAuthority,
       destination,
       "destination",
       { mustExist: false },
     );
     await afterDestinationValidation?.();
-    await ownedRootAuthority.assertCurrent();
+    await sourceOwnedRootAuthority.assertCurrent();
+    await destinationOwnedRootAuthority.assertCurrent();
     mkdirPrivate(canonicalDestination);
     destinationRootIdentity = await lstat(canonicalDestination, { bigint: true });
     await afterDestinationRootCreated?.();
+    await assertNoMountBoundary(canonicalDestination, listMountPoints);
     await assertPathIdentity(
       canonicalDestination,
       destinationRootIdentity,
@@ -1171,7 +1863,8 @@ export async function copyStoppedTree({
     );
     await destinationRootHandle.chmod(0o700);
     const assertDestinationRootCurrent = async () => {
-      await ownedRootAuthority.assertCurrent();
+      await sourceOwnedRootAuthority.assertCurrent();
+      await destinationOwnedRootAuthority.assertCurrent();
       const heldIdentity = await destinationRootHandle.stat({ bigint: true });
       const currentIdentity = await assertPathIdentity(
         canonicalDestination,
@@ -1183,12 +1876,12 @@ export async function copyStoppedTree({
         "stopped-tree copy rejects destination root identity changes",
       );
     };
-    // Index before copying so an absolute link cannot reach a source subtree
-    // through an external bind-mount or other filesystem identity alias.
-    const sourceIdentityKeys = await collectTreeIdentities(canonicalSource);
+    // The pre-creation index also prevents absolute links from reaching a
+    // source subtree through an external bind-mount or identity alias.
     await assertDestinationRootCurrent();
     await copyTreeEntry(
       {
+        allowAbsoluteSymlinks,
         assertDestinationRootCurrent,
         afterDestinationDirectoryCreated,
         afterSourceSymlinkValidated,
@@ -1203,6 +1896,9 @@ export async function copyStoppedTree({
           ),
         ],
         destinationRootIdentity,
+        forbiddenAbsoluteSymlinkAuthorities:
+          normalizedForbiddenAbsoluteSymlinkAuthorities,
+        forbiddenAbsoluteSymlinkIdentityKeys,
         inspectSymlinkPath,
         sourceIdentityKeys,
         sourceRootIdentity,
@@ -1218,16 +1914,46 @@ export async function copyStoppedTree({
         expectedSourceIdentity: sourceRootIdentity,
       },
     );
+    await assertNoMountBoundary(canonicalSource, listMountPoints, {
+      allowRootMount: allowSourceRootMount,
+    });
+    await assertNoMountBoundary(canonicalDestination, listMountPoints);
+    if (forbiddenAbsoluteSymlinkIdentityKeys.size > 0) {
+      const currentForbiddenAuthorityIdentityKeys =
+        await collectForbiddenAuthorityIdentityKeys(
+          normalizedForbiddenAbsoluteSymlinkAuthorities,
+          listMountPoints,
+        );
+      assert(
+        identitySetsEqual(
+          forbiddenAbsoluteSymlinkIdentityKeys,
+          currentForbiddenAuthorityIdentityKeys,
+        ),
+        "stopped-tree copy rejects forbidden authority identity changes",
+      );
+    }
     await assertDestinationRootCurrent();
   } catch (error) {
     primaryFailure = { error };
     throw error;
   } finally {
     await runSequentialCleanup(
-      [() => destinationRootHandle?.close(), () => ownedRootAuthority.handle.close()],
+      [
+        () => destinationRootHandle?.close(),
+        () => destinationOwnedRootAuthority?.handle.close(),
+        () => sourceOwnedRootAuthority?.handle.close(),
+      ],
       primaryFailure,
     );
   }
+}
+
+export async function copyStoppedTree({ ownedRoot, ...options }) {
+  return copyStoppedTreeBetweenRoots({
+    ...options,
+    destinationOwnedRoot: ownedRoot,
+    sourceOwnedRoot: ownedRoot,
+  });
 }
 
 function updateHashFields(hash, fields) {
@@ -1236,6 +1962,169 @@ function updateHashFields(hash, fields) {
     hash.update(`${bytes.length}:`);
     hash.update(bytes);
   }
+}
+
+async function syncTreeEntry(
+  path,
+  {
+    afterEntryOpen,
+    beforeEntryOpen,
+    checkAccess,
+    syncDirectory,
+    syncFile,
+  },
+) {
+  const metadata = await lstat(path, { bigint: true });
+  if (metadata.isSymbolicLink()) {
+    if (metadata.nlink !== 1n) {
+      throw new Error("stopped-tree sync rejects hard-linked symlinks");
+    }
+    await readPortableSymlink(path);
+    const finalMetadata = await lstat(path, { bigint: true });
+    assertStableFileMetadata(
+      metadata,
+      finalMetadata,
+      "stopped-tree sync rejects symlink metadata changes",
+    );
+    await assertPathIdentity(
+      path,
+      metadata,
+      "stopped-tree sync rejects symlink identity changes",
+    );
+    return;
+  }
+
+  if (metadata.isDirectory()) {
+    await beforeEntryOpen?.(path, metadata);
+    const handle = await open(
+      path,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    let primaryFailure;
+    try {
+      const heldMetadata = await handle.stat({ bigint: true });
+      assert(
+        heldMetadata.isDirectory(),
+        "stopped-tree sync rejects directory identity changes",
+      );
+      assertStableFileMetadata(
+        metadata,
+        heldMetadata,
+        "stopped-tree sync rejects directory metadata changes",
+      );
+      await afterEntryOpen?.(path, heldMetadata);
+      await assertSnapshotUserAccess(
+        path,
+        fsConstants.R_OK | fsConstants.X_OK,
+        checkAccess,
+      );
+      portableMode(heldMetadata);
+      const entries = await readPortableDirectory(path);
+      await assertPathIdentity(
+        path,
+        heldMetadata,
+        "stopped-tree sync rejects directory identity changes",
+      );
+      for (const entry of entries) {
+        await syncTreeEntry(join(path, entry), {
+          afterEntryOpen,
+          beforeEntryOpen,
+          checkAccess,
+          syncDirectory,
+          syncFile,
+        });
+      }
+      await syncDirectory(handle, path);
+      assertStableFileMetadata(
+        heldMetadata,
+        await handle.stat({ bigint: true }),
+        "stopped-tree sync rejects directory metadata changes",
+      );
+      await assertPathIdentity(
+        path,
+        heldMetadata,
+        "stopped-tree sync rejects directory identity changes",
+      );
+    } catch (error) {
+      primaryFailure = { error };
+      throw error;
+    } finally {
+      await runSequentialCleanup([() => handle.close()], primaryFailure);
+    }
+    return;
+  }
+
+  if (!metadata.isFile()) {
+    throw new Error("stopped-tree sync rejects sockets, devices, and FIFOs");
+  }
+  await assertSnapshotUserAccess(path, fsConstants.R_OK, checkAccess);
+  if (metadata.nlink !== 1n) {
+    throw new Error("stopped-tree sync rejects hard-linked files");
+  }
+  await beforeEntryOpen?.(path, metadata);
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let primaryFailure;
+  try {
+    const heldMetadata = await handle.stat({ bigint: true });
+    assert(
+      heldMetadata.isFile(),
+      "stopped-tree sync rejects file identity changes",
+    );
+    assertStableFileMetadata(
+      metadata,
+      heldMetadata,
+      "stopped-tree sync rejects file metadata changes",
+    );
+    await afterEntryOpen?.(path, heldMetadata);
+    portableMode(heldMetadata);
+    await syncFile(handle, path);
+    assertStableFileMetadata(
+      heldMetadata,
+      await handle.stat({ bigint: true }),
+      "stopped-tree sync rejects file metadata changes",
+    );
+    await assertPathIdentity(
+      path,
+      heldMetadata,
+      "stopped-tree sync rejects file identity changes",
+    );
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await runSequentialCleanup([() => handle.close()], primaryFailure);
+  }
+}
+
+export async function syncStoppedTree(
+  root,
+  {
+    afterEntryOpen,
+    allowRootMount = false,
+    beforeEntryOpen,
+    checkAccess = access,
+    listMountPoints = listCurrentMountPoints,
+    syncDirectory = async (handle) => handle.sync(),
+    syncFile = async (handle) => handle.sync(),
+  } = {},
+) {
+  assert.equal(typeof allowRootMount, "boolean", "allowRootMount must be a boolean");
+  assert.equal(typeof syncDirectory, "function", "syncDirectory must be a function");
+  assert.equal(typeof syncFile, "function", "syncFile must be a function");
+  const rootMetadata = await lstat(root, { bigint: true });
+  assert(
+    rootMetadata.isDirectory() && !rootMetadata.isSymbolicLink(),
+    "stopped-tree sync root must be a directory",
+  );
+  await assertNoMountBoundary(root, listMountPoints, { allowRootMount });
+  await syncTreeEntry(root, {
+    afterEntryOpen,
+    beforeEntryOpen,
+    checkAccess,
+    syncDirectory,
+    syncFile,
+  });
+  await assertNoMountBoundary(root, listMountPoints, { allowRootMount });
 }
 
 async function hashTreeEntry(hash, root, path, checkAccess) {
@@ -1324,11 +2213,17 @@ async function hashTreeEntry(hash, root, path, checkAccess) {
 
 export async function digestTree(
   root,
-  { checkAccess = access, listMountPoints = listCurrentMountPoints } = {},
+  {
+    allowRootMount = false,
+    checkAccess = access,
+    listMountPoints = listCurrentMountPoints,
+  } = {},
 ) {
-  await assertNoMountBoundary(root, listMountPoints);
+  assert.equal(typeof allowRootMount, "boolean", "allowRootMount must be a boolean");
+  await assertNoMountBoundary(root, listMountPoints, { allowRootMount });
   const hash = createHash("sha256");
   await hashTreeEntry(hash, root, root, checkAccess);
+  await assertNoMountBoundary(root, listMountPoints, { allowRootMount });
   return hash.digest("hex");
 }
 

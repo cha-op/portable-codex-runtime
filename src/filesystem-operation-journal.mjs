@@ -20,6 +20,7 @@ import {
 } from "./stopped-tree.mjs";
 
 export const OPERATION_JOURNAL_RECORD_VERSION = 1;
+export const OPERATION_JOURNAL_LOCK_NAME = ".operation-journal.lock";
 
 const MAX_CANONICAL_BYTES = 512 * 1024;
 const MAX_CANONICAL_DEPTH = 24;
@@ -363,6 +364,20 @@ function canonicalBytes(value, code = "invalid_journal_request") {
 
 function canonicalEqual(left, right) {
   return canonicalBytes(left) === canonicalBytes(right);
+}
+
+export function snapshotOperationJournalBinding(value) {
+  const binding = canonicalize(
+    value,
+    "invalid_journal_request",
+    canonicalTraversalState({ bytes: 0, nodes: 0 }),
+  );
+  ensure(
+    binding !== null && typeof binding === "object" && !Array.isArray(binding),
+    "invalid_journal_request",
+  );
+  canonicalBytes(binding);
+  return deepFreeze(binding);
 }
 
 function normalizeResult(value, request, code, budget) {
@@ -1382,7 +1397,10 @@ export class FilesystemOperationJournal {
       let operationCommitState = "not-committed";
       try {
         try {
-          lock = await this.#acquireLock(join(authority.path, ".operation-journal.lock"));
+          lock = await this.#acquireLock(
+            join(authority.path, OPERATION_JOURNAL_LOCK_NAME),
+            { requireExisting: true },
+          );
         } catch {
           fail("journal_io_failed");
         }
@@ -1468,6 +1486,55 @@ export class FilesystemOperationJournal {
           record,
         },
       };
+    });
+  }
+
+  async readStateHint(options) {
+    const { operationId } = exactOptions(
+      options,
+      ["operationId"],
+      ["operationId"],
+    );
+    const normalizedId = assertOperationId(operationId);
+    const pin = await this.#getDirectoryPin();
+    const queueKey = `${pin.identity.dev.toString()}\0${pin.identity.ino.toString()}`;
+    return runQueued(queueKey, async () => {
+      let authority;
+      let outcome;
+      let primaryError;
+      try {
+        authority = await openDirectoryAuthority(pin.path, {
+          expectedPin: pin,
+          inspectAncestorAcl: this.#inspectAncestorAcl,
+          inspectDirectoryAcl: this.#inspectDirectoryAcl,
+        });
+        const visible = await readCanonicalRecord(
+          authority,
+          normalizedId,
+          { afterRecordRead: async () => {} },
+          { inspectTemporaryRecordPath: this.#inspectTemporaryRecord },
+        );
+        await authority.assertCurrent();
+        outcome = frozenOutcome(visible.record, false);
+      } catch (error) {
+        primaryError = normalizeRuntimeError(error);
+      }
+      try {
+        await authority?.handle.close();
+      } catch {
+        primaryError = createJournalError("journal_io_failed", "not-committed");
+      }
+      if (primaryError !== undefined) throw primaryError;
+      return outcome;
+    });
+  }
+
+  async describeAuthority() {
+    const pin = await this.#getDirectoryPin();
+    return Object.freeze({
+      device: pin.identity.dev.toString(),
+      inode: pin.identity.ino.toString(),
+      path: pin.path,
     });
   }
 

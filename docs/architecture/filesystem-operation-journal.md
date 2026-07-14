@@ -8,12 +8,32 @@ mutation request, complete checkpoint descriptor, predetermined final result,
 and later materialisation metadata without performing the storage operation
 itself.
 
-`FilesystemOperationJournal` exposes four transitions:
+`FilesystemOperationJournal` exposes four authoritative operations:
 
 - `read()` observes the canonical record or the implicit `absent` state;
 - `prepare()` creates the first exact operation record;
 - `markMaterialized()` records caller-supplied materialisation metadata; and
 - `commit()` authorises replay of the exact result fixed by `prepare()`.
+
+`readStateHint()` is a separate read-only planning primitive. It opens and
+validates the canonical record without acquiring the journal lock and without
+running observable journal fault callbacks. Trusted directory-ACL and
+temporary-record inspectors still execute to validate the read. Publication
+uses that hint only after acquiring its preprovisioned publication-root lock,
+to decide whether the caller's current source leaf must be inspected before an
+authoritative journal read. A hint never authorises replay or a state
+transition: the caller must perform an authoritative locked `read()` and prove
+that the durable state did not move backwards before relying on it. Every
+transition for a publication-owned operation ID must go through the
+publication layer and therefore hold that same publication-root lock. A
+forward transition outside that ownership boundary is unsupported.
+
+`describeAuthority()` is a non-transitioning integration helper for the local
+publication layer. It returns the frozen canonical journal-directory path and
+device/inode identity from the same pinned authority used by transitions, so
+the physical layer can reject a journal nested inside a captured or published
+tree. That absolute path is host-local topology data and is never persisted in
+an operation record or checkpoint artefact.
 
 `operationJournalRecordFilename()` maps an operation ID to its canonical
 record filename. The mapping is journal metadata, not an artefact locator or a
@@ -25,7 +45,19 @@ Failure and Restart Semantics; constructing that type in an injected
 collaborator does not let the collaborator forge an internally trusted journal
 outcome.
 
-Reads and transitions return a deeply frozen `{ record, replayed }` envelope.
+`OPERATION_JOURNAL_LOCK_NAME` exposes the fixed `.operation-journal.lock`
+provisioning name. Before the journal directory is exposed to a worker or used
+by a journal instance, the trusted provisioner creates that empty regular file
+with one link, runtime effective-UID ownership, and exact mode `0600`, then
+fsyncs both the file and journal directory. Existing directories are upgraded
+only while detached and quiescent. Journal calls acquire the inode with
+`requireExisting: true`; they never create, chmod, truncate, unlink, or repair
+it. A missing or unsafe lock fails closed as journal I/O failure.
+An injected `acquireLock(path, { requireExisting: true })` implementation is a
+trusted adapter and must preserve that existing-only, no-mutation contract.
+
+Reads, state hints, and transitions return a deeply frozen
+`{ record, replayed }` envelope.
 An absent read has `record: null`; a transition sets `replayed: true` only when
 it returns an already-published exact state without rewriting the record.
 
@@ -101,7 +133,7 @@ device/inode identity, not by pathname or operation ID, because the directory
 has one advisory lock. This also coalesces aliases such as bind-mount paths and
 keeps independent operation IDs from turning ordinary local concurrency into a
 non-retryable lock conflict. Cross-process callers still require the same
-single-writer coordination boundary and default advisory lock.
+single-writer coordination boundary and preprovisioned default advisory lock.
 
 Every forward transition uses the same publication protocol while holding the
 journal lock and directory authority:
@@ -185,6 +217,15 @@ An earlier state tells the future backend which durable journal phase was
 reached. The journal does not itself continue, roll back, or reconcile the
 physical operation.
 
+`readStateHint()` deliberately omits the journal lock, fault-callback
+execution, record fsync, parent fsync, and durable readback performed by
+`read()`. It is
+safe only inside an outer serialization boundary that owns all relevant state
+transitions, as a monotonic planning hint followed by an authoritative locked
+read. A temporary-record conflict, malformed record, directory-authority
+change, or other ambiguous observation fails closed instead of guessing a
+state.
+
 ## Explicit Non-Guarantees
 
 The journal proves only the durable canonical state of an exact operation
@@ -209,8 +250,14 @@ stale predecessor from being overwritten after callbacks complete, but it is
 not a portable kernel compare-and-swap primitive. Exclusive single-writer
 control and the private-directory boundary remain required.
 
-The materialisation metadata and predetermined result are caller-supplied
-claims bound to the operation record. PR #9 must connect journal phases to
-held-directory storage barriers and atomic publication. PR #10 owns the
-same-process stopped-writer capability. PR #11 then composes those pieces into
-the stopped-directory backend and its conformance suite.
+The materialisation metadata and predetermined result remain caller-supplied
+claims when this journal is used alone. The stopped-directory publication layer
+now connects those phases to a held local-directory storage barrier,
+deterministic staging, absent-destination rename, parent sync, and exact final
+readback. A consumer still must use that higher layer rather than infer physical
+success from a journal record alone. See
+`stopped-directory-publication.md`.
+
+PR #10 owns the same-process stopped-writer capability. PR #11 then composes
+that capability, publication, canonical fence authority, and the snapshot core
+into the stopped-directory backend and its conformance suite.

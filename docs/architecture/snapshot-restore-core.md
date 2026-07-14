@@ -38,6 +38,12 @@ process restart. It does not prove that any physical backend step occurred and
 does not satisfy the core's stop, fence, barrier, publication, or destination
 isolation obligations. See `filesystem-operation-journal.md`.
 
+The stopped-directory publication layer supplies the local physical barrier,
+checkpoint bundle or restore-tree staging, atomic final-name publication, and
+exact readback boundary. It still does not authenticate stopped-writer
+evidence, atomically recheck a canonical fence, or implement the backend
+contract. See `stopped-directory-publication.md`.
+
 `captureCleanCheckpoint()` and `restoreCleanCheckpoint()` are the orchestration
 entry points. Both reject `graceful-abort` and `crash-prefix` before backend
 dispatch. Successful results contain the deeply frozen validated checkpoint
@@ -149,8 +155,8 @@ pull-request order in the runtime delivery plan:
 
 1. PR #6, backend-neutral snapshot and restore core (completed);
 2. PR #7, reusable stopped-tree primitives (completed);
-3. PR #8, durable filesystem operation journal (completed by this workstream);
-4. PR #9, stopped-directory atomic publication;
+3. PR #8, durable filesystem operation journal (completed);
+4. PR #9, stopped-directory atomic publication (completed);
 5. PR #10, same-process stopped-writer capability;
 6. PR #11, stopped-directory backend conformance;
 7. replay-only uncertain-result reconciliation, followed by same-image resume

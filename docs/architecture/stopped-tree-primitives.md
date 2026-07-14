@@ -24,6 +24,29 @@ The extracted module also exposes a small set of repository-internal metadata,
 digest, and ACL helpers needed by the probe. Those helpers are not a new stable
 storage-backend contract.
 
+The stopped-directory publication layer additionally uses
+`openStoppedTreeRootAuthority()`, `copyStoppedTreeBetweenRoots()`, and
+`syncStoppedTree()`. The two-root copy retains a pinned authority for each
+private root, rejects root aliases and nesting, and allows a trusted adapter to
+declare the source root itself as its approved mount while still rejecting
+nested mounts. A caller may also require the source root to retain an
+already-observed device/inode identity, reject every absolute symlink, or deny
+absolute-link traversal into explicit path and device/inode authorities. These
+are publication-building primitives, not independent backend authority.
+Cross-root copy inventories every source entry identity before it creates the
+destination and rejects a destination-root identity found anywhere in that
+inventory, including a descendant bind-mount alias. When absolute links are
+enabled with forbidden authorities, it likewise inventories every authority
+root and descendant identity before destination mutation, rejects traversal
+through hard-link or bind aliases of any inventoried descendant, and requires
+the authority inventory and mount boundaries to remain stable through copy.
+`stoppedTreeContainsAnyIdentity()` provides the corresponding targeted proof:
+it validates the mount table before recursion, permits an explicitly approved
+root mount, rejects nested mounts and cross-device entries, stops before
+opening a directory whose identity already matches, and repeats the mount
+check after the scan. Its injectable mount-table reader is a trusted test and
+platform-adapter seam.
+
 These functions operate only after an external coordinator has stopped the
 writer. They do not stop a process, authenticate stopped-writer evidence, or
 authorise a checkpoint.
@@ -74,16 +97,22 @@ the helper's filesystem rules, not that an atomic or durable checkpoint was
 published.
 
 The separate filesystem operation journal can durably record predetermined
-operation phases and results, but it does not add a storage barrier or
-publication semantics to these primitives. See
-`filesystem-operation-journal.md`.
+operation phases and results, but it does not by itself add a storage barrier
+or publication semantics to these primitives. The stopped-directory
+publication layer composes both boundaries for an approved local filesystem.
+See `filesystem-operation-journal.md` and
+`stopped-directory-publication.md`.
 
 ## Integration Boundary
 
-A later stopped-directory backend may compose these primitives with a trusted
-same-process stopped-writer coordinator, an atomic canonical fence recheck, a
-storage barrier, destination isolation, durable idempotency, and an operation
-journal. That backend must return the exact descriptor and mutation envelope
+The stopped-directory publication layer now composes these primitives with a
+post-order fsync barrier, deterministic private staging, atomic final-name
+publication, exact readback, and the durable operation journal. The primitives
+remain non-durable when called independently.
+
+PR #10 supplies the trusted same-process stopped-writer capability. PR #11
+must compose that capability and this publication layer with an atomic
+canonical fence recheck and return the exact descriptor and mutation envelope
 required by the snapshot and restore core.
 
 The ext4 or filesystem-image backend, differential export, retention,

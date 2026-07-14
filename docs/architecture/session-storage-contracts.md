@@ -360,6 +360,17 @@ caller-supplied claims. It does not prove the physical artefact, writer stop,
 canonical fence, publication, destination isolation, shared-filesystem
 semantics, or backend success. See `filesystem-operation-journal.md`.
 
+The stopped-directory publication layer binds that journal to a local
+post-order fsync barrier, a canonical `artifact.json` plus `payload/`
+checkpoint bundle, a payload-only restore tree, deterministic private staging,
+absent-destination rename, parent sync, and exact final readback. The final path
+is not consumer or launcher authority before journal commit. Restore also
+requires the capture operation ID, payload digest, and canonical manifest
+digest from trusted committed catalogue state rather than accepting a bundle's
+self-reported digest as authority. This remains a local physical primitive
+rather than stopped-writer or canonical-fence authority. See
+`stopped-directory-publication.md`.
+
 Checkpoint descriptors record the source backend and storage ID, but
 intentionally omit lease ID, expiration, host-local attachment path,
 credentials, and Git Summary. Differential export consumes an immutable
@@ -383,9 +394,9 @@ Later pull requests own:
 - the linearizable binding database, renewer, idempotency store, and host fence;
 - held-directory launch authority, atomic mutation/fence transitions, provider
   proofs, and adapter conformance validators;
-- stopped-directory atomic publication, stopped-writer capability, adapter
-  conformance, graceful-abort evidence, crash-prefix atomic capture,
-  rollout-tail repair, and same-image resume verification;
+- stopped-writer capability, stopped-directory adapter conformance,
+  graceful-abort evidence, crash-prefix atomic capture, rollout-tail repair,
+  and same-image resume verification;
 - ext4 or filesystem-image physical snapshot and restore;
 - differential compression, encryption, retention, and atomic publication;
 - cross-host migration and fault injection; and
