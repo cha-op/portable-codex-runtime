@@ -2161,6 +2161,29 @@ test("public option envelopes reject hostile values without invoking traps", asy
   assert.equal(traps, 0);
 });
 
+test("revoked writer proxies remain inside the sanitized public error boundary", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+
+  await rejectedCapabilityError(
+    () =>
+      coordinator.stopAndIssueCapability(
+        stopOptions(revoked.proxy),
+      ),
+    "writer_state_conflict",
+  );
+  syncCapabilityError(
+    () => coordinator.revokeWriter(writerOptions(revoked.proxy)),
+    "writer_state_conflict",
+  );
+  syncCapabilityError(
+    () => coordinator.retireWriter(writerOptions(revoked.proxy)),
+    "writer_state_conflict",
+  );
+  assert.equal(coordinator.dispose(), undefined);
+});
+
 test("registration rejects malformed identities, callbacks, and mismatched attachment fences", async (t) => {
   const invalidRegistrations = [
     registerOptions({ processIncarnationId: "" }),

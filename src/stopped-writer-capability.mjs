@@ -731,8 +731,8 @@ export class StoppedWriterCapabilityCoordinator {
     if (
       writer === null ||
       typeof writer !== "object" ||
-      arrayIsArray(writer) ||
-      isProxyValue(writer)
+      isProxyValue(writer) ||
+      arrayIsArray(writer)
     ) {
       fail("writer_state_conflict");
     }
