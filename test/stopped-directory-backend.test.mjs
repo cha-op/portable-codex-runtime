@@ -732,7 +732,7 @@ function createRuntime(fixture, options = {}) {
   const lifecycle = options.lifecycle ?? createLifecycleBackend();
   const mutation = createMutationAuthority(fixture, options);
   let resolverCalls = 0;
-  const resolveStoppedWriter = options.resolveStoppedWriter ?? ((input) => {
+  const resolveDefault = (input) => {
     resolverCalls += 1;
     fixture.observation.events.push("resolver");
     assert(Object.isFrozen(input));
@@ -744,7 +744,16 @@ function createRuntime(fixture, options = {}) {
       writer,
       writerIncarnationId: WRITER_INCARNATION_ID,
     });
-  });
+  };
+  const resolveStoppedWriter =
+    options.resolveStoppedWriterFactory?.({
+      resolveDefault,
+      writer,
+      writerAttachment,
+      writerLease,
+    }) ??
+    options.resolveStoppedWriter ??
+    resolveDefault;
 
   const backend = new StoppedDirectoryBackend({
     backendId: BACKEND_ID,
@@ -1295,6 +1304,125 @@ test("restore waits for durable authority finalization after publication", async
     fixture.mutation.state.restoreFinalizations[0],
     callbackCompletion,
   );
+});
+
+test("constructor rejects an async stopped-writer resolver before invocation", async (t) => {
+  let resolverCalls = 0;
+  await assert.rejects(
+    () =>
+      createFixture(t, {
+        async resolveStoppedWriter() {
+          resolverCalls += 1;
+          return undefined;
+        },
+      }),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
+  assert.equal(resolverCalls, 0);
+});
+
+test("a rejected native resolver Promise is observed without consuming authority", async (t) => {
+  const unhandledRejections = [];
+  const onUnhandledRejection = (reason, promise) => {
+    unhandledRejections.push({ promise, reason });
+  };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    const resolverFailure = new Error(
+      "resolver secret at /company/private/resolver-state",
+    );
+    let resolverInvocations = 0;
+    let rejectedResolution;
+    const fixture = await createFixture(t, {
+      resolveStoppedWriterFactory: ({ resolveDefault }) => (input) => {
+        resolverInvocations += 1;
+        if (resolverInvocations === 1) {
+          rejectedResolution = Promise.reject(resolverFailure);
+          return rejectedResolution;
+        }
+        return resolveDefault(input);
+      },
+    });
+    const capability = await issueCapability(fixture);
+    let observedError;
+
+    await assert.rejects(
+      () =>
+        fixture.backend.captureCheckpoint(
+          captureDispatchInput(fixture, capability),
+        ),
+      (error) => {
+        observedError = error;
+        return assertBackendError(error);
+      },
+    );
+    assert(rejectedResolution instanceof Promise);
+    assert.equal(resolverInvocations, 1);
+    assert.equal(fixture.mutation.state.captureRuns, 0);
+    assert.equal(await pathExists(fixture.artifactDirectory), false);
+    assert.equal(
+      `${observedError.message}\n${observedError.stack}`.includes(
+        "/company/private/resolver-state",
+      ),
+      false,
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandledRejections, []);
+
+    const options = captureCoreOptions(fixture, capability);
+    const result = await captureCleanCheckpoint(options);
+    assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+    assert.equal(resolverInvocations, 2);
+    assert.equal(fixture.resolverCalls, 1);
+    assert.equal(fixture.mutation.state.captureRuns, 1);
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+  }
+});
+
+test("resolver thenable accessors remain opaque and do not consume authority", async (t) => {
+  let resolverInvocations = 0;
+  let thenCalls = 0;
+  let thenReads = 0;
+  const fixture = await createFixture(t, {
+    resolveStoppedWriterFactory: ({ resolveDefault }) => (input) => {
+      resolverInvocations += 1;
+      if (resolverInvocations !== 1) return resolveDefault(input);
+      return Object.defineProperty({}, "then", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          thenReads += 1;
+          return () => {
+            thenCalls += 1;
+          };
+        },
+      });
+    },
+  });
+  const capability = await issueCapability(fixture);
+
+  await assert.rejects(
+    () =>
+      fixture.backend.captureCheckpoint(
+        captureDispatchInput(fixture, capability),
+      ),
+    assertBackendError,
+  );
+  assert.equal(thenReads, 0);
+  assert.equal(thenCalls, 0);
+  assert.equal(fixture.mutation.state.captureRuns, 0);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+
+  const options = captureCoreOptions(fixture, capability);
+  const result = await captureCleanCheckpoint(options);
+  assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+  assert.equal(resolverInvocations, 2);
+  assert.equal(thenReads, 0);
+  assert.equal(thenCalls, 0);
 });
 
 test("deterministic invalid inputs fail before resolver, authority, publication, or journal", async (t) => {

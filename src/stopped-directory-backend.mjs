@@ -50,6 +50,7 @@ const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const stringStartsWithIntrinsic = String.prototype.startsWith;
 const {
+  isAsyncFunction: isAsyncFunctionValue,
   isGeneratorFunction: isGeneratorFunctionValue,
   isGeneratorObject: isGeneratorObjectValue,
   isPromise: isPromiseValue,
@@ -380,6 +381,12 @@ function assertTrustedFunction(value, failure = failInvalid) {
     failure();
   }
   return value;
+}
+
+function assertTrustedSynchronousFunction(value, failure = failInvalid) {
+  const operation = assertTrustedFunction(value, failure);
+  if (isAsyncFunctionValue(operation)) failure();
+  return operation;
 }
 
 function assertOpaqueId(value, failure = failInvalid) {
@@ -980,6 +987,15 @@ function isSafeAuthorityPromise(value) {
   return false;
 }
 
+async function observeSafePromiseRejection(value) {
+  try {
+    await value;
+  } catch {
+    // The resolver violated its synchronous contract. Observation prevents an
+    // owned native rejection from escaping after the backend fails closed.
+  }
+}
+
 async function runAuthorityMethod(authority, method, admission, publish) {
   let callbackCalls = 0;
   let callbackCompleted = false;
@@ -1199,7 +1215,7 @@ export class StoppedDirectoryBackend {
     this.#lifecycleBackend = lifecycleBackend;
     this.#lifecycleMethods = exactFrozenRecord(lifecycleMethods);
     this.#publication = options.publication;
-    this.#resolveStoppedWriter = assertTrustedFunction(
+    this.#resolveStoppedWriter = assertTrustedSynchronousFunction(
       options.resolveStoppedWriter,
     );
     objectDefineProperty(this, "backendId", {
@@ -1256,9 +1272,13 @@ export class StoppedDirectoryBackend {
       const resolution = reflectApply(this.#resolveStoppedWriter, undefined, [
         resolverInput,
       ]);
-      ensureUncertain(
-        !isPromiseValue(resolution) && !isGeneratorObjectValue(resolution),
-      );
+      if (isPromiseValue(resolution)) {
+        if (isSafeAuthorityPromise(resolution)) {
+          void observeSafePromiseRejection(resolution);
+        }
+        failUncertain();
+      }
+      ensureUncertain(!isGeneratorObjectValue(resolution));
       resolved = normalizeResolvedWriter(resolution, request.attachment);
     } catch {
       failUncertain();

@@ -89,6 +89,14 @@ It resolves trusted runtime state to exactly:
 }
 ```
 
+An `AsyncFunction` resolver is rejected during backend construction. If an
+ordinary resolver nevertheless returns a same-realm native Promise, the
+backend observes that Promise only through its safe local await boundary so a
+rejection cannot become process-level unhandled state, then fails the capture
+as uncertain without using the fulfillment value. The backend never invokes
+an unsafe thenable or Promise constructor path; the resolver retains rejection
+observation ownership for any unsafe asynchronous value it returns.
+
 The supplied stopped-writer evidence remains the original process-local object
 capability. The resolver record supplies the matching writer handle and
 correlation values, but none of those fields independently carries stop
