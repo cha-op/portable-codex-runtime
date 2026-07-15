@@ -1,3 +1,4 @@
+import { randomUUID as randomUUIDExport } from "node:crypto";
 import {
   basename as pathBasenameExport,
   dirname as pathDirnameExport,
@@ -47,6 +48,7 @@ const pathIsAbsolute = pathIsAbsoluteExport;
 const pathParse = pathParseExport;
 const pathResolve = pathResolveExport;
 const PromiseConstructor = Promise;
+const randomUUIDIntrinsic = randomUUIDExport;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -445,6 +447,16 @@ function assertUuid(value, failure) {
     failure();
   }
   return value;
+}
+
+function mintCaptureAttemptId() {
+  let captureAttemptId;
+  try {
+    captureAttemptId = callIntrinsic(randomUUIDIntrinsic, undefined, []);
+  } catch {
+    failUncertain();
+  }
+  return assertUuid(captureAttemptId, failUncertain);
 }
 
 function parseFencingEpoch(value, failure) {
@@ -1043,7 +1055,7 @@ function normalizeCaptureAttempt(value, request) {
     CAPTURE_JOURNAL_BINDING_KEYS,
     failUncertain,
   );
-  const captureAttemptId = assertOpaqueId(
+  const captureAttemptId = assertUuid(
     attempt.captureAttemptId,
     failUncertain,
   );
@@ -1210,7 +1222,12 @@ async function runAuthorityMethod(authority, method, admission, publish) {
   }
 }
 
-function normalizeCaptureContext(value, request, resolved) {
+function normalizeCaptureContext(
+  value,
+  request,
+  resolved,
+  expectedCaptureAttemptId,
+) {
   const context = assertExactDataObject(
     value,
     CAPTURE_CONTEXT_KEYS,
@@ -1263,10 +1280,11 @@ function normalizeCaptureContext(value, request, resolved) {
     source.directory === canonicalAttachment.rootPath &&
       pathsAreDisjoint(source.ownedRoot, artifact.ownedRoot),
   );
-  const captureAttemptId = assertOpaqueId(
+  const captureAttemptId = assertUuid(
     context.captureAttemptId,
     failUncertain,
   );
+  ensureUncertain(captureAttemptId === expectedCaptureAttemptId);
   const reservationId = assertOpaqueId(context.reservationId, failUncertain);
   return exactFrozenRecord({
     artifact,
@@ -1519,15 +1537,21 @@ export class StoppedDirectoryBackend {
             processIncarnationId: resolved.processIncarnationId,
             runSnapshot: async (binding) => {
               validateCoordinatorBinding(binding, request, resolved);
+              const captureAttemptId = mintCaptureAttemptId();
+              const captureAdmission = exactFrozenRecord({
+                ...admission,
+                captureAttemptId,
+              });
               return runAuthorityMethod(
                 this.#authority,
                 this.#authority.runCapture,
-                admission,
+                captureAdmission,
                 async (rawContext) => {
                   const context = normalizeCaptureContext(
                     rawContext,
                     request,
                     resolved,
+                    captureAttemptId,
                   );
                   const bindingRecord = captureJournalBinding(
                     context,

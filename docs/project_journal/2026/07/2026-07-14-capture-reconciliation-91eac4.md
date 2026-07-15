@@ -23,9 +23,23 @@ superseded_by:
 ## Current State
 
 - Normal capture still consumes exactly one same-process stopped-writer
-  capability and atomically requires an absent journal operation. Before
-  publication, the trusted mutation authority durably creates the canonical
-  attempt and supplies its opaque attempt ID for the v2 coordinator binding.
+  capability and atomically requires an absent journal operation. Inside that
+  one-shot callback the backend generates a fresh UUID; before publication,
+  the trusted mutation authority atomically claims it in a globally unique
+  durable ledger and creates the canonical attempt for the v2 coordinator
+  binding.
+- Attempt-ID and operation claims are never reusable. Durable tombstones must
+  outlive every journal, artefact, snapshot, backup, and DR generation that can
+  reintroduce an old value, and the authority ledger must not roll back with a
+  session data volume.
+- Both active claim indexes bind the same canonical attempt record. Retirement
+  atomically transitions them to one non-authorizing tombstone, so reinserting
+  a structural copy of the old attempt cannot revive reconciliation authority.
+- Normal capture, reconciliation, and retirement share per-operation
+  serialization. Reconciliation revalidates after admission waits and
+  immediately before verification. Durable finalization revalidates the
+  expected attempt plus both active claim indexes after asynchronous
+  verification so a concurrent tombstone cannot be overwritten.
 - `reconcileCleanCheckpointCapture()` accepts the original descriptor and
   checkpoint request without a current lease, clock, attachment, writer, or
   stopped-writer capability. It dispatches only to a backend advertising the
@@ -49,6 +63,10 @@ superseded_by:
 - The conformance mutation authority proves the seam and failure model. A
   production linearizable database, catalogue, fence service, and launcher
   admission implementation remain deferred.
+- Hostile regressions prove that a pre-existing committed artefact cannot be
+  authenticated by a fresh attempt and that a durable attempt-ID collision is
+  rejected before the publication callback, including after the canonical
+  attempt record itself has been retired.
 - Git Summary remains deferred user context and is not reconciliation
   authority.
 

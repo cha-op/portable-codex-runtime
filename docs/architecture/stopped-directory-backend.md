@@ -121,14 +121,33 @@ and attachment/launcher admission guard. After a successful callback it must
 durably and idempotently finalize the catalogue or restore destination and
 return the exact same completion object.
 
-Before normal capture publication, `runCapture` must also atomically create an
-authenticated durable capture-attempt record from absent state. Its opaque
-attempt ID and complete v2 coordinator binding remain outside worker-controlled
-storage as canonical authority data. `runCaptureReconciliation` must load that
-same record by the original operation, serialize concurrent reconciliation,
-and supply its exact binding, request, and predetermined result to the callback.
-A journal record or caller-supplied attempt ID cannot substitute for that
-lookup.
+After the stopped-writer capability has entered its one-shot snapshot callback,
+the backend generates a fresh CSPRNG UUID candidate and includes it in the
+normal capture admission. Before normal capture publication, `runCapture` must
+atomically claim that exact ID in a globally unique durable ledger and create
+the authenticated capture-attempt record from absent state. It may neither
+replace the candidate nor invoke the callback before the claim and record are
+durable. The ID and complete v2 coordinator binding remain outside
+worker-controlled storage as canonical authority data.
+
+Both the attempt-ID claim and the operation claim are non-reusable generation
+records backed by the same transactional ownership row. While active, that row
+must bind both indexes to the canonical attempt record itself; matching string
+values or a reconstructed structural copy are insufficient. Deleting or
+compacting a complete attempt must atomically transition both indexes to the
+same `retired` tombstone, which can reject reuse but can never authorize
+reconciliation.
+Their retention must cover every journal, artefact, snapshot, backup, and DR
+restore generation in which the old value can reappear; the safest production
+policy is permanent retention. The authority ledger must not roll back with a
+session data volume. CSPRNG collision resistance is defense in depth, not a
+replacement for the unique durable claim.
+
+`runCaptureReconciliation` must load that same claimed record by the original
+operation, serialize concurrent reconciliation, and supply its exact binding,
+request, and predetermined result to the callback. A journal record,
+tombstone, caller-supplied attempt ID, or reconstructed record cannot substitute
+for that lookup.
 
 The canonical attempt passed across the seam has this exact data shape:
 
@@ -174,19 +193,24 @@ Capture follows one authority chain:
 3. Consume the supplied capability through the designated coordinator with the
    resolved writer, process/writer incarnations, stop operation, registered
    canonical lease, and attachment.
-4. Inside the coordinator's one `runSnapshot` callback, invoke
+4. Inside the coordinator's one `runSnapshot` callback, generate a fresh
+   capture-attempt UUID and include it in
    `mutationAuthority.runCapture(admission, publish)`.
-5. Let the authority reserve the exact request, descriptor, and predetermined
-   `{ checkpoint, mutation }` result before it invokes `publish`.
-6. Validate the complete authority context while its fence and admission guard
+5. Let the authority atomically claim that exact UUID and operation, create the
+   immutable durable attempt, and reserve the exact request, descriptor, and
+   predetermined `{ checkpoint, mutation }` result before it invokes
+   `publish`.
+6. Require the authority context to echo the admitted UUID exactly, then
+   validate the rest of the context while its fence and admission guard
    is still held, then call `publishFreshCheckpointArtifact()`. Its atomic
    journal preparation accepts only an `absent` operation ID.
 7. Return the publication completion to the authority, which must durably
    finalize the catalogue and return that same object before backend success.
 
 The frozen capture admission contains the exact attachment, checkpoint,
-request, process and writer incarnation IDs, and stop operation ID. It does
-not contain the writer handle or the stopped-writer capability.
+request, backend-generated capture-attempt UUID, process and writer incarnation
+IDs, and stop operation ID. It does not contain the writer handle or the
+stopped-writer capability.
 
 The authority invokes `publish(context)` exactly once with:
 
@@ -206,8 +230,10 @@ The authority invokes `publish(context)` exactly once with:
 }
 ```
 
-The callback revalidates the authority clock, exact fence, storage binding,
-attachment, predetermined result, and complete path plan before publication.
+The callback requires `captureAttemptId` to equal the backend-generated value
+in the admission, then revalidates the authority clock, exact fence, storage
+binding, attachment, predetermined result, and complete path plan before
+publication.
 The capture publication binding remains independently versioned at v2; it is
 not derived from the adapter contract version. It contains the capture-attempt
 and reservation IDs, exact checkpoint, attachment ID, attachment operation and
@@ -238,16 +264,29 @@ admission contains only `{ checkpoint, request }`. Before invoking `verify`,
 the trusted authority must load the canonical durable attempt and pass an exact
 context containing the artefact path plan plus that attempt's v2 binding,
 request, and predetermined result. The backend validates every field, including
-the opaque capture-attempt ID, and requires the attempt request and result to
-match the admission exactly.
+the UUID capture-attempt ID, and requires the attempt request and result to
+match the admission exactly. The authority must also prove internally that the
+loaded attempt is the canonical record bound by both sides of the same active
+durable claim. A retained tombstone, matching pair of strings, or reconstructed
+attempt is not active ownership and cannot authorize verification.
+
+Claim activation, reconciliation, finalization, and retirement for one
+operation share the same serialized authority transaction or operation mutex.
+After any asynchronous admission gate, the authority revalidates active
+ownership immediately before each verifier invocation. Because physical
+verification is also asynchronous, finalization must compare the expected
+canonical attempt and both active claim indexes again after the callback
+settles. It must never overwrite a concurrent `retired` tombstone or adopt a
+replacement attempt; any ownership change makes the result uncertain.
 
 The callback calls `verifyCommittedCheckpointArtifact()` with no source path.
 That publication method can only read and validate the exact committed journal
 record and final artefact; it cannot advance `prepared` or `materialized`
 state. The backend requires `replayed: true`, derives the canonical artefact
 proof from the verified materialisation, and returns the same frozen completion
-shape as capture. The authority must idempotently finalize or confirm the
-catalogue and return the exact same completion object before success.
+shape as capture. The authority must revalidate the same active claim and
+expected canonical attempt, then idempotently finalize or confirm the catalogue
+and return the exact same completion object before success.
 
 This division is the authentication boundary: the mutation authority proves
 that the attempt record is canonical, while publication proves that its exact

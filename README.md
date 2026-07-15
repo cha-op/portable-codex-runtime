@@ -183,12 +183,19 @@ retaining exact committed replay. Runtime collaborator failures are fixed
 path-free uncertainty; the adapter performs no internal retry, speculative
 cleanup, or replacement-coordinator recovery.
 
-Before normal publication, the authority durably creates an authenticated
-capture-attempt record whose opaque attempt ID is included in the v2 journal
-binding. A separate authority method can later load that exact record and ask
-the backend to verify only its committed artefact. It never consumes another
-stopped-writer capability, reads the old mutable source, or advances an
-uncommitted journal phase.
+Inside the one-shot stopped-writer callback, the backend generates a fresh
+capture-attempt UUID. Before publication, the authority must atomically claim
+that exact UUID and operation in a globally unique durable ledger, create the
+authenticated attempt, and retain non-reusable tombstones beyond every
+journal, artefact, snapshot, backup, and DR generation that could restore an
+old value. Active claim indexes must bind the same canonical attempt record;
+retirement atomically changes both to non-authorizing tombstones. Claim
+activation, reconciliation, finalization, and retirement share a per-operation
+authority transaction or mutex, and finalization revalidates ownership after
+asynchronous verification. A separate authority method can later load that
+exact actively claimed record and ask the backend to verify only its committed
+artefact. It never consumes another stopped-writer capability, reads the old
+mutable source, or advances an uncommitted journal phase.
 
 The adapter advertises normal directory attachments, exclusive writers,
 `fencing: "manual"`, and
