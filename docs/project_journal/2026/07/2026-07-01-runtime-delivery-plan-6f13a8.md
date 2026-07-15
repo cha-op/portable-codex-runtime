@@ -3,7 +3,7 @@ id: 20260701-6f13a8
 title: Portable Runtime Delivery Plan
 status: active
 created: 2026-07-01
-updated: 2026-07-02
+updated: 2026-07-15
 branch:
 pr:
 supersedes: []
@@ -24,20 +24,23 @@ superseded_by:
 - The external `chatgptAuthTokens` consumer boundary is already proven.
 - Auth refresh authority, interrupted-turn recovery, session storage contracts,
   the auth broker MVP, snapshot and restore core, stopped-tree primitives,
-  durable filesystem operation journal, and local stopped-directory
-  publication layer are complete.
-- The next serial workstream is the same-process stopped-writer capability.
+  durable filesystem operation journal, stopped-directory publication,
+  stopped-writer capability, backend composition, and committed capture
+  reconciliation are complete through PR #12.
+- Pinned-executable resume evidence and offline rollout-tail repair before
+  writable recovery are complete in the current serial slice.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Implement the same-process stopped-writer capability, then compose it with
-  publication and canonical fence authority in the stopped-directory backend
-  conformance workstream.
+- Implement the production linearizable lease, reservation, catalogue, trusted
+  OCI resolution, and launcher-admission authority behind the validated
+  backend seam.
 
 ## Evidence
 
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
+- `docs/project_journal/2026/07/2026-07-15-pinned-executable-resume-tail-repair-9d813d.md`
 - `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`

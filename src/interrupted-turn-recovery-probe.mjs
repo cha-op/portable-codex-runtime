@@ -9,6 +9,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -67,7 +68,20 @@ export const RECOVERY_SCENARIOS = Object.freeze([
   "sigterm",
   "sigkill",
   "snapshot_restore",
+  "missing_final_lf_repair",
+  "torn_unterminated_tail_repair",
 ]);
+
+const TAIL_REPAIR_SCENARIOS = Object.freeze({
+  missing_final_lf_repair: Object.freeze({
+    damage: "remove_final_lf",
+    repairAction: "append_lf",
+  }),
+  torn_unterminated_tail_repair: Object.freeze({
+    damage: "append_partial_record",
+    repairAction: "truncate_partial_tail",
+  }),
+});
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const SENSITIVE_EVIDENCE_PATTERNS = [
@@ -355,6 +369,79 @@ export function assertNewTurnId(turnId, interruptedTurnId) {
   return turnId;
 }
 
+async function discoverRootRecoveryRollout(codexHome, rootSessionId) {
+  const sessionsRoot = join(codexHome, "sessions");
+  const candidates = [];
+  const pending = [sessionsRoot];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(path);
+        continue;
+      }
+      assert(entry.isFile(), "recovery rollout discovery rejects non-regular entries");
+      if (entry.name.endsWith(".jsonl")) candidates.push(path);
+    }
+  }
+  assert(candidates.length > 0, "recovery rollout discovery found no JSONL candidates");
+
+  const matches = [];
+  for (const path of candidates) {
+    const bytes = await readFile(path);
+    const firstLf = bytes.indexOf(0x0a);
+    assert(firstLf > 0, "recovery rollout omitted a complete metadata record");
+    let firstRecord;
+    try {
+      firstRecord = JSON.parse(bytes.subarray(0, firstLf).toString("utf8"));
+    } catch {
+      throw new Error("recovery rollout metadata was not valid JSON");
+    }
+    if (
+      firstRecord?.type === "session_meta" &&
+      firstRecord?.payload?.id === rootSessionId &&
+      firstRecord?.payload?.session_id === rootSessionId
+    ) {
+      matches.push({ bytes, path });
+    }
+  }
+  assert.equal(matches.length, 1, "recovery rollout ownership was missing or ambiguous");
+  return matches[0];
+}
+
+export async function injectRecoveryRolloutTailDamage({
+  codexHome,
+  damage,
+  rootSessionId,
+}) {
+  assert(
+    Object.values(TAIL_REPAIR_SCENARIOS).some((scenario) => scenario.damage === damage),
+    "unknown recovery rollout tail damage",
+  );
+  const { bytes, path } = await discoverRootRecoveryRollout(codexHome, rootSessionId);
+  assert(bytes.length > 1 && bytes.at(-1) === 0x0a, "recovery rollout lacked a final LF boundary");
+
+  if (damage === "remove_final_lf") {
+    const previousLf = bytes.lastIndexOf(0x0a, bytes.length - 2);
+    const finalRecord = bytes.subarray(previousLf + 1, bytes.length - 1);
+    assert(finalRecord.length > 0, "recovery rollout ended in an empty record");
+    JSON.parse(finalRecord.toString("utf8"));
+    await writeFile(path, bytes.subarray(0, bytes.length - 1));
+  } else {
+    await writeFile(
+      path,
+      Buffer.concat([bytes, Buffer.from('{"type":"tail_repair_probe"', "utf8")]),
+    );
+  }
+}
+
+async function repairRecoveryRollouts(options) {
+  const { repairStoppedRolloutTails } = await import("./rollout-tail-repair.mjs");
+  return repairStoppedRolloutTails(options);
+}
+
 export async function verifyModelWorkspaceContext(
   requestBody,
   {
@@ -479,7 +566,11 @@ async function recoverAndInspect({
     resumeSucceeded: true,
     sameThreadId: true,
     tailTurnStatus: resumedTurn.status,
-    threadReadAgrees: coldReadTurnStatus === resumedTurn.status,
+    ...(coldReadTurnStatus === undefined
+      ? {}
+      : { threadReadAgrees: coldReadTurnStatus === resumedTurn.status }),
+    followUpCompleted: true,
+    followUpTurnId,
     modelAbortMarker: markerPresent ? "present" : "absent",
     modelWorkspaceContextMatched: workspaceContext.activeWorkspaceMatched,
     historicalWorkspaceRetained: workspaceContext.historicalWorkspaceRetained,
@@ -490,8 +581,12 @@ export async function runRecoveryScenario({
   codexBin,
   kind,
   makeTemporaryDirectory = mkdtemp,
+  repairRollouts = repairRecoveryRollouts,
+  runtimeIdentity,
   startMock = startHeldResponsesMock,
+  startClient = startRecoveryClient,
   temporaryRoot,
+  terminateClient = terminateAppServer,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
   if (!RECOVERY_SCENARIOS.includes(kind)) throw new Error(`unknown recovery scenario: ${kind}`);
@@ -505,6 +600,7 @@ export async function runRecoveryScenario({
   let client;
   let readClient;
   let recoveredClient;
+  let verificationClient;
   let mock;
   let primaryFailure;
   try {
@@ -520,7 +616,7 @@ export async function runRecoveryScenario({
     mock = await startMock({ timeoutMs });
     await writeRecoveryConfig(codexHome, mock.baseUrl);
 
-    client = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
+    client = await startClient({ codexBin, codexHome, timeoutMs });
     const started = await client.request("thread/start", { cwd: workspace, model: "mock-model" });
     const threadId = started.thread.id;
     const turn = await client.request("turn/start", {
@@ -534,6 +630,10 @@ export async function runRecoveryScenario({
     let originalCompletionObserved = false;
     let expectAbortMarker = false;
     let snapshot;
+    const repairScenario = TAIL_REPAIR_SCENARIOS[kind];
+    let immutableBackupDigest;
+    let immutableBackupRoot;
+    let repairSummary;
     if (kind === "logical_interrupt") {
       const completedPromise = client.waitForNotification("turn/completed");
       // If the interrupt RPC fails, outer cleanup rejects this waiter later.
@@ -552,7 +652,7 @@ export async function runRecoveryScenario({
       const signal = kind === "sigterm" ? "SIGTERM" : "SIGKILL";
       const completedPromise = client.waitForNotification("turn/completed");
       void completedPromise.catch(() => {});
-      const termination = await terminateAppServer(client, signal, { timeoutMs: 5_000 });
+      const termination = await terminateClient(client, signal, { timeoutMs: 5_000 });
       terminationObserved = termination.signal;
       let completed;
       try {
@@ -600,65 +700,126 @@ export async function runRecoveryScenario({
       };
     }
 
+    if (repairScenario) {
+      assert(
+        runtimeIdentity !== null && typeof runtimeIdentity === "object",
+        "tail repair scenario requires a pinned runtime identity",
+      );
+      const sourceDigest = await digestTree(sessionRoot);
+      immutableBackupRoot = join(ownedRoot, "immutable-stopped-tree-copy");
+      await copyStoppedTree({
+        ownedRoot,
+        source: sessionRoot,
+        destination: immutableBackupRoot,
+      });
+      immutableBackupDigest = await digestTree(immutableBackupRoot);
+      assert.equal(immutableBackupDigest, sourceDigest);
+
+      const restoredRoot = join(ownedRoot, "repair-restored-session");
+      await copyStoppedTree({
+        ownedRoot,
+        source: immutableBackupRoot,
+        destination: restoredRoot,
+      });
+      assert.equal(await digestTree(restoredRoot), sourceDigest);
+      await removeTreeForCleanup(sessionRoot);
+      sessionRoot = restoredRoot;
+      codexHome = join(sessionRoot, "codex-home");
+      workspace = join(sessionRoot, "workspace");
+      await injectRecoveryRolloutTailDamage({
+        codexHome,
+        damage: repairScenario.damage,
+        rootSessionId: threadId,
+      });
+
+      const repair = await repairRollouts({
+        codexHome,
+        rootSessionId: threadId,
+        runtimeIdentity,
+      });
+      assert.equal(repair?.rootSessionId, threadId, "tail repair proof changed root ownership");
+      assert(Array.isArray(repair?.files), "tail repair proof omitted files");
+      assert.equal(repair.files.length, 1, "tail repair probe expected one root rollout");
+      const changedFiles = repair.files.filter((file) => file.action !== "unchanged");
+      assert.equal(changedFiles.length, 1, "tail repair probe expected one changed rollout");
+      assert.equal(
+        changedFiles[0].action,
+        repairScenario.repairAction,
+        "tail repair selected the wrong framing action",
+      );
+      assert.equal(
+        await digestTree(immutableBackupRoot),
+        immutableBackupDigest,
+        "tail repair mutated the immutable backup",
+      );
+      repairSummary = {
+        action: changedFiles[0].action,
+        changedFileCount: changedFiles.length,
+        fileCount: repair.files.length,
+      };
+    }
+
     assert.equal(
       mock.requestCount(),
       1,
       "interrupted turn issued unexpected model requests",
     );
     const modelRequestBaseline = mock.requestCount();
-    const coldReadRoot = join(ownedRoot, "cold-read-session");
-    const recoveryStateDigest = await digestTree(sessionRoot);
-    await copyStoppedTree({
-      ownedRoot,
-      source: sessionRoot,
-      destination: coldReadRoot,
-    });
-    assert.equal(await digestTree(coldReadRoot), recoveryStateDigest);
-    const heldRecoveryRoot = join(ownedRoot, "resume-held-session");
-    const recoveryRootMode = portableMode(await lstat(sessionRoot));
-    await rename(sessionRoot, heldRecoveryRoot);
-    await chmod(heldRecoveryRoot, 0o000);
     let coldReadTurn;
-    let coldReadFailure;
-    try {
+    if (!repairScenario) {
+      const coldReadRoot = join(ownedRoot, "cold-read-session");
+      const recoveryStateDigest = await digestTree(sessionRoot);
+      await copyStoppedTree({
+        ownedRoot,
+        source: sessionRoot,
+        destination: coldReadRoot,
+      });
+      assert.equal(await digestTree(coldReadRoot), recoveryStateDigest);
+      const heldRecoveryRoot = join(ownedRoot, "resume-held-session");
+      const recoveryRootMode = portableMode(await lstat(sessionRoot));
+      await rename(sessionRoot, heldRecoveryRoot);
+      await chmod(heldRecoveryRoot, 0o000);
+      let coldReadFailure;
       try {
-        await lstat(sessionRoot);
-        throw new Error("cold read left the original recovery path reachable");
+        try {
+          await lstat(sessionRoot);
+          throw new Error("cold read left the original recovery path reachable");
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+        readClient = await startClient({
+          codexBin,
+          codexHome: join(coldReadRoot, "codex-home"),
+          timeoutMs,
+        });
+        const coldRead = await readClient.request("thread/read", {
+          threadId,
+          includeTurns: true,
+        });
+        assert.equal(coldRead.thread.id, threadId);
+        coldReadTurn = findTailTurn(coldRead.thread, turnId);
+        assert.equal(coldReadTurn.status, "interrupted");
+        await readClient.stop();
       } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
+        coldReadFailure = { error };
+        throw error;
+      } finally {
+        await runSequentialCleanup(
+          [
+            () => readClient?.abort(),
+            () => chmod(heldRecoveryRoot, recoveryRootMode),
+            () => rename(heldRecoveryRoot, sessionRoot),
+          ],
+          coldReadFailure,
+        );
+        readClient = undefined;
       }
-      readClient = await startRecoveryClient({
-        codexBin,
-        codexHome: join(coldReadRoot, "codex-home"),
-        timeoutMs,
-      });
-      const coldRead = await readClient.request("thread/read", {
-        threadId,
-        includeTurns: true,
-      });
-      assert.equal(coldRead.thread.id, threadId);
-      coldReadTurn = findTailTurn(coldRead.thread, turnId);
-      assert.equal(coldReadTurn.status, "interrupted");
-      await readClient.stop();
-    } catch (error) {
-      coldReadFailure = { error };
-      throw error;
-    } finally {
-      await runSequentialCleanup(
-        [
-          () => readClient?.abort(),
-          () => chmod(heldRecoveryRoot, recoveryRootMode),
-          () => rename(heldRecoveryRoot, sessionRoot),
-        ],
-        coldReadFailure,
-      );
-      readClient = undefined;
     }
 
-    recoveredClient = await startRecoveryClient({ codexBin, codexHome, timeoutMs });
+    recoveredClient = await startClient({ codexBin, codexHome, timeoutMs });
     const recovery = await recoverAndInspect({
       client: recoveredClient,
-      coldReadTurnStatus: coldReadTurn.status,
+      coldReadTurnStatus: coldReadTurn?.status,
       mock,
       previousWorkspace: originalWorkspace,
       previousWorkspaceCanonical: originalWorkspaceCanonical,
@@ -668,7 +829,61 @@ export async function runRecoveryScenario({
       expectAbortMarker,
       modelRequestBaseline,
     });
+    await recoveredClient.stop();
+
+    if (repairScenario) {
+      assert.equal(recovery.tailTurnStatus, "interrupted");
+      assert.equal(recovery.modelAbortMarker, "absent");
+      const requestCountAfterFollowUp = mock.requestCount();
+      verificationClient = await startClient({ codexBin, codexHome, timeoutMs });
+      const readback = await verificationClient.request("thread/read", {
+        threadId,
+        includeTurns: true,
+      });
+      assert.equal(readback.thread.id, threadId);
+      assert(Array.isArray(readback.thread.turns), "follow-up readback omitted turns");
+      const persistedFollowUp = readback.thread.turns.find(
+        (candidate) => candidate.id === recovery.followUpTurnId,
+      );
+      assert(persistedFollowUp, "follow-up readback omitted the exact completed turn");
+      assert.equal(persistedFollowUp.status, "completed");
+      assert.equal(readback.thread.turns.at(-1)?.id, recovery.followUpTurnId);
+      assert.equal(
+        mock.requestCount(),
+        requestCountAfterFollowUp,
+        "follow-up readback issued an extra model request",
+      );
+      await verificationClient.stop();
+      assert.equal(
+        await digestTree(immutableBackupRoot),
+        immutableBackupDigest,
+        "post-resume verification mutated the immutable backup",
+      );
+      return {
+        kind,
+        turnMaterialized: true,
+        terminationObserved,
+        originalCompletionObserved,
+        restoredWritableCopyUsed: true,
+        immutableBackupUnchanged: true,
+        repairInvocationCount: 1,
+        repairFileCount: repairSummary.fileCount,
+        repairChangedFileCount: repairSummary.changedFileCount,
+        repairAction: repairSummary.action,
+        resumeSucceeded: recovery.resumeSucceeded,
+        sameThreadId: recovery.sameThreadId,
+        interruptedTailRecovered: true,
+        abortMarkerObserved: false,
+        followUpCompleted: recovery.followUpCompleted,
+        followUpTurnReadbackCompleted: true,
+        modelRequestCount: mock.requestCount(),
+        extraModelRequestObserved: false,
+      };
+    }
+
     const {
+      followUpCompleted: _followUpCompleted,
+      followUpTurnId: _followUpTurnId,
       historicalWorkspaceRetained,
       modelWorkspaceContextMatched,
       ...recoveryReport
@@ -677,7 +892,6 @@ export async function runRecoveryScenario({
       snapshot.appServerWorkspaceMatched = modelWorkspaceContextMatched;
       snapshot.historicalWorkspaceRetained = historicalWorkspaceRetained;
     }
-    await recoveredClient.stop();
 
     return {
       kind,
@@ -695,6 +909,7 @@ export async function runRecoveryScenario({
     await runSequentialCleanup(
       [
         () => recoveredClient?.abort(),
+        () => verificationClient?.abort(),
         () => readClient?.abort(),
         () => client?.abort(),
         () => mock?.close(),
@@ -716,7 +931,7 @@ function assertRecoveryEvidenceSchema(report) {
     ["schemaVersion", "probe", "runtime", "backend", "snapshot", "scenarios", "result"],
     "recovery evidence",
   );
-  assert.equal(report.schemaVersion, 5);
+  assert.equal(report.schemaVersion, 6);
   assert.equal(report.probe, "interrupted-turn-recovery");
   assert.equal(report.result, "passed");
 
@@ -726,6 +941,7 @@ function assertRecoveryEvidenceSchema(report) {
       "codexVersion",
       "codexBinarySha256",
       "binaryExecution",
+      "compatibilityClaim",
       "sourceAnalysisCommit",
       "platform",
       "launcherArch",
@@ -738,6 +954,7 @@ function assertRecoveryEvidenceSchema(report) {
   );
   assert.match(report.runtime.codexBinarySha256, /^[0-9a-f]{64}$/);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
+  assert.equal(report.runtime.compatibilityClaim, "same-pinned-executable");
   assert.match(report.runtime.sourceAnalysisCommit, /^[0-9a-f]{40}$/);
   assert(["darwin", "linux"].includes(report.runtime.platform), "unsupported evidence platform");
   assert(
@@ -787,6 +1004,51 @@ function assertRecoveryEvidenceSchema(report) {
     RECOVERY_SCENARIOS,
   );
   for (const scenario of report.scenarios) {
+    const repairScenario = TAIL_REPAIR_SCENARIOS[scenario.kind];
+    if (repairScenario) {
+      assertExactObject(
+        scenario,
+        [
+          "kind",
+          "turnMaterialized",
+          "terminationObserved",
+          "originalCompletionObserved",
+          "restoredWritableCopyUsed",
+          "immutableBackupUnchanged",
+          "repairInvocationCount",
+          "repairFileCount",
+          "repairChangedFileCount",
+          "repairAction",
+          "resumeSucceeded",
+          "sameThreadId",
+          "interruptedTailRecovered",
+          "abortMarkerObserved",
+          "followUpCompleted",
+          "followUpTurnReadbackCompleted",
+          "modelRequestCount",
+          "extraModelRequestObserved",
+        ],
+        `${scenario.kind} scenario evidence`,
+      );
+      assert.equal(scenario.turnMaterialized, true);
+      assert.equal(scenario.terminationObserved, "SIGKILL");
+      assert.equal(scenario.originalCompletionObserved, false);
+      assert.equal(scenario.restoredWritableCopyUsed, true);
+      assert.equal(scenario.immutableBackupUnchanged, true);
+      assert.equal(scenario.repairInvocationCount, 1);
+      assert.equal(scenario.repairFileCount, 1);
+      assert.equal(scenario.repairChangedFileCount, 1);
+      assert.equal(scenario.repairAction, repairScenario.repairAction);
+      assert.equal(scenario.resumeSucceeded, true);
+      assert.equal(scenario.sameThreadId, true);
+      assert.equal(scenario.interruptedTailRecovered, true);
+      assert.equal(scenario.abortMarkerObserved, false);
+      assert.equal(scenario.followUpCompleted, true);
+      assert.equal(scenario.followUpTurnReadbackCompleted, true);
+      assert.equal(scenario.modelRequestCount, 2);
+      assert.equal(scenario.extraModelRequestObserved, false);
+      continue;
+    }
     assertExactObject(
       scenario,
       [
@@ -1428,12 +1690,22 @@ export async function probeInterruptedTurnRecovery({
       cwd: versionHome,
       env: buildWorkerEnvironment(versionHome, process.env, versionHome),
     });
+    const runtimeIdentity = Object.freeze({
+      codexVersion: binaryVersion,
+      codexBinarySha256: binaryDigest,
+      sourceAnalysisCommit,
+    });
 
     const scenarioReports = [];
     for (const kind of scenarios) {
       await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
       scenarioReports.push(
-        await runScenario({ codexBin: privateBinary, kind, temporaryRoot: binaryRoot }),
+        await runScenario({
+          codexBin: privateBinary,
+          kind,
+          runtimeIdentity,
+          temporaryRoot: binaryRoot,
+        }),
       );
     }
     await assertPrivateBinaryIntegrity(privateBinary, binaryDigest);
@@ -1441,12 +1713,13 @@ export async function probeInterruptedTurnRecovery({
       (scenario) => scenario.kind === "snapshot_restore",
     );
     const report = {
-      schemaVersion: 5,
+      schemaVersion: 6,
       probe: "interrupted-turn-recovery",
       runtime: {
         codexVersion: binaryVersion,
         codexBinarySha256: binaryDigest,
         binaryExecution: "private-read-only-copy",
+        compatibilityClaim: "same-pinned-executable",
         sourceAnalysisCommit,
         platform: platform(),
         launcherArch: arch(),

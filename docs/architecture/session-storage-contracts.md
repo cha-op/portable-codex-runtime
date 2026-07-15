@@ -434,8 +434,9 @@ Later pull requests own:
 - production held-directory launch authority, provider-specific mutation/fence
   transitions, proofs, and conformance validators beyond the stopped-directory
   adapter;
-- graceful-abort evidence, crash-prefix atomic capture, rollout-tail repair,
-  and same-image resume verification;
+- production graceful-abort storage barriers and crash-prefix atomic capture;
+- composition of the separate pinned-runtime rollout-tail repair primitive
+  with trusted OCI resolution and launcher admission;
 - ext4 or filesystem-image physical snapshot and restore;
 - differential compression, encryption, retention, and atomic publication;
 - cross-host migration and fault injection; and

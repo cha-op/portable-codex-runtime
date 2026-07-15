@@ -13,8 +13,10 @@ Treat Codex session recovery as three distinct checkpoint classes:
    recovery may normalize a stale in-progress view, but it must not claim the
    same durable conversation semantics as explicit interruption.
 
-The current probe validates Codex application semantics for classes 2 and 3. It
-does not implement the production block-volume snapshot barrier.
+The current probe validates Codex application semantics for classes 2 and 3
+and the offline byte-framing repair required before writable crash-prefix
+resume. It does not implement production storage capture, sync/freeze, or
+publication barriers.
 
 ## Reproducible Matrix
 
@@ -31,6 +33,8 @@ staged. The fixed prompt contains no repository data.
 | `sigterm` | child observed `SIGTERM` | same thread ID | `interrupted` | absent |
 | `sigkill` | child observed `SIGKILL` | same thread ID | `interrupted` | absent |
 | `snapshot_restore` | child observed `SIGKILL`; source tree quiesced before copy | same thread ID from a new absolute path | `interrupted` | absent |
+| `missing_final_lf_repair` | child observed `SIGKILL`; final LF removed only on a stopped-tree-derived writable copy | explicit same thread ID and restored `cwd` after `append_lf` | `interrupted`, then one completed follow-up | absent |
+| `torn_unterminated_tail_repair` | child observed `SIGKILL`; invalid unterminated bytes appended only on a stopped-tree-derived writable copy | explicit same thread ID and restored `cwd` after `truncate_partial_tail` | `interrupted`, then one completed follow-up | absent |
 
 A fresh app-server performs cold `thread/read {includeTurns:true}` on a private
 copy of the quiesced recovery tree. A second fresh app-server performs
@@ -40,6 +44,16 @@ neither operation may issue a model request. A completed follow-up turn is
 matched by its exact turn ID and captures the single corresponding next
 loopback request to distinguish a persisted abort marker from view-only
 normalization.
+
+The two repair scenarios first copy the quiesced killed-process tree to an
+immutable backup, copy that backup to a distinct writable restore tree, and
+only then inject deterministic tail damage. They invoke
+`repairStoppedRolloutTails` exactly once, resume with explicit `threadId` and
+`cwd`, complete exactly one follow-up model turn, and stop. A third fresh
+app-server performs `thread/read {includeTurns:true}` and must find that exact
+follow-up turn still completed without issuing another model request. The
+backup modeled-tree digest is checked before repair and after readback and must
+remain unchanged. Repair never synthesizes an abort record or model marker.
 
 The snapshot scenario copies every snapshot-user-accessible entry in the
 synthetic session tree, including `CODEX_HOME` and workspace, after the killed
@@ -76,25 +90,31 @@ or failure semantics. The reusable module remains non-durable; see
 
 The complete matrix passed on macOS with an arm64 Node launcher and:
 
-- Codex CLI `0.142.4`;
+- Codex CLI `0.144.1`;
 - execution from a private mode `0500`, single-link copy whose file type, link
   count, mode, and digest are checked before every scenario and after the full
   matrix;
 - binary SHA-256
-  `32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5`;
+  `29915529b97697def1a957b0505e770aa6a45744435d62fc263e98d7619e167a`;
 - source analysis at upstream commit
   `db887d03e1f907467e33271572dffb73bceecd6b`.
 
 The source commit identifies the code inspected for semantics; it is not a
-claim that the installed binary was built from that exact commit. The redacted
+claim that the installed binary was built from that exact commit. Reusing the
+same staged private executable for all six scenarios proves only the stated
+`same-pinned-executable` compatibility, not OCI `same-image`. The redacted
 machine-readable result is stored in
 `evidence/interrupted-turn-recovery.json`. It contains no thread or turn IDs,
 paths, prompts, model output, credentials, account identifiers, or hostnames.
-Schema version 5 records the private binary execution mode, the Node launcher
-architecture (not an inferred Codex binary architecture), the exact
+Schema version 6 records the private binary execution mode, the
+`same-pinned-executable` compatibility claim, the Node launcher architecture
+(not an inferred Codex binary architecture), the exact
 `copy-original-path-absent-held-tree-000` cold-read isolation mode, and the
 distinction between configured inputs and OS-enforced isolation; older evidence
-is rejected.
+is rejected. Repair scenarios retain only action names, counts, and booleans;
+their internal proof paths, thread IDs, content hashes, byte sizes, and rollout
+content are discarded. The runtime section retains the existing Codex version
+and executable SHA-256 binding.
 Snapshot fields use `modeledTreeDigestMatched` terminology because the digest
 intentionally excludes metadata listed under limitations.
 
@@ -179,10 +199,13 @@ power-loss durability barrier.
 
 The rollout loader skips an invalid JSONL tail, but resume opens the same file
 for append without first repairing a truncated or complete-but-unterminated
-last record. New bytes can be concatenated onto the bad tail. Production crash
-restore must inspect and preserve the original, then truncate or terminate the
-tail at a validated record boundary before allowing append. That repair is not
-implemented by this spike.
+last record. New bytes can be concatenated onto the bad tail. The offline
+`repairStoppedRolloutTails` primitive now validates the pinned rollout set and
+either appends one missing LF or truncates only an invalid unterminated tail on
+a restored writable copy before resume. It preserves the immutable backup and
+does not reconstruct conversation semantics. Production still must supply the
+stopped-writer, attachment, durability, and launcher-admission authority around
+that primitive.
 
 A production clean migration checkpoint must additionally:
 
@@ -194,9 +217,9 @@ A production clean migration checkpoint must additionally:
 6. snapshot the single-attached session volume and then unfreeze it.
 
 SQLite metadata, its WAL and shared-memory files, rollouts, workspace, and
-session metadata must share the same atomic volume boundary. The later storage
-contract PR will define the exact lease, fencing, manifest, snapshot, and
-restore interfaces.
+session metadata must share the same atomic volume boundary. The existing
+storage contracts define these logical boundaries; concrete production
+adapters, physical capture, and launcher admission remain pending.
 
 ## Limitations
 
@@ -210,9 +233,10 @@ restore interfaces.
   prove that the app-server process could not read unrelated host files or make
   unrelated outbound connections. Use container-level filesystem and network
   isolation when that stronger claim is required.
-- The probe covers a clean JSONL prefix after process termination. It documents
-  but does not inject or repair torn JSON, a missing final newline, filesystem
-  writeback loss, or inconsistent SQLite WAL state.
+- The repair matrix covers one complete final JSON record missing LF and one
+  invalid unterminated tail after a valid prefix. It does not cover filesystem
+  writeback loss, syntactically valid semantic corruption, or inconsistent
+  SQLite WAL state.
 - Background terminal state is intentionally outside the recoverable
   filesystem contract. A checkpoint with a live terminal is not migration
   ready even if all files copy successfully.

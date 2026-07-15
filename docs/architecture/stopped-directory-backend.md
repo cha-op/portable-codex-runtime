@@ -420,7 +420,8 @@ This backend deliberately does not provide:
 - NFS or another remote/shared-filesystem adapter;
 - an ext4 or filesystem-image physical backend and automatic host fencing;
 - `graceful-abort` or live `crash-prefix` capture;
-- same-image Codex resume verification or rollout-tail repair;
+- composition of the separate pinned-runtime rollout-tail repair primitive
+  with trusted OCI resolution and launcher admission;
 - differential compression, content-addressed storage, encryption, retention,
   periodic long-goal checkpoints, or cross-host migration verification; or
 - the read-only Git Summary.

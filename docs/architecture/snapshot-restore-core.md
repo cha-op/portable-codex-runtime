@@ -181,10 +181,11 @@ rejected before dispatch.
 
 ## Explicitly Deferred Work
 
-This core does not yet provide:
+This core does not yet provide or compose:
 
-- evidence for a graceful `turn/interrupt` abort boundary;
-- atomic `crash-prefix` capture or rollout-tail repair;
+- a production storage barrier for the graceful `turn/interrupt` boundary;
+- atomic `crash-prefix` capture, launcher admission, or invocation of the
+  separate pinned-runtime rollout-tail repair primitive;
 - repair or automatic continuation of `prepared` or `materialized` capture
   attempts;
 - an ext4 or filesystem-image physical backend;
@@ -209,10 +210,12 @@ pull-request order in the runtime delivery plan:
 5. PR #10, same-process stopped-writer capability (completed);
 6. PR #11, stopped-directory backend conformance (completed);
 7. PR #12, authenticated committed-result reconciliation (completed);
-8. same-image resume verification and rollout-tail repair;
-9. ext4 or filesystem-image physical backend; and
-10. differential export.
+8. same-pinned-executable resume verification and rollout-tail repair
+   (completed separately from this core);
+9. production linearizable authority and trusted OCI launcher admission;
+10. ext4 or filesystem-image physical backend; and
+11. differential export.
 
 This order keeps orchestration semantics testable before selecting a physical
-format, and requires same-image Codex recovery evidence before optimising
-transport or retention.
+format, and establishes pinned-executable Codex recovery evidence before
+adding production image resolution or optimising transport and retention.

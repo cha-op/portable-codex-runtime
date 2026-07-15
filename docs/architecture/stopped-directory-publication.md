@@ -495,10 +495,12 @@ separate adapter with its own server-side idempotency, fencing, publication,
 and fault evidence.
 
 The layer implements stopped-writer `clean` directory capture and restore. It
-does not implement an atomic live-volume `crash-prefix` snapshot, rollout-tail
-repair, same-image Codex resume verification, differential compression,
-content-addressed storage, encryption, retention, periodic long-goal capture,
-cross-host migration, or Git Summary.
+does not implement an atomic live-volume `crash-prefix` snapshot or compose
+the separate pinned-runtime rollout-tail repair primitive with trusted OCI
+resolution and launcher admission. It also does not implement differential
+compression, content-addressed storage, encryption, retention, periodic
+long-goal capture, cross-host migration, or Git Summary. See
+`rollout-tail-repair.md` for the offline repair contract.
 
 The composed stopped-directory backend does not widen this physical boundary:
 it advertises manual fencing and no atomic point-in-time checkpoint. Its

@@ -8,6 +8,12 @@
   `account/read` without a model turn, then atomically promote verified state.
 - Explicit turn interruption and process-kill recovery semantics are captured
   by a deterministic real-app-server probe with redacted evidence.
+- An offline rollout-tail repair primitive now validates the complete stopped
+  session set, preserves valid JSONL bytes, appends one missing final LF or
+  truncates one invalid unterminated tail, and fails closed on non-tail
+  corruption or unsafe filesystem state. The live probe binds one Codex
+  executable by version and SHA-256 before and after repair; it does not claim
+  OCI same-image recovery or production launcher authority.
 - Versioned session manifest, storage attachment, lease/fencing, structural
   rootless worker template, and checkpoint class contracts define the portable
   data-plane boundary without exposing raw devices to workers or claiming
@@ -55,6 +61,8 @@
   `docs/project_journal/2026/07/2026-07-01-auth-refresh-authority-8b2e41.md`
 - Interrupted-turn recovery spike:
   `docs/project_journal/2026/07/2026-07-01-interrupted-turn-recovery-4a91c7.md`
+- Pinned-executable resume and rollout-tail repair:
+  `docs/project_journal/2026/07/2026-07-15-pinned-executable-resume-tail-repair-9d813d.md`
 - Session filesystem and storage contracts:
   `docs/project_journal/2026/07/2026-07-02-session-storage-contracts-7c31e2.md`
 - Auth broker MVP:
@@ -80,5 +88,7 @@
 
 - The app-server `chatgptAuthTokens` integration is experimental and requires a
   pinned Codex binary or image plus compatibility testing on upgrades.
-- Codex rollout flush is not a stable-storage sync barrier; production snapshot
-  contracts must supply external sync/freeze and crash-tail repair semantics.
+- Codex rollout flush is not a stable-storage sync barrier. The implemented
+  repair covers only pinned plain-JSONL tail framing on a detached restored
+  copy; production recovery still needs external sync/freeze, atomic crash
+  capture, trusted OCI resolution, fencing, and launcher admission.
