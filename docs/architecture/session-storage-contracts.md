@@ -300,6 +300,21 @@ portable evidence. Passing the capability validator confirms only this object
 shape and declaration; backend behavior remains untrusted until the concrete
 adapter passes its conformance suite.
 
+Checkpoint-capture reconciliation is an optional, separately versioned
+extension rather than a new required v1 storage method. A backend that exposes
+`captureReconciliationContractVersion: 1` plus
+`reconcileCheckpointCapture()` can be validated with
+`assertCheckpointCaptureReconciliationBackend()`. Keeping the extension out of
+the base method set lets unrelated v1 backends remain valid while callers
+explicitly opt into the narrower recovery contract.
+
+The extension receives only the exact original `{ checkpoint, request }`.
+There is deliberately no current lease, attachment, clock, writer handle, or
+stopped-writer capability. The backend must authenticate durable attempt
+provenance outside the session volume and may return success only for the
+already committed exact result. It must not treat structural request fields or
+the checkpoint's observed source epoch as current writer authority.
+
 `assertSessionProvisionRequest()` and `assertSessionProvisionResult()` define
 the separate control-plane provisioning boundary. The remaining attachment,
 checkpoint, restore, detach, and destroy operations use the writer-fenced

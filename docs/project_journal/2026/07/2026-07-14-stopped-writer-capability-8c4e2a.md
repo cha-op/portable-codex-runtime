@@ -76,11 +76,11 @@ superseded_by:
 
 ## Next Steps
 
-- PR #11 composes capability consumption with the atomic canonical fence
-  recheck, stopped-directory publication, exact operation binding, and durable
-  idempotent replay in the backend adapter and conformance suite.
-- Keep replay-only uncertain-result reconciliation and a joined Codex writer
-  shutdown API as later workstreams.
+- The completed backend and committed-reconciliation workstreams compose
+  capability consumption with the canonical fence guard, exact operation
+  binding, durable attempt provenance, and source-free committed replay.
+- Keep a joined Codex writer shutdown API, same-image resume, and rollout-tail
+  repair as later workstreams.
 
 ## Evidence
 

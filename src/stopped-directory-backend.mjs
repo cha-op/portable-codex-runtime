@@ -1,3 +1,4 @@
+import { randomUUID as randomUUIDExport } from "node:crypto";
 import {
   basename as pathBasenameExport,
   dirname as pathDirnameExport,
@@ -8,6 +9,7 @@ import {
 import { types as utilTypes } from "node:util";
 
 import {
+  CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
   assertCanonicalFenceMatch,
   assertCheckpointDescriptor,
@@ -46,6 +48,7 @@ const pathIsAbsolute = pathIsAbsoluteExport;
 const pathParse = pathParseExport;
 const pathResolve = pathResolveExport;
 const PromiseConstructor = Promise;
+const randomUUIDIntrinsic = randomUUIDExport;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -65,6 +68,8 @@ const publishFreshCheckpointArtifactIntrinsic =
   StoppedDirectoryPublication.prototype.publishFreshCheckpointArtifact;
 const publishRestoreDestinationIntrinsic =
   StoppedDirectoryPublication.prototype.publishRestoreDestination;
+const verifyCommittedCheckpointArtifactIntrinsic =
+  StoppedDirectoryPublication.prototype.verifyCommittedCheckpointArtifact;
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
@@ -179,6 +184,7 @@ const CAPTURE_KEYS = objectFreeze([
   "request",
   "stoppedWriterEvidence",
 ]);
+const CAPTURE_RECONCILIATION_KEYS = objectFreeze(["checkpoint", "request"]);
 const RESTORE_KEYS = objectFreeze(["checkpoint", "request"]);
 const RESOLVED_WRITER_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
@@ -206,12 +212,39 @@ const CAPTURE_CONTEXT_KEYS = objectFreeze([
   "artifactOwnedRoot",
   "canonicalAttachment",
   "canonicalLease",
+  "captureAttemptId",
   "now",
   "reservationId",
   "result",
   "sourceDirectory",
   "sourceOwnedRoot",
   "storageRef",
+]);
+const CAPTURE_RECONCILIATION_CONTEXT_KEYS = objectFreeze([
+  "artifactDirectory",
+  "artifactOwnedRoot",
+  "captureAttempt",
+]);
+const CAPTURE_ATTEMPT_RECORD_KEYS = objectFreeze([
+  "binding",
+  "captureAttemptId",
+  "contractVersion",
+  "operationId",
+  "request",
+  "result",
+  "state",
+]);
+const CAPTURE_JOURNAL_BINDING_KEYS = objectFreeze([
+  "attachmentId",
+  "attachmentOperationId",
+  "attachmentProofId",
+  "captureAttemptId",
+  "checkpoint",
+  "contractVersion",
+  "processIncarnationId",
+  "reservationId",
+  "stopOperationId",
+  "writerIncarnationId",
 ]);
 const RESTORE_CONTEXT_KEYS = objectFreeze([
   "artifactDirectory",
@@ -267,7 +300,10 @@ const ERROR_MESSAGES = objectFreeze({
     "Stopped-directory backend outcome is uncertain",
 });
 
-export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 1;
+const CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION = 2;
+const RESTORE_JOURNAL_BINDING_CONTRACT_VERSION = 1;
+
+export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 2;
 
 export class StoppedDirectoryBackendError extends Error {
   constructor(code) {
@@ -411,6 +447,16 @@ function assertUuid(value, failure) {
     failure();
   }
   return value;
+}
+
+function mintCaptureAttemptId() {
+  let captureAttemptId;
+  try {
+    captureAttemptId = callIntrinsic(randomUUIDIntrinsic, undefined, []);
+  } catch {
+    failUncertain();
+  }
+  return assertUuid(captureAttemptId, failUncertain);
 }
 
 function parseFencingEpoch(value, failure) {
@@ -617,6 +663,36 @@ function sameResult(left, right) {
   );
 }
 
+function sameMutationRequest(left, right) {
+  const leftKeys = objectKeys(left);
+  const rightKeys = objectKeys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    arrayEvery(
+      leftKeys,
+      (key) =>
+        objectHasOwn(right, key) &&
+        (key === "target" || left[key] === right[key]),
+    ) &&
+    sameFlatRecord(left.target, right.target)
+  );
+}
+
+function sameCaptureJournalBinding(left, right) {
+  const leftKeys = objectKeys(left);
+  const rightKeys = objectKeys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    arrayEvery(
+      leftKeys,
+      (key) =>
+        objectHasOwn(right, key) &&
+        (key === "checkpoint" || left[key] === right[key]),
+    ) &&
+    sameFlatRecord(left.checkpoint, right.checkpoint)
+  );
+}
+
 function exactFrozenRecord(value) {
   return objectFreeze(value);
 }
@@ -681,6 +757,31 @@ function normalizeCaptureRequest(value, backendId) {
     request,
     stoppedWriterEvidence,
   });
+}
+
+function normalizeCaptureReconciliationRequest(value, backendId) {
+  const options = assertExactDataObject(value, CAPTURE_RECONCILIATION_KEYS);
+  const checkpoint = runContractValidator(() =>
+    assertCheckpointDescriptor(options.checkpoint),
+  );
+  const request = runContractValidator(() =>
+    assertStorageMutationRequest(options.request),
+  );
+  assertRobustCheckpoint(checkpoint, failInvalid);
+  assertRobustMutationRequest(request, failInvalid);
+  ensureInvalid(
+    checkpoint.backendId === backendId &&
+      request.backendId === backendId &&
+      checkpoint.storageId === request.storageId &&
+      checkpoint.sessionId === request.sessionId &&
+      checkpoint.sourceFencingEpoch === request.fencingEpoch &&
+      checkpoint.checkpointClass === "clean" &&
+      request.operation === "checkpoint" &&
+      request.target.kind === "checkpoint" &&
+      request.target.checkpointId === checkpoint.checkpointId &&
+      request.target.artifactId === checkpoint.artifactId,
+  );
+  return exactFrozenRecord({ checkpoint, request });
 }
 
 function normalizeRestoreRequest(value, backendId) {
@@ -943,13 +1044,90 @@ function normalizePublicationOutcome(
   });
 }
 
+function normalizeCaptureAttempt(value, request) {
+  const attempt = assertExactDataObject(
+    value,
+    CAPTURE_ATTEMPT_RECORD_KEYS,
+    failUncertain,
+  );
+  const binding = assertExactDataObject(
+    attempt.binding,
+    CAPTURE_JOURNAL_BINDING_KEYS,
+    failUncertain,
+  );
+  const captureAttemptId = assertUuid(
+    attempt.captureAttemptId,
+    failUncertain,
+  );
+  const operationId = assertOpaqueId(attempt.operationId, failUncertain);
+  const durableRequest = runRuntimeValidator(() =>
+    assertStorageMutationRequest(attempt.request),
+  );
+  assertRobustMutationRequest(durableRequest, failUncertain);
+  const result = normalizeResult(
+    attempt.result,
+    durableRequest,
+    failUncertain,
+  );
+  const boundCheckpoint = runRuntimeValidator(() =>
+    assertCheckpointDescriptor(binding.checkpoint),
+  );
+  assertRobustCheckpoint(boundCheckpoint, failUncertain);
+  ensureUncertain(
+    attempt.contractVersion ===
+      CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION &&
+      arrayIncludes(["authorized", "committed"], attempt.state) &&
+      operationId === request.request.operationId &&
+      durableRequest.operation === "checkpoint" &&
+      sameMutationRequest(durableRequest, request.request) &&
+      sameFlatRecord(boundCheckpoint, request.checkpoint) &&
+      sameFlatRecord(result.checkpoint, request.checkpoint) &&
+      binding.contractVersion === CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION &&
+      binding.captureAttemptId === captureAttemptId,
+  );
+  for (const value of [
+    binding.attachmentId,
+    binding.attachmentOperationId,
+    binding.attachmentProofId,
+    binding.processIncarnationId,
+    binding.reservationId,
+    binding.stopOperationId,
+    binding.writerIncarnationId,
+  ]) {
+    assertOpaqueId(value, failUncertain);
+  }
+  const normalizedBinding = exactFrozenRecord({
+    attachmentId: binding.attachmentId,
+    attachmentOperationId: binding.attachmentOperationId,
+    attachmentProofId: binding.attachmentProofId,
+    captureAttemptId,
+    checkpoint: boundCheckpoint,
+    contractVersion: binding.contractVersion,
+    processIncarnationId: binding.processIncarnationId,
+    reservationId: binding.reservationId,
+    stopOperationId: binding.stopOperationId,
+    writerIncarnationId: binding.writerIncarnationId,
+  });
+  ensureUncertain(sameCaptureJournalBinding(normalizedBinding, binding));
+  return exactFrozenRecord({
+    binding: normalizedBinding,
+    captureAttemptId,
+    contractVersion: attempt.contractVersion,
+    operationId,
+    request: durableRequest,
+    result,
+    state: attempt.state,
+  });
+}
+
 function captureJournalBinding(context, request, resolved) {
   return exactFrozenRecord({
     attachmentId: request.attachment.attachmentId,
     attachmentOperationId: request.attachment.operationId,
     attachmentProofId: request.attachment.proofId,
+    captureAttemptId: context.captureAttemptId,
     checkpoint: request.checkpoint,
-    contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
+    contractVersion: CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION,
     processIncarnationId: resolved.processIncarnationId,
     reservationId: context.reservationId,
     stopOperationId: resolved.stopOperationId,
@@ -960,7 +1138,7 @@ function captureJournalBinding(context, request, resolved) {
 function restoreJournalBinding(context, request) {
   return exactFrozenRecord({
     checkpoint: request.checkpoint,
-    contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
+    contractVersion: RESTORE_JOURNAL_BINDING_CONTRACT_VERSION,
     destinationIsolationProofId: context.destinationIsolationProofId,
     reservationId: context.reservationId,
   });
@@ -1044,7 +1222,12 @@ async function runAuthorityMethod(authority, method, admission, publish) {
   }
 }
 
-function normalizeCaptureContext(value, request, resolved) {
+function normalizeCaptureContext(
+  value,
+  request,
+  resolved,
+  expectedCaptureAttemptId,
+) {
   const context = assertExactDataObject(
     value,
     CAPTURE_CONTEXT_KEYS,
@@ -1097,17 +1280,41 @@ function normalizeCaptureContext(value, request, resolved) {
     source.directory === canonicalAttachment.rootPath &&
       pathsAreDisjoint(source.ownedRoot, artifact.ownedRoot),
   );
+  const captureAttemptId = assertUuid(
+    context.captureAttemptId,
+    failUncertain,
+  );
+  ensureUncertain(captureAttemptId === expectedCaptureAttemptId);
   const reservationId = assertOpaqueId(context.reservationId, failUncertain);
   return exactFrozenRecord({
     artifact,
     canonicalAttachment,
     canonicalLease,
+    captureAttemptId,
     now: context.now,
     reservationId,
     result,
     source,
     storageRef,
   });
+}
+
+function normalizeCaptureReconciliationContext(value, request) {
+  const context = assertExactDataObject(
+    value,
+    CAPTURE_RECONCILIATION_CONTEXT_KEYS,
+    failUncertain,
+  );
+  const artifact = assertDirectPathPlan(
+    context.artifactDirectory,
+    context.artifactOwnedRoot,
+    failUncertain,
+  );
+  const captureAttempt = normalizeCaptureAttempt(
+    context.captureAttempt,
+    request,
+  );
+  return exactFrozenRecord({ artifact, captureAttempt });
 }
 
 function normalizeRestoreContext(value, request) {
@@ -1213,10 +1420,14 @@ export class StoppedDirectoryBackend {
     ensureInvalid(lifecycleBackendId === backendId);
     const authorityOptions = assertExactDataObject(options.mutationAuthority, [
       "runCapture",
+      "runCaptureReconciliation",
       "runRestore",
     ]);
     const authority = exactFrozenRecord({
       runCapture: assertTrustedFunction(authorityOptions.runCapture),
+      runCaptureReconciliation: assertTrustedFunction(
+        authorityOptions.runCaptureReconciliation,
+      ),
       runRestore: assertTrustedFunction(authorityOptions.runRestore),
     });
     const lifecycleMethods = objectCreate(null);
@@ -1251,6 +1462,10 @@ export class StoppedDirectoryBackend {
     objectDefineProperty(this, "contractVersion", {
       enumerable: true,
       value: STORAGE_CONTRACT_VERSION,
+    });
+    objectDefineProperty(this, "captureReconciliationContractVersion", {
+      enumerable: true,
+      value: CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
     });
     objectFreeze(this);
   }
@@ -1322,15 +1537,21 @@ export class StoppedDirectoryBackend {
             processIncarnationId: resolved.processIncarnationId,
             runSnapshot: async (binding) => {
               validateCoordinatorBinding(binding, request, resolved);
+              const captureAttemptId = mintCaptureAttemptId();
+              const captureAdmission = exactFrozenRecord({
+                ...admission,
+                captureAttemptId,
+              });
               return runAuthorityMethod(
                 this.#authority,
                 this.#authority.runCapture,
-                admission,
+                captureAdmission,
                 async (rawContext) => {
                   const context = normalizeCaptureContext(
                     rawContext,
                     request,
                     resolved,
+                    captureAttemptId,
                   );
                   const bindingRecord = captureJournalBinding(
                     context,
@@ -1386,6 +1607,68 @@ export class StoppedDirectoryBackend {
           typeof completion === "object" &&
           !isProxyValue(completion) &&
           objectHasOwn(completion, "result"),
+      );
+      return completion.result;
+    } catch {
+      failUncertain();
+    }
+  }
+
+  async reconcileCheckpointCapture(...args) {
+    ensureInvalid(args.length === 1);
+    const request = normalizeCaptureReconciliationRequest(
+      args[0],
+      this.backendId,
+    );
+    const admission = exactFrozenRecord({
+      checkpoint: request.checkpoint,
+      request: request.request,
+    });
+
+    try {
+      const completion = await runAuthorityMethod(
+        this.#authority,
+        this.#authority.runCaptureReconciliation,
+        admission,
+        async (rawContext) => {
+          const context = normalizeCaptureReconciliationContext(
+            rawContext,
+            request,
+          );
+          const publicationOutcome = await callIntrinsic(
+            verifyCommittedCheckpointArtifactIntrinsic,
+            this.#publication,
+            [
+              exactFrozenRecord({
+                artifactDirectory: context.artifact.directory,
+                artifactOwnedRoot: context.artifact.ownedRoot,
+                binding: context.captureAttempt.binding,
+                operationId: context.captureAttempt.operationId,
+                request: context.captureAttempt.request,
+                result: context.captureAttempt.result,
+              }),
+            ],
+          );
+          const outcome = normalizePublicationOutcome(
+            publicationOutcome,
+            context.captureAttempt.result,
+            context.captureAttempt.request,
+            "checkpoint-artifact",
+          );
+          ensureUncertain(outcome.replayed === true);
+          const artifactProof = exactFrozenRecord({
+            artifactManifestDigest:
+              outcome.materialization.artifactManifestDigest,
+            captureOperationId: context.captureAttempt.operationId,
+            modeledDigest: outcome.materialization.modeledDigest,
+          });
+          return exactFrozenRecord({
+            artifactProof,
+            materialization: outcome.materialization,
+            replayed: outcome.replayed,
+            result: context.captureAttempt.result,
+          });
+        },
       );
       return completion.result;
     } catch {

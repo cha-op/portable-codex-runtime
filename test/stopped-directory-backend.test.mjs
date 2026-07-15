@@ -19,10 +19,14 @@ import {
   StoppedDirectoryBackend,
   StoppedDirectoryBackendError,
 } from "../src/stopped-directory-backend.mjs";
-import { FilesystemOperationJournal } from "../src/filesystem-operation-journal.mjs";
+import {
+  FilesystemOperationJournal,
+  operationJournalRecordFilename,
+} from "../src/filesystem-operation-journal.mjs";
 import {
   SessionSnapshotCoreError,
   captureCleanCheckpoint,
+  reconcileCleanCheckpointCapture,
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
 import {
@@ -52,10 +56,15 @@ const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
 const STOP_OPERATION_ID = "stop-operation-001";
 const RESERVATION_ID = "reservation-001";
+const CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000003";
+const FOREIGN_CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000004";
 const DESTINATION_ISOLATION_PROOF_ID = "destination-isolation-proof-001";
 const NOW = Date.parse("2026-07-02T12:00:00.000Z");
 const CREATED_AT = "2026-07-02T12:00:00.000Z";
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
+const CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION = 2;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 const TRUSTED_JOURNAL_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
@@ -188,6 +197,122 @@ function fixedResult(checkpointDescriptor, request) {
   return Object.freeze({
     checkpoint: checkpointDescriptor,
     mutation: mutationResult(request),
+  });
+}
+
+function captureAttemptBinding(
+  fixture,
+  admission,
+  captureAttemptId = CAPTURE_ATTEMPT_ID,
+) {
+  return Object.freeze({
+    attachmentId: fixture.writerAttachment.attachmentId,
+    attachmentOperationId: fixture.writerAttachment.operationId,
+    attachmentProofId: fixture.writerAttachment.proofId,
+    captureAttemptId,
+    checkpoint: admission.checkpoint,
+    contractVersion: CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION,
+    processIncarnationId: PROCESS_INCARNATION_ID,
+    reservationId: RESERVATION_ID,
+    stopOperationId: STOP_OPERATION_ID,
+    writerIncarnationId: WRITER_INCARNATION_ID,
+  });
+}
+
+function captureAttemptRecord(fixture, admission, overrides = {}) {
+  const captureAttemptId =
+    overrides.captureAttemptId ??
+    admission.captureAttemptId ??
+    CAPTURE_ATTEMPT_ID;
+  return Object.freeze({
+    binding:
+      overrides.binding ??
+      captureAttemptBinding(fixture, admission, captureAttemptId),
+    captureAttemptId,
+    contractVersion: 1,
+    operationId: admission.request.operationId,
+    request: admission.request,
+    result: fixedResult(admission.checkpoint, admission.request),
+    state: "authorized",
+    ...overrides,
+  });
+}
+
+function captureAttemptActiveClaim(state, attempt) {
+  const operationClaim = state.captureOperationClaims.get(attempt.operationId);
+  assert.strictEqual(
+    operationClaim,
+    state.captureAttemptIdClaims.get(attempt.captureAttemptId),
+    "capture claim indexes must reference the same record",
+  );
+  assert.equal(
+    operationClaim?.state,
+    "active",
+    "capture claim must remain active",
+  );
+  assert.equal(operationClaim.captureAttemptId, attempt.captureAttemptId);
+  assert.equal(operationClaim.operationId, attempt.operationId);
+  assert.strictEqual(
+    operationClaim.attempt,
+    attempt,
+    "active capture claim must bind the canonical attempt record",
+  );
+  assert.strictEqual(state.captureAttempts.get(attempt.operationId), attempt);
+  return operationClaim;
+}
+
+function activateCaptureAttemptClaims(state, attempt) {
+  assert.equal(state.captureAttempts.has(attempt.operationId), false);
+  assert.equal(state.captureOperationClaims.has(attempt.operationId), false);
+  assert.equal(state.captureAttemptIdClaims.has(attempt.captureAttemptId), false);
+  const claim = Object.freeze({
+    attempt,
+    captureAttemptId: attempt.captureAttemptId,
+    operationId: attempt.operationId,
+    state: "active",
+  });
+  state.captureAttemptIdClaims.set(attempt.captureAttemptId, claim);
+  state.captureOperationClaims.set(attempt.operationId, claim);
+  state.captureAttempts.set(attempt.operationId, attempt);
+  return claim;
+}
+
+function transitionActiveCaptureAttemptClaims(state, expected, next) {
+  captureAttemptActiveClaim(state, expected);
+  assert.equal(next.captureAttemptId, expected.captureAttemptId);
+  assert.equal(next.operationId, expected.operationId);
+  const claim = Object.freeze({
+    attempt: next,
+    captureAttemptId: next.captureAttemptId,
+    operationId: next.operationId,
+    state: "active",
+  });
+  state.captureAttemptIdClaims.set(next.captureAttemptId, claim);
+  state.captureOperationClaims.set(next.operationId, claim);
+  state.captureAttempts.set(next.operationId, next);
+  return claim;
+}
+
+function retireCaptureAttemptClaims(state, operationId) {
+  const attempt = state.captureAttempts.get(operationId);
+  assert(attempt, "canonical capture attempt must exist before retirement");
+  captureAttemptActiveClaim(state, attempt);
+  const tombstone = Object.freeze({
+    captureAttemptId: attempt.captureAttemptId,
+    operationId,
+    state: "retired",
+  });
+  state.captureAttemptIdClaims.set(attempt.captureAttemptId, tombstone);
+  state.captureOperationClaims.set(operationId, tombstone);
+  state.captureAttempts.delete(operationId);
+  return Object.freeze({ attempt, tombstone });
+}
+
+function durableCaptureCompletion(completion) {
+  return Object.freeze({
+    artifactProof: completion.artifactProof,
+    materialization: completion.materialization,
+    result: completion.result,
   });
 }
 
@@ -324,6 +449,18 @@ async function pathExists(path) {
   }
 }
 
+function assertSameObjectMetadata(actual, expected) {
+  for (const field of [
+    "dev",
+    "ino",
+    "birthtimeNs",
+    "mtimeNs",
+    "ctimeNs",
+  ]) {
+    assert.equal(actual[field], expected[field]);
+  }
+}
+
 async function inspectTestPersistentObjectIdentity(path) {
   const metadata = await lstat(path, { bigint: true });
   return {
@@ -445,6 +582,7 @@ async function createFixture(t, options = {}) {
     captureGuard: false,
     events: [],
     preseeding: false,
+    reconciliationGuard: false,
     restoreGuard: false,
   };
   const journal = new FilesystemOperationJournal({
@@ -459,6 +597,7 @@ async function createFixture(t, options = {}) {
       afterJournalPrepared: async () => {
         assert.equal(
           observation.captureGuard ||
+            observation.reconciliationGuard ||
             observation.restoreGuard ||
             observation.preseeding,
           true,
@@ -470,6 +609,7 @@ async function createFixture(t, options = {}) {
       afterCopy: async () => {
         assert.equal(
           observation.captureGuard ||
+            observation.reconciliationGuard ||
             observation.restoreGuard ||
             observation.preseeding,
           true,
@@ -481,6 +621,7 @@ async function createFixture(t, options = {}) {
       afterMaterialized: async () => {
         assert.equal(
           observation.captureGuard ||
+            observation.reconciliationGuard ||
             observation.restoreGuard ||
             observation.preseeding,
           true,
@@ -519,10 +660,24 @@ function createMutationAuthority(fixture, options = {}) {
   const state = {
     background: [],
     captureAdmissions: [],
+    captureAttemptIdClaims: new Map(),
+    captureAttempts: new Map(),
     captureCallbackCompletions: [],
+    captureCatalogue: new Map(),
     captureContexts: [],
     captureFinalizations: [],
+    captureOperationClaims: new Map(),
+    capturePublicationInvocations: 0,
     captureRuns: 0,
+    reconciliationAdmissions: [],
+    activeReconciliations: 0,
+    maxActiveReconciliations: 0,
+    reconciliationCallbackCompletions: [],
+    reconciliationContexts: [],
+    reconciliationFinalizations: [],
+    reconciliationVerificationInvocations: 0,
+    reconciliationRuns: 0,
+    captureOperationTails: new Map(),
     restoreAdmissions: [],
     restoreCallbackCompletions: [],
     restoreContexts: [],
@@ -536,6 +691,7 @@ function createMutationAuthority(fixture, options = {}) {
       artifactOwnedRoot: fixture.artifactOwnedRoot,
       canonicalAttachment: fixture.writerAttachment,
       canonicalLease: fixture.writerLease,
+      captureAttemptId: admission.captureAttemptId,
       now: NOW,
       reservationId: RESERVATION_ID,
       result: fixedResult(admission.checkpoint, admission.request),
@@ -545,6 +701,18 @@ function createMutationAuthority(fixture, options = {}) {
       ...(typeof options.captureContext === "function"
         ? options.captureContext(admission)
         : options.captureContext),
+    };
+    return Object.freeze(context);
+  };
+
+  const reconciliationContext = (admission) => {
+    const context = {
+      artifactDirectory: fixture.artifactDirectory,
+      artifactOwnedRoot: fixture.artifactOwnedRoot,
+      captureAttempt: state.captureAttempts.get(admission.request.operationId),
+      ...(typeof options.reconciliationContext === "function"
+        ? options.reconciliationContext(admission, state)
+        : options.reconciliationContext),
     };
     return Object.freeze(context);
   };
@@ -570,94 +738,280 @@ function createMutationAuthority(fixture, options = {}) {
     return Object.freeze(context);
   };
 
+  const authorizeCaptureAttempt = (admission) => {
+    assert.match(admission.captureAttemptId, UUID_PATTERN);
+    assert.equal(
+      state.captureAttempts.has(admission.request.operationId),
+      false,
+      "normal capture must durably create a fresh attempt",
+    );
+    assert.equal(
+      state.captureOperationClaims.has(admission.request.operationId),
+      false,
+      "capture operation IDs must never be reauthorized",
+    );
+    assert.equal(
+      state.captureAttemptIdClaims.has(admission.captureAttemptId),
+      false,
+      "capture attempt IDs must never be reused",
+    );
+    const attempt = captureAttemptRecord(fixture, admission, {
+      captureAttemptId: admission.captureAttemptId,
+    });
+    activateCaptureAttemptClaims(state, attempt);
+    fixture.observation.events.push("authority:capture:attempt-authorized");
+    options.onCaptureAttemptAuthorized?.(attempt);
+    return attempt;
+  };
+
+  const finalizeCaptureAttempt = (admission, completion, expectedAttempt) => {
+    const current = state.captureAttempts.get(admission.request.operationId);
+    assert.strictEqual(
+      current,
+      expectedAttempt,
+      "capture attempt must remain canonical through finalization",
+    );
+    captureAttemptActiveClaim(state, expectedAttempt);
+    const durableCompletion = durableCaptureCompletion(completion);
+    const existing = state.captureCatalogue.get(admission.request.operationId);
+    if (existing !== undefined) {
+      assert.deepEqual(durableCompletion, existing);
+    } else {
+      state.captureCatalogue.set(
+        admission.request.operationId,
+        durableCompletion,
+      );
+    }
+    transitionActiveCaptureAttemptClaims(
+      state,
+      expectedAttempt,
+      Object.freeze({ ...current, state: "committed" }),
+    );
+  };
+
+  const runCaptureOperationSerialized = async (operationId, operation) => {
+    const preceding =
+      state.captureOperationTails.get(operationId) ?? Promise.resolve();
+    const current = preceding.then(operation, operation);
+    state.captureOperationTails.set(operationId, current);
+    try {
+      return await current;
+    } finally {
+      if (state.captureOperationTails.get(operationId) === current) {
+        state.captureOperationTails.delete(operationId);
+      }
+    }
+  };
+
   const normalAuthority = {
     async runCapture(admission, publish) {
       state.captureRuns += 1;
       state.captureAdmissions.push(admission);
-      fixture.observation.events.push("authority:capture:start");
+      return runCaptureOperationSerialized(
+        admission.request.operationId,
+        async () => {
+          fixture.observation.events.push("authority:capture:start");
+          assert(Object.isFrozen(admission));
+          exactKeys(admission, [
+            "attachment",
+            "captureAttemptId",
+            "checkpoint",
+            "processIncarnationId",
+            "request",
+            "stopOperationId",
+            "writerIncarnationId",
+          ]);
+          assert.deepEqual(admission.attachment, fixture.writerAttachment);
+          assert.equal(admission.processIncarnationId, PROCESS_INCARNATION_ID);
+          assert.equal(admission.writerIncarnationId, WRITER_INCARNATION_ID);
+          assert.equal(admission.stopOperationId, STOP_OPERATION_ID);
+          assert.match(admission.captureAttemptId, UUID_PATTERN);
+          assert.equal(Object.hasOwn(admission, "capability"), false);
+          assert.equal(Object.hasOwn(admission, "writer"), false);
+
+          fixture.observation.captureGuard = true;
+          try {
+            options.onCaptureAdmission?.(admission, state);
+            const captureAttempt = authorizeCaptureAttempt(admission);
+            const context = captureContext(admission);
+            state.captureContexts.push(context);
+            options.onCaptureEntered?.();
+            if (options.captureGate) await options.captureGate;
+            const invokePublish = (value) => {
+              state.capturePublicationInvocations += 1;
+              return publish(value);
+            };
+            switch (options.captureMode) {
+              case "zero":
+                return Object.freeze({ ignored: true });
+              case "multiple": {
+                const first = await invokePublish(context);
+                state.captureCallbackCompletions.push(first);
+                const second = await invokePublish(context);
+                state.captureCallbackCompletions.push(second);
+                return first;
+              }
+              case "early": {
+                const pending = invokePublish(context);
+                state.background.push(pending.catch(() => undefined));
+                return Object.freeze({ ignored: true });
+              }
+              case "discard-invalid": {
+                void invokePublish(Object.freeze({}));
+                return Object.freeze({ ignored: true });
+              }
+              case "late-unobserved": {
+                setImmediate(() => {
+                  void invokePublish(context);
+                  options.onCaptureLatePublishIssued?.();
+                });
+                return Object.freeze({ ignored: true });
+              }
+              case "throw":
+                throw new Error(
+                  "runtime secret Bearer sensitive-token-value at /company/private/session",
+                );
+              case "substituted": {
+                const completion = await invokePublish(context);
+                state.captureCallbackCompletions.push(completion);
+                return Object.freeze({ ...completion });
+              }
+              default: {
+                const completion = await invokePublish(context);
+                state.captureCallbackCompletions.push(completion);
+                exactKeys(completion, [
+                  "artifactProof",
+                  "materialization",
+                  "replayed",
+                  "result",
+                ]);
+                assert(Object.isFrozen(completion));
+                assert(Object.isFrozen(completion.artifactProof));
+                assert.deepEqual(completion.result, context.result);
+                options.onCapturePublished?.(completion);
+                if (options.captureFinalizationGate) {
+                  await options.captureFinalizationGate;
+                }
+                if (options.captureFinalizationFailure) {
+                  throw new Error(
+                    "capture catalogue finalization acknowledgement lost",
+                  );
+                }
+                finalizeCaptureAttempt(admission, completion, captureAttempt);
+                fixture.artifactProof = completion.artifactProof;
+                state.captureFinalizations.push(completion);
+                fixture.observation.events.push("authority:capture:finalized");
+                return completion;
+              }
+            }
+          } finally {
+            fixture.observation.captureGuard = false;
+            fixture.observation.events.push("authority:capture:end");
+          }
+        },
+      );
+    },
+
+    async runCaptureReconciliation(admission, verify) {
+      state.reconciliationRuns += 1;
+      state.reconciliationAdmissions.push(admission);
+      fixture.observation.events.push("authority:reconciliation:start");
       assert(Object.isFrozen(admission));
-      exactKeys(admission, [
-        "attachment",
-        "checkpoint",
-        "processIncarnationId",
-        "request",
-        "stopOperationId",
-        "writerIncarnationId",
-      ]);
-      assert.deepEqual(admission.attachment, fixture.writerAttachment);
-      assert.equal(admission.processIncarnationId, PROCESS_INCARNATION_ID);
-      assert.equal(admission.writerIncarnationId, WRITER_INCARNATION_ID);
-      assert.equal(admission.stopOperationId, STOP_OPERATION_ID);
+      exactKeys(admission, ["checkpoint", "request"]);
+      assert.equal(Object.hasOwn(admission, "attachment"), false);
       assert.equal(Object.hasOwn(admission, "capability"), false);
       assert.equal(Object.hasOwn(admission, "writer"), false);
-
-      const context = captureContext(admission);
-      state.captureContexts.push(context);
-      fixture.observation.captureGuard = true;
-      options.onCaptureEntered?.();
-      try {
-        if (options.captureGate) await options.captureGate;
-        switch (options.captureMode) {
-          case "zero":
-            return Object.freeze({ ignored: true });
-          case "multiple": {
-            const first = await publish(context);
-            state.captureCallbackCompletions.push(first);
-            const second = await publish(context);
-            state.captureCallbackCompletions.push(second);
-            return first;
-          }
-          case "early": {
-            const pending = publish(context);
-            state.background.push(pending.catch(() => undefined));
-            return Object.freeze({ ignored: true });
-          }
-          case "discard-invalid": {
-            void publish(Object.freeze({}));
-            return Object.freeze({ ignored: true });
-          }
-          case "late-unobserved": {
-            setImmediate(() => {
-              void publish(context);
-              options.onCaptureLatePublishIssued?.();
-            });
-            return Object.freeze({ ignored: true });
-          }
-          case "throw":
-            throw new Error(
-              "runtime secret Bearer sensitive-token-value at /company/private/session",
-            );
-          case "substituted": {
-            const completion = await publish(context);
-            state.captureCallbackCompletions.push(completion);
-            return Object.freeze({ ...completion });
-          }
-          default: {
-            const completion = await publish(context);
-            state.captureCallbackCompletions.push(completion);
-            exactKeys(completion, [
-              "artifactProof",
-              "materialization",
-              "replayed",
-              "result",
-            ]);
-            assert(Object.isFrozen(completion));
-            assert(Object.isFrozen(completion.artifactProof));
-            assert.deepEqual(completion.result, context.result);
-            options.onCapturePublished?.(completion);
-            if (options.captureFinalizationGate) {
-              await options.captureFinalizationGate;
-            }
-            fixture.artifactProof = completion.artifactProof;
-            state.captureFinalizations.push(completion);
-            fixture.observation.events.push("authority:capture:finalized");
-            return completion;
-          }
-        }
-      } finally {
-        fixture.observation.captureGuard = false;
-        fixture.observation.events.push("authority:capture:end");
+      options.onReconciliationAuthorityEntered?.(admission);
+      if (options.reconciliationEntryGate) {
+        await options.reconciliationEntryGate;
       }
+
+      return runCaptureOperationSerialized(
+        admission.request.operationId,
+        async () => {
+          const context = reconciliationContext(admission);
+          if (context.captureAttempt === undefined) {
+            throw new Error("canonical capture attempt is missing");
+          }
+          captureAttemptActiveClaim(state, context.captureAttempt);
+          state.reconciliationContexts.push(context);
+          state.activeReconciliations += 1;
+          state.maxActiveReconciliations = Math.max(
+            state.maxActiveReconciliations,
+            state.activeReconciliations,
+          );
+          fixture.observation.reconciliationGuard = true;
+          try {
+            options.onReconciliationEntered?.();
+            if (options.reconciliationGate) await options.reconciliationGate;
+            const invokeVerify = (value) => {
+              captureAttemptActiveClaim(state, context.captureAttempt);
+              state.reconciliationVerificationInvocations += 1;
+              return verify(value);
+            };
+            switch (options.reconciliationMode) {
+              case "zero":
+                return Object.freeze({ ignored: true });
+              case "multiple": {
+                const first = await invokeVerify(context);
+                state.reconciliationCallbackCompletions.push(first);
+                const second = await invokeVerify(context);
+                state.reconciliationCallbackCompletions.push(second);
+                return first;
+              }
+              case "early": {
+                const pending = invokeVerify(context);
+                state.background.push(pending.catch(() => undefined));
+                return Object.freeze({ ignored: true });
+              }
+              case "late-unobserved": {
+                setImmediate(() => {
+                  void invokeVerify(context);
+                  options.onReconciliationLateVerifyIssued?.();
+                });
+                return Object.freeze({ ignored: true });
+              }
+              case "substituted": {
+                const completion = await invokeVerify(context);
+                state.reconciliationCallbackCompletions.push(completion);
+                return Object.freeze({ ...completion });
+              }
+              default: {
+                const completion = await invokeVerify(context);
+                state.reconciliationCallbackCompletions.push(completion);
+                exactKeys(completion, [
+                  "artifactProof",
+                  "materialization",
+                  "replayed",
+                  "result",
+                ]);
+                assert(Object.isFrozen(completion));
+                assert(Object.isFrozen(completion.artifactProof));
+                assert.equal(completion.replayed, true);
+                options.onReconciliationVerified?.(completion);
+                if (options.reconciliationFinalizationGate) {
+                  await options.reconciliationFinalizationGate;
+                }
+                finalizeCaptureAttempt(
+                  admission,
+                  completion,
+                  context.captureAttempt,
+                );
+                fixture.artifactProof = completion.artifactProof;
+                state.reconciliationFinalizations.push(completion);
+                fixture.observation.events.push(
+                  "authority:reconciliation:finalized",
+                );
+                return completion;
+              }
+            }
+          } finally {
+            fixture.observation.reconciliationGuard = false;
+            state.activeReconciliations -= 1;
+            fixture.observation.events.push("authority:reconciliation:end");
+          }
+        },
+      );
     },
 
     async runRestore(admission, publish) {
@@ -729,9 +1083,18 @@ function createMutationAuthority(fixture, options = {}) {
         : function runCaptureWithAdversarialReturn(admission, publish) {
             state.captureRuns += 1;
             state.captureAdmissions.push(admission);
-            const context = captureContext(admission);
-            state.captureContexts.push(context);
+            let context;
+            fixture.observation.captureGuard = true;
+            try {
+              options.onCaptureAdmission?.(admission, state);
+              authorizeCaptureAttempt(admission);
+              context = captureContext(admission);
+              state.captureContexts.push(context);
+            } finally {
+              fixture.observation.captureGuard = false;
+            }
             const publishUnderGuard = async (value) => {
+              state.capturePublicationInvocations += 1;
               fixture.observation.captureGuard = true;
               try {
                 return await publish(value);
@@ -745,6 +1108,7 @@ function createMutationAuthority(fixture, options = {}) {
               publish: publishUnderGuard,
             });
           },
+    runCaptureReconciliation: normalAuthority.runCaptureReconciliation,
     runRestore:
       options.restoreReturnFactory === undefined
         ? normalAuthority.runRestore
@@ -768,7 +1132,11 @@ function createMutationAuthority(fixture, options = {}) {
             });
           },
   };
-  return { authority, state };
+  const retireCaptureAttempt = (operationId) =>
+    runCaptureOperationSerialized(operationId, () =>
+      retireCaptureAttemptClaims(state, operationId),
+    );
+  return { authority, retireCaptureAttempt, state };
 }
 
 function createRuntime(fixture, options = {}) {
@@ -889,6 +1257,14 @@ function captureDispatchInput(fixture, capability, overrides = {}) {
   };
 }
 
+function captureReconciliationInput(fixture, overrides = {}) {
+  return {
+    checkpoint: checkpoint(),
+    request: mutationRequest("checkpoint", fixture.writerLease),
+    ...overrides,
+  };
+}
+
 function capturePublicationOptions(fixture) {
   const captureRequest = mutationRequest("checkpoint", fixture.writerLease);
   return {
@@ -898,8 +1274,9 @@ function capturePublicationOptions(fixture) {
       attachmentId: fixture.writerAttachment.attachmentId,
       attachmentOperationId: fixture.writerAttachment.operationId,
       attachmentProofId: fixture.writerAttachment.proofId,
+      captureAttemptId: CAPTURE_ATTEMPT_ID,
       checkpoint: checkpoint(),
-      contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
+      contractVersion: CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION,
       processIncarnationId: PROCESS_INCARNATION_ID,
       reservationId: RESERVATION_ID,
       stopOperationId: STOP_OPERATION_ID,
@@ -910,6 +1287,26 @@ function capturePublicationOptions(fixture) {
     result: fixedResult(checkpoint(), captureRequest),
     sourceDirectory: fixture.sourceDirectory,
     sourceOwnedRoot: fixture.sourceOwnedRoot,
+  };
+}
+
+function restorePublicationOptions(fixture) {
+  const restoreRequest = mutationRequest("restore", fixture.restoreWriterLease);
+  return {
+    artifactDirectory: fixture.artifactDirectory,
+    artifactOwnedRoot: fixture.artifactOwnedRoot,
+    artifactProof: fixture.artifactProof,
+    binding: {
+      checkpoint: checkpoint(),
+      contractVersion: 1,
+      destinationIsolationProofId: DESTINATION_ISOLATION_PROOF_ID,
+      reservationId: "reservation-restore-001",
+    },
+    destinationDirectory: fixture.destinationDirectory,
+    destinationOwnedRoot: fixture.destinationOwnedRoot,
+    operationId: RESTORE_OPERATION_ID,
+    request: restoreRequest,
+    result: fixedResult(checkpoint(), restoreRequest),
   };
 }
 
@@ -947,9 +1344,11 @@ function restoreDispatchInput(fixture, overrides = {}) {
 test("backend exposes the fixed directory surface and delegates lifecycle operations", async (t) => {
   const fixture = await createFixture(t);
 
-  assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 1);
+  assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 2);
+  assert.equal(CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION, 2);
   assert.strictEqual(assertStorageBackend(fixture.backend), fixture.backend);
   assert.equal(fixture.backend.contractVersion, 1);
+  assert.equal(fixture.backend.captureReconciliationContractVersion, 1);
   assert.equal(fixture.backend.backendId, BACKEND_ID);
   assert.deepEqual(fixture.backend.capabilities, {
     atomicPointInTimeCheckpoint: false,
@@ -981,6 +1380,23 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
         coordinator: new StoppedWriterCapabilityCoordinator(),
         lifecycleBackend: mismatched.backend,
         mutationAuthority: fixture.mutation.authority,
+        publication: fixture.publication,
+        resolveStoppedWriter() {},
+      }),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
+
+  assert.throws(
+    () =>
+      new StoppedDirectoryBackend({
+        backendId: BACKEND_ID,
+        coordinator: fixture.coordinator,
+        lifecycleBackend: fixture.lifecycle.backend,
+        mutationAuthority: {
+          runCapture: fixture.mutation.authority.runCapture,
+          runRestore: fixture.mutation.authority.runRestore,
+        },
         publication: fixture.publication,
         resolveStoppedWriter() {},
       }),
@@ -1039,7 +1455,18 @@ test("lifecycle delegation contains collaborator errors without leaking details"
 });
 
 test("capture composes the real coordinator, publication, journal, and catalogue", async (t) => {
-  const fixture = await createFixture(t);
+  let fixture;
+  let authorizedBeforePublication;
+  fixture = await createFixture(t, {
+    onCaptureAttemptAuthorized(attempt) {
+      assert.equal(fixture.observation.captureGuard, true);
+      assert.equal(
+        fixture.observation.events.includes("publication:prepared"),
+        false,
+      );
+      authorizedBeforePublication = attempt;
+    },
+  });
   const capability = await issueCapability(fixture);
   fixture.observation.events.length = 0;
 
@@ -1052,6 +1479,18 @@ test("capture composes the real coordinator, publication, journal, and catalogue
   assert.equal(fixture.stopCalls, 1);
   assert.equal(fixture.resolverCalls, 1);
   assert.equal(fixture.mutation.state.captureRuns, 1);
+  assert.strictEqual(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).binding,
+    authorizedBeforePublication.binding,
+  );
+  assert.equal(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).state,
+    "committed",
+  );
+  assert.equal(
+    fixture.mutation.state.captureCatalogue.has(CAPTURE_OPERATION_ID),
+    true,
+  );
   assert.strictEqual(completion, fixture.mutation.state.captureCallbackCompletions[0]);
   assert.equal(completion.replayed, false);
   assert.deepEqual(completion.artifactProof, {
@@ -1064,6 +1503,7 @@ test("capture composes the real coordinator, publication, journal, and catalogue
   assert.deepEqual(fixture.observation.events, [
     "resolver",
     "authority:capture:start",
+    "authority:capture:attempt-authorized",
     "publication:prepared",
     "publication:copied",
     "authority:capture:finalized",
@@ -1086,6 +1526,386 @@ test("capture composes the real coordinator, publication, journal, and catalogue
   ]) {
     assert.equal(serializedAdmission.includes(forbidden), false);
     assert.equal(serializedCompletion.includes(forbidden), false);
+  }
+});
+
+test("committed capture reconciliation finalizes an authenticated durable attempt idempotently", async (t) => {
+  const fixture = await createFixture(t, { captureFinalizationFailure: true });
+  const capability = await issueCapability(fixture);
+
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+
+  const authorized = fixture.mutation.state.captureAttempts.get(
+    CAPTURE_OPERATION_ID,
+  );
+  assert(authorized);
+  assert.equal(authorized.state, "authorized");
+  assert.match(authorized.captureAttemptId, UUID_PATTERN);
+  assert.equal(
+    authorized.binding.captureAttemptId,
+    authorized.captureAttemptId,
+  );
+  const activeClaim = fixture.mutation.state.captureAttemptIdClaims.get(
+    authorized.captureAttemptId,
+  );
+  assert.strictEqual(
+    activeClaim,
+    fixture.mutation.state.captureOperationClaims.get(CAPTURE_OPERATION_ID),
+  );
+  assert.equal(activeClaim.state, "active");
+  assert.equal(activeClaim.captureAttemptId, authorized.captureAttemptId);
+  assert.equal(activeClaim.operationId, CAPTURE_OPERATION_ID);
+  assert.strictEqual(activeClaim.attempt, authorized);
+  assert.equal(authorized.binding.contractVersion, 2);
+  assert.equal(
+    fixture.mutation.state.captureCatalogue.has(CAPTURE_OPERATION_ID),
+    false,
+  );
+  const journalBefore = await fixture.journal.read({
+    operationId: CAPTURE_OPERATION_ID,
+  });
+  assert.equal(journalBefore.record.state, "committed");
+  assert.equal(
+    journalBefore.record.binding.coordinator.captureAttemptId,
+    authorized.captureAttemptId,
+  );
+  assert.deepEqual(journalBefore.record.binding.coordinator, authorized.binding);
+  const artifactBefore = await lstat(fixture.artifactDirectory, { bigint: true });
+  const stopCalls = fixture.stopCalls;
+  const resolverCalls = fixture.resolverCalls;
+  fixture.observation.events.length = 0;
+
+  const input = captureReconciliationInput(fixture);
+  const result = await reconcileCleanCheckpointCapture({
+    backend: fixture.backend,
+    checkpoint: input.checkpoint,
+    manifest: manifest(),
+    request: input.request,
+    storageRef: storageRef(),
+  });
+  const completion = fixture.mutation.state.reconciliationFinalizations[0];
+  assert.deepEqual(result, fixedResult(input.checkpoint, input.request));
+  assert.equal(completion.replayed, true);
+  assert.deepEqual(completion.artifactProof, {
+    artifactManifestDigest: completion.materialization.artifactManifestDigest,
+    captureOperationId: CAPTURE_OPERATION_ID,
+    modeledDigest: completion.materialization.modeledDigest,
+  });
+  assert.equal(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).state,
+    "committed",
+  );
+  assert.equal(
+    fixture.mutation.state.captureCatalogue.has(CAPTURE_OPERATION_ID),
+    true,
+  );
+  assert.equal(fixture.stopCalls, stopCalls);
+  assert.equal(fixture.resolverCalls, resolverCalls);
+  assert.deepEqual(fixture.observation.events, [
+    "authority:reconciliation:start",
+    "authority:reconciliation:finalized",
+    "authority:reconciliation:end",
+  ]);
+
+  fixture.observation.events.length = 0;
+  const replayed = await reconcileCleanCheckpointCapture({
+    backend: fixture.backend,
+    checkpoint: input.checkpoint,
+    manifest: manifest(),
+    request: input.request,
+    storageRef: storageRef(),
+  });
+  assert.deepEqual(replayed, result);
+  assert.equal(fixture.mutation.state.reconciliationRuns, 2);
+  assert.equal(fixture.mutation.state.reconciliationFinalizations.length, 2);
+  const artifactAfter = await lstat(fixture.artifactDirectory, { bigint: true });
+  assert.equal(artifactAfter.dev, artifactBefore.dev);
+  assert.equal(artifactAfter.ino, artifactBefore.ino);
+  assert.equal(artifactAfter.birthtimeNs, artifactBefore.birthtimeNs);
+  assert.equal(fixture.stopCalls, stopCalls);
+  assert.equal(fixture.resolverCalls, resolverCalls);
+  assert.deepEqual(fixture.observation.events, [
+    "authority:reconciliation:start",
+    "authority:reconciliation:finalized",
+    "authority:reconciliation:end",
+  ]);
+});
+
+test("two overlapping exact reconciliations serialize one durable catalogue result", async (t) => {
+  const bothAuthoritiesEntered = deferred();
+  const releaseAuthorities = deferred();
+  let authorityEntries = 0;
+  const fixture = await createFixture(t, {
+    captureFinalizationFailure: true,
+    reconciliationEntryGate: releaseAuthorities.promise,
+    onReconciliationAuthorityEntered() {
+      authorityEntries += 1;
+      if (authorityEntries === 2) bothAuthoritiesEntered.resolve();
+    },
+  });
+  const capability = await issueCapability(fixture);
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+  const artifactBefore = await lstat(fixture.artifactDirectory, { bigint: true });
+  const stopCalls = fixture.stopCalls;
+  const resolverCalls = fixture.resolverCalls;
+  const input = captureReconciliationInput(fixture);
+  const reconcile = () =>
+    reconcileCleanCheckpointCapture({
+      backend: fixture.backend,
+      checkpoint: input.checkpoint,
+      manifest: manifest(),
+      request: input.request,
+      storageRef: storageRef(),
+    });
+
+  const pending = [reconcile(), reconcile()];
+  let entryFailure;
+  let timeoutId;
+  try {
+    await Promise.race([
+      bothAuthoritiesEntered.promise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error("two reconciliation authorities did not enter")),
+          2_000,
+        );
+      }),
+    ]);
+  } catch (error) {
+    entryFailure = error;
+  } finally {
+    clearTimeout(timeoutId);
+    releaseAuthorities.resolve();
+  }
+  if (entryFailure !== undefined) {
+    await Promise.allSettled(pending);
+    throw entryFailure;
+  }
+  assert.equal(authorityEntries, 2);
+  assert.equal(fixture.mutation.state.reconciliationRuns, 2);
+  assert.equal(fixture.mutation.state.reconciliationContexts.length, 0);
+
+  const [first, second] = await Promise.all(pending);
+  assert.deepEqual(first, second);
+  assert.deepEqual(first, fixedResult(input.checkpoint, input.request));
+  assert.equal(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).state,
+    "committed",
+  );
+  assert.equal(fixture.mutation.state.captureCatalogue.size, 1);
+  const catalogueRecord = fixture.mutation.state.captureCatalogue.get(
+    CAPTURE_OPERATION_ID,
+  );
+  assert(catalogueRecord);
+  assert.deepEqual(
+    catalogueRecord,
+    durableCaptureCompletion(
+      fixture.mutation.state.reconciliationFinalizations[0],
+    ),
+  );
+  assert.deepEqual(
+    durableCaptureCompletion(
+      fixture.mutation.state.reconciliationFinalizations[1],
+    ),
+    catalogueRecord,
+  );
+  assert.equal(fixture.mutation.state.reconciliationFinalizations.length, 2);
+  assert.equal(fixture.mutation.state.maxActiveReconciliations, 1);
+  assert.equal(fixture.mutation.state.activeReconciliations, 0);
+  assert.equal(fixture.mutation.state.captureOperationTails.size, 0);
+  assert.equal(fixture.stopCalls, stopCalls);
+  assert.equal(fixture.resolverCalls, resolverCalls);
+  assert.equal(fixture.mutation.state.captureRuns, 1);
+  const artifactAfter = await lstat(fixture.artifactDirectory, { bigint: true });
+  assert.equal(artifactAfter.dev, artifactBefore.dev);
+  assert.equal(artifactAfter.ino, artifactBefore.ino);
+  assert.equal(artifactAfter.birthtimeNs, artifactBefore.birthtimeNs);
+});
+
+test("capture reconciliation rejects missing, forged, and mismatched durable attempts", async (t) => {
+  const scenarios = [
+    {
+      name: "missing attempt",
+      expectedVerificationInvocations: 0,
+      mutate(state) {
+        state.captureAttempts.delete(CAPTURE_OPERATION_ID);
+      },
+    },
+    {
+      name: "foreign attempt binding",
+      expectedVerificationInvocations: 0,
+      mutate(state) {
+        const current = state.captureAttempts.get(CAPTURE_OPERATION_ID);
+        const captureAttemptId = FOREIGN_CAPTURE_ATTEMPT_ID;
+        state.captureAttempts.set(
+          CAPTURE_OPERATION_ID,
+          Object.freeze({
+            ...current,
+            binding: Object.freeze({
+              ...current.binding,
+              captureAttemptId,
+            }),
+            captureAttemptId,
+          }),
+        );
+      },
+    },
+    {
+      name: "request mismatch",
+      expectedVerificationInvocations: 1,
+      mutate(state) {
+        const current = state.captureAttempts.get(CAPTURE_OPERATION_ID);
+        const request = mutationRequest("checkpoint", lease(), {
+          holderId: "host-conflicting",
+        });
+        transitionActiveCaptureAttemptClaims(
+          state,
+          current,
+          Object.freeze({
+            ...current,
+            request,
+            result: fixedResult(current.result.checkpoint, request),
+          }),
+        );
+      },
+    },
+    {
+      name: "result mismatch",
+      expectedVerificationInvocations: 1,
+      mutate(state) {
+        const current = state.captureAttempts.get(CAPTURE_OPERATION_ID);
+        transitionActiveCaptureAttemptClaims(
+          state,
+          current,
+          Object.freeze({
+            ...current,
+            result: Object.freeze({
+              checkpoint: current.result.checkpoint,
+              mutation: Object.freeze({
+                ...current.result.mutation,
+                proofId: "proof-checkpoint-conflicting",
+              }),
+            }),
+          }),
+        );
+      },
+    },
+    {
+      name: "reconstructed attempt without active claims",
+      expectedVerificationInvocations: 0,
+      mutate(state) {
+        const current = state.captureAttempts.get(CAPTURE_OPERATION_ID);
+        state.captureAttempts.set(
+          CAPTURE_OPERATION_ID,
+          Object.freeze({ ...current }),
+        );
+        state.captureAttemptIdClaims.clear();
+        state.captureOperationClaims.clear();
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async (t) => {
+      const fixture = await createFixture(t, {
+        captureFinalizationFailure: true,
+      });
+      const capability = await issueCapability(fixture);
+      await assert.rejects(
+        () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+        (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+      );
+      scenario.mutate(fixture.mutation.state);
+      const journalBefore = await fixture.journal.read({
+        operationId: CAPTURE_OPERATION_ID,
+      });
+      const artifactBefore = await lstat(fixture.artifactDirectory, {
+        bigint: true,
+      });
+      const stopCalls = fixture.stopCalls;
+      const resolverCalls = fixture.resolverCalls;
+
+      await assert.rejects(
+        () =>
+          fixture.backend.reconcileCheckpointCapture(
+            captureReconciliationInput(fixture),
+          ),
+        assertBackendError,
+      );
+
+      assert.equal(fixture.stopCalls, stopCalls);
+      assert.equal(fixture.resolverCalls, resolverCalls);
+      assert.equal(
+        fixture.mutation.state.reconciliationFinalizations.length,
+        0,
+      );
+      assert.equal(
+        fixture.mutation.state.reconciliationVerificationInvocations,
+        scenario.expectedVerificationInvocations,
+      );
+      assert.deepEqual(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID }))
+          .record,
+        journalBefore.record,
+      );
+      const artifactAfter = await lstat(fixture.artifactDirectory, {
+        bigint: true,
+      });
+      assert.equal(artifactAfter.dev, artifactBefore.dev);
+      assert.equal(artifactAfter.ino, artifactBefore.ino);
+      assert.equal(artifactAfter.birthtimeNs, artifactBefore.birthtimeNs);
+    });
+  }
+});
+
+test("capture reconciliation authority must await exactly one callback and return it by reference", async (t) => {
+  for (const mode of ["zero", "multiple", "late-unobserved", "substituted"]) {
+    await t.test(mode, async (t) => {
+      const lateVerifyIssued = deferred();
+      const fixture = await createFixture(t, {
+        captureFinalizationFailure: true,
+        reconciliationMode: mode,
+        onReconciliationLateVerifyIssued: lateVerifyIssued.resolve,
+      });
+      const capability = await issueCapability(fixture);
+      await assert.rejects(
+        () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+        (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+      );
+      const stopCalls = fixture.stopCalls;
+      const resolverCalls = fixture.resolverCalls;
+
+      await assert.rejects(
+        () =>
+          fixture.backend.reconcileCheckpointCapture(
+            captureReconciliationInput(fixture),
+          ),
+        assertBackendError,
+      );
+      if (mode === "late-unobserved") await lateVerifyIssued.promise;
+      await Promise.all(fixture.mutation.state.background);
+
+      assert.equal(fixture.stopCalls, stopCalls);
+      assert.equal(fixture.resolverCalls, resolverCalls);
+      assert.equal(
+        fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).state,
+        "authorized",
+      );
+      assert.equal(
+        fixture.mutation.state.reconciliationFinalizations.length,
+        0,
+      );
+      assert.equal(
+        fixture.mutation.state.captureCatalogue.has(CAPTURE_OPERATION_ID),
+        false,
+      );
+    });
   }
 });
 
@@ -1139,6 +1959,53 @@ test("restore requires a newer current fence, trusted proof, and detached destin
   assert.equal(fixture.mutation.state.restoreRuns, 2);
   assert.equal(fixture.mutation.state.restoreFinalizations.length, 2);
   assert.equal(replayCompletion.replayed, true);
+  assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
+  assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
+  assert.equal(
+    destinationAfterReplay.birthtimeNs,
+    destinationBeforeReplay.birthtimeNs,
+  );
+  assert.deepEqual(fixture.observation.events, [
+    "authority:restore:start",
+    "authority:restore:finalized",
+    "authority:restore:end",
+  ]);
+});
+
+test("adapter v2 replays a committed v1 restore journal binding", async (t) => {
+  const fixture = await createFixture(t);
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+  fixture.observation.preseeding = true;
+  let seeded;
+  try {
+    seeded = await fixture.publication.publishRestoreDestination(
+      restorePublicationOptions(fixture),
+    );
+  } finally {
+    fixture.observation.preseeding = false;
+  }
+  assert.equal(seeded.replayed, false);
+  const committed = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(committed.record.state, "committed");
+  assert.equal(committed.record.binding.coordinator.contractVersion, 1);
+  const destinationBeforeReplay = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  fixture.observation.events.length = 0;
+
+  const options = restoreCoreOptions(fixture);
+  const result = await restoreCleanCheckpoint(options);
+  const completion = fixture.mutation.state.restoreFinalizations[0];
+  const destinationAfterReplay = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+
+  assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+  assert.equal(completion.replayed, true);
+  assert.equal(fixture.mutation.state.restoreRuns, 1);
   assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
   assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
   assert.equal(
@@ -1216,6 +2083,12 @@ test("stale or expired capture authority is terminal and never publishes", async
       name: "expired lease",
       captureContext: () => ({
         now: Date.parse(lease().expiresAt) + 1,
+      }),
+    },
+    {
+      name: "substituted capture-attempt ID",
+      captureContext: () => ({
+        captureAttemptId: FOREIGN_CAPTURE_ATTEMPT_ID,
       }),
     },
   ];
@@ -1872,6 +2745,10 @@ test("deterministic invalid inputs fail before resolver, authority, publication,
     request: mutationRequest("restore", fixture.restoreWriterLease),
     unexpected: true,
   };
+  const invalidReconciliation = {
+    ...captureReconciliationInput(fixture),
+    unexpected: true,
+  };
 
   await assert.rejects(
     () => fixture.backend.captureCheckpoint(invalidCapture),
@@ -1883,9 +2760,15 @@ test("deterministic invalid inputs fail before resolver, authority, publication,
     (error) =>
       assertBackendError(error, "invalid_stopped_directory_backend_request"),
   );
+  await assert.rejects(
+    () => fixture.backend.reconcileCheckpointCapture(invalidReconciliation),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
   assert.equal(fixture.resolverCalls, 0);
   assert.equal(fixture.mutation.state.captureRuns, 0);
   assert.equal(fixture.mutation.state.restoreRuns, 0);
+  assert.equal(fixture.mutation.state.reconciliationRuns, 0);
   assert.equal(await pathExists(fixture.artifactDirectory), false);
   assert.equal(await pathExists(fixture.destinationDirectory), false);
 
@@ -1956,6 +2839,105 @@ test("runtime collaborator failures become fixed path-free uncertainty", async (
     assertBackendError,
   );
   assert.equal(fixture.mutation.state.captureRuns, 1);
+});
+
+test("capture reconciliation never adopts prepared or materialized publication state", async (t) => {
+  for (const phase of ["prepared", "materialized"]) {
+    await t.test(phase, async (t) => {
+      let seedFaultEnabled = true;
+      const fixture = await createFixture(t, {
+        publicationFaults: {
+          async afterJournalPrepared() {
+            if (phase === "prepared" && seedFaultEnabled) {
+              throw new Error("prepared reconciliation seed fault");
+            }
+          },
+          async afterMaterialized() {
+            if (phase === "materialized" && seedFaultEnabled) {
+              throw new Error("materialized reconciliation seed fault");
+            }
+          },
+        },
+      });
+      const publicationOptions = capturePublicationOptions(fixture);
+      fixture.observation.preseeding = true;
+      try {
+        await assert.rejects(
+          fixture.publication.publishCheckpointArtifact(publicationOptions),
+          (error) =>
+            error?.code === "publication_io_failed" &&
+            error.commitState === "not-committed",
+        );
+      } finally {
+        fixture.observation.preseeding = false;
+      }
+      seedFaultEnabled = false;
+
+      const admission = Object.freeze({
+        checkpoint: checkpoint(),
+        request: mutationRequest("checkpoint", fixture.writerLease),
+      });
+      const captureAttempt = captureAttemptRecord(fixture, admission);
+      activateCaptureAttemptClaims(
+        fixture.mutation.state,
+        captureAttempt,
+      );
+      const journalBefore = await fixture.journal.read({
+        operationId: CAPTURE_OPERATION_ID,
+      });
+      assert.equal(journalBefore.record.state, phase);
+      const candidate = captureCandidatePath(fixture);
+      const candidateBefore =
+        phase === "materialized"
+          ? await lstat(candidate, { bigint: true })
+          : null;
+      await rm(fixture.sourceDirectory, { force: true, recursive: true });
+      fixture.observation.events.length = 0;
+
+      await assert.rejects(
+        () =>
+          fixture.backend.reconcileCheckpointCapture(
+            captureReconciliationInput(fixture),
+          ),
+        assertBackendError,
+      );
+
+      assert.equal(fixture.stopCalls, 0);
+      assert.equal(fixture.resolverCalls, 0);
+      assert.equal(fixture.mutation.state.captureRuns, 0);
+      assert.equal(fixture.mutation.state.reconciliationRuns, 1);
+      assert.equal(
+        fixture.mutation.state.reconciliationCallbackCompletions.length,
+        0,
+      );
+      assert.equal(
+        fixture.mutation.state.reconciliationFinalizations.length,
+        0,
+      );
+      assert.equal(
+        fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).state,
+        "authorized",
+      );
+      assert.deepEqual(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID }))
+          .record,
+        journalBefore.record,
+      );
+      assert.equal(await pathExists(fixture.artifactDirectory), false);
+      if (candidateBefore === null) {
+        assert.equal(await pathExists(candidate), false);
+      } else {
+        const candidateAfter = await lstat(candidate, { bigint: true });
+        assert.equal(candidateAfter.dev, candidateBefore.dev);
+        assert.equal(candidateAfter.ino, candidateBefore.ino);
+        assert.equal(candidateAfter.birthtimeNs, candidateBefore.birthtimeNs);
+      }
+      assert.deepEqual(fixture.observation.events, [
+        "authority:reconciliation:start",
+        "authority:reconciliation:end",
+      ]);
+    });
+  }
 });
 
 test("pre-existing capture phases cannot satisfy a new stopped-writer capability", async (t) => {
@@ -2045,6 +3027,7 @@ test("pre-existing capture phases cannot satisfy a new stopped-writer capability
       assert.deepEqual(fixture.observation.events, [
         "resolver",
         "authority:capture:start",
+        "authority:capture:attempt-authorized",
         "authority:capture:end",
       ]);
 
@@ -2057,4 +3040,496 @@ test("pre-existing capture phases cannot satisfy a new stopped-writer capability
       assert.equal(fixture.mutation.state.captureFinalizations.length, 0);
     });
   }
+});
+
+test("fresh capture-attempt provenance cannot adopt a pre-existing committed publication", async (t) => {
+  const fixture = await createFixture(t);
+  fixture.observation.preseeding = true;
+  try {
+    await fixture.publication.publishCheckpointArtifact(
+      capturePublicationOptions(fixture),
+    );
+  } finally {
+    fixture.observation.preseeding = false;
+  }
+
+  const journalBefore = await fixture.journal.read({
+    operationId: CAPTURE_OPERATION_ID,
+  });
+  const journalPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(CAPTURE_OPERATION_ID),
+  );
+  const journalIdentityBefore = await lstat(journalPath, { bigint: true });
+  const artifactIdentityBefore = await lstat(fixture.artifactDirectory, {
+    bigint: true,
+  });
+  const candidate = captureCandidatePath(fixture);
+  assert.equal(
+    journalBefore.record.binding.coordinator.captureAttemptId,
+    CAPTURE_ATTEMPT_ID,
+  );
+  assert.equal(await pathExists(candidate), false);
+  fixture.observation.events.length = 0;
+
+  const capability = await issueCapability(fixture);
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+
+  const attempt = fixture.mutation.state.captureAttempts.get(
+    CAPTURE_OPERATION_ID,
+  );
+  assert(attempt);
+  assert.match(attempt.captureAttemptId, UUID_PATTERN);
+  assert.notEqual(attempt.captureAttemptId, CAPTURE_ATTEMPT_ID);
+  assert.equal(attempt.binding.captureAttemptId, attempt.captureAttemptId);
+  assert.equal(attempt.state, "authorized");
+  assert.equal(fixture.mutation.state.capturePublicationInvocations, 1);
+  assert.equal(fixture.mutation.state.captureFinalizations.length, 0);
+  assert.equal(fixture.mutation.state.captureCatalogue.size, 0);
+
+  const reconcile = () =>
+    reconcileCleanCheckpointCapture({
+      backend: fixture.backend,
+      checkpoint: checkpoint(),
+      manifest: manifest(),
+      request: mutationRequest("checkpoint", fixture.writerLease),
+      storageRef: storageRef(),
+    });
+  await assert.rejects(
+    reconcile,
+    (error) =>
+      assertCoreError(error, "checkpoint_reconciliation_outcome_uncertain"),
+  );
+
+  assert.equal(fixture.mutation.state.reconciliationRuns, 1);
+  assert.equal(
+    fixture.mutation.state.reconciliationVerificationInvocations,
+    1,
+  );
+
+  fixture.mutation.state.captureAttempts.set(
+    CAPTURE_OPERATION_ID,
+    Object.freeze({
+      ...attempt,
+      binding: Object.freeze({
+        ...journalBefore.record.binding.coordinator,
+      }),
+      captureAttemptId: CAPTURE_ATTEMPT_ID,
+    }),
+  );
+  await assert.rejects(
+    reconcile,
+    (error) =>
+      assertCoreError(error, "checkpoint_reconciliation_outcome_uncertain"),
+  );
+  assert.equal(fixture.mutation.state.reconciliationRuns, 2);
+  assert.equal(
+    fixture.mutation.state.reconciliationVerificationInvocations,
+    1,
+  );
+  assert.equal(fixture.mutation.state.reconciliationContexts.length, 1);
+  assert.equal(
+    fixture.mutation.state.reconciliationCallbackCompletions.length,
+    0,
+  );
+  assert.equal(fixture.mutation.state.reconciliationFinalizations.length, 0);
+  assert.equal(fixture.mutation.state.captureCatalogue.size, 0);
+  assert.equal(fixture.stopCalls, 1);
+  assert.equal(fixture.resolverCalls, 1);
+  assert.deepEqual(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    journalBefore.record,
+  );
+  assertSameObjectMetadata(
+    await lstat(journalPath, { bigint: true }),
+    journalIdentityBefore,
+  );
+  assertSameObjectMetadata(
+    await lstat(fixture.artifactDirectory, { bigint: true }),
+    artifactIdentityBefore,
+  );
+  assert.equal(await pathExists(candidate), false);
+});
+
+test("durable capture-attempt claims reject ID reuse before publication", async (t) => {
+  const fixture = await createFixture(t, {
+    onCaptureAdmission(admission, state) {
+      state.captureAttemptIdClaims.set(
+        admission.captureAttemptId,
+        "operation-claimed-elsewhere",
+      );
+    },
+  });
+  const capability = await issueCapability(fixture);
+
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+
+  const admission = fixture.mutation.state.captureAdmissions[0];
+  assert.match(admission.captureAttemptId, UUID_PATTERN);
+  assert.equal(
+    fixture.mutation.state.captureAttemptIdClaims.has(
+      admission.captureAttemptId,
+    ),
+    true,
+  );
+  assert.equal(fixture.mutation.state.captureAttempts.size, 0);
+  assert.equal(fixture.mutation.state.captureOperationClaims.size, 0);
+  assert.equal(fixture.mutation.state.captureContexts.length, 0);
+  assert.equal(fixture.mutation.state.capturePublicationInvocations, 0);
+  assert.equal(fixture.mutation.state.captureCallbackCompletions.length, 0);
+  assert.equal(fixture.mutation.state.captureFinalizations.length, 0);
+  assert.equal(fixture.mutation.state.captureCatalogue.size, 0);
+  assert.equal(await pathExists(fixture.artifactDirectory), false);
+  assert.equal(await pathExists(captureCandidatePath(fixture)), false);
+});
+
+test("capture-attempt tombstones survive canonical attempt retirement", async (t) => {
+  const fixture = await createFixture(t);
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+
+  const originalAdmission = fixture.mutation.state.captureAdmissions[0];
+  const originalAttempt = fixture.mutation.state.captureAttempts.get(
+    CAPTURE_OPERATION_ID,
+  );
+  assert(originalAttempt);
+  const retirement = await fixture.mutation.retireCaptureAttempt(
+    CAPTURE_OPERATION_ID,
+  );
+  assert.strictEqual(retirement.attempt, originalAttempt);
+  fixture.mutation.state.captureAttempts.set(
+    CAPTURE_OPERATION_ID,
+    Object.freeze({ ...originalAttempt }),
+  );
+
+  await assert.rejects(
+    () =>
+      reconcileCleanCheckpointCapture({
+        backend: fixture.backend,
+        checkpoint: checkpoint(),
+        manifest: manifest(),
+        request: mutationRequest("checkpoint", fixture.writerLease),
+        storageRef: storageRef(),
+      }),
+    (error) =>
+      assertCoreError(error, "checkpoint_reconciliation_outcome_uncertain"),
+  );
+  assert.equal(
+    fixture.mutation.state.reconciliationVerificationInvocations,
+    0,
+  );
+  assert.equal(fixture.mutation.state.reconciliationContexts.length, 0);
+
+  const retiredOperationId = "operation-checkpoint-retired-002";
+  const retiredAdmission = Object.freeze({
+    ...originalAdmission,
+    request: Object.freeze({
+      ...originalAdmission.request,
+      operationId: retiredOperationId,
+    }),
+  });
+  let publicationInvocations = 0;
+  await assert.rejects(
+    () =>
+      fixture.mutation.authority.runCapture(
+        retiredAdmission,
+        async () => {
+          publicationInvocations += 1;
+        },
+      ),
+    (error) =>
+      error?.code === "ERR_ASSERTION" &&
+      error.message.includes("capture attempt IDs must never be reused"),
+  );
+
+  assert.equal(publicationInvocations, 0);
+  assert.strictEqual(
+    fixture.mutation.state.captureAttemptIdClaims.get(
+      originalAttempt.captureAttemptId,
+    ),
+    retirement.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureOperationClaims.get(CAPTURE_OPERATION_ID),
+    retirement.tombstone,
+  );
+  assert.equal(retirement.tombstone.state, "retired");
+  assert.equal(
+    Object.hasOwn(retirement.tombstone, "attempt"),
+    false,
+  );
+  assert.equal(
+    fixture.mutation.state.captureOperationClaims.has(retiredOperationId),
+    false,
+  );
+  assert.equal(
+    fixture.mutation.state.captureAttempts.has(retiredOperationId),
+    false,
+  );
+  assert.equal(fixture.mutation.state.captureContexts.length, 1);
+});
+
+test("reconciliation revalidates active claims after authority waits", async (t) => {
+  const reconciliationEntered = deferred();
+  const releaseReconciliation = deferred();
+  t.after(() => releaseReconciliation.resolve());
+  const fixture = await createFixture(t, {
+    captureFinalizationFailure: true,
+    onReconciliationEntered() {
+      reconciliationEntered.resolve();
+    },
+    reconciliationGate: releaseReconciliation.promise,
+  });
+  const capability = await issueCapability(fixture);
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+  const originalAttempt = fixture.mutation.state.captureAttempts.get(
+    CAPTURE_OPERATION_ID,
+  );
+  assert(originalAttempt);
+  const artifactBefore = await lstat(fixture.artifactDirectory, {
+    bigint: true,
+  });
+
+  const pending = reconcileCleanCheckpointCapture({
+    backend: fixture.backend,
+    checkpoint: checkpoint(),
+    manifest: manifest(),
+    request: mutationRequest("checkpoint", fixture.writerLease),
+    storageRef: storageRef(),
+  });
+  await reconciliationEntered.promise;
+  // Simulate an out-of-band authority-store change even though correct
+  // retirement uses the shared operation serializer.
+  const retirement = retireCaptureAttemptClaims(
+    fixture.mutation.state,
+    CAPTURE_OPERATION_ID,
+  );
+  const reconstructedAttempt = Object.freeze({ ...originalAttempt });
+  fixture.mutation.state.captureAttempts.set(
+    CAPTURE_OPERATION_ID,
+    reconstructedAttempt,
+  );
+  releaseReconciliation.resolve();
+
+  await assert.rejects(
+    pending,
+    (error) =>
+      assertCoreError(error, "checkpoint_reconciliation_outcome_uncertain"),
+  );
+  assert.equal(
+    fixture.mutation.state.reconciliationVerificationInvocations,
+    0,
+  );
+  assert.equal(
+    fixture.mutation.state.reconciliationCallbackCompletions.length,
+    0,
+  );
+  assert.equal(fixture.mutation.state.reconciliationFinalizations.length, 0);
+  assert.equal(fixture.mutation.state.captureCatalogue.size, 0);
+  assert.strictEqual(
+    fixture.mutation.state.captureAttemptIdClaims.get(
+      originalAttempt.captureAttemptId,
+    ),
+    retirement.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureOperationClaims.get(CAPTURE_OPERATION_ID),
+    retirement.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID),
+    reconstructedAttempt,
+  );
+  assertSameObjectMetadata(
+    await lstat(fixture.artifactDirectory, { bigint: true }),
+    artifactBefore,
+  );
+});
+
+test("reconciliation revalidates active claims after physical verification", async (t) => {
+  let fixture;
+  let retirement;
+  fixture = await createFixture(t, {
+    captureFinalizationFailure: true,
+    onReconciliationVerified() {
+      const originalAttempt = fixture.mutation.state.captureAttempts.get(
+        CAPTURE_OPERATION_ID,
+      );
+      retirement = retireCaptureAttemptClaims(
+        fixture.mutation.state,
+        CAPTURE_OPERATION_ID,
+      );
+      fixture.mutation.state.captureAttempts.set(
+        CAPTURE_OPERATION_ID,
+        originalAttempt,
+      );
+    },
+  });
+  const capability = await issueCapability(fixture);
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+  const artifactBefore = await lstat(fixture.artifactDirectory, {
+    bigint: true,
+  });
+
+  await assert.rejects(
+    () =>
+      reconcileCleanCheckpointCapture({
+        backend: fixture.backend,
+        checkpoint: checkpoint(),
+        manifest: manifest(),
+        request: mutationRequest("checkpoint", fixture.writerLease),
+        storageRef: storageRef(),
+      }),
+    (error) =>
+      assertCoreError(error, "checkpoint_reconciliation_outcome_uncertain"),
+  );
+
+  assert(retirement);
+  assert.equal(
+    fixture.mutation.state.reconciliationVerificationInvocations,
+    1,
+  );
+  assert.equal(
+    fixture.mutation.state.reconciliationCallbackCompletions.length,
+    1,
+  );
+  assert.equal(fixture.mutation.state.reconciliationFinalizations.length, 0);
+  assert.equal(fixture.mutation.state.captureCatalogue.size, 0);
+  assert.strictEqual(
+    fixture.mutation.state.captureAttemptIdClaims.get(
+      retirement.attempt.captureAttemptId,
+    ),
+    retirement.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureOperationClaims.get(CAPTURE_OPERATION_ID),
+    retirement.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID),
+    retirement.attempt,
+  );
+  assertSameObjectMetadata(
+    await lstat(fixture.artifactDirectory, { bigint: true }),
+    artifactBefore,
+  );
+});
+
+test("capture-attempt retirement serializes behind reconciliation", async (t) => {
+  const reconciliationEntered = deferred();
+  const releaseReconciliation = deferred();
+  t.after(() => releaseReconciliation.resolve());
+  const fixture = await createFixture(t, {
+    captureFinalizationFailure: true,
+    onReconciliationEntered() {
+      reconciliationEntered.resolve();
+    },
+    reconciliationGate: releaseReconciliation.promise,
+  });
+  const capability = await issueCapability(fixture);
+  await assert.rejects(
+    () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+    (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+  );
+
+  const reconciliation = reconcileCleanCheckpointCapture({
+    backend: fixture.backend,
+    checkpoint: checkpoint(),
+    manifest: manifest(),
+    request: mutationRequest("checkpoint", fixture.writerLease),
+    storageRef: storageRef(),
+  });
+  await reconciliationEntered.promise;
+  let retirementSettled = false;
+  const retirement = fixture.mutation
+    .retireCaptureAttempt(CAPTURE_OPERATION_ID)
+    .then((result) => {
+      retirementSettled = true;
+      return result;
+    });
+  await Promise.resolve();
+  assert.equal(retirementSettled, false);
+
+  releaseReconciliation.resolve();
+  await reconciliation;
+  const retired = await retirement;
+  assert.equal(retirementSettled, true);
+  assert.equal(retired.attempt.state, "committed");
+  assert.equal(retired.tombstone.state, "retired");
+  assert.strictEqual(
+    fixture.mutation.state.captureAttemptIdClaims.get(
+      retired.attempt.captureAttemptId,
+    ),
+    retired.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureOperationClaims.get(CAPTURE_OPERATION_ID),
+    retired.tombstone,
+  );
+  assert.equal(
+    fixture.mutation.state.captureAttempts.has(CAPTURE_OPERATION_ID),
+    false,
+  );
+  assert.equal(fixture.mutation.state.reconciliationFinalizations.length, 1);
+});
+
+test("capture-attempt retirement serializes behind normal capture", async (t) => {
+  const capturePublished = deferred();
+  const releaseCaptureFinalization = deferred();
+  t.after(() => releaseCaptureFinalization.resolve());
+  const fixture = await createFixture(t, {
+    captureFinalizationGate: releaseCaptureFinalization.promise,
+    onCapturePublished() {
+      capturePublished.resolve();
+    },
+  });
+  const capability = await issueCapability(fixture);
+  const capture = captureCleanCheckpoint(
+    captureCoreOptions(fixture, capability),
+  );
+  await capturePublished.promise;
+
+  let retirementSettled = false;
+  const retirement = fixture.mutation
+    .retireCaptureAttempt(CAPTURE_OPERATION_ID)
+    .then((result) => {
+      retirementSettled = true;
+      return result;
+    });
+  await Promise.resolve();
+  assert.equal(retirementSettled, false);
+
+  releaseCaptureFinalization.resolve();
+  await capture;
+  const retired = await retirement;
+  assert.equal(retirementSettled, true);
+  assert.equal(retired.attempt.state, "committed");
+  assert.equal(retired.tombstone.state, "retired");
+  assert.strictEqual(
+    fixture.mutation.state.captureAttemptIdClaims.get(
+      retired.attempt.captureAttemptId,
+    ),
+    retired.tombstone,
+  );
+  assert.strictEqual(
+    fixture.mutation.state.captureOperationClaims.get(CAPTURE_OPERATION_ID),
+    retired.tombstone,
+  );
+  assert.equal(
+    fixture.mutation.state.captureAttempts.has(CAPTURE_OPERATION_ID),
+    false,
+  );
+  assert.equal(fixture.mutation.state.captureFinalizations.length, 1);
 });

@@ -33,13 +33,18 @@
 - A same-process stopped-writer coordinator now converts one trusted, fully
   joined writer stop into one object-identity capability for one snapshot
   callback without making protocol events or serialized fields into authority.
-- A v1 stopped-directory backend now composes that one-use capability with a
+- A v2 stopped-directory backend now composes that one-use capability with a
   durable mutation-authority/catalogue seam and local publication. It delegates
   lifecycle operations, guards exact predetermined capture/restore results,
   atomically starts normal capture from an absent journal operation, and fails
   closed on pre-existing publication state, callback uncertainty, or
   finalization uncertainty while declaring local-filesystem and manual-fencing
   limits.
+- Normal capture now durably binds an authenticated capture-attempt ID before
+  publication. The optional v1 reconciliation extension can load that
+  canonical attempt and source-free verify only its exact committed journal
+  record and artefact; it never reuses a stopped-writer capability or advances
+  `prepared` or `materialized` evidence.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -66,6 +71,8 @@
   `docs/project_journal/2026/07/2026-07-14-stopped-writer-capability-8c4e2a.md`
 - Stopped-directory backend:
   `docs/project_journal/2026/07/2026-07-14-stopped-directory-backend-c5a91e.md`
+- Committed capture reconciliation:
+  `docs/project_journal/2026/07/2026-07-14-capture-reconciliation-91eac4.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

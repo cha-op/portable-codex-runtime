@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import {
   SessionStorageContractError,
+  assertCheckpointCaptureReconciliationBackend,
   assertCheckpointClass,
   assertCheckpointDescriptor,
   assertLeaseGrant,
@@ -10,6 +11,7 @@ import {
   assertSessionStorageRef,
   assertStorageBackend,
   assertStorageMutationMatchesLeaseSnapshot,
+  assertStorageMutationRequest,
   assertStorageMutationResult,
   compareFencingEpochs,
 } from "./session-storage-contracts.mjs";
@@ -19,6 +21,8 @@ import {
 
 const CORE_ERROR_MESSAGES = Object.freeze({
   checkpoint_outcome_uncertain: "Checkpoint capture outcome is uncertain",
+  checkpoint_reconciliation_outcome_uncertain:
+    "Checkpoint capture reconciliation outcome is uncertain",
   restore_outcome_uncertain: "Checkpoint restore outcome is uncertain",
   unsupported_checkpoint_class: "Checkpoint class is not supported by the clean snapshot core",
 });
@@ -133,6 +137,14 @@ function checkedBackend(value) {
     () => assertStorageBackend(value),
     "invalid_storage_backend",
     "storage backend is invalid",
+  );
+}
+
+function checkedCaptureReconciliationBackend(value) {
+  return validateExternalOperation(
+    () => assertCheckpointCaptureReconciliationBackend(value),
+    "invalid_storage_backend",
+    "storage backend does not support checkpoint capture reconciliation",
   );
 }
 
@@ -327,6 +339,83 @@ export async function captureCleanCheckpoint(options) {
     });
   } catch {
     throw new SessionSnapshotCoreError("checkpoint_outcome_uncertain");
+  }
+}
+
+/**
+ * Reconciles one exact durable clean-capture attempt without presenting new
+ * writer authority. The backend must authenticate the original attempt and
+ * must not start a new physical mutation when no such attempt exists.
+ */
+export async function reconcileCleanCheckpointCapture(options) {
+  const { backend, checkpoint, manifest, request, storageRef } =
+    assertExactOptions(
+      options,
+      ["backend", "checkpoint", "manifest", "request", "storageRef"],
+      "checkpoint capture reconciliation options",
+    );
+
+  const storage = validateContract(
+    () => assertSessionStorageRef(storageRef),
+    "invalid_storage_ref",
+    "session storage reference is invalid",
+  );
+  const sessionManifest = validateContract(
+    () => assertSessionManifest(manifest),
+    "invalid_session_manifest",
+    "session manifest is invalid",
+  );
+  const descriptor = validateContract(
+    () =>
+      assertCheckpointDescriptor(checkpoint, {
+        manifest: sessionManifest,
+        storageRef: storage,
+      }),
+    "invalid_checkpoint",
+    "checkpoint descriptor is invalid",
+  );
+  assertCleanCheckpointClass(descriptor.checkpointClass);
+  const mutationRequest = validateContract(
+    () => assertStorageMutationRequest(request),
+    "invalid_storage_mutation",
+    "checkpoint reconciliation mutation request is invalid",
+  );
+  assertOperation(mutationRequest, "checkpoint");
+  assertCheckpointTarget(mutationRequest, descriptor);
+  ensureContract(
+    mutationRequest.backendId === descriptor.backendId &&
+      mutationRequest.storageId === descriptor.storageId &&
+      mutationRequest.sessionId === descriptor.sessionId,
+    "invalid_storage_mutation",
+    "checkpoint reconciliation request does not match its source storage",
+  );
+  ensureContract(
+    mutationRequest.fencingEpoch === descriptor.sourceFencingEpoch,
+    "stale_fence",
+    "checkpoint reconciliation request fence does not match its source fence",
+  );
+
+  const storageBackend = checkedCaptureReconciliationBackend(backend);
+  assertBackendMatchesStorage(storageBackend, storage);
+  const reconcile = checkedBackendMethod(
+    storageBackend,
+    "reconcileCheckpointCapture",
+  );
+  try {
+    const result = await reconcile.call(
+      storageBackend,
+      Object.freeze({ checkpoint: descriptor, request: mutationRequest }),
+    );
+    return assertBackendCheckpointResult(result, {
+      expectedCheckpoint: descriptor,
+      manifest: sessionManifest,
+      request: mutationRequest,
+      storageRef: storage,
+    });
+  } catch {
+    throw new SessionSnapshotCoreError(
+      "checkpoint_reconciliation_outcome_uncertain",
+    );
   }
 }
 

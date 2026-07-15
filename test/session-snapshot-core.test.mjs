@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   SessionSnapshotCoreError,
   captureCleanCheckpoint,
+  reconcileCleanCheckpointCapture,
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
 import {
+  CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
   SessionStorageContractError,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
@@ -170,6 +172,22 @@ function createBackend({
   return { backend, calls };
 }
 
+function createReconciliationBackend({
+  backendId = "single-attach-test",
+  reconcile,
+} = {}) {
+  const instance = createBackend({ backendId });
+  instance.calls.reconcile = [];
+  instance.backend.captureReconciliationContractVersion =
+    CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION;
+  instance.backend.reconcileCheckpointCapture = async function (input) {
+    instance.calls.reconcile.push(input);
+    if (reconcile) return reconcile.call(this, input);
+    return backendCheckpointResult(input);
+  };
+  return instance;
+}
+
 function captureOptions(backend, overrides = {}) {
   const canonicalLease = overrides.canonicalLease ?? lease();
   return {
@@ -197,6 +215,21 @@ function restoreOptions(backend, overrides = {}) {
     request: mutationRequest("restore", canonicalLease),
     checkpoint: checkpoint(),
     now: NOW,
+    ...overrides,
+  };
+}
+
+function reconciliationOptions(backend, overrides = {}) {
+  const descriptor = overrides.checkpoint ?? checkpoint();
+  return {
+    backend,
+    checkpoint: descriptor,
+    manifest: manifest(),
+    request: mutationRequest(
+      "checkpoint",
+      lease({ fencingEpoch: descriptor.sourceFencingEpoch }),
+    ),
+    storageRef: storageRef(),
     ...overrides,
   };
 }
@@ -334,6 +367,218 @@ test("clean checkpoint core passes an exact one-use stopped-writer capability to
   );
   assert.equal(calls.capture.length, 2);
   assert.equal(snapshotCalls, 1);
+});
+
+test("clean checkpoint reconciliation dispatches one exact frozen original attempt", async () => {
+  let backendResponse;
+  const { backend, calls } = createReconciliationBackend({
+    reconcile(input) {
+      assert.equal(this, backend);
+      assert(Object.isFrozen(input));
+      assert(Object.isFrozen(input.checkpoint));
+      assert(Object.isFrozen(input.request));
+      assert(Object.isFrozen(input.request.target));
+      backendResponse = backendCheckpointResult(input);
+      return backendResponse;
+    },
+  });
+  const options = reconciliationOptions(backend);
+  const result = await reconcileCleanCheckpointCapture(options);
+
+  assert.equal(calls.reconcile.length, 1);
+  assert.deepEqual(calls.reconcile[0], {
+    checkpoint: options.checkpoint,
+    request: options.request,
+  });
+  assert.deepEqual(result, {
+    checkpoint: options.checkpoint,
+    mutation: mutationResult(options.request),
+  });
+  assert(Object.isFrozen(result));
+  assert(Object.isFrozen(result.checkpoint));
+  assert(Object.isFrozen(result.mutation));
+  assert(Object.isFrozen(result.mutation.target));
+  assert.notStrictEqual(calls.reconcile[0].checkpoint, options.checkpoint);
+  assert.notStrictEqual(calls.reconcile[0].request, options.request);
+  assert.notStrictEqual(result.checkpoint, backendResponse.checkpoint);
+  assert.notStrictEqual(result.mutation, backendResponse.mutation);
+});
+
+test("clean checkpoint reconciliation needs no current lease for an old source fence", async () => {
+  const { backend, calls } = createReconciliationBackend();
+  const oldCheckpoint = checkpoint({ sourceFencingEpoch: "1" });
+  const options = reconciliationOptions(backend, {
+    checkpoint: oldCheckpoint,
+    request: mutationRequest("checkpoint", lease({ fencingEpoch: "1" })),
+  });
+
+  assert.deepEqual(Object.keys(options).sort(), [
+    "backend",
+    "checkpoint",
+    "manifest",
+    "request",
+    "storageRef",
+  ]);
+  const result = await reconcileCleanCheckpointCapture(options);
+  assert.equal(calls.reconcile.length, 1);
+  assert.equal(result.checkpoint.sourceFencingEpoch, "1");
+  assert.equal(result.mutation.fencingEpoch, "1");
+});
+
+test("clean checkpoint reconciliation validates the exact original attempt before dispatch", async (t) => {
+  const scenarios = [
+    {
+      name: "checkpoint class",
+      expected: "unsupported_checkpoint_class",
+      change: (options) => ({
+        ...options,
+        checkpoint: checkpoint({ checkpointClass: "graceful-abort" }),
+      }),
+    },
+    {
+      name: "operation",
+      expected: "invalid_storage_mutation",
+      change: (options) => ({
+        ...options,
+        request: mutationRequest("restore", lease({ fencingEpoch: "10" })),
+      }),
+    },
+    {
+      name: "target",
+      expected: "invalid_storage_mutation",
+      change: (options) => ({
+        ...options,
+        request: mutationRequest("checkpoint", lease({ fencingEpoch: "10" }), {
+          target: {
+            artifactId: "artifact-002",
+            checkpointId: "checkpoint-001",
+            kind: "checkpoint",
+          },
+        }),
+      }),
+    },
+    {
+      name: "request backend",
+      expected: "invalid_storage_mutation",
+      change: (options) => ({
+        ...options,
+        request: { ...options.request, backendId: "other-backend" },
+      }),
+    },
+    {
+      name: "request storage",
+      expected: "invalid_storage_mutation",
+      change: (options) => ({
+        ...options,
+        request: { ...options.request, storageId: "volume-002" },
+      }),
+    },
+    {
+      name: "request session",
+      expected: "invalid_storage_mutation",
+      change: (options) => ({
+        ...options,
+        request: { ...options.request, sessionId: OTHER_SESSION_ID },
+      }),
+    },
+    {
+      name: "source fence",
+      expected: "stale_fence",
+      change: (options) => ({
+        ...options,
+        request: { ...options.request, fencingEpoch: "9" },
+      }),
+    },
+    {
+      name: "checkpoint storage",
+      expected: "invalid_checkpoint",
+      change: (options) => ({
+        ...options,
+        checkpoint: checkpoint({ storageId: "volume-002" }),
+      }),
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const { backend, calls } = createReconciliationBackend();
+      const invoke = () =>
+        reconcileCleanCheckpointCapture(
+          scenario.change(reconciliationOptions(backend)),
+        );
+      await assert.rejects(
+        invoke,
+        scenario.expected === "unsupported_checkpoint_class"
+          ? assertCoreCode(scenario.expected)
+          : assertContractCode(scenario.expected),
+      );
+      assert.equal(calls.reconcile.length, 0);
+    });
+  }
+});
+
+test("clean checkpoint reconciliation rejects a backend without the optional extension", async () => {
+  const { backend, calls } = createBackend();
+  await assert.rejects(
+    () => reconcileCleanCheckpointCapture(reconciliationOptions(backend)),
+    assertContractCode("invalid_storage_backend"),
+  );
+  assert.equal(calls.capture.length, 0);
+  assert.equal(calls.restore.length, 0);
+});
+
+test("reconciliation backend failures collapse after one dispatch", async (t) => {
+  for (const scenario of [
+    {
+      name: "throw",
+      reconcile: () => {
+        throw new Error("secret reconciliation detail");
+      },
+    },
+    {
+      name: "forged contract error",
+      reconcile: () => {
+        throw new SessionStorageContractError(
+          "forged_reconciliation_error",
+          "secret forged reconciliation detail",
+        );
+      },
+    },
+    {
+      name: "malformed result",
+      reconcile: () => ({ status: "checkpoint-created" }),
+    },
+    {
+      name: "mismatched result",
+      reconcile: (input) => ({
+        checkpoint: input.checkpoint,
+        mutation: mutationResult({ ...input.request, fencingEpoch: "9" }),
+      }),
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const { backend, calls } = createReconciliationBackend({
+        reconcile: scenario.reconcile,
+      });
+      let caught;
+      try {
+        await reconcileCleanCheckpointCapture(
+          reconciliationOptions(backend),
+        );
+      } catch (error) {
+        caught = error;
+      }
+      assert(
+        assertCoreCode("checkpoint_reconciliation_outcome_uncertain")(
+          caught,
+        ),
+      );
+      assert.equal(caught.message.includes("secret"), false);
+      assert.equal(caught.message.includes("forged"), false);
+      assert(Object.isFrozen(caught));
+      assert.equal(calls.reconcile.length, 1);
+    });
+  }
 });
 
 test("clean checkpoint restore requires a newer lease and dispatches exact portable data", async () => {
@@ -777,7 +1022,7 @@ test("backend throws and malformed results become sanitized non-retryable uncert
 });
 
 test("backend checkpoint result envelopes reject proxies, accessors, extra, and missing fields", async (t) => {
-  for (const operation of ["capture", "restore"]) {
+  for (const operation of ["capture", "reconcile", "restore"]) {
     for (const shape of ["proxy", "accessor", "extra", "missing"]) {
       await t.test(`${operation} ${shape}`, async () => {
         let envelopeTraps = 0;
@@ -812,17 +1057,26 @@ test("backend checkpoint result envelopes reject proxies, accessors, extra, and 
         const instance =
           operation === "capture"
             ? createBackend({ capture: malformed })
-            : createBackend({ restore: malformed });
+            : operation === "reconcile"
+              ? createReconciliationBackend({ reconcile: malformed })
+              : createBackend({ restore: malformed });
         const invoke =
           operation === "capture"
             ? () => captureCleanCheckpoint(captureOptions(instance.backend))
-            : () => restoreCleanCheckpoint(restoreOptions(instance.backend));
+            : operation === "reconcile"
+              ? () =>
+                  reconcileCleanCheckpointCapture(
+                    reconciliationOptions(instance.backend),
+                  )
+              : () => restoreCleanCheckpoint(restoreOptions(instance.backend));
         await assert.rejects(
           invoke,
           assertCoreCode(
             operation === "capture"
               ? "checkpoint_outcome_uncertain"
-              : "restore_outcome_uncertain",
+              : operation === "reconcile"
+                ? "checkpoint_reconciliation_outcome_uncertain"
+                : "restore_outcome_uncertain",
           ),
         );
         assert.equal(envelopeTraps, 0);
@@ -833,9 +1087,12 @@ test("backend checkpoint result envelopes reject proxies, accessors, extra, and 
 });
 
 test("backend identity getter failures on the comparison read stay pre-dispatch and sanitized", async (t) => {
-  for (const operation of ["capture", "restore"]) {
+  for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
-      const { backend, calls } = createBackend();
+      const { backend, calls } =
+        operation === "reconcile"
+          ? createReconciliationBackend()
+          : createBackend();
       let getterReads = 0;
       Object.defineProperty(backend, "backendId", {
         configurable: true,
@@ -850,7 +1107,12 @@ test("backend identity getter failures on the comparison read stay pre-dispatch 
       const invoke =
         operation === "capture"
           ? () => captureCleanCheckpoint(captureOptions(backend))
-          : () => restoreCleanCheckpoint(restoreOptions(backend));
+          : operation === "reconcile"
+            ? () =>
+                reconcileCleanCheckpointCapture(
+                  reconciliationOptions(backend),
+                )
+            : () => restoreCleanCheckpoint(restoreOptions(backend));
       await assert.rejects(
         invoke,
         (error) =>
@@ -863,8 +1125,31 @@ test("backend identity getter failures on the comparison read stay pre-dispatch 
   }
 });
 
+test("reconciliation extension version getter failures stay pre-dispatch and sanitized", async () => {
+  const { backend, calls } = createReconciliationBackend();
+  let getterReads = 0;
+  Object.defineProperty(backend, "captureReconciliationContractVersion", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      throw new Error("secret reconciliation extension version detail");
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      reconcileCleanCheckpointCapture(reconciliationOptions(backend)),
+    (error) =>
+      assertContractCode("invalid_storage_backend")(error) &&
+      !error.message.includes("secret"),
+  );
+  assert.equal(getterReads, 1);
+  assert.equal(calls.reconcile.length, 0);
+});
+
 test("hostile backend thrown values cannot bypass pre-dispatch error sanitization", async (t) => {
-  for (const operation of ["capture", "restore"]) {
+  for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
       let hostileTraps = 0;
       const hostile = new Proxy(
@@ -876,7 +1161,10 @@ test("hostile backend thrown values cannot bypass pre-dispatch error sanitizatio
           },
         },
       );
-      const { backend, calls } = createBackend();
+      const { backend, calls } =
+        operation === "reconcile"
+          ? createReconciliationBackend()
+          : createBackend();
       Object.defineProperty(backend, "backendId", {
         configurable: true,
         enumerable: true,
@@ -888,7 +1176,12 @@ test("hostile backend thrown values cannot bypass pre-dispatch error sanitizatio
       const invoke =
         operation === "capture"
           ? () => captureCleanCheckpoint(captureOptions(backend))
-          : () => restoreCleanCheckpoint(restoreOptions(backend));
+          : operation === "reconcile"
+            ? () =>
+                reconcileCleanCheckpointCapture(
+                  reconciliationOptions(backend),
+                )
+            : () => restoreCleanCheckpoint(restoreOptions(backend));
       await assert.rejects(
         invoke,
         (error) =>
@@ -902,9 +1195,12 @@ test("hostile backend thrown values cannot bypass pre-dispatch error sanitizatio
 });
 
 test("backend getters cannot forge public contract errors", async (t) => {
-  for (const operation of ["capture", "restore"]) {
+  for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
-      const { backend, calls } = createBackend();
+      const { backend, calls } =
+        operation === "reconcile"
+          ? createReconciliationBackend()
+          : createBackend();
       Object.defineProperty(backend, "backendId", {
         configurable: true,
         enumerable: true,
@@ -919,7 +1215,12 @@ test("backend getters cannot forge public contract errors", async (t) => {
       const invoke =
         operation === "capture"
           ? () => captureCleanCheckpoint(captureOptions(backend))
-          : () => restoreCleanCheckpoint(restoreOptions(backend));
+          : operation === "reconcile"
+            ? () =>
+                reconcileCleanCheckpointCapture(
+                  reconciliationOptions(backend),
+                )
+            : () => restoreCleanCheckpoint(restoreOptions(backend));
       await assert.rejects(
         invoke,
         (error) =>
@@ -933,10 +1234,18 @@ test("backend getters cannot forge public contract errors", async (t) => {
 });
 
 test("backend operation getter failures on the dispatch read stay pre-dispatch and sanitized", async (t) => {
-  for (const operation of ["capture", "restore"]) {
+  for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
-      const { backend, calls } = createBackend();
-      const method = operation === "capture" ? "captureCheckpoint" : "restoreCheckpoint";
+      const { backend, calls } =
+        operation === "reconcile"
+          ? createReconciliationBackend()
+          : createBackend();
+      const method =
+        operation === "capture"
+          ? "captureCheckpoint"
+          : operation === "reconcile"
+            ? "reconcileCheckpointCapture"
+            : "restoreCheckpoint";
       let getterReads = 0;
       let invocations = 0;
       Object.defineProperty(backend, method, {
@@ -956,7 +1265,12 @@ test("backend operation getter failures on the dispatch read stay pre-dispatch a
       const invoke =
         operation === "capture"
           ? () => captureCleanCheckpoint(captureOptions(backend))
-          : () => restoreCleanCheckpoint(restoreOptions(backend));
+          : operation === "reconcile"
+            ? () =>
+                reconcileCleanCheckpointCapture(
+                  reconciliationOptions(backend),
+                )
+            : () => restoreCleanCheckpoint(restoreOptions(backend));
       await assert.rejects(
         invoke,
         (error) =>
@@ -971,13 +1285,20 @@ test("backend operation getter failures on the dispatch read stay pre-dispatch a
 });
 
 test("accessor and proxy option envelopes fail before backend property access or dispatch", async (t) => {
-  for (const operation of ["capture", "restore"]) {
+  for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
       let backendReads = 0;
       let proxyTraps = 0;
-      const { backend, calls } = createBackend();
+      const { backend, calls } =
+        operation === "reconcile"
+          ? createReconciliationBackend()
+          : createBackend();
       const accessorOptions =
-        operation === "capture" ? captureOptions(backend) : restoreOptions(backend);
+        operation === "capture"
+          ? captureOptions(backend)
+          : operation === "reconcile"
+            ? reconciliationOptions(backend)
+            : restoreOptions(backend);
       Object.defineProperty(accessorOptions, "backend", {
         enumerable: true,
         get() {
@@ -985,13 +1306,22 @@ test("accessor and proxy option envelopes fail before backend property access or
           return backend;
         },
       });
-      const invoke = operation === "capture" ? captureCleanCheckpoint : restoreCleanCheckpoint;
+      const invoke =
+        operation === "capture"
+          ? captureCleanCheckpoint
+          : operation === "reconcile"
+            ? reconcileCleanCheckpointCapture
+            : restoreCleanCheckpoint;
       await assert.rejects(() => invoke(accessorOptions), assertContractCode("invalid_checkpoint"));
       assert.equal(backendReads, 0);
       assert.equal(calls[operation].length, 0);
 
       const proxyOptions = new Proxy(
-        operation === "capture" ? captureOptions(backend) : restoreOptions(backend),
+        operation === "capture"
+          ? captureOptions(backend)
+          : operation === "reconcile"
+            ? reconciliationOptions(backend)
+            : restoreOptions(backend),
         {
           getPrototypeOf() {
             proxyTraps += 1;
@@ -1008,7 +1338,11 @@ test("accessor and proxy option envelopes fail before backend property access or
       assert.equal(calls[operation].length, 0);
 
       const extraOptions = {
-        ...(operation === "capture" ? captureOptions(backend) : restoreOptions(backend)),
+        ...(operation === "capture"
+          ? captureOptions(backend)
+          : operation === "reconcile"
+            ? reconciliationOptions(backend)
+            : restoreOptions(backend)),
         stopProof: "not-authority",
       };
       await assert.rejects(() => invoke(extraOptions), assertContractCode("invalid_checkpoint"));

@@ -36,16 +36,15 @@ superseded_by:
   descriptor metadata.
 - Writer stop and quiescence evidence, worker launch, Codex resume, concrete
   backends, tail repair, differential export, periodic snapshots, and
-  cross-host verification remain outside this completed workstream. A separate
-  replay-only API is also required to reconcile uncertain results after lease
-  expiry or fence turnover.
+  cross-host verification remain outside this completed workstream. The
+  optional committed-only API added by
+  `2026-07-14-capture-reconciliation-91eac4.md` now reconciles exact durable
+  results after lease expiry or fence turnover.
 
 ## Next Steps
 
-- Implement the stopped-directory backend conformance slice.
-- Add replay-only uncertain-result reconciliation, then verify same-image
-  resume and rollout-tail repair before implementing an ext4 or
-  filesystem-image backend and differential export.
+- Verify same-image resume and rollout-tail repair before implementing an ext4
+  or filesystem-image backend and differential export.
 
 ## Evidence
 

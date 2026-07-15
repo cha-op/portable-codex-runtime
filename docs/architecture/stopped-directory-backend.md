@@ -16,7 +16,7 @@ prevents the adapter from inventing attachment or lease authority.
 
 The module exports:
 
-- `STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION`, with value `1`;
+- `STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION`, with value `2`;
 - `StoppedDirectoryBackendError`; and
 - `StoppedDirectoryBackend`.
 
@@ -50,6 +50,11 @@ These capabilities describe a trusted local-directory development and
 conformance backend. They do not claim automatic failover, a live
 crash-consistent volume snapshot, or remote-filesystem fencing.
 
+The adapter separately advertises
+`captureReconciliationContractVersion: 1` and implements the optional
+`reconcileCheckpointCapture()` extension. The extension does not change the v1
+base storage-backend method set.
+
 ## Lifecycle Delegation
 
 The adapter delegates these five operations to the validated lifecycle
@@ -67,8 +72,9 @@ not let the adapter promote a local lock, publication journal, or checkpoint
 record into lease authority. The trusted lifecycle and mutation-authority
 layers must prevent a stale writer from crossing the mutation guard.
 
-Only `captureCheckpoint` and `restoreCheckpoint` are implemented by this
-adapter.
+`captureCheckpoint` and `restoreCheckpoint` implement the base mutation
+contract. `reconcileCheckpointCapture` implements the optional committed
+capture-reconciliation extension.
 
 ## Trusted Collaborators
 
@@ -106,13 +112,73 @@ capability. The resolver record supplies the matching writer handle and
 correlation values, but none of those fields independently carries stop
 authority.
 
-The mutation authority exposes exact own-data `runCapture` and `runRestore`
-methods. It is the durable catalogue and admission seam: before invoking the
-backend callback, it must reserve the exact request, checkpoint descriptor,
-and predetermined result. During the complete callback it must hold the
-canonical fence and attachment/launcher admission guard. After a successful
-callback it must durably and idempotently finalize the catalogue or restore
-destination and return the exact same completion object.
+The mutation authority exposes exact own-data `runCapture`,
+`runCaptureReconciliation`, and `runRestore` methods. It is the durable
+catalogue and admission seam: before invoking a normal mutation callback, it
+must reserve the exact request, checkpoint descriptor, and predetermined
+result. During the complete normal callback it must hold the canonical fence
+and attachment/launcher admission guard. After a successful callback it must
+durably and idempotently finalize the catalogue or restore destination and
+return the exact same completion object.
+
+After the stopped-writer capability has entered its one-shot snapshot callback,
+the backend generates a fresh CSPRNG UUID candidate and includes it in the
+normal capture admission. Before normal capture publication, `runCapture` must
+atomically claim that exact ID in a globally unique durable ledger and create
+the authenticated capture-attempt record from absent state. It may neither
+replace the candidate nor invoke the callback before the claim and record are
+durable. The ID and complete v2 coordinator binding remain outside
+worker-controlled storage as canonical authority data.
+
+Both the attempt-ID claim and the operation claim are non-reusable generation
+records backed by the same transactional ownership row. While active, that row
+must bind both indexes to the canonical attempt record itself; matching string
+values or a reconstructed structural copy are insufficient. Deleting or
+compacting a complete attempt must atomically transition both indexes to the
+same `retired` tombstone, which can reject reuse but can never authorize
+reconciliation.
+Their retention must cover every journal, artefact, snapshot, backup, and DR
+restore generation in which the old value can reappear; the safest production
+policy is permanent retention. The authority ledger must not roll back with a
+session data volume. CSPRNG collision resistance is defense in depth, not a
+replacement for the unique durable claim.
+
+`runCaptureReconciliation` must load that same claimed record by the original
+operation, serialize concurrent reconciliation, and supply its exact binding,
+request, and predetermined result to the callback. A journal record,
+tombstone, caller-supplied attempt ID, or reconstructed record cannot substitute
+for that lookup.
+
+The canonical attempt passed across the seam has this exact data shape:
+
+```js
+{
+  contractVersion: 1,
+  captureAttemptId,
+  operationId,
+  state: "authorized" | "committed",
+  binding: {
+    contractVersion: 2,
+    captureAttemptId,
+    reservationId,
+    checkpoint,
+    attachmentId,
+    attachmentOperationId,
+    attachmentProofId,
+    processIncarnationId,
+    writerIncarnationId,
+    stopOperationId,
+  },
+  request,
+  result,
+}
+```
+
+`authorized` means the attempt exists durably and may have a physically
+committed publication whose catalogue finalization acknowledgement was lost.
+`committed` means the authority has also finalized the exact catalogue result.
+Transport-only `replayed` is not durable attempt authority; the canonical
+catalogue stores the verified artefact proof and materialisation separately.
 
 This repository defines and tests that seam. A production database, catalogue,
 lease service, and launcher-admission implementation remain separate work.
@@ -127,19 +193,24 @@ Capture follows one authority chain:
 3. Consume the supplied capability through the designated coordinator with the
    resolved writer, process/writer incarnations, stop operation, registered
    canonical lease, and attachment.
-4. Inside the coordinator's one `runSnapshot` callback, invoke
+4. Inside the coordinator's one `runSnapshot` callback, generate a fresh
+   capture-attempt UUID and include it in
    `mutationAuthority.runCapture(admission, publish)`.
-5. Let the authority reserve the exact request, descriptor, and predetermined
-   `{ checkpoint, mutation }` result before it invokes `publish`.
-6. Validate the complete authority context while its fence and admission guard
+5. Let the authority atomically claim that exact UUID and operation, create the
+   immutable durable attempt, and reserve the exact request, descriptor, and
+   predetermined `{ checkpoint, mutation }` result before it invokes
+   `publish`.
+6. Require the authority context to echo the admitted UUID exactly, then
+   validate the rest of the context while its fence and admission guard
    is still held, then call `publishFreshCheckpointArtifact()`. Its atomic
    journal preparation accepts only an `absent` operation ID.
 7. Return the publication completion to the authority, which must durably
    finalize the catalogue and return that same object before backend success.
 
 The frozen capture admission contains the exact attachment, checkpoint,
-request, process and writer incarnation IDs, and stop operation ID. It does
-not contain the writer handle or the stopped-writer capability.
+request, backend-generated capture-attempt UUID, process and writer incarnation
+IDs, and stop operation ID. It does not contain the writer handle or the
+stopped-writer capability.
 
 The authority invokes `publish(context)` exactly once with:
 
@@ -147,6 +218,7 @@ The authority invokes `publish(context)` exactly once with:
 {
   artifactDirectory,
   artifactOwnedRoot,
+  captureAttemptId,
   canonicalAttachment,
   canonicalLease,
   now,
@@ -158,21 +230,69 @@ The authority invokes `publish(context)` exactly once with:
 }
 ```
 
-The callback revalidates the authority clock, exact fence, storage binding,
-attachment, predetermined result, and complete path plan before publication.
-The versioned publication binding contains the reservation ID, exact
-checkpoint, attachment ID, attachment operation and proof, and the
-process/writer/stop correlation IDs. It contains no capability, writer handle,
-absolute path, or credential.
+The callback requires `captureAttemptId` to equal the backend-generated value
+in the admission, then revalidates the authority clock, exact fence, storage
+binding, attachment, predetermined result, and complete path plan before
+publication.
+The capture publication binding remains independently versioned at v2; it is
+not derived from the adapter contract version. It contains the capture-attempt
+and reservation IDs, exact checkpoint, attachment ID, attachment operation and
+proof, and the process/writer/stop correlation IDs. It contains no capability,
+writer handle, absolute path, or credential.
 
 The frozen completion contains `artifactProof`, `materialization`,
 `replayed`, and `result`. A successful normal capture always has
 `replayed: false`. Any pre-existing `prepared`, `materialized`, or `committed`
 journal phase conflicts with fresh preparation and becomes terminal backend
-uncertainty; serialized reservation and process/writer/stop correlation IDs
-are not proof that an earlier artifact was created after the current writer
-stop. Exact replay belongs to a later authenticated reconciliation API, not a
-new stopped-writer capability.
+uncertainty; serialized attempt, reservation, and process/writer/stop
+correlation IDs are not independently proof that an earlier artifact was
+created after the current writer stop. Exact replay belongs to the separate
+authenticated reconciliation API, not a new stopped-writer capability.
+
+## Committed Capture Reconciliation
+
+`reconcileCheckpointCapture({ checkpoint, request })` receives only the exact
+original clean-capture descriptor and mutation request. It does not resolve a
+writer, consult or consume the same-process coordinator, accept a capability,
+or require the old lease to remain current. The public core can therefore call
+it after lease expiry or fence turnover without pretending that serialized
+source-fence fields are present authority.
+
+The backend invokes
+`mutationAuthority.runCaptureReconciliation(admission, verify)`. The frozen
+admission contains only `{ checkpoint, request }`. Before invoking `verify`,
+the trusted authority must load the canonical durable attempt and pass an exact
+context containing the artefact path plan plus that attempt's v2 binding,
+request, and predetermined result. The backend validates every field, including
+the UUID capture-attempt ID, and requires the attempt request and result to
+match the admission exactly. The authority must also prove internally that the
+loaded attempt is the canonical record bound by both sides of the same active
+durable claim. A retained tombstone, matching pair of strings, or reconstructed
+attempt is not active ownership and cannot authorize verification.
+
+Claim activation, reconciliation, finalization, and retirement for one
+operation share the same serialized authority transaction or operation mutex.
+After any asynchronous admission gate, the authority revalidates active
+ownership immediately before each verifier invocation. Because physical
+verification is also asynchronous, finalization must compare the expected
+canonical attempt and both active claim indexes again after the callback
+settles. It must never overwrite a concurrent `retired` tombstone or adopt a
+replacement attempt; any ownership change makes the result uncertain.
+
+The callback calls `verifyCommittedCheckpointArtifact()` with no source path.
+That publication method can only read and validate the exact committed journal
+record and final artefact; it cannot advance `prepared` or `materialized`
+state. The backend requires `replayed: true`, derives the canonical artefact
+proof from the verified materialisation, and returns the same frozen completion
+shape as capture. The authority must revalidate the same active claim and
+expected canonical attempt, then idempotently finalize or confirm the catalogue
+and return the exact same completion object before success.
+
+This division is the authentication boundary: the mutation authority proves
+that the attempt record is canonical, while publication proves that its exact
+binding and bytes are durably committed. Neither side alone is sufficient.
+Legacy v1 journal bindings without capture-attempt provenance cannot pass this
+path and are not automatically upgraded.
 
 ## Restore Transaction
 
@@ -207,7 +327,10 @@ The authority invokes `publish(context)` exactly once with:
 `destinationState` must be exactly `"detached"`. The callback revalidates
 the newer current fence, storage binding, predetermined result, trusted
 artefact proof, destination isolation proof, detached state, and complete path
-plan before calling `publishRestoreDestination()`.
+plan before calling `publishRestoreDestination()`. The restore publication
+binding remains at v1 independently of the v2 adapter and v2 capture binding,
+so an upgraded backend can still replay an exact committed restore started by
+the previous adapter version.
 
 The frozen restore completion contains `materialization`, `replayed`, and
 `result`. The authority must durably finalize launcher-visible destination
@@ -217,7 +340,7 @@ authority.
 
 ## Callback and Uncertainty Contract
 
-Both mutation-authority methods must await their single callback. Calling it
+All three mutation-authority methods must await their single callback. Calling it
 zero times, more than once, after the authority method has returned, or
 returning a substituted completion object fails closed as uncertain. The
 authority guard must span the callback's complete asynchronous lifetime and
@@ -251,9 +374,10 @@ credentials, attachment details, or private authority state.
 
 A capture failure after entering the coordinator callback is terminal for the
 one-use capability. The backend performs no internal retry, coordinator
-replacement, speculative cleanup, or reconciliation. Retained staging,
-published objects, and durable reservations remain evidence for an operator or
-the later replay-only reconciliation path.
+replacement, or speculative cleanup. Retained staging, published objects, and
+durable reservations remain evidence. A caller may separately invoke committed
+reconciliation under the durable attempt authority; that call never reuses the
+terminal capability.
 
 In particular, the normal capture path never adopts or advances an earlier
 publication phase. The fresh journal transition is atomic with respect to the
@@ -289,7 +413,8 @@ fencing, idempotency, publication, and fault evidence.
 
 This backend deliberately does not provide:
 
-- replay-only reconciliation after an uncertain result or fence turnover;
+- automatic repair or continuation of `prepared` or `materialized` capture
+  attempts;
 - a production linearizable lease, reservation, catalogue, and
   launcher-admission database;
 - NFS or another remote/shared-filesystem adapter;
