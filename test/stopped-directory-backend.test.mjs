@@ -1146,6 +1146,26 @@ function capturePublicationOptions(fixture) {
   };
 }
 
+function restorePublicationOptions(fixture) {
+  const restoreRequest = mutationRequest("restore", fixture.restoreWriterLease);
+  return {
+    artifactDirectory: fixture.artifactDirectory,
+    artifactOwnedRoot: fixture.artifactOwnedRoot,
+    artifactProof: fixture.artifactProof,
+    binding: {
+      checkpoint: checkpoint(),
+      contractVersion: 1,
+      destinationIsolationProofId: DESTINATION_ISOLATION_PROOF_ID,
+      reservationId: "reservation-restore-001",
+    },
+    destinationDirectory: fixture.destinationDirectory,
+    destinationOwnedRoot: fixture.destinationOwnedRoot,
+    operationId: RESTORE_OPERATION_ID,
+    request: restoreRequest,
+    result: fixedResult(checkpoint(), restoreRequest),
+  };
+}
+
 function captureCandidatePath(fixture) {
   return join(
     fixture.artifactOwnedRoot,
@@ -1757,6 +1777,53 @@ test("restore requires a newer current fence, trusted proof, and detached destin
   assert.equal(fixture.mutation.state.restoreRuns, 2);
   assert.equal(fixture.mutation.state.restoreFinalizations.length, 2);
   assert.equal(replayCompletion.replayed, true);
+  assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
+  assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
+  assert.equal(
+    destinationAfterReplay.birthtimeNs,
+    destinationBeforeReplay.birthtimeNs,
+  );
+  assert.deepEqual(fixture.observation.events, [
+    "authority:restore:start",
+    "authority:restore:finalized",
+    "authority:restore:end",
+  ]);
+});
+
+test("adapter v2 replays a committed v1 restore journal binding", async (t) => {
+  const fixture = await createFixture(t);
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+  fixture.observation.preseeding = true;
+  let seeded;
+  try {
+    seeded = await fixture.publication.publishRestoreDestination(
+      restorePublicationOptions(fixture),
+    );
+  } finally {
+    fixture.observation.preseeding = false;
+  }
+  assert.equal(seeded.replayed, false);
+  const committed = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(committed.record.state, "committed");
+  assert.equal(committed.record.binding.coordinator.contractVersion, 1);
+  const destinationBeforeReplay = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  fixture.observation.events.length = 0;
+
+  const options = restoreCoreOptions(fixture);
+  const result = await restoreCleanCheckpoint(options);
+  const completion = fixture.mutation.state.restoreFinalizations[0];
+  const destinationAfterReplay = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+
+  assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+  assert.equal(completion.replayed, true);
+  assert.equal(fixture.mutation.state.restoreRuns, 1);
   assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
   assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
   assert.equal(

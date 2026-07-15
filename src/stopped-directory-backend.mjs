@@ -298,6 +298,9 @@ const ERROR_MESSAGES = objectFreeze({
     "Stopped-directory backend outcome is uncertain",
 });
 
+const CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION = 2;
+const RESTORE_JOURNAL_BINDING_CONTRACT_VERSION = 1;
+
 export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 2;
 
 export class StoppedDirectoryBackendError extends Error {
@@ -1067,7 +1070,7 @@ function normalizeCaptureAttempt(value, request) {
       sameMutationRequest(durableRequest, request.request) &&
       sameFlatRecord(boundCheckpoint, request.checkpoint) &&
       sameFlatRecord(result.checkpoint, request.checkpoint) &&
-      binding.contractVersion === STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION &&
+      binding.contractVersion === CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION &&
       binding.captureAttemptId === captureAttemptId,
   );
   for (const value of [
@@ -1112,7 +1115,7 @@ function captureJournalBinding(context, request, resolved) {
     attachmentProofId: request.attachment.proofId,
     captureAttemptId: context.captureAttemptId,
     checkpoint: request.checkpoint,
-    contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
+    contractVersion: CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION,
     processIncarnationId: resolved.processIncarnationId,
     reservationId: context.reservationId,
     stopOperationId: resolved.stopOperationId,
@@ -1123,7 +1126,7 @@ function captureJournalBinding(context, request, resolved) {
 function restoreJournalBinding(context, request) {
   return exactFrozenRecord({
     checkpoint: request.checkpoint,
-    contractVersion: STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION,
+    contractVersion: RESTORE_JOURNAL_BINDING_CONTRACT_VERSION,
     destinationIsolationProofId: context.destinationIsolationProofId,
     reservationId: context.reservationId,
   });

@@ -208,10 +208,11 @@ The authority invokes `publish(context)` exactly once with:
 
 The callback revalidates the authority clock, exact fence, storage binding,
 attachment, predetermined result, and complete path plan before publication.
-The versioned publication binding contains the capture-attempt and reservation
-IDs, exact checkpoint, attachment ID, attachment operation and proof, and the
-process/writer/stop correlation IDs. It contains no capability, writer handle,
-absolute path, or credential.
+The capture publication binding remains independently versioned at v2; it is
+not derived from the adapter contract version. It contains the capture-attempt
+and reservation IDs, exact checkpoint, attachment ID, attachment operation and
+proof, and the process/writer/stop correlation IDs. It contains no capability,
+writer handle, absolute path, or credential.
 
 The frozen completion contains `artifactProof`, `materialization`,
 `replayed`, and `result`. A successful normal capture always has
@@ -287,7 +288,10 @@ The authority invokes `publish(context)` exactly once with:
 `destinationState` must be exactly `"detached"`. The callback revalidates
 the newer current fence, storage binding, predetermined result, trusted
 artefact proof, destination isolation proof, detached state, and complete path
-plan before calling `publishRestoreDestination()`.
+plan before calling `publishRestoreDestination()`. The restore publication
+binding remains at v1 independently of the v2 adapter and v2 capture binding,
+so an upgraded backend can still replay an exact committed restore started by
+the previous adapter version.
 
 The frozen restore completion contains `materialization`, `replayed`, and
 `result`. The authority must durably finalize launcher-visible destination

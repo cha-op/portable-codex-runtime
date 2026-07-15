@@ -43,6 +43,9 @@ superseded_by:
   repair design.
 - Legacy v1 capture bindings have no authenticated attempt provenance and are
   not automatically upgraded or reconciled.
+- Adapter v2 upgrades only the capture coordinator binding. Restore bindings
+  remain at v1 so exact committed restores from adapter v1 still replay after
+  an upgrade.
 - The conformance mutation authority proves the seam and failure model. A
   production linearizable database, catalogue, fence service, and launcher
   admission implementation remain deferred.
