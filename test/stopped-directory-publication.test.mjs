@@ -326,6 +326,28 @@ function committedVerificationOptions(fixture, published, overrides = {}) {
   };
 }
 
+test("committed verification sanitizes an oversized combined journal envelope", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedCheckpointArtifact({
+      artifactDirectory: fixture.artifactDirectory,
+      artifactOwnedRoot: fixture.artifactOwnedRoot,
+      binding: { padding: "x".repeat(523_500) },
+      operationId: options.operationId,
+      request: options.request,
+      result: options.result,
+    }),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+});
+
 function restoreOptions(fixture, overrides = {}) {
   const mutationRequest =
     overrides.request ??

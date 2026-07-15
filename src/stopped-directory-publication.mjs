@@ -1353,11 +1353,16 @@ export class StoppedDirectoryPublication {
       "checkpoint-artifact",
       normalized,
     );
-    const expected = snapshotOperationJournalBinding({
-      binding: snapshot.binding,
-      request: snapshot.request,
-      result: snapshot.result,
-    });
+    let expected;
+    try {
+      expected = snapshotOperationJournalBinding({
+        binding: snapshot.binding,
+        request: snapshot.request,
+        result: snapshot.result,
+      });
+    } catch {
+      fail("invalid_publication_request");
+    }
     const verification = {
       expected,
       finalDirectory: normalized.artifactDirectory,
