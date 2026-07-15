@@ -26,9 +26,8 @@ superseded_by:
   the auth broker MVP, snapshot and restore core, stopped-tree primitives,
   durable filesystem operation journal, stopped-directory publication,
   stopped-writer capability, backend composition, and committed capture
-  reconciliation are complete through PR #12.
-- Pinned-executable resume evidence and offline rollout-tail repair before
-  writable recovery are complete in the current serial slice.
+  reconciliation, pinned-executable resume evidence, and offline rollout-tail
+  repair before writable recovery are complete through PR #13.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 

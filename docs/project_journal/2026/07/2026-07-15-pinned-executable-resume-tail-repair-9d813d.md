@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-15
 updated: 2026-07-15
 branch: wip/same-image-resume-tail-repair
-pr:
+pr: 13
 supersedes: []
 superseded_by:
 ---

@@ -64,13 +64,15 @@ plane.
     - Bind normal capture to authenticated durable attempt provenance and add a
       source-free, committed-only reconciliation path that cannot advance
       `prepared` or `materialized` publication state.
+13. **PR #13: pinned-executable rollout-tail repair**
+    - Repair a missing final LF or one invalid unterminated tail on a detached
+      writable copy, bind every rollout to the audited writer version, and
+      preserve six-scenario same-pinned-executable recovery evidence.
 
-The sequence through PR #12 is complete. The next serial slice adds
-same-pinned-executable resume evidence and offline rollout-tail repair. Later
-pull requests own a production linearizable lease/reservation/catalogue and
-launcher-admission implementation, an ext4 or filesystem-image backend,
-differential export and content-addressed storage, cross-host migration, and
-operational hardening.
+The sequence through PR #13 is complete. Later pull requests own a production
+linearizable lease/reservation/catalogue and launcher-admission implementation,
+an ext4 or filesystem-image backend, differential export and content-addressed
+storage, cross-host migration, and operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental
