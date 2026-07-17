@@ -89,7 +89,9 @@ preflight.
 
 Enumeration is bounded to 256 rollout files, 1,024 directories, directory
 depth 8, 64 MiB per file, and 256 MiB in total. Candidate directories and
-files must remain inside the held Codex-home authority. Plain rollout files
+files must remain inside the held Codex-home authority. The 64 MiB bound also
+applies to the final repaired byte sequence, so an LF append that would cross
+the limit fails before a replacement is created. Plain rollout files
 must be current-user-owned regular files with one link, owner read/write
 permission with no execute bits, no special mode bits, and no group/world
 write permission, and no extended ACL. Enumerated directories must be

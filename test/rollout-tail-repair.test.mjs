@@ -33,6 +33,7 @@ const ROOT_ID = "019f2600-0000-7000-8000-000000000001";
 const SUBAGENT_ID = "019f2600-0000-7000-8000-000000000002";
 const OTHER_ID = "019f2600-0000-7000-8000-000000000099";
 const BINARY_SHA = "ab".repeat(32);
+const MAX_ROLLOUT_BYTES = 64 * 1024 * 1024;
 const RUNTIME_IDENTITY = Object.freeze({
   codexBinarySha256: BINARY_SHA,
   codexVersion: "codex-cli 0.144.1",
@@ -701,6 +702,22 @@ test("enforces the per-file size bound before reading contents", async (t) => {
     repairStoppedRolloutTails(request(codexHome)),
     (error) => assertRepairError(error, "rollout_content_invalid"),
   );
+});
+
+test("rejects an LF append that would exceed the per-file size bound", async (t) => {
+  const { codexHome, day } = await fixture(t);
+  const original = Buffer.alloc(MAX_ROLLOUT_BYTES, 0x20);
+  Buffer.from(JSON.stringify(sessionMeta())).copy(original);
+  const path = await putRollout(day, "root.jsonl", original);
+
+  await assert.rejects(
+    repairStoppedRolloutTails(request(codexHome)),
+    (error) => assertRepairError(error, "rollout_content_invalid"),
+  );
+
+  assert.equal((await stat(path)).size, MAX_ROLLOUT_BYTES);
+  assert.deepEqual(await readFile(path), original);
+  assert.deepEqual(await readdir(day), ["root.jsonl"]);
 });
 
 test("requires the exact trusted runtime binding shape and pinned version/source", async (t) => {

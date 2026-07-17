@@ -60,7 +60,9 @@ superseded_by:
   permissions, aliases detectable by the adapter, and identity races. Common
   Codex-created `0755`/`0750` directories and `0644`/`0640` rollout files are
   descriptor-pinned, tightened to exact private modes, synced, checked for
-  extended ACLs, and revalidated before rollout contents are consumed.
+  extended ACLs, and revalidated before rollout contents are consumed. The
+  prospective repaired byte sequence must also remain within the 64 MiB
+  per-file bound before any replacement is created.
 - The schema-v6 live probe exercises both modifying actions with one staged
   private Codex executable on stopped-tree-derived writable copies, resumes by
   explicit thread ID and restored `cwd`, completes one follow-up, and verifies

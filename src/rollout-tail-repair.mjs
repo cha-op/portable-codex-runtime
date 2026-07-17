@@ -526,6 +526,7 @@ function analyzeBytes(bytes) {
     }
   }
   ensure(completeLines.length > 0, "rollout_content_invalid");
+  ensure(after.length <= MAX_FILE_BYTES, "rollout_content_invalid");
   const meta = assertSessionMeta(completeLines[0]);
   return { action, after, meta, removedBytes };
 }
