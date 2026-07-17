@@ -407,7 +407,13 @@ async function openPinnedDirectory(path, uid, expectedDev, inspectAcl) {
   }
 }
 
-async function readPinnedFile(path, uid, expectedDev, inspectAcl) {
+async function readPinnedFile(
+  path,
+  uid,
+  expectedDev,
+  inspectAcl,
+  remainingBytes = MAX_TOTAL_BYTES,
+) {
   const before = await lstat(path, { bigint: true });
   assertTightenableFile(before, uid);
   ensure(before.dev === expectedDev, "unsafe_filesystem");
@@ -433,7 +439,11 @@ async function readPinnedFile(path, uid, expectedDev, inspectAcl) {
       tightened.size > 0n && tightened.size <= BigInt(MAX_FILE_BYTES),
       "rollout_content_invalid",
     );
-    const bytes = await readExactBytes(handle, Number(tightened.size));
+    const bytes = await readWithinAggregateBudget(
+      tightened.size,
+      remainingBytes,
+      (size) => readExactBytes(handle, size),
+    );
     const after = await handle.stat({ bigint: true });
     ensure(
       sameFingerprint(tightened, fingerprint(after)),
@@ -444,6 +454,18 @@ async function readPinnedFile(path, uid, expectedDev, inspectAcl) {
     await handle.close().catch(() => {});
     throw error;
   }
+}
+
+async function readWithinAggregateBudget(size, remainingBytes, reader) {
+  ensure(
+    typeof size === "bigint" &&
+      size >= 0n &&
+      Number.isSafeInteger(remainingBytes) &&
+      remainingBytes >= 0 &&
+      size <= BigInt(remainingBytes),
+    "rollout_set_invalid",
+  );
+  return reader(Number(size));
 }
 
 async function readExactBytes(handle, size) {
@@ -461,6 +483,14 @@ async function readExactBytes(handle, size) {
 }
 
 function jsonValue(bytes) {
+  if (
+    bytes.length >= 3 &&
+    bytes[0] === 0xef &&
+    bytes[1] === 0xbb &&
+    bytes[2] === 0xbf
+  ) {
+    return { ok: false };
+  }
   try {
     const text = UTF8_DECODER.decode(bytes);
     if (text.length === 0) return { ok: false };
@@ -554,27 +584,30 @@ function relativeRolloutPath(sessionsPath, path) {
 }
 
 async function scanTree(codexHome, uid, hooks) {
-  const requestedHome = await lstat(codexHome, { bigint: true });
-  ensure(!requestedHome.isSymbolicLink(), "unsafe_filesystem");
-  const canonicalHome = await realpath(codexHome);
-  await hooks.beforeHomeOpen();
-  const home = await openPinnedDirectory(
-    canonicalHome,
-    uid,
-    undefined,
-    hooks.inspectAcl,
-  );
-  ensure(
-    sameFingerprint(fingerprint(requestedHome), home.preTighteningFingerprint),
-    "unsafe_filesystem",
-  );
-  const filesystemDev = home.fingerprint.dev;
-  const sessionsPath = join(canonicalHome, "sessions");
+  let home;
   let sessions;
-  const directories = [home];
+  let sessionsPath;
+  const directories = [];
   const files = [];
   let totalBytes = 0;
   try {
+    const requestedHome = await lstat(codexHome, { bigint: true });
+    ensure(!requestedHome.isSymbolicLink(), "unsafe_filesystem");
+    const canonicalHome = await realpath(codexHome);
+    await hooks.beforeHomeOpen();
+    home = await openPinnedDirectory(
+      canonicalHome,
+      uid,
+      undefined,
+      hooks.inspectAcl,
+    );
+    directories.push(home);
+    ensure(
+      sameFingerprint(fingerprint(requestedHome), home.preTighteningFingerprint),
+      "unsafe_filesystem",
+    );
+    const filesystemDev = home.fingerprint.dev;
+    sessionsPath = join(canonicalHome, "sessions");
     ensure((await realpath(sessionsPath)) === sessionsPath, "unsafe_filesystem");
     sessions = await openPinnedDirectory(
       sessionsPath,
@@ -614,11 +647,14 @@ async function scanTree(codexHome, uid, hooks) {
           uid,
           filesystemDev,
           hooks.inspectAcl,
+          MAX_TOTAL_BYTES - totalBytes,
         );
         file.parent = directory;
         file.relativePath = relativeRolloutPath(sessionsPath, path);
         files.push(file);
         totalBytes += file.bytes.length;
+        // Keep a defensive post-read invariant in addition to the pinned-size
+        // admission check that runs before Buffer allocation.
         ensure(totalBytes <= MAX_TOTAL_BYTES, "rollout_set_invalid");
       }
     }
@@ -698,17 +734,47 @@ async function verifyDirectory(
   );
 }
 
-async function verifyFile(file, uid, expectedFingerprint = file.fingerprint) {
+async function verifyFile(
+  file,
+  uid,
+  hooks,
+  expectedFingerprint = file.fingerprint,
+) {
   const pathMetadata = await lstat(file.path, { bigint: true });
   assertSafeFile(pathMetadata, uid);
+  const pathFingerprint = fingerprint(pathMetadata);
   ensure(
-    sameFingerprint(expectedFingerprint, fingerprint(pathMetadata)),
+    sameFingerprint(expectedFingerprint, pathFingerprint),
+    "unsafe_filesystem",
+  );
+  let handleFingerprint;
+  if (file.handle !== null) {
+    const handleMetadata = await file.handle.stat({ bigint: true });
+    assertSafeFile(handleMetadata, uid);
+    handleFingerprint = fingerprint(handleMetadata);
+    ensure(
+      sameFingerprint(expectedFingerprint, handleFingerprint) &&
+        sameFingerprint(pathFingerprint, handleFingerprint),
+      "unsafe_filesystem",
+    );
+  }
+
+  ensure((await hooks.inspectAcl(file.path)) === false, "unsafe_filesystem");
+  const finalPathMetadata = await lstat(file.path, { bigint: true });
+  assertSafeFile(finalPathMetadata, uid);
+  const finalPathFingerprint = fingerprint(finalPathMetadata);
+  ensure(
+    sameFingerprint(pathFingerprint, finalPathFingerprint) &&
+      sameFingerprint(expectedFingerprint, finalPathFingerprint),
     "unsafe_filesystem",
   );
   if (file.handle !== null) {
-    const handleMetadata = await file.handle.stat({ bigint: true });
+    const finalHandleMetadata = await file.handle.stat({ bigint: true });
+    assertSafeFile(finalHandleMetadata, uid);
+    const finalHandleFingerprint = fingerprint(finalHandleMetadata);
     ensure(
-      sameFingerprint(file.fingerprint, fingerprint(handleMetadata)),
+      sameFingerprint(handleFingerprint, finalHandleFingerprint) &&
+        sameFingerprint(finalPathFingerprint, finalHandleFingerprint),
       "unsafe_filesystem",
     );
   }
@@ -829,7 +895,7 @@ async function replaceFile(file, analysis, uid, hooks) {
     temporaryFingerprint = fingerprint(temporaryReadbackMetadata);
 
     await hooks.beforeRename();
-    await verifyFile(file, uid);
+    await verifyFile(file, uid, hooks);
     await verifyDirectory(file.parent, uid, hooks, {
       expectedExtraEntry: basename(temporaryPath),
     });
@@ -865,8 +931,10 @@ async function replaceFile(file, analysis, uid, hooks) {
         "repair_outcome_uncertain",
       );
       file.fingerprint = replacement.fingerprint;
-    } finally {
-      await replacement.handle.close();
+      file.handle = replacement.handle;
+    } catch (error) {
+      await replacement.handle.close().catch(() => {});
+      throw error;
     }
   } catch (error) {
     if (temporaryHandle !== undefined) {
@@ -930,14 +998,14 @@ async function repairWithHooks(options, hooks) {
         includeTimestamps: true,
       });
     }
-    for (const file of scan.files) await verifyFile(file, uid);
+    for (const file of scan.files) await verifyFile(file, uid, hooks);
 
     const proofs = [];
     for (const entry of analyzed) {
       const before = proofState(entry.file.bytes);
       const after = proofState(entry.after);
       if (entry.action === "unchanged") {
-        await verifyFile(entry.file, uid);
+        await verifyFile(entry.file, uid, hooks);
       } else {
         await verifyDirectory(entry.file.parent, uid, hooks);
         await replaceFile(entry.file, entry, uid, hooks);
@@ -955,7 +1023,9 @@ async function repairWithHooks(options, hooks) {
     for (const directory of scan.directories) {
       await verifyDirectory(directory, uid, hooks);
     }
-    for (const file of scan.files) await verifyFile(file, uid, file.fingerprint);
+    for (const file of scan.files) {
+      await verifyFile(file, uid, hooks, file.fingerprint);
+    }
 
     proofs.sort((left, right) =>
       left.relativePath.localeCompare(right.relativePath, "en"),
@@ -1003,4 +1073,5 @@ export const __testing = objectFreeze({
     const checkedHooks = normalizeHooks(hooks);
     return async (options) => repairWithHooks(options, checkedHooks);
   },
+  readWithinAggregateBudget,
 });

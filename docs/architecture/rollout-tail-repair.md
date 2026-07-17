@@ -88,10 +88,14 @@ ownership, duplicate thread ownership, or a foreign session fails the whole
 preflight.
 
 Enumeration is bounded to 256 rollout files, 1,024 directories, directory
-depth 8, 64 MiB per file, and 256 MiB in total. Candidate directories and
-files must remain inside the held Codex-home authority. The 64 MiB bound also
-applies to the final repaired byte sequence, so an LF append that would cross
-the limit fails before a replacement is created. Plain rollout files
+depth 8, 64 MiB per file, and 256 MiB of discovered input bytes in total. Each
+descriptor-pinned file size is compared with the remaining aggregate budget
+before a content Buffer is allocated or read. This aggregate input bound is
+not a strict process-RSS bound: analysis and replacement readback can briefly
+retain additional bounded Buffers. Candidate directories and files must remain
+inside the held Codex-home authority. The 64 MiB bound also applies to the
+final repaired byte sequence, so an LF append that would cross the limit fails
+before a replacement is created. Plain rollout files
 must be current-user-owned regular files with one link, owner read/write
 permission with no execute bits, no special mode bits, and no group/world
 write permission, and no extended ACL. Enumerated directories must be
@@ -112,10 +116,11 @@ Codex-home identity check binds the caller's original path observation to the
 descriptor's pre-tightening fingerprint, so only a mode change performed by
 that pinned descriptor receives the narrow `ctime`/mode exception.
 
-Every later directory validation repeats the ACL check with complete
-path/handle fingerprints immediately before and after inspection, validates
-the exact expected entry set, and repeats the complete fingerprint check after
-directory enumeration. The repair
+Every later directory and file validation repeats the ACL check with complete
+path/handle fingerprints immediately before and after inspection. Directory
+validation also checks the exact expected entry set and repeats the complete
+fingerprint check after enumeration. The repaired file's readback handle stays
+pinned through the final full-tree pass. The repair
 revalidates the parent ACL immediately before creating a replacement, checks a
 new `O_EXCL` temporary file for inherited ACLs before writing rollout bytes,
 rechecks the parent after the pre-rename fault window, rebinds the temporary
@@ -124,6 +129,9 @@ a final ACL pass before returning. An identity race, ACL inspection failure,
 or failed metadata sync fails closed. Permission tightening can occur while
 the tree is discovered, but the complete content candidate set remains
 validated before the first byte-framing repair.
+Every successfully opened home, directory, and rollout handle is registered
+with cleanup before the next identity assertion, so a failed race check does
+not defer descriptor release to garbage collection.
 Symlinks, hard links, FIFOs, devices, sockets, compressed `.jsonl.zst`
 rollouts, unknown physical rollout formats, unsafe permissions, filesystem
 device changes, and identity changes fail closed. The complete candidate set
@@ -147,9 +155,9 @@ re-serializing any retained JSON:
 1. Scan from byte zero for LF (`0x0a`). For every LF at offset `i`, validate
    `bytes[start..i]` as a non-empty strict-UTF-8 JSON record. The first logical
    record must additionally pass the pinned `SessionMeta` binding above. An
-   empty, whitespace-only, invalid-UTF-8, or malformed LF-terminated record at
-   any position is non-tail corruption and fails closed. After validation, set
-   `start = i + 1`.
+   empty, whitespace-only, UTF-8-BOM-prefixed, invalid-UTF-8, or malformed
+   LF-terminated record at any position is non-tail corruption and fails
+   closed. After validation, set `start = i + 1`.
 2. If `start == bytes.length`, the file already ends at a validated record
    boundary. Its action is `unchanged`.
 3. Otherwise, `bytes[start..bytes.length]` is the only unterminated tail. If it
@@ -185,9 +193,10 @@ For either modifying action, the replacement sequence is:
 4. atomically replace the original pathname by renaming the temporary file on
    the same approved filesystem;
 5. sync the held parent directory; and
-6. reopen the final pathname without following links and verify its file type,
-   ownership, link count, mode, identity, size, and SHA-256 digest against the
-   planned result.
+6. reopen the final pathname without following links, verify its file type,
+   ownership, link count, mode, identity, size, ACL state, and SHA-256 digest
+   against the planned result, and retain that handle through the final
+   full-tree verification.
 
 A failure before rename must leave the original pathname unchanged. A failure
 after rename, including directory-sync or readback failure, is an uncertain

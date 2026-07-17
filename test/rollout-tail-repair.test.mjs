@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { fstatSync } from "node:fs";
 import {
   chmod,
   link,
@@ -48,6 +49,19 @@ const TEST_REPAIR_HOOKS = Object.freeze({
   syncDirectory: async (handle) => handle.sync(),
 });
 const repairStoppedRolloutTails = __testing.createRepair(TEST_REPAIR_HOOKS);
+
+function countOpenFileDescriptors() {
+  let count = 0;
+  for (let descriptor = 0; descriptor < 1_024; descriptor += 1) {
+    try {
+      fstatSync(descriptor);
+      count += 1;
+    } catch (error) {
+      if (error?.code !== "EBADF") throw error;
+    }
+  }
+  return count;
+}
 
 function sessionMeta(id = ROOT_ID, sessionId = ROOT_ID) {
   return {
@@ -293,6 +307,18 @@ test("rejects missing or malformed SessionMeta and non-tail corruption", async (
     [
       "empty-middle.jsonl",
       Buffer.from(`${JSON.stringify(sessionMeta())}\n\n${JSON.stringify(event())}\n`),
+    ],
+    [
+      "bom-prefixed-meta.jsonl",
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), lines(sessionMeta())]),
+    ],
+    [
+      "bom-prefixed-middle.jsonl",
+      Buffer.concat([
+        lines(sessionMeta()),
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        lines(event()),
+      ]),
     ],
   ];
   for (const [name, bytes] of cases) {
@@ -550,6 +576,7 @@ test("fails closed on extended ACLs and ACL inspection races", async (t) => {
   await t.test("Codex-home mode toggle before descriptor open", async (t) => {
     const { codexHome, day } = await fixture(t);
     await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    const descriptorsBefore = countOpenFileDescriptors();
     let raced = false;
     const repair = __testing.createRepair({
       ...TEST_REPAIR_HOOKS,
@@ -566,6 +593,7 @@ test("fails closed on extended ACLs and ACL inspection races", async (t) => {
       (error) => assertRepairError(error, "unsafe_filesystem"),
     );
     assert.equal(raced, true);
+    assert.equal(countOpenFileDescriptors(), descriptorsBefore);
   });
 
   await t.test("directory ACL appearing after the initial scan", async (t) => {
@@ -587,6 +615,73 @@ test("fails closed on extended ACLs and ACL inspection races", async (t) => {
       (error) => assertRepairError(error, "unsafe_filesystem"),
     );
     assert.equal(dayInspections, 3);
+  });
+
+  await t.test("file ACL appearing during the final unchanged pass", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    const path = await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    const canonicalDay = await realpath(day);
+    const canonicalPath = await realpath(path);
+    let dayInspections = 0;
+    let finalPass = false;
+    let rejectedFinalFileAcl = false;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      inspectAcl: async (candidate) => {
+        if (candidate === canonicalDay) {
+          dayInspections += 1;
+          if (dayInspections === 3) finalPass = true;
+          return false;
+        }
+        if (candidate === canonicalPath && finalPass) {
+          rejectedFinalFileAcl = true;
+          return true;
+        }
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+    assert.equal(rejectedFinalFileAcl, true);
+    assert.deepEqual(await readFile(path), lines(sessionMeta()));
+  });
+
+  await t.test("file ACL appearing after repaired-file readback", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    const original = Buffer.from(JSON.stringify(sessionMeta()));
+    const repaired = Buffer.concat([original, Buffer.from("\n")]);
+    const path = await putRollout(day, "root.jsonl", original);
+    const canonicalPath = await realpath(path);
+    let published = false;
+    let sawReadback = false;
+    let rejectedFinalFileAcl = false;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      afterRename: async () => {
+        published = true;
+      },
+      inspectAcl: async (candidate) => {
+        if (candidate !== canonicalPath || !published) return false;
+        if (!sawReadback) {
+          sawReadback = true;
+          return false;
+        }
+        rejectedFinalFileAcl = true;
+        return true;
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "repair_outcome_uncertain"),
+    );
+    assert.equal(sawReadback, true);
+    assert.equal(rejectedFinalFileAcl, true);
+    assert.deepEqual(await readFile(path), repaired);
+    assert.deepEqual(await readdir(day), ["root.jsonl"]);
   });
 
   await t.test("inherited temporary-file ACL before content write", async (t) => {
@@ -702,6 +797,34 @@ test("enforces the per-file size bound before reading contents", async (t) => {
     repairStoppedRolloutTails(request(codexHome)),
     (error) => assertRepairError(error, "rollout_content_invalid"),
   );
+});
+
+test("enforces the remaining aggregate budget before invoking the reader", async () => {
+  const sentinel = Buffer.from("bounded");
+  let reads = 0;
+  const reader = async (size) => {
+    reads += 1;
+    assert.equal(size, sentinel.length);
+    return sentinel;
+  };
+
+  assert.equal(
+    await __testing.readWithinAggregateBudget(
+      BigInt(sentinel.length),
+      sentinel.length,
+      reader,
+    ),
+    sentinel,
+  );
+  await assert.rejects(
+    __testing.readWithinAggregateBudget(
+      BigInt(sentinel.length + 1),
+      sentinel.length,
+      reader,
+    ),
+    (error) => assertRepairError(error, "rollout_set_invalid"),
+  );
+  assert.equal(reads, 1);
 });
 
 test("rejects an LF append that would exceed the per-file size bound", async (t) => {

@@ -62,7 +62,12 @@ superseded_by:
   descriptor-pinned, tightened to exact private modes, synced, checked for
   extended ACLs, and revalidated before rollout contents are consumed. The
   prospective repaired byte sequence must also remain within the 64 MiB
-  per-file bound before any replacement is created.
+  per-file bound before any replacement is created. Descriptor-pinned input
+  sizes are admitted against the remaining 256 MiB aggregate budget before
+  allocation, UTF-8-BOM-prefixed records fail closed, every final file check
+  repeats ACL inspection with path/handle rebinding, and repaired-file handles
+  remain pinned through the final full-tree pass. Home handles enter cleanup
+  ownership before caller-observation identity checks can fail.
 - The schema-v6 live probe exercises both modifying actions with one staged
   private Codex executable on stopped-tree-derived writable copies, resumes by
   explicit thread ID and restored `cwd`, completes one follow-up, and verifies
@@ -75,8 +80,9 @@ superseded_by:
 
 - Targeted `node --test --test-reporter=dot` over the repair and recovery-probe
   files passed after the review fixes, including permission tightening, ACL
-  rejection and race detection, copy-seam isolation, and exact evidence-pin
-  checks.
+  rejection and final-pass race detection, home-handle cleanup, BOM rejection,
+  pre-read aggregate-budget enforcement, copy-seam isolation, and exact
+  evidence-pin checks.
 - Pinned `npm run probe:turn-recovery -- --write-evidence` passed all six live
   app-server scenarios under a normal `022` umask. The run used the official
   `rust-v0.144.1` macOS arm64 release asset: archive SHA-256
@@ -85,11 +91,9 @@ superseded_by:
   `29915529b97697def1a957b0505e770aa6a45744435d62fc263e98d7619e167a`,
   matching the tracked schema-v6 evidence. The host-installed `0.144.5`
   binary was rejected by the compatibility identity gate as designed.
-- Pinned `npm test`: 1,097 tests, 1,095 passed and 2 platform conditions
-  skipped.
-- After migrating credential-shaped test inputs to exact `joey-private-v3`
-  catalog entries, the final `npm test -- --test-reporter=dot` run passed
-  outside the filesystem sandbox, including its loopback-dependent cases.
+- The final `npm test -- --test-reporter=dot` run passed outside the filesystem
+  sandbox, including its loopback-dependent cases and the credential-shaped
+  inputs migrated to exact `joey-private-v3` catalog entries.
 - JavaScript syntax checks, project-journal validation, and `git diff --check`
   passed.
 
