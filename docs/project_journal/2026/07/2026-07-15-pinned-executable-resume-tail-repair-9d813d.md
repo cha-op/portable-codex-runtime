@@ -3,7 +3,7 @@ id: 20260715-9d813d
 title: Pinned-Executable Resume and Rollout-Tail Repair
 status: completed
 created: 2026-07-15
-updated: 2026-07-15
+updated: 2026-07-17
 branch: wip/same-image-resume-tail-repair
 pr: 13
 supersedes: []
@@ -74,6 +74,8 @@ superseded_by:
   app-server scenarios passed and schema-v6 redacted evidence was published.
 - Pinned `npm test`: 1,097 tests, 1,095 passed and 2 platform conditions
   skipped.
+- After migrating credential-shaped test inputs to exact `joey-private-v3`
+  catalog entries, `npm test -- --test-reporter=dot` passed.
 - Project-journal validation and `git diff --check` passed.
 
 ## Deferred Work

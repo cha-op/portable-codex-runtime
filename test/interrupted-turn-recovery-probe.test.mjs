@@ -63,6 +63,7 @@ import {
   stoppedTreesShareAnyIdentity,
   syncStoppedTree,
 } from "../src/stopped-tree.mjs";
+import { SYNTHETIC_API_KEY_A } from "./synthetic-token-fixtures.mjs";
 
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
 
@@ -2480,13 +2481,13 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       { ...report, value: "123e4567-e89b-42d3-a456-426614174000" },
       { ...report, prompt: "portable recovery probe" },
       { ...report, marker: "<turn_aborted>" },
-      { ...report, apiKey: "sk-secret-sentinel" },
+      { ...report, apiKey: SYNTHETIC_API_KEY_A.api_key },
       { ...report, path: "/var/folders/private-state" },
     ]) {
       assert.throws(() => assertRecoveryEvidenceSafe(unsafe), /unexpected fields|disallowed runtime data/);
     }
     for (const codexVersion of [
-      "sk-secret-sentinel",
+      SYNTHETIC_API_KEY_A.api_key,
       "123e4567-e89b-42d3-a456-426614174000",
       "/var/folders/private-state",
       "/srv/portable/private-state",

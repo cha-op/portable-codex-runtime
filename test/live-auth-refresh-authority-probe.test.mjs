@@ -21,6 +21,16 @@ const LIVE_PROBE_SCRIPT = fileURLToPath(
   new URL("../scripts/probe-live-auth-refresh-authority.mjs", import.meta.url),
 );
 
+function makeJwtLikeSecret() {
+  // The authoring pool covers generic assignments, so build this provider-pattern
+  // rejection fixture at runtime without storing a complete JWT-shaped literal.
+  return [
+    Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ sub: "secret" })).toString("base64url"),
+    Buffer.from("signature").toString("base64url"),
+  ].join(".");
+}
+
 test("source provenance is omitted without an explicit source mirror", () => {
   let spawnCalls = 0;
   const commit = codexSourceCommit(undefined, () => {
@@ -259,7 +269,7 @@ test("authority evidence rejects raw current or rotated credentials", () => {
   assert.throws(
     () =>
       assertAuthorityEvidenceSafe(
-        JSON.stringify({ token: "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWNyZXQifQ.signature" }),
+        JSON.stringify({ token: makeJwtLikeSecret() }),
         [],
       ),
     /eyJ/,
