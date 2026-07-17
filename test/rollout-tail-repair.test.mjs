@@ -7,14 +7,17 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
+  stat,
   symlink,
   truncate,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -22,7 +25,7 @@ import {
   ROLLOUT_TAIL_REPAIR_COMPATIBILITY,
   RolloutTailRepairError,
   __testing,
-  repairStoppedRolloutTails,
+  repairStoppedRolloutTails as repairStoppedRolloutTailsWithAcl,
 } from "../src/rollout-tail-repair.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -35,6 +38,15 @@ const RUNTIME_IDENTITY = Object.freeze({
   codexVersion: "codex-cli 0.144.1",
   sourceAnalysisCommit: "db887d03e1f907467e33271572dffb73bceecd6b",
 });
+const TEST_REPAIR_HOOKS = Object.freeze({
+  afterDirectoryRead: async () => {},
+  afterRename: async () => {},
+  beforeHomeOpen: async () => {},
+  beforeRename: async () => {},
+  inspectAcl: async () => false,
+  syncDirectory: async (handle) => handle.sync(),
+});
+const repairStoppedRolloutTails = __testing.createRepair(TEST_REPAIR_HOOKS);
 
 function sessionMeta(id = ROOT_ID, sessionId = ROOT_ID) {
   return {
@@ -114,6 +126,7 @@ function assertRepairError(error, code, forbidden = []) {
 }
 
 test("publishes the exact pinned compatibility surface", () => {
+  assert.equal(typeof repairStoppedRolloutTailsWithAcl, "function");
   assert.deepEqual(ROLLOUT_TAIL_REPAIR_COMPATIBILITY, {
     codexVersion: "codex-cli 0.144.1",
     rolloutCliVersion: "0.144.1",
@@ -396,10 +409,40 @@ test("rejects compressed, unknown, symlink, hard-linked, and non-regular objects
   });
 });
 
+test("tightens non-writable shared modes before reading or repair", async (t) => {
+  for (const [name, directoryMode, fileMode] of [
+    ["world-readable Codex defaults", 0o755, 0o644],
+    ["group-readable Codex defaults", 0o750, 0o640],
+  ]) {
+    await t.test(name, async (t) => {
+      const { codexHome, day, sessions } = await fixture(t);
+      const directories = [
+        codexHome,
+        sessions,
+        join(sessions, "2026"),
+        join(sessions, "2026", "07"),
+        day,
+      ];
+      for (const path of directories) await chmod(path, directoryMode);
+      const original = Buffer.from(JSON.stringify(sessionMeta()));
+      const path = await putRollout(day, "root.jsonl", original, fileMode);
+
+      const proof = await repairStoppedRolloutTails(request(codexHome));
+
+      assert.equal(proof.files[0].action, "append_lf");
+      assert.deepEqual(await readFile(path), Buffer.concat([original, Buffer.from("\n")]));
+      for (const directory of directories) {
+        assert.equal((await stat(directory)).mode & 0o7777, 0o700);
+      }
+      assert.equal((await stat(path)).mode & 0o7777, 0o600);
+    });
+  }
+});
+
 test("rejects unsafe file and directory modes", async (t) => {
-  await t.test("readable-by-group rollout", async (t) => {
+  await t.test("group-writable rollout", async (t) => {
     const { codexHome, day } = await fixture(t);
-    await putRollout(day, "root.jsonl", lines(sessionMeta()), 0o640);
+    await putRollout(day, "root.jsonl", lines(sessionMeta()), 0o620);
     await assert.rejects(
       repairStoppedRolloutTails(request(codexHome)),
       (error) => assertRepairError(error, "unsafe_filesystem"),
@@ -424,6 +467,15 @@ test("rejects unsafe file and directory modes", async (t) => {
     );
   });
 
+  await t.test("group-executable rollout", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    await putRollout(day, "root.jsonl", lines(sessionMeta()), 0o610);
+    await assert.rejects(
+      repairStoppedRolloutTails(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+  });
+
   await t.test("group-writable sessions directory", async (t) => {
     const { codexHome, day, sessions } = await fixture(t);
     await putRollout(day, "root.jsonl", lines(sessionMeta()));
@@ -434,14 +486,210 @@ test("rejects unsafe file and directory modes", async (t) => {
     );
   });
 
-  await t.test("world-readable nested directory", async (t) => {
+  await t.test("world-writable nested directory", async (t) => {
     const { codexHome, day } = await fixture(t);
     await putRollout(day, "root.jsonl", lines(sessionMeta()));
-    await chmod(day, 0o755);
+    await chmod(day, 0o703);
     await assert.rejects(
       repairStoppedRolloutTails(request(codexHome)),
       (error) => assertRepairError(error, "unsafe_filesystem"),
     );
+  });
+
+  await t.test("special-bit nested directory", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    await chmod(day, 0o1700);
+    await assert.rejects(
+      repairStoppedRolloutTails(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+  });
+});
+
+test("fails closed on extended ACLs and ACL inspection races", async (t) => {
+  await t.test("extended ACL", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    const path = await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      inspectAcl: async (candidate) => basename(candidate) === "root.jsonl",
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+  });
+
+  await t.test("exact-mode ACL inspection race", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    const path = await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    let raced = false;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      inspectAcl: async (candidate) => {
+        if (basename(candidate) === "root.jsonl" && !raced) {
+          raced = true;
+          await chmod(path, 0o640);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          await chmod(path, 0o600);
+        }
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+    assert.equal(raced, true);
+  });
+
+  await t.test("Codex-home mode toggle before descriptor open", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    let raced = false;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      beforeHomeOpen: async () => {
+        raced = true;
+        await chmod(codexHome, 0o750);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await chmod(codexHome, 0o700);
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+    assert.equal(raced, true);
+  });
+
+  await t.test("directory ACL appearing after the initial scan", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    const canonicalDay = await realpath(day);
+    let dayInspections = 0;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      inspectAcl: async (candidate) => {
+        if (candidate !== canonicalDay) return false;
+        dayInspections += 1;
+        return dayInspections === 3;
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+    assert.equal(dayInspections, 3);
+  });
+
+  await t.test("inherited temporary-file ACL before content write", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    const original = Buffer.from(JSON.stringify(sessionMeta()));
+    const path = await putRollout(day, "root.jsonl", original);
+    let temporarySize;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      inspectAcl: async (candidate) => {
+        if (!basename(candidate).startsWith(".rollout-tail-repair-")) return false;
+        temporarySize = (await stat(candidate)).size;
+        return true;
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "repair_failed"),
+    );
+    assert.equal(temporarySize, 0);
+    assert.deepEqual(await readFile(path), original);
+    assert.deepEqual(await readdir(day), ["root.jsonl"]);
+  });
+
+  await t.test("parent ACL appearing before rename", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    const original = Buffer.from(JSON.stringify(sessionMeta()));
+    const path = await putRollout(day, "root.jsonl", original);
+    const canonicalDay = await realpath(day);
+    let armed = false;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      beforeRename: async () => {
+        armed = true;
+      },
+      inspectAcl: async (candidate) => candidate === canonicalDay && armed,
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "repair_failed"),
+    );
+    assert.equal(armed, true);
+    assert.deepEqual(await readFile(path), original);
+    assert.deepEqual(await readdir(day), ["root.jsonl"]);
+  });
+
+  await t.test("temporary pathname replacement before rename", async (t) => {
+    const { codexHome, day, root } = await fixture(t);
+    const original = Buffer.from(JSON.stringify(sessionMeta()));
+    const repaired = Buffer.concat([original, Buffer.from("\n")]);
+    const path = await putRollout(day, "root.jsonl", original);
+    let replacementPath;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      beforeRename: async () => {
+        const temporaryName = (await readdir(day)).find((name) =>
+          name.startsWith(".rollout-tail-repair-"),
+        );
+        assert.notEqual(temporaryName, undefined);
+        replacementPath = join(day, temporaryName);
+        await rename(replacementPath, join(root, "displaced-temporary.jsonl"));
+        await writeFile(replacementPath, repaired, { mode: 0o600 });
+        await chmod(replacementPath, 0o600);
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "repair_failed"),
+    );
+    assert.deepEqual(await readFile(path), original);
+    assert.deepEqual(await readFile(replacementPath), repaired);
+  });
+
+  await t.test("directory entry race after readdir", async (t) => {
+    const { codexHome, day } = await fixture(t);
+    await putRollout(day, "root.jsonl", lines(sessionMeta()));
+    const canonicalDay = await realpath(day);
+    const transientPath = join(day, "transient.jsonl");
+    let armed = false;
+    let raced = false;
+    const repair = __testing.createRepair({
+      ...TEST_REPAIR_HOOKS,
+      afterDirectoryRead: async () => {
+        if (!armed || raced) return;
+        raced = true;
+        await writeFile(transientPath, lines(sessionMeta()), { mode: 0o600 });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await unlink(transientPath);
+      },
+      inspectAcl: async (candidate) => {
+        armed = candidate === canonicalDay;
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      repair(request(codexHome)),
+      (error) => assertRepairError(error, "unsafe_filesystem"),
+    );
+    assert.equal(raced, true);
+    assert.deepEqual(await readdir(day), ["root.jsonl"]);
   });
 });
 
@@ -486,6 +734,7 @@ test("detects a before-rename identity race without publishing repair", async (t
   const path = await putRollout(day, "root.jsonl", original);
   const displaced = join(day, "displaced.jsonl");
   const repair = __testing.createRepair({
+    ...TEST_REPAIR_HOOKS,
     afterRename: async () => {},
     beforeRename: async () => {
       await rename(path, displaced);
@@ -508,6 +757,7 @@ test("reports uncertain outcome when parent-directory sync fails after rename", 
   const path = await putRollout(day, "root.jsonl", original);
   const secret = "post-rename-secret";
   const repair = __testing.createRepair({
+    ...TEST_REPAIR_HOOKS,
     afterRename: async () => {},
     beforeRename: async () => {},
     syncDirectory: async () => {

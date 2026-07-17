@@ -90,15 +90,51 @@ preflight.
 Enumeration is bounded to 256 rollout files, 1,024 directories, directory
 depth 8, 64 MiB per file, and 256 MiB in total. Candidate directories and
 files must remain inside the held Codex-home authority. Plain rollout files
-must be current-user-owned regular files with one link and exact mode `0600`;
-every enumerated directory must have exact mode `0700`.
+must be current-user-owned regular files with one link, owner read/write
+permission with no execute bits, no special mode bits, and no group/world
+write permission, and no extended ACL. Enumerated directories must be
+current-user-owned directories with all owner permissions, no special mode
+bits, no group/world write permission, and no extended ACL. This admits common Codex-created
+`0644`/`0640` rollout files and `0755`/`0750` directories as inputs that can be
+tightened; group/world-writable objects, owner-incomplete objects, and
+owner-executable rollout files fail closed.
+
+Before reading a rollout byte, the adapter compares path metadata with metadata
+from a no-follow opened handle, uses only that pinned handle to change the mode
+to exact `0600` for a file or `0700` for a directory, syncs a changed inode, and
+then revalidates the path and handle identity, unchanged content metadata, and
+exact private mode. It then requires the platform ACL inspector to report no
+extended ACL and repeats the complete path/handle fingerprint check so an ACL
+or mode race cannot hide behind the permission-tightening exception. The outer
+Codex-home identity check binds the caller's original path observation to the
+descriptor's pre-tightening fingerprint, so only a mode change performed by
+that pinned descriptor receives the narrow `ctime`/mode exception.
+
+Every later directory validation repeats the ACL check with complete
+path/handle fingerprints immediately before and after inspection, validates
+the exact expected entry set, and repeats the complete fingerprint check after
+directory enumeration. The repair
+revalidates the parent ACL immediately before creating a replacement, checks a
+new `O_EXCL` temporary file for inherited ACLs before writing rollout bytes,
+rechecks the parent after the pre-rename fault window, rebinds the temporary
+pathname to its held descriptor and full pre-rename fingerprint, and performs
+a final ACL pass before returning. An identity race, ACL inspection failure,
+or failed metadata sync fails closed. Permission tightening can occur while
+the tree is discovered, but the complete content candidate set remains
+validated before the first byte-framing repair.
 Symlinks, hard links, FIFOs, devices, sockets, compressed `.jsonl.zst`
 rollouts, unknown physical rollout formats, unsafe permissions, filesystem
 device changes, and identity changes fail closed. The complete candidate set
-is discovered and validated before the first file is changed. The adapter
+is discovered and validated before the first content repair. The adapter
 checks `st_dev` before and after no-follow opens; the external attachment
 authority must additionally exclude same-device bind mounts and other mount
 aliases that `st_dev` alone cannot distinguish.
+
+Tightening a restored object's mode prevents later group/world access through
+that pathname; it cannot undo disclosure that may already have occurred while a
+checkpoint was stored as `0755`/`0644`. Production launchers should therefore
+set a private `0077` umask before Codex creates session state, while retaining
+this normalization for already captured trees.
 
 ## Exact Byte-Framing Algorithm
 

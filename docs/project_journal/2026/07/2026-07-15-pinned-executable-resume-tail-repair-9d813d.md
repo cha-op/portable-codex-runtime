@@ -57,7 +57,10 @@ superseded_by:
 - The pass preserves validated bytes, appends one missing final LF, or removes
   one invalid unterminated tail. It rejects malformed completed records,
   ambiguous session ownership, unsupported formats, unsafe objects,
-  permissions, aliases detectable by the adapter, and identity races.
+  permissions, aliases detectable by the adapter, and identity races. Common
+  Codex-created `0755`/`0750` directories and `0644`/`0640` rollout files are
+  descriptor-pinned, tightened to exact private modes, synced, checked for
+  extended ACLs, and revalidated before rollout contents are consumed.
 - The schema-v6 live probe exercises both modifying actions with one staged
   private Codex executable on stopped-tree-derived writable copies, resumes by
   explicit thread ID and restored `cwd`, completes one follow-up, and verifies
@@ -68,15 +71,25 @@ superseded_by:
 
 ## Validation
 
-- Targeted `node --test` over the repair and recovery-probe files: 137 tests,
-  134 passed and 3 platform/explicit-live conditions skipped.
-- Pinned `npm run probe:turn-recovery -- --write-evidence`: all six live
-  app-server scenarios passed and schema-v6 redacted evidence was published.
+- Targeted `node --test --test-reporter=dot` over the repair and recovery-probe
+  files passed after the review fixes, including permission tightening, ACL
+  rejection and race detection, copy-seam isolation, and exact evidence-pin
+  checks.
+- Pinned `npm run probe:turn-recovery -- --write-evidence` passed all six live
+  app-server scenarios under a normal `022` umask. The run used the official
+  `rust-v0.144.1` macOS arm64 release asset: archive SHA-256
+  `88e72ac8bd30815f7d18e62dac333dc20ce3ad1cba94be1649a1977dd9bfdbb8`
+  and extracted binary SHA-256
+  `29915529b97697def1a957b0505e770aa6a45744435d62fc263e98d7619e167a`,
+  matching the tracked schema-v6 evidence. The host-installed `0.144.5`
+  binary was rejected by the compatibility identity gate as designed.
 - Pinned `npm test`: 1,097 tests, 1,095 passed and 2 platform conditions
   skipped.
 - After migrating credential-shaped test inputs to exact `joey-private-v3`
-  catalog entries, `npm test -- --test-reporter=dot` passed.
-- Project-journal validation and `git diff --check` passed.
+  catalog entries, the final `npm test -- --test-reporter=dot` run passed
+  outside the filesystem sandbox, including its loopback-dependent cases.
+- JavaScript syntax checks, project-journal validation, and `git diff --check`
+  passed.
 
 ## Deferred Work
 

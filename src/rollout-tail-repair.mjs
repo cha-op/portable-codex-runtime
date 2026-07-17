@@ -8,8 +8,10 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TextDecoder, types as utilTypes } from "node:util";
+
+import { recoveryPathHasExtendedAcl } from "./stopped-tree.mjs";
 
 const objectFreeze = Object.freeze;
 const objectCreate = Object.create;
@@ -222,6 +224,19 @@ function sameFingerprint(left, right) {
   );
 }
 
+function sameFingerprintAfterModeTightening(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.gid === right.gid &&
+    left.ino === right.ino &&
+    left.mtimeNs === right.mtimeNs &&
+    left.nlink === right.nlink &&
+    left.size === right.size &&
+    left.type === right.type &&
+    left.uid === right.uid
+  );
+}
+
 function sameDirectoryAuthority(left, right) {
   return (
     left.dev === right.dev &&
@@ -258,11 +273,84 @@ function assertSafeDirectory(metadata, uid) {
   ensure(mode === 0o700n, "unsafe_filesystem");
 }
 
+function assertTightenableDirectory(metadata, uid) {
+  ensure(metadata.isDirectory() && !metadata.isSymbolicLink(), "unsafe_filesystem");
+  ensure(metadata.uid === uid, "unsafe_filesystem");
+  const mode = metadata.mode & 0o7777n;
+  ensure(
+    (mode & 0o7000n) === 0n &&
+      (mode & 0o700n) === 0o700n &&
+      (mode & 0o022n) === 0n,
+    "unsafe_filesystem",
+  );
+}
+
 function assertSafeFile(metadata, uid) {
   ensure(metadata.isFile() && !metadata.isSymbolicLink(), "unsafe_filesystem");
   ensure(metadata.uid === uid && metadata.nlink === 1n, "unsafe_filesystem");
   const mode = metadata.mode & 0o7777n;
   ensure(mode === 0o600n, "unsafe_filesystem");
+}
+
+function assertTightenableFile(metadata, uid) {
+  ensure(metadata.isFile() && !metadata.isSymbolicLink(), "unsafe_filesystem");
+  ensure(metadata.uid === uid && metadata.nlink === 1n, "unsafe_filesystem");
+  const mode = metadata.mode & 0o7777n;
+  ensure(
+    (mode & 0o7000n) === 0n &&
+      (mode & 0o700n) === 0o600n &&
+      (mode & 0o111n) === 0n &&
+      (mode & 0o022n) === 0n,
+    "unsafe_filesystem",
+  );
+}
+
+async function tightenPinnedMode({
+  assertSafe,
+  exactMode,
+  handle,
+  inspectAcl,
+  opened,
+  path,
+  uid,
+}) {
+  const openedFingerprint = fingerprint(opened);
+  const modeChanged = (opened.mode & 0o7777n) !== BigInt(exactMode);
+  if (modeChanged) {
+    await handle.chmod(exactMode);
+    await handle.sync();
+  }
+
+  const pathMetadata = await lstat(path, { bigint: true });
+  const handleMetadata = await handle.stat({ bigint: true });
+  assertSafe(pathMetadata, uid);
+  assertSafe(handleMetadata, uid);
+  const pathFingerprint = fingerprint(pathMetadata);
+  const handleFingerprint = fingerprint(handleMetadata);
+  const matchesOpened = modeChanged
+    ? sameFingerprintAfterModeTightening
+    : sameFingerprint;
+  ensure(
+    matchesOpened(openedFingerprint, pathFingerprint) &&
+      matchesOpened(openedFingerprint, handleFingerprint) &&
+      sameFingerprint(pathFingerprint, handleFingerprint),
+    "unsafe_filesystem",
+  );
+
+  ensure((await inspectAcl(path)) === false, "unsafe_filesystem");
+  const finalPathMetadata = await lstat(path, { bigint: true });
+  const finalHandleMetadata = await handle.stat({ bigint: true });
+  assertSafe(finalPathMetadata, uid);
+  assertSafe(finalHandleMetadata, uid);
+  const finalPathFingerprint = fingerprint(finalPathMetadata);
+  const finalHandleFingerprint = fingerprint(finalHandleMetadata);
+  ensure(
+    sameFingerprint(handleFingerprint, finalPathFingerprint) &&
+      sameFingerprint(handleFingerprint, finalHandleFingerprint) &&
+      sameFingerprint(finalPathFingerprint, finalHandleFingerprint),
+    "unsafe_filesystem",
+  );
+  return finalHandleFingerprint;
 }
 
 function openDirectoryFlags() {
@@ -283,24 +371,35 @@ function openFileFlags() {
   );
 }
 
-async function openPinnedDirectory(path, uid, expectedDev) {
+async function openPinnedDirectory(path, uid, expectedDev, inspectAcl) {
   const before = await lstat(path, { bigint: true });
-  assertSafeDirectory(before, uid);
+  assertTightenableDirectory(before, uid);
   if (expectedDev !== undefined) ensure(before.dev === expectedDev, "unsafe_filesystem");
   const handle = await open(path, openDirectoryFlags());
   try {
     const opened = await handle.stat({ bigint: true });
-    assertSafeDirectory(opened, uid);
+    assertTightenableDirectory(opened, uid);
     if (expectedDev !== undefined) ensure(opened.dev === expectedDev, "unsafe_filesystem");
+    const preTighteningFingerprint = fingerprint(opened);
     ensure(
-      sameFingerprint(fingerprint(before), fingerprint(opened)),
+      sameFingerprint(fingerprint(before), preTighteningFingerprint),
       "unsafe_filesystem",
     );
+    const tightened = await tightenPinnedMode({
+      assertSafe: assertSafeDirectory,
+      exactMode: 0o700,
+      handle,
+      inspectAcl,
+      opened,
+      path,
+      uid,
+    });
     return {
       entries: null,
-      fingerprint: fingerprint(opened),
+      fingerprint: tightened,
       handle,
       path,
+      preTighteningFingerprint,
     };
   } catch (error) {
     await handle.close().catch(() => {});
@@ -308,24 +407,36 @@ async function openPinnedDirectory(path, uid, expectedDev) {
   }
 }
 
-async function readPinnedFile(path, uid, expectedDev) {
+async function readPinnedFile(path, uid, expectedDev, inspectAcl) {
   const before = await lstat(path, { bigint: true });
-  assertSafeFile(before, uid);
+  assertTightenableFile(before, uid);
   ensure(before.dev === expectedDev, "unsafe_filesystem");
-  ensure(before.size > 0n && before.size <= BigInt(MAX_FILE_BYTES), "rollout_content_invalid");
   const handle = await open(path, openFileFlags());
   try {
     const opened = await handle.stat({ bigint: true });
-    assertSafeFile(opened, uid);
+    assertTightenableFile(opened, uid);
     ensure(opened.dev === expectedDev, "unsafe_filesystem");
     ensure(
       sameFingerprint(fingerprint(before), fingerprint(opened)),
       "unsafe_filesystem",
     );
-    const bytes = await readExactBytes(handle, Number(opened.size));
+    const tightened = await tightenPinnedMode({
+      assertSafe: assertSafeFile,
+      exactMode: 0o600,
+      handle,
+      inspectAcl,
+      opened,
+      path,
+      uid,
+    });
+    ensure(
+      tightened.size > 0n && tightened.size <= BigInt(MAX_FILE_BYTES),
+      "rollout_content_invalid",
+    );
+    const bytes = await readExactBytes(handle, Number(tightened.size));
     const after = await handle.stat({ bigint: true });
     ensure(
-      sameFingerprint(fingerprint(opened), fingerprint(after)),
+      sameFingerprint(tightened, fingerprint(after)),
       "unsafe_filesystem",
     );
     return { bytes, fingerprint: fingerprint(after), handle, path };
@@ -441,13 +552,19 @@ function relativeRolloutPath(sessionsPath, path) {
   return candidate.split(sep).join("/");
 }
 
-async function scanTree(codexHome, uid) {
+async function scanTree(codexHome, uid, hooks) {
   const requestedHome = await lstat(codexHome, { bigint: true });
   ensure(!requestedHome.isSymbolicLink(), "unsafe_filesystem");
   const canonicalHome = await realpath(codexHome);
-  const home = await openPinnedDirectory(canonicalHome, uid);
+  await hooks.beforeHomeOpen();
+  const home = await openPinnedDirectory(
+    canonicalHome,
+    uid,
+    undefined,
+    hooks.inspectAcl,
+  );
   ensure(
-    sameFingerprint(fingerprint(requestedHome), home.fingerprint),
+    sameFingerprint(fingerprint(requestedHome), home.preTighteningFingerprint),
     "unsafe_filesystem",
   );
   const filesystemDev = home.fingerprint.dev;
@@ -458,7 +575,12 @@ async function scanTree(codexHome, uid) {
   let totalBytes = 0;
   try {
     ensure((await realpath(sessionsPath)) === sessionsPath, "unsafe_filesystem");
-    sessions = await openPinnedDirectory(sessionsPath, uid, filesystemDev);
+    sessions = await openPinnedDirectory(
+      sessionsPath,
+      uid,
+      filesystemDev,
+      hooks.inspectAcl,
+    );
     directories.push(sessions);
 
     async function visit(directory, depth) {
@@ -473,7 +595,12 @@ async function scanTree(codexHome, uid) {
         if (metadata.isSymbolicLink()) fail("unsafe_filesystem");
         if (metadata.isDirectory()) {
           ensure(directories.length < MAX_DIRECTORIES, "rollout_set_invalid");
-          const child = await openPinnedDirectory(path, uid, filesystemDev);
+          const child = await openPinnedDirectory(
+            path,
+            uid,
+            filesystemDev,
+            hooks.inspectAcl,
+          );
           directories.push(child);
           await visit(child, depth + 1);
           continue;
@@ -481,7 +608,12 @@ async function scanTree(codexHome, uid) {
         if (!metadata.isFile()) fail("unsupported_rollout_object");
         if (!entry.name.endsWith(".jsonl")) fail("unsupported_rollout_object");
         ensure(files.length < MAX_ROLLOUT_FILES, "rollout_set_invalid");
-        const file = await readPinnedFile(path, uid, filesystemDev);
+        const file = await readPinnedFile(
+          path,
+          uid,
+          filesystemDev,
+          hooks.inspectAcl,
+        );
         file.parent = directory;
         file.relativePath = relativeRolloutPath(sessionsPath, path);
         files.push(file);
@@ -500,23 +632,67 @@ async function scanTree(codexHome, uid) {
   }
 }
 
-async function verifyDirectory(directory, uid, { includeTimestamps = false } = {}) {
+async function verifyDirectory(
+  directory,
+  uid,
+  hooks,
+  { expectedExtraEntry, includeTimestamps = false } = {},
+) {
   const pathMetadata = await lstat(directory.path, { bigint: true });
   const handleMetadata = await directory.handle.stat({ bigint: true });
   assertSafeDirectory(pathMetadata, uid);
   assertSafeDirectory(handleMetadata, uid);
   const pathFingerprint = fingerprint(pathMetadata);
   const handleFingerprint = fingerprint(handleMetadata);
-  const compare = includeTimestamps ? sameFingerprint : sameDirectoryAuthority;
+  const compare = includeTimestamps
+    ? sameFingerprint
+    : expectedExtraEntry === undefined
+      ? sameDirectoryAuthority
+      : sameDirectoryIdentityWhileEditing;
   ensure(compare(directory.fingerprint, pathFingerprint), "unsafe_filesystem");
   ensure(compare(directory.fingerprint, handleFingerprint), "unsafe_filesystem");
+  ensure(sameFingerprint(pathFingerprint, handleFingerprint), "unsafe_filesystem");
+
+  ensure((await hooks.inspectAcl(directory.path)) === false, "unsafe_filesystem");
+  const finalPathMetadata = await lstat(directory.path, { bigint: true });
+  const finalHandleMetadata = await directory.handle.stat({ bigint: true });
+  assertSafeDirectory(finalPathMetadata, uid);
+  assertSafeDirectory(finalHandleMetadata, uid);
+  const finalPathFingerprint = fingerprint(finalPathMetadata);
+  const finalHandleFingerprint = fingerprint(finalHandleMetadata);
+  ensure(
+    sameFingerprint(pathFingerprint, finalPathFingerprint) &&
+      sameFingerprint(handleFingerprint, finalHandleFingerprint) &&
+      sameFingerprint(finalPathFingerprint, finalHandleFingerprint),
+    "unsafe_filesystem",
+  );
+
   if (directory.entries === null) return;
   const names = (await readdir(directory.path)).sort((left, right) =>
     left.localeCompare(right, "en"),
   );
+  await hooks.afterDirectoryRead();
+  const expectedNames =
+    expectedExtraEntry === undefined
+      ? directory.entries
+      : [...directory.entries, expectedExtraEntry].sort((left, right) =>
+          left.localeCompare(right, "en"),
+        );
   ensure(
-    names.length === directory.entries.length &&
-      names.every((name, index) => name === directory.entries[index]),
+    names.length === expectedNames.length &&
+      names.every((name, index) => name === expectedNames[index]),
+    "unsafe_filesystem",
+  );
+  const listedPathMetadata = await lstat(directory.path, { bigint: true });
+  const listedHandleMetadata = await directory.handle.stat({ bigint: true });
+  assertSafeDirectory(listedPathMetadata, uid);
+  assertSafeDirectory(listedHandleMetadata, uid);
+  const listedPathFingerprint = fingerprint(listedPathMetadata);
+  const listedHandleFingerprint = fingerprint(listedHandleMetadata);
+  ensure(
+    sameFingerprint(finalPathFingerprint, listedPathFingerprint) &&
+      sameFingerprint(finalHandleFingerprint, listedHandleFingerprint) &&
+      sameFingerprint(listedPathFingerprint, listedHandleFingerprint),
     "unsafe_filesystem",
   );
 }
@@ -556,7 +732,10 @@ async function safelyUnlinkTemporary(path, handleFingerprint) {
 
 const DEFAULT_HOOKS = objectFreeze({
   afterRename: async () => {},
+  afterDirectoryRead: async () => {},
+  beforeHomeOpen: async () => {},
   beforeRename: async () => {},
+  inspectAcl: recoveryPathHasExtendedAcl,
   syncDirectory: async (handle) => handle.sync(),
 });
 
@@ -564,10 +743,24 @@ function normalizeHooks(hooks) {
   if (hooks === undefined) return DEFAULT_HOOKS;
   const normalized = exactPlainObject(
     hooks,
-    ["afterRename", "beforeRename", "syncDirectory"],
+    [
+      "afterDirectoryRead",
+      "afterRename",
+      "beforeHomeOpen",
+      "beforeRename",
+      "inspectAcl",
+      "syncDirectory",
+    ],
     "invalid_request",
   );
-  for (const name of ["afterRename", "beforeRename", "syncDirectory"]) {
+  for (const name of [
+    "afterDirectoryRead",
+    "afterRename",
+    "beforeHomeOpen",
+    "beforeRename",
+    "inspectAcl",
+    "syncDirectory",
+  ]) {
     ensure(typeof normalized[name] === "function", "invalid_request");
   }
   return normalized;
@@ -592,6 +785,22 @@ async function replaceFile(file, analysis, uid, hooks) {
       0o600,
     );
     await temporaryHandle.chmod(0o600);
+    await temporaryHandle.sync();
+    const emptyTemporaryMetadata = await temporaryHandle.stat({ bigint: true });
+    assertSafeFile(emptyTemporaryMetadata, uid);
+    ensure(
+      emptyTemporaryMetadata.dev === file.parent.fingerprint.dev,
+      "unsafe_filesystem",
+    );
+    await tightenPinnedMode({
+      assertSafe: assertSafeFile,
+      exactMode: 0o600,
+      handle: temporaryHandle,
+      inspectAcl: hooks.inspectAcl,
+      opened: emptyTemporaryMetadata,
+      path: temporaryPath,
+      uid,
+    });
     await temporaryHandle.writeFile(analysis.after);
     await temporaryHandle.sync();
     const temporaryMetadata = await temporaryHandle.stat({ bigint: true });
@@ -620,14 +829,18 @@ async function replaceFile(file, analysis, uid, hooks) {
 
     await hooks.beforeRename();
     await verifyFile(file, uid);
-    const parentPath = await lstat(file.parent.path, { bigint: true });
-    ensure(
-      sameDirectoryIdentityWhileEditing(
-        file.parent.fingerprint,
-        fingerprint(parentPath),
-      ),
-      "unsafe_filesystem",
-    );
+    await verifyDirectory(file.parent, uid, hooks, {
+      expectedExtraEntry: basename(temporaryPath),
+    });
+    await tightenPinnedMode({
+      assertSafe: assertSafeFile,
+      exactMode: 0o600,
+      handle: temporaryHandle,
+      inspectAcl: hooks.inspectAcl,
+      opened: temporaryReadbackMetadata,
+      path: temporaryPath,
+      uid,
+    });
 
     publicationAttempted = true;
     await rename(temporaryPath, file.path);
@@ -638,7 +851,12 @@ async function replaceFile(file, analysis, uid, hooks) {
     await file.handle.close();
     file.handle = null;
 
-    const replacement = await readPinnedFile(file.path, uid, file.fingerprint.dev);
+    const replacement = await readPinnedFile(
+      file.path,
+      uid,
+      file.fingerprint.dev,
+      hooks.inspectAcl,
+    );
     try {
       ensure(
         replacement.bytes.length === analysis.after.length &&
@@ -683,7 +901,7 @@ async function repairWithHooks(options, hooks) {
   let scan;
   let published = false;
   try {
-    scan = await scanTree(request.codexHome, uid);
+    scan = await scanTree(request.codexHome, uid, hooks);
     const analyzed = scan.files.map((file) => ({
       ...analyzeBytes(file.bytes),
       file,
@@ -707,7 +925,9 @@ async function repairWithHooks(options, hooks) {
     }
 
     for (const directory of scan.directories) {
-      await verifyDirectory(directory, uid, { includeTimestamps: true });
+      await verifyDirectory(directory, uid, hooks, {
+        includeTimestamps: true,
+      });
     }
     for (const file of scan.files) await verifyFile(file, uid);
 
@@ -718,7 +938,7 @@ async function repairWithHooks(options, hooks) {
       if (entry.action === "unchanged") {
         await verifyFile(entry.file, uid);
       } else {
-        await verifyDirectory(entry.file.parent, uid);
+        await verifyDirectory(entry.file.parent, uid, hooks);
         await replaceFile(entry.file, entry, uid, hooks);
         published = true;
       }
@@ -731,7 +951,9 @@ async function repairWithHooks(options, hooks) {
       });
     }
 
-    for (const directory of scan.directories) await verifyDirectory(directory, uid);
+    for (const directory of scan.directories) {
+      await verifyDirectory(directory, uid, hooks);
+    }
     for (const file of scan.files) await verifyFile(file, uid, file.fingerprint);
 
     proofs.sort((left, right) =>
@@ -772,8 +994,9 @@ export async function repairStoppedRolloutTails(options) {
   return repairWithHooks(options, DEFAULT_HOOKS);
 }
 
-// Fault injection is intentionally separate from the production entry point.
-// Hooks receive no path, bytes, identifiers, or proof content.
+// Test-only dependencies are intentionally separate from the production entry
+// point. The ACL inspector receives one absolute path; fault-injection hooks
+// receive no path, bytes, identifiers, or proof content.
 export const __testing = objectFreeze({
   createRepair(hooks) {
     const checkedHooks = normalizeHooks(hooks);

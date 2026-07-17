@@ -31,6 +31,9 @@ import {
 import {
   authorityDirectoryPermissionsAreSafe,
 } from "./managed-auth-refresh.mjs";
+import {
+  ROLLOUT_TAIL_REPAIR_COMPATIBILITY,
+} from "./rollout-tail-repair.mjs";
 
 import {
   assertPortableDirectoryNames,
@@ -62,7 +65,7 @@ export {
 };
 
 export const PINNED_SOURCE_ANALYSIS_COMMIT =
-  "db887d03e1f907467e33271572dffb73bceecd6b";
+  ROLLOUT_TAIL_REPAIR_COMPATIBILITY.sourceAnalysisCommit;
 export const RECOVERY_SCENARIOS = Object.freeze([
   "logical_interrupt",
   "sigterm",
@@ -579,6 +582,7 @@ async function recoverAndInspect({
 
 export async function runRecoveryScenario({
   codexBin,
+  copyTree = copyStoppedTree,
   kind,
   makeTemporaryDirectory = mkdtemp,
   repairRollouts = repairRecoveryRollouts,
@@ -675,13 +679,13 @@ export async function runRecoveryScenario({
       const sourceDigest = await digestTree(sessionRoot);
       const sourceWorkspaceDigest = await digestTree(workspace);
       const backupRoot = join(ownedRoot, "stopped-tree-copy");
-      await copyStoppedTree({ ownedRoot, source: sessionRoot, destination: backupRoot });
+      await copyTree({ ownedRoot, source: sessionRoot, destination: backupRoot });
       const backupDigest = await digestTree(backupRoot);
       assert.equal(backupDigest, sourceDigest);
       assert.equal(await digestTree(join(backupRoot, "workspace")), sourceWorkspaceDigest);
       await removeTreeForCleanup(sessionRoot);
       const restoredRoot = join(ownedRoot, "restored-session");
-      await copyStoppedTree({ ownedRoot, source: backupRoot, destination: restoredRoot });
+      await copyTree({ ownedRoot, source: backupRoot, destination: restoredRoot });
       const restoredDigest = await digestTree(restoredRoot);
       assert.equal(restoredDigest, sourceDigest);
       sessionRoot = restoredRoot;
@@ -707,7 +711,7 @@ export async function runRecoveryScenario({
       );
       const sourceDigest = await digestTree(sessionRoot);
       immutableBackupRoot = join(ownedRoot, "immutable-stopped-tree-copy");
-      await copyStoppedTree({
+      await copyTree({
         ownedRoot,
         source: sessionRoot,
         destination: immutableBackupRoot,
@@ -716,7 +720,7 @@ export async function runRecoveryScenario({
       assert.equal(immutableBackupDigest, sourceDigest);
 
       const restoredRoot = join(ownedRoot, "repair-restored-session");
-      await copyStoppedTree({
+      await copyTree({
         ownedRoot,
         source: immutableBackupRoot,
         destination: restoredRoot,
@@ -769,7 +773,7 @@ export async function runRecoveryScenario({
     if (!repairScenario) {
       const coldReadRoot = join(ownedRoot, "cold-read-session");
       const recoveryStateDigest = await digestTree(sessionRoot);
-      await copyStoppedTree({
+      await copyTree({
         ownedRoot,
         source: sessionRoot,
         destination: coldReadRoot,
@@ -952,10 +956,20 @@ function assertRecoveryEvidenceSchema(report) {
     report.runtime.codexVersion,
     /^codex-cli [0-9]+\.[0-9]+\.[0-9]+$/,
   );
+  assert.equal(
+    report.runtime.codexVersion,
+    ROLLOUT_TAIL_REPAIR_COMPATIBILITY.codexVersion,
+    "runtime evidence Codex version does not match the tail-repair pin",
+  );
   assert.match(report.runtime.codexBinarySha256, /^[0-9a-f]{64}$/);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
   assert.equal(report.runtime.compatibilityClaim, "same-pinned-executable");
   assert.match(report.runtime.sourceAnalysisCommit, /^[0-9a-f]{40}$/);
+  assert.equal(
+    report.runtime.sourceAnalysisCommit,
+    ROLLOUT_TAIL_REPAIR_COMPATIBILITY.sourceAnalysisCommit,
+    "runtime evidence source commit does not match the tail-repair pin",
+  );
   assert(["darwin", "linux"].includes(report.runtime.platform), "unsupported evidence platform");
   assert(
     NODE_ARCHITECTURES.has(report.runtime.launcherArch),

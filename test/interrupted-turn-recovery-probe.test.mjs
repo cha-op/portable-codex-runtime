@@ -179,7 +179,7 @@ function completeEvidenceReport() {
       codexBinarySha256: "a".repeat(64),
       binaryExecution: "private-read-only-copy",
       compatibilityClaim: "same-pinned-executable",
-      sourceAnalysisCommit: "b".repeat(40),
+      sourceAnalysisCommit: PINNED_SOURCE_ANALYSIS_COMMIT,
       platform: "darwin",
       launcherArch: "arm64",
     },
@@ -565,6 +565,7 @@ test("tail repair scenarios repair once and cold-read the exact completed follow
 
     const report = await runRecoveryScenario({
       codexBin: process.execPath,
+      copyTree: copyStoppedTree,
       kind,
       repairRollouts,
       runtimeIdentity: {
@@ -2501,6 +2502,19 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
         /disallowed runtime data|did not match/,
       );
     }
+    for (const [field, value] of [
+      ["codexVersion", "codex-cli 0.144.2"],
+      ["sourceAnalysisCommit", "0".repeat(40)],
+    ]) {
+      assert.throws(
+        () =>
+          assertRecoveryEvidenceSafe({
+            ...report,
+            runtime: { ...report.runtime, [field]: value },
+          }),
+        /does not match the tail-repair pin/,
+      );
+    }
     assert.throws(
       () =>
         assertRecoveryEvidenceSafe({
@@ -2862,7 +2876,7 @@ test("probe report contains the complete recovery matrix without runtime identif
     readCodexVersion: (codexBin, context) => {
       versionBinary = codexBin;
       versionContext = context;
-      return "codex-cli 0.142.4";
+      return "codex-cli 0.144.1";
     },
     runScenario: async ({ codexBin, kind, runtimeIdentity, temporaryRoot }) => {
       calls.push(kind);
@@ -2907,7 +2921,7 @@ test("probe rejects private binary mode changes between scenarios", async () => 
     probeInterruptedTurnRecovery({
       ...TRUSTED_RECOVERY_ACL,
       codexBin: process.execPath,
-      readCodexVersion: () => "codex-cli 0.142.4",
+      readCodexVersion: () => "codex-cli 0.144.1",
       runScenario: async ({ codexBin, kind }) => {
         privateBinary = codexBin;
         calls += 1;
@@ -2931,7 +2945,7 @@ test("probe stages its private binary under an explicit executable root", async 
       executableRoot,
       readCodexVersion: (codexBin) => {
         privateBinary = codexBin;
-        return "codex-cli 0.142.4";
+        return "codex-cli 0.144.1";
       },
       runScenario: async ({ kind }) => scenarioReport(kind),
     });
@@ -2951,7 +2965,7 @@ test("probe rejects an untrusted writable executable root", async () => {
         ...TRUSTED_RECOVERY_ACL,
         codexBin: process.execPath,
         executableRoot,
-        readCodexVersion: () => "codex-cli 0.142.4",
+        readCodexVersion: () => "codex-cli 0.144.1",
         runScenario: async ({ kind }) => scenarioReport(kind),
       }),
       /recovery executable root must have trusted ownership and permissions/,
@@ -2975,7 +2989,7 @@ test("probe rejects an executable root below an unsafe ancestor", async () => {
         ...TRUSTED_RECOVERY_ACL,
         codexBin: process.execPath,
         executableRoot,
-        readCodexVersion: () => "codex-cli 0.142.4",
+        readCodexVersion: () => "codex-cli 0.144.1",
         runScenario: async ({ kind }) => scenarioReport(kind),
       }),
       /recovery executable root ancestor chain is not trusted/,
@@ -2995,7 +3009,7 @@ test("probe rejects executable-root ACLs through the inspection seam", async () 
         executableRoot,
         inspectExecutableAncestorAcl: async () => false,
         inspectExecutableRootAcl: async () => true,
-        readCodexVersion: () => "codex-cli 0.142.4",
+        readCodexVersion: () => "codex-cli 0.144.1",
         runScenario: async ({ kind }) => scenarioReport(kind),
       }),
       /recovery executable root must not have extended access controls/,
