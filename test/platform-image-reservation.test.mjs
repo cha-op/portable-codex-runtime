@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  MAX_IMAGE_CONFIG_BYTES,
+  MAX_PLATFORM_MANIFEST_BYTES,
   PlatformImageReservationCoordinator,
   PlatformImageReservationError,
 } from "../src/platform-image-reservation.mjs";
@@ -451,6 +453,116 @@ test("rejects tags, descriptor digest drift, size drift, MIME drift, and indexes
       assert.equal(inspected.requests.length, 0);
     });
   }
+});
+
+test("rejects oversized byte views before allocating or copying", async () => {
+  const nativeBufferAllocUnsafe = Buffer.allocUnsafe;
+  const nativeBufferFrom = Buffer.from;
+  const allocations = [];
+  let copies = 0;
+  Buffer.allocUnsafe = function monitoredBufferAllocUnsafe(size) {
+    allocations.push(size);
+    return Reflect.apply(nativeBufferAllocUnsafe, Buffer, [size]);
+  };
+  Buffer.from = function monitoredBufferFrom(...args) {
+    copies += 1;
+    return Reflect.apply(nativeBufferFrom, Buffer, args);
+  };
+
+  let FreshCoordinator;
+  try {
+    ({ PlatformImageReservationCoordinator: FreshCoordinator } =
+      await import(
+        "../src/platform-image-reservation.mjs?bounded-copy-preflight"
+      ));
+  } finally {
+    Buffer.allocUnsafe = nativeBufferAllocUnsafe;
+    Buffer.from = nativeBufferFrom;
+  }
+  allocations.length = 0;
+  copies = 0;
+
+  const fixture = imageFixture();
+  const inspected = inspector();
+  const oversizedManifest = new Uint8Array(
+    MAX_PLATFORM_MANIFEST_BYTES + 1,
+  );
+  await assert.rejects(
+    new FreshCoordinator().reservePlatformImage(
+      reserveOptions(fixture, inspected.inspectCodex, {
+        descriptor: {
+          ...fixture.descriptor,
+          bytes: oversizedManifest,
+          size: 1,
+        },
+      }),
+    ),
+    (error) =>
+      error?.name === "PlatformImageReservationError" &&
+      error.code === "invalid_platform_image_request",
+  );
+  assert.deepEqual(allocations, []);
+  assert.equal(copies, 0);
+
+  const oversizedConfig = Buffer.alloc(MAX_IMAGE_CONFIG_BYTES + 1);
+  await assert.rejects(
+    new FreshCoordinator().reservePlatformImage(
+      reserveOptions(fixture, inspected.inspectCodex, {
+        configBytes: oversizedConfig,
+      }),
+    ),
+    (error) =>
+      error?.name === "PlatformImageReservationError" &&
+      error.code === "invalid_platform_image_request",
+  );
+  assert.deepEqual(allocations, [fixture.descriptor.bytes.byteLength]);
+  assert.equal(copies, 0);
+  assert.equal(inspected.requests.length, 0);
+});
+
+test("copies genuine byte views without invoking shadowable properties", async () => {
+  const fixture = imageFixture();
+  const inspected = inspector();
+  let trapCalls = 0;
+  const trap = () => {
+    trapCalls += 1;
+    throw new Error("byte-view property trap must not run");
+  };
+  const shadowProperties = (view) => {
+    for (const key of [
+      "buffer",
+      "byteLength",
+      "byteOffset",
+      "constructor",
+      "length",
+      "valueOf",
+    ]) {
+      Object.defineProperty(view, key, {
+        configurable: true,
+        get: trap,
+      });
+    }
+    return view;
+  };
+  const descriptorBytes = shadowProperties(
+    new Uint8Array(fixture.descriptor.bytes),
+  );
+  const configBytes = shadowProperties(
+    new Uint8Array(fixture.configBytes),
+  );
+
+  await new PlatformImageReservationCoordinator().reservePlatformImage(
+    reserveOptions(fixture, inspected.inspectCodex, {
+      configBytes,
+      descriptor: {
+        ...fixture.descriptor,
+        bytes: descriptorBytes,
+      },
+    }),
+  );
+
+  assert.equal(trapCalls, 0);
+  assert.equal(inspected.requests.length, 1);
 });
 
 test("rejects a manifest document that claims an index or a different MIME", async (t) => {

@@ -37,7 +37,10 @@ superseded_by:
   outcome-uncertain.
 - Database `transaction_timestamp()` supplies one canonical clock value to the
   complete callback. Query capabilities expire after the callback and an
-  unobserved or suppressed failed query cannot be committed as success.
+  unobserved or suppressed failed query cannot be committed as success. Local
+  validation rejections are internally observed without changing the rejected
+  promise returned to the caller, so fire-and-forget misuse cannot become an
+  unhandled process rejection.
 - Generic commit transport failures remain outcome-uncertain. A server-returned
   transaction-rollback SQLSTATE is definitely not committed and may retry
   within the configured bound.
@@ -48,6 +51,9 @@ superseded_by:
   binary path, and SHA-256 derived from the descriptor/config identity. The
   reservation is an opaque same-process object capability and is terminal on
   concurrent use, evidence drift, inspector replacement, or uncertainty.
+  Manifest and config byte views are rejected by intrinsic length before any
+  source-sized private byte-buffer allocation and copied without invoking
+  shadowable source properties.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.

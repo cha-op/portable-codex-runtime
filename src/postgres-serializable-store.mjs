@@ -66,6 +66,12 @@ function storeError(code, commitState = "not-committed") {
   return new PostgresSerializableStoreError(code, commitState);
 }
 
+function observedRejectedPromise(error) {
+  const rejection = Promise.reject(error);
+  void rejection.then(undefined, () => undefined);
+  return rejection;
+}
+
 function inspectOptions(options) {
   if (
     options === null ||
@@ -473,7 +479,9 @@ function createTransactionCapability(client, now, transactionId) {
 
   const query = (...args) => {
     if (!active) {
-      return Promise.reject(storeError("transaction_query_inactive"));
+      return observedRejectedPromise(
+        storeError("transaction_query_inactive"),
+      );
     }
     if (
       (args.length !== 1 && args.length !== 2) ||
@@ -481,10 +489,10 @@ function createTransactionCapability(client, now, transactionId) {
       args[0].length === 0
     ) {
       queryCount += 1;
-      return Promise.reject(markLocalQueryError());
+      return observedRejectedPromise(markLocalQueryError());
     }
     if (terminalQueryError !== undefined) {
-      return Promise.reject(terminalQueryError);
+      return observedRejectedPromise(terminalQueryError);
     }
 
     let values;
@@ -492,7 +500,7 @@ function createTransactionCapability(client, now, transactionId) {
       values = args.length === 2 ? copyQueryValues(args[1]) : Object.freeze([]);
     } catch {
       queryCount += 1;
-      return Promise.reject(markLocalQueryError());
+      return observedRejectedPromise(markLocalQueryError());
     }
 
     queryCount += 1;

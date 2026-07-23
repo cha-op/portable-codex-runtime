@@ -12,6 +12,7 @@ const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arrayMapIntrinsic = Array.prototype.map;
+const bufferAllocUnsafe = Buffer.allocUnsafe;
 const bufferCompare = Buffer.compare;
 const bufferFrom = Buffer.from;
 const bufferIsBuffer = Buffer.isBuffer;
@@ -35,6 +36,15 @@ const setHasIntrinsic = Set.prototype.has;
 const stringIncludesIntrinsic = String.prototype.includes;
 const stringSplitIntrinsic = String.prototype.split;
 const textDecoderDecodeIntrinsic = TextDecoder.prototype.decode;
+const typedArrayPrototype = objectGetPrototypeOf(Uint8Array.prototype);
+const typedArrayByteLengthGetter = objectGetOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "byteLength",
+).get;
+const typedArraySetIntrinsic = objectGetOwnPropertyDescriptor(
+  typedArrayPrototype,
+  "set",
+).value;
 const {
   isProxy: isProxyValue,
   isUint8Array: isUint8ArrayValue,
@@ -78,6 +88,14 @@ function stringIncludes(value, candidate) {
 
 function stringSplit(value, separator) {
   return callIntrinsic(stringSplitIntrinsic, value, [separator]);
+}
+
+function typedArrayByteLength(value) {
+  return callIntrinsic(typedArrayByteLengthGetter, value, []);
+}
+
+function typedArraySet(value, source) {
+  return callIntrinsic(typedArraySetIntrinsic, value, [source]);
 }
 
 function weakMapGet(value, key) {
@@ -423,13 +441,38 @@ function copyBoundedBytes(value, maximum, code) {
   ) {
     fail(code);
   }
-  let copy;
+  let sourceByteLength;
   try {
-    copy = bufferFrom(value);
+    sourceByteLength = typedArrayByteLength(value);
   } catch {
     fail(code);
   }
-  ensure(copy.byteLength > 0 && copy.byteLength <= maximum, code);
+  ensure(
+    sourceByteLength > 0 && sourceByteLength <= maximum,
+    code,
+  );
+
+  let copy;
+  try {
+    copy = bufferAllocUnsafe(sourceByteLength);
+    typedArraySet(copy, value);
+  } catch {
+    fail(code);
+  }
+  let copiedByteLength;
+  let finalSourceByteLength;
+  try {
+    copiedByteLength = typedArrayByteLength(copy);
+    finalSourceByteLength = typedArrayByteLength(value);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    copiedByteLength === sourceByteLength &&
+      finalSourceByteLength === sourceByteLength &&
+      copiedByteLength <= maximum,
+    code,
+  );
   return copy;
 }
 

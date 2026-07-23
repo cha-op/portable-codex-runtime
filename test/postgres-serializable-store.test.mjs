@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { DatabaseError } from "pg";
@@ -15,6 +17,12 @@ import {
 const COMMIT_RESULT = Object.freeze({ command: "COMMIT" });
 const DISCARD_RESULT = Object.freeze({ command: "DISCARD" });
 const ROLLBACK_RESULT = Object.freeze({ command: "ROLLBACK" });
+const FIRE_AND_FORGET_FIXTURE = fileURLToPath(
+  new URL(
+    "./fixtures/postgres-fire-and-forget-rejection.mjs",
+    import.meta.url,
+  ),
+);
 
 class FakeClient {
   constructor(steps, { releaseError, resetSteps = [] } = {}) {
@@ -382,6 +390,105 @@ test("a suppressed revoked query values proxy cannot allow commit", async () => 
       "ROLLBACK",
     ],
   );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a fire-and-forget invalid query rejection is internally observed", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable((transaction) => {
+      void transaction.query({ text: "SELECT 1" });
+      return "must-not-commit";
+    }),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("all immediate query rejections are safe under strict unhandled mode", async (t) => {
+  for (const scenario of [
+    "inactive",
+    "invalid-signature",
+    "invalid-values",
+    "terminal-error",
+  ]) {
+    await t.test(scenario, () => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--unhandled-rejections=strict",
+          FIRE_AND_FORGET_FIXTURE,
+          scenario,
+        ],
+        {
+          encoding: "utf8",
+          timeout: 10_000,
+        },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.signal, null);
+      assert.equal(
+        result.status,
+        0,
+        `strict child failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+    });
+  }
+});
+
+test("an observed local query rejection preserves its error identity", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  let queryError;
+  let transactionError;
+
+  try {
+    await store.runSerializable(async (transaction) => {
+      await assert.rejects(
+        transaction.query({ text: "SELECT 1" }),
+        (error) => {
+          queryError = error;
+          return (
+            error?.code === "transaction_query_invalid" &&
+            error.commitState === "not-committed"
+          );
+        },
+      );
+      return "must-not-commit";
+    });
+  } catch (error) {
+    transactionError = error;
+  }
+
+  assert(queryError);
+  assert.strictEqual(transactionError, queryError);
   assert.deepEqual(client.releaseCalls, [[]]);
   client.assertExhausted();
 });

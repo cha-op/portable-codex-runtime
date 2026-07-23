@@ -68,7 +68,9 @@ option; legacy or ambiguous `pool` input is rejected. It:
    boolean, or bigint values, so node-postgres never invokes application
    converters while classifying a database retry; callers serialize structured
    values to strings and use explicit SQL casts such as `$1::jsonb`;
-4. rejects an unsettled or suppressed failed query;
+4. rejects an unsettled or suppressed failed query, and internally observes
+   locally rejected query promises so a fire-and-forget call cannot emit an
+   unhandled process rejection while the original promise remains rejected;
 5. rechecks the transaction ID after every successful user query so
    callback-issued transaction control cannot be hidden by a later throw, and
    treats a query failure without a trusted PostgreSQL SQLSTATE as
@@ -176,6 +178,9 @@ matching DiffID count, and supported standard descriptor metadata. OCI
 manifest `mediaType` may be omitted as the specification permits. Artifact
 manifests, unknown descriptor fields, non-HTTPS or credential-bearing
 descriptor URLs, and unsupported layer media types are rejected deliberately.
+Caller-supplied byte views are size-checked through captured typed-array
+intrinsics before any source-sized private byte-buffer allocation, then copied
+into an exact bounded buffer without invoking shadowable source properties.
 
 Image reservation follows one-process object capability semantics:
 
@@ -234,10 +239,11 @@ promote an unfenced session merely because a lease timestamp has passed.
 
 The foundation unit suite uses deterministic transaction doubles to cover
 database time, query-capability lifetime, provenance-aware retry, migration,
-commit uncertainty, and release failure. Image tests cover exact bytes,
-descriptor and config identity, measurement drift, and one-use capability
-semantics. A separate GitHub Actions job runs the schema and competing
-authority clients against a real PostgreSQL service. The next authority slice
-must add lifecycle, idempotency, epoch, reservation, catalogue, and launch
-transition tests. Later physical-backend pull requests must add crash,
-detach/fence, container-launch, and cross-host conformance evidence.
+commit uncertainty, fire-and-forget query rejection, and release failure.
+Image tests cover exact bytes, pre-allocation resource limits, descriptor and
+config identity, measurement drift, and one-use capability semantics. A
+separate GitHub Actions job runs the schema and competing authority clients
+against a real PostgreSQL service. The next authority slice must add lifecycle,
+idempotency, epoch, reservation, catalogue, and launch transition tests. Later
+physical-backend pull requests must add crash, detach/fence, container-launch,
+and cross-host conformance evidence.
