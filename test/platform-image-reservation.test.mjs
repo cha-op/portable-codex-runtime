@@ -1237,6 +1237,7 @@ test("prototype poisoning cannot forge image authority", async (t) => {
     "revalidate",
     "consume",
     "hash-prototype",
+    "manifest-validation",
     "promise-rejection",
     "regexp-prototype",
     "set-constructor",

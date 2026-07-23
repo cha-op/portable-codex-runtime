@@ -245,11 +245,16 @@ native parse result through module-captured `protocol`, `hostname`, `username`,
 and `password` getters. Post-import intrinsic poisoning therefore cannot
 replace the ledger, skip nested freezing, reinterpret a platform tuple, forge a
 descriptor digest, or disguise an HTTP or credential-bearing descriptor URL as
-admissible HTTPS. Before invoking the shared session-manifest validator, image
-authority snapshots every runtime field through captured own-data descriptors
-and later ignores the validator's defensive-clone result. An inspector
-therefore cannot replace that validator's clone operation and reenter image
-reservation with a runtime tuple that differs from the validated snapshot.
+admissible HTTPS. The shared complete session-manifest validator captures the
+structure, array-membership, RegExp, integer, and freeze intrinsics that decide
+manifest validity; post-import prototype or static-method mutation therefore
+cannot admit an invalid UUID, history policy, runtime identity, or agent
+policy. Its final `structuredClone` remains deliberately dynamic for existing
+reentrancy semantics. Before invoking it, image authority snapshots every
+runtime field through captured own-data descriptors and later ignores the
+validator's defensive-clone result. An inspector therefore cannot replace that
+clone operation and reenter image reservation with a runtime tuple that differs
+from the validated snapshot.
 
 Image reservation follows one-process object capability semantics:
 

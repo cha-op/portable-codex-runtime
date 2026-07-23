@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { types as utilTypes } from "node:util";
 import test from "node:test";
 
 import {
@@ -321,6 +322,150 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
   ]) {
     assert.throws(() => assertSessionManifest(invalid), assertCode("invalid_session_manifest"));
   }
+});
+
+test("session manifest UUID validation ignores post-import RegExp poisoning", () => {
+  const invalid = {
+    ...sessionManifest(),
+    sessionId: "not-a-uuid",
+  };
+  const execDescriptor = Object.getOwnPropertyDescriptor(
+    RegExp.prototype,
+    "exec",
+  );
+  const testDescriptor = Object.getOwnPropertyDescriptor(
+    RegExp.prototype,
+    "test",
+  );
+  let poisonedCalls = 0;
+  let validationError;
+  try {
+    Object.defineProperty(RegExp.prototype, "exec", {
+      ...execDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return ["forged UUID match"];
+      },
+    });
+    Object.defineProperty(RegExp.prototype, "test", {
+      ...testDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    try {
+      assertSessionManifest(invalid);
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    Object.defineProperty(RegExp.prototype, "exec", execDescriptor);
+    Object.defineProperty(RegExp.prototype, "test", testDescriptor);
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.ok(assertCode("invalid_session_manifest")(validationError));
+});
+
+test("session history validation ignores post-import Array prototype poisoning", () => {
+  const invalid = {
+    ...sessionManifest(),
+    codex: {
+      ...sessionManifest().codex,
+      historyMode: "future-history",
+    },
+  };
+  const everyDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "every",
+  );
+  const includesDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "includes",
+  );
+  let poisonedCalls = 0;
+  let validationError;
+  try {
+    Object.defineProperty(Array.prototype, "every", {
+      ...everyDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    Object.defineProperty(Array.prototype, "includes", {
+      ...includesDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    try {
+      assertSessionManifest(invalid);
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    Object.defineProperty(Array.prototype, "every", everyDescriptor);
+    Object.defineProperty(Array.prototype, "includes", includesDescriptor);
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.ok(assertCode("invalid_session_manifest")(validationError));
+});
+
+test("session manifest validation uses captured static intrinsics", () => {
+  const manifest = sessionManifest();
+  const targets = [
+    [Array, "isArray"],
+    [Number, "isSafeInteger"],
+    [Object, "freeze"],
+    [Object, "getOwnPropertyDescriptor"],
+    [Object, "getPrototypeOf"],
+    [Object, "hasOwn"],
+    [Object, "isFrozen"],
+    [Object, "values"],
+    [Reflect, "apply"],
+    [Reflect, "ownKeys"],
+    [utilTypes, "isProxy"],
+  ].map(([owner, key]) => ({
+    descriptor: Object.getOwnPropertyDescriptor(owner, key),
+    key,
+    owner,
+  }));
+  let poisonedCalls = 0;
+  let validated;
+  let validationError;
+  try {
+    for (const target of targets) {
+      Object.defineProperty(target.owner, target.key, {
+        ...target.descriptor,
+        value() {
+          poisonedCalls += 1;
+          throw new Error(`poisoned ${target.key}`);
+        },
+      });
+    }
+    try {
+      validated = assertSessionManifest(manifest);
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    for (const target of targets) {
+      Object.defineProperty(
+        target.owner,
+        target.key,
+        target.descriptor,
+      );
+    }
+  }
+
+  assert.equal(validationError, undefined);
+  assert.equal(poisonedCalls, 0);
+  assert.deepEqual(validated, manifest);
+  assert.equal(Object.isFrozen(validated), true);
 });
 
 test("trusted OCI resolution must match the recorded platform manifest", () => {

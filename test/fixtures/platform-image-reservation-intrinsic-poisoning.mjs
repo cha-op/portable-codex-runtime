@@ -14,6 +14,7 @@ const scenarios = new Set([
   "array-iterator-platform",
   "consume",
   "hash-prototype",
+  "manifest-validation",
   "promise-rejection",
   "regexp-prototype",
   "reserve",
@@ -36,10 +37,23 @@ const arrayIteratorDescriptor = objectGetOwnPropertyDescriptor(
   Array.prototype,
   arrayIteratorSymbol,
 );
+const arrayEveryDescriptor = objectGetOwnPropertyDescriptor(
+  Array.prototype,
+  "every",
+);
+const arrayIncludesDescriptor = objectGetOwnPropertyDescriptor(
+  Array.prototype,
+  "includes",
+);
 const globalWeakMapDescriptor = objectGetOwnPropertyDescriptor(
   globalThis,
   "WeakMap",
 );
+const objectGetOwnPropertyDescriptorDescriptor =
+  objectGetOwnPropertyDescriptor(
+    Object,
+    "getOwnPropertyDescriptor",
+  );
 const structuredCloneDescriptor = objectGetOwnPropertyDescriptor(
   globalThis,
   "structuredClone",
@@ -247,6 +261,7 @@ let poisonNext =
 let leakedReservationLedger;
 let poisonedHashDigestCalls = 0;
 let poisonedHashUpdateCalls = 0;
+let poisonedManifestValidationCalls = 0;
 
 function restoreArrayIterator() {
   Object.defineProperty(
@@ -299,6 +314,72 @@ function poisonArrayIterator(mode) {
         );
       }
       return Reflect.apply(arrayIteratorDescriptor.value, this, []);
+    },
+  });
+}
+
+function restoreManifestValidationIntrinsics() {
+  Object.defineProperty(
+    Array.prototype,
+    "every",
+    arrayEveryDescriptor,
+  );
+  Object.defineProperty(
+    Array.prototype,
+    "includes",
+    arrayIncludesDescriptor,
+  );
+  Object.defineProperty(
+    Object,
+    "getOwnPropertyDescriptor",
+    objectGetOwnPropertyDescriptorDescriptor,
+  );
+  Object.defineProperty(
+    RegExp.prototype,
+    "exec",
+    regexpExecDescriptor,
+  );
+  Object.defineProperty(
+    RegExp.prototype,
+    "test",
+    regexpTestDescriptor,
+  );
+}
+
+function poisonManifestValidationIntrinsics() {
+  Object.defineProperty(Array.prototype, "every", {
+    ...arrayEveryDescriptor,
+    value() {
+      poisonedManifestValidationCalls += 1;
+      return true;
+    },
+  });
+  Object.defineProperty(Array.prototype, "includes", {
+    ...arrayIncludesDescriptor,
+    value() {
+      poisonedManifestValidationCalls += 1;
+      return true;
+    },
+  });
+  Object.defineProperty(Object, "getOwnPropertyDescriptor", {
+    ...objectGetOwnPropertyDescriptorDescriptor,
+    value() {
+      poisonedManifestValidationCalls += 1;
+      throw new Error("poisoned Object.getOwnPropertyDescriptor");
+    },
+  });
+  Object.defineProperty(RegExp.prototype, "exec", {
+    ...regexpExecDescriptor,
+    value() {
+      poisonedManifestValidationCalls += 1;
+      return ["forged manifest match"];
+    },
+  });
+  Object.defineProperty(RegExp.prototype, "test", {
+    ...regexpTestDescriptor,
+    value() {
+      poisonedManifestValidationCalls += 1;
+      return true;
     },
   });
 }
@@ -883,6 +964,41 @@ function runScenario() {
       (error) => {
         restoreHashPrototype();
         throw error;
+      },
+    );
+  } else if (scenario === "manifest-validation") {
+    let inspectorCalls = 0;
+    const invalidSessionManifest = {
+      ...image.sessionManifest,
+      codex: {
+        ...image.sessionManifest.codex,
+        historyMode: "future-history",
+      },
+      sessionId: "not-a-uuid",
+    };
+    poisonManifestValidationIntrinsics();
+    safeThen(
+      coordinator.reservePlatformImage({
+        ...image,
+        sessionManifest: invalidSessionManifest,
+        inspectCodex() {
+          inspectorCalls += 1;
+          return PromiseConstructor.resolve(measurement());
+        },
+      }),
+      () => {
+        restoreManifestValidationIntrinsics();
+        throw new Error(
+          "poisoned manifest intrinsics forged image authority",
+        );
+      },
+      (error) => {
+        restoreManifestValidationIntrinsics();
+        assert.equal(poisonedManifestValidationCalls, 0);
+        assert.equal(inspectorCalls, 0);
+        assert.ok(error instanceof PlatformImageReservationError);
+        assert.equal(error.code, "invalid_platform_image_request");
+        process.exitCode = 0;
       },
     );
   } else if (scenario === "url-accessors") {

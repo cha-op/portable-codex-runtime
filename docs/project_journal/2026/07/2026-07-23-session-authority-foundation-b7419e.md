@@ -100,11 +100,14 @@ superseded_by:
   cannot skip nested freezing, reinterpret platform identity, or expose the
   ledger. Descriptor URL policy uses captured native `URL` accessors, so
   prototype mutation cannot disguise HTTP or embedded credentials as an
-  admissible HTTPS location. Image authority snapshots every session-runtime
-  field through captured own-data descriptors before invoking the shared
-  manifest validator and ignores its defensive-clone result, preventing an
-  inspector from using a reentrant reservation to substitute a different
-  image identity.
+  admissible HTTPS location. The shared complete session-manifest validator
+  uses captured structure, array-membership, RegExp, integer, and freeze
+  intrinsics, so prototype or static-method mutation cannot admit an invalid
+  UUID, history policy, runtime identity, or agent policy. Image authority
+  snapshots every session-runtime field through captured own-data descriptors
+  before invoking that validator and ignores its deliberately dynamic
+  defensive-clone result, preventing an inspector from using clone reentrancy
+  to substitute a different image identity.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.
