@@ -2318,3 +2318,48 @@ test("constructor and query APIs reject shapes that could escape tracking", asyn
   assert.deepEqual(client.releaseCalls, [[]]);
   client.assertExhausted();
 });
+
+test("shape-invalid borrowed clients are destroyed exactly once", async (t) => {
+  for (const releaseError of [
+    undefined,
+    new Error("invalid client release failed"),
+  ]) {
+    await t.test(
+      releaseError === undefined ? "release succeeds" : "release rejects",
+      async () => {
+        const releaseCalls = [];
+        const client = {
+          connection: null,
+          async query() {
+            throw new Error("invalid client query must not run");
+          },
+          async release(...args) {
+            releaseCalls.push(args);
+            if (releaseError !== undefined) throw releaseError;
+          },
+        };
+        const pool = new FakePool([client]);
+        const store = new PostgresSerializableStore({
+          dedicatedPool: pool,
+        });
+        let callbackCalls = 0;
+
+        await assertStoreError(
+          store.runSerializable(() => {
+            callbackCalls += 1;
+          }),
+          {
+            code: "connection_failed",
+            commitState: "not-committed",
+            omittedText: releaseError?.message,
+          },
+        );
+        assert.equal(callbackCalls, 0);
+        assert.equal(pool.connectCalls, 1);
+        assert.equal(releaseCalls.length, 1);
+        assert.equal(releaseCalls[0].length, 1);
+        assert.ok(releaseCalls[0][0] instanceof Error);
+      },
+    );
+  }
+});

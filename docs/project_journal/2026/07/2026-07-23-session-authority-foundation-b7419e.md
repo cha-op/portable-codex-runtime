@@ -41,6 +41,9 @@ superseded_by:
   cannot convert a local or unknown outcome into a retry. The dedicated pool,
   client, connection event source, and node-postgres implementation remain an
   explicit trusted boundary and must not be exposed to callbacks.
+  A shape-invalid client returned by that pool is destroyed exactly once with
+  `release(error)` before the sanitized connection failure escapes; failure to
+  destroy it does not replace the primary classification.
 - Store errors thrown through the callback are trusted only when minted by the
   exact current transaction attempt. Module-private constructor identity
   covers alternate `newTarget` construction, while the captured public
@@ -91,7 +94,10 @@ superseded_by:
   use indexed access, while the private reservation ledger uses a captured
   WeakMap constructor, so post-import iterator or constructor replacement
   cannot skip nested freezing, reinterpret platform identity, or expose the
-  ledger.
+  ledger. Image authority snapshots every session-runtime field through
+  captured own-data descriptors before invoking the shared manifest validator
+  and ignores its defensive-clone result, preventing an inspector from using a
+  reentrant reservation to substitute a different image identity.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.

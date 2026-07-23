@@ -764,14 +764,38 @@ function parseBoundedJson(bytes, code, documentKind) {
 }
 
 function normalizeSessionRuntime(sessionManifest) {
-  let manifest;
+  let runtime;
   try {
-    manifest = assertSessionManifest(sessionManifest);
+    const manifest = assertExactPlainObject(
+      sessionManifest,
+      [
+        "agents",
+        "authMode",
+        "codex",
+        "layoutVersion",
+        "runtime",
+        "schemaVersion",
+        "sessionId",
+      ],
+      "invalid_platform_image_request",
+    );
+    runtime = assertExactPlainObject(
+      manifest.runtime,
+      [
+        "codexSandbox",
+        "codexVersion",
+        "imageDigest",
+        "imageMediaType",
+        "platform",
+      ],
+      "invalid_platform_image_request",
+    );
+    assertSessionManifest(sessionManifest);
   } catch {
     fail("invalid_platform_image_request");
   }
   const platformParts = stringSplit(
-    manifest.runtime.platform,
+    runtime.platform,
     "/",
   );
   const os = platformParts[0];
@@ -782,14 +806,27 @@ function normalizeSessionRuntime(sessionManifest) {
       arrayIncludes(["amd64", "arm64"], architecture),
     "invalid_platform_image_request",
   );
+  ensure(
+    typeof runtime.imageDigest === "string" &&
+      regexpTest(OCI_DIGEST_PATTERN, runtime.imageDigest) &&
+      arrayIncludes(
+        PLATFORM_IMAGE_MEDIA_TYPES,
+        runtime.imageMediaType,
+      ) &&
+      typeof runtime.codexVersion === "string" &&
+      runtime.codexVersion.length <= 128 &&
+      regexpTest(CODEX_VERSION_PATTERN, runtime.codexVersion) &&
+      runtime.codexSandbox === "danger-full-access",
+    "invalid_platform_image_request",
+  );
   return deepFreeze({
     architecture,
-    codexSandbox: manifest.runtime.codexSandbox,
-    codexVersion: manifest.runtime.codexVersion,
-    digest: manifest.runtime.imageDigest,
-    mediaType: manifest.runtime.imageMediaType,
+    codexSandbox: runtime.codexSandbox,
+    codexVersion: runtime.codexVersion,
+    digest: runtime.imageDigest,
+    mediaType: runtime.imageMediaType,
     os,
-    platform: manifest.runtime.platform,
+    platform: runtime.platform,
   });
 }
 

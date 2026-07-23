@@ -652,7 +652,18 @@ async function acquireClient(pool) {
     throw storeError("connection_failed");
   }
   if (!validateClient(client)) {
-    throw storeError("connection_failed");
+    const connectionError = storeError("connection_failed");
+    try {
+      const release = client?.release;
+      if (typeof release === "function") {
+        await protectPromise(
+          reflectApply(release, client, [connectionError]),
+        );
+      }
+    } catch {
+      // The shape failure remains primary after best-effort slot destruction.
+    }
+    throw connectionError;
   }
   return client;
 }

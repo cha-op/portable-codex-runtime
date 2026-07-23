@@ -86,7 +86,10 @@ Serialization failures and deadlocks may be retried only when the same
 node-postgres `DatabaseError` object was first observed on that client's
 `errorMessage` connection event and then rejected the active query with the
 exact transaction-rollback SQLSTATE. The client is destroyed or reset after a
-proved rollback. Merely constructing `DatabaseError` or matching its `code` is
+proved rollback. A client returned by the dedicated pool is also destroyed
+with `release(error)` when its required query, release, or connection-event
+shape is invalid; the acquisition failure remains primary even if destruction
+fails. Merely constructing `DatabaseError` or matching its `code` is
 insufficient: custom parameter conversion and result-parser failures never
 receive protocol provenance. The executor captures the WeakMap, Set, Array,
 RegExp, object, Promise, cryptographic Hash, and prototype-test intrinsics used
@@ -233,7 +236,12 @@ captured cryptographic Hash methods; own-key and platform arrays use indexed
 access instead of a mutable array iterator; and the private reservation ledger
 uses the module-captured WeakMap constructor. Post-import intrinsic poisoning
 therefore cannot replace the ledger, skip nested freezing, reinterpret a
-platform tuple, or forge a descriptor digest.
+platform tuple, or forge a descriptor digest. Before invoking the shared
+session-manifest validator, image authority snapshots every runtime field
+through captured own-data descriptors and later ignores the validator's
+defensive-clone result. An inspector therefore cannot replace that validator's
+clone operation and reenter image reservation with a runtime tuple that
+differs from the validated snapshot.
 
 Image reservation follows one-process object capability semantics:
 

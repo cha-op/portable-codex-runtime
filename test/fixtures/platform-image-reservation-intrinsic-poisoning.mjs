@@ -18,6 +18,7 @@ const scenarios = new Set([
   "reserve",
   "revalidate",
   "set-constructor",
+  "structured-clone-reentry",
   "typed-array-byte-length",
   "weakmap-constructor",
 ]);
@@ -37,6 +38,11 @@ const globalWeakMapDescriptor = objectGetOwnPropertyDescriptor(
   globalThis,
   "WeakMap",
 );
+const structuredCloneDescriptor = objectGetOwnPropertyDescriptor(
+  globalThis,
+  "structuredClone",
+);
+const structuredCloneIntrinsic = structuredCloneDescriptor.value;
 const hashDigestDescriptor = objectGetOwnPropertyDescriptor(
   Hash.prototype,
   "digest",
@@ -193,6 +199,24 @@ function tamperLayerDigest(descriptor) {
   };
 }
 
+function replaceLayerDigest(imageFixture) {
+  const document = JSON.parse(
+    imageFixture.descriptor.bytes.toString("utf8"),
+  );
+  document.layers[0].digest = `sha256:${"d".repeat(64)}`;
+  const bytes = Buffer.from(JSON.stringify(document), "utf8");
+  return {
+    configBytes: imageFixture.configBytes,
+    descriptor: {
+      ...imageFixture.descriptor,
+      bytes,
+      digest: digest(bytes),
+      size: bytes.byteLength,
+    },
+    sessionManifest: imageFixture.sessionManifest,
+  };
+}
+
 let inspectionPromise;
 let poisonNext =
   scenario === "reserve" ||
@@ -328,6 +352,57 @@ function constructCoordinator() {
       "WeakMap",
       globalWeakMapDescriptor,
     );
+  }
+}
+
+function restoreStructuredClone() {
+  Object.defineProperty(
+    globalThis,
+    "structuredClone",
+    structuredCloneDescriptor,
+  );
+}
+
+async function inspectWithStructuredCloneReentry() {
+  let nestedInspectorCalls = 0;
+  Object.defineProperty(globalThis, "structuredClone", {
+    ...structuredCloneDescriptor,
+    value(value, options) {
+      const clone =
+        options === undefined
+          ? Reflect.apply(structuredCloneIntrinsic, globalThis, [value])
+          : Reflect.apply(structuredCloneIntrinsic, globalThis, [
+              value,
+              options,
+            ]);
+      if (value === image.sessionManifest) {
+        clone.runtime.imageDigest = alternateImage.descriptor.digest;
+      }
+      return clone;
+    },
+  });
+  try {
+    let nestedError;
+    try {
+      await coordinator.reservePlatformImage({
+        ...alternateImage,
+        inspectCodex() {
+          nestedInspectorCalls += 1;
+          return PromiseConstructor.resolve(measurement());
+        },
+      });
+    } catch (error) {
+      nestedError = error;
+    }
+    assert.equal(nestedInspectorCalls, 0);
+    assert.ok(nestedError instanceof PlatformImageReservationError);
+    assert.equal(
+      nestedError.code,
+      "platform_image_identity_mismatch",
+    );
+    return measurement();
+  } finally {
+    restoreStructuredClone();
   }
 }
 
@@ -488,6 +563,10 @@ function safeThen(value, onFulfilled, onRejected) {
 }
 
 function inspectCodex() {
+  if (scenario === "structured-clone-reentry") {
+    inspectionPromise = inspectWithStructuredCloneReentry();
+    return inspectionPromise;
+  }
   inspectionPromise =
     scenario === "promise-rejection"
       ? PromiseConstructor.reject(new Error("inspector rejected"))
@@ -509,6 +588,7 @@ const image = fixture({
   embedded: scenario === "typed-array-byte-length",
 });
 const tamperedDescriptor = tamperLayerDigest(image.descriptor);
+const alternateImage = replaceLayerDigest(image);
 let coordinator;
 
 function assertRuntimeIdentity(result) {
@@ -633,6 +713,7 @@ function runScenario() {
   if (
     scenario === "reserve" ||
     scenario === "promise-rejection" ||
+    scenario === "structured-clone-reentry" ||
     scenario === "weakmap-constructor"
   ) {
     const operation = coordinator.reservePlatformImage({
