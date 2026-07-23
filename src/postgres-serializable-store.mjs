@@ -24,7 +24,15 @@ const QUERY_PARAMETER_TYPES = new Set([
 const MAX_QUERY_PARAMETERS = 65_535;
 const COMMIT_STATES = new Set(["committed", "not-committed", "uncertain"]);
 const PROTOCOL_ERROR_SQLSTATES = new WeakMap();
-const ERROR_MESSAGES = Object.freeze({
+const objectDefineProperties = Object.defineProperties;
+const objectFreeze = Object.freeze;
+const objectHasOwn = Object.hasOwn;
+const reflectApply = Reflect.apply;
+const setHasIntrinsic = Set.prototype.has;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+const WeakSetConstructor = WeakSet;
+const ERROR_MESSAGES = objectFreeze({
   client_reset_failed: "PostgreSQL client reset failed",
   client_release_failed: "PostgreSQL client release failed",
   connection_failed: "PostgreSQL connection acquisition failed",
@@ -50,15 +58,40 @@ const ERROR_MESSAGES = Object.freeze({
 
 export class PostgresSerializableStoreError extends Error {
   constructor(code, commitState = "not-committed") {
-    if (!Object.hasOwn(ERROR_MESSAGES, code) || !COMMIT_STATES.has(commitState)) {
+    if (
+      !objectHasOwn(ERROR_MESSAGES, code) ||
+      !reflectApply(setHasIntrinsic, COMMIT_STATES, [commitState])
+    ) {
       throw new TypeError("unsupported PostgreSQL serializable store error");
     }
     super(ERROR_MESSAGES[code]);
-    this.name = "PostgresSerializableStoreError";
-    this.code = code;
-    this.commitState = commitState;
-    this.retryable = false;
-    Object.freeze(this);
+    objectDefineProperties(this, {
+      name: {
+        configurable: true,
+        enumerable: true,
+        value: "PostgresSerializableStoreError",
+        writable: true,
+      },
+      code: {
+        configurable: true,
+        enumerable: true,
+        value: code,
+        writable: true,
+      },
+      commitState: {
+        configurable: true,
+        enumerable: true,
+        value: commitState,
+        writable: true,
+      },
+      retryable: {
+        configurable: true,
+        enumerable: true,
+        value: false,
+        writable: true,
+      },
+    });
+    objectFreeze(this);
   }
 }
 
@@ -744,6 +777,12 @@ export class PostgresSerializableStore {
       throw storeError("transaction_begin_failed");
     }
 
+    const migrationErrors = new WeakSetConstructor();
+    const migrationError = (code) => {
+      const error = storeError(code);
+      reflectApply(weakSetAddIntrinsic, migrationErrors, [error]);
+      return error;
+    };
     let applied = false;
     try {
       await clientQuery(
@@ -775,7 +814,7 @@ export class PostgresSerializableStore {
         typeof current !== "object" ||
         !Array.isArray(current.rows)
       ) {
-        throw storeError("migration_state_invalid");
+        throw migrationError("migration_state_invalid");
       }
       if (current.rows.length !== 0) {
         if (
@@ -785,10 +824,10 @@ export class PostgresSerializableStore {
           current.rows[0].version !== SESSION_AUTHORITY_MIGRATION_VERSION ||
           typeof current.rows[0].checksum !== "string"
         ) {
-          throw storeError("migration_state_invalid");
+          throw migrationError("migration_state_invalid");
         }
         if (current.rows[0].checksum !== migration.checksum) {
-          throw storeError("migration_checksum_mismatch");
+          throw migrationError("migration_checksum_mismatch");
         }
       } else {
         await clientQuery(client, migration.sql);
@@ -805,7 +844,9 @@ export class PostgresSerializableStore {
       }
     } catch (error) {
       await rollbackAndRelease(client, release, error);
-      if (error instanceof PostgresSerializableStoreError) throw error;
+      if (reflectApply(weakSetHasIntrinsic, migrationErrors, [error])) {
+        throw error;
+      }
       throw storeError("migration_failed");
     }
 

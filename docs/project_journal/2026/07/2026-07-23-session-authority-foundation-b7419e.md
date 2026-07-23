@@ -35,6 +35,11 @@ superseded_by:
   after each proved transaction boundary. A user-query failure without a
   trusted PostgreSQL SQLSTATE destroys the client and remains
   outcome-uncertain.
+- Migration validation errors retain their specific code only when marked by
+  the current `migrate()` invocation. Publicly constructed errors, internal
+  errors replayed from another operation, and inherited prototype accessors
+  cannot forge a committed migration outcome after the current transaction
+  has rolled back.
 - Database `transaction_timestamp()` supplies one canonical clock value to the
   complete callback. Query capabilities expire after the callback and an
   unobserved or suppressed failed query cannot be committed as success. Local

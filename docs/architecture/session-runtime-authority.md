@@ -97,6 +97,14 @@ the connection/operator/system/internal error classes, and the explicit
 `40003` completion-unknown state are likewise outcome-uncertain; a later
 `ROLLBACK` cannot reclassify them.
 
+Migration rollback preserves a specific migration validation error only when
+that exact error object was created and marked by the current `migrate()`
+invocation. A publicly constructed store error or an internal error replayed
+from another operation is translated to `migration_failed` after the current
+rollback, so stale or forged `commitState` evidence cannot cross operation
+boundaries. Store errors define frozen own data fields rather than consulting
+mutable prototype accessors for their reported state.
+
 The next authority slice must use that executor to lock or insert canonical
 session and claim rows, validate the complete expected identity and revision,
 and commit a durable reservation before any external provider callback starts.

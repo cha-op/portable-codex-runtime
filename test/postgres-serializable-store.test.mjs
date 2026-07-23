@@ -1781,6 +1781,117 @@ test("migrate rolls back an installed checksum mismatch", async () => {
   client.assertExhausted();
 });
 
+test("migrate does not trust externally constructed store error state", async () => {
+  const forgedError = new PostgresSerializableStoreError(
+    "client_release_failed",
+    "committed",
+  );
+  const client = new FakeClient([{}, forgedError, {}]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(store.migrate(), {
+    code: "migration_failed",
+    commitState: "not-committed",
+    omittedText: forgedError.message,
+  });
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    ["BEGIN", "SELECT pg_advisory_xact_lock($1::bigint)", "ROLLBACK"],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("migrate does not trust store errors replayed from another operation", async () => {
+  const resetFailure = new Error("prior operation reset failed");
+  const sourceClient = new FakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      transactionIdResult(),
+      COMMIT_RESULT,
+    ],
+    { resetSteps: [DISCARD_RESULT, resetFailure] },
+  );
+  const sourceStore = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([sourceClient]),
+  });
+  let replayedError;
+  await assert.rejects(
+    sourceStore.runSerializable(() => "committed"),
+    (error) => {
+      assert.ok(error instanceof PostgresSerializableStoreError);
+      assert.equal(error.code, "client_reset_failed");
+      assert.equal(error.commitState, "committed");
+      replayedError = error;
+      return true;
+    },
+  );
+  sourceClient.assertExhausted();
+
+  const client = new FakeClient([{}, replayedError, {}]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(store.migrate(), {
+    code: "migration_failed",
+    commitState: "not-committed",
+    omittedText: replayedError.message,
+  });
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    ["BEGIN", "SELECT pg_advisory_xact_lock($1::bigint)", "ROLLBACK"],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("migration errors own their state despite prototype accessors", async () => {
+  const prototype = PostgresSerializableStoreError.prototype;
+  const originalDescriptor = Object.getOwnPropertyDescriptor(
+    prototype,
+    "commitState",
+  );
+  const client = new FakeClient([
+    {},
+    {},
+    {},
+    {},
+    () => {
+      Object.defineProperty(prototype, "commitState", {
+        configurable: true,
+        get: () => "committed",
+        set: () => undefined,
+      });
+      return { rows: null };
+    },
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  try {
+    await assertStoreError(store.migrate(), {
+      code: "migration_state_invalid",
+      commitState: "not-committed",
+    });
+  } finally {
+    if (originalDescriptor === undefined) {
+      delete prototype.commitState;
+    } else {
+      Object.defineProperty(prototype, "commitState", originalDescriptor);
+    }
+  }
+  assert.equal(Object.hasOwn(prototype, "commitState"), false);
+  assert.equal(queryText(nonResetQueries(client).at(-1)), "ROLLBACK");
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
 test("migrate rejects a future-only migration ledger", async () => {
   const client = new FakeClient([
     {},
