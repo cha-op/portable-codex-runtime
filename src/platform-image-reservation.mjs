@@ -20,7 +20,6 @@ const jsonParse = JSON.parse;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
 const objectDefineProperties = Object.defineProperties;
-const objectDefineProperty = Object.defineProperty;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
@@ -30,9 +29,23 @@ const objectPrototype = Object.prototype;
 const posixIsAbsolute = posixPath.isAbsolute;
 const posixNormalize = posixPath.normalize;
 const PromiseConstructor = Promise;
+const promiseSpeciesSymbol = Symbol.species;
+const promiseResolveIntrinsic = Promise.resolve;
+const promiseThenIntrinsic = Promise.prototype.then;
+const promiseSpeciesHolder = objectFreeze(
+  objectCreate(null, {
+    [promiseSpeciesSymbol]: {
+      configurable: false,
+      enumerable: false,
+      value: PromiseConstructor,
+      writable: false,
+    },
+  }),
+);
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
+const SetConstructor = Set;
 const setAddIntrinsic = Set.prototype.add;
 const setHasIntrinsic = Set.prototype.has;
 const stringIncludesIntrinsic = String.prototype.includes;
@@ -74,7 +87,11 @@ function arrayMap(value, callback) {
 }
 
 function regexpTest(pattern, value) {
-  return callIntrinsic(regexpExecIntrinsic, pattern, [value]) !== null;
+  return regexpExec(pattern, value) !== null;
+}
+
+function regexpExec(pattern, value) {
+  return callIntrinsic(regexpExecIntrinsic, pattern, [value]);
 }
 
 function setAdd(value, entry) {
@@ -117,13 +134,90 @@ function weakSetHas(value, entry) {
   return callIntrinsic(weakSetHasIntrinsic, value, [entry]);
 }
 
+function protectPromiseReaction(callback) {
+  if (typeof callback !== "function") return callback;
+  return (value) =>
+    protectPromise(reflectApply(callback, undefined, [value]));
+}
+
+function protectedPromiseThen(onFulfilled, onRejected) {
+  return protectPromise(
+    callIntrinsic(promiseThenIntrinsic, this, [
+      protectPromiseReaction(onFulfilled),
+      protectPromiseReaction(onRejected),
+    ]),
+  );
+}
+
+function protectedPromiseCatch(onRejected) {
+  return callIntrinsic(protectedPromiseThen, this, [
+    undefined,
+    onRejected,
+  ]);
+}
+
+function resolveProtectedPromise(value) {
+  return protectPromise(
+    callIntrinsic(promiseResolveIntrinsic, PromiseConstructor, [
+      protectPromise(value),
+    ]),
+  );
+}
+
+function protectedPromiseFinally(onFinally) {
+  if (typeof onFinally !== "function") {
+    return callIntrinsic(protectedPromiseThen, this, [
+      onFinally,
+      onFinally,
+    ]);
+  }
+  const runFinally = () =>
+    resolveProtectedPromise(
+      reflectApply(onFinally, undefined, []),
+    );
+  return callIntrinsic(protectedPromiseThen, this, [
+    (value) =>
+      callIntrinsic(protectedPromiseThen, runFinally(), [
+        () => value,
+        undefined,
+      ]),
+    (reason) =>
+      callIntrinsic(protectedPromiseThen, runFinally(), [
+        () => {
+          throw reason;
+        },
+        undefined,
+      ]),
+  ]);
+}
+
 function protectPromise(value) {
   if (!isPromiseValue(value)) return value;
-  objectDefineProperty(value, "constructor", {
-    configurable: false,
-    enumerable: false,
-    value: PromiseConstructor,
-    writable: false,
+  objectDefineProperties(value, {
+    catch: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseCatch,
+      writable: false,
+    },
+    constructor: {
+      configurable: false,
+      enumerable: false,
+      value: promiseSpeciesHolder,
+      writable: false,
+    },
+    finally: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseFinally,
+      writable: false,
+    },
+    then: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseThen,
+      writable: false,
+    },
   });
   return value;
 }
@@ -390,7 +484,7 @@ function decodeEmbeddedDescriptorData(descriptor, code) {
     fail(code);
   }
   ensure(
-    decoded.byteLength === descriptor.size &&
+    typedArrayByteLength(decoded) === descriptor.size &&
       sha256Digest(decoded) === descriptor.digest,
     code,
   );
@@ -509,12 +603,15 @@ function assertNoDuplicateJsonObjectKeys(
   let arrayElements = 0;
   let nodes = 0;
   let objectMembers = 0;
+  const whitespacePattern = /\s/u;
   const skipWhitespace = () => {
-    while (/\s/u.test(serialized[index] ?? "")) index += 1;
+    while (regexpTest(whitespacePattern, serialized[index] ?? "")) {
+      index += 1;
+    }
   };
   const parseString = () => {
     JSON_STRING_AT_PATTERN.lastIndex = index;
-    const match = JSON_STRING_AT_PATTERN.exec(serialized);
+    const match = regexpExec(JSON_STRING_AT_PATTERN, serialized);
     ensure(match !== null, code);
     index = JSON_STRING_AT_PATTERN.lastIndex;
     try {
@@ -535,7 +632,7 @@ function assertNoDuplicateJsonObjectKeys(
       ensure(depth < MAX_JSON_NESTING_DEPTH, code);
       index += 1;
       skipWhitespace();
-      const keys = new Set();
+      const keys = new SetConstructor();
       let entries = 0;
       if (serialized[index] === "}") {
         index += 1;
@@ -629,7 +726,7 @@ function assertNoDuplicateJsonObjectKeys(
       return;
     }
     JSON_PRIMITIVE_AT_PATTERN.lastIndex = index;
-    const match = JSON_PRIMITIVE_AT_PATTERN.exec(serialized);
+    const match = regexpExec(JSON_PRIMITIVE_AT_PATTERN, serialized);
     ensure(match !== null, code);
     index = JSON_PRIMITIVE_AT_PATTERN.lastIndex;
   };
@@ -712,7 +809,7 @@ function normalizePlatformDescriptor(value) {
     "invalid_platform_image_request",
   );
   ensure(
-    descriptor.size === bytes.byteLength &&
+    descriptor.size === typedArrayByteLength(bytes) &&
       descriptor.digest === sha256Digest(bytes),
     "platform_image_identity_mismatch",
   );
@@ -785,7 +882,7 @@ function normalizeManifestDocument(descriptor, configBytes) {
     ),
   );
   ensure(
-    config.size === configCopy.byteLength &&
+    config.size === typedArrayByteLength(configCopy) &&
       config.digest === sha256Digest(configCopy),
     "platform_image_identity_mismatch",
   );

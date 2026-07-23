@@ -220,10 +220,15 @@ layers and rootfs DiffIDs, and config history entries. These structural budgets
 prevent a byte-valid manifest or config from expanding into unbounded parser
 work or duplicate-key tracking memory. The inspector is an external callback,
 so every Promise crossing that boundary and every authority-owned async
-operation is given a captured own `constructor` before it is awaited or
-returned. Callback mutation of `Promise.prototype.constructor` or `then`
-therefore cannot substitute a forged measurement, revalidation result, or
-public operation result.
+operation is given a frozen, null-prototype species holder as its own
+`constructor` before it is awaited or returned. Public operation Promises also
+expose own hardened `then`, `catch`, and `finally` methods that protect every
+returned chain and native Promise produced by a reaction. Callback mutation of
+`Promise.prototype` or `Promise[Symbol.species]` therefore cannot substitute a
+forged measurement, an unprotected reaction chain, a revalidation result, an
+observation callback, or a public operation result. The JSON scanner and
+copied-byte comparisons likewise use captured RegExp, Set, and typed-array
+intrinsics rather than mutable prototype dispatch.
 
 Image reservation follows one-process object capability semantics:
 

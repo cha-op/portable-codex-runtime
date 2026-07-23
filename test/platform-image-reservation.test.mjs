@@ -1229,8 +1229,16 @@ test("any concurrent reservation use poisons the capability", async (t) => {
   }
 });
 
-test("inspector Promise poisoning cannot forge image authority", async (t) => {
-  for (const scenario of ["reserve", "revalidate", "consume"]) {
+test("prototype poisoning cannot forge image authority", async (t) => {
+  for (const scenario of [
+    "reserve",
+    "revalidate",
+    "consume",
+    "promise-rejection",
+    "regexp-prototype",
+    "set-constructor",
+    "typed-array-byte-length",
+  ]) {
     await t.test(scenario, () => {
       const result = spawnSync(
         process.execPath,
