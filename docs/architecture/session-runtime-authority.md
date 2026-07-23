@@ -71,7 +71,11 @@ option; legacy or ambiguous `pool` input is rejected. It:
 4. rejects an unsettled or suppressed failed query, and internally observes
    locally rejected query promises so a fire-and-forget call cannot emit an
    unhandled process rejection while the original promise remains rejected;
-5. rechecks the transaction ID after every successful user query so
+5. rejects `PREPARE TRANSACTION`, including leading empty statements and
+   comment-separated forms, before submission so a callback cannot move the
+   transaction and its locks into PostgreSQL's prepared-transaction registry;
+   ordinary `PREPARE name [(types)] AS ...` remains available and is reset with
+   the session; then rechecks the transaction ID after every successful user query so
    callback-issued transaction control cannot be hidden by a later throw, and
    treats a query failure without a trusted PostgreSQL SQLSTATE as
    outcome-uncertain; and

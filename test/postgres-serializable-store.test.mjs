@@ -429,8 +429,10 @@ test("a fire-and-forget invalid query rejection is internally observed", async (
 test("all immediate query rejections are safe under strict unhandled mode", async (t) => {
   for (const scenario of [
     "inactive",
+    "boundary-escape",
     "invalid-signature",
     "invalid-values",
+    "prototype-index-trap",
     "terminal-error",
   ]) {
     await t.test(scenario, () => {
@@ -1411,6 +1413,94 @@ test("concurrent user queries serialize each boundary proof and cannot hide fail
   );
   assert.deepEqual(client.releaseCalls, [[]]);
   client.assertExhausted();
+});
+
+test("PREPARE TRANSACTION is rejected before PostgreSQL submission", async (t) => {
+  const statements = [
+    "PREPARE TRANSACTION 'portable-codex-runtime'",
+    " \t\r\nprepare transaction 'portable-codex-runtime'",
+    "/* leading */ PREPARE/* separator */TRANSACTION 'portable-codex-runtime'",
+    [
+      ";",
+      "/* empty statement */ ; -- another empty statement",
+      "PREPARE TRANSACTION 'portable-codex-runtime'",
+    ].join("\n"),
+    [
+      "/* outer /* nested */ comment */",
+      "-- line comment",
+      "PrEpArE",
+      "TrAnSaCtIoN 'portable-codex-runtime'",
+    ].join("\n"),
+  ];
+
+  for (const [index, statement] of statements.entries()) {
+    await t.test(String(index + 1), async () => {
+      const client = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:12.000Z"),
+        {},
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new FakePool([client]),
+      });
+
+      await assertStoreError(
+        store.runSerializable((transaction) =>
+          transaction.query(statement),
+        ),
+        {
+          code: "transaction_query_invalid",
+          commitState: "not-committed",
+        },
+      );
+      assert.deepEqual(
+        nonResetQueries(client).map(queryText),
+        [
+          "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+          "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+          "ROLLBACK",
+        ],
+      );
+      assert.deepEqual(client.releaseCalls, [[]]);
+      client.assertExhausted();
+    });
+  }
+});
+
+test("ordinary PREPARE named transaction remains inside the checked transaction", async (t) => {
+  for (const statement of [
+    "PREPARE transaction AS SELECT 1",
+    "PREPARE transaction (integer) AS SELECT $1",
+  ]) {
+    await t.test(statement, async () => {
+      const client = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:12.000Z"),
+        { command: "PREPARE" },
+        transactionIdResult(),
+        COMMIT_RESULT,
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new FakePool([client]),
+      });
+
+      await store.runSerializable((transaction) =>
+        transaction.query(statement),
+      );
+      assert.deepEqual(
+        nonResetQueries(client).map(queryText),
+        [
+          "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+          "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+          statement,
+          "SELECT pg_current_xact_id()::text AS transaction_id",
+          "COMMIT",
+        ],
+      );
+      assert.deepEqual(client.releaseCalls, [[]]);
+      client.assertExhausted();
+    });
+  }
 });
 
 test("multi-statement text is submitted only through extended protocol", async () => {

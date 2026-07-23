@@ -40,7 +40,11 @@ superseded_by:
   unobserved or suppressed failed query cannot be committed as success. Local
   validation rejections are internally observed without changing the rejected
   promise returned to the caller, so fire-and-forget misuse cannot become an
-  unhandled process rejection.
+  unhandled process rejection. `PREPARE TRANSACTION` is rejected before
+  submission, including leading empty statements and PostgreSQL
+  comment-separated spellings, so a callback cannot strand the transaction and
+  its locks outside the executor boundary; ordinary server-side prepared
+  statements remain available and are removed by the post-transaction reset.
 - Generic commit transport failures remain outcome-uncertain. A server-returned
   transaction-rollback SQLSTATE is definitely not committed and may retry
   within the configured bound.

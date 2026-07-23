@@ -30,7 +30,23 @@ test(
       max: 2,
     });
     let conflictSessionId;
+    let preparedTransactionId;
     t.after(async () => {
+      if (preparedTransactionId !== undefined) {
+        const prepared = await pool.query(
+          [
+            "SELECT 1",
+            "FROM pg_prepared_xacts",
+            "WHERE gid = $1 AND database = current_database()",
+          ].join(" "),
+          [preparedTransactionId],
+        );
+        if (prepared.rows.length > 0) {
+          await pool.query(
+            `ROLLBACK PREPARED '${preparedTransactionId}'`,
+          );
+        }
+      }
       if (conflictSessionId !== undefined) {
         await pool.query(
           "DELETE FROM session_authority.sessions WHERE session_id = $1",
@@ -167,6 +183,38 @@ test(
         return true;
       },
     );
+    await store.runSerializable((transaction) =>
+      transaction.query("PREPARE transaction AS SELECT 1"),
+    );
+    preparedTransactionId =
+      `portable-codex-runtime-integration-${randomUUID()}`;
+    await assert.rejects(
+      store.runSerializable((transaction) =>
+        transaction.query(
+          [
+            "; /* leading empty statement */ PREPARE",
+            "/* transaction-boundary */ TRANSACTION",
+            `'${preparedTransactionId}'`,
+          ].join(" "),
+        ),
+      ),
+      (error) => {
+        assert.ok(error instanceof PostgresSerializableStoreError);
+        assert.equal(error.code, "transaction_query_invalid");
+        assert.equal(error.commitState, "not-committed");
+        assert.equal("cause" in error, false);
+        return true;
+      },
+    );
+    const preparedTransaction = await pool.query(
+      [
+        "SELECT 1",
+        "FROM pg_prepared_xacts",
+        "WHERE gid = $1 AND database = current_database()",
+      ].join(" "),
+      [preparedTransactionId],
+    );
+    assert.deepEqual(preparedTransaction.rows, []);
 
     conflictSessionId = randomUUID();
     await store.runSerializable((transaction) =>

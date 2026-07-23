@@ -199,6 +199,128 @@ function copyQueryValues(values) {
   }
 }
 
+function isPostgresSqlWhitespace(character) {
+  return (
+    character === " " ||
+    character === "\t" ||
+    character === "\n" ||
+    character === "\v" ||
+    character === "\f" ||
+    character === "\r"
+  );
+}
+
+function skipPostgresSqlTrivia(text, start) {
+  let cursor = start;
+  while (cursor < text.length) {
+    if (isPostgresSqlWhitespace(text[cursor])) {
+      cursor += 1;
+      continue;
+    }
+    if (
+      text[cursor] === "-" &&
+      cursor + 1 < text.length &&
+      text[cursor + 1] === "-"
+    ) {
+      cursor += 2;
+      while (
+        cursor < text.length &&
+        text[cursor] !== "\n" &&
+        text[cursor] !== "\r"
+      ) {
+        cursor += 1;
+      }
+      continue;
+    }
+    if (
+      text[cursor] === "/" &&
+      cursor + 1 < text.length &&
+      text[cursor + 1] === "*"
+    ) {
+      let depth = 1;
+      cursor += 2;
+      while (cursor < text.length && depth > 0) {
+        if (
+          text[cursor] === "/" &&
+          cursor + 1 < text.length &&
+          text[cursor + 1] === "*"
+        ) {
+          depth += 1;
+          cursor += 2;
+        } else if (
+          text[cursor] === "*" &&
+          cursor + 1 < text.length &&
+          text[cursor + 1] === "/"
+        ) {
+          depth -= 1;
+          cursor += 2;
+        } else {
+          cursor += 1;
+        }
+      }
+      if (depth > 0) return text.length;
+      continue;
+    }
+    break;
+  }
+  return cursor;
+}
+
+function isPostgresIdentifierContinuation(character) {
+  return (
+    character === "_" ||
+    character === "$" ||
+    (character >= "0" && character <= "9") ||
+    (character >= "A" && character <= "Z") ||
+    (character >= "a" && character <= "z") ||
+    character >= "\u0080"
+  );
+}
+
+function hasPostgresKeyword(text, start, uppercase, lowercase) {
+  const end = start + uppercase.length;
+  if (start < 0 || end > text.length) return false;
+  for (let index = 0; index < uppercase.length; index += 1) {
+    const character = text[start + index];
+    if (character !== uppercase[index] && character !== lowercase[index]) {
+      return false;
+    }
+  }
+  return (
+    end === text.length ||
+    !isPostgresIdentifierContinuation(text[end])
+  );
+}
+
+function isPrepareTransactionStatement(text) {
+  let prepareStart = skipPostgresSqlTrivia(text, 0);
+  while (prepareStart < text.length && text[prepareStart] === ";") {
+    prepareStart = skipPostgresSqlTrivia(text, prepareStart + 1);
+  }
+  if (!hasPostgresKeyword(text, prepareStart, "PREPARE", "prepare")) {
+    return false;
+  }
+  const afterPrepare = prepareStart + "PREPARE".length;
+  const transactionStart = skipPostgresSqlTrivia(text, afterPrepare);
+  if (
+    transactionStart === afterPrepare ||
+    !hasPostgresKeyword(
+      text,
+      transactionStart,
+      "TRANSACTION",
+      "transaction",
+    )
+  ) {
+    return false;
+  }
+  const afterTransaction = transactionStart + "TRANSACTION".length;
+  const argumentStart = skipPostgresSqlTrivia(text, afterTransaction);
+  return !(
+    hasPostgresKeyword(text, argumentStart, "AS", "as") ||
+    (argumentStart < text.length && text[argumentStart] === "(")
+  );
+}
+
 function validateClient(client) {
   try {
     return (
@@ -486,7 +608,8 @@ function createTransactionCapability(client, now, transactionId) {
     if (
       (args.length !== 1 && args.length !== 2) ||
       typeof args[0] !== "string" ||
-      args[0].length === 0
+      args[0].length === 0 ||
+      isPrepareTransactionStatement(args[0])
     ) {
       queryCount += 1;
       return observedRejectedPromise(markLocalQueryError());
