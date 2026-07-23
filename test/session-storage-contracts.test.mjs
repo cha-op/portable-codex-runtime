@@ -41,6 +41,7 @@ import {
 } from "../src/session-storage-contracts.mjs";
 
 const RUNTIME_SESSION_ID = "019f2100-0000-7000-8000-000000000001";
+const OTHER_RUNTIME_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 const CODEX_THREAD_ID = "019f2100-0000-7000-8000-000000000002";
 const CODEX_SESSION_ID = CODEX_THREAD_ID;
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -726,6 +727,60 @@ test("rootless worker template is structural and fixed-layout", () => {
     }),
     assertCode("stale_fence"),
   );
+});
+
+test("attachment matching rejects cross-session authority despite Array every poisoning", () => {
+  const otherManifest = createSessionManifest({
+    ...manifestInput(),
+    sessionId: OTHER_RUNTIME_SESSION_ID,
+  });
+  const everyDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "every",
+  );
+  let poisonedCalls = 0;
+  let poisonedEveryResult;
+  let matchError;
+  let templateError;
+  let template;
+  try {
+    Object.defineProperty(Array.prototype, "every", {
+      ...everyDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    poisonedEveryResult = [].every(() => false);
+    try {
+      assertSessionAttachmentMatches({
+        attachment: attachment(),
+        lease: lease(),
+        manifest: otherManifest,
+        storageRef: storageRef(),
+      });
+    } catch (error) {
+      matchError = error;
+    }
+    try {
+      template = createRootlessWorkerTemplate({
+        attachment: attachment(),
+        lease: lease(),
+        manifest: otherManifest,
+        storageRef: storageRef(),
+      });
+    } catch (error) {
+      templateError = error;
+    }
+  } finally {
+    Object.defineProperty(Array.prototype, "every", everyDescriptor);
+  }
+
+  assert(poisonedCalls > 0);
+  assert.equal(poisonedEveryResult, true);
+  assert.ok(assertCode("stale_fence")(matchError));
+  assert.ok(assertCode("stale_fence")(templateError));
+  assert.equal(template, undefined);
 });
 
 test("storage backend contract requires directory, exclusivity, fencing, and all operations", () => {

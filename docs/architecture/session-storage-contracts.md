@@ -153,6 +153,10 @@ attachment root, and keep the directory authority pinned through the actual
 bind. A self-declared `kind: "directory"` or an opaque `proofId` is not enough.
 If the launcher cannot hold that authority through the bind, it must fail
 closed rather than consume this template as an authorization decision.
+The four session IDs are compared directly after structural validation rather
+than through a mutable array iterator, so post-import
+`Array.prototype.every` poisoning cannot cross-bind another session's
+host-local `rootPath`.
 
 `CODEX_SQLITE_HOME` is only a fallback: a user-writable
 `/session/codex-home/config.toml` can override it. The trusted launcher must

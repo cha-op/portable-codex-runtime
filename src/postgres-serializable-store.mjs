@@ -206,6 +206,12 @@ function protectPromise(value) {
 }
 
 const RETRYABLE_TRANSACTION_CODES = new SetConstructor(["40001", "40P01"]);
+const DURABLE_COMMIT_QUERY_VALUES = objectFreeze([]);
+const DURABLE_COMMIT_QUERY = objectFreeze({
+  queryMode: "extended",
+  text: "SET LOCAL synchronous_commit = on",
+  values: DURABLE_COMMIT_QUERY_VALUES,
+});
 const QUERY_PARAMETER_TYPES = new SetConstructor([
   "bigint",
   "boolean",
@@ -899,6 +905,26 @@ function canonicalTransactionId(result) {
   return value;
 }
 
+async function enforceDurableCommit(client, transactionId) {
+  const durabilityResult = await protectPromise(
+    clientQuery(client, DURABLE_COMMIT_QUERY),
+  );
+  if (resultCommand(durabilityResult) !== "SET") {
+    throw new ErrorConstructor(
+      "invalid synchronous_commit acknowledgement",
+    );
+  }
+  const boundaryResult = await protectPromise(
+    clientQuery(
+      client,
+      "SELECT pg_current_xact_id()::text AS transaction_id",
+    ),
+  );
+  if (canonicalTransactionId(boundaryResult) !== transactionId) {
+    throw new ErrorConstructor("transaction identifier changed");
+  }
+}
+
 function createTransactionCapability(
   client,
   now,
@@ -908,8 +934,8 @@ function createTransactionCapability(
   let active = true;
   let boundaryLost = false;
   let firstQueryFailure;
-  let queryCount = 0;
   let queryQueue = protectPromise((async () => undefined)());
+  let retryableBoundaryRollback;
   let terminalQueryError;
   const pending = new SetConstructor();
   const queryErrorSqlStates = new WeakMapConstructor();
@@ -937,6 +963,17 @@ function createTransactionCapability(
     }
     return error;
   };
+  const markBoundaryRecheckError = (error) => {
+    if (hasRetryableTransactionSqlState(error)) {
+      retryableBoundaryRollback ??= error;
+      return transactionError("transaction_rolled_back");
+    }
+    boundaryLost = true;
+    return transactionError(
+      "transaction_boundary_lost",
+      "uncertain",
+    );
+  };
 
   const query = (...args) => {
     if (!active) {
@@ -950,7 +987,6 @@ function createTransactionCapability(
       args[0].length === 0 ||
       isPrepareTransactionStatement(args[0])
     ) {
-      queryCount += 1;
       return observedRejectedPromise(markLocalQueryError());
     }
     if (terminalQueryError !== undefined) {
@@ -962,11 +998,9 @@ function createTransactionCapability(
       values =
         args.length === 2 ? copyQueryValues(args[1]) : objectFreeze([]);
     } catch {
-      queryCount += 1;
       return observedRejectedPromise(markLocalQueryError());
     }
 
-    queryCount += 1;
     const queryConfig = objectFreeze({
       queryMode: "extended",
       text: args[0],
@@ -982,6 +1016,9 @@ function createTransactionCapability(
             "transaction_boundary_lost",
             "uncertain",
           );
+        }
+        if (retryableBoundaryRollback !== undefined) {
+          throw transactionError("transaction_rolled_back");
         }
 
         let result;
@@ -1005,12 +1042,8 @@ function createTransactionCapability(
           if (canonicalTransactionId(boundaryResult) !== transactionId) {
             throw new ErrorConstructor("transaction identifier changed");
           }
-        } catch {
-          boundaryLost = true;
-          throw transactionError(
-            "transaction_boundary_lost",
-            "uncertain",
-          );
+        } catch (error) {
+          throw markBoundaryRecheckError(error);
         }
         return result;
       })(),
@@ -1066,8 +1099,8 @@ function createTransactionCapability(
       return objectFreeze({
         boundaryLost,
         firstQueryFailure,
-        queryCount,
         queryPending,
+        retryableBoundaryRollback,
       });
     },
     isQueryError: (error) =>
@@ -1374,6 +1407,20 @@ export class PostgresSerializableStore {
       const closedCapability = await protectPromise(
         capability.close(),
       );
+      if (closedCapability.retryableBoundaryRollback !== undefined) {
+        await protectPromise(
+          releaseAfterServerRollback(
+            client,
+            release,
+            closedCapability.retryableBoundaryRollback,
+          ),
+        );
+        if (attempt < this.#maxTransactionAttempts) continue;
+        throw storeError(
+          "serialization_retry_exhausted",
+          "not-committed",
+        );
+      }
       if (closedCapability.boundaryLost) {
         await protectPromise(
           failBoundaryUncertain(client, release),
@@ -1418,33 +1465,24 @@ export class PostgresSerializableStore {
         throw callbackError;
       }
 
-      if (closedCapability.queryCount === 0) {
-        let boundaryResult;
-        try {
-          boundaryResult = await protectPromise(
-            clientQuery(
-              client,
-              "SELECT pg_current_xact_id()::text AS transaction_id",
-            ),
-          );
-        } catch {
+      try {
+        await protectPromise(
+          enforceDurableCommit(client, transactionId),
+        );
+      } catch (error) {
+        if (hasRetryableTransactionSqlState(error)) {
           await protectPromise(
-            failBoundaryUncertain(client, release),
+            releaseAfterServerRollback(client, release, error),
+          );
+          if (attempt < this.#maxTransactionAttempts) continue;
+          throw storeError(
+            "serialization_retry_exhausted",
+            "not-committed",
           );
         }
-        let currentTransactionId;
-        try {
-          currentTransactionId = canonicalTransactionId(boundaryResult);
-        } catch {
-          await protectPromise(
-            failBoundaryUncertain(client, release),
-          );
-        }
-        if (currentTransactionId !== transactionId) {
-          await protectPromise(
-            failBoundaryUncertain(client, release),
-          );
-        }
+        await protectPromise(
+          failBoundaryUncertain(client, release),
+        );
       }
 
       let commitResult;

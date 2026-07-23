@@ -893,9 +893,9 @@ export function assertSessionAttachmentMatches(options) {
   const writerLease = assertLeaseGrant(lease);
   const mounted = assertSessionAttachment(attachment);
   ensure(
-    [storage.sessionId, writerLease.sessionId, mounted.sessionId].every(
-      (sessionId) => sessionId === sessionManifest.sessionId,
-    ) &&
+    storage.sessionId === sessionManifest.sessionId &&
+      writerLease.sessionId === sessionManifest.sessionId &&
+      mounted.sessionId === sessionManifest.sessionId &&
       mounted.backendId === storage.backendId &&
       mounted.storageId === storage.storageId &&
       mounted.leaseId === writerLease.leaseId &&

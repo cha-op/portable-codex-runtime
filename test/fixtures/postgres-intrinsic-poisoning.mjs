@@ -106,6 +106,9 @@ class FixtureClient {
     if (text === "SELECT pg_current_xact_id()::text AS transaction_id") {
       return { rows: [{ transaction_id: "1" }] };
     }
+    if (text === "SET LOCAL synchronous_commit = on") {
+      return { command: "SET" };
+    }
     if (text === "SELECT fail") {
       this.connection.emit("errorMessage", uncertainQueryError);
       throw uncertainQueryError;
@@ -406,6 +409,7 @@ if (scenario !== undefined) {
       "DISCARD ALL",
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
       "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SET LOCAL synchronous_commit = on",
       "SELECT pg_current_xact_id()::text AS transaction_id",
       "COMMIT",
       "DISCARD ALL",
@@ -454,6 +458,7 @@ if (scenario !== undefined) {
       "DISCARD ALL",
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
       "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SET LOCAL synchronous_commit = on",
       "SELECT pg_current_xact_id()::text AS transaction_id",
       "COMMIT",
       "ROLLBACK",

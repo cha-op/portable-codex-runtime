@@ -34,12 +34,22 @@ superseded_by:
   replay. The dedicated pool is reset with verified `DISCARD ALL` before and
   after each proved transaction boundary. A user-query failure without a
   trusted PostgreSQL SQLSTATE destroys the client and remains
-  outcome-uncertain. SQLSTATE provenance, pending-query tracking, and
-  post-callback boundary checks use module-captured intrinsics, own driver
-  result fields, and a captured `DatabaseError` prototype check. Built-in
-  prototype poisoning by a callback limited to the transaction capability
-  cannot convert a local or unknown outcome into a retry. Each driver query
-  also pins the connection's protocol-event dispatch to captured
+  outcome-uncertain. A trusted server `40001` or `40P01` observed during a
+  user-query boundary recheck or the final durability/boundary recheck proves
+  rollback and may retry the complete callback within the configured bound;
+  local, reused, and merely SQLSTATE-shaped exceptions remain uncertain and
+  cannot request replay. Immediately before `COMMIT`, the executor uses a
+  frozen extended-protocol query to restore
+  `SET LOCAL synchronous_commit = on`, verifies its `SET` acknowledgement, and
+  rechecks the original transaction ID. This prevents callback-local
+  durability weakening while retaining PostgreSQL's normal WAL and filesystem
+  durability as a deployment prerequisite. SQLSTATE provenance,
+  pending-query tracking, and post-callback boundary checks use
+  module-captured intrinsics, own driver result fields, and a captured
+  `DatabaseError` prototype check. Built-in prototype poisoning by a callback
+  limited to the transaction capability cannot convert a local or unknown
+  outcome into a retry. Each driver query also pins the connection's
+  protocol-event dispatch to captured
   `EventEmitter` emit/listener intrinsics and restores the prior own descriptor
   afterward, so post-import prototype mutation cannot reinterpret a completed
   `COMMIT` as a retryable rollback. The dedicated pool, client, connection
@@ -108,9 +118,15 @@ superseded_by:
   before invoking that validator and ignores its deliberately dynamic
   defensive-clone result, preventing an inspector from using clone reentrancy
   to substitute a different image identity.
+- The rootless worker template compares the manifest, storage reference, lease,
+  and attachment session IDs directly after validation. Post-import
+  `Array.prototype.every` poisoning therefore cannot make a different
+  session's attachment or host-local `rootPath` pass the structural binding.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
-  serializable conflict, verifies bounded whole-callback retry, and exercises
-  the active partial-unique indexes.
+  serializable conflict, verifies bounded whole-callback retry, proves that a
+  callback-local `synchronous_commit=off` is restored to `on` before the
+  transaction-boundary recheck and `COMMIT`, and exercises the active
+  partial-unique indexes.
 - The foundation does not yet implement session lifecycle transitions,
   authorize a lease or launch, verify registry publisher trust, pin a runtime
   mount, or provide a physical stale-writer fence.

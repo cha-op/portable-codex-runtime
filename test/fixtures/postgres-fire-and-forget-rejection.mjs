@@ -43,6 +43,9 @@ class FixtureClient {
     if (text === "SELECT pg_current_xact_id()::text AS transaction_id") {
       return { rows: [{ transaction_id: "1" }] };
     }
+    if (text === "SET LOCAL synchronous_commit = on") {
+      return { command: "SET" };
+    }
     if (text === "ROLLBACK") return { command: "ROLLBACK" };
     if (text === "COMMIT") return { command: "COMMIT" };
     if (

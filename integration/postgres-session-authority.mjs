@@ -118,6 +118,63 @@ test(
       workMem: baselineWorkMem,
     });
 
+    const durabilityPool = new Pool({
+      application_name:
+        "portable-codex-runtime-durable-commit-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
+    });
+    t.after(() => durabilityPool.end());
+    const durabilityQueries = [];
+    const durabilityStore = new PostgresSerializableStore({
+      dedicatedPool: {
+        async connect() {
+          const client = await durabilityPool.connect();
+          const query = client.query;
+          client.query = function (...args) {
+            durabilityQueries.push(args);
+            return Reflect.apply(query, this, args);
+          };
+          return client;
+        },
+      },
+    });
+    const callbackSynchronousCommit =
+      await durabilityStore.runSerializable(async (transaction) => {
+        await transaction.query(
+          "SET LOCAL synchronous_commit = off",
+        );
+        const result = await transaction.query(
+          "SHOW synchronous_commit",
+        );
+        return result.rows[0].synchronous_commit;
+      });
+    assert.equal(callbackSynchronousCommit, "off");
+    assert.deepEqual(
+      durabilityQueries.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+      [
+        "DISCARD ALL",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+        "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+        "SET LOCAL synchronous_commit = off",
+        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "SHOW synchronous_commit",
+        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "SET LOCAL synchronous_commit = on",
+        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "COMMIT",
+        "DISCARD ALL",
+      ],
+    );
+    for (const queryIndex of [3, 5, 7]) {
+      assert.equal(
+        durabilityQueries[queryIndex][0].queryMode,
+        "extended",
+      );
+    }
+
     const schema = await store.runSerializable(async (transaction) => {
       const result = await transaction.query(
         [

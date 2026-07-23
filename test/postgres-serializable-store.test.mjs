@@ -17,6 +17,8 @@ import {
 const COMMIT_RESULT = Object.freeze({ command: "COMMIT" });
 const DISCARD_RESULT = Object.freeze({ command: "DISCARD" });
 const ROLLBACK_RESULT = Object.freeze({ command: "ROLLBACK" });
+const SET_RESULT = Object.freeze({ command: "SET" });
+const DURABLE_COMMIT_QUERY = "SET LOCAL synchronous_commit = on";
 const FIRE_AND_FORGET_FIXTURE = fileURLToPath(
   new URL(
     "./fixtures/postgres-fire-and-forget-rejection.mjs",
@@ -31,8 +33,23 @@ const INTRINSIC_POISONING_FIXTURE = fileURLToPath(
 );
 
 class FakeClient {
-  constructor(steps, { releaseError, resetSteps = [] } = {}) {
+  constructor(
+    steps,
+    {
+      durabilityBoundarySteps,
+      durabilitySteps,
+      releaseError,
+      resetSteps = [],
+    } = {},
+  ) {
     this.connection = new EventEmitter();
+    this.durabilityBoundaryPending = false;
+    this.durabilityBoundarySteps =
+      durabilityBoundarySteps === undefined
+        ? undefined
+        : [...durabilityBoundarySteps];
+    this.durabilitySteps =
+      durabilitySteps === undefined ? undefined : [...durabilitySteps];
     this.queries = [];
     this.releaseCalls = [];
     this.releaseError = releaseError;
@@ -48,6 +65,69 @@ class FakeClient {
       const resetStep = this.resetSteps.shift();
       if (resetStep instanceof Error) throw resetStep;
       return resetStep;
+    }
+    if (text === DURABLE_COMMIT_QUERY) {
+      assert.deepEqual(args, [
+        {
+          queryMode: "extended",
+          text: DURABLE_COMMIT_QUERY,
+          values: [],
+        },
+      ]);
+      if (this.durabilitySteps === undefined) {
+        this.durabilityBoundaryPending = true;
+        return SET_RESULT;
+      }
+      assert.notEqual(
+        this.durabilitySteps.length,
+        0,
+        `unexpected durability query: ${text}`,
+      );
+      const durabilityStep = this.durabilitySteps.shift();
+      if (typeof durabilityStep === "function") {
+        return durabilityStep(args);
+      }
+      if (durabilityStep instanceof Error) {
+        if (durabilityStep instanceof DatabaseError) {
+          this.connection.emit("errorMessage", durabilityStep);
+        }
+        throw durabilityStep;
+      }
+      this.durabilityBoundaryPending =
+        durabilityStep?.command === "SET";
+      return durabilityStep;
+    }
+    if (
+      text === "SELECT pg_current_xact_id()::text AS transaction_id" &&
+      this.durabilityBoundaryPending
+    ) {
+      this.durabilityBoundaryPending = false;
+      if (this.durabilityBoundarySteps !== undefined) {
+        assert.notEqual(
+          this.durabilityBoundarySteps.length,
+          0,
+          `unexpected durability boundary query: ${text}`,
+        );
+        const boundaryStep = this.durabilityBoundarySteps.shift();
+        if (typeof boundaryStep === "function") {
+          return boundaryStep(args);
+        }
+        if (boundaryStep instanceof Error) {
+          if (boundaryStep instanceof DatabaseError) {
+            this.connection.emit("errorMessage", boundaryStep);
+          }
+          throw boundaryStep;
+        }
+        return boundaryStep;
+      }
+      const candidate = this.steps[0];
+      const candidateRows = candidate?.rows;
+      if (
+        !Array.isArray(candidateRows) ||
+        candidateRows[0]?.transaction_id === undefined
+      ) {
+        return transactionIdResult();
+      }
     }
     assert.notEqual(this.steps.length, 0, `unexpected query: ${text}`);
     const step = this.steps.shift();
@@ -76,6 +156,9 @@ class FakeClient {
 
   assertExhausted() {
     assert.deepEqual(this.steps, []);
+    assert.equal(this.durabilityBoundaryPending, false);
+    assert.deepEqual(this.durabilityBoundarySteps ?? [], []);
+    assert.deepEqual(this.durabilitySteps ?? [], []);
     assert.deepEqual(this.resetSteps, []);
     assert.equal(this.connection.listenerCount("errorMessage"), 0);
   }
@@ -176,6 +259,14 @@ test("runSerializable binds query and database time to one released client", asy
       },
     ],
     ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    [
+      {
+        queryMode: "extended",
+        text: DURABLE_COMMIT_QUERY,
+        values: [],
+      },
+    ],
+    ["SELECT pg_current_xact_id()::text AS transaction_id"],
     ["COMMIT"],
     ["DISCARD ALL"],
   ]);
@@ -188,6 +279,88 @@ test("runSerializable binds query and database time to one released client", asy
       commitState: "not-committed",
     },
   );
+});
+
+test("runSerializable restores durable synchronous commit before COMMIT", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    SET_RESULT,
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  assert.equal(
+    await store.runSerializable(async (transaction) => {
+      const result = await transaction.query(
+        "SET LOCAL synchronous_commit = off",
+      );
+      assert.equal(result.command, "SET");
+      return "durably-committed";
+    }),
+    "durably-committed",
+  );
+
+  assert.deepEqual(client.queries, [
+    ["DISCARD ALL"],
+    ["BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE"],
+    [
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    ],
+    [
+      {
+        queryMode: "extended",
+        text: "SET LOCAL synchronous_commit = off",
+        values: [],
+      },
+    ],
+    ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    [
+      {
+        queryMode: "extended",
+        text: DURABLE_COMMIT_QUERY,
+        values: [],
+      },
+    ],
+    ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    ["COMMIT"],
+    ["DISCARD ALL"],
+  ]);
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a malformed durable-setting acknowledgement cannot reach COMMIT", async () => {
+  const client = new FakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      {},
+    ],
+    { durabilitySteps: [{ command: "SELECT" }] },
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(store.runSerializable(() => "must-not-return"), {
+    code: "transaction_boundary_lost",
+    commitState: "uncertain",
+  });
+  assert.deepEqual(nonResetQueries(client).map(queryText), [
+    "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    DURABLE_COMMIT_QUERY,
+    "ROLLBACK",
+  ]);
+  assert.equal(
+    client.releaseCalls[0][0]?.message,
+    "transaction boundary lost",
+  );
+  client.assertExhausted();
 });
 
 test("runSerializable retries only callback SQLSTATE failures on new clients", async () => {
@@ -247,6 +420,8 @@ test("runSerializable retries only callback SQLSTATE failures on new clients", a
             "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
             "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
             "SELECT 'committed' AS value",
+            "SELECT pg_current_xact_id()::text AS transaction_id",
+            DURABLE_COMMIT_QUERY,
             "SELECT pg_current_xact_id()::text AS transaction_id",
             "COMMIT",
           ],
@@ -955,6 +1130,162 @@ test("a client-local SQLSTATE-shaped query error is never retried", async () => 
   client.assertExhausted();
 });
 
+test("trusted retryable failures during a user-query boundary recheck retry the callback", async (t) => {
+  for (const sqlState of ["40001", "40P01"]) {
+    await t.test(sqlState, async () => {
+      const boundaryFailure = pgError(
+        sqlState,
+        `boundary recheck failed with ${sqlState}`,
+      );
+      const first = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:12.000Z"),
+        { rows: [{ value: 1 }] },
+        boundaryFailure,
+      ]);
+      const second = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:13.000Z"),
+        { rows: [{ value: 2 }] },
+        transactionIdResult(),
+        COMMIT_RESULT,
+      ]);
+      const pool = new FakePool([first, second]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: pool,
+        maxTransactionAttempts: 2,
+      });
+      let callbacks = 0;
+
+      assert.equal(
+        await store.runSerializable(async (transaction) => {
+          callbacks += 1;
+          const result = await transaction.query(
+            "SELECT $1::integer AS value",
+            [callbacks],
+          );
+          return result.rows[0].value;
+        }),
+        2,
+      );
+      assert.equal(callbacks, 2);
+      assert.equal(pool.connectCalls, 2);
+      assert.deepEqual(
+        nonResetQueries(first).map(queryText),
+        [
+          "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+          "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+          "SELECT $1::integer AS value",
+          "SELECT pg_current_xact_id()::text AS transaction_id",
+        ],
+      );
+      assert.deepEqual(first.releaseCalls, [[boundaryFailure]]);
+      assert.deepEqual(second.releaseCalls, [[]]);
+      first.assertExhausted();
+      second.assertExhausted();
+    });
+  }
+});
+
+test("a local SQLSTATE-shaped user-query boundary failure is uncertain and never retried", async () => {
+  const localFailure = pgError(
+    "40001",
+    "local boundary parser impersonated a server rollback",
+  );
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    { rows: [{ value: 1 }] },
+    () => {
+      throw localFailure;
+    },
+    {},
+  ]);
+  const pool = new FakePool([client]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: pool,
+    maxTransactionAttempts: 3,
+  });
+  let callbacks = 0;
+
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      callbacks += 1;
+      await transaction.query("SELECT 1 AS value");
+    }),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: localFailure.message,
+    },
+  );
+  assert.equal(callbacks, 1);
+  assert.equal(pool.connectCalls, 1);
+  assert.deepEqual(nonResetQueries(client).map(queryText), [
+    "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT 1 AS value",
+    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "ROLLBACK",
+  ]);
+  assert.equal(
+    client.releaseCalls[0][0]?.message,
+    "transaction boundary lost",
+  );
+  client.assertExhausted();
+});
+
+test("a protocol marker cannot be replayed into a later boundary recheck", async () => {
+  const reusedFailure = pgError(
+    "40001",
+    "reused serialization failure",
+  );
+  const beginClient = new FakeClient([reusedFailure]);
+  const boundaryClient = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:13.000Z"),
+    { rows: [{ value: 1 }] },
+    () => {
+      throw reusedFailure;
+    },
+    {},
+  ]);
+  const pool = new FakePool([beginClient, boundaryClient]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: pool,
+    maxTransactionAttempts: 3,
+  });
+
+  await assertStoreError(
+    store.runSerializable(() => assert.fail("callback must not run")),
+    {
+      code: "transaction_begin_failed",
+      commitState: "not-committed",
+    },
+  );
+  let callbacks = 0;
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      callbacks += 1;
+      await transaction.query("SELECT 1 AS value");
+    }),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: reusedFailure.message,
+    },
+  );
+  assert.equal(callbacks, 1);
+  assert.equal(pool.connectCalls, 2);
+  assert.deepEqual(beginClient.releaseCalls, [[reusedFailure]]);
+  assert.equal(
+    boundaryClient.releaseCalls[0][0]?.message,
+    "transaction boundary lost",
+  );
+  beginClient.assertExhausted();
+  boundaryClient.assertExhausted();
+});
+
 test("a query error marker cannot be replayed into a later attempt", async () => {
   const firstFailure = pgError("40001");
   const first = new FakeClient([
@@ -996,6 +1327,109 @@ test("a query error marker cannot be replayed into a later attempt", async () =>
   second.assertExhausted();
 });
 
+test("trusted retryable failures during the final boundary recheck retry the callback", async (t) => {
+  for (const sqlState of ["40001", "40P01"]) {
+    await t.test(sqlState, async () => {
+      const boundaryFailure = pgError(
+        sqlState,
+        `final boundary recheck failed with ${sqlState}`,
+      );
+      const first = new FakeClient(
+        [
+          {},
+          timestampResult("2026-07-23T10:11:12.000Z"),
+        ],
+        { durabilityBoundarySteps: [boundaryFailure] },
+      );
+      const second = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:13.000Z"),
+        transactionIdResult(),
+        COMMIT_RESULT,
+      ]);
+      const pool = new FakePool([first, second]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: pool,
+        maxTransactionAttempts: 2,
+      });
+      let callbacks = 0;
+
+      assert.equal(
+        await store.runSerializable(() => {
+          callbacks += 1;
+          return callbacks;
+        }),
+        2,
+      );
+      assert.equal(callbacks, 2);
+      assert.equal(pool.connectCalls, 2);
+      assert.deepEqual(nonResetQueries(first).map(queryText), [
+        "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+        "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+        DURABLE_COMMIT_QUERY,
+        "SELECT pg_current_xact_id()::text AS transaction_id",
+      ]);
+      assert.deepEqual(first.releaseCalls, [[boundaryFailure]]);
+      assert.deepEqual(second.releaseCalls, [[]]);
+      first.assertExhausted();
+      second.assertExhausted();
+    });
+  }
+});
+
+test("a local SQLSTATE-shaped final boundary failure is uncertain and never retried", async () => {
+  const localFailure = pgError(
+    "40P01",
+    "local final-boundary parser impersonated a deadlock",
+  );
+  const client = new FakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      {},
+    ],
+    {
+      durabilityBoundarySteps: [
+        () => {
+          throw localFailure;
+        },
+      ],
+    },
+  );
+  const pool = new FakePool([client]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: pool,
+    maxTransactionAttempts: 3,
+  });
+  let callbacks = 0;
+
+  await assertStoreError(
+    store.runSerializable(() => {
+      callbacks += 1;
+      return "must-not-return";
+    }),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: localFailure.message,
+    },
+  );
+  assert.equal(callbacks, 1);
+  assert.equal(pool.connectCalls, 1);
+  assert.deepEqual(nonResetQueries(client).map(queryText), [
+    "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    DURABLE_COMMIT_QUERY,
+    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "ROLLBACK",
+  ]);
+  assert.equal(
+    client.releaseCalls[0][0]?.message,
+    "transaction boundary lost",
+  );
+  client.assertExhausted();
+});
+
 test("runSerializable retries a server-proved serialization rollback at COMMIT", async () => {
   const commitFailure = pgError("40001", "serialization failure at commit");
   const first = new FakeClient([
@@ -1031,6 +1465,7 @@ test("runSerializable retries a server-proved serialization rollback at COMMIT",
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
       "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      DURABLE_COMMIT_QUERY,
       "SELECT pg_current_xact_id()::text AS transaction_id",
       "COMMIT",
     ],
@@ -1111,6 +1546,7 @@ test("runSerializable never retries an uncertain failed COMMIT", async () => {
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
       "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      DURABLE_COMMIT_QUERY,
       "SELECT pg_current_xact_id()::text AS transaction_id",
       "COMMIT",
       "ROLLBACK",
@@ -1435,6 +1871,7 @@ test("malformed COMMIT acknowledgement is uncertain", async () => {
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
       "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      DURABLE_COMMIT_QUERY,
       "SELECT pg_current_xact_id()::text AS transaction_id",
       "COMMIT",
       "ROLLBACK",
@@ -1770,6 +2207,8 @@ test("ordinary PREPARE named transaction remains inside the checked transaction"
           "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
           "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
           statement,
+          "SELECT pg_current_xact_id()::text AS transaction_id",
+          DURABLE_COMMIT_QUERY,
           "SELECT pg_current_xact_id()::text AS transaction_id",
           "COMMIT",
         ],

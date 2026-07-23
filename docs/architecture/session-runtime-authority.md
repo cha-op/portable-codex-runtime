@@ -75,11 +75,15 @@ option; legacy or ambiguous `pool` input is rejected. It:
    comment-separated forms, before submission so a callback cannot move the
    transaction and its locks into PostgreSQL's prepared-transaction registry;
    ordinary `PREPARE name [(types)] AS ...` remains available and is reset with
-   the session; then rechecks the transaction ID after every successful user query so
-   callback-issued transaction control cannot be hidden by a later throw, and
-   treats a query failure without a trusted PostgreSQL SQLSTATE as
-   outcome-uncertain; and
-6. accepts only an exact node-postgres `COMMIT` acknowledgement, then verifies
+   the session; then rechecks the transaction ID after every successful user
+   query so callback-issued transaction control cannot be hidden by a later
+   throw, and treats a query failure without a trusted PostgreSQL SQLSTATE as
+   outcome-uncertain;
+6. immediately before `COMMIT`, executes a frozen extended-protocol
+   `SET LOCAL synchronous_commit = on`, requires an exact `SET`
+   acknowledgement, and rechecks the original transaction ID so a callback
+   cannot lower this transaction's acknowledgement durability; and
+7. accepts only an exact node-postgres `COMMIT` acknowledgement, then verifies
    another `DISCARD ALL` before returning the client to its dedicated pool.
 
 Serialization failures and deadlocks may be retried only when the same
@@ -107,9 +111,16 @@ pins the connection's own `emit` method to the module-captured native
 restores the exact prior own descriptor. A callback that mutates
 `EventEmitter.prototype` after its final user query therefore cannot redirect
 a completed `COMMIT` event into forged retryable SQLSTATE evidence. That rule
-also covers a server `40001` detected during `COMMIT`. A transport failure or
-any other `COMMIT` error is outcome-uncertain and is never automatically
-replayed as a fresh operation.
+also covers a server `40001` detected during a user-query boundary recheck,
+the final durability/boundary recheck, or `COMMIT`. A trusted `40001` or
+`40P01` from either recheck proves that PostgreSQL aborted the transaction, so
+the executor destroys the client and may retry the complete callback within
+the configured bound. A local, reused, or merely SQLSTATE-shaped exception
+does not carry that proof and remains outcome-uncertain. A transport failure
+or any other `COMMIT` error is outcome-uncertain and is never automatically
+replayed as a fresh operation. Forcing `synchronous_commit=on` protects the
+transaction from callback-local weakening; it does not compensate for a
+PostgreSQL deployment that disables normal WAL or filesystem durability.
 Reset failure destroys the connection and preserves the already proved
 committed or not-committed outcome. User-query failures without a SQLSTATE,
 the connection/operator/system/internal error classes, and the explicit
