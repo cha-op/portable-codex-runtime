@@ -89,18 +89,18 @@ exact transaction-rollback SQLSTATE. The client is destroyed or reset after a
 proved rollback. Merely constructing `DatabaseError` or matching its `code` is
 insufficient: custom parameter conversion and result-parser failures never
 receive protocol provenance. The executor captures the WeakMap, Set, Array,
-RegExp, object, Promise, and prototype-test intrinsics used by that proof
-before any callback runs. Authority-bearing driver results must expose own
-data fields rather than inherited values or accessors. A callback limited to
-the transaction capability therefore cannot use built-in prototype mutation
-to manufacture SQLSTATE provenance, hide pending queries, or turn an unknown
-`COMMIT` result into a retry. This is not an unforgeable brand against code
-that can access or replace the dedicated pool, checked-out client, connection
-event source, or node-postgres implementation: those objects form the trusted
-driver boundary and must not be exposed to callbacks. That rule also covers a
-server `40001` detected during `COMMIT`. A transport failure or any other
-`COMMIT` error is outcome-uncertain and is never automatically replayed as a
-fresh operation.
+RegExp, object, Promise, cryptographic Hash, and prototype-test intrinsics used
+by that proof before any callback runs. Authority-bearing driver results must
+expose own data fields rather than inherited values or accessors. A callback
+limited to the transaction capability therefore cannot use built-in prototype
+mutation to manufacture SQLSTATE provenance, hide pending queries, replace
+migration checksum operations, or turn an unknown `COMMIT` result into a
+retry. This is not an unforgeable brand against code that can access or replace
+the dedicated pool, checked-out client, connection event source, or
+node-postgres implementation: those objects form the trusted driver boundary
+and must not be exposed to callbacks. That rule also covers a server `40001`
+detected during `COMMIT`. A transport failure or any other `COMMIT` error is
+outcome-uncertain and is never automatically replayed as a fresh operation.
 Reset failure destroys the connection and preserves the already proved
 committed or not-committed outcome. User-query failures without a SQLSTATE,
 the connection/operator/system/internal error classes, and the explicit
@@ -228,7 +228,12 @@ returned chain and native Promise produced by a reaction. Callback mutation of
 forged measurement, an unprotected reaction chain, a revalidation result, an
 observation callback, or a public operation result. The JSON scanner and
 copied-byte comparisons likewise use captured RegExp, Set, and typed-array
-intrinsics rather than mutable prototype dispatch.
+intrinsics rather than mutable prototype dispatch. Descriptor hashes use
+captured cryptographic Hash methods; own-key and platform arrays use indexed
+access instead of a mutable array iterator; and the private reservation ledger
+uses the module-captured WeakMap constructor. Post-import intrinsic poisoning
+therefore cannot replace the ledger, skip nested freezing, reinterpret a
+platform tuple, or forge a descriptor digest.
 
 Image reservation follows one-process object capability semantics:
 

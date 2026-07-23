@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { Hash, createHash } from "node:crypto";
 import { posix as posixPath } from "node:path";
 import { URL } from "node:url";
 import { TextDecoder, types as utilTypes } from "node:util";
@@ -16,6 +16,9 @@ const bufferAllocUnsafe = Buffer.allocUnsafe;
 const bufferCompare = Buffer.compare;
 const bufferFrom = Buffer.from;
 const bufferIsBuffer = Buffer.isBuffer;
+const createHashIntrinsic = createHash;
+const hashDigestIntrinsic = Hash.prototype.digest;
+const hashUpdateIntrinsic = Hash.prototype.update;
 const jsonParse = JSON.parse;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
@@ -67,8 +70,10 @@ const {
 } = utilTypes;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
 const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakMapConstructor = WeakMap;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
+const WeakSetConstructor = WeakSet;
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
@@ -276,7 +281,7 @@ const ERROR_MESSAGES = Object.freeze({
   platform_image_inspection_uncertain: "Platform image inspection is uncertain",
   platform_image_reservation_rejected: "Platform image reservation was rejected",
 });
-const INTERNAL_ERRORS = new WeakSet();
+const INTERNAL_ERRORS = new WeakSetConstructor();
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 export class PlatformImageReservationError extends Error {
@@ -371,7 +376,8 @@ function assertExactPlainObject(value, keys, code) {
   );
 
   const normalized = objectCreate(null);
-  for (const key of actual) {
+  for (let index = 0; index < actual.length; index += 1) {
+    const key = actual[index];
     let descriptor;
     try {
       descriptor = objectGetOwnPropertyDescriptor(value, key);
@@ -537,7 +543,9 @@ function normalizeContentDescriptor(
 
 function deepFreeze(value) {
   if (value !== null && typeof value === "object" && !objectIsFrozen(value)) {
-    for (const key of reflectOwnKeys(value)) {
+    const keys = reflectOwnKeys(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
       const descriptor = objectGetOwnPropertyDescriptor(value, key);
       if (descriptor && objectHasOwn(descriptor, "value")) {
         deepFreeze(descriptor.value);
@@ -591,7 +599,9 @@ function copyBoundedBytes(value, maximum, code) {
 }
 
 function sha256Digest(bytes) {
-  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [bytes]);
+  return `sha256:${callIntrinsic(hashDigestIntrinsic, hash, ["hex"])}`;
 }
 
 function assertNoDuplicateJsonObjectKeys(
@@ -760,12 +770,14 @@ function normalizeSessionRuntime(sessionManifest) {
   } catch {
     fail("invalid_platform_image_request");
   }
-  const [os, architecture, ...rest] = stringSplit(
+  const platformParts = stringSplit(
     manifest.runtime.platform,
     "/",
   );
+  const os = platformParts[0];
+  const architecture = platformParts[1];
   ensure(
-    rest.length === 0 &&
+    platformParts.length === 2 &&
       os === "linux" &&
       arrayIncludes(["amd64", "arm64"], architecture),
     "invalid_platform_image_request",
@@ -1092,7 +1104,7 @@ function consumptionProjection(record) {
  * publisher trust, pin a container-runtime object, or launch a container.
  */
 export class PlatformImageReservationCoordinator {
-  #reservations = new WeakMap();
+  #reservations = new WeakMapConstructor();
 
   reservePlatformImage(options) {
     return protectPromise(this.#reservePlatformImage(options));

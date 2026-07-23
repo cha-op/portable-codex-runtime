@@ -1120,12 +1120,13 @@ test("runSerializable never retries an uncertain failed COMMIT", async () => {
   client.assertExhausted();
 });
 
-test("callback intrinsic poisoning cannot forge transaction authority", async (t) => {
+test("post-import intrinsic poisoning cannot forge store authority", async (t) => {
   for (const scenario of [
     "weak-map-get",
     "set-has",
     "array-includes",
     "database-error-brand",
+    "hash-prototype",
     "object-command",
     "promise-prototype",
   ]) {

@@ -1231,13 +1231,17 @@ test("any concurrent reservation use poisons the capability", async (t) => {
 
 test("prototype poisoning cannot forge image authority", async (t) => {
   for (const scenario of [
+    "array-iterator-freeze",
+    "array-iterator-platform",
     "reserve",
     "revalidate",
     "consume",
+    "hash-prototype",
     "promise-rejection",
     "regexp-prototype",
     "set-constructor",
     "typed-array-byte-length",
+    "weakmap-constructor",
   ]) {
     await t.test(scenario, () => {
       const result = spawnSync(

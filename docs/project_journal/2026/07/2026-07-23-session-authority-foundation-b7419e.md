@@ -69,6 +69,8 @@ superseded_by:
 - Migration application is serialized by a PostgreSQL advisory transaction
   lock and binds version 1 to the exact LF-normalized tracked SQL SHA-256.
   Unknown, additional, or checksum-mismatched installed versions fail closed.
+  The SHA-256 operation uses module-captured Hash methods so post-import
+  prototype mutation cannot forge the installed checksum comparison.
 - A trusted image inspector must return the exact normalized Codex version,
   binary path, and SHA-256 derived from the descriptor/config identity. The
   reservation is an opaque same-process object capability and is terminal on
@@ -83,8 +85,13 @@ superseded_by:
   expose own hardened `then`, `catch`, and `finally` methods and protect
   reaction chains, so inspector mutation of Promise prototype accessors or
   `Promise[Symbol.species]` cannot forge a measurement, unprotected chain,
-  revalidation, observation callback, or consumption result. Pre-parse JSON scanning and all
-  copied-byte length checks use captured RegExp, Set, and typed-array intrinsics.
+  revalidation, observation callback, or consumption result. Pre-parse JSON
+  scanning and all copied-byte length checks use captured RegExp, Set,
+  typed-array, and cryptographic Hash intrinsics. Own-key and platform arrays
+  use indexed access, while the private reservation ledger uses a captured
+  WeakMap constructor, so post-import iterator or constructor replacement
+  cannot skip nested freezing, reinterpret platform identity, or expose the
+  ledger.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.

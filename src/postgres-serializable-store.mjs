@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { Hash, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isPromise, isProxy } from "node:util/types";
 
@@ -25,6 +25,9 @@ const dateParse = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const databaseErrorPrototype = DatabaseError.prototype;
 const ErrorConstructor = Error;
+const createHashIntrinsic = createHash;
+const hashDigestIntrinsic = Hash.prototype.digest;
+const hashUpdateIntrinsic = Hash.prototype.update;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
 const numberNaN = Number.NaN;
@@ -66,6 +69,12 @@ const WeakSetConstructor = WeakSet;
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
+}
+
+function sha256Hex(value, encoding) {
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [value, encoding]);
+  return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
 }
 
 function arrayEvery(value, callback) {
@@ -1033,7 +1042,7 @@ async function readMigration() {
   if (sql.length === 0 || !stringEndsWith(sql, "\n")) {
     throw storeError("migration_source_failed");
   }
-  const checksum = createHash("sha256").update(sql, "utf8").digest("hex");
+  const checksum = sha256Hex(sql, "utf8");
   return objectFreeze({ checksum, sql });
 }
 

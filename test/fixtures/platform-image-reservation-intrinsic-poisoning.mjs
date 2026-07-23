@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { Hash, createHash } from "node:crypto";
 
 import {
   PlatformImageReservationCoordinator,
@@ -9,20 +9,42 @@ import { createSessionManifest } from "../../src/session-storage-contracts.mjs";
 
 const scenario = process.argv[2];
 const scenarios = new Set([
+  "array-iterator-freeze",
+  "array-iterator-platform",
   "consume",
+  "hash-prototype",
   "promise-rejection",
   "regexp-prototype",
   "reserve",
   "revalidate",
   "set-constructor",
   "typed-array-byte-length",
+  "weakmap-constructor",
 ]);
 if (scenario !== undefined && !scenarios.has(scenario)) {
   throw new Error("unsupported intrinsic-poisoning scenario");
 }
 
 const PromiseConstructor = Promise;
+const WeakMapConstructor = WeakMap;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const arrayIteratorSymbol = Symbol.iterator;
+const arrayIteratorDescriptor = objectGetOwnPropertyDescriptor(
+  Array.prototype,
+  arrayIteratorSymbol,
+);
+const globalWeakMapDescriptor = objectGetOwnPropertyDescriptor(
+  globalThis,
+  "WeakMap",
+);
+const hashDigestDescriptor = objectGetOwnPropertyDescriptor(
+  Hash.prototype,
+  "digest",
+);
+const hashUpdateDescriptor = objectGetOwnPropertyDescriptor(
+  Hash.prototype,
+  "update",
+);
 const promiseSpeciesSymbol = Symbol.species;
 const promiseSpeciesDescriptor = objectGetOwnPropertyDescriptor(
   PromiseConstructor,
@@ -85,10 +107,13 @@ function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
-function fixture({ embedded = false } = {}) {
+function fixture({
+  architecture = "arm64",
+  embedded = false,
+} = {}) {
   const configBytes = Buffer.from(
     JSON.stringify({
-      architecture: "arm64",
+      architecture,
       config: {},
       os: "linux",
       rootfs: {
@@ -157,9 +182,154 @@ function measurement() {
   };
 }
 
+function tamperLayerDigest(descriptor) {
+  const document = JSON.parse(descriptor.bytes.toString("utf8"));
+  document.layers[0].digest = `sha256:${"e".repeat(64)}`;
+  const bytes = Buffer.from(JSON.stringify(document), "utf8");
+  assert.equal(bytes.byteLength, descriptor.bytes.byteLength);
+  return {
+    ...descriptor,
+    bytes,
+  };
+}
+
 let inspectionPromise;
 let poisonNext =
-  scenario === "reserve" || scenario === "promise-rejection";
+  scenario === "reserve" ||
+  scenario === "promise-rejection" ||
+  scenario === "hash-prototype";
+let leakedReservationLedger;
+let poisonedHashDigestCalls = 0;
+let poisonedHashUpdateCalls = 0;
+
+function restoreArrayIterator() {
+  Object.defineProperty(
+    Array.prototype,
+    arrayIteratorSymbol,
+    arrayIteratorDescriptor,
+  );
+}
+
+function poisonArrayIterator(mode) {
+  Object.defineProperty(Array.prototype, arrayIteratorSymbol, {
+    ...arrayIteratorDescriptor,
+    value() {
+      if (
+        mode === "platform" &&
+        this.length === 4 &&
+        this[0] === "configBytes" &&
+        this[1] === "descriptor" &&
+        this[2] === "sessionManifest" &&
+        this[3] === "inspectCodex"
+      ) {
+        throw new Error("poisoned options key iterator");
+      }
+      if (
+        mode === "platform" &&
+        this.length === 2 &&
+        this[0] === "linux" &&
+        this[1] === "arm64"
+      ) {
+        return Reflect.apply(
+          arrayIteratorDescriptor.value,
+          ["linux", "amd64"],
+          [],
+        );
+      }
+      if (
+        mode === "freeze" &&
+        this.length === 3 &&
+        ((this[0] === "platformImage" &&
+          this[1] === "codexSandbox" &&
+          this[2] === "codexVersion") ||
+          (this[0] === "codexSandbox" &&
+            this[1] === "codexVersion" &&
+            this[2] === "platformImage"))
+      ) {
+        return Reflect.apply(
+          arrayIteratorDescriptor.value,
+          ["codexSandbox", "codexVersion"],
+          [],
+        );
+      }
+      return Reflect.apply(arrayIteratorDescriptor.value, this, []);
+    },
+  });
+}
+
+function restoreHashPrototype() {
+  Object.defineProperty(
+    Hash.prototype,
+    "digest",
+    hashDigestDescriptor,
+  );
+  Object.defineProperty(
+    Hash.prototype,
+    "update",
+    hashUpdateDescriptor,
+  );
+}
+
+function poisonHashPrototype() {
+  const forgedHashes = new WeakSet();
+  Object.defineProperty(Hash.prototype, "update", {
+    ...hashUpdateDescriptor,
+    value(input, encoding) {
+      poisonedHashUpdateCalls += 1;
+      if (
+        Buffer.isBuffer(input) &&
+        input.byteLength === tamperedDescriptor.bytes.byteLength
+      ) {
+        forgedHashes.add(this);
+        return this;
+      }
+      return Reflect.apply(hashUpdateDescriptor.value, this, [
+        input,
+        encoding,
+      ]);
+    },
+  });
+  Object.defineProperty(Hash.prototype, "digest", {
+    ...hashDigestDescriptor,
+    value(encoding) {
+      poisonedHashDigestCalls += 1;
+      if (forgedHashes.has(this)) {
+        assert.equal(encoding, "hex");
+        return image.descriptor.digest.slice("sha256:".length);
+      }
+      return Reflect.apply(hashDigestDescriptor.value, this, [
+        encoding,
+      ]);
+    },
+  });
+}
+
+function constructCoordinator() {
+  if (scenario !== "weakmap-constructor") {
+    return new PlatformImageReservationCoordinator();
+  }
+  class LeakingWeakMap extends WeakMapConstructor {
+    constructor(...args) {
+      super(...args);
+      leakedReservationLedger = this;
+    }
+  }
+  Object.defineProperty(globalThis, "WeakMap", {
+    ...globalWeakMapDescriptor,
+    value: LeakingWeakMap,
+  });
+  try {
+    const coordinator = new PlatformImageReservationCoordinator();
+    assert.equal(leakedReservationLedger, undefined);
+    return coordinator;
+  } finally {
+    Object.defineProperty(
+      globalThis,
+      "WeakMap",
+      globalWeakMapDescriptor,
+    );
+  }
+}
 
 function restorePromisePrototype() {
   Object.defineProperty(
@@ -324,15 +494,22 @@ function inspectCodex() {
       : PromiseConstructor.resolve(measurement());
   if (poisonNext) {
     poisonNext = false;
-    poisonPromisePrototype();
+    if (scenario === "hash-prototype") {
+      poisonHashPrototype();
+    } else {
+      poisonPromisePrototype();
+    }
   }
   return inspectionPromise;
 }
 
 const image = fixture({
+  architecture:
+    scenario === "array-iterator-platform" ? "amd64" : "arm64",
   embedded: scenario === "typed-array-byte-length",
 });
-const coordinator = new PlatformImageReservationCoordinator();
+const tamperedDescriptor = tamperLayerDigest(image.descriptor);
+let coordinator;
 
 function assertRuntimeIdentity(result) {
   assert.equal(
@@ -452,7 +629,12 @@ function observeRejectedOperation(operation) {
 }
 
 function runScenario() {
-  if (scenario === "reserve" || scenario === "promise-rejection") {
+  coordinator = constructCoordinator();
+  if (
+    scenario === "reserve" ||
+    scenario === "promise-rejection" ||
+    scenario === "weakmap-constructor"
+  ) {
     const operation = coordinator.reservePlatformImage({
       ...image,
       inspectCodex,
@@ -466,6 +648,86 @@ function runScenario() {
         assertRuntimeIdentity,
       );
     }
+  } else if (scenario === "array-iterator-platform") {
+    poisonArrayIterator("platform");
+    safeThen(
+      coordinator.reservePlatformImage({
+        ...image,
+        inspectCodex,
+      }),
+      () => {
+        restoreArrayIterator();
+        throw new Error("poisoned platform iterator forged image authority");
+      },
+      (error) => {
+        restoreArrayIterator();
+        assert.ok(error instanceof PlatformImageReservationError);
+        assert.equal(error.code, "platform_image_identity_mismatch");
+        process.exitCode = 0;
+      },
+    );
+  } else if (scenario === "array-iterator-freeze") {
+    poisonArrayIterator("freeze");
+    safeThen(
+      coordinator.reservePlatformImage({
+        ...image,
+        inspectCodex,
+      }),
+      (reserved) => {
+        restoreArrayIterator();
+        assert.equal(Object.isFrozen(reserved.projection), true);
+        assert.equal(
+          Object.isFrozen(reserved.projection.platformImage),
+          true,
+        );
+        assert.equal(
+          Object.isFrozen(reserved.projection.platformImage.config),
+          true,
+        );
+        assert.equal(Object.isFrozen(reserved.runtimeIdentity), true);
+        process.exitCode = 0;
+      },
+      (error) => {
+        restoreArrayIterator();
+        throw error;
+      },
+    );
+  } else if (scenario === "hash-prototype") {
+    safeThen(
+      coordinator.reservePlatformImage({
+        ...image,
+        inspectCodex,
+      }),
+      (reserved) => {
+        safeThen(
+          coordinator.revalidateReservation({
+            configBytes: image.configBytes,
+            descriptor: tamperedDescriptor,
+            inspectCodex,
+            reservation: reserved.reservation,
+          }),
+          () => {
+            restoreHashPrototype();
+            throw new Error("poisoned Hash prototype forged image authority");
+          },
+          (error) => {
+            restoreHashPrototype();
+            assert.equal(poisonedHashDigestCalls, 0);
+            assert.equal(poisonedHashUpdateCalls, 0);
+            assert.ok(error instanceof PlatformImageReservationError);
+            assert.equal(
+              error.code,
+              "platform_image_reservation_rejected",
+            );
+            process.exitCode = 0;
+          },
+        );
+      },
+      (error) => {
+        restoreHashPrototype();
+        throw error;
+      },
+    );
   } else if (scenario === "revalidate" || scenario === "consume") {
     const reserveOperation = coordinator.reservePlatformImage({
       ...image,

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Hash } from "node:crypto";
 import { EventEmitter } from "node:events";
 
 import { DatabaseError } from "pg";
@@ -11,6 +12,7 @@ const scenario = process.argv[2];
 const scenarios = new Set([
   "array-includes",
   "database-error-brand",
+  "hash-prototype",
   "object-command",
   "promise-prototype",
   "set-has",
@@ -32,6 +34,14 @@ const uncertainQueryError = new DatabaseError(
 );
 uncertainQueryError.code = "08006";
 uncertainQueryError.severity = "ERROR";
+const hashDigestDescriptor = Object.getOwnPropertyDescriptor(
+  Hash.prototype,
+  "digest",
+);
+const hashUpdateDescriptor = Object.getOwnPropertyDescriptor(
+  Hash.prototype,
+  "update",
+);
 
 class FixtureClient {
   constructor() {
@@ -44,6 +54,35 @@ class FixtureClient {
     const text = typeof input === "string" ? input : input.text;
     this.queries.push(text);
     if (text === "DISCARD ALL") return { command: "DISCARD" };
+    if (scenario === "hash-prototype") {
+      if (text === "BEGIN") return {};
+      if (text === "SELECT pg_advisory_xact_lock($1::bigint)") {
+        return {};
+      }
+      if (
+        text === "CREATE SCHEMA IF NOT EXISTS session_authority" ||
+        text.startsWith(
+          "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations",
+        )
+      ) {
+        return {};
+      }
+      if (
+        text.startsWith(
+          "SELECT version, checksum FROM session_authority.schema_migrations",
+        )
+      ) {
+        return {
+          rows: [
+            {
+              checksum: "0".repeat(64),
+              version: 1,
+            },
+          ],
+        };
+      }
+      if (text === "COMMIT") return { command: "COMMIT" };
+    }
     if (text === "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE") return {};
     if (text.startsWith("SELECT transaction_timestamp()")) {
       return {
@@ -104,6 +143,61 @@ if (scenario !== undefined) {
   let callbacks = 0;
   let caught;
   let restore;
+
+  if (scenario === "hash-prototype") {
+    let poisonedDigestCalls = 0;
+    let poisonedUpdateCalls = 0;
+    Object.defineProperty(Hash.prototype, "update", {
+      ...hashUpdateDescriptor,
+      value() {
+        poisonedUpdateCalls += 1;
+        return this;
+      },
+    });
+    Object.defineProperty(Hash.prototype, "digest", {
+      ...hashDigestDescriptor,
+      value(encoding) {
+        poisonedDigestCalls += 1;
+        assert.equal(encoding, "hex");
+        return "0".repeat(64);
+      },
+    });
+    try {
+      await store.migrate();
+    } catch (error) {
+      caught = error;
+    } finally {
+      Object.defineProperty(
+        Hash.prototype,
+        "digest",
+        hashDigestDescriptor,
+      );
+      Object.defineProperty(
+        Hash.prototype,
+        "update",
+        hashUpdateDescriptor,
+      );
+    }
+
+    assert.notEqual(caught, undefined);
+    assert.equal(caught.code, "migration_checksum_mismatch");
+    assert.equal(caught.commitState, "not-committed");
+    assert.equal(poisonedDigestCalls, 0);
+    assert.equal(poisonedUpdateCalls, 0);
+    assert.equal(pool.connectCalls, 1);
+    assert.equal(client.releaseCause, undefined);
+    assert.deepEqual(client.queries, [
+      "DISCARD ALL",
+      "BEGIN",
+      "SELECT pg_advisory_xact_lock($1::bigint)",
+      "CREATE SCHEMA IF NOT EXISTS session_authority",
+      "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations ( version integer PRIMARY KEY CHECK (version > 0), checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), applied_at timestamp with time zone NOT NULL )",
+      "SELECT version, checksum FROM session_authority.schema_migrations ORDER BY version",
+      "ROLLBACK",
+      "DISCARD ALL",
+    ]);
+    process.exit(0);
+  }
 
   try {
     await store.runSerializable(async (transaction) => {
