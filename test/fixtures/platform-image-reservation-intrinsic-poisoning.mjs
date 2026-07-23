@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Hash, createHash } from "node:crypto";
+import { URL } from "node:url";
 
 import {
   PlatformImageReservationCoordinator,
@@ -20,6 +21,7 @@ const scenarios = new Set([
   "set-constructor",
   "structured-clone-reentry",
   "typed-array-byte-length",
+  "url-accessors",
   "weakmap-constructor",
 ]);
 if (scenario !== undefined && !scenarios.has(scenario)) {
@@ -99,6 +101,22 @@ const typedArrayByteLengthDescriptor = objectGetOwnPropertyDescriptor(
   typedArrayPrototype,
   "byteLength",
 );
+const urlHostnameDescriptor = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "hostname",
+);
+const urlPasswordDescriptor = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "password",
+);
+const urlProtocolDescriptor = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "protocol",
+);
+const urlUsernameDescriptor = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "username",
+);
 const CODEX_BINARY_SHA256 = "b".repeat(64);
 const CODEX_VERSION = "codex-cli 0.144.1";
 const CONFIG_MEDIA_TYPE = "application/vnd.oci.image.config.v1+json";
@@ -115,6 +133,7 @@ function digest(bytes) {
 
 function fixture({
   architecture = "arm64",
+  descriptorUrl = undefined,
   embedded = false,
 } = {}) {
   const configBytes = Buffer.from(
@@ -136,6 +155,9 @@ function fixture({
   };
   if (embedded) {
     configDescriptor.data = configBytes.toString("base64");
+  }
+  if (descriptorUrl !== undefined) {
+    configDescriptor.urls = [descriptorUrl];
   }
   const manifestBytes = Buffer.from(
     JSON.stringify({
@@ -324,6 +346,56 @@ function poisonHashPrototype() {
       return Reflect.apply(hashDigestDescriptor.value, this, [
         encoding,
       ]);
+    },
+  });
+}
+
+function restoreUrlAccessors() {
+  Object.defineProperty(
+    URL.prototype,
+    "hostname",
+    urlHostnameDescriptor,
+  );
+  Object.defineProperty(
+    URL.prototype,
+    "password",
+    urlPasswordDescriptor,
+  );
+  Object.defineProperty(
+    URL.prototype,
+    "protocol",
+    urlProtocolDescriptor,
+  );
+  Object.defineProperty(
+    URL.prototype,
+    "username",
+    urlUsernameDescriptor,
+  );
+}
+
+function poisonUrlAccessors() {
+  Object.defineProperty(URL.prototype, "hostname", {
+    ...urlHostnameDescriptor,
+    get() {
+      return "example.invalid";
+    },
+  });
+  Object.defineProperty(URL.prototype, "password", {
+    ...urlPasswordDescriptor,
+    get() {
+      return "";
+    },
+  });
+  Object.defineProperty(URL.prototype, "protocol", {
+    ...urlProtocolDescriptor,
+    get() {
+      return "https:";
+    },
+  });
+  Object.defineProperty(URL.prototype, "username", {
+    ...urlUsernameDescriptor,
+    get() {
+      return "";
     },
   });
 }
@@ -585,6 +657,10 @@ function inspectCodex() {
 const image = fixture({
   architecture:
     scenario === "array-iterator-platform" ? "amd64" : "arm64",
+  descriptorUrl:
+    scenario === "url-accessors"
+      ? "http://user:password@example.invalid/config"
+      : undefined,
   embedded: scenario === "typed-array-byte-length",
 });
 const tamperedDescriptor = tamperLayerDigest(image.descriptor);
@@ -807,6 +883,32 @@ function runScenario() {
       (error) => {
         restoreHashPrototype();
         throw error;
+      },
+    );
+  } else if (scenario === "url-accessors") {
+    let inspectorCalls = 0;
+    poisonUrlAccessors();
+    safeThen(
+      coordinator.reservePlatformImage({
+        ...image,
+        inspectCodex() {
+          inspectorCalls += 1;
+          return PromiseConstructor.resolve(measurement());
+        },
+      }),
+      () => {
+        restoreUrlAccessors();
+        throw new Error("poisoned URL accessors forged image authority");
+      },
+      (error) => {
+        restoreUrlAccessors();
+        assert.equal(inspectorCalls, 0);
+        assert.ok(error instanceof PlatformImageReservationError);
+        assert.equal(
+          error.code,
+          "platform_image_identity_mismatch",
+        );
+        process.exitCode = 0;
       },
     );
   } else if (scenario === "revalidate" || scenario === "consume") {

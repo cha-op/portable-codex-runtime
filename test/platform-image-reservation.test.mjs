@@ -1242,6 +1242,7 @@ test("prototype poisoning cannot forge image authority", async (t) => {
     "set-constructor",
     "structured-clone-reentry",
     "typed-array-byte-length",
+    "url-accessors",
     "weakmap-constructor",
   ]) {
     await t.test(scenario, () => {

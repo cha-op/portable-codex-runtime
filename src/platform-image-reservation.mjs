@@ -63,6 +63,22 @@ const typedArraySetIntrinsic = objectGetOwnPropertyDescriptor(
   typedArrayPrototype,
   "set",
 ).value;
+const urlHostnameGetter = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "hostname",
+).get;
+const urlPasswordGetter = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "password",
+).get;
+const urlProtocolGetter = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "protocol",
+).get;
+const urlUsernameGetter = objectGetOwnPropertyDescriptor(
+  URL.prototype,
+  "username",
+).get;
 const {
   isPromise: isPromiseValue,
   isProxy: isProxyValue,
@@ -445,10 +461,10 @@ function isAllowedDescriptorUrl(value) {
   try {
     const parsed = new URL(value);
     return (
-      parsed.protocol === "https:" &&
-      parsed.hostname.length > 0 &&
-      parsed.username === "" &&
-      parsed.password === ""
+      callIntrinsic(urlProtocolGetter, parsed, []) === "https:" &&
+      callIntrinsic(urlHostnameGetter, parsed, []).length > 0 &&
+      callIntrinsic(urlUsernameGetter, parsed, []) === "" &&
+      callIntrinsic(urlPasswordGetter, parsed, []) === ""
     );
   } catch {
     return false;

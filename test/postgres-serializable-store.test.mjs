@@ -1126,6 +1126,7 @@ test("post-import intrinsic poisoning cannot forge store authority", async (t) =
     "set-has",
     "array-includes",
     "database-error-brand",
+    "event-emitter-prototype",
     "hash-prototype",
     "object-command",
     "promise-prototype",

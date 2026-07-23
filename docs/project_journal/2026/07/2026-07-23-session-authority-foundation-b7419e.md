@@ -38,9 +38,13 @@ superseded_by:
   post-callback boundary checks use module-captured intrinsics, own driver
   result fields, and a captured `DatabaseError` prototype check. Built-in
   prototype poisoning by a callback limited to the transaction capability
-  cannot convert a local or unknown outcome into a retry. The dedicated pool,
-  client, connection event source, and node-postgres implementation remain an
-  explicit trusted boundary and must not be exposed to callbacks.
+  cannot convert a local or unknown outcome into a retry. Each driver query
+  also pins the connection's protocol-event dispatch to captured
+  `EventEmitter` emit/listener intrinsics and restores the prior own descriptor
+  afterward, so post-import prototype mutation cannot reinterpret a completed
+  `COMMIT` as a retryable rollback. The dedicated pool, client, connection
+  event source, and node-postgres implementation remain an explicit trusted
+  boundary and must not be exposed to callbacks.
   A shape-invalid client returned by that pool is destroyed exactly once with
   `release(error)` before the sanitized connection failure escapes; failure to
   destroy it does not replace the primary classification.
@@ -94,10 +98,13 @@ superseded_by:
   use indexed access, while the private reservation ledger uses a captured
   WeakMap constructor, so post-import iterator or constructor replacement
   cannot skip nested freezing, reinterpret platform identity, or expose the
-  ledger. Image authority snapshots every session-runtime field through
-  captured own-data descriptors before invoking the shared manifest validator
-  and ignores its defensive-clone result, preventing an inspector from using a
-  reentrant reservation to substitute a different image identity.
+  ledger. Descriptor URL policy uses captured native `URL` accessors, so
+  prototype mutation cannot disguise HTTP or embedded credentials as an
+  admissible HTTPS location. Image authority snapshots every session-runtime
+  field through captured own-data descriptors before invoking the shared
+  manifest validator and ignores its defensive-clone result, preventing an
+  inspector from using a reentrant reservation to substitute a different
+  image identity.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.

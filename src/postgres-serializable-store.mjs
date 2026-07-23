@@ -1,4 +1,5 @@
 import { Hash, createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { isPromise, isProxy } from "node:util/types";
 
@@ -25,6 +26,12 @@ const dateParse = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const databaseErrorPrototype = DatabaseError.prototype;
 const ErrorConstructor = Error;
+const eventEmitterEmitIntrinsic = EventEmitter.prototype.emit;
+const eventEmitterPrependListenerIntrinsic =
+  EventEmitter.prototype.prependListener;
+const eventEmitterPrototype = EventEmitter.prototype;
+const eventEmitterRemoveListenerIntrinsic =
+  EventEmitter.prototype.removeListener;
 const createHashIntrinsic = createHash;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
@@ -43,6 +50,7 @@ const objectIsPrototypeOfIntrinsic = Object.prototype.isPrototypeOf;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const reflectApply = Reflect.apply;
+const reflectDeleteProperty = Reflect.deleteProperty;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const setAddIntrinsic = Set.prototype.add;
@@ -66,6 +74,12 @@ const WeakMapConstructor = WeakMap;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
 const WeakSetConstructor = WeakSet;
+const protocolEmitDescriptor = objectFreeze({
+  configurable: true,
+  enumerable: false,
+  value: eventEmitterEmitIntrinsic,
+  writable: false,
+});
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
@@ -579,15 +593,16 @@ function isPrepareTransactionStatement(text) {
 
 function validateClient(client) {
   try {
+    const connection = client.connection;
     return (
       client !== null &&
       arrayIncludes(["object", "function"], typeof client) &&
       typeof client.query === "function" &&
       typeof client.release === "function" &&
-      client.connection !== null &&
-      typeof client.connection === "object" &&
-      typeof client.connection.prependListener === "function" &&
-      typeof client.connection.removeListener === "function"
+      connection !== null &&
+      typeof connection === "object" &&
+      !isProxy(connection) &&
+      objectIsPrototypeOf(eventEmitterPrototype, connection)
     );
   } catch {
     return false;
@@ -595,6 +610,11 @@ function validateClient(client) {
 }
 
 async function clientQuery(client, ...args) {
+  const connection = client.connection;
+  const priorEmitDescriptor = objectGetOwnPropertyDescriptor(
+    connection,
+    "emit",
+  );
   const observed = new WeakMapConstructor();
   const observeProtocolError = (error) => {
     try {
@@ -613,32 +633,57 @@ async function clientQuery(client, ...args) {
     }
   };
 
-  reflectApply(
-    client.connection.prependListener,
-    client.connection,
-    ["errorMessage", observeProtocolError],
-  );
+  // Keep the driver-originated protocol event channel independent from
+  // callback-controlled EventEmitter prototype mutations for this query.
+  objectDefineProperty(connection, "emit", protocolEmitDescriptor);
+  let listenerAttached = false;
   try {
-    return await protectPromise(
-      reflectApply(client.query, client, args),
-    );
-  } catch (error) {
-    try {
-      weakMapDelete(PROTOCOL_ERROR_SQLSTATES, error);
-      const sqlState = weakMapGet(observed, error);
-      if (sqlState !== undefined) {
-        weakMapSet(PROTOCOL_ERROR_SQLSTATES, error, sqlState);
-      }
-    } catch {
-      // Preserve the query failure without adding protocol provenance.
-    }
-    throw error;
-  } finally {
-    reflectApply(
-      client.connection.removeListener,
-      client.connection,
+    callIntrinsic(
+      eventEmitterPrependListenerIntrinsic,
+      connection,
       ["errorMessage", observeProtocolError],
     );
+    listenerAttached = true;
+    try {
+      return await protectPromise(
+        reflectApply(client.query, client, args),
+      );
+    } catch (error) {
+      try {
+        weakMapDelete(PROTOCOL_ERROR_SQLSTATES, error);
+        const sqlState = weakMapGet(observed, error);
+        if (sqlState !== undefined) {
+          weakMapSet(PROTOCOL_ERROR_SQLSTATES, error, sqlState);
+        }
+      } catch {
+        // Preserve the query failure without adding protocol provenance.
+      }
+      throw error;
+    }
+  } finally {
+    try {
+      if (listenerAttached) {
+        callIntrinsic(
+          eventEmitterRemoveListenerIntrinsic,
+          connection,
+          ["errorMessage", observeProtocolError],
+        );
+      }
+    } finally {
+      if (priorEmitDescriptor === undefined) {
+        if (!reflectDeleteProperty(connection, "emit")) {
+          throw new TypeErrorConstructor(
+            "PostgreSQL protocol emitter could not be restored",
+          );
+        }
+      } else {
+        objectDefineProperty(
+          connection,
+          "emit",
+          priorEmitDescriptor,
+        );
+      }
+    }
   }
 }
 

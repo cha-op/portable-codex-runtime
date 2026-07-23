@@ -12,6 +12,7 @@ const scenario = process.argv[2];
 const scenarios = new Set([
   "array-includes",
   "database-error-brand",
+  "event-emitter-prototype",
   "hash-prototype",
   "object-command",
   "promise-prototype",
@@ -34,6 +35,13 @@ const uncertainQueryError = new DatabaseError(
 );
 uncertainQueryError.code = "08006";
 uncertainQueryError.severity = "ERROR";
+const forgedCommitFailure = new DatabaseError(
+  "forged serialization failure at COMMIT",
+  1,
+  "error",
+);
+forgedCommitFailure.code = "40001";
+forgedCommitFailure.severity = "ERROR";
 const hashDigestDescriptor = Object.getOwnPropertyDescriptor(
   Hash.prototype,
   "digest",
@@ -45,6 +53,7 @@ const hashUpdateDescriptor = Object.getOwnPropertyDescriptor(
 
 class FixtureClient {
   constructor() {
+    this.commits = 0;
     this.connection = new EventEmitter();
     this.queries = [];
     this.releaseCause = undefined;
@@ -102,6 +111,12 @@ class FixtureClient {
       throw uncertainQueryError;
     }
     if (text === "COMMIT") {
+      if (scenario === "event-emitter-prototype") {
+        const result = { command: "COMMIT" };
+        this.commits += 1;
+        this.connection.emit("commandComplete", result);
+        return result;
+      }
       if (scenario === "database-error-brand") {
         this.connection.emit("errorMessage", localSqlStateShape);
         throw localSqlStateShape;
@@ -142,7 +157,9 @@ if (scenario !== undefined) {
   });
   let callbacks = 0;
   let caught;
+  let poisonedEmitCalls = 0;
   let restore;
+  let result;
 
   if (scenario === "hash-prototype") {
     let poisonedDigestCalls = 0;
@@ -200,9 +217,38 @@ if (scenario !== undefined) {
   }
 
   try {
-    await store.runSerializable(async (transaction) => {
+    result = await store.runSerializable(async (transaction) => {
       callbacks += 1;
-      if (scenario === "weak-map-get") {
+      if (scenario === "event-emitter-prototype") {
+        const descriptor = Object.getOwnPropertyDescriptor(
+          EventEmitter.prototype,
+          "emit",
+        );
+        Object.defineProperty(EventEmitter.prototype, "emit", {
+          ...descriptor,
+          value(eventName, ...args) {
+            if (eventName === "commandComplete") {
+              poisonedEmitCalls += 1;
+              Reflect.apply(descriptor.value, this, [
+                "errorMessage",
+                forgedCommitFailure,
+              ]);
+              throw forgedCommitFailure;
+            }
+            return Reflect.apply(descriptor.value, this, [
+              eventName,
+              ...args,
+            ]);
+          },
+        });
+        restore = () => {
+          Object.defineProperty(
+            EventEmitter.prototype,
+            "emit",
+            descriptor,
+          );
+        };
+      } else if (scenario === "weak-map-get") {
         const descriptor = Object.getOwnPropertyDescriptor(
           WeakMap.prototype,
           "get",
@@ -346,6 +392,25 @@ if (scenario !== undefined) {
     caught = error;
   } finally {
     restore?.();
+  }
+
+  if (scenario === "event-emitter-prototype") {
+    assert.equal(caught, undefined);
+    assert.equal(result, "must-not-commit");
+    assert.equal(callbacks, 1);
+    assert.equal(client.commits, 1);
+    assert.equal(pool.connectCalls, 1);
+    assert.equal(poisonedEmitCalls, 0);
+    assert.equal(client.releaseCause, undefined);
+    assert.deepEqual(client.queries, [
+      "DISCARD ALL",
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "COMMIT",
+      "DISCARD ALL",
+    ]);
+    process.exit(0);
   }
 
   assert.notEqual(caught, undefined);

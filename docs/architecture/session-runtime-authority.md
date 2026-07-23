@@ -101,9 +101,15 @@ migration checksum operations, or turn an unknown `COMMIT` result into a
 retry. This is not an unforgeable brand against code that can access or replace
 the dedicated pool, checked-out client, connection event source, or
 node-postgres implementation: those objects form the trusted driver boundary
-and must not be exposed to callbacks. That rule also covers a server `40001`
-detected during `COMMIT`. A transport failure or any other `COMMIT` error is
-outcome-uncertain and is never automatically replayed as a fresh operation.
+and must not be exposed to callbacks. For every query, the executor temporarily
+pins the connection's own `emit` method to the module-captured native
+`EventEmitter` implementation and uses captured listener intrinsics, then
+restores the exact prior own descriptor. A callback that mutates
+`EventEmitter.prototype` after its final user query therefore cannot redirect
+a completed `COMMIT` event into forged retryable SQLSTATE evidence. That rule
+also covers a server `40001` detected during `COMMIT`. A transport failure or
+any other `COMMIT` error is outcome-uncertain and is never automatically
+replayed as a fresh operation.
 Reset failure destroys the connection and preserves the already proved
 committed or not-committed outcome. User-query failures without a SQLSTATE,
 the connection/operator/system/internal error classes, and the explicit
@@ -234,14 +240,16 @@ copied-byte comparisons likewise use captured RegExp, Set, and typed-array
 intrinsics rather than mutable prototype dispatch. Descriptor hashes use
 captured cryptographic Hash methods; own-key and platform arrays use indexed
 access instead of a mutable array iterator; and the private reservation ledger
-uses the module-captured WeakMap constructor. Post-import intrinsic poisoning
-therefore cannot replace the ledger, skip nested freezing, reinterpret a
-platform tuple, or forge a descriptor digest. Before invoking the shared
-session-manifest validator, image authority snapshots every runtime field
-through captured own-data descriptors and later ignores the validator's
-defensive-clone result. An inspector therefore cannot replace that validator's
-clone operation and reenter image reservation with a runtime tuple that
-differs from the validated snapshot.
+uses the module-captured WeakMap constructor. Descriptor URL policy reads the
+native parse result through module-captured `protocol`, `hostname`, `username`,
+and `password` getters. Post-import intrinsic poisoning therefore cannot
+replace the ledger, skip nested freezing, reinterpret a platform tuple, forge a
+descriptor digest, or disguise an HTTP or credential-bearing descriptor URL as
+admissible HTTPS. Before invoking the shared session-manifest validator, image
+authority snapshots every runtime field through captured own-data descriptors
+and later ignores the validator's defensive-clone result. An inspector
+therefore cannot replace that validator's clone operation and reenter image
+reservation with a runtime tuple that differs from the validated snapshot.
 
 Image reservation follows one-process object capability semantics:
 
