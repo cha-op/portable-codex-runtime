@@ -20,6 +20,7 @@ const jsonParse = JSON.parse;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
 const objectDefineProperties = Object.defineProperties;
+const objectDefineProperty = Object.defineProperty;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
@@ -28,6 +29,7 @@ const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
 const posixIsAbsolute = posixPath.isAbsolute;
 const posixNormalize = posixPath.normalize;
+const PromiseConstructor = Promise;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -46,6 +48,7 @@ const typedArraySetIntrinsic = objectGetOwnPropertyDescriptor(
   "set",
 ).value;
 const {
+  isPromise: isPromiseValue,
   isProxy: isProxyValue,
   isUint8Array: isUint8ArrayValue,
 } = utilTypes;
@@ -112,6 +115,17 @@ function weakSetAdd(value, entry) {
 
 function weakSetHas(value, entry) {
   return callIntrinsic(weakSetHasIntrinsic, value, [entry]);
+}
+
+function protectPromise(value) {
+  if (!isPromiseValue(value)) return value;
+  objectDefineProperty(value, "constructor", {
+    configurable: false,
+    enumerable: false,
+    value: PromiseConstructor,
+    writable: false,
+  });
+  return value;
 }
 
 export const PLATFORM_IMAGE_RESERVATION_CONTRACT_VERSION = 1;
@@ -892,9 +906,9 @@ async function inspectRuntime(inspectCodex, projection) {
   });
   let rawMeasurement;
   try {
-    rawMeasurement = await reflectApply(inspectCodex, undefined, [
-      inspectionRequest,
-    ]);
+    rawMeasurement = await protectPromise(
+      reflectApply(inspectCodex, undefined, [inspectionRequest]),
+    );
   } catch {
     fail("platform_image_inspection_uncertain");
   }
@@ -957,7 +971,9 @@ async function verifyEvidence({
     document,
     expectedRuntime,
   );
-  const runtimeIdentity = await inspectRuntime(inspectCodex, projection);
+  const runtimeIdentity = await protectPromise(
+    inspectRuntime(inspectCodex, projection),
+  );
   return { projection, runtimeIdentity };
 }
 
@@ -981,7 +997,11 @@ function consumptionProjection(record) {
 export class PlatformImageReservationCoordinator {
   #reservations = new WeakMap();
 
-  async reservePlatformImage(options) {
+  reservePlatformImage(options) {
+    return protectPromise(this.#reservePlatformImage(options));
+  }
+
+  async #reservePlatformImage(options) {
     const normalized = assertExactPlainObject(
       options,
       ["configBytes", "descriptor", "inspectCodex", "sessionManifest"],
@@ -991,12 +1011,14 @@ export class PlatformImageReservationCoordinator {
       normalized.sessionManifest,
     );
     const inspectCodex = normalizeInspector(normalized.inspectCodex);
-    const verified = await verifyEvidence({
-      configBytes: normalized.configBytes,
-      descriptor: normalized.descriptor,
-      expectedRuntime,
-      inspectCodex,
-    });
+    const verified = await protectPromise(
+      verifyEvidence({
+        configBytes: normalized.configBytes,
+        descriptor: normalized.descriptor,
+        expectedRuntime,
+        inspectCodex,
+      }),
+    );
     const reservation = makeOpaqueReservation();
     const record = {
       expectedRuntime,
@@ -1030,12 +1052,14 @@ export class PlatformImageReservationCoordinator {
 
     record.state = "revalidating";
     try {
-      const verified = await verifyEvidence({
-        configBytes: normalized.configBytes,
-        descriptor: normalized.descriptor,
-        expectedRuntime: record.expectedRuntime,
-        inspectCodex: record.inspectCodex,
-      });
+      const verified = await protectPromise(
+        verifyEvidence({
+          configBytes: normalized.configBytes,
+          descriptor: normalized.descriptor,
+          expectedRuntime: record.expectedRuntime,
+          inspectCodex: record.inspectCodex,
+        }),
+      );
       ensure(
         record.state === "revalidating" &&
           sameProjection(verified.projection, record.projection) &&
@@ -1061,21 +1085,22 @@ export class PlatformImageReservationCoordinator {
     }
   }
 
-  async revalidateReservation(options) {
-    const normalized = assertExactPlainObject(
-      options,
-      ["configBytes", "descriptor", "inspectCodex", "reservation"],
-      "invalid_platform_image_request",
-    );
-    return this.#revalidate(normalized, false);
+  revalidateReservation(options) {
+    return protectPromise(this.#useReservation(options, false));
   }
 
-  async consumeReservation(options) {
+  consumeReservation(options) {
+    return protectPromise(this.#useReservation(options, true));
+  }
+
+  async #useReservation(options, consume) {
     const normalized = assertExactPlainObject(
       options,
       ["configBytes", "descriptor", "inspectCodex", "reservation"],
       "invalid_platform_image_request",
     );
-    return this.#revalidate(normalized, true);
+    return await protectPromise(
+      this.#revalidate(normalized, consume),
+    );
   }
 }

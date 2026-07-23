@@ -218,7 +218,12 @@ Before full JSON parsing, the scanner also bounds nesting, total value nodes,
 aggregate object members, aggregate array elements, each container, image
 layers and rootfs DiffIDs, and config history entries. These structural budgets
 prevent a byte-valid manifest or config from expanding into unbounded parser
-work or duplicate-key tracking memory.
+work or duplicate-key tracking memory. The inspector is an external callback,
+so every Promise crossing that boundary and every authority-owned async
+operation is given a captured own `constructor` before it is awaited or
+returned. Callback mutation of `Promise.prototype.constructor` or `then`
+therefore cannot substitute a forged measurement, revalidation result, or
+public operation result.
 
 Image reservation follows one-process object capability semantics:
 

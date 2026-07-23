@@ -77,7 +77,10 @@ superseded_by:
   source-sized private byte-buffer allocation and copied without invoking
   shadowable source properties. Their JSON is also rejected before full parse
   when bounded node, member, element, container, layer, DiffID, or history
-  budgets are exceeded.
+  budgets are exceeded. Inspector-returned, authority-internal, and public
+  operation Promises receive a captured own constructor before await or
+  return, so inspector mutation of Promise prototype accessors cannot forge a
+  measurement, revalidation, or consumption result.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.

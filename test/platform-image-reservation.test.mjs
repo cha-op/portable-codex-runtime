@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -34,6 +36,12 @@ const CODEX_VERSION = "codex-cli 0.144.1";
 const CODEX_BINARY_SHA256 = "b".repeat(64);
 const LAYER_DIGEST = `sha256:${"c".repeat(64)}`;
 const DIFF_ID = `sha256:${"d".repeat(64)}`;
+const INTRINSIC_POISONING_FIXTURE = fileURLToPath(
+  new URL(
+    "./fixtures/platform-image-reservation-intrinsic-poisoning.mjs",
+    import.meta.url,
+  ),
+);
 
 function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -1217,6 +1225,32 @@ test("any concurrent reservation use poisons the capability", async (t) => {
         assertCode("platform_image_reservation_rejected"),
       );
       assert.equal(inspectionCalls, 2);
+    });
+  }
+});
+
+test("inspector Promise poisoning cannot forge image authority", async (t) => {
+  for (const scenario of ["reserve", "revalidate", "consume"]) {
+    await t.test(scenario, () => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--unhandled-rejections=strict",
+          INTRINSIC_POISONING_FIXTURE,
+          scenario,
+        ],
+        {
+          encoding: "utf8",
+          timeout: 10_000,
+        },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.signal, null);
+      assert.equal(
+        result.status,
+        0,
+        `intrinsic-poisoning child failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
     });
   }
 });
