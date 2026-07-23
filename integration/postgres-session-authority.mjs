@@ -9,6 +9,7 @@ import {
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
 
+const EMPTY_JSON_OBJECT = "{}";
 const databaseUrl = process.env.SESSION_AUTHORITY_DATABASE_URL;
 const databaseConfigured =
   typeof databaseUrl === "string" && databaseUrl.length > 0;
@@ -136,10 +137,9 @@ test(
           "AND indexname = ANY($1::text[])",
           "ORDER BY indexname",
         ].join(" "),
-        [[
-          "operation_claims_one_active_per_session",
-          "reservations_one_active_per_session",
-        ]],
+        [
+          "{operation_claims_one_active_per_session,reservations_one_active_per_session}",
+        ],
       ),
     );
     assert.deepEqual(
@@ -174,9 +174,9 @@ test(
         [
           "INSERT INTO session_authority.sessions",
           "(session_id, document, created_at, updated_at)",
-          "VALUES ($1, $2, $3, $3)",
+          "VALUES ($1, $2::jsonb, $3, $3)",
         ].join(" "),
-        [conflictSessionId, {}, transaction.now],
+        [conflictSessionId, EMPTY_JSON_OBJECT, transaction.now],
       ),
     );
     let releaseInitialReaders;
@@ -232,9 +232,9 @@ test(
           [
             "INSERT INTO session_authority.sessions",
             "(session_id, document, created_at, updated_at)",
-            "VALUES ($1, $2, $3, $3)",
+            "VALUES ($1, $2::jsonb, $3, $3)",
           ].join(" "),
-          [activeOperationSessionId, {}, transaction.now],
+          [activeOperationSessionId, EMPTY_JSON_OBJECT, transaction.now],
         );
         for (const operationId of [
           `integration-operation-${randomUUID()}`,
@@ -244,9 +244,14 @@ test(
             [
               "INSERT INTO session_authority.operation_claims",
               "(operation_id, session_id, kind, request, state, created_at, updated_at)",
-              "VALUES ($1, $2, 'integration', $3, 'active', $4, $4)",
+              "VALUES ($1, $2, 'integration', $3::jsonb, 'active', $4, $4)",
             ].join(" "),
-            [operationId, activeOperationSessionId, {}, transaction.now],
+            [
+              operationId,
+              activeOperationSessionId,
+              EMPTY_JSON_OBJECT,
+              transaction.now,
+            ],
           );
         }
       }),
@@ -266,9 +271,9 @@ test(
           [
             "INSERT INTO session_authority.sessions",
             "(session_id, document, created_at, updated_at)",
-            "VALUES ($1, $2, $3, $3)",
+            "VALUES ($1, $2::jsonb, $3, $3)",
           ].join(" "),
-          [activeReservationSessionId, {}, transaction.now],
+          [activeReservationSessionId, EMPTY_JSON_OBJECT, transaction.now],
         );
         const retiredOperationId = `integration-operation-${randomUUID()}`;
         const activeOperationId = `integration-operation-${randomUUID()}`;
@@ -276,17 +281,27 @@ test(
           [
             "INSERT INTO session_authority.operation_claims",
             "(operation_id, session_id, kind, request, state, created_at, updated_at, retired_at)",
-            "VALUES ($1, $2, 'integration', $3, 'retired', $4, $4, $4)",
+            "VALUES ($1, $2, 'integration', $3::jsonb, 'retired', $4, $4, $4)",
           ].join(" "),
-          [retiredOperationId, activeReservationSessionId, {}, transaction.now],
+          [
+            retiredOperationId,
+            activeReservationSessionId,
+            EMPTY_JSON_OBJECT,
+            transaction.now,
+          ],
         );
         await transaction.query(
           [
             "INSERT INTO session_authority.operation_claims",
             "(operation_id, session_id, kind, request, state, created_at, updated_at)",
-            "VALUES ($1, $2, 'integration', $3, 'active', $4, $4)",
+            "VALUES ($1, $2, 'integration', $3::jsonb, 'active', $4, $4)",
           ].join(" "),
-          [activeOperationId, activeReservationSessionId, {}, transaction.now],
+          [
+            activeOperationId,
+            activeReservationSessionId,
+            EMPTY_JSON_OBJECT,
+            transaction.now,
+          ],
         );
         for (const [reservationId, operationId] of [
           [`integration-reservation-${randomUUID()}`, retiredOperationId],
@@ -299,13 +314,13 @@ test(
                 "(reservation_id, operation_id, session_id, kind,",
                 "expected_session_revision, state, payload, created_at, updated_at)",
               ].join(" "),
-              "VALUES ($1, $2, $3, 'integration', 0, 'active', $4, $5, $5)",
+              "VALUES ($1, $2, $3, 'integration', 0, 'active', $4::jsonb, $5, $5)",
             ].join(" "),
             [
               reservationId,
               operationId,
               activeReservationSessionId,
-              {},
+              EMPTY_JSON_OBJECT,
               transaction.now,
             ],
           );

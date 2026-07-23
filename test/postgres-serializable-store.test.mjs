@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+
+import { DatabaseError } from "pg";
 
 import {
   PostgresSerializableStore,
@@ -15,6 +18,7 @@ const ROLLBACK_RESULT = Object.freeze({ command: "ROLLBACK" });
 
 class FakeClient {
   constructor(steps, { releaseError, resetSteps = [] } = {}) {
+    this.connection = new EventEmitter();
     this.queries = [];
     this.releaseCalls = [];
     this.releaseError = releaseError;
@@ -34,7 +38,12 @@ class FakeClient {
     assert.notEqual(this.steps.length, 0, `unexpected query: ${text}`);
     const step = this.steps.shift();
     if (typeof step === "function") return step(args);
-    if (step instanceof Error) throw step;
+    if (step instanceof Error) {
+      if (step instanceof DatabaseError) {
+        this.connection.emit("errorMessage", step);
+      }
+      throw step;
+    }
     if (
       text === "ROLLBACK" &&
       step !== null &&
@@ -54,6 +63,7 @@ class FakeClient {
   assertExhausted() {
     assert.deepEqual(this.steps, []);
     assert.deepEqual(this.resetSteps, []);
+    assert.equal(this.connection.listenerCount("errorMessage"), 0);
   }
 }
 
@@ -91,7 +101,10 @@ function nonResetQueries(client) {
 }
 
 function pgError(code, message = code) {
-  return Object.assign(new Error(message), { code });
+  const error = new DatabaseError(message, 1, "error");
+  error.code = code;
+  error.severity = "ERROR";
+  return error;
 }
 
 async function assertStoreError(promise, expected) {
@@ -288,6 +301,309 @@ test("a callback-spoofed transaction SQLSTATE is never retried", async () => {
   client.assertExhausted();
 });
 
+test("custom parameter conversion cannot impersonate a server retry", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const pool = new FakePool([client]);
+  const store = new PostgresSerializableStore({
+    maxTransactionAttempts: 3,
+    dedicatedPool: pool,
+  });
+  let callbacks = 0;
+  let conversions = 0;
+  const value = {
+    toPostgres() {
+      conversions += 1;
+      throw pgError("40001", "local converter impersonated a server error");
+    },
+  };
+
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      callbacks += 1;
+      await transaction.query("SELECT $1::text", [value]);
+    }),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.equal(callbacks, 1);
+  assert.equal(conversions, 0);
+  assert.equal(pool.connectCalls, 1);
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a suppressed revoked query values proxy cannot allow commit", async () => {
+  const revoked = Proxy.revocable([], {});
+  revoked.revoke();
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const pool = new FakePool([client]);
+  const store = new PostgresSerializableStore({
+    maxTransactionAttempts: 3,
+    dedicatedPool: pool,
+  });
+
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      try {
+        await transaction.query("SELECT 1", revoked.proxy);
+      } catch {
+        // The callback cannot suppress an invalid query and then commit.
+      }
+    }),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.equal(pool.connectCalls, 1);
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a live query values proxy cannot run descriptor traps", async () => {
+  let descriptorReads = 0;
+  const values = new Proxy([], {
+    getOwnPropertyDescriptor(target, property) {
+      descriptorReads += 1;
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const pool = new FakePool([client]);
+  const store = new PostgresSerializableStore({
+    maxTransactionAttempts: 3,
+    dedicatedPool: pool,
+  });
+
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      try {
+        await transaction.query("SELECT 1", values);
+      } catch {
+        // The callback cannot suppress an invalid query and then commit.
+      }
+    }),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.equal(descriptorReads, 0);
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("an Array-prototype object cannot masquerade as query values", async () => {
+  const values = Object.create(Array.prototype);
+  Object.defineProperty(values, "length", {
+    configurable: true,
+    value: 0,
+    writable: true,
+  });
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      transaction.query("SELECT 1", values),
+    ),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("query values copy owns every slot despite Array prototype accessors", async () => {
+  const lastIndex = 65_534;
+  const values = new Array(lastIndex + 1);
+  Object.defineProperty(values, String(lastIndex), {
+    configurable: true,
+    enumerable: true,
+    value: "safe",
+    writable: true,
+  });
+  const previousDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    String(lastIndex),
+  );
+  let inheritedGets = 0;
+  let inheritedSets = 0;
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    ([config]) => {
+      assert.equal(config.values.length, 65_535);
+      assert.equal(Object.hasOwn(config.values, String(lastIndex)), true);
+      assert.equal(config.values[lastIndex], "safe");
+      return { rows: [{ value: "safe" }] };
+    },
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  Object.defineProperty(Array.prototype, String(lastIndex), {
+    configurable: true,
+    get() {
+      inheritedGets += 1;
+      return {
+        toPostgres() {
+          throw new Error("inherited converter must not run");
+        },
+      };
+    },
+    set() {
+      inheritedSets += 1;
+    },
+  });
+  try {
+    assert.equal(
+      await store.runSerializable(async (transaction) => {
+        const result = await transaction.query("SELECT $1::text", values);
+        return result.rows[0].value;
+      }),
+      "safe",
+    );
+  } finally {
+    if (previousDescriptor === undefined) {
+      delete Array.prototype[lastIndex];
+    } else {
+      Object.defineProperty(
+        Array.prototype,
+        String(lastIndex),
+        previousDescriptor,
+      );
+    }
+  }
+  assert.equal(inheritedGets, 0);
+  assert.equal(inheritedSets, 0);
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("query values reject more than 65,535 parameters before submission", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      transaction.query("SELECT 1", new Array(65_536)),
+    ),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a client-local SQLSTATE-shaped query error is never retried", async () => {
+  const localFailure = pgError("40001", "local result parser failed");
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    () => {
+      throw localFailure;
+    },
+    {},
+  ]);
+  const pool = new FakePool([client]);
+  const store = new PostgresSerializableStore({
+    maxTransactionAttempts: 3,
+    dedicatedPool: pool,
+  });
+  let callbacks = 0;
+
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      callbacks += 1;
+      await transaction.query("SELECT 1");
+    }),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+    },
+  );
+  assert.equal(callbacks, 1);
+  assert.equal(pool.connectCalls, 1);
+  assert.equal(client.releaseCalls.length, 1);
+  assert.equal(client.releaseCalls[0].length, 1);
+  assert.ok(client.releaseCalls[0][0] instanceof Error);
+  client.assertExhausted();
+});
+
 test("a query error marker cannot be replayed into a later attempt", async () => {
   const firstFailure = pgError("40001");
   const first = new FakeClient([
@@ -372,6 +688,42 @@ test("runSerializable retries a server-proved serialization rollback at COMMIT",
   assert.deepEqual(second.releaseCalls, [[]]);
   first.assertExhausted();
   second.assertExhausted();
+});
+
+test("a protocol marker cannot be replayed by a later local COMMIT error", async () => {
+  const reusedFailure = pgError("40001", "reused serialization failure");
+  const beginClient = new FakeClient([reusedFailure]);
+  const commitClient = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:13.000Z"),
+    transactionIdResult(),
+    () => {
+      throw reusedFailure;
+    },
+    {},
+  ]);
+  const pool = new FakePool([beginClient, commitClient]);
+  const store = new PostgresSerializableStore({
+    maxTransactionAttempts: 1,
+    dedicatedPool: pool,
+  });
+
+  await assertStoreError(
+    store.runSerializable(() => assert.fail("callback must not run")),
+    {
+      code: "transaction_begin_failed",
+      commitState: "not-committed",
+    },
+  );
+  await assertStoreError(store.runSerializable(() => "value"), {
+    code: "transaction_commit_outcome_uncertain",
+    commitState: "uncertain",
+  });
+  assert.equal(pool.connectCalls, 2);
+  assert.deepEqual(beginClient.releaseCalls, [[reusedFailure]]);
+  assert.deepEqual(commitClient.releaseCalls, [[reusedFailure]]);
+  beginClient.assertExhausted();
+  commitClient.assertExhausted();
 });
 
 test("runSerializable never retries an uncertain failed COMMIT", async () => {

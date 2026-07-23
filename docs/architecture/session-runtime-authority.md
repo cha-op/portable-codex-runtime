@@ -62,7 +62,12 @@ option; legacy or ambiguous `pool` input is rejected. It:
 2. obtains `transaction_timestamp()` and a transaction ID from that same
    database transaction;
 3. exposes only a callback-scoped extended-protocol `query(text, values?)`
-   capability and the canonical timestamp;
+   capability and the canonical timestamp; parameter input must be a built-in,
+   non-Proxy array with at most 65,535 entries, and every entry is copied into
+   an own data property that accepts only `null`, `undefined`, string, number,
+   boolean, or bigint values, so node-postgres never invokes application
+   converters while classifying a database retry; callers serialize structured
+   values to strings and use explicit SQL casts such as `$1::jsonb`;
 4. rejects an unsettled or suppressed failed query;
 5. rechecks the transaction ID after every successful user query so
    callback-issued transaction control cannot be hidden by a later throw, and
@@ -71,10 +76,14 @@ option; legacy or ambiguous `pool` input is rejected. It:
 6. accepts only an exact node-postgres `COMMIT` acknowledgement, then verifies
    another `DISCARD ALL` before returning the client to its dedicated pool.
 
-Serialization failures and deadlocks may be retried only after PostgreSQL has
-returned the exact transaction-rollback SQLSTATE and the client has been
-destroyed or reset after a proved rollback. That rule also covers a `40001`
-detected during `COMMIT`. A transport failure or any other `COMMIT` error is
+Serialization failures and deadlocks may be retried only when the same
+node-postgres `DatabaseError` object was first observed on that client's
+`errorMessage` connection event and then rejected the active query with the
+exact transaction-rollback SQLSTATE. The client is destroyed or reset after a
+proved rollback. Merely constructing `DatabaseError` or matching its `code` is
+insufficient: custom parameter conversion and result-parser failures never
+receive protocol provenance. That rule also covers a server `40001` detected
+during `COMMIT`. A transport failure or any other `COMMIT` error is
 outcome-uncertain and is never automatically replayed as a fresh operation.
 Reset failure destroys the connection and preserves the already proved
 committed or not-committed outcome. User-query failures without a SQLSTATE,

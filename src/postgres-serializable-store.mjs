@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { isProxy } from "node:util/types";
+
+import { DatabaseError } from "pg";
 
 export const SESSION_AUTHORITY_MIGRATION_VERSION = 1;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
@@ -11,7 +14,16 @@ const MIGRATION_URL = new URL(
 );
 const MIGRATION_LOCK_KEY = "7275632827684484689";
 const RETRYABLE_TRANSACTION_CODES = new Set(["40001", "40P01"]);
+const QUERY_PARAMETER_TYPES = new Set([
+  "bigint",
+  "boolean",
+  "number",
+  "string",
+  "undefined",
+]);
+const MAX_QUERY_PARAMETERS = 65_535;
 const COMMIT_STATES = new Set(["committed", "not-committed", "uncertain"]);
+const PROTOCOL_ERROR_SQLSTATES = new WeakMap();
 const ERROR_MESSAGES = Object.freeze({
   client_reset_failed: "PostgreSQL client reset failed",
   client_release_failed: "PostgreSQL client release failed",
@@ -113,19 +125,18 @@ function validateAttemptLimit(value) {
   return value;
 }
 
-function safeSqlState(error) {
+function observedProtocolSqlState(error) {
   try {
-    return typeof error?.code === "string" &&
-      /^[0-9A-Z]{5}$/u.test(error.code)
-      ? error.code
-      : undefined;
+    const sqlState = PROTOCOL_ERROR_SQLSTATES.get(error);
+    PROTOCOL_ERROR_SQLSTATES.delete(error);
+    return sqlState;
   } catch {
     return undefined;
   }
 }
 
 function hasRetryableTransactionSqlState(error) {
-  return RETRYABLE_TRANSACTION_CODES.has(safeSqlState(error));
+  return RETRYABLE_TRANSACTION_CODES.has(observedProtocolSqlState(error));
 }
 
 function isTrustedUserQueryRejectionSqlState(sqlState) {
@@ -136,17 +147,111 @@ function isTrustedUserQueryRejectionSqlState(sqlState) {
   );
 }
 
+function copyQueryValues(values) {
+  try {
+    if (
+      isProxy(values) ||
+      !Array.isArray(values) ||
+      Object.getPrototypeOf(values) !== Array.prototype
+    ) {
+      throw new TypeError("query values must use the built-in Array prototype");
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(values, "length");
+    const length = lengthDescriptor?.value;
+    if (
+      !Object.hasOwn(lengthDescriptor ?? {}, "value") ||
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > MAX_QUERY_PARAMETERS
+    ) {
+      throw new TypeError("query values length is invalid");
+    }
+
+    const copied = new Array(length);
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
+      if (descriptor !== undefined && !Object.hasOwn(descriptor, "value")) {
+        throw new TypeError("query values must use plain data fields");
+      }
+      const value = descriptor?.value;
+      if (
+        value !== null &&
+        !QUERY_PARAMETER_TYPES.has(typeof value)
+      ) {
+        throw new TypeError("query values must be primitive data");
+      }
+      Object.defineProperty(copied, String(index), {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+      });
+    }
+    return Object.freeze(copied);
+  } catch {
+    throw storeError("transaction_query_invalid");
+  }
+}
+
 function validateClient(client) {
-  return (
-    client !== null &&
-    ["object", "function"].includes(typeof client) &&
-    typeof client.query === "function" &&
-    typeof client.release === "function"
-  );
+  try {
+    return (
+      client !== null &&
+      ["object", "function"].includes(typeof client) &&
+      typeof client.query === "function" &&
+      typeof client.release === "function" &&
+      client.connection !== null &&
+      typeof client.connection === "object" &&
+      typeof client.connection.prependListener === "function" &&
+      typeof client.connection.removeListener === "function"
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function clientQuery(client, ...args) {
-  return Reflect.apply(client.query, client, args);
+  const observed = new WeakMap();
+  const observeProtocolError = (error) => {
+    try {
+      if (
+        error instanceof DatabaseError &&
+        error.name === "error" &&
+        typeof error.code === "string" &&
+        /^[0-9A-Z]{5}$/u.test(error.code)
+      ) {
+        observed.set(error, error.code);
+      }
+    } catch {
+      // An invalid event payload cannot become trusted protocol evidence.
+    }
+  };
+
+  Reflect.apply(
+    client.connection.prependListener,
+    client.connection,
+    ["errorMessage", observeProtocolError],
+  );
+  try {
+    return await Reflect.apply(client.query, client, args);
+  } catch (error) {
+    try {
+      PROTOCOL_ERROR_SQLSTATES.delete(error);
+      const sqlState = observed.get(error);
+      if (sqlState !== undefined) {
+        PROTOCOL_ERROR_SQLSTATES.set(error, sqlState);
+      }
+    } catch {
+      // Preserve the query failure without adding protocol provenance.
+    }
+    throw error;
+  } finally {
+    Reflect.apply(
+      client.connection.removeListener,
+      client.connection,
+      ["errorMessage", observeProtocolError],
+    );
+  }
 }
 
 async function acquireClient(pool) {
@@ -344,13 +449,19 @@ function createTransactionCapability(client, now, transactionId) {
   let terminalQueryError;
   const pending = new Set();
   const queryErrorSqlStates = new WeakMap();
+  const markLocalQueryError = () => {
+    const error = storeError("transaction_query_invalid");
+    firstQueryFailure ??= Object.freeze({ error, source: "local" });
+    terminalQueryError ??= error;
+    return error;
+  };
   const markQueryError = (error) => {
-    const sqlState = safeSqlState(error);
+    const sqlState = observedProtocolSqlState(error);
     if (!isTrustedUserQueryRejectionSqlState(sqlState)) {
       boundaryLost = true;
       return storeError("transaction_boundary_lost", "uncertain");
     }
-    firstQueryFailure ??= Object.freeze({ error });
+    firstQueryFailure ??= Object.freeze({ error, source: "server" });
     if (
       error !== null &&
       ["object", "function"].includes(typeof error)
@@ -367,17 +478,28 @@ function createTransactionCapability(client, now, transactionId) {
     if (
       (args.length !== 1 && args.length !== 2) ||
       typeof args[0] !== "string" ||
-      args[0].length === 0 ||
-      (args.length === 2 && !Array.isArray(args[1]))
+      args[0].length === 0
     ) {
-      return Promise.reject(storeError("transaction_query_invalid"));
+      queryCount += 1;
+      return Promise.reject(markLocalQueryError());
+    }
+    if (terminalQueryError !== undefined) {
+      return Promise.reject(terminalQueryError);
+    }
+
+    let values;
+    try {
+      values = args.length === 2 ? copyQueryValues(args[1]) : Object.freeze([]);
+    } catch {
+      queryCount += 1;
+      return Promise.reject(markLocalQueryError());
     }
 
     queryCount += 1;
     const queryConfig = Object.freeze({
       queryMode: "extended",
       text: args[0],
-      values: args.length === 2 ? [...args[1]] : [],
+      values,
     });
     const operation = queryQueue.then(async () => {
       if (terminalQueryError !== undefined) throw terminalQueryError;
@@ -387,7 +509,7 @@ function createTransactionCapability(client, now, transactionId) {
 
       let result;
       try {
-        result = await Reflect.apply(client.query, client, [queryConfig]);
+        result = await clientQuery(client, queryConfig);
       } catch (error) {
         terminalQueryError = markQueryError(error);
         throw terminalQueryError;
@@ -435,6 +557,7 @@ function createTransactionCapability(client, now, transactionId) {
     },
     isQueryError: (error) =>
       firstQueryFailure !== undefined &&
+      firstQueryFailure.source === "server" &&
       (Object.is(firstQueryFailure.error, error) ||
         (error !== null &&
           ["object", "function"].includes(typeof error) &&
