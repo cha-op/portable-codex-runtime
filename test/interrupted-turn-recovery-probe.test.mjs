@@ -32,12 +32,14 @@ import {
   decodePortablePathBytes as recoveryProbeDecodePortablePathBytes,
   digestTree as recoveryProbeDigestTree,
   interruptedTurnRecoveryFailureReport,
+  injectRecoveryRolloutTailDamage,
   inspectLinuxRecoveryAcl as recoveryProbeInspectLinuxRecoveryAcl,
   parseDarwinMountTable as recoveryProbeParseDarwinMountTable,
   parseLinuxGetfacl as recoveryProbeParseLinuxGetfacl,
   parseLinuxMountInfo as recoveryProbeParseLinuxMountInfo,
   probeInterruptedTurnRecovery,
   removeTreeForCleanup as recoveryProbeRemoveTreeForCleanup,
+  runRecoveryScenario,
   runInterruptedTurnRecoveryCli,
   startRecoveryClient,
   terminateAppServer,
@@ -61,6 +63,7 @@ import {
   stoppedTreesShareAnyIdentity,
   syncStoppedTree,
 } from "../src/stopped-tree.mjs";
+import { SYNTHETIC_API_KEY_A } from "./synthetic-token-fixtures.mjs";
 
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
 
@@ -74,6 +77,34 @@ async function inspectTestPersistentObjectIdentity(path) {
 }
 
 function scenarioReport(kind) {
+  const repairAction =
+    kind === "missing_final_lf_repair"
+      ? "append_lf"
+      : kind === "torn_unterminated_tail_repair"
+        ? "truncate_partial_tail"
+        : undefined;
+  if (repairAction) {
+    return {
+      kind,
+      turnMaterialized: true,
+      terminationObserved: "SIGKILL",
+      originalCompletionObserved: false,
+      restoredWritableCopyUsed: true,
+      immutableBackupUnchanged: true,
+      repairInvocationCount: 1,
+      repairFileCount: 1,
+      repairChangedFileCount: 1,
+      repairAction,
+      resumeSucceeded: true,
+      sameThreadId: true,
+      interruptedTailRecovered: true,
+      abortMarkerObserved: false,
+      followUpCompleted: true,
+      followUpTurnReadbackCompleted: true,
+      modelRequestCount: 2,
+      extraModelRequestObserved: false,
+    };
+  }
   return {
     kind,
     turnMaterialized: true,
@@ -141,13 +172,14 @@ function completeEvidenceReport() {
     return scenario;
   });
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     probe: "interrupted-turn-recovery",
     runtime: {
-      codexVersion: "codex-cli 0.142.4",
+      codexVersion: "codex-cli 0.144.1",
       codexBinarySha256: "a".repeat(64),
       binaryExecution: "private-read-only-copy",
-      sourceAnalysisCommit: "b".repeat(40),
+      compatibilityClaim: "same-pinned-executable",
+      sourceAnalysisCommit: PINNED_SOURCE_ANALYSIS_COMMIT,
       platform: "darwin",
       launcherArch: "arm64",
     },
@@ -343,6 +375,215 @@ test("follow-up turn identity is present and distinct from the interrupted turn"
       () => assertNewTurnId(turnId, "turn-interrupted"),
       /omitted its ID|reused the interrupted turn ID/,
     );
+  }
+});
+
+test("recovery rollout damage injection covers missing LF and torn tail deterministically", async () => {
+  const root = await mkdtemp(join(tmpdir(), "portable-rollout-damage-test-"));
+  try {
+    const rootSessionId = "root-thread";
+    const makeRollout = async (name) => {
+      const codexHome = join(root, name, "codex-home");
+      const sessions = join(codexHome, "sessions", "2026", "07", "15");
+      await mkdir(sessions, { recursive: true });
+      const path = join(sessions, "rollout.jsonl");
+      const records = [
+        {
+          type: "session_meta",
+          payload: { id: rootSessionId, session_id: rootSessionId },
+        },
+        { type: "event_msg", payload: { type: "turn_started" } },
+      ];
+      const bytes = Buffer.from(
+        `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+        "utf8",
+      );
+      await writeFile(path, bytes, { mode: 0o600 });
+      return { bytes, codexHome, path };
+    };
+
+    const missingLf = await makeRollout("missing-lf");
+    await injectRecoveryRolloutTailDamage({
+      codexHome: missingLf.codexHome,
+      damage: "remove_final_lf",
+      rootSessionId,
+    });
+    const missingLfBytes = await readFile(missingLf.path);
+    assert.deepEqual(missingLfBytes, missingLf.bytes.subarray(0, missingLf.bytes.length - 1));
+    assert.notEqual(missingLfBytes.at(-1), 0x0a);
+    assert.doesNotThrow(() =>
+      JSON.parse(missingLfBytes.subarray(missingLfBytes.lastIndexOf(0x0a) + 1).toString("utf8")),
+    );
+
+    const tornTail = await makeRollout("torn-tail");
+    await injectRecoveryRolloutTailDamage({
+      codexHome: tornTail.codexHome,
+      damage: "append_partial_record",
+      rootSessionId,
+    });
+    const tornTailBytes = await readFile(tornTail.path);
+    assert.deepEqual(tornTailBytes.subarray(0, tornTail.bytes.length), tornTail.bytes);
+    assert.notEqual(tornTailBytes.at(-1), 0x0a);
+    assert.throws(() =>
+      JSON.parse(tornTailBytes.subarray(tornTail.bytes.length).toString("utf8")),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("tail repair scenarios repair once and cold-read the exact completed follow-up", async () => {
+  for (const [kind, expectedAction] of [
+    ["missing_final_lf_repair", "append_lf"],
+    ["torn_unterminated_tail_repair", "truncate_partial_tail"],
+  ]) {
+    const requests = [];
+    const mock = {
+      baseUrl: "http://127.0.0.1:1/v1",
+      close: async () => {},
+      requestBody: (index) => requests[index],
+      requestCount: () => requests.length,
+      waitForRequest: async (count) => assert(requests.length >= count),
+    };
+    const threadId = "root-thread";
+    const interruptedTurnId = "interrupted-turn";
+    const followUpTurnId = "follow-up-turn";
+    let clientCount = 0;
+    let originalWorkspace;
+    let restoredWorkspace;
+    let repairInvocationCount = 0;
+    const startClient = async ({ codexHome }) => {
+      clientCount += 1;
+      const ordinal = clientCount;
+      return {
+        abort: async () => {},
+        stop: async () => {},
+        async request(method, params) {
+          if (ordinal === 1 && method === "thread/start") {
+            originalWorkspace = params.cwd;
+            return { thread: { id: threadId } };
+          }
+          if (ordinal === 1 && method === "turn/start") {
+            const sessions = join(codexHome, "sessions", "2026", "07", "15");
+            await mkdir(sessions, { recursive: true, mode: 0o700 });
+            const records = [
+              {
+                type: "session_meta",
+                payload: { id: threadId, session_id: threadId },
+              },
+              { type: "event_msg", payload: { type: "turn_started" } },
+            ];
+            await writeFile(
+              join(sessions, "rollout.jsonl"),
+              `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+              { mode: 0o600 },
+            );
+            requests.push(JSON.stringify({ input: [] }));
+            return { turn: { id: interruptedTurnId } };
+          }
+          if (ordinal === 2 && method === "thread/resume") {
+            assert.equal(params.threadId, threadId);
+            restoredWorkspace = params.cwd;
+            return {
+              cwd: restoredWorkspace,
+              thread: {
+                id: threadId,
+                turns: [{ id: interruptedTurnId, status: "interrupted" }],
+              },
+            };
+          }
+          if (ordinal === 2 && method === "turn/start") {
+            assert.equal(params.threadId, threadId);
+            const environmentMessage = (cwd) => ({
+              type: "message",
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: `<environment_context>\n<cwd>${cwd}</cwd>\n</environment_context>`,
+                },
+              ],
+            });
+            requests.push(
+              JSON.stringify({
+                input: [environmentMessage(originalWorkspace), environmentMessage(restoredWorkspace)],
+              }),
+            );
+            return { turn: { id: followUpTurnId } };
+          }
+          if (ordinal === 3 && method === "thread/read") {
+            assert.deepEqual(params, { threadId, includeTurns: true });
+            return {
+              thread: {
+                id: threadId,
+                turns: [
+                  { id: interruptedTurnId, status: "interrupted" },
+                  { id: followUpTurnId, status: "completed" },
+                ],
+              },
+            };
+          }
+          assert.fail(`unexpected client ${ordinal} request: ${method}`);
+        },
+        async waitForNotification(method) {
+          assert.equal(method, "turn/completed");
+          if (ordinal === 1) throw new Error("synthetic SIGKILL shutdown");
+          return {
+            params: { turn: { id: followUpTurnId, status: "completed" } },
+          };
+        },
+      };
+    };
+    const repairRollouts = async ({ codexHome, rootSessionId, runtimeIdentity }) => {
+      repairInvocationCount += 1;
+      assert.equal(rootSessionId, threadId);
+      assert.equal(runtimeIdentity.codexVersion, "codex-cli 0.144.1");
+      const path = join(codexHome, "sessions", "2026", "07", "15", "rollout.jsonl");
+      const bytes = await readFile(path);
+      if (expectedAction === "append_lf") {
+        assert.notEqual(bytes.at(-1), 0x0a);
+        await writeFile(path, Buffer.concat([bytes, Buffer.from("\n")]));
+      } else {
+        assert.notEqual(bytes.at(-1), 0x0a);
+        const lastLf = bytes.lastIndexOf(0x0a);
+        assert(lastLf >= 0);
+        await writeFile(path, bytes.subarray(0, lastLf + 1));
+      }
+      return {
+        rootSessionId,
+        files: [
+          {
+            action: expectedAction,
+            before: { sha256: "private", size: 1 },
+            after: { sha256: "private", size: 1 },
+            relativePath: "private",
+            removedBytes: 0,
+          },
+        ],
+      };
+    };
+
+    const report = await runRecoveryScenario({
+      codexBin: process.execPath,
+      copyTree: copyStoppedTree,
+      kind,
+      repairRollouts,
+      runtimeIdentity: {
+        codexVersion: "codex-cli 0.144.1",
+        codexBinarySha256: "a".repeat(64),
+        sourceAnalysisCommit: PINNED_SOURCE_ANALYSIS_COMMIT,
+      },
+      startClient,
+      startMock: async () => mock,
+      temporaryRoot: tmpdir(),
+      terminateClient: async (_client, signal) => ({ signal }),
+    });
+    assert.equal(clientCount, 3);
+    assert.equal(repairInvocationCount, 1);
+    assert.equal(report.repairAction, expectedAction);
+    assert.equal(report.followUpTurnReadbackCompleted, true);
+    assert.equal(report.extraModelRequestObserved, false);
+    assert.equal(report.modelRequestCount, 2);
   }
 });
 
@@ -2234,20 +2475,20 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
     assert.throws(
       () => assertRecoveryEvidenceSafe({ ...report, schemaVersion: 1 }),
-      /1 !== 5/,
+      /1 !== 6/,
     );
     for (const unsafe of [
       { ...report, cwd: "/Users/example/private" },
       { ...report, value: "123e4567-e89b-42d3-a456-426614174000" },
       { ...report, prompt: "portable recovery probe" },
       { ...report, marker: "<turn_aborted>" },
-      { ...report, apiKey: "sk-secret-sentinel" },
+      { ...report, apiKey: SYNTHETIC_API_KEY_A.api_key },
       { ...report, path: "/var/folders/private-state" },
     ]) {
       assert.throws(() => assertRecoveryEvidenceSafe(unsafe), /unexpected fields|disallowed runtime data/);
     }
     for (const codexVersion of [
-      "sk-secret-sentinel",
+      SYNTHETIC_API_KEY_A.api_key,
       "123e4567-e89b-42d3-a456-426614174000",
       "/var/folders/private-state",
       "/srv/portable/private-state",
@@ -2261,6 +2502,19 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
         /disallowed runtime data|did not match/,
       );
     }
+    for (const [field, value] of [
+      ["codexVersion", "codex-cli 0.144.2"],
+      ["sourceAnalysisCommit", "0".repeat(40)],
+    ]) {
+      assert.throws(
+        () =>
+          assertRecoveryEvidenceSafe({
+            ...report,
+            runtime: { ...report.runtime, [field]: value },
+          }),
+        /does not match the tail-repair pin/,
+      );
+    }
     assert.throws(
       () =>
         assertRecoveryEvidenceSafe({
@@ -2270,16 +2524,16 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
       /launcherArch is not a recognized Node architecture/,
     );
     const escapedSecret = JSON.stringify(report).replace(
-      "codex-cli 0.142.4",
-      "codex-cli 0.142.4-s\\u006b-secret-sentinel",
+      "codex-cli 0.144.1",
+      "codex-cli 0.144.1-s\\u006b-secret-sentinel",
     );
     assert.throws(
       () => assertRecoveryEvidenceSafe(escapedSecret),
       /disallowed runtime data/,
     );
     const duplicateEscapedSecret = JSON.stringify(report).replace(
-      '"codexVersion":"codex-cli 0.142.4"',
-      '"codexVersion":"s\\u006b-secret-sentinel","codexVersion":"codex-cli 0.142.4"',
+      '"codexVersion":"codex-cli 0.144.1"',
+      '"codexVersion":"s\\u006b-secret-sentinel","codexVersion":"codex-cli 0.144.1"',
     );
     assert.throws(
       () => assertRecoveryEvidenceSafe(duplicateEscapedSecret),
@@ -2287,8 +2541,8 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     const nestedSecret = String.raw`{"token":"s\u006b-secret-sentinel"}`;
     const duplicateNestedSecret = JSON.stringify(report).replace(
-      '"codexVersion":"codex-cli 0.142.4"',
-      `"codexVersion":${JSON.stringify(nestedSecret)},"codexVersion":"codex-cli 0.142.4"`,
+      '"codexVersion":"codex-cli 0.144.1"',
+      `"codexVersion":${JSON.stringify(nestedSecret)},"codexVersion":"codex-cli 0.144.1"`,
     );
     assert.throws(
       () => assertRecoveryEvidenceSafe(duplicateNestedSecret),
@@ -2296,11 +2550,11 @@ test("recovery evidence is allowlisted and rejects identifiers, paths, and promp
     );
     const serialized = JSON.stringify(report);
     for (const duplicate of [
-      serialized.replace('"schemaVersion":5', '"schemaVersion":1,"schemaVersion":5'),
+      serialized.replace('"schemaVersion":6', '"schemaVersion":1,"schemaVersion":6'),
       serialized.replace('"result":"passed"', '"result":"failed","result":"passed"'),
       serialized.replace(
-        '"schemaVersion":5',
-        '"\\u0073chemaVersion":1,"schemaVersion":5',
+        '"schemaVersion":6',
+        '"\\u0073chemaVersion":1,"schemaVersion":6',
       ),
     ]) {
       assert.throws(
@@ -2391,13 +2645,14 @@ test("tracked interrupted-turn recovery evidence matches the pinned run", async 
   assert.equal(assertRecoveryEvidenceSafe(raw), raw);
   const report = JSON.parse(raw);
 
-  assert.equal(report.schemaVersion, 5);
+  assert.equal(report.schemaVersion, 6);
   assert.equal(report.probe, "interrupted-turn-recovery");
-  assert.equal(report.runtime.codexVersion, "codex-cli 0.142.4");
+  assert.equal(report.runtime.codexVersion, "codex-cli 0.144.1");
   assert.equal(
     report.runtime.codexBinarySha256,
-    "32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5",
+    "29915529b97697def1a957b0505e770aa6a45744435d62fc263e98d7619e167a",
   );
+  assert.equal(report.runtime.compatibilityClaim, "same-pinned-executable");
   assert.equal(report.runtime.sourceAnalysisCommit, PINNED_SOURCE_ANALYSIS_COMMIT);
   assert.equal(report.runtime.platform, "darwin");
   assert.equal(report.runtime.launcherArch, "arm64");
@@ -2608,10 +2863,11 @@ test("model workspace evidence distinguishes canonical history from active conte
   );
 });
 
-test("probe report contains all four recovery scenarios without runtime identifiers", async () => {
+test("probe report contains the complete recovery matrix without runtime identifiers", async () => {
   const calls = [];
   const scenarioBinaries = [];
   const scenarioRoots = [];
+  const runtimeIdentities = [];
   let versionBinary;
   let versionContext;
   const report = await probeInterruptedTurnRecovery({
@@ -2620,20 +2876,30 @@ test("probe report contains all four recovery scenarios without runtime identifi
     readCodexVersion: (codexBin, context) => {
       versionBinary = codexBin;
       versionContext = context;
-      return "codex-cli 0.142.4";
+      return "codex-cli 0.144.1";
     },
-    runScenario: async ({ codexBin, kind, temporaryRoot }) => {
+    runScenario: async ({ codexBin, kind, runtimeIdentity, temporaryRoot }) => {
       calls.push(kind);
       scenarioBinaries.push(codexBin);
       scenarioRoots.push(temporaryRoot);
+      runtimeIdentities.push(runtimeIdentity);
       return scenarioReport(kind);
     },
   });
   assert.deepEqual(calls, RECOVERY_SCENARIOS);
-  assert.equal(report.schemaVersion, 5);
+  assert.equal(report.schemaVersion, 6);
   assert.equal(report.runtime.binaryExecution, "private-read-only-copy");
+  assert.equal(report.runtime.compatibilityClaim, "same-pinned-executable");
   assert(scenarioBinaries.every((binary) => binary === versionBinary));
   assert(scenarioRoots.every((root) => root === dirname(versionBinary)));
+  assert(
+    runtimeIdentities.every(
+      (identity) =>
+        identity.codexVersion === report.runtime.codexVersion &&
+        identity.codexBinarySha256 === report.runtime.codexBinarySha256 &&
+        identity.sourceAnalysisCommit === report.runtime.sourceAnalysisCommit,
+    ),
+  );
   assert.notEqual(versionBinary, process.execPath);
   assert.equal(versionContext.cwd, versionContext.env.CODEX_HOME);
   assert.equal(versionContext.env.OPENAI_API_KEY, undefined);
@@ -2644,7 +2910,7 @@ test("probe report contains all four recovery scenarios without runtime identifi
   assert.equal(report.backend.credentialInputProvisioned, false);
   assert.equal(report.backend.outboundNetworkIsolated, false);
   assert.equal(report.snapshot.kind, "stopped-tree-copy");
-  assert.equal(report.scenarios.length, 4);
+  assert.equal(report.scenarios.length, 6);
   assert.doesNotThrow(() => assertRecoveryEvidenceSafe(report));
 });
 
@@ -2655,7 +2921,7 @@ test("probe rejects private binary mode changes between scenarios", async () => 
     probeInterruptedTurnRecovery({
       ...TRUSTED_RECOVERY_ACL,
       codexBin: process.execPath,
-      readCodexVersion: () => "codex-cli 0.142.4",
+      readCodexVersion: () => "codex-cli 0.144.1",
       runScenario: async ({ codexBin, kind }) => {
         privateBinary = codexBin;
         calls += 1;
@@ -2679,7 +2945,7 @@ test("probe stages its private binary under an explicit executable root", async 
       executableRoot,
       readCodexVersion: (codexBin) => {
         privateBinary = codexBin;
-        return "codex-cli 0.142.4";
+        return "codex-cli 0.144.1";
       },
       runScenario: async ({ kind }) => scenarioReport(kind),
     });
@@ -2699,7 +2965,7 @@ test("probe rejects an untrusted writable executable root", async () => {
         ...TRUSTED_RECOVERY_ACL,
         codexBin: process.execPath,
         executableRoot,
-        readCodexVersion: () => "codex-cli 0.142.4",
+        readCodexVersion: () => "codex-cli 0.144.1",
         runScenario: async ({ kind }) => scenarioReport(kind),
       }),
       /recovery executable root must have trusted ownership and permissions/,
@@ -2723,7 +2989,7 @@ test("probe rejects an executable root below an unsafe ancestor", async () => {
         ...TRUSTED_RECOVERY_ACL,
         codexBin: process.execPath,
         executableRoot,
-        readCodexVersion: () => "codex-cli 0.142.4",
+        readCodexVersion: () => "codex-cli 0.144.1",
         runScenario: async ({ kind }) => scenarioReport(kind),
       }),
       /recovery executable root ancestor chain is not trusted/,
@@ -2743,7 +3009,7 @@ test("probe rejects executable-root ACLs through the inspection seam", async () 
         executableRoot,
         inspectExecutableAncestorAcl: async () => false,
         inspectExecutableRootAcl: async () => true,
-        readCodexVersion: () => "codex-cli 0.142.4",
+        readCodexVersion: () => "codex-cli 0.144.1",
         runScenario: async ({ kind }) => scenarioReport(kind),
       }),
       /recovery executable root must not have extended access controls/,

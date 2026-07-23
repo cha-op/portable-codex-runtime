@@ -24,6 +24,7 @@ import {
   validateEvidenceDestination,
   writeEvidenceSafely,
 } from "../src/live-app-server-auth-probe.mjs";
+import { SYNTHETIC_REFRESH_I } from "./synthetic-token-fixtures.mjs";
 
 function encodeJwt(payload) {
   const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
@@ -225,14 +226,16 @@ test("dedicated credential metadata is redacted before evidence is written", asy
 
 test("malformed dedicated auth JSON errors omit credential fragments", async () => {
   const authHome = await mkdtemp(join(tmpdir(), "portable-codex-malformed-auth-"));
-  const sensitiveFragment = "REFRESH_TOKEN_SECRET_SENTINEL";
+  const malformedAuth = JSON.stringify({
+    refresh_token: SYNTHETIC_REFRESH_I.refresh_token,
+  }).slice(0, -1);
   try {
-    await writeFile(join(authHome, "auth.json"), `{"refresh_token":"${sensitiveFragment}"`, {
+    await writeFile(join(authHome, "auth.json"), malformedAuth, {
       mode: 0o600,
     });
     await assert.rejects(readDedicatedChatgptCredential(authHome), (error) => {
       assert.equal(error.message, "dedicated auth.json is not valid JSON");
-      assert.doesNotMatch(error.stack, /REFRESH_TOKEN_SECRET_SENTINEL/);
+      assert.equal(error.stack.includes(SYNTHETIC_REFRESH_I.refresh_token), false);
       return true;
     });
   } finally {

@@ -1,10 +1,11 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "probe": "interrupted-turn-recovery",
   "runtime": {
-    "codexVersion": "codex-cli 0.142.4",
-    "codexBinarySha256": "32b3b3a3e8e19b09f2b74979ca2a7f6890dc88b8335bb0e1913a0ad68a6505b5",
+    "codexVersion": "codex-cli 0.144.1",
+    "codexBinarySha256": "29915529b97697def1a957b0505e770aa6a45744435d62fc263e98d7619e167a",
     "binaryExecution": "private-read-only-copy",
+    "compatibilityClaim": "same-pinned-executable",
     "sourceAnalysisCommit": "db887d03e1f907467e33271572dffb73bceecd6b",
     "platform": "darwin",
     "launcherArch": "arm64"
@@ -71,6 +72,46 @@
       "tailTurnStatus": "interrupted",
       "threadReadAgrees": true,
       "modelAbortMarker": "absent"
+    },
+    {
+      "kind": "missing_final_lf_repair",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGKILL",
+      "originalCompletionObserved": false,
+      "restoredWritableCopyUsed": true,
+      "immutableBackupUnchanged": true,
+      "repairInvocationCount": 1,
+      "repairFileCount": 1,
+      "repairChangedFileCount": 1,
+      "repairAction": "append_lf",
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "interruptedTailRecovered": true,
+      "abortMarkerObserved": false,
+      "followUpCompleted": true,
+      "followUpTurnReadbackCompleted": true,
+      "modelRequestCount": 2,
+      "extraModelRequestObserved": false
+    },
+    {
+      "kind": "torn_unterminated_tail_repair",
+      "turnMaterialized": true,
+      "terminationObserved": "SIGKILL",
+      "originalCompletionObserved": false,
+      "restoredWritableCopyUsed": true,
+      "immutableBackupUnchanged": true,
+      "repairInvocationCount": 1,
+      "repairFileCount": 1,
+      "repairChangedFileCount": 1,
+      "repairAction": "truncate_partial_tail",
+      "resumeSucceeded": true,
+      "sameThreadId": true,
+      "interruptedTailRecovered": true,
+      "abortMarkerObserved": false,
+      "followUpCompleted": true,
+      "followUpTurnReadbackCompleted": true,
+      "modelRequestCount": 2,
+      "extraModelRequestObserved": false
     }
   ],
   "result": "passed"

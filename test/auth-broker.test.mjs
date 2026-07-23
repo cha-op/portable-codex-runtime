@@ -11,6 +11,7 @@ import {
   authBrokerErrorMetadata,
 } from "../src/auth-broker.mjs";
 import { EncryptedAuthStateStore } from "../src/encrypted-auth-state-store.mjs";
+import { SYNTHETIC_REFRESH_J } from "./synthetic-token-fixtures.mjs";
 
 const NOW = Date.parse("2026-07-03T00:00:00.000Z");
 const ACCOUNT_ID = "account-1";
@@ -47,7 +48,7 @@ function nonCanonicalBase64UrlAlias(segment) {
   assert.fail(`test segment has no non-canonical base64url alias: ${segment}`);
 }
 
-function jwtWithInvalidUtf8Marker(token, marker) {
+function makeInvalidJwt(token, marker) {
   const parts = token.split(".");
   const payload = Buffer.from(parts[1], "base64url");
   const markerOffset = payload.indexOf(Buffer.from(marker, "utf8"));
@@ -868,7 +869,7 @@ test("JWTs require canonical compact segments and valid payload UTF-8 before per
     {
       name: "invalid UTF-8 access-token payload",
       credential: makeCredential({
-        accessToken: jwtWithInvalidUtf8Marker(makeAccessToken(), "access-1"),
+        accessToken: makeInvalidJwt(makeAccessToken(), "access-1"),
       }),
     },
     {
@@ -892,7 +893,7 @@ test("JWTs require canonical compact segments and valid payload UTF-8 before per
     {
       name: "invalid UTF-8 ID-token payload",
       credential: makeCredential({
-        idToken: jwtWithInvalidUtf8Marker(
+        idToken: makeInvalidJwt(
           idTokenWithIgnoredMarker,
           "id-invalid-utf8-marker",
         ),
@@ -1913,7 +1914,7 @@ test("post-dispatch blocks retain the recovery fence", async () => {
   );
   const recovered = makeCredential({
     marker: "access-recovered-after-block",
-    refreshToken: "refresh-recovered-after-block",
+    refreshToken: SYNTHETIC_REFRESH_J.refresh_token,
   });
   assert.deepEqual(
     await broker.recoverRefreshReservation({

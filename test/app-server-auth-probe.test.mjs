@@ -32,6 +32,7 @@ import {
   stopAndAssertNoWorkerAuth,
 } from "../src/app-server-auth-probe.mjs";
 import { readDedicatedChatgptCredential } from "../src/live-app-server-auth-probe.mjs";
+import { SYNTHETIC_REFRESH_H } from "./synthetic-token-fixtures.mjs";
 
 const configuredCodexBin = process.env.CODEX_BIN ?? "codex";
 const codexBin = resolveAppServerExecutable(configuredCodexBin);
@@ -169,7 +170,7 @@ test("dedicated credentials reject access-token expirations outside the Date ran
     chatgpt_plan_type: "enterprise",
     chatgpt_user_id: "user-invalid-expiration",
   };
-  const refreshToken = "refresh-invalid-expiration-sensitive";
+  const refreshToken = SYNTHETIC_REFRESH_H.refresh_token;
   try {
     await writeFile(
       join(authHome, "auth.json"),
@@ -191,7 +192,7 @@ test("dedicated credentials reject access-token expirations outside the Date ran
     await assert.rejects(readDedicatedChatgptCredential(authHome), (error) => {
       assert.equal(error.name, "AssertionError");
       assert.match(error.message, /finite and within the ECMAScript Date range/);
-      assert.doesNotMatch(error.stack, /refresh-invalid-expiration-sensitive/);
+      assert.equal(error.stack.includes(SYNTHETIC_REFRESH_H.refresh_token), false);
       assert.notEqual(error.name, "RangeError");
       return true;
     });

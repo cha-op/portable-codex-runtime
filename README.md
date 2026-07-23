@@ -5,9 +5,10 @@ app-server sessions between trusted machines while keeping the execution
 environment, workspace, rollout state, and recovery data explicit.
 
 The current repository combines compatibility probes for authentication and
-interrupted-turn recovery with the storage contracts, journal, local
-stopped-directory publication, same-process stopped-writer authority, and a
-composed stopped-directory backend for guarded clean capture, committed-result
+interrupted-turn recovery with an offline, pinned-runtime rollout-tail repair
+primitive, the storage contracts, journal, local stopped-directory
+publication, same-process stopped-writer authority, and a composed
+stopped-directory backend for guarded clean capture, committed-result
 reconciliation, and restore.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
@@ -20,8 +21,11 @@ proves that the installed Codex app-server supports external ChatGPT access-toke
 injection and proves the managed refresh API choreography with an explicitly
 uncontained host probe. Production managed refresh fails closed until a
 per-refresh rootless containment executor is implemented. A separate loopback
-probe characterizes explicit interruption, process signals, hard kills, and a
-stopped-tree restore without using credentials or a real model turn.
+probe characterizes explicit interruption, process signals, hard kills, a
+stopped-tree restore, and both supported rollout-tail repairs without using
+credentials or a real model turn. The repair compatibility evidence binds one
+private Codex executable by version and SHA-256; it does not claim OCI
+same-image recovery.
 
 The `chatgptAuthTokens` protocol is an experimental Codex app-server API. Pin the
 Codex binary or image digest and rerun these probes before upgrading it.
@@ -209,13 +213,19 @@ and catalogue remain separate work. See
 ## Interrupted-Turn Recovery
 
 The recovery probe starts a real Codex app-server against a held localhost
-Responses API mock. It exercises four independent scenarios:
+Responses API mock. It exercises six independent scenarios:
 
 - stable `turn/interrupt`, followed by a cold resume;
 - `SIGTERM` during an active turn;
 - `SIGKILL` during an active turn;
 - `SIGKILL`, a stopped full-tree copy, deletion of the source tree, and restore
-  at a different absolute path.
+  at a different absolute path;
+- `SIGKILL`, removal of the final LF on a stopped-tree-derived writable copy,
+  offline `append_lf` repair, resume, one completed follow-up, and a fresh cold
+  read;
+- `SIGKILL`, injection of an invalid unterminated tail on a stopped-tree-derived
+  writable copy, offline `truncate_partial_tail` repair, resume, one completed
+  follow-up, and a fresh cold read.
 
 The probe verifies the explicit thread ID through both `thread/resume` and
 `thread/read`. Explicit interruption persists a model-visible abort marker.
@@ -243,6 +253,10 @@ and requires a trusted owner, permission, identity, and ACL state across the
 complete ancestor chain. Concurrent mutation by another process with the same
 UID is not a supported security boundary.
 It is not an online, atomic, or power-loss-durable snapshot implementation.
+The two repair scenarios preserve an immutable backup and use the same staged
+private executable before and after repair. This proves
+`same-pinned-executable` compatibility only; production OCI same-image
+resolution, physical restore, and launcher admission remain separate work.
 
 Run the deterministic compatibility probe with the exact Codex binary from the
 pinned runtime image:
@@ -281,7 +295,9 @@ The command provisions no credential input and configures the model provider to
 use the loopback mock. It does not impose OS-level outbound network isolation;
 run it inside a network-isolated container when that stronger evidence is
 required. See `docs/experiments/interrupted-turn-recovery.md` for source
-evidence, exact semantics, and storage limitations.
+evidence and exact probe semantics, and
+`docs/architecture/rollout-tail-repair.md` for the repair contract and storage
+limitations.
 
 ## Managed Auth Refresh Authority
 

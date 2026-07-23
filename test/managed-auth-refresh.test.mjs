@@ -40,6 +40,15 @@ import {
   runUncontainedCodexManagedRefreshProbe,
 } from "../src/managed-auth-refresh.mjs";
 import { AdvisoryLockError, acquireAdvisoryLock } from "../src/advisory-lock.mjs";
+import {
+  SYNTHETIC_REFRESH_A,
+  SYNTHETIC_REFRESH_B,
+  SYNTHETIC_REFRESH_C,
+  SYNTHETIC_REFRESH_D,
+  SYNTHETIC_REFRESH_E,
+  SYNTHETIC_REFRESH_F,
+  SYNTHETIC_REFRESH_G,
+} from "./synthetic-token-fixtures.mjs";
 
 const ACCOUNT_ID = "123e4567-e89b-42d3-a456-426614174088";
 const USER_ID = "user-123e4567-e89b-42d3-a456-426614174088";
@@ -266,7 +275,7 @@ async function createAuthorityHome() {
       authDocument({
         accessMarker: "before",
         lastRefresh: "2026-07-01T08:00:00.000Z",
-        refreshToken: "refresh-before-sensitive",
+        refreshToken: SYNTHETIC_REFRESH_A.refresh_token,
       }),
     )}\n`,
     { mode: 0o600 },
@@ -371,7 +380,7 @@ async function replaceStagedAuth(
     accountId = ACCOUNT_ID,
     expiresAtUnixSeconds,
     lastRefresh = "2026-07-01T08:01:00.000Z",
-    refreshToken = "refresh-after-sensitive",
+    refreshToken = SYNTHETIC_REFRESH_B.refresh_token,
     userId,
   } = {},
 ) {
@@ -1318,7 +1327,7 @@ test("unresolved refresh artifacts block token rotation and expose safe recovery
     authDocument({
       accessMarker: "orphaned",
       lastRefresh: "2026-07-01T08:01:00.000Z",
-      refreshToken: "refresh-orphaned-sensitive",
+      refreshToken: SYNTHETIC_REFRESH_C.refresh_token,
     }),
   )}\n`;
   let refreshCalled = false;
@@ -1355,7 +1364,7 @@ test("unresolved refresh artifacts block token rotation and expose safe recovery
     assert.equal((await stat(promotionCandidate)).isFile(), true);
     assert.equal((await stat(join(attempt, "auth.json"))).isFile(), true);
     const serialized = JSON.stringify(managedAuthRefreshErrorMetadata(refreshError));
-    assert.equal(serialized.includes("refresh-orphaned-sensitive"), false);
+    assert.equal(serialized.includes(SYNTHETIC_REFRESH_C.refresh_token), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1383,7 +1392,7 @@ test("access-token expirations outside the ECMAScript Date range are invalid aut
       accessMarker: "invalid-expiration",
       expiresAtUnixSeconds: 1e20,
       lastRefresh: "2026-07-01T08:00:00.000Z",
-      refreshToken: "refresh-invalid-expiration-sensitive",
+      refreshToken: SYNTHETIC_REFRESH_D.refresh_token,
     });
     await writeFile(join(authHome, "auth.json"), `${JSON.stringify(document)}\n`, {
       mode: 0o600,
@@ -1462,7 +1471,7 @@ test("unchanged refresh tokens are never promoted after an observed access refre
         authHome,
         runRefresh: async ({ stagingHome }) => {
           await replaceStagedAuth(stagingHome, {
-            refreshToken: "refresh-before-sensitive",
+            refreshToken: SYNTHETIC_REFRESH_A.refresh_token,
           });
           return successResponse();
         },
@@ -2349,7 +2358,7 @@ test("canonical compare-and-swap conflict preserves the staged recovery record",
               authDocument({
                 accessMarker: "concurrent",
                 lastRefresh: "2026-07-01T08:02:00.000Z",
-                refreshToken: "refresh-concurrent-sensitive",
+                refreshToken: SYNTHETIC_REFRESH_E.refresh_token,
               }),
             )}\n`,
             { mode: 0o600 },
@@ -3126,7 +3135,7 @@ test("authority directory replacement is rejected before protected auth is read"
     authDocument({
       accessMarker: "protected",
       lastRefresh: "2026-07-01T08:00:00.000Z",
-      refreshToken: "refresh-protected-sensitive",
+      refreshToken: SYNTHETIC_REFRESH_F.refresh_token,
     }),
   )}\n`;
   let released = false;
@@ -3490,7 +3499,7 @@ test("authority guard defeats directory replacement even when the lock inode is 
     authDocument({
       accessMarker: "replacement",
       lastRefresh: "2026-07-01T08:00:00.000Z",
-      refreshToken: "refresh-replacement-sensitive",
+      refreshToken: SYNTHETIC_REFRESH_G.refresh_token,
     }),
   )}\n`;
   try {
@@ -3664,7 +3673,7 @@ test(
           authDocument({
             accessMarker: "before",
             lastRefresh: "2026-07-01T08:00:00.000Z",
-            refreshToken: "refresh-before-sensitive",
+            refreshToken: SYNTHETIC_REFRESH_A.refresh_token,
           }),
         )}\n`,
         { mode: 0o600 },
@@ -3749,7 +3758,7 @@ test(
           authDocument({
             accessMarker: "before",
             lastRefresh: "2026-07-01T08:00:00.000Z",
-            refreshToken: "refresh-before-sensitive",
+            refreshToken: SYNTHETIC_REFRESH_A.refresh_token,
           }),
         )}\n`,
         { mode: 0o600 },

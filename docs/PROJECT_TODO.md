@@ -24,10 +24,11 @@
   adapter and conformance suite.
 - [done] Add authenticated durable capture-attempt provenance and source-free,
   committed-only uncertain-outcome reconciliation.
-- [pending] Verify same-image resume and implement rollout-tail repair.
-- [pending] Implement the production linearizable lease, reservation,
-  catalogue, and launcher-admission authority behind the validated backend
-  seam.
+- [done] Verify same-pinned-executable resume and implement offline
+  rollout-tail repair for the pinned plain-JSONL framing contract.
+- [pending] Bind recovery to an exact platform OCI manifest and implement the
+  production linearizable lease, reservation, catalogue, fencing, attachment,
+  and launcher-admission authority behind the validated backend seam.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.
