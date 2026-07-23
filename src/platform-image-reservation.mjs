@@ -117,6 +117,12 @@ function weakSetHas(value, entry) {
 export const PLATFORM_IMAGE_RESERVATION_CONTRACT_VERSION = 1;
 export const MAX_PLATFORM_MANIFEST_BYTES = 4 * 1024 * 1024;
 export const MAX_IMAGE_CONFIG_BYTES = 16 * 1024 * 1024;
+export const MAX_IMAGE_JSON_NODES = 65_536;
+export const MAX_IMAGE_JSON_OBJECT_MEMBERS = 32_768;
+export const MAX_IMAGE_JSON_ARRAY_ELEMENTS = 32_768;
+export const MAX_IMAGE_JSON_CONTAINER_ENTRIES = 4_096;
+export const MAX_IMAGE_LAYER_COUNT = 2_048;
+export const MAX_IMAGE_HISTORY_ENTRIES = 2_048;
 
 const OCI_IMAGE_CONFIG_MEDIA_TYPE =
   "application/vnd.oci.image.config.v1+json";
@@ -480,8 +486,15 @@ function sha256Digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
-function assertNoDuplicateJsonObjectKeys(serialized, code) {
+function assertNoDuplicateJsonObjectKeys(
+  serialized,
+  code,
+  documentKind,
+) {
   let index = 0;
+  let arrayElements = 0;
+  let nodes = 0;
+  let objectMembers = 0;
   const skipWhitespace = () => {
     while (/\s/u.test(serialized[index] ?? "")) index += 1;
   };
@@ -496,18 +509,32 @@ function assertNoDuplicateJsonObjectKeys(serialized, code) {
       fail(code);
     }
   };
-  const parseValue = (depth = 0) => {
+  const parseValue = (
+    depth = 0,
+    context = "root",
+    maximumArrayEntries = MAX_IMAGE_JSON_CONTAINER_ENTRIES,
+  ) => {
+    nodes += 1;
+    ensure(nodes <= MAX_IMAGE_JSON_NODES, code);
     skipWhitespace();
     if (serialized[index] === "{") {
       ensure(depth < MAX_JSON_NESTING_DEPTH, code);
       index += 1;
       skipWhitespace();
       const keys = new Set();
+      let entries = 0;
       if (serialized[index] === "}") {
         index += 1;
         return;
       }
       while (true) {
+        entries += 1;
+        objectMembers += 1;
+        ensure(
+          entries <= MAX_IMAGE_JSON_CONTAINER_ENTRIES &&
+            objectMembers <= MAX_IMAGE_JSON_OBJECT_MEMBERS,
+          code,
+        );
         skipWhitespace();
         const key = parseString();
         ensure(!setHas(keys, key), code);
@@ -515,7 +542,38 @@ function assertNoDuplicateJsonObjectKeys(serialized, code) {
         skipWhitespace();
         ensure(serialized[index] === ":", code);
         index += 1;
-        parseValue(depth + 1);
+        let childContext = "other";
+        let childMaximumArrayEntries =
+          MAX_IMAGE_JSON_CONTAINER_ENTRIES;
+        if (
+          context === "root" &&
+          documentKind === "manifest" &&
+          key === "layers"
+        ) {
+          childMaximumArrayEntries = MAX_IMAGE_LAYER_COUNT;
+        } else if (
+          context === "root" &&
+          documentKind === "config" &&
+          key === "history"
+        ) {
+          childMaximumArrayEntries = MAX_IMAGE_HISTORY_ENTRIES;
+        } else if (
+          context === "root" &&
+          documentKind === "config" &&
+          key === "rootfs"
+        ) {
+          childContext = "config-rootfs";
+        } else if (
+          context === "config-rootfs" &&
+          key === "diff_ids"
+        ) {
+          childMaximumArrayEntries = MAX_IMAGE_LAYER_COUNT;
+        }
+        parseValue(
+          depth + 1,
+          childContext,
+          childMaximumArrayEntries,
+        );
         skipWhitespace();
         if (serialized[index] === "}") {
           index += 1;
@@ -529,12 +587,20 @@ function assertNoDuplicateJsonObjectKeys(serialized, code) {
       ensure(depth < MAX_JSON_NESTING_DEPTH, code);
       index += 1;
       skipWhitespace();
+      let entries = 0;
       if (serialized[index] === "]") {
         index += 1;
         return;
       }
       while (true) {
-        parseValue(depth + 1);
+        entries += 1;
+        arrayElements += 1;
+        ensure(
+          entries <= maximumArrayEntries &&
+            arrayElements <= MAX_IMAGE_JSON_ARRAY_ELEMENTS,
+          code,
+        );
+        parseValue(depth + 1, "other");
         skipWhitespace();
         if (serialized[index] === "]") {
           index += 1;
@@ -559,7 +625,7 @@ function assertNoDuplicateJsonObjectKeys(serialized, code) {
   ensure(index === serialized.length, code);
 }
 
-function parseBoundedJson(bytes, code) {
+function parseBoundedJson(bytes, code, documentKind) {
   let serialized;
   try {
     serialized = callIntrinsic(textDecoderDecodeIntrinsic, UTF8_DECODER, [
@@ -568,7 +634,7 @@ function parseBoundedJson(bytes, code) {
   } catch {
     fail(code);
   }
-  assertNoDuplicateJsonObjectKeys(serialized, code);
+  assertNoDuplicateJsonObjectKeys(serialized, code, documentKind);
   try {
     return jsonParse(serialized);
   } catch {
@@ -649,6 +715,7 @@ function normalizeManifestDocument(descriptor, configBytes) {
     parseBoundedJson(
       descriptor.bytes,
       "platform_image_identity_mismatch",
+      "manifest",
     ),
     ["annotations", "config", "layers", "mediaType", "schemaVersion"],
     "platform_image_identity_mismatch",
@@ -660,6 +727,7 @@ function normalizeManifestDocument(descriptor, configBytes) {
     manifest.schemaVersion === 2 &&
       arrayIsArray(manifest.layers) &&
       manifest.layers.length > 0 &&
+      manifest.layers.length <= MAX_IMAGE_LAYER_COUNT &&
       !objectHasOwn(manifest, "manifests"),
     "platform_image_identity_mismatch",
   );
@@ -711,9 +779,18 @@ function normalizeManifestDocument(descriptor, configBytes) {
     parseBoundedJson(
       configCopy,
       "platform_image_identity_mismatch",
+      "config",
     ),
     "platform_image_identity_mismatch",
   );
+  if (objectHasOwn(configDocument, "history")) {
+    ensure(
+      arrayIsArray(configDocument.history) &&
+        configDocument.history.length <=
+          MAX_IMAGE_HISTORY_ENTRIES,
+      "platform_image_identity_mismatch",
+    );
+  }
   const rootfs = assertAllowedJsonObject(
     configDocument.rootfs,
     ["diff_ids", "type"],
@@ -724,6 +801,7 @@ function normalizeManifestDocument(descriptor, configBytes) {
       typeof configDocument.architecture === "string" &&
       rootfs.type === "layers" &&
       arrayIsArray(rootfs.diff_ids) &&
+      rootfs.diff_ids.length <= MAX_IMAGE_LAYER_COUNT &&
       rootfs.diff_ids.length === layers.length &&
       arrayEvery(
         rootfs.diff_ids,

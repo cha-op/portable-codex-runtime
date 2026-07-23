@@ -34,7 +34,20 @@ superseded_by:
   replay. The dedicated pool is reset with verified `DISCARD ALL` before and
   after each proved transaction boundary. A user-query failure without a
   trusted PostgreSQL SQLSTATE destroys the client and remains
-  outcome-uncertain.
+  outcome-uncertain. SQLSTATE provenance, pending-query tracking, and
+  post-callback boundary checks use module-captured intrinsics, own driver
+  result fields, and a captured `DatabaseError` prototype check. Built-in
+  prototype poisoning by a callback limited to the transaction capability
+  cannot convert a local or unknown outcome into a retry. The dedicated pool,
+  client, connection event source, and node-postgres implementation remain an
+  explicit trusted boundary and must not be exposed to callbacks.
+- Store errors thrown through the callback are trusted only when minted by the
+  exact current transaction attempt. Module-private constructor identity
+  covers alternate `newTarget` construction, while the captured public
+  prototype chain covers prototype-created counterfeits. Publicly constructed,
+  cross-operation, prototype-forged, and opaque Proxy errors become a definite
+  generic rollback result, so forged or stale `commitState` cannot contradict
+  the current transaction outcome.
 - Migration validation errors retain their specific code only when marked by
   the current `migrate()` invocation. Publicly constructed errors, internal
   errors replayed from another operation, and inherited prototype accessors
@@ -62,7 +75,9 @@ superseded_by:
   concurrent use, evidence drift, inspector replacement, or uncertainty.
   Manifest and config byte views are rejected by intrinsic length before any
   source-sized private byte-buffer allocation and copied without invoking
-  shadowable source properties.
+  shadowable source properties. Their JSON is also rejected before full parse
+  when bounded node, member, element, container, layer, DiffID, or history
+  budgets are exceeded.
 - Real PostgreSQL CI applies the migration, creates a genuine concurrent
   serializable conflict, verifies bounded whole-callback retry, and exercises
   the active partial-unique indexes.

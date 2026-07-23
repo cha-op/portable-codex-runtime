@@ -23,6 +23,12 @@ const FIRE_AND_FORGET_FIXTURE = fileURLToPath(
     import.meta.url,
   ),
 );
+const INTRINSIC_POISONING_FIXTURE = fileURLToPath(
+  new URL(
+    "./fixtures/postgres-intrinsic-poisoning.mjs",
+    import.meta.url,
+  ),
+);
 
 class FakeClient {
   constructor(steps, { releaseError, resetSteps = [] } = {}) {
@@ -305,6 +311,242 @@ test("a callback-spoofed transaction SQLSTATE is never retried", async () => {
   );
   assert.equal(callbacks, 1);
   assert.equal(pool.connectCalls, 1);
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a callback cannot forge a committed store-error outcome", async () => {
+  const forgedError = new PostgresSerializableStoreError(
+    "client_release_failed",
+    "committed",
+  );
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable(() => {
+      throw forgedError;
+    }),
+    {
+      code: "transaction_rolled_back",
+      commitState: "not-committed",
+      omittedText: forgedError.message,
+    },
+  );
+  assert.deepEqual(
+    nonResetQueries(client).map(queryText),
+    [
+      "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "ROLLBACK",
+    ],
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("alternate newTarget store errors cannot escape a proved rollback", async () => {
+  function AlternateError() {}
+  const forgedError = Reflect.construct(
+    PostgresSerializableStoreError,
+    ["client_release_failed", "committed"],
+    AlternateError,
+  );
+  assert.equal(
+    forgedError instanceof PostgresSerializableStoreError,
+    false,
+  );
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable(() => {
+      throw forgedError;
+    }),
+    {
+      code: "transaction_rolled_back",
+      commitState: "not-committed",
+      omittedText: forgedError.message,
+    },
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("prototype-forged store errors cannot escape a proved rollback", async () => {
+  const forgedError = Object.create(
+    PostgresSerializableStoreError.prototype,
+  );
+  Object.assign(forgedError, {
+    code: "client_release_failed",
+    commitState: "committed",
+    message: "forged committed store state",
+    name: "PostgresSerializableStoreError",
+    retryable: false,
+  });
+  assert.ok(forgedError instanceof PostgresSerializableStoreError);
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable(() => {
+      throw forgedError;
+    }),
+    {
+      code: "transaction_rolled_back",
+      commitState: "not-committed",
+      omittedText: forgedError.message,
+    },
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("opaque Proxy errors fail closed after a proved rollback", async () => {
+  const target = new PostgresSerializableStoreError(
+    "client_release_failed",
+    "committed",
+  );
+  const opaqueError = new Proxy(target, {
+    getPrototypeOf() {
+      throw new Error("proxy target identity is opaque");
+    },
+  });
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+
+  await assertStoreError(
+    store.runSerializable(() => {
+      throw opaqueError;
+    }),
+    {
+      code: "transaction_rolled_back",
+      commitState: "not-committed",
+    },
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a callback cannot replay store-error state from another operation", async () => {
+  const resetFailure = new Error("prior operation reset failed");
+  const sourceClient = new FakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:11.000Z"),
+      transactionIdResult(),
+      COMMIT_RESULT,
+    ],
+    { resetSteps: [DISCARD_RESULT, resetFailure] },
+  );
+  const sourceStore = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([sourceClient]),
+  });
+  let replayedError;
+  await assert.rejects(
+    sourceStore.runSerializable(() => "committed"),
+    (error) => {
+      assert.ok(error instanceof PostgresSerializableStoreError);
+      assert.equal(error.code, "client_reset_failed");
+      assert.equal(error.commitState, "committed");
+      replayedError = error;
+      return true;
+    },
+  );
+  sourceClient.assertExhausted();
+
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable(() => {
+      throw replayedError;
+    }),
+    {
+      code: "transaction_rolled_back",
+      commitState: "not-committed",
+      omittedText: replayedError.message,
+    },
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a frozen native callback Promise remains supported", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  const callbackResult = Object.freeze(Promise.resolve("committed"));
+
+  assert.equal(
+    await store.runSerializable(() => callbackResult),
+    "committed",
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("callback Promise subclasses retain ordinary await semantics", async () => {
+  class TransformingPromise extends Promise {
+    then(onFulfilled, onRejected) {
+      return super.then(
+        (value) => onFulfilled(`transformed:${value}`),
+        onRejected,
+      );
+    }
+  }
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  const callbackResult = new TransformingPromise((resolve) => {
+    resolve("base");
+  });
+
+  assert.equal(
+    await store.runSerializable(() => callbackResult),
+    "transformed:base",
+  );
   assert.deepEqual(client.releaseCalls, [[]]);
   client.assertExhausted();
 });
@@ -876,6 +1118,39 @@ test("runSerializable never retries an uncertain failed COMMIT", async () => {
   );
   assert.deepEqual(client.releaseCalls, [[commitFailure]]);
   client.assertExhausted();
+});
+
+test("callback intrinsic poisoning cannot forge transaction authority", async (t) => {
+  for (const scenario of [
+    "weak-map-get",
+    "set-has",
+    "array-includes",
+    "database-error-brand",
+    "object-command",
+    "promise-prototype",
+  ]) {
+    await t.test(scenario, () => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--unhandled-rejections=strict",
+          INTRINSIC_POISONING_FIXTURE,
+          scenario,
+        ],
+        {
+          encoding: "utf8",
+          timeout: 10_000,
+        },
+      );
+      assert.equal(result.error, undefined);
+      assert.equal(result.signal, null);
+      assert.equal(
+        result.status,
+        0,
+        `intrinsic-poisoning child failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+    });
+  }
 });
 
 test("rollback failure supersedes a callback failure and destroys the client", async () => {

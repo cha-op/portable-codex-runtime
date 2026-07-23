@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { isProxy } from "node:util/types";
+import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError } from "pg";
 
@@ -13,8 +13,177 @@ const MIGRATION_URL = new URL(
   import.meta.url,
 );
 const MIGRATION_LOCK_KEY = "7275632827684484689";
-const RETRYABLE_TRANSACTION_CODES = new Set(["40001", "40P01"]);
-const QUERY_PARAMETER_TYPES = new Set([
+const ArrayConstructor = Array;
+const arrayEveryIntrinsic = Array.prototype.every;
+const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayIsArray = Array.isArray;
+const arrayJoinIntrinsic = Array.prototype.join;
+const arrayPushIntrinsic = Array.prototype.push;
+const DateConstructor = Date;
+const dateGetTimeIntrinsic = Date.prototype.getTime;
+const dateParse = Date.parse;
+const dateToISOStringIntrinsic = Date.prototype.toISOString;
+const databaseErrorPrototype = DatabaseError.prototype;
+const ErrorConstructor = Error;
+const numberIsFinite = Number.isFinite;
+const numberIsSafeInteger = Number.isSafeInteger;
+const numberNaN = Number.NaN;
+const objectCreate = Object.create;
+const objectDefineProperties = Object.defineProperties;
+const objectDefineProperty = Object.defineProperty;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const objectIs = Object.is;
+const objectIsPrototypeOfIntrinsic = Object.prototype.isPrototypeOf;
+const objectPrototype = Object.prototype;
+const PromiseConstructor = Promise;
+const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
+const regexpExecIntrinsic = RegExp.prototype.exec;
+const setAddIntrinsic = Set.prototype.add;
+const setDeleteIntrinsic = Set.prototype.delete;
+const setForEachIntrinsic = Set.prototype.forEach;
+const setHasIntrinsic = Set.prototype.has;
+const setSizeGetter = objectGetOwnPropertyDescriptor(
+  Set.prototype,
+  "size",
+).get;
+const SetConstructor = Set;
+const StringConstructor = String;
+const stringEndsWithIntrinsic = String.prototype.endsWith;
+const stringSliceIntrinsic = String.prototype.slice;
+const TypeErrorConstructor = TypeError;
+const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapHasIntrinsic = WeakMap.prototype.has;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakMapConstructor = WeakMap;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+const WeakSetConstructor = WeakSet;
+
+function callIntrinsic(intrinsic, receiver, args) {
+  return reflectApply(intrinsic, receiver, args);
+}
+
+function arrayEvery(value, callback) {
+  return callIntrinsic(arrayEveryIntrinsic, value, [callback]);
+}
+
+function arrayIncludes(value, candidate) {
+  return callIntrinsic(arrayIncludesIntrinsic, value, [candidate]);
+}
+
+function arrayJoin(value, separator) {
+  return callIntrinsic(arrayJoinIntrinsic, value, [separator]);
+}
+
+function arrayPush(value, entry) {
+  return callIntrinsic(arrayPushIntrinsic, value, [entry]);
+}
+
+function dateGetTime(value) {
+  return callIntrinsic(dateGetTimeIntrinsic, value, []);
+}
+
+function dateToISOString(value) {
+  return callIntrinsic(dateToISOStringIntrinsic, value, []);
+}
+
+function regexpTest(pattern, value) {
+  return callIntrinsic(regexpExecIntrinsic, pattern, [value]) !== null;
+}
+
+function objectIsPrototypeOf(prototype, value) {
+  return callIntrinsic(objectIsPrototypeOfIntrinsic, prototype, [value]);
+}
+
+function ownDataValue(value, key) {
+  try {
+    const valueType = typeof value;
+    if (
+      value === null ||
+      (valueType !== "object" && valueType !== "function") ||
+      isProxy(value)
+    ) {
+      return undefined;
+    }
+    const descriptor = objectGetOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && objectHasOwn(descriptor, "value")
+      ? descriptor.value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function setAdd(value, entry) {
+  return callIntrinsic(setAddIntrinsic, value, [entry]);
+}
+
+function setDelete(value, entry) {
+  return callIntrinsic(setDeleteIntrinsic, value, [entry]);
+}
+
+function setForEach(value, callback) {
+  return callIntrinsic(setForEachIntrinsic, value, [callback]);
+}
+
+function setHas(value, entry) {
+  return callIntrinsic(setHasIntrinsic, value, [entry]);
+}
+
+function setSize(value) {
+  return callIntrinsic(setSizeGetter, value, []);
+}
+
+function stringEndsWith(value, suffix) {
+  return callIntrinsic(stringEndsWithIntrinsic, value, [suffix]);
+}
+
+function stringSlice(value, start, end) {
+  return callIntrinsic(stringSliceIntrinsic, value, [start, end]);
+}
+
+function weakMapDelete(value, key) {
+  return callIntrinsic(weakMapDeleteIntrinsic, value, [key]);
+}
+
+function weakMapGet(value, key) {
+  return callIntrinsic(weakMapGetIntrinsic, value, [key]);
+}
+
+function weakMapHas(value, key) {
+  return callIntrinsic(weakMapHasIntrinsic, value, [key]);
+}
+
+function weakMapSet(value, key, entry) {
+  return callIntrinsic(weakMapSetIntrinsic, value, [key, entry]);
+}
+
+function weakSetAdd(value, entry) {
+  return callIntrinsic(weakSetAddIntrinsic, value, [entry]);
+}
+
+function weakSetHas(value, entry) {
+  return callIntrinsic(weakSetHasIntrinsic, value, [entry]);
+}
+
+function protectPromise(value) {
+  if (!isPromise(value)) return value;
+  objectDefineProperty(value, "constructor", {
+    configurable: false,
+    enumerable: false,
+    value: PromiseConstructor,
+    writable: false,
+  });
+  return value;
+}
+
+const RETRYABLE_TRANSACTION_CODES = new SetConstructor(["40001", "40P01"]);
+const QUERY_PARAMETER_TYPES = new SetConstructor([
   "bigint",
   "boolean",
   "number",
@@ -22,16 +191,13 @@ const QUERY_PARAMETER_TYPES = new Set([
   "undefined",
 ]);
 const MAX_QUERY_PARAMETERS = 65_535;
-const COMMIT_STATES = new Set(["committed", "not-committed", "uncertain"]);
-const PROTOCOL_ERROR_SQLSTATES = new WeakMap();
-const objectDefineProperties = Object.defineProperties;
-const objectFreeze = Object.freeze;
-const objectHasOwn = Object.hasOwn;
-const reflectApply = Reflect.apply;
-const setHasIntrinsic = Set.prototype.has;
-const weakSetAddIntrinsic = WeakSet.prototype.add;
-const weakSetHasIntrinsic = WeakSet.prototype.has;
-const WeakSetConstructor = WeakSet;
+const COMMIT_STATES = new SetConstructor([
+  "committed",
+  "not-committed",
+  "uncertain",
+]);
+const PROTOCOL_ERROR_SQLSTATES = new WeakMapConstructor();
+const STORE_ERRORS = new WeakSetConstructor();
 const ERROR_MESSAGES = objectFreeze({
   client_reset_failed: "PostgreSQL client reset failed",
   client_release_failed: "PostgreSQL client release failed",
@@ -60,9 +226,11 @@ export class PostgresSerializableStoreError extends Error {
   constructor(code, commitState = "not-committed") {
     if (
       !objectHasOwn(ERROR_MESSAGES, code) ||
-      !reflectApply(setHasIntrinsic, COMMIT_STATES, [commitState])
+      !setHas(COMMIT_STATES, commitState)
     ) {
-      throw new TypeError("unsupported PostgreSQL serializable store error");
+      throw new TypeErrorConstructor(
+        "unsupported PostgreSQL serializable store error",
+      );
     }
     super(ERROR_MESSAGES[code]);
     objectDefineProperties(this, {
@@ -91,7 +259,29 @@ export class PostgresSerializableStoreError extends Error {
         writable: true,
       },
     });
+    weakSetAdd(STORE_ERRORS, this);
     objectFreeze(this);
+  }
+}
+
+const postgresSerializableStoreErrorPrototype =
+  PostgresSerializableStoreError.prototype;
+
+function isPostgresSerializableStoreError(error) {
+  try {
+    const errorType = typeof error;
+    return (
+      error !== null &&
+      (errorType === "object" || errorType === "function") &&
+      (isProxy(error) ||
+        weakSetHas(STORE_ERRORS, error) ||
+        objectIsPrototypeOf(
+          postgresSerializableStoreErrorPrototype,
+          error,
+        ))
+    );
+  } catch {
+    return true;
   }
 }
 
@@ -100,8 +290,18 @@ function storeError(code, commitState = "not-committed") {
 }
 
 function observedRejectedPromise(error) {
-  const rejection = Promise.reject(error);
-  void rejection.then(undefined, () => undefined);
+  const rejection = protectPromise(
+    (async () => {
+      throw error;
+    })(),
+  );
+  void (async () => {
+    try {
+      await rejection;
+    } catch {
+      // The returned rejection remains observable without becoming unhandled.
+    }
+  })();
   return rejection;
 }
 
@@ -109,29 +309,33 @@ function inspectOptions(options) {
   if (
     options === null ||
     typeof options !== "object" ||
-    Array.isArray(options) ||
-    ![Object.prototype, null].includes(Object.getPrototypeOf(options))
+    arrayIsArray(options) ||
+    !arrayIncludes([objectPrototype, null], objectGetPrototypeOf(options))
   ) {
-    throw new TypeError("PostgreSQL serializable store options must be a plain object");
+    throw new TypeErrorConstructor(
+      "PostgreSQL serializable store options must be a plain object",
+    );
   }
-  const keys = Reflect.ownKeys(options);
+  const keys = reflectOwnKeys(options);
   if (
-    !keys.every(
+    !arrayEvery(
+      keys,
       (key) =>
         typeof key === "string" &&
-        ["dedicatedPool", "maxTransactionAttempts"].includes(key),
+        arrayIncludes(["dedicatedPool", "maxTransactionAttempts"], key),
     ) ||
-    !keys.includes("dedicatedPool")
+    !arrayIncludes(keys, "dedicatedPool")
   ) {
-    throw new TypeError(
+    throw new TypeErrorConstructor(
       "PostgreSQL serializable store options contain unexpected or missing fields",
     );
   }
-  const normalized = Object.create(null);
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(options, key);
-    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) {
-      throw new TypeError(
+  const normalized = objectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const descriptor = objectGetOwnPropertyDescriptor(options, key);
+    if (!descriptor?.enumerable || !objectHasOwn(descriptor, "value")) {
+      throw new TypeErrorConstructor(
         "PostgreSQL serializable store options must use plain data fields",
       );
     }
@@ -143,21 +347,21 @@ function inspectOptions(options) {
 function validateDedicatedPool(pool) {
   if (
     pool === null ||
-    !["object", "function"].includes(typeof pool) ||
+    !arrayIncludes(["object", "function"], typeof pool) ||
     typeof pool.connect !== "function"
   ) {
-    throw new TypeError("dedicatedPool must provide connect()");
+    throw new TypeErrorConstructor("dedicatedPool must provide connect()");
   }
   return pool;
 }
 
 function validateAttemptLimit(value) {
   if (
-    !Number.isSafeInteger(value) ||
+    !numberIsSafeInteger(value) ||
     value < 1 ||
     value > MAX_TRANSACTION_ATTEMPTS
   ) {
-    throw new TypeError(
+    throw new TypeErrorConstructor(
       `maxTransactionAttempts must be an integer from 1 through ${MAX_TRANSACTION_ATTEMPTS}`,
     );
   }
@@ -166,8 +370,8 @@ function validateAttemptLimit(value) {
 
 function observedProtocolSqlState(error) {
   try {
-    const sqlState = PROTOCOL_ERROR_SQLSTATES.get(error);
-    PROTOCOL_ERROR_SQLSTATES.delete(error);
+    const sqlState = weakMapGet(PROTOCOL_ERROR_SQLSTATES, error);
+    weakMapDelete(PROTOCOL_ERROR_SQLSTATES, error);
     return sqlState;
   } catch {
     return undefined;
@@ -175,14 +379,17 @@ function observedProtocolSqlState(error) {
 }
 
 function hasRetryableTransactionSqlState(error) {
-  return RETRYABLE_TRANSACTION_CODES.has(observedProtocolSqlState(error));
+  return setHas(
+    RETRYABLE_TRANSACTION_CODES,
+    observedProtocolSqlState(error),
+  );
 }
 
 function isTrustedUserQueryRejectionSqlState(sqlState) {
   return (
     sqlState !== undefined &&
     sqlState !== "40003" &&
-    !["08", "57", "58", "XX"].includes(sqlState.slice(0, 2))
+    !arrayIncludes(["08", "57", "58", "XX"], stringSlice(sqlState, 0, 2))
   );
 }
 
@@ -190,43 +397,50 @@ function copyQueryValues(values) {
   try {
     if (
       isProxy(values) ||
-      !Array.isArray(values) ||
-      Object.getPrototypeOf(values) !== Array.prototype
+      !arrayIsArray(values) ||
+      objectGetPrototypeOf(values) !== ArrayConstructor.prototype
     ) {
-      throw new TypeError("query values must use the built-in Array prototype");
+      throw new TypeErrorConstructor(
+        "query values must use the built-in Array prototype",
+      );
     }
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(values, "length");
+    const lengthDescriptor = objectGetOwnPropertyDescriptor(values, "length");
     const length = lengthDescriptor?.value;
     if (
-      !Object.hasOwn(lengthDescriptor ?? {}, "value") ||
-      !Number.isSafeInteger(length) ||
+      !objectHasOwn(lengthDescriptor ?? {}, "value") ||
+      !numberIsSafeInteger(length) ||
       length < 0 ||
       length > MAX_QUERY_PARAMETERS
     ) {
-      throw new TypeError("query values length is invalid");
+      throw new TypeErrorConstructor("query values length is invalid");
     }
 
-    const copied = new Array(length);
+    const copied = new ArrayConstructor(length);
     for (let index = 0; index < length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
-      if (descriptor !== undefined && !Object.hasOwn(descriptor, "value")) {
-        throw new TypeError("query values must use plain data fields");
+      const descriptor = objectGetOwnPropertyDescriptor(
+        values,
+        StringConstructor(index),
+      );
+      if (descriptor !== undefined && !objectHasOwn(descriptor, "value")) {
+        throw new TypeErrorConstructor(
+          "query values must use plain data fields",
+        );
       }
       const value = descriptor?.value;
       if (
         value !== null &&
-        !QUERY_PARAMETER_TYPES.has(typeof value)
+        !setHas(QUERY_PARAMETER_TYPES, typeof value)
       ) {
-        throw new TypeError("query values must be primitive data");
+        throw new TypeErrorConstructor("query values must be primitive data");
       }
-      Object.defineProperty(copied, String(index), {
+      objectDefineProperty(copied, StringConstructor(index), {
         configurable: true,
         enumerable: true,
         value,
         writable: true,
       });
     }
-    return Object.freeze(copied);
+    return objectFreeze(copied);
   } catch {
     throw storeError("transaction_query_invalid");
   }
@@ -358,7 +572,7 @@ function validateClient(client) {
   try {
     return (
       client !== null &&
-      ["object", "function"].includes(typeof client) &&
+      arrayIncludes(["object", "function"], typeof client) &&
       typeof client.query === "function" &&
       typeof client.release === "function" &&
       client.connection !== null &&
@@ -372,42 +586,46 @@ function validateClient(client) {
 }
 
 async function clientQuery(client, ...args) {
-  const observed = new WeakMap();
+  const observed = new WeakMapConstructor();
   const observeProtocolError = (error) => {
     try {
+      const name = ownDataValue(error, "name");
+      const code = ownDataValue(error, "code");
       if (
-        error instanceof DatabaseError &&
-        error.name === "error" &&
-        typeof error.code === "string" &&
-        /^[0-9A-Z]{5}$/u.test(error.code)
+        objectIsPrototypeOf(databaseErrorPrototype, error) &&
+        name === "error" &&
+        typeof code === "string" &&
+        regexpTest(/^[0-9A-Z]{5}$/u, code)
       ) {
-        observed.set(error, error.code);
+        weakMapSet(observed, error, code);
       }
     } catch {
       // An invalid event payload cannot become trusted protocol evidence.
     }
   };
 
-  Reflect.apply(
+  reflectApply(
     client.connection.prependListener,
     client.connection,
     ["errorMessage", observeProtocolError],
   );
   try {
-    return await Reflect.apply(client.query, client, args);
+    return await protectPromise(
+      reflectApply(client.query, client, args),
+    );
   } catch (error) {
     try {
-      PROTOCOL_ERROR_SQLSTATES.delete(error);
-      const sqlState = observed.get(error);
+      weakMapDelete(PROTOCOL_ERROR_SQLSTATES, error);
+      const sqlState = weakMapGet(observed, error);
       if (sqlState !== undefined) {
-        PROTOCOL_ERROR_SQLSTATES.set(error, sqlState);
+        weakMapSet(PROTOCOL_ERROR_SQLSTATES, error, sqlState);
       }
     } catch {
       // Preserve the query failure without adding protocol provenance.
     }
     throw error;
   } finally {
-    Reflect.apply(
+    reflectApply(
       client.connection.removeListener,
       client.connection,
       ["errorMessage", observeProtocolError],
@@ -418,7 +636,9 @@ async function clientQuery(client, ...args) {
 async function acquireClient(pool) {
   let client;
   try {
-    client = await Reflect.apply(pool.connect, pool, []);
+    client = await protectPromise(
+      reflectApply(pool.connect, pool, []),
+    );
   } catch {
     throw storeError("connection_failed");
   }
@@ -437,9 +657,13 @@ function releaseOnce(client) {
     released = true;
     try {
       if (destroyCause === undefined) {
-        await Reflect.apply(client.release, client, []);
+        await protectPromise(
+          reflectApply(client.release, client, []),
+        );
       } else {
-        await Reflect.apply(client.release, client, [destroyCause]);
+        await protectPromise(
+          reflectApply(client.release, client, [destroyCause]),
+        );
       }
     } catch {
       throw storeError("client_release_failed", commitState);
@@ -448,90 +672,95 @@ function releaseOnce(client) {
 }
 
 function resultCommand(result) {
-  try {
-    return result !== null &&
-      typeof result === "object" &&
-      typeof result.command === "string"
-      ? result.command
-      : undefined;
-  } catch {
-    return undefined;
-  }
+  const command = ownDataValue(result, "command");
+  return typeof command === "string" ? command : undefined;
 }
 
 async function resetAndRelease(client, release, commitState) {
   let resetFailure;
   try {
-    const result = await clientQuery(client, "DISCARD ALL");
+    const result = await protectPromise(
+      clientQuery(client, "DISCARD ALL"),
+    );
     if (resultCommand(result) !== "DISCARD") {
-      resetFailure = new Error("invalid DISCARD ALL acknowledgement");
+      resetFailure = new ErrorConstructor(
+        "invalid DISCARD ALL acknowledgement",
+      );
     }
   } catch (error) {
     resetFailure = error;
   }
   if (resetFailure !== undefined) {
     try {
-      await release(resetFailure, commitState);
+      await protectPromise(release(resetFailure, commitState));
     } catch {
       // Preserve the reset classification while the client is being destroyed.
     }
     throw storeError("client_reset_failed", commitState);
   }
-  await release(undefined, commitState);
+  await protectPromise(release(undefined, commitState));
 }
 
 async function acquireCleanClient(pool) {
-  const client = await acquireClient(pool);
+  const client = await protectPromise(acquireClient(pool));
   const release = releaseOnce(client);
   try {
-    const result = await clientQuery(client, "DISCARD ALL");
+    const result = await protectPromise(
+      clientQuery(client, "DISCARD ALL"),
+    );
     if (resultCommand(result) !== "DISCARD") {
-      throw new Error("invalid DISCARD ALL acknowledgement");
+      throw new ErrorConstructor("invalid DISCARD ALL acknowledgement");
     }
   } catch (error) {
     try {
-      await release(error, "not-committed");
+      await protectPromise(release(error, "not-committed"));
     } catch {
       // Preserve the reset classification while the client is being destroyed.
     }
     throw storeError("client_reset_failed");
   }
-  return Object.freeze({ client, release });
+  return objectFreeze({ client, release });
 }
 
 async function rollbackAndRelease(client, release, originalError) {
   let rollbackResult;
   try {
-    rollbackResult = await clientQuery(client, "ROLLBACK");
+    rollbackResult = await protectPromise(
+      clientQuery(client, "ROLLBACK"),
+    );
   } catch (rollbackError) {
     try {
-      await release(rollbackError, "uncertain");
+      await protectPromise(release(rollbackError, "uncertain"));
     } catch {
       // The rollback failure already makes the transaction outcome uncertain.
     }
     throw storeError("transaction_rollback_failed", "uncertain");
   }
   if (resultCommand(rollbackResult) !== "ROLLBACK") {
-    const rollbackError = new Error("invalid ROLLBACK acknowledgement");
+    const rollbackError = new ErrorConstructor(
+      "invalid ROLLBACK acknowledgement",
+    );
     try {
-      await release(rollbackError, "uncertain");
+      await protectPromise(release(rollbackError, "uncertain"));
     } catch {
       // The malformed acknowledgement already makes the outcome uncertain.
     }
     throw storeError("transaction_rollback_failed", "uncertain");
   }
-  await resetAndRelease(client, release, "not-committed");
+  await protectPromise(
+    resetAndRelease(client, release, "not-committed"),
+  );
   return originalError;
 }
 
 async function failCommitUncertain(client, release, commitError) {
   try {
-    await clientQuery(client, "ROLLBACK");
+    await protectPromise(clientQuery(client, "ROLLBACK"));
   } catch {
     // A failed COMMIT is already uncertain; rollback is only best-effort cleanup.
   }
   try {
-    await release(commitError, "uncertain");
+    await protectPromise(release(commitError, "uncertain"));
   } catch {
     // Preserve the primary commit uncertainty classification.
   }
@@ -541,17 +770,24 @@ async function failCommitUncertain(client, release, commitError) {
 async function releaseAfterServerRollback(client, release, transactionError) {
   // The SQLSTATE proves rollback, but a possibly aborted session is destroyed
   // instead of being reset and returned to the dedicated pool.
-  await release(transactionError, "not-committed");
+  await protectPromise(
+    release(transactionError, "not-committed"),
+  );
 }
 
 async function failBoundaryUncertain(client, release) {
   try {
-    await clientQuery(client, "ROLLBACK");
+    await protectPromise(clientQuery(client, "ROLLBACK"));
   } catch {
     // The original transaction boundary is already unproven.
   }
   try {
-    await release(new Error("transaction boundary lost"), "uncertain");
+    await protectPromise(
+      release(
+        new ErrorConstructor("transaction boundary lost"),
+        "uncertain",
+      ),
+    );
   } catch {
     // Preserve the primary boundary-loss classification.
   }
@@ -559,60 +795,62 @@ async function failBoundaryUncertain(client, release) {
 }
 
 function canonicalTransactionTimestamp(result) {
-  const value =
-    result !== null &&
-    typeof result === "object" &&
-    Array.isArray(result.rows) &&
-    result.rows.length === 1 &&
-    result.rows[0] !== null &&
-    typeof result.rows[0] === "object"
-      ? result.rows[0].transaction_timestamp
+  const rows = ownDataValue(result, "rows");
+  const row =
+    arrayIsArray(rows) &&
+    !isProxy(rows) &&
+    ownDataValue(rows, "length") === 1
+      ? ownDataValue(rows, "0")
       : undefined;
+  const value = ownDataValue(row, "transaction_timestamp");
   let timestamp;
   try {
     timestamp =
-      value instanceof Date
-        ? value.getTime()
-        : typeof value === "string"
-          ? Date.parse(value)
-          : Number.NaN;
+      typeof value === "string" ? dateParse(value) : dateGetTime(value);
   } catch {
-    timestamp = Number.NaN;
+    timestamp = numberNaN;
   }
-  if (!Number.isFinite(timestamp)) {
+  if (!numberIsFinite(timestamp)) {
     throw storeError("transaction_timestamp_failed");
   }
-  return new Date(timestamp).toISOString();
+  return dateToISOString(new DateConstructor(timestamp));
 }
 
 function canonicalTransactionId(result) {
-  const value =
-    result !== null &&
-    typeof result === "object" &&
-    Array.isArray(result.rows) &&
-    result.rows.length === 1 &&
-    result.rows[0] !== null &&
-    typeof result.rows[0] === "object"
-      ? result.rows[0].transaction_id
+  const rows = ownDataValue(result, "rows");
+  const row =
+    arrayIsArray(rows) &&
+    !isProxy(rows) &&
+    ownDataValue(rows, "length") === 1
+      ? ownDataValue(rows, "0")
       : undefined;
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) {
+  const value = ownDataValue(row, "transaction_id");
+  if (
+    typeof value !== "string" ||
+    !regexpTest(/^[1-9][0-9]*$/u, value)
+  ) {
     throw storeError("transaction_boundary_lost");
   }
   return value;
 }
 
-function createTransactionCapability(client, now, transactionId) {
+function createTransactionCapability(
+  client,
+  now,
+  transactionId,
+  transactionError,
+) {
   let active = true;
   let boundaryLost = false;
   let firstQueryFailure;
   let queryCount = 0;
-  let queryQueue = Promise.resolve();
+  let queryQueue = protectPromise((async () => undefined)());
   let terminalQueryError;
-  const pending = new Set();
-  const queryErrorSqlStates = new WeakMap();
+  const pending = new SetConstructor();
+  const queryErrorSqlStates = new WeakMapConstructor();
   const markLocalQueryError = () => {
-    const error = storeError("transaction_query_invalid");
-    firstQueryFailure ??= Object.freeze({ error, source: "local" });
+    const error = transactionError("transaction_query_invalid");
+    firstQueryFailure ??= objectFreeze({ error, source: "local" });
     terminalQueryError ??= error;
     return error;
   };
@@ -620,14 +858,17 @@ function createTransactionCapability(client, now, transactionId) {
     const sqlState = observedProtocolSqlState(error);
     if (!isTrustedUserQueryRejectionSqlState(sqlState)) {
       boundaryLost = true;
-      return storeError("transaction_boundary_lost", "uncertain");
+      return transactionError(
+        "transaction_boundary_lost",
+        "uncertain",
+      );
     }
-    firstQueryFailure ??= Object.freeze({ error, source: "server" });
+    firstQueryFailure ??= objectFreeze({ error, source: "server" });
     if (
       error !== null &&
-      ["object", "function"].includes(typeof error)
+      arrayIncludes(["object", "function"], typeof error)
     ) {
-      queryErrorSqlStates.set(error, sqlState);
+      weakMapSet(queryErrorSqlStates, error, sqlState);
     }
     return error;
   };
@@ -635,7 +876,7 @@ function createTransactionCapability(client, now, transactionId) {
   const query = (...args) => {
     if (!active) {
       return observedRejectedPromise(
-        storeError("transaction_query_inactive"),
+        transactionError("transaction_query_inactive"),
       );
     }
     if (
@@ -653,66 +894,111 @@ function createTransactionCapability(client, now, transactionId) {
 
     let values;
     try {
-      values = args.length === 2 ? copyQueryValues(args[1]) : Object.freeze([]);
+      values =
+        args.length === 2 ? copyQueryValues(args[1]) : objectFreeze([]);
     } catch {
       queryCount += 1;
       return observedRejectedPromise(markLocalQueryError());
     }
 
     queryCount += 1;
-    const queryConfig = Object.freeze({
+    const queryConfig = objectFreeze({
       queryMode: "extended",
       text: args[0],
       values,
     });
-    const operation = queryQueue.then(async () => {
-      if (terminalQueryError !== undefined) throw terminalQueryError;
-      if (boundaryLost) {
-        throw storeError("transaction_boundary_lost", "uncertain");
-      }
-
-      let result;
-      try {
-        result = await clientQuery(client, queryConfig);
-      } catch (error) {
-        terminalQueryError = markQueryError(error);
-        throw terminalQueryError;
-      }
-
-      let boundaryResult;
-      try {
-        boundaryResult = await clientQuery(
-          client,
-          "SELECT pg_current_xact_id()::text AS transaction_id",
-        );
-        if (canonicalTransactionId(boundaryResult) !== transactionId) {
-          throw new Error("transaction identifier changed");
+    const previousQuery = queryQueue;
+    const execution = protectPromise(
+      (async () => {
+        await protectPromise(previousQuery);
+        if (terminalQueryError !== undefined) throw terminalQueryError;
+        if (boundaryLost) {
+          throw transactionError(
+            "transaction_boundary_lost",
+            "uncertain",
+          );
         }
-      } catch {
-        boundaryLost = true;
-        throw storeError("transaction_boundary_lost", "uncertain");
-      }
-      return result;
-    });
-    queryQueue = operation.catch(() => undefined);
-    pending.add(operation);
-    void operation.then(
-      () => pending.delete(operation),
-      () => pending.delete(operation),
+
+        let result;
+        try {
+          result = await protectPromise(
+            clientQuery(client, queryConfig),
+          );
+        } catch (error) {
+          terminalQueryError = markQueryError(error);
+          throw terminalQueryError;
+        }
+
+        let boundaryResult;
+        try {
+          boundaryResult = await protectPromise(
+            clientQuery(
+              client,
+              "SELECT pg_current_xact_id()::text AS transaction_id",
+            ),
+          );
+          if (canonicalTransactionId(boundaryResult) !== transactionId) {
+            throw new ErrorConstructor("transaction identifier changed");
+          }
+        } catch {
+          boundaryLost = true;
+          throw transactionError(
+            "transaction_boundary_lost",
+            "uncertain",
+          );
+        }
+        return result;
+      })(),
     );
+    let operation;
+    operation = protectPromise(
+      (async () => {
+        try {
+          return await protectPromise(execution);
+        } finally {
+          setDelete(pending, operation);
+        }
+      })(),
+    );
+    queryQueue = protectPromise(
+      (async () => {
+        try {
+          await protectPromise(operation);
+        } catch {
+          // A rejected query does not prevent the queue from draining.
+        }
+      })(),
+    );
+    setAdd(pending, operation);
+    void (async () => {
+      try {
+        await protectPromise(operation);
+      } catch {
+        // The caller observes the original operation rejection.
+      }
+    })();
     return operation;
   };
 
-  const transaction = Object.freeze({ now, query });
-  return Object.freeze({
+  const transaction = objectFreeze({ now, query });
+  return objectFreeze({
     close: async () => {
       active = false;
-      const queryPending = pending.size !== 0;
+      const queryPending = setSize(pending) !== 0;
       if (queryPending) {
-        const unsettled = [...pending];
-        await Promise.allSettled(unsettled);
+        const unsettled = [];
+        setForEach(pending, (operation) => {
+          arrayPush(unsettled, operation);
+        });
+        for (let index = 0; index < unsettled.length; index += 1) {
+          try {
+            await protectPromise(unsettled[index]);
+          } catch {
+            // Closing observes every pending query without changing its result.
+          }
+        }
       }
-      return Object.freeze({
+      return objectFreeze({
         boundaryLost,
         firstQueryFailure,
         queryCount,
@@ -722,14 +1008,17 @@ function createTransactionCapability(client, now, transactionId) {
     isQueryError: (error) =>
       firstQueryFailure !== undefined &&
       firstQueryFailure.source === "server" &&
-      (Object.is(firstQueryFailure.error, error) ||
+      (objectIs(firstQueryFailure.error, error) ||
         (error !== null &&
-          ["object", "function"].includes(typeof error) &&
-          queryErrorSqlStates.has(error))),
+          arrayIncludes(["object", "function"], typeof error) &&
+          weakMapHas(queryErrorSqlStates, error))),
     isRetryableQueryError: (error) =>
       error !== null &&
-      ["object", "function"].includes(typeof error) &&
-      RETRYABLE_TRANSACTION_CODES.has(queryErrorSqlStates.get(error)),
+      arrayIncludes(["object", "function"], typeof error) &&
+      setHas(
+        RETRYABLE_TRANSACTION_CODES,
+        weakMapGet(queryErrorSqlStates, error),
+      ),
     transaction,
   });
 }
@@ -737,15 +1026,15 @@ function createTransactionCapability(client, now, transactionId) {
 async function readMigration() {
   let sql;
   try {
-    sql = await readFile(MIGRATION_URL, "utf8");
+    sql = await protectPromise(readFile(MIGRATION_URL, "utf8"));
   } catch {
     throw storeError("migration_source_failed");
   }
-  if (sql.length === 0 || !sql.endsWith("\n")) {
+  if (sql.length === 0 || !stringEndsWith(sql, "\n")) {
     throw storeError("migration_source_failed");
   }
   const checksum = createHash("sha256").update(sql, "utf8").digest("hex");
-  return Object.freeze({ checksum, sql });
+  return objectFreeze({ checksum, sql });
 }
 
 /**
@@ -763,17 +1052,19 @@ export class PostgresSerializableStore {
     this.#maxTransactionAttempts = validateAttemptLimit(
       normalized.maxTransactionAttempts ?? DEFAULT_TRANSACTION_ATTEMPTS,
     );
-    Object.freeze(this);
+    objectFreeze(this);
   }
 
   async migrate() {
-    const migration = await readMigration();
-    const { client, release } = await acquireCleanClient(this.#dedicatedPool);
+    const migration = await protectPromise(readMigration());
+    const { client, release } = await protectPromise(
+      acquireCleanClient(this.#dedicatedPool),
+    );
 
     try {
-      await clientQuery(client, "BEGIN");
+      await protectPromise(clientQuery(client, "BEGIN"));
     } catch (error) {
-      await release(error, "not-committed");
+      await protectPromise(release(error, "not-committed"));
       throw storeError("transaction_begin_failed");
     }
 
@@ -785,65 +1076,94 @@ export class PostgresSerializableStore {
     };
     let applied = false;
     try {
-      await clientQuery(
-        client,
-        "SELECT pg_advisory_xact_lock($1::bigint)",
-        [MIGRATION_LOCK_KEY],
+      await protectPromise(
+        clientQuery(
+          client,
+          "SELECT pg_advisory_xact_lock($1::bigint)",
+          [MIGRATION_LOCK_KEY],
+        ),
       );
-      await clientQuery(client, "CREATE SCHEMA IF NOT EXISTS session_authority");
-      await clientQuery(
-        client,
-        [
-          "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations (",
-          "version integer PRIMARY KEY CHECK (version > 0),",
-          "checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),",
-          "applied_at timestamp with time zone NOT NULL",
-          ")",
-        ].join(" "),
+      await protectPromise(
+        clientQuery(
+          client,
+          "CREATE SCHEMA IF NOT EXISTS session_authority",
+        ),
       );
-      const current = await clientQuery(
-        client,
-        [
-          "SELECT version, checksum",
-          "FROM session_authority.schema_migrations",
-          "ORDER BY version",
-        ].join(" "),
+      await protectPromise(
+        clientQuery(
+          client,
+          arrayJoin(
+            [
+              "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations (",
+              "version integer PRIMARY KEY CHECK (version > 0),",
+              "checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),",
+              "applied_at timestamp with time zone NOT NULL",
+              ")",
+            ],
+            " ",
+          ),
+        ),
       );
+      const current = await protectPromise(
+        clientQuery(
+          client,
+          arrayJoin(
+            [
+              "SELECT version, checksum",
+              "FROM session_authority.schema_migrations",
+              "ORDER BY version",
+            ],
+            " ",
+          ),
+        ),
+      );
+      const currentRows = ownDataValue(current, "rows");
+      const currentLength =
+        arrayIsArray(currentRows) && !isProxy(currentRows)
+          ? ownDataValue(currentRows, "length")
+          : undefined;
       if (
-        current === null ||
-        typeof current !== "object" ||
-        !Array.isArray(current.rows)
+        !numberIsSafeInteger(currentLength) ||
+        currentLength < 0
       ) {
         throw migrationError("migration_state_invalid");
       }
-      if (current.rows.length !== 0) {
+      if (currentLength !== 0) {
+        const currentRow = ownDataValue(currentRows, "0");
+        const currentVersion = ownDataValue(currentRow, "version");
+        const currentChecksum = ownDataValue(currentRow, "checksum");
         if (
-          current.rows.length !== 1 ||
-          current.rows[0] === null ||
-          typeof current.rows[0] !== "object" ||
-          current.rows[0].version !== SESSION_AUTHORITY_MIGRATION_VERSION ||
-          typeof current.rows[0].checksum !== "string"
+          currentLength !== 1 ||
+          currentVersion !== SESSION_AUTHORITY_MIGRATION_VERSION ||
+          typeof currentChecksum !== "string"
         ) {
           throw migrationError("migration_state_invalid");
         }
-        if (current.rows[0].checksum !== migration.checksum) {
+        if (currentChecksum !== migration.checksum) {
           throw migrationError("migration_checksum_mismatch");
         }
       } else {
-        await clientQuery(client, migration.sql);
-        await clientQuery(
-          client,
-          [
-            "INSERT INTO session_authority.schema_migrations",
-            "(version, checksum, applied_at)",
-            "VALUES ($1, $2, transaction_timestamp())",
-          ].join(" "),
-          [SESSION_AUTHORITY_MIGRATION_VERSION, migration.checksum],
+        await protectPromise(clientQuery(client, migration.sql));
+        await protectPromise(
+          clientQuery(
+            client,
+            arrayJoin(
+              [
+                "INSERT INTO session_authority.schema_migrations",
+                "(version, checksum, applied_at)",
+                "VALUES ($1, $2, transaction_timestamp())",
+              ],
+              " ",
+            ),
+            [SESSION_AUTHORITY_MIGRATION_VERSION, migration.checksum],
+          ),
         );
         applied = true;
       }
     } catch (error) {
-      await rollbackAndRelease(client, release, error);
+      await protectPromise(
+        rollbackAndRelease(client, release, error),
+      );
       if (reflectApply(weakSetHasIntrinsic, migrationErrors, [error])) {
         throw error;
       }
@@ -852,28 +1172,40 @@ export class PostgresSerializableStore {
 
     let commitResult;
     try {
-      commitResult = await clientQuery(client, "COMMIT");
+      commitResult = await protectPromise(
+        clientQuery(client, "COMMIT"),
+      );
     } catch (error) {
       if (hasRetryableTransactionSqlState(error)) {
-        await releaseAfterServerRollback(client, release, error);
+        await protectPromise(
+          releaseAfterServerRollback(client, release, error),
+        );
         throw storeError("migration_failed");
       }
-      await failCommitUncertain(client, release, error);
+      await protectPromise(
+        failCommitUncertain(client, release, error),
+      );
     }
     const command = resultCommand(commitResult);
     if (command === "ROLLBACK") {
-      await resetAndRelease(client, release, "not-committed");
+      await protectPromise(
+        resetAndRelease(client, release, "not-committed"),
+      );
       throw storeError("migration_failed");
     }
     if (command !== "COMMIT") {
-      await failCommitUncertain(
-        client,
-        release,
-        new Error("invalid COMMIT acknowledgement"),
+      await protectPromise(
+        failCommitUncertain(
+          client,
+          release,
+          new ErrorConstructor("invalid COMMIT acknowledgement"),
+        ),
       );
     }
-    await resetAndRelease(client, release, "committed");
-    return Object.freeze({
+    await protectPromise(
+      resetAndRelease(client, release, "committed"),
+    );
+    return objectFreeze({
       applied,
       checksum: migration.checksum,
       version: SESSION_AUTHORITY_MIGRATION_VERSION,
@@ -882,7 +1214,9 @@ export class PostgresSerializableStore {
 
   async runSerializable(callback) {
     if (typeof callback !== "function") {
-      throw new TypeError("transaction callback must be a function");
+      throw new TypeErrorConstructor(
+        "transaction callback must be a function",
+      );
     }
 
     for (
@@ -890,31 +1224,49 @@ export class PostgresSerializableStore {
       attempt <= this.#maxTransactionAttempts;
       attempt += 1
     ) {
-      const { client, release } = await acquireCleanClient(
-        this.#dedicatedPool,
+      const transactionErrors = new WeakSetConstructor();
+      const transactionError = (
+        code,
+        commitState = "not-committed",
+      ) => {
+        const error = storeError(code, commitState);
+        reflectApply(weakSetAddIntrinsic, transactionErrors, [error]);
+        return error;
+      };
+      const { client, release } = await protectPromise(
+        acquireCleanClient(this.#dedicatedPool),
       );
 
       try {
-        await clientQuery(
-          client,
-          "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+        await protectPromise(
+          clientQuery(
+            client,
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+          ),
         );
       } catch (error) {
-        await release(error, "not-committed");
+        await protectPromise(release(error, "not-committed"));
         throw storeError("transaction_begin_failed");
       }
 
       let timestampResult;
       try {
-        timestampResult = await clientQuery(
-          client,
-          [
-            "SELECT transaction_timestamp() AS transaction_timestamp,",
-            "pg_current_xact_id()::text AS transaction_id",
-          ].join(" "),
+        timestampResult = await protectPromise(
+          clientQuery(
+            client,
+            arrayJoin(
+              [
+                "SELECT transaction_timestamp() AS transaction_timestamp,",
+                "pg_current_xact_id()::text AS transaction_id",
+              ],
+              " ",
+            ),
+          ),
         );
       } catch (error) {
-        await rollbackAndRelease(client, release, error);
+        await protectPromise(
+          rollbackAndRelease(client, release, error),
+        );
         throw storeError(
           "transaction_timestamp_failed",
           "not-committed",
@@ -927,7 +1279,9 @@ export class PostgresSerializableStore {
         now = canonicalTransactionTimestamp(timestampResult);
         transactionId = canonicalTransactionId(timestampResult);
       } catch (error) {
-        await rollbackAndRelease(client, release, error);
+        await protectPromise(
+          rollbackAndRelease(client, release, error),
+        );
         throw error;
       }
 
@@ -935,25 +1289,36 @@ export class PostgresSerializableStore {
         client,
         now,
         transactionId,
+        transactionError,
       );
       let callbackError;
       let callbackFailed = false;
       let value;
       try {
-        value = await Reflect.apply(callback, undefined, [
+        // Preserve ordinary await semantics for the callback's own result,
+        // including Promise subclasses and cross-realm promises. The callback
+        // controls only its value/error here; every authority-owned await that
+        // follows is protected independently.
+        value = await reflectApply(callback, undefined, [
           capability.transaction,
         ]);
       } catch (error) {
         callbackFailed = true;
         callbackError = error;
       }
-      const closedCapability = await capability.close();
+      const closedCapability = await protectPromise(
+        capability.close(),
+      );
       if (closedCapability.boundaryLost) {
-        await failBoundaryUncertain(client, release);
+        await protectPromise(
+          failBoundaryUncertain(client, release),
+        );
       }
       if (!callbackFailed && closedCapability.queryPending) {
         callbackFailed = true;
-        callbackError = storeError("transaction_query_pending");
+        callbackError = transactionError(
+          "transaction_query_pending",
+        );
       }
       if (
         !callbackFailed &&
@@ -964,7 +1329,9 @@ export class PostgresSerializableStore {
       }
 
       if (callbackFailed) {
-        await rollbackAndRelease(client, release, callbackError);
+        await protectPromise(
+          rollbackAndRelease(client, release, callbackError),
+        );
         if (capability.isQueryError(callbackError)) {
           if (capability.isRetryableQueryError(callbackError)) {
             if (attempt < this.#maxTransactionAttempts) continue;
@@ -975,60 +1342,88 @@ export class PostgresSerializableStore {
           }
           throw storeError("transaction_query_failed");
         }
+        if (
+          isPostgresSerializableStoreError(callbackError) &&
+          !reflectApply(weakSetHasIntrinsic, transactionErrors, [
+            callbackError,
+          ])
+        ) {
+          throw transactionError("transaction_rolled_back");
+        }
         throw callbackError;
       }
 
       if (closedCapability.queryCount === 0) {
         let boundaryResult;
         try {
-          boundaryResult = await clientQuery(
-            client,
-            "SELECT pg_current_xact_id()::text AS transaction_id",
+          boundaryResult = await protectPromise(
+            clientQuery(
+              client,
+              "SELECT pg_current_xact_id()::text AS transaction_id",
+            ),
           );
         } catch {
-          await failBoundaryUncertain(client, release);
+          await protectPromise(
+            failBoundaryUncertain(client, release),
+          );
         }
         let currentTransactionId;
         try {
           currentTransactionId = canonicalTransactionId(boundaryResult);
         } catch {
-          await failBoundaryUncertain(client, release);
+          await protectPromise(
+            failBoundaryUncertain(client, release),
+          );
         }
         if (currentTransactionId !== transactionId) {
-          await failBoundaryUncertain(client, release);
+          await protectPromise(
+            failBoundaryUncertain(client, release),
+          );
         }
       }
 
       let commitResult;
       try {
-        commitResult = await clientQuery(client, "COMMIT");
+        commitResult = await protectPromise(
+          clientQuery(client, "COMMIT"),
+        );
       } catch (error) {
         if (hasRetryableTransactionSqlState(error)) {
-          await releaseAfterServerRollback(client, release, error);
+          await protectPromise(
+            releaseAfterServerRollback(client, release, error),
+          );
           if (attempt < this.#maxTransactionAttempts) continue;
           throw storeError(
             "serialization_retry_exhausted",
             "not-committed",
           );
         }
-        await failCommitUncertain(client, release, error);
+        await protectPromise(
+          failCommitUncertain(client, release, error),
+        );
       }
       const command = resultCommand(commitResult);
       if (command === "ROLLBACK") {
-        await resetAndRelease(client, release, "not-committed");
+        await protectPromise(
+          resetAndRelease(client, release, "not-committed"),
+        );
         throw storeError("transaction_rolled_back");
       }
       if (command !== "COMMIT") {
-        await failCommitUncertain(
-          client,
-          release,
-          new Error("invalid COMMIT acknowledgement"),
+        await protectPromise(
+          failCommitUncertain(
+            client,
+            release,
+            new ErrorConstructor("invalid COMMIT acknowledgement"),
+          ),
         );
       }
-      await resetAndRelease(client, release, "committed");
+      await protectPromise(
+        resetAndRelease(client, release, "committed"),
+      );
       return value;
     }
 
-    throw new Error("unreachable transaction attempt state");
+    throw new ErrorConstructor("unreachable transaction attempt state");
   }
 }

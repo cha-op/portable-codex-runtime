@@ -88,14 +88,35 @@ node-postgres `DatabaseError` object was first observed on that client's
 exact transaction-rollback SQLSTATE. The client is destroyed or reset after a
 proved rollback. Merely constructing `DatabaseError` or matching its `code` is
 insufficient: custom parameter conversion and result-parser failures never
-receive protocol provenance. That rule also covers a server `40001` detected
-during `COMMIT`. A transport failure or any other `COMMIT` error is
-outcome-uncertain and is never automatically replayed as a fresh operation.
+receive protocol provenance. The executor captures the WeakMap, Set, Array,
+RegExp, object, Promise, and prototype-test intrinsics used by that proof
+before any callback runs. Authority-bearing driver results must expose own
+data fields rather than inherited values or accessors. A callback limited to
+the transaction capability therefore cannot use built-in prototype mutation
+to manufacture SQLSTATE provenance, hide pending queries, or turn an unknown
+`COMMIT` result into a retry. This is not an unforgeable brand against code
+that can access or replace the dedicated pool, checked-out client, connection
+event source, or node-postgres implementation: those objects form the trusted
+driver boundary and must not be exposed to callbacks. That rule also covers a
+server `40001` detected during `COMMIT`. A transport failure or any other
+`COMMIT` error is outcome-uncertain and is never automatically replayed as a
+fresh operation.
 Reset failure destroys the connection and preserves the already proved
 committed or not-committed outcome. User-query failures without a SQLSTATE,
 the connection/operator/system/internal error classes, and the explicit
 `40003` completion-unknown state are likewise outcome-uncertain; a later
 `ROLLBACK` cannot reclassify them.
+After a callback rollback is proved, only a store error minted by that exact
+transaction attempt retains its specific state. A publicly constructed store
+error or one replayed from another operation is translated to the generic
+`transaction_rolled_back` / `not-committed` result. Constructor provenance is
+recorded in a module-private identity set, including objects constructed with
+an alternate `newTarget`; the captured public prototype chain independently
+covers prototype-created or prototype-grafted counterfeits. An opaque Proxy
+callback error also fails closed to the generic rollback result because its
+target identity cannot be proved. Ordinary non-Proxy application errors remain
+unchanged, while stale or forged `committed` / `uncertain` store state cannot
+escape a transaction that definitely rolled back.
 
 Migration rollback preserves a specific migration validation error only when
 that exact error object was created and marked by the current `migrate()`
@@ -193,6 +214,11 @@ descriptor URLs, and unsupported layer media types are rejected deliberately.
 Caller-supplied byte views are size-checked through captured typed-array
 intrinsics before any source-sized private byte-buffer allocation, then copied
 into an exact bounded buffer without invoking shadowable source properties.
+Before full JSON parsing, the scanner also bounds nesting, total value nodes,
+aggregate object members, aggregate array elements, each container, image
+layers and rootfs DiffIDs, and config history entries. These structural budgets
+prevent a byte-valid manifest or config from expanding into unbounded parser
+work or duplicate-key tracking memory.
 
 Image reservation follows one-process object capability semantics:
 

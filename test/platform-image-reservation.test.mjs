@@ -4,6 +4,11 @@ import test from "node:test";
 
 import {
   MAX_IMAGE_CONFIG_BYTES,
+  MAX_IMAGE_HISTORY_ENTRIES,
+  MAX_IMAGE_JSON_ARRAY_ELEMENTS,
+  MAX_IMAGE_JSON_CONTAINER_ENTRIES,
+  MAX_IMAGE_JSON_OBJECT_MEMBERS,
+  MAX_IMAGE_LAYER_COUNT,
   MAX_PLATFORM_MANIFEST_BYTES,
   PlatformImageReservationCoordinator,
   PlatformImageReservationError,
@@ -518,6 +523,166 @@ test("rejects oversized byte views before allocating or copying", async () => {
   assert.deepEqual(allocations, [fixture.descriptor.bytes.byteLength]);
   assert.equal(copies, 0);
   assert.equal(inspected.requests.length, 0);
+});
+
+test("rejects structurally expansive image JSON within byte limits", async (t) => {
+  const rejectFixture = async (fixture) => {
+    const inspected = inspector();
+    assert.ok(
+      fixture.descriptor.bytes.byteLength <=
+        MAX_PLATFORM_MANIFEST_BYTES,
+    );
+    assert.ok(
+      fixture.configBytes.byteLength <= MAX_IMAGE_CONFIG_BYTES,
+    );
+    await assert.rejects(
+      new PlatformImageReservationCoordinator().reservePlatformImage(
+        reserveOptions(fixture, inspected.inspectCodex),
+      ),
+      assertCode("platform_image_identity_mismatch"),
+    );
+    assert.equal(inspected.requests.length, 0);
+  };
+
+  await t.test("one object exceeds its member budget", async () => {
+    const extra = Object.fromEntries(
+      Array.from(
+        { length: MAX_IMAGE_JSON_CONTAINER_ENTRIES + 1 },
+        (_, index) => [`key-${index}`, null],
+      ),
+    );
+    await rejectFixture(
+      imageFixture({
+        configDocument: {
+          architecture: "arm64",
+          extra,
+          os: "linux",
+          rootfs: { diff_ids: [DIFF_ID], type: "layers" },
+        },
+      }),
+    );
+  });
+
+  await t.test("aggregate object members exceed their budget", async () => {
+    const groups = Math.floor(
+      MAX_IMAGE_JSON_OBJECT_MEMBERS /
+        MAX_IMAGE_JSON_CONTAINER_ENTRIES,
+    ) + 1;
+    const extra = Array.from({ length: groups }, (_, group) =>
+      Object.fromEntries(
+        Array.from(
+          { length: MAX_IMAGE_JSON_CONTAINER_ENTRIES },
+          (_, index) => [`key-${group}-${index}`, null],
+        ),
+      ),
+    );
+    await rejectFixture(
+      imageFixture({
+        configDocument: {
+          architecture: "arm64",
+          extra,
+          os: "linux",
+          rootfs: { diff_ids: [DIFF_ID], type: "layers" },
+        },
+      }),
+    );
+  });
+
+  await t.test("aggregate array elements exceed their budget", async () => {
+    const groups = Math.floor(
+      MAX_IMAGE_JSON_ARRAY_ELEMENTS /
+        MAX_IMAGE_JSON_CONTAINER_ENTRIES,
+    ) + 1;
+    const extra = Array.from({ length: groups }, () =>
+      Array(MAX_IMAGE_JSON_CONTAINER_ENTRIES).fill(null),
+    );
+    await rejectFixture(
+      imageFixture({
+        configDocument: {
+          architecture: "arm64",
+          extra,
+          os: "linux",
+          rootfs: { diff_ids: [DIFF_ID], type: "layers" },
+        },
+      }),
+    );
+  });
+
+  await t.test("aggregate nodes exceed their budget", async () => {
+    const groupSize = MAX_IMAGE_JSON_CONTAINER_ENTRIES - 1;
+    const groups = Math.floor(
+      MAX_IMAGE_JSON_ARRAY_ELEMENTS /
+        MAX_IMAGE_JSON_CONTAINER_ENTRIES,
+    );
+    const extra = Array.from({ length: groups }, (_, index) =>
+      Array(index === groups - 1 ? groupSize - 1 : groupSize).fill({
+        value: null,
+      }),
+    );
+    await rejectFixture(
+      imageFixture({
+        configDocument: {
+          architecture: "arm64",
+          extra,
+          marker: null,
+          markerTwo: null,
+          markerThree: null,
+          os: "linux",
+          rootfs: { diff_ids: [DIFF_ID], type: "layers" },
+        },
+      }),
+    );
+  });
+
+  await t.test("layer count exceeds its pre-parse budget", async () => {
+    await rejectFixture(
+      imageFixture({
+        manifestMutator(document) {
+          document.layers = Array(MAX_IMAGE_LAYER_COUNT + 1).fill(
+            document.layers[0],
+          );
+        },
+      }),
+    );
+  });
+
+  await t.test("history count exceeds its pre-parse budget", async () => {
+    await rejectFixture(
+      imageFixture({
+        configDocument: {
+          architecture: "arm64",
+          history: Array(MAX_IMAGE_HISTORY_ENTRIES + 1).fill({
+            created: "2026-07-23T00:00:00Z",
+          }),
+          os: "linux",
+          rootfs: { diff_ids: [DIFF_ID], type: "layers" },
+        },
+      }),
+    );
+  });
+});
+
+test("applies image array budgets only to authoritative paths", async () => {
+  const extensionEntries = MAX_IMAGE_LAYER_COUNT + 1;
+  const fixture = imageFixture({
+    configDocument: {
+      architecture: "arm64",
+      extension: {
+        diff_ids: Array(extensionEntries).fill(null),
+        history: Array(extensionEntries).fill(null),
+      },
+      layers: Array(extensionEntries).fill(null),
+      os: "linux",
+      rootfs: { diff_ids: [DIFF_ID], type: "layers" },
+    },
+  });
+  const inspected = inspector();
+
+  await new PlatformImageReservationCoordinator().reservePlatformImage(
+    reserveOptions(fixture, inspected.inspectCodex),
+  );
+
+  assert.equal(inspected.requests.length, 1);
 });
 
 test("copies genuine byte views without invoking shadowable properties", async () => {
