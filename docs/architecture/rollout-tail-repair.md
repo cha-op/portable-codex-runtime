@@ -88,14 +88,19 @@ ownership, duplicate thread ownership, or a foreign session fails the whole
 preflight.
 
 Enumeration is bounded to 256 rollout files, 1,024 directories, directory
-depth 8, 64 MiB per file, and 256 MiB of discovered input bytes in total. Each
+depth 8, 1,280 directory entries, 1 MiB of aggregate UTF-8 entry-name bytes,
+64 MiB per file, and 256 MiB of discovered input bytes in total. Directory
+enumeration uses a fixed-buffer streaming `opendir()` reader and applies the
+entry and name-byte budgets before retaining or sorting each name. Full-tree
+and publication-time directory revalidation use the same bounded reader, so an
+entry-set race cannot reintroduce an unbounded `readdir()` allocation. Each
 descriptor-pinned file size is compared with the remaining aggregate budget
-before a content Buffer is allocated or read. This aggregate input bound is
-not a strict process-RSS bound: analysis and replacement readback can briefly
-retain additional bounded Buffers. Candidate directories and files must remain
-inside the held Codex-home authority. The 64 MiB bound also applies to the
-final repaired byte sequence, so an LF append that would cross the limit fails
-before a replacement is created. Plain rollout files
+before a content Buffer is allocated or read. These input and enumeration
+bounds are not a strict process-RSS bound: analysis and replacement readback
+can briefly retain additional bounded Buffers. Candidate directories and files
+must remain inside the held Codex-home authority. The 64 MiB bound also applies
+to the final repaired byte sequence, so an LF append that would cross the limit
+fails before a replacement is created. Plain rollout files
 must be current-user-owned regular files with one link, owner read/write
 permission with no execute bits, no special mode bits, and no group/world
 write permission, and no extended ACL. Enumerated directories must be

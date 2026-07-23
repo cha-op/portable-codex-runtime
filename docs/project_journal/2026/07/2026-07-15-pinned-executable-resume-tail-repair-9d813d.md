@@ -3,7 +3,7 @@ id: 20260715-9d813d
 title: Pinned-Executable Resume and Rollout-Tail Repair
 status: completed
 created: 2026-07-15
-updated: 2026-07-17
+updated: 2026-07-23
 branch: wip/same-image-resume-tail-repair
 pr: 13
 supersedes: []
@@ -67,7 +67,11 @@ superseded_by:
   allocation, UTF-8-BOM-prefixed records fail closed, every final file check
   repeats ACL inspection with path/handle rebinding, and repaired-file handles
   remain pinned through the final full-tree pass. Home handles enter cleanup
-  ownership before caller-observation identity checks can fail.
+  ownership before caller-observation identity checks can fail. Directory
+  discovery and revalidation use fixed-buffer streaming enumeration; they
+  enforce 1,280 total entries and 1 MiB of UTF-8 name bytes before retaining or
+  sorting names, so an oversized directory fails without an unbounded
+  `readdir()` allocation.
 - The schema-v6 live probe exercises both modifying actions with one staged
   private Codex executable on stopped-tree-derived writable copies, resumes by
   explicit thread ID and restored `cwd`, completes one follow-up, and verifies
@@ -82,18 +86,21 @@ superseded_by:
   files passed after the review fixes, including permission tightening, ACL
   rejection and final-pass race detection, home-handle cleanup, BOM rejection,
   pre-read aggregate-budget enforcement, copy-seam isolation, and exact
-  evidence-pin checks.
-- Pinned `npm run probe:turn-recovery -- --write-evidence` passed all six live
-  app-server scenarios under a normal `022` umask. The run used the official
+  evidence-pin checks. The final resource-bound fix also passed synthetic
+  entry/name-budget checks and a real 1,281-entry directory regression.
+- Pinned `npm run probe:turn-recovery` was rerun after the streaming-enumeration
+  fix and passed all six live app-server scenarios under a normal `022` umask.
+  The run used the official
   `rust-v0.144.1` macOS arm64 release asset: archive SHA-256
   `88e72ac8bd30815f7d18e62dac333dc20ce3ad1cba94be1649a1977dd9bfdbb8`
   and extracted binary SHA-256
   `29915529b97697def1a957b0505e770aa6a45744435d62fc263e98d7619e167a`,
   matching the tracked schema-v6 evidence. The host-installed `0.144.5`
   binary was rejected by the compatibility identity gate as designed.
-- The final `npm test -- --test-reporter=dot` run passed outside the filesystem
-  sandbox, including its loopback-dependent cases and the credential-shaped
-  inputs migrated to exact `joey-private-v3` catalog entries.
+- The final Node `24.18.0` `npm test -- --test-reporter=dot` run passed outside
+  the filesystem sandbox, including its loopback-dependent cases and the
+  credential-shaped inputs migrated to exact `joey-private-v3` catalog
+  entries.
 - JavaScript syntax checks, project-journal validation, and `git diff --check`
   passed.
 

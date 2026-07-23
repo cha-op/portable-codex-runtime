@@ -3,7 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import {
   lstat,
   open,
-  readdir,
+  opendir,
   realpath,
   rename,
   unlink,
@@ -28,6 +28,9 @@ const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 const MAX_ROLLOUT_FILES = 256;
 const MAX_DIRECTORIES = 1_024;
 const MAX_DIRECTORY_DEPTH = 8;
+const MAX_ENUMERATED_ENTRIES = MAX_DIRECTORIES + MAX_ROLLOUT_FILES;
+const MAX_ENUMERATED_NAME_BYTES = 1024 * 1024;
+const DIRECTORY_READ_BUFFER_SIZE = 32;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -583,12 +586,58 @@ function relativeRolloutPath(sessionsPath, path) {
   return candidate.split(sep).join("/");
 }
 
+function createEnumerationBudget() {
+  return { entries: 0, nameBytes: 0 };
+}
+
+async function collectBoundedDirectoryEntries(readNext, budget) {
+  const entries = [];
+  while (true) {
+    const entry = await readNext();
+    if (entry === null) return entries;
+    ensure(
+      entry !== null &&
+        typeof entry === "object" &&
+        typeof entry.name === "string" &&
+        entry.name.length > 0 &&
+        entry.name !== "." &&
+        entry.name !== "..",
+      "unsafe_filesystem",
+    );
+    const nameBytes = Buffer.byteLength(entry.name, "utf8");
+    ensure(
+      budget.entries < MAX_ENUMERATED_ENTRIES &&
+        nameBytes <= MAX_ENUMERATED_NAME_BYTES - budget.nameBytes,
+      "rollout_set_invalid",
+    );
+    budget.entries += 1;
+    budget.nameBytes += nameBytes;
+    entries.push(entry);
+  }
+}
+
+async function readBoundedDirectory(path, budget = createEnumerationBudget()) {
+  const directory = await opendir(path, {
+    bufferSize: DIRECTORY_READ_BUFFER_SIZE,
+    encoding: "utf8",
+  });
+  try {
+    return await collectBoundedDirectoryEntries(
+      () => directory.read(),
+      budget,
+    );
+  } finally {
+    await directory.close();
+  }
+}
+
 async function scanTree(codexHome, uid, hooks) {
   let home;
   let sessions;
   let sessionsPath;
   const directories = [];
   const files = [];
+  const enumerationBudget = createEnumerationBudget();
   let totalBytes = 0;
   try {
     const requestedHome = await lstat(codexHome, { bigint: true });
@@ -619,11 +668,13 @@ async function scanTree(codexHome, uid, hooks) {
 
     async function visit(directory, depth) {
       ensure(depth <= MAX_DIRECTORY_DEPTH, "rollout_set_invalid");
-      const entries = await readdir(directory.path, { withFileTypes: true });
+      const entries = await readBoundedDirectory(
+        directory.path,
+        enumerationBudget,
+      );
       entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
       directory.entries = entries.map((entry) => entry.name);
       for (const entry of entries) {
-        ensure(entry.name !== "." && entry.name !== "..", "unsafe_filesystem");
         const path = join(directory.path, entry.name);
         const metadata = await lstat(path, { bigint: true });
         if (metadata.isSymbolicLink()) fail("unsafe_filesystem");
@@ -673,7 +724,11 @@ async function verifyDirectory(
   directory,
   uid,
   hooks,
-  { expectedExtraEntry, includeTimestamps = false } = {},
+  {
+    enumerationBudget = createEnumerationBudget(),
+    expectedExtraEntry,
+    includeTimestamps = false,
+  } = {},
 ) {
   const pathMetadata = await lstat(directory.path, { bigint: true });
   const handleMetadata = await directory.handle.stat({ bigint: true });
@@ -705,9 +760,11 @@ async function verifyDirectory(
   );
 
   if (directory.entries === null) return;
-  const names = (await readdir(directory.path)).sort((left, right) =>
-    left.localeCompare(right, "en"),
-  );
+  const names = (
+    await readBoundedDirectory(directory.path, enumerationBudget)
+  )
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right, "en"));
   await hooks.afterDirectoryRead();
   const expectedNames =
     expectedExtraEntry === undefined
@@ -993,8 +1050,10 @@ async function repairWithHooks(options, hooks) {
       threadIds.add(entry.meta.threadId);
     }
 
+    const initialVerificationBudget = createEnumerationBudget();
     for (const directory of scan.directories) {
       await verifyDirectory(directory, uid, hooks, {
+        enumerationBudget: initialVerificationBudget,
         includeTimestamps: true,
       });
     }
@@ -1020,8 +1079,11 @@ async function repairWithHooks(options, hooks) {
       });
     }
 
+    const finalVerificationBudget = createEnumerationBudget();
     for (const directory of scan.directories) {
-      await verifyDirectory(directory, uid, hooks);
+      await verifyDirectory(directory, uid, hooks, {
+        enumerationBudget: finalVerificationBudget,
+      });
     }
     for (const file of scan.files) {
       await verifyFile(file, uid, hooks, file.fingerprint);
@@ -1069,9 +1131,15 @@ export async function repairStoppedRolloutTails(options) {
 // point. The ACL inspector receives one absolute path; fault-injection hooks
 // receive no path, bytes, identifiers, or proof content.
 export const __testing = objectFreeze({
+  collectBoundedDirectoryEntries,
   createRepair(hooks) {
     const checkedHooks = normalizeHooks(hooks);
     return async (options) => repairWithHooks(options, checkedHooks);
   },
+  createEnumerationBudget,
+  enumerationLimits: objectFreeze({
+    maxEntries: MAX_ENUMERATED_ENTRIES,
+    maxNameBytes: MAX_ENUMERATED_NAME_BYTES,
+  }),
   readWithinAggregateBudget,
 });

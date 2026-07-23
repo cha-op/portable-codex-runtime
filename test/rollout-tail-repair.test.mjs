@@ -827,6 +827,60 @@ test("enforces the remaining aggregate budget before invoking the reader", async
   assert.equal(reads, 1);
 });
 
+test("bounds streamed directory enumeration before retaining excess entries", async (t) => {
+  await t.test("total entry count", async () => {
+    const budget = __testing.createEnumerationBudget();
+    let reads = 0;
+    await assert.rejects(
+      __testing.collectBoundedDirectoryEntries(async () => {
+        reads += 1;
+        return { name: `entry-${reads}` };
+      }, budget),
+      (error) => assertRepairError(error, "rollout_set_invalid"),
+    );
+    assert.equal(reads, __testing.enumerationLimits.maxEntries + 1);
+    assert.equal(budget.entries, __testing.enumerationLimits.maxEntries);
+  });
+
+  await t.test("aggregate UTF-8 name bytes", async () => {
+    const budget = __testing.createEnumerationBudget();
+    budget.nameBytes = __testing.enumerationLimits.maxNameBytes - 1;
+    let reads = 0;
+    await assert.rejects(
+      __testing.collectBoundedDirectoryEntries(async () => {
+        reads += 1;
+        return { name: "é" };
+      }, budget),
+      (error) => assertRepairError(error, "rollout_set_invalid"),
+    );
+    assert.equal(reads, 1);
+    assert.equal(
+      budget.nameBytes,
+      __testing.enumerationLimits.maxNameBytes - 1,
+    );
+  });
+});
+
+test("rejects an oversized physical directory through streaming enumeration", async (t) => {
+  const { codexHome, day } = await fixture(t);
+  const limit = __testing.enumerationLimits.maxEntries;
+  for (let start = 0; start <= limit; start += 64) {
+    const end = Math.min(start + 64, limit + 1);
+    await Promise.all(
+      Array.from({ length: end - start }, (_, offset) =>
+        mkdir(join(day, `entry-${String(start + offset).padStart(4, "0")}`), {
+          mode: 0o700,
+        }),
+      ),
+    );
+  }
+
+  await assert.rejects(
+    repairStoppedRolloutTails(request(codexHome)),
+    (error) => assertRepairError(error, "rollout_set_invalid"),
+  );
+});
+
 test("rejects an LF append that would exceed the per-file size bound", async (t) => {
   const { codexHome, day } = await fixture(t);
   const original = Buffer.alloc(MAX_ROLLOUT_BYTES, 0x20);
