@@ -1,0 +1,739 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 1;
+export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
+export const MAX_TRANSACTION_ATTEMPTS = 16;
+
+const MIGRATION_URL = new URL(
+  "../migrations/authority/001-session-authority.sql",
+  import.meta.url,
+);
+const MIGRATION_LOCK_KEY = "7275632827684484689";
+const RETRYABLE_TRANSACTION_CODES = new Set(["40001", "40P01"]);
+const COMMIT_STATES = new Set(["committed", "not-committed", "uncertain"]);
+const ERROR_MESSAGES = Object.freeze({
+  client_reset_failed: "PostgreSQL client reset failed",
+  client_release_failed: "PostgreSQL client release failed",
+  connection_failed: "PostgreSQL connection acquisition failed",
+  migration_checksum_mismatch: "Authority schema migration checksum mismatch",
+  migration_failed: "Authority schema migration failed",
+  migration_source_failed: "Authority schema migration source could not be read",
+  migration_state_invalid: "Authority schema migration state is invalid",
+  serialization_retry_exhausted: "Serializable transaction retry limit was exhausted",
+  transaction_begin_failed: "Serializable transaction could not begin",
+  transaction_boundary_lost: "Serializable transaction boundary was lost",
+  transaction_commit_outcome_uncertain:
+    "Serializable transaction commit outcome is uncertain",
+  transaction_query_inactive: "Transaction query capability is no longer active",
+  transaction_query_failed: "Transaction query failed",
+  transaction_query_invalid: "Transaction query arguments are invalid",
+  transaction_query_pending:
+    "Transaction callback returned with an unsettled query",
+  transaction_rolled_back: "Serializable transaction was rolled back",
+  transaction_rollback_failed: "Serializable transaction rollback failed",
+  transaction_timestamp_failed:
+    "Serializable transaction timestamp could not be established",
+});
+
+export class PostgresSerializableStoreError extends Error {
+  constructor(code, commitState = "not-committed") {
+    if (!Object.hasOwn(ERROR_MESSAGES, code) || !COMMIT_STATES.has(commitState)) {
+      throw new TypeError("unsupported PostgreSQL serializable store error");
+    }
+    super(ERROR_MESSAGES[code]);
+    this.name = "PostgresSerializableStoreError";
+    this.code = code;
+    this.commitState = commitState;
+    this.retryable = false;
+    Object.freeze(this);
+  }
+}
+
+function storeError(code, commitState = "not-committed") {
+  return new PostgresSerializableStoreError(code, commitState);
+}
+
+function inspectOptions(options) {
+  if (
+    options === null ||
+    typeof options !== "object" ||
+    Array.isArray(options) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(options))
+  ) {
+    throw new TypeError("PostgreSQL serializable store options must be a plain object");
+  }
+  const keys = Reflect.ownKeys(options);
+  if (
+    !keys.every(
+      (key) =>
+        typeof key === "string" &&
+        ["dedicatedPool", "maxTransactionAttempts"].includes(key),
+    ) ||
+    !keys.includes("dedicatedPool")
+  ) {
+    throw new TypeError(
+      "PostgreSQL serializable store options contain unexpected or missing fields",
+    );
+  }
+  const normalized = Object.create(null);
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) {
+      throw new TypeError(
+        "PostgreSQL serializable store options must use plain data fields",
+      );
+    }
+    normalized[key] = descriptor.value;
+  }
+  return normalized;
+}
+
+function validateDedicatedPool(pool) {
+  if (
+    pool === null ||
+    !["object", "function"].includes(typeof pool) ||
+    typeof pool.connect !== "function"
+  ) {
+    throw new TypeError("dedicatedPool must provide connect()");
+  }
+  return pool;
+}
+
+function validateAttemptLimit(value) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > MAX_TRANSACTION_ATTEMPTS
+  ) {
+    throw new TypeError(
+      `maxTransactionAttempts must be an integer from 1 through ${MAX_TRANSACTION_ATTEMPTS}`,
+    );
+  }
+  return value;
+}
+
+function safeSqlState(error) {
+  try {
+    return typeof error?.code === "string" &&
+      /^[0-9A-Z]{5}$/u.test(error.code)
+      ? error.code
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasRetryableTransactionSqlState(error) {
+  return RETRYABLE_TRANSACTION_CODES.has(safeSqlState(error));
+}
+
+function isTrustedUserQueryRejectionSqlState(sqlState) {
+  return (
+    sqlState !== undefined &&
+    sqlState !== "40003" &&
+    !["08", "57", "58", "XX"].includes(sqlState.slice(0, 2))
+  );
+}
+
+function validateClient(client) {
+  return (
+    client !== null &&
+    ["object", "function"].includes(typeof client) &&
+    typeof client.query === "function" &&
+    typeof client.release === "function"
+  );
+}
+
+async function clientQuery(client, ...args) {
+  return Reflect.apply(client.query, client, args);
+}
+
+async function acquireClient(pool) {
+  let client;
+  try {
+    client = await Reflect.apply(pool.connect, pool, []);
+  } catch {
+    throw storeError("connection_failed");
+  }
+  if (!validateClient(client)) {
+    throw storeError("connection_failed");
+  }
+  return client;
+}
+
+function releaseOnce(client) {
+  let released = false;
+  return async (destroyCause, commitState) => {
+    if (released) {
+      throw storeError("client_release_failed", commitState);
+    }
+    released = true;
+    try {
+      if (destroyCause === undefined) {
+        await Reflect.apply(client.release, client, []);
+      } else {
+        await Reflect.apply(client.release, client, [destroyCause]);
+      }
+    } catch {
+      throw storeError("client_release_failed", commitState);
+    }
+  };
+}
+
+function resultCommand(result) {
+  try {
+    return result !== null &&
+      typeof result === "object" &&
+      typeof result.command === "string"
+      ? result.command
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resetAndRelease(client, release, commitState) {
+  let resetFailure;
+  try {
+    const result = await clientQuery(client, "DISCARD ALL");
+    if (resultCommand(result) !== "DISCARD") {
+      resetFailure = new Error("invalid DISCARD ALL acknowledgement");
+    }
+  } catch (error) {
+    resetFailure = error;
+  }
+  if (resetFailure !== undefined) {
+    try {
+      await release(resetFailure, commitState);
+    } catch {
+      // Preserve the reset classification while the client is being destroyed.
+    }
+    throw storeError("client_reset_failed", commitState);
+  }
+  await release(undefined, commitState);
+}
+
+async function acquireCleanClient(pool) {
+  const client = await acquireClient(pool);
+  const release = releaseOnce(client);
+  try {
+    const result = await clientQuery(client, "DISCARD ALL");
+    if (resultCommand(result) !== "DISCARD") {
+      throw new Error("invalid DISCARD ALL acknowledgement");
+    }
+  } catch (error) {
+    try {
+      await release(error, "not-committed");
+    } catch {
+      // Preserve the reset classification while the client is being destroyed.
+    }
+    throw storeError("client_reset_failed");
+  }
+  return Object.freeze({ client, release });
+}
+
+async function rollbackAndRelease(client, release, originalError) {
+  let rollbackResult;
+  try {
+    rollbackResult = await clientQuery(client, "ROLLBACK");
+  } catch (rollbackError) {
+    try {
+      await release(rollbackError, "uncertain");
+    } catch {
+      // The rollback failure already makes the transaction outcome uncertain.
+    }
+    throw storeError("transaction_rollback_failed", "uncertain");
+  }
+  if (resultCommand(rollbackResult) !== "ROLLBACK") {
+    const rollbackError = new Error("invalid ROLLBACK acknowledgement");
+    try {
+      await release(rollbackError, "uncertain");
+    } catch {
+      // The malformed acknowledgement already makes the outcome uncertain.
+    }
+    throw storeError("transaction_rollback_failed", "uncertain");
+  }
+  await resetAndRelease(client, release, "not-committed");
+  return originalError;
+}
+
+async function failCommitUncertain(client, release, commitError) {
+  try {
+    await clientQuery(client, "ROLLBACK");
+  } catch {
+    // A failed COMMIT is already uncertain; rollback is only best-effort cleanup.
+  }
+  try {
+    await release(commitError, "uncertain");
+  } catch {
+    // Preserve the primary commit uncertainty classification.
+  }
+  throw storeError("transaction_commit_outcome_uncertain", "uncertain");
+}
+
+async function releaseAfterServerRollback(client, release, transactionError) {
+  // The SQLSTATE proves rollback, but a possibly aborted session is destroyed
+  // instead of being reset and returned to the dedicated pool.
+  await release(transactionError, "not-committed");
+}
+
+async function failBoundaryUncertain(client, release) {
+  try {
+    await clientQuery(client, "ROLLBACK");
+  } catch {
+    // The original transaction boundary is already unproven.
+  }
+  try {
+    await release(new Error("transaction boundary lost"), "uncertain");
+  } catch {
+    // Preserve the primary boundary-loss classification.
+  }
+  throw storeError("transaction_boundary_lost", "uncertain");
+}
+
+function canonicalTransactionTimestamp(result) {
+  const value =
+    result !== null &&
+    typeof result === "object" &&
+    Array.isArray(result.rows) &&
+    result.rows.length === 1 &&
+    result.rows[0] !== null &&
+    typeof result.rows[0] === "object"
+      ? result.rows[0].transaction_timestamp
+      : undefined;
+  let timestamp;
+  try {
+    timestamp =
+      value instanceof Date
+        ? value.getTime()
+        : typeof value === "string"
+          ? Date.parse(value)
+          : Number.NaN;
+  } catch {
+    timestamp = Number.NaN;
+  }
+  if (!Number.isFinite(timestamp)) {
+    throw storeError("transaction_timestamp_failed");
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function canonicalTransactionId(result) {
+  const value =
+    result !== null &&
+    typeof result === "object" &&
+    Array.isArray(result.rows) &&
+    result.rows.length === 1 &&
+    result.rows[0] !== null &&
+    typeof result.rows[0] === "object"
+      ? result.rows[0].transaction_id
+      : undefined;
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) {
+    throw storeError("transaction_boundary_lost");
+  }
+  return value;
+}
+
+function createTransactionCapability(client, now, transactionId) {
+  let active = true;
+  let boundaryLost = false;
+  let firstQueryFailure;
+  let queryCount = 0;
+  let queryQueue = Promise.resolve();
+  let terminalQueryError;
+  const pending = new Set();
+  const queryErrorSqlStates = new WeakMap();
+  const markQueryError = (error) => {
+    const sqlState = safeSqlState(error);
+    if (!isTrustedUserQueryRejectionSqlState(sqlState)) {
+      boundaryLost = true;
+      return storeError("transaction_boundary_lost", "uncertain");
+    }
+    firstQueryFailure ??= Object.freeze({ error });
+    if (
+      error !== null &&
+      ["object", "function"].includes(typeof error)
+    ) {
+      queryErrorSqlStates.set(error, sqlState);
+    }
+    return error;
+  };
+
+  const query = (...args) => {
+    if (!active) {
+      return Promise.reject(storeError("transaction_query_inactive"));
+    }
+    if (
+      (args.length !== 1 && args.length !== 2) ||
+      typeof args[0] !== "string" ||
+      args[0].length === 0 ||
+      (args.length === 2 && !Array.isArray(args[1]))
+    ) {
+      return Promise.reject(storeError("transaction_query_invalid"));
+    }
+
+    queryCount += 1;
+    const queryConfig = Object.freeze({
+      queryMode: "extended",
+      text: args[0],
+      values: args.length === 2 ? [...args[1]] : [],
+    });
+    const operation = queryQueue.then(async () => {
+      if (terminalQueryError !== undefined) throw terminalQueryError;
+      if (boundaryLost) {
+        throw storeError("transaction_boundary_lost", "uncertain");
+      }
+
+      let result;
+      try {
+        result = await Reflect.apply(client.query, client, [queryConfig]);
+      } catch (error) {
+        terminalQueryError = markQueryError(error);
+        throw terminalQueryError;
+      }
+
+      let boundaryResult;
+      try {
+        boundaryResult = await clientQuery(
+          client,
+          "SELECT pg_current_xact_id()::text AS transaction_id",
+        );
+        if (canonicalTransactionId(boundaryResult) !== transactionId) {
+          throw new Error("transaction identifier changed");
+        }
+      } catch {
+        boundaryLost = true;
+        throw storeError("transaction_boundary_lost", "uncertain");
+      }
+      return result;
+    });
+    queryQueue = operation.catch(() => undefined);
+    pending.add(operation);
+    void operation.then(
+      () => pending.delete(operation),
+      () => pending.delete(operation),
+    );
+    return operation;
+  };
+
+  const transaction = Object.freeze({ now, query });
+  return Object.freeze({
+    close: async () => {
+      active = false;
+      const queryPending = pending.size !== 0;
+      if (queryPending) {
+        const unsettled = [...pending];
+        await Promise.allSettled(unsettled);
+      }
+      return Object.freeze({
+        boundaryLost,
+        firstQueryFailure,
+        queryCount,
+        queryPending,
+      });
+    },
+    isQueryError: (error) =>
+      firstQueryFailure !== undefined &&
+      (Object.is(firstQueryFailure.error, error) ||
+        (error !== null &&
+          ["object", "function"].includes(typeof error) &&
+          queryErrorSqlStates.has(error))),
+    isRetryableQueryError: (error) =>
+      error !== null &&
+      ["object", "function"].includes(typeof error) &&
+      RETRYABLE_TRANSACTION_CODES.has(queryErrorSqlStates.get(error)),
+    transaction,
+  });
+}
+
+async function readMigration() {
+  let sql;
+  try {
+    sql = await readFile(MIGRATION_URL, "utf8");
+  } catch {
+    throw storeError("migration_source_failed");
+  }
+  if (sql.length === 0 || !sql.endsWith("\n")) {
+    throw storeError("migration_source_failed");
+  }
+  const checksum = createHash("sha256").update(sql, "utf8").digest("hex");
+  return Object.freeze({ checksum, sql });
+}
+
+/**
+ * Executes authority work on an otherwise unused, dedicated node-postgres
+ * Pool. The store resets every reusable client with DISCARD ALL, which would
+ * invalidate session state owned by any other pool consumer.
+ */
+export class PostgresSerializableStore {
+  #dedicatedPool;
+  #maxTransactionAttempts;
+
+  constructor(options) {
+    const normalized = inspectOptions(options);
+    this.#dedicatedPool = validateDedicatedPool(normalized.dedicatedPool);
+    this.#maxTransactionAttempts = validateAttemptLimit(
+      normalized.maxTransactionAttempts ?? DEFAULT_TRANSACTION_ATTEMPTS,
+    );
+    Object.freeze(this);
+  }
+
+  async migrate() {
+    const migration = await readMigration();
+    const { client, release } = await acquireCleanClient(this.#dedicatedPool);
+
+    try {
+      await clientQuery(client, "BEGIN");
+    } catch (error) {
+      await release(error, "not-committed");
+      throw storeError("transaction_begin_failed");
+    }
+
+    let applied = false;
+    try {
+      await clientQuery(
+        client,
+        "SELECT pg_advisory_xact_lock($1::bigint)",
+        [MIGRATION_LOCK_KEY],
+      );
+      await clientQuery(client, "CREATE SCHEMA IF NOT EXISTS session_authority");
+      await clientQuery(
+        client,
+        [
+          "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations (",
+          "version integer PRIMARY KEY CHECK (version > 0),",
+          "checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),",
+          "applied_at timestamp with time zone NOT NULL",
+          ")",
+        ].join(" "),
+      );
+      const current = await clientQuery(
+        client,
+        [
+          "SELECT version, checksum",
+          "FROM session_authority.schema_migrations",
+          "ORDER BY version",
+        ].join(" "),
+      );
+      if (
+        current === null ||
+        typeof current !== "object" ||
+        !Array.isArray(current.rows)
+      ) {
+        throw storeError("migration_state_invalid");
+      }
+      if (current.rows.length !== 0) {
+        if (
+          current.rows.length !== 1 ||
+          current.rows[0] === null ||
+          typeof current.rows[0] !== "object" ||
+          current.rows[0].version !== SESSION_AUTHORITY_MIGRATION_VERSION ||
+          typeof current.rows[0].checksum !== "string"
+        ) {
+          throw storeError("migration_state_invalid");
+        }
+        if (current.rows[0].checksum !== migration.checksum) {
+          throw storeError("migration_checksum_mismatch");
+        }
+      } else {
+        await clientQuery(client, migration.sql);
+        await clientQuery(
+          client,
+          [
+            "INSERT INTO session_authority.schema_migrations",
+            "(version, checksum, applied_at)",
+            "VALUES ($1, $2, transaction_timestamp())",
+          ].join(" "),
+          [SESSION_AUTHORITY_MIGRATION_VERSION, migration.checksum],
+        );
+        applied = true;
+      }
+    } catch (error) {
+      await rollbackAndRelease(client, release, error);
+      if (error instanceof PostgresSerializableStoreError) throw error;
+      throw storeError("migration_failed");
+    }
+
+    let commitResult;
+    try {
+      commitResult = await clientQuery(client, "COMMIT");
+    } catch (error) {
+      if (hasRetryableTransactionSqlState(error)) {
+        await releaseAfterServerRollback(client, release, error);
+        throw storeError("migration_failed");
+      }
+      await failCommitUncertain(client, release, error);
+    }
+    const command = resultCommand(commitResult);
+    if (command === "ROLLBACK") {
+      await resetAndRelease(client, release, "not-committed");
+      throw storeError("migration_failed");
+    }
+    if (command !== "COMMIT") {
+      await failCommitUncertain(
+        client,
+        release,
+        new Error("invalid COMMIT acknowledgement"),
+      );
+    }
+    await resetAndRelease(client, release, "committed");
+    return Object.freeze({
+      applied,
+      checksum: migration.checksum,
+      version: SESSION_AUTHORITY_MIGRATION_VERSION,
+    });
+  }
+
+  async runSerializable(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("transaction callback must be a function");
+    }
+
+    for (
+      let attempt = 1;
+      attempt <= this.#maxTransactionAttempts;
+      attempt += 1
+    ) {
+      const { client, release } = await acquireCleanClient(
+        this.#dedicatedPool,
+      );
+
+      try {
+        await clientQuery(
+          client,
+          "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+        );
+      } catch (error) {
+        await release(error, "not-committed");
+        throw storeError("transaction_begin_failed");
+      }
+
+      let timestampResult;
+      try {
+        timestampResult = await clientQuery(
+          client,
+          [
+            "SELECT transaction_timestamp() AS transaction_timestamp,",
+            "pg_current_xact_id()::text AS transaction_id",
+          ].join(" "),
+        );
+      } catch (error) {
+        await rollbackAndRelease(client, release, error);
+        throw storeError(
+          "transaction_timestamp_failed",
+          "not-committed",
+        );
+      }
+
+      let now;
+      let transactionId;
+      try {
+        now = canonicalTransactionTimestamp(timestampResult);
+        transactionId = canonicalTransactionId(timestampResult);
+      } catch (error) {
+        await rollbackAndRelease(client, release, error);
+        throw error;
+      }
+
+      const capability = createTransactionCapability(
+        client,
+        now,
+        transactionId,
+      );
+      let callbackError;
+      let callbackFailed = false;
+      let value;
+      try {
+        value = await Reflect.apply(callback, undefined, [
+          capability.transaction,
+        ]);
+      } catch (error) {
+        callbackFailed = true;
+        callbackError = error;
+      }
+      const closedCapability = await capability.close();
+      if (closedCapability.boundaryLost) {
+        await failBoundaryUncertain(client, release);
+      }
+      if (!callbackFailed && closedCapability.queryPending) {
+        callbackFailed = true;
+        callbackError = storeError("transaction_query_pending");
+      }
+      if (
+        !callbackFailed &&
+        closedCapability.firstQueryFailure !== undefined
+      ) {
+        callbackFailed = true;
+        callbackError = closedCapability.firstQueryFailure.error;
+      }
+
+      if (callbackFailed) {
+        await rollbackAndRelease(client, release, callbackError);
+        if (capability.isQueryError(callbackError)) {
+          if (capability.isRetryableQueryError(callbackError)) {
+            if (attempt < this.#maxTransactionAttempts) continue;
+            throw storeError(
+              "serialization_retry_exhausted",
+              "not-committed",
+            );
+          }
+          throw storeError("transaction_query_failed");
+        }
+        throw callbackError;
+      }
+
+      if (closedCapability.queryCount === 0) {
+        let boundaryResult;
+        try {
+          boundaryResult = await clientQuery(
+            client,
+            "SELECT pg_current_xact_id()::text AS transaction_id",
+          );
+        } catch {
+          await failBoundaryUncertain(client, release);
+        }
+        let currentTransactionId;
+        try {
+          currentTransactionId = canonicalTransactionId(boundaryResult);
+        } catch {
+          await failBoundaryUncertain(client, release);
+        }
+        if (currentTransactionId !== transactionId) {
+          await failBoundaryUncertain(client, release);
+        }
+      }
+
+      let commitResult;
+      try {
+        commitResult = await clientQuery(client, "COMMIT");
+      } catch (error) {
+        if (hasRetryableTransactionSqlState(error)) {
+          await releaseAfterServerRollback(client, release, error);
+          if (attempt < this.#maxTransactionAttempts) continue;
+          throw storeError(
+            "serialization_retry_exhausted",
+            "not-committed",
+          );
+        }
+        await failCommitUncertain(client, release, error);
+      }
+      const command = resultCommand(commitResult);
+      if (command === "ROLLBACK") {
+        await resetAndRelease(client, release, "not-committed");
+        throw storeError("transaction_rolled_back");
+      }
+      if (command !== "COMMIT") {
+        await failCommitUncertain(
+          client,
+          release,
+          new Error("invalid COMMIT acknowledgement"),
+        );
+      }
+      await resetAndRelease(client, release, "committed");
+      return value;
+    }
+
+    throw new Error("unreachable transaction attempt state");
+  }
+}

@@ -80,6 +80,25 @@ not part of checkpoint correctness. See
 `docs/architecture/session-storage-contracts.md` for the state machine,
 backend interface, NFS/image constraints, and Codex source basis.
 
+## Session Authority Foundation
+
+The control-plane foundation supplies a single-client PostgreSQL
+`SERIALIZABLE` transaction executor, a checksum-bound initial schema for
+canonical sessions, operation and reservation claims, capture tombstones, and
+the checkpoint catalogue, plus real-PostgreSQL concurrency coverage. Business
+lifecycle transitions and launcher admission will be added in the next
+authority slice; the schema or executor alone does not authorize a writer.
+
+A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
+config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
+platform, and normalized Codex version to a one-use in-process object
+capability. This closes serialized image-identity substitution inside the
+authority boundary. It intentionally rejects artifact manifests and unsupported
+descriptor extensions; it does not implement registry signature policy, mount
+an image, launch Podman/Docker, or turn a database epoch into a physical
+stale-writer fence. The stopped-directory backend remains manual-fencing only.
+See `docs/architecture/session-runtime-authority.md`.
+
 ## Snapshot and Restore Core
 
 The backend-neutral core orchestrates stopped-writer `clean` checkpoint
@@ -337,11 +356,25 @@ localhost Responses API mock. It verifies that:
 - The retried request uses the replacement access token.
 - External auth does not create a worker `auth.json`.
 
-Run the full local test suite:
+Install the exact locked dependencies, then run the full Node test suite:
 
 ```bash
+npm ci
 npm test
 ```
+
+The PostgreSQL authority integration applies the authority schema and creates
+concurrency fixtures. It is excluded from default test discovery and must be
+run explicitly against a dedicated disposable PostgreSQL 13-or-newer database:
+
+```bash
+SESSION_AUTHORITY_DATABASE_URL=postgresql://user@127.0.0.1:5432/portable_codex_runtime_test \
+  npm run test:postgres
+```
+
+The GitHub Actions integration job supplies a fresh PostgreSQL 18.4 service and
+this URL. The explicit command fails when the URL is absent, so that gate cannot
+pass by silently skipping the test.
 
 Two external-auth app-server integration tests run when `CODEX_BIN` (or
 `codex` on `PATH`) is executable. The third app-server integration test is the
