@@ -2392,7 +2392,7 @@ test("migrate applies the checksum-bound migration in one transaction", async ()
     MIGRATION_SEARCH_PATH_QUERY,
   ]);
   assert.deepEqual(migrationQueries[2], [
-    "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+    "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
     ["7275632827684484689"],
   ]);
   assert.deepEqual(migrationQueries[3], [
@@ -2476,7 +2476,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
     [
       "BEGIN",
       MIGRATION_SEARCH_PATH_QUERY,
-      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
       "CREATE SCHEMA IF NOT EXISTS session_authority",
       nonResetQueries(client)[4][0],
       "SELECT version, checksum FROM session_authority.schema_migrations ORDER BY version",
@@ -2529,7 +2529,7 @@ test("migrate does not trust externally constructed store error state", async ()
     [
       "BEGIN",
       MIGRATION_SEARCH_PATH_QUERY,
-      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
       "ROLLBACK",
     ],
   );
@@ -2579,7 +2579,7 @@ test("migrate does not trust store errors replayed from another operation", asyn
     [
       "BEGIN",
       MIGRATION_SEARCH_PATH_QUERY,
-      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
       "ROLLBACK",
     ],
   );

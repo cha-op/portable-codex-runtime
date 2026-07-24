@@ -70,7 +70,7 @@ class FixtureClient {
       }
       if (
         text ===
-        "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)"
+        "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)"
       ) {
         return {};
       }
@@ -222,7 +222,7 @@ if (scenario !== undefined) {
       "DISCARD ALL",
       "BEGIN",
       "SET LOCAL search_path = pg_catalog",
-      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
       "CREATE SCHEMA IF NOT EXISTS session_authority",
       "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations ( version integer PRIMARY KEY CHECK (version > 0), checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), applied_at timestamp with time zone NOT NULL )",
       "SELECT version, checksum FROM session_authority.schema_migrations ORDER BY version",

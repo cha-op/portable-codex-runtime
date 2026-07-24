@@ -1180,7 +1180,7 @@ export class PostgresSerializableStore {
       await protectPromise(
         clientQuery(
           client,
-          "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+          "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.int8)",
           [MIGRATION_LOCK_KEY],
         ),
       );
