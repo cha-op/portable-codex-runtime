@@ -2209,62 +2209,91 @@ test("registration owns a frozen binding snapshot despite poisoned clone and fre
   assert.equal(snapshotCalls, 0);
 });
 
-test("disposal reentrancy during registration validation remains terminal", async (t) => {
+test("post-import structuredClone poisoning cannot reenter registration", async () => {
   const originalStructuredClone = globalThis.structuredClone;
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  let disposeCalls = 0;
+  let poisonCalls = 0;
+  let stopCalls = 0;
+  let writer;
 
-  for (const [name, disposeOnCloneCall] of [
-    ["attachment validation", 1],
-    ["lease validation", 2],
-  ]) {
-    await t.test(name, () => {
-      const coordinator = new StoppedWriterCapabilityCoordinator();
-      let disposeCalls = 0;
-      let outerWriter;
-      let poisonCalls = 0;
-      let stopCalls = 0;
-
-      try {
-        globalThis.structuredClone = (value) => {
-          poisonCalls += 1;
-          if (poisonCalls === disposeOnCloneCall) {
-            assert.equal(coordinator.dispose(), undefined);
-            disposeCalls += 1;
-            globalThis.structuredClone = originalStructuredClone;
-          }
-          return originalStructuredClone(value);
-        };
-        syncCapabilityError(
-          () => {
-            outerWriter = coordinator.registerWriter(
-              registerOptions({
-                stopWriter: () => {
-                  stopCalls += 1;
-                  return STOPPED_WRITER_STOP_CONFIRMED;
-                },
-              }),
-            );
-          },
-          "writer_state_conflict",
-        );
-      } finally {
-        globalThis.structuredClone = originalStructuredClone;
-      }
-
-      assert.equal(poisonCalls, disposeOnCloneCall);
-      assert.equal(disposeCalls, 1);
-      assert.equal(outerWriter, undefined);
-      assert.equal(stopCalls, 0);
-      syncCapabilityError(
-        () => coordinator.registerWriter(registerOptions()),
-        "writer_state_conflict",
-      );
-      syncCapabilityError(
-        () => coordinator.dispose(),
-        "writer_state_conflict",
-      );
-      assert.equal(stopCalls, 0);
-    });
+  try {
+    globalThis.structuredClone = (value) => {
+      poisonCalls += 1;
+      assert.equal(coordinator.dispose(), undefined);
+      disposeCalls += 1;
+      return originalStructuredClone(value);
+    };
+    writer = coordinator.registerWriter(
+      registerOptions({
+        stopWriter: () => {
+          stopCalls += 1;
+          return STOPPED_WRITER_STOP_CONFIRMED;
+        },
+      }),
+    );
+  } finally {
+    globalThis.structuredClone = originalStructuredClone;
   }
+
+  assert.equal(poisonCalls, 0);
+  assert.equal(disposeCalls, 0);
+  assertOpaqueHandle(writer);
+  const capability = await coordinator.stopAndIssueCapability(stopOptions(writer));
+  assertOpaqueHandle(capability);
+  assert.equal(stopCalls, 1);
+});
+
+test("disposal reentrancy during lease validation remains terminal", () => {
+  const dateParseDescriptor = Object.getOwnPropertyDescriptor(Date, "parse");
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  let disposeCalls = 0;
+  let parseCalls = 0;
+  let stopCalls = 0;
+  let writer;
+
+  try {
+    Object.defineProperty(Date, "parse", {
+      ...dateParseDescriptor,
+      value(candidate) {
+        parseCalls += 1;
+        if (disposeCalls === 0) {
+          assert.equal(coordinator.dispose(), undefined);
+          disposeCalls += 1;
+        }
+        return Reflect.apply(dateParseDescriptor.value, Date, [candidate]);
+      },
+    });
+    syncCapabilityError(
+      () => {
+        writer = coordinator.registerWriter(
+          registerOptions({
+            stopWriter: () => {
+              stopCalls += 1;
+              return STOPPED_WRITER_STOP_CONFIRMED;
+            },
+          }),
+        );
+      },
+      "writer_state_conflict",
+    );
+  } finally {
+    Object.defineProperty(Date, "parse", dateParseDescriptor);
+  }
+
+  assert(parseCalls > 0);
+  assert.equal(disposeCalls, 1);
+  assert.equal(writer, undefined);
+  assert.equal(stopCalls, 0);
+  syncCapabilityError(
+    () => coordinator.registerWriter(registerOptions()),
+    "writer_state_conflict",
+  );
+  syncCapabilityError(
+    () => coordinator.dispose(),
+    "writer_state_conflict",
+  );
+  assert.equal(stopCalls, 0);
 });
 
 test("public option envelopes reject hostile values without invoking traps", async (t) => {

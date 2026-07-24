@@ -783,6 +783,60 @@ test("attachment matching rejects cross-session authority despite Array every po
   assert.equal(template, undefined);
 });
 
+test("worker template ignores post-import clone and freeze poisoning across session bindings", () => {
+  const manifest = sessionManifest();
+  const storage = storageRef();
+  const writerLease = lease();
+  const mounted = attachment();
+  const originalStructuredClone = globalThis.structuredClone;
+  const objectTargets = ["freeze", "isFrozen", "values"].map((key) => ({
+    descriptor: Object.getOwnPropertyDescriptor(Object, key),
+    key,
+  }));
+  const alternateRootPath = "/var/lib/portable-codex/other-session";
+  let poisonedObjectCalls = 0;
+  let poisonedCalls = 0;
+  let template;
+  try {
+    for (const target of objectTargets) {
+      Object.defineProperty(Object, target.key, {
+        ...target.descriptor,
+        value() {
+          poisonedObjectCalls += 1;
+          throw new Error(`poisoned Object.${target.key}`);
+        },
+      });
+    }
+    globalThis.structuredClone = (value) => {
+      poisonedCalls += 1;
+      const clone = Reflect.apply(originalStructuredClone, globalThis, [value]);
+      if (clone && typeof clone === "object" && "sessionId" in clone) {
+        clone.sessionId = OTHER_RUNTIME_SESSION_ID;
+      }
+      if (clone && typeof clone === "object" && "rootPath" in clone) {
+        clone.rootPath = alternateRootPath;
+      }
+      return clone;
+    };
+    template = createRootlessWorkerTemplate({
+      attachment: mounted,
+      lease: writerLease,
+      manifest,
+      storageRef: storage,
+    });
+  } finally {
+    globalThis.structuredClone = originalStructuredClone;
+    for (const target of objectTargets) {
+      Object.defineProperty(Object, target.key, target.descriptor);
+    }
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.equal(poisonedObjectCalls, 0);
+  assert.equal(template.mount.source, mounted.rootPath);
+  assert.notEqual(template.mount.source, alternateRootPath);
+});
+
 test("storage backend contract requires directory, exclusivity, fencing, and all operations", () => {
   const backend = storageBackend();
   assert.equal(assertStorageBackend(backend), backend);

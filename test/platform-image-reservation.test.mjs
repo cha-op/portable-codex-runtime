@@ -1241,7 +1241,7 @@ test("prototype poisoning cannot forge image authority", async (t) => {
     "promise-rejection",
     "regexp-prototype",
     "set-constructor",
-    "structured-clone-reentry",
+    "structured-clone-capture",
     "typed-array-byte-length",
     "url-accessors",
     "weakmap-constructor",

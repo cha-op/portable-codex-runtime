@@ -20,7 +20,7 @@ const scenarios = new Set([
   "reserve",
   "revalidate",
   "set-constructor",
-  "structured-clone-reentry",
+  "structured-clone-capture",
   "typed-array-byte-length",
   "url-accessors",
   "weakmap-constructor",
@@ -262,6 +262,7 @@ let leakedReservationLedger;
 let poisonedHashDigestCalls = 0;
 let poisonedHashUpdateCalls = 0;
 let poisonedManifestValidationCalls = 0;
+let poisonedStructuredCloneCalls = 0;
 
 function restoreArrayIterator() {
   Object.defineProperty(
@@ -516,11 +517,12 @@ function restoreStructuredClone() {
   );
 }
 
-async function inspectWithStructuredCloneReentry() {
+async function inspectWithStructuredClonePoisoning() {
   let nestedInspectorCalls = 0;
   Object.defineProperty(globalThis, "structuredClone", {
     ...structuredCloneDescriptor,
     value(value, options) {
+      poisonedStructuredCloneCalls += 1;
       const clone =
         options === undefined
           ? Reflect.apply(structuredCloneIntrinsic, globalThis, [value])
@@ -547,6 +549,7 @@ async function inspectWithStructuredCloneReentry() {
     } catch (error) {
       nestedError = error;
     }
+    assert.equal(poisonedStructuredCloneCalls, 0);
     assert.equal(nestedInspectorCalls, 0);
     assert.ok(nestedError instanceof PlatformImageReservationError);
     assert.equal(
@@ -716,8 +719,8 @@ function safeThen(value, onFulfilled, onRejected) {
 }
 
 function inspectCodex() {
-  if (scenario === "structured-clone-reentry") {
-    inspectionPromise = inspectWithStructuredCloneReentry();
+  if (scenario === "structured-clone-capture") {
+    inspectionPromise = inspectWithStructuredClonePoisoning();
     return inspectionPromise;
   }
   inspectionPromise =
@@ -870,7 +873,7 @@ function runScenario() {
   if (
     scenario === "reserve" ||
     scenario === "promise-rejection" ||
-    scenario === "structured-clone-reentry" ||
+    scenario === "structured-clone-capture" ||
     scenario === "weakmap-constructor"
   ) {
     const operation = coordinator.reservePlatformImage({

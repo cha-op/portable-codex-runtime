@@ -15,6 +15,7 @@ const objectValues = Object.values;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
+const structuredCloneIntrinsic = globalThis.structuredClone;
 
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
@@ -106,27 +107,23 @@ function ensure(condition, code, message) {
 }
 
 function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
-  }
-  return value;
-}
-
-function deepFreezeManifest(value) {
   if (value && typeof value === "object" && !objectIsFrozen(value)) {
     objectFreeze(value);
     const children = objectValues(value);
     for (let index = 0; index < children.length; index += 1) {
-      deepFreezeManifest(children[index]);
+      deepFreeze(children[index]);
     }
   }
   return value;
 }
 
+function deepFreezeManifest(value) {
+  return deepFreeze(value);
+}
+
 function defensiveClone(value, code, label) {
   try {
-    return structuredClone(value);
+    return reflectApply(structuredCloneIntrinsic, globalThis, [value]);
   } catch {
     fail(code, `${label} must contain cloneable data`);
   }

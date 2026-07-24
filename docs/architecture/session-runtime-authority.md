@@ -260,12 +260,11 @@ admissible HTTPS. The shared complete session-manifest validator captures the
 structure, array-membership, RegExp, integer, and freeze intrinsics that decide
 manifest validity; post-import prototype or static-method mutation therefore
 cannot admit an invalid UUID, history policy, runtime identity, or agent
-policy. Its final `structuredClone` remains deliberately dynamic for existing
-reentrancy semantics. Before invoking it, image authority snapshots every
-runtime field through captured own-data descriptors and later ignores the
-validator's defensive-clone result. An inspector therefore cannot replace that
-clone operation and reenter image reservation with a runtime tuple that differs
-from the validated snapshot.
+policy. Its defensive clone and recursive freeze also use module-captured
+intrinsics, so post-import replacement cannot mutate the validated session
+binding or reenter image reservation. Image authority independently snapshots
+every runtime field through captured own-data descriptors and ignores the
+validator's defensive-clone result.
 
 Image reservation follows one-process object capability semantics:
 
