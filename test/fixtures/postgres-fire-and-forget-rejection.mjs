@@ -30,7 +30,10 @@ class FixtureClient {
     if (text === "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE") {
       return {};
     }
-    if (text.startsWith("SELECT transaction_timestamp()")) {
+    if (
+      text ===
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"
+    ) {
       return {
         rows: [
           {
@@ -40,7 +43,10 @@ class FixtureClient {
         ],
       };
     }
-    if (text === "SELECT pg_current_xact_id()::text AS transaction_id") {
+    if (
+      text ===
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"
+    ) {
       return { rows: [{ transaction_id: "1" }] };
     }
     if (text === "SET LOCAL synchronous_commit = on") {

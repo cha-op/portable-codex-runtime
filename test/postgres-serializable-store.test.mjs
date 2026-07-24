@@ -19,6 +19,8 @@ const DISCARD_RESULT = Object.freeze({ command: "DISCARD" });
 const ROLLBACK_RESULT = Object.freeze({ command: "ROLLBACK" });
 const SET_RESULT = Object.freeze({ command: "SET" });
 const DURABLE_COMMIT_QUERY = "SET LOCAL synchronous_commit = on";
+const MIGRATION_SEARCH_PATH_QUERY =
+  "SET LOCAL search_path = pg_catalog";
 const FIRE_AND_FORGET_FIXTURE = fileURLToPath(
   new URL(
     "./fixtures/postgres-fire-and-forget-rejection.mjs",
@@ -97,8 +99,11 @@ class FakeClient {
         durabilityStep?.command === "SET";
       return durabilityStep;
     }
+    if (text === MIGRATION_SEARCH_PATH_QUERY) {
+      return SET_RESULT;
+    }
     if (
-      text === "SELECT pg_current_xact_id()::text AS transaction_id" &&
+      text === "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id" &&
       this.durabilityBoundaryPending
     ) {
       this.durabilityBoundaryPending = false;
@@ -249,7 +254,7 @@ test("runSerializable binds query and database time to one released client", asy
     ["DISCARD ALL"],
     ["BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE"],
     [
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     ],
     [
       {
@@ -258,7 +263,7 @@ test("runSerializable binds query and database time to one released client", asy
         values: [7],
       },
     ],
-    ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    ["SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"],
     [
       {
         queryMode: "extended",
@@ -266,7 +271,7 @@ test("runSerializable binds query and database time to one released client", asy
         values: [],
       },
     ],
-    ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    ["SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"],
     ["COMMIT"],
     ["DISCARD ALL"],
   ]);
@@ -308,7 +313,7 @@ test("runSerializable restores durable synchronous commit before COMMIT", async 
     ["DISCARD ALL"],
     ["BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE"],
     [
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     ],
     [
       {
@@ -317,7 +322,7 @@ test("runSerializable restores durable synchronous commit before COMMIT", async 
         values: [],
       },
     ],
-    ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    ["SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"],
     [
       {
         queryMode: "extended",
@@ -325,7 +330,7 @@ test("runSerializable restores durable synchronous commit before COMMIT", async 
         values: [],
       },
     ],
-    ["SELECT pg_current_xact_id()::text AS transaction_id"],
+    ["SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"],
     ["COMMIT"],
     ["DISCARD ALL"],
   ]);
@@ -352,7 +357,7 @@ test("a malformed durable-setting acknowledgement cannot reach COMMIT", async ()
   });
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     DURABLE_COMMIT_QUERY,
     "ROLLBACK",
   ]);
@@ -412,17 +417,17 @@ test("runSerializable retries only callback SQLSTATE failures on new clients", a
       index < 2
         ? [
             "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-            "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+            "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
             "SELECT 'committed' AS value",
             "ROLLBACK",
           ]
         : [
             "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-            "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+            "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
             "SELECT 'committed' AS value",
-            "SELECT pg_current_xact_id()::text AS transaction_id",
+            "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
             DURABLE_COMMIT_QUERY,
-            "SELECT pg_current_xact_id()::text AS transaction_id",
+            "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
             "COMMIT",
           ],
     );
@@ -518,7 +523,7 @@ test("a callback cannot forge a committed store-error outcome", async () => {
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -763,7 +768,7 @@ test("custom parameter conversion cannot impersonate a server retry", async () =
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -803,7 +808,7 @@ test("a suppressed revoked query values proxy cannot allow commit", async () => 
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -835,7 +840,7 @@ test("a fire-and-forget invalid query rejection is internally observed", async (
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -949,7 +954,7 @@ test("a live query values proxy cannot run descriptor traps", async () => {
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -986,7 +991,7 @@ test("an Array-prototype object cannot masquerade as query values", async () => 
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -1087,7 +1092,7 @@ test("query values reject more than 65,535 parameters before submission", async 
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -1174,9 +1179,9 @@ test("trusted retryable failures during a user-query boundary recheck retry the 
         nonResetQueries(first).map(queryText),
         [
           "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-          "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+          "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
           "SELECT $1::integer AS value",
-          "SELECT pg_current_xact_id()::text AS transaction_id",
+          "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         ],
       );
       assert.deepEqual(first.releaseCalls, [[boundaryFailure]]);
@@ -1223,9 +1228,9 @@ test("a local SQLSTATE-shaped user-query boundary failure is uncertain and never
   assert.equal(pool.connectCalls, 1);
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "SELECT 1 AS value",
-    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "ROLLBACK",
   ]);
   assert.equal(
@@ -1365,9 +1370,9 @@ test("trusted retryable failures during the final boundary recheck retry the cal
       assert.equal(pool.connectCalls, 2);
       assert.deepEqual(nonResetQueries(first).map(queryText), [
         "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-        "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         DURABLE_COMMIT_QUERY,
-        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       ]);
       assert.deepEqual(first.releaseCalls, [[boundaryFailure]]);
       assert.deepEqual(second.releaseCalls, [[]]);
@@ -1418,9 +1423,9 @@ test("a local SQLSTATE-shaped final boundary failure is uncertain and never retr
   assert.equal(pool.connectCalls, 1);
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     DURABLE_COMMIT_QUERY,
-    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "ROLLBACK",
   ]);
   assert.equal(
@@ -1464,9 +1469,9 @@ test("runSerializable retries a server-proved serialization rollback at COMMIT",
     nonResetQueries(first).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       DURABLE_COMMIT_QUERY,
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "COMMIT",
     ],
   );
@@ -1545,9 +1550,9 @@ test("runSerializable never retries an uncertain failed COMMIT", async () => {
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       DURABLE_COMMIT_QUERY,
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "COMMIT",
       "ROLLBACK",
     ],
@@ -1744,7 +1749,7 @@ test("a callback cannot suppress a rejected transaction query", async () => {
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "INSERT INTO authority VALUES (1)",
       "ROLLBACK",
     ],
@@ -1821,9 +1826,9 @@ test("an unsettled callback query is drained and the transaction is rolled back"
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "SELECT 1",
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -1870,9 +1875,9 @@ test("malformed COMMIT acknowledgement is uncertain", async () => {
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       DURABLE_COMMIT_QUERY,
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "COMMIT",
       "ROLLBACK",
     ],
@@ -1906,9 +1911,9 @@ test("callback-controlled COMMIT loses the bound transaction and fails closed", 
     nonResetQueries(client).map(queryText),
     [
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "COMMIT",
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
     ],
   );
@@ -1947,9 +1952,9 @@ test("callback COMMIT followed by an application failure remains uncertain", asy
   );
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "COMMIT",
-    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "ROLLBACK",
   ]);
   assert.equal(client.releaseCalls.length, 1);
@@ -1986,7 +1991,7 @@ test("a local COMMIT timeout without SQLSTATE is a persistent boundary loss", as
   );
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "COMMIT",
     "ROLLBACK",
   ]);
@@ -2032,7 +2037,7 @@ test("unknown-result SQLSTATEs cannot prove callback COMMIT rejection", async (t
       assert.equal(dedicatedPool.connectCalls, 1);
       assert.deepEqual(nonResetQueries(client).map(queryText), [
         "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-        "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         "COMMIT",
         "ROLLBACK",
       ]);
@@ -2071,9 +2076,9 @@ test("a swallowed callback ROLLBACK remains a persistent boundary loss", async (
   );
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "ROLLBACK",
-    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "ROLLBACK",
   ]);
   assert.equal(client.releaseCalls.length, 1);
@@ -2110,9 +2115,9 @@ test("concurrent user queries serialize each boundary proof and cannot hide fail
   );
   assert.deepEqual(nonResetQueries(client).map(queryText), [
     "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-    "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "SELECT 1 AS value",
-    "SELECT pg_current_xact_id()::text AS transaction_id",
+    "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
     "SELECT 2 AS value",
     "ROLLBACK",
   ]);
@@ -2171,7 +2176,7 @@ test("PREPARE TRANSACTION is rejected before PostgreSQL submission", async (t) =
         nonResetQueries(client).map(queryText),
         [
           "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-          "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+          "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
           "ROLLBACK",
         ],
       );
@@ -2205,11 +2210,11 @@ test("ordinary PREPARE named transaction remains inside the checked transaction"
         nonResetQueries(client).map(queryText),
         [
           "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-          "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+          "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
           statement,
-          "SELECT pg_current_xact_id()::text AS transaction_id",
+          "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
           DURABLE_COMMIT_QUERY,
-          "SELECT pg_current_xact_id()::text AS transaction_id",
+          "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
           "COMMIT",
         ],
       );
@@ -2384,19 +2389,25 @@ test("migrate applies the checksum-bound migration in one transaction", async ()
   const migrationQueries = nonResetQueries(client);
   assert.deepEqual(migrationQueries[0], ["BEGIN"]);
   assert.deepEqual(migrationQueries[1], [
-    "SELECT pg_advisory_xact_lock($1::bigint)",
-    ["7275632827684484689"],
+    MIGRATION_SEARCH_PATH_QUERY,
   ]);
   assert.deepEqual(migrationQueries[2], [
+    "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+    ["7275632827684484689"],
+  ]);
+  assert.deepEqual(migrationQueries[3], [
     "CREATE SCHEMA IF NOT EXISTS session_authority",
   ]);
-  assert.match(migrationQueries[3][0], /schema_migrations/u);
-  assert.deepEqual(migrationQueries[4], [
+  assert.match(migrationQueries[4][0], /schema_migrations/u);
+  assert.deepEqual(migrationQueries[5], [
     "SELECT version, checksum FROM session_authority.schema_migrations ORDER BY version",
   ]);
-  assert.deepEqual(migrationQueries[5], [sql]);
-  assert.deepEqual(migrationQueries[6][1], [1, checksum]);
-  assert.deepEqual(migrationQueries[7], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[6], [sql]);
+  assert.deepEqual(migrationQueries[7], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [1, checksum],
+  ]);
+  assert.deepEqual(migrationQueries[8], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -2464,9 +2475,10 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
     nonResetQueries(client).map(queryText),
     [
       "BEGIN",
-      "SELECT pg_advisory_xact_lock($1::bigint)",
+      MIGRATION_SEARCH_PATH_QUERY,
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
       "CREATE SCHEMA IF NOT EXISTS session_authority",
-      nonResetQueries(client)[3][0],
+      nonResetQueries(client)[4][0],
       "SELECT version, checksum FROM session_authority.schema_migrations ORDER BY version",
       "COMMIT",
     ],
@@ -2514,7 +2526,12 @@ test("migrate does not trust externally constructed store error state", async ()
   });
   assert.deepEqual(
     nonResetQueries(client).map(queryText),
-    ["BEGIN", "SELECT pg_advisory_xact_lock($1::bigint)", "ROLLBACK"],
+    [
+      "BEGIN",
+      MIGRATION_SEARCH_PATH_QUERY,
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+      "ROLLBACK",
+    ],
   );
   assert.deepEqual(client.releaseCalls, [[]]);
   client.assertExhausted();
@@ -2559,7 +2576,12 @@ test("migrate does not trust store errors replayed from another operation", asyn
   });
   assert.deepEqual(
     nonResetQueries(client).map(queryText),
-    ["BEGIN", "SELECT pg_advisory_xact_lock($1::bigint)", "ROLLBACK"],
+    [
+      "BEGIN",
+      MIGRATION_SEARCH_PATH_QUERY,
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
+      "ROLLBACK",
+    ],
   );
   assert.deepEqual(client.releaseCalls, [[]]);
   client.assertExhausted();

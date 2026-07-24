@@ -65,7 +65,13 @@ class FixtureClient {
     if (text === "DISCARD ALL") return { command: "DISCARD" };
     if (scenario === "hash-prototype") {
       if (text === "BEGIN") return {};
-      if (text === "SELECT pg_advisory_xact_lock($1::bigint)") {
+      if (text === "SET LOCAL search_path = pg_catalog") {
+        return { command: "SET" };
+      }
+      if (
+        text ===
+        "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)"
+      ) {
         return {};
       }
       if (
@@ -93,7 +99,10 @@ class FixtureClient {
       if (text === "COMMIT") return { command: "COMMIT" };
     }
     if (text === "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE") return {};
-    if (text.startsWith("SELECT transaction_timestamp()")) {
+    if (
+      text ===
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"
+    ) {
       return {
         rows: [
           {
@@ -103,7 +112,10 @@ class FixtureClient {
         ],
       };
     }
-    if (text === "SELECT pg_current_xact_id()::text AS transaction_id") {
+    if (
+      text ===
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id"
+    ) {
       return { rows: [{ transaction_id: "1" }] };
     }
     if (text === "SET LOCAL synchronous_commit = on") {
@@ -209,7 +221,8 @@ if (scenario !== undefined) {
     assert.deepEqual(client.queries, [
       "DISCARD ALL",
       "BEGIN",
-      "SELECT pg_advisory_xact_lock($1::bigint)",
+      "SET LOCAL search_path = pg_catalog",
+      "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
       "CREATE SCHEMA IF NOT EXISTS session_authority",
       "CREATE TABLE IF NOT EXISTS session_authority.schema_migrations ( version integer PRIMARY KEY CHECK (version > 0), checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), applied_at timestamp with time zone NOT NULL )",
       "SELECT version, checksum FROM session_authority.schema_migrations ORDER BY version",
@@ -408,9 +421,9 @@ if (scenario !== undefined) {
     assert.deepEqual(client.queries, [
       "DISCARD ALL",
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "SET LOCAL synchronous_commit = on",
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "COMMIT",
       "DISCARD ALL",
     ]);
@@ -426,7 +439,7 @@ if (scenario !== undefined) {
     assert.deepEqual(client.queries, [
       "DISCARD ALL",
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "ROLLBACK",
       "DISCARD ALL",
     ]);
@@ -437,7 +450,7 @@ if (scenario !== undefined) {
     assert.deepEqual(client.queries, [
       "DISCARD ALL",
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "SELECT fail",
       "ROLLBACK",
     ]);
@@ -457,9 +470,9 @@ if (scenario !== undefined) {
     assert.deepEqual(client.queries, [
       "DISCARD ALL",
       "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-      "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "SET LOCAL synchronous_commit = on",
-      "SELECT pg_current_xact_id()::text AS transaction_id",
+      "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
       "COMMIT",
       "ROLLBACK",
     ]);

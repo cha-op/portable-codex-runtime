@@ -14,6 +14,12 @@ const MIGRATION_URL = new URL(
   import.meta.url,
 );
 const MIGRATION_LOCK_KEY = "7275632827684484689";
+const MIGRATION_SEARCH_PATH_QUERY =
+  "SET LOCAL search_path = pg_catalog";
+const TRANSACTION_ID_QUERY =
+  "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
+const TRANSACTION_TIMESTAMP_QUERY =
+  "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const ArrayConstructor = Array;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
@@ -915,10 +921,7 @@ async function enforceDurableCommit(client, transactionId) {
     );
   }
   const boundaryResult = await protectPromise(
-    clientQuery(
-      client,
-      "SELECT pg_current_xact_id()::text AS transaction_id",
-    ),
+    clientQuery(client, TRANSACTION_ID_QUERY),
   );
   if (canonicalTransactionId(boundaryResult) !== transactionId) {
     throw new ErrorConstructor("transaction identifier changed");
@@ -1034,10 +1037,7 @@ function createTransactionCapability(
         let boundaryResult;
         try {
           boundaryResult = await protectPromise(
-            clientQuery(
-              client,
-              "SELECT pg_current_xact_id()::text AS transaction_id",
-            ),
+            clientQuery(client, TRANSACTION_ID_QUERY),
           );
           if (canonicalTransactionId(boundaryResult) !== transactionId) {
             throw new ErrorConstructor("transaction identifier changed");
@@ -1175,9 +1175,12 @@ export class PostgresSerializableStore {
     let applied = false;
     try {
       await protectPromise(
+        clientQuery(client, MIGRATION_SEARCH_PATH_QUERY),
+      );
+      await protectPromise(
         clientQuery(
           client,
-          "SELECT pg_advisory_xact_lock($1::bigint)",
+          "SELECT pg_catalog.pg_advisory_xact_lock($1::pg_catalog.bigint)",
           [MIGRATION_LOCK_KEY],
         ),
       );
@@ -1249,7 +1252,7 @@ export class PostgresSerializableStore {
               [
                 "INSERT INTO session_authority.schema_migrations",
                 "(version, checksum, applied_at)",
-                "VALUES ($1, $2, transaction_timestamp())",
+                "VALUES ($1, $2, pg_catalog.transaction_timestamp())",
               ],
               " ",
             ),
@@ -1350,16 +1353,7 @@ export class PostgresSerializableStore {
       let timestampResult;
       try {
         timestampResult = await protectPromise(
-          clientQuery(
-            client,
-            arrayJoin(
-              [
-                "SELECT transaction_timestamp() AS transaction_timestamp,",
-                "pg_current_xact_id()::text AS transaction_id",
-              ],
-              " ",
-            ),
-          ),
+          clientQuery(client, TRANSACTION_TIMESTAMP_QUERY),
         );
       } catch (error) {
         await protectPromise(

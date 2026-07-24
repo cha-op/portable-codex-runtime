@@ -31,6 +31,7 @@ test(
     });
     let conflictSessionId;
     let preparedTransactionId;
+    let shadowSchema;
     t.after(async () => {
       if (preparedTransactionId !== undefined) {
         const prepared = await pool.query(
@@ -46,6 +47,11 @@ test(
             `ROLLBACK PREPARED '${preparedTransactionId}'`,
           );
         }
+      }
+      if (shadowSchema !== undefined) {
+        await pool.query(
+          `DROP SCHEMA IF EXISTS "${shadowSchema}" CASCADE`,
+        );
       }
       if (conflictSessionId !== undefined) {
         await pool.query(
@@ -157,13 +163,13 @@ test(
       [
         "DISCARD ALL",
         "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
-        "SELECT transaction_timestamp() AS transaction_timestamp, pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         "SET LOCAL synchronous_commit = off",
-        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         "SHOW synchronous_commit",
-        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         "SET LOCAL synchronous_commit = on",
-        "SELECT pg_current_xact_id()::text AS transaction_id",
+        "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
         "COMMIT",
         "DISCARD ALL",
       ],
@@ -232,6 +238,38 @@ test(
     );
     await assert.rejects(
       store.runSerializable((transaction) => transaction.query("COMMIT")),
+      (error) => {
+        assert.ok(error instanceof PostgresSerializableStoreError);
+        assert.equal(error.code, "transaction_boundary_lost");
+        assert.equal(error.commitState, "uncertain");
+        assert.equal("cause" in error, false);
+        return true;
+      },
+    );
+    shadowSchema =
+      `authority_shadow_${randomUUID().replaceAll("-", "_")}`;
+    await assert.rejects(
+      store.runSerializable(async (transaction) => {
+        const transactionIdResult = await transaction.query(
+          "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
+        );
+        const transactionId =
+          transactionIdResult.rows[0].transaction_id;
+        assert.match(transactionId, /^[1-9][0-9]*$/u);
+        await transaction.query(`CREATE SCHEMA "${shadowSchema}"`);
+        await transaction.query(
+          [
+            `CREATE FUNCTION "${shadowSchema}".pg_current_xact_id()`,
+            "RETURNS pg_catalog.xid8",
+            "LANGUAGE sql IMMUTABLE",
+            `AS $$ SELECT '${transactionId}'::pg_catalog.xid8 $$`,
+          ].join(" "),
+        );
+        await transaction.query(
+          `SET search_path = "${shadowSchema}", pg_catalog`,
+        );
+        await transaction.query("COMMIT");
+      }),
       (error) => {
         assert.ok(error instanceof PostgresSerializableStoreError);
         assert.equal(error.code, "transaction_boundary_lost");
