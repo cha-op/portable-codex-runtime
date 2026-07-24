@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { types as utilTypes } from "node:util";
 import test from "node:test";
 
 import {
@@ -40,6 +41,7 @@ import {
 } from "../src/session-storage-contracts.mjs";
 
 const RUNTIME_SESSION_ID = "019f2100-0000-7000-8000-000000000001";
+const OTHER_RUNTIME_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 const CODEX_THREAD_ID = "019f2100-0000-7000-8000-000000000002";
 const CODEX_SESSION_ID = CODEX_THREAD_ID;
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -323,6 +325,150 @@ test("session manifest rejects mutable identity, credentials, tags, and unsuppor
   }
 });
 
+test("session manifest UUID validation ignores post-import RegExp poisoning", () => {
+  const invalid = {
+    ...sessionManifest(),
+    sessionId: "not-a-uuid",
+  };
+  const execDescriptor = Object.getOwnPropertyDescriptor(
+    RegExp.prototype,
+    "exec",
+  );
+  const testDescriptor = Object.getOwnPropertyDescriptor(
+    RegExp.prototype,
+    "test",
+  );
+  let poisonedCalls = 0;
+  let validationError;
+  try {
+    Object.defineProperty(RegExp.prototype, "exec", {
+      ...execDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return ["forged UUID match"];
+      },
+    });
+    Object.defineProperty(RegExp.prototype, "test", {
+      ...testDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    try {
+      assertSessionManifest(invalid);
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    Object.defineProperty(RegExp.prototype, "exec", execDescriptor);
+    Object.defineProperty(RegExp.prototype, "test", testDescriptor);
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.ok(assertCode("invalid_session_manifest")(validationError));
+});
+
+test("session history validation ignores post-import Array prototype poisoning", () => {
+  const invalid = {
+    ...sessionManifest(),
+    codex: {
+      ...sessionManifest().codex,
+      historyMode: "future-history",
+    },
+  };
+  const everyDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "every",
+  );
+  const includesDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "includes",
+  );
+  let poisonedCalls = 0;
+  let validationError;
+  try {
+    Object.defineProperty(Array.prototype, "every", {
+      ...everyDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    Object.defineProperty(Array.prototype, "includes", {
+      ...includesDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    try {
+      assertSessionManifest(invalid);
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    Object.defineProperty(Array.prototype, "every", everyDescriptor);
+    Object.defineProperty(Array.prototype, "includes", includesDescriptor);
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.ok(assertCode("invalid_session_manifest")(validationError));
+});
+
+test("session manifest validation uses captured static intrinsics", () => {
+  const manifest = sessionManifest();
+  const targets = [
+    [Array, "isArray"],
+    [Number, "isSafeInteger"],
+    [Object, "freeze"],
+    [Object, "getOwnPropertyDescriptor"],
+    [Object, "getPrototypeOf"],
+    [Object, "hasOwn"],
+    [Object, "isFrozen"],
+    [Object, "values"],
+    [Reflect, "apply"],
+    [Reflect, "ownKeys"],
+    [utilTypes, "isProxy"],
+  ].map(([owner, key]) => ({
+    descriptor: Object.getOwnPropertyDescriptor(owner, key),
+    key,
+    owner,
+  }));
+  let poisonedCalls = 0;
+  let validated;
+  let validationError;
+  try {
+    for (const target of targets) {
+      Object.defineProperty(target.owner, target.key, {
+        ...target.descriptor,
+        value() {
+          poisonedCalls += 1;
+          throw new Error(`poisoned ${target.key}`);
+        },
+      });
+    }
+    try {
+      validated = assertSessionManifest(manifest);
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    for (const target of targets) {
+      Object.defineProperty(
+        target.owner,
+        target.key,
+        target.descriptor,
+      );
+    }
+  }
+
+  assert.equal(validationError, undefined);
+  assert.equal(poisonedCalls, 0);
+  assert.deepEqual(validated, manifest);
+  assert.equal(Object.isFrozen(validated), true);
+});
+
 test("trusted OCI resolution must match the recorded platform manifest", () => {
   const resolution = {
     codexVersion: "codex-cli 0.142.4",
@@ -581,6 +727,114 @@ test("rootless worker template is structural and fixed-layout", () => {
     }),
     assertCode("stale_fence"),
   );
+});
+
+test("attachment matching rejects cross-session authority despite Array every poisoning", () => {
+  const otherManifest = createSessionManifest({
+    ...manifestInput(),
+    sessionId: OTHER_RUNTIME_SESSION_ID,
+  });
+  const everyDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "every",
+  );
+  let poisonedCalls = 0;
+  let poisonedEveryResult;
+  let matchError;
+  let templateError;
+  let template;
+  try {
+    Object.defineProperty(Array.prototype, "every", {
+      ...everyDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return true;
+      },
+    });
+    poisonedEveryResult = [].every(() => false);
+    try {
+      assertSessionAttachmentMatches({
+        attachment: attachment(),
+        lease: lease(),
+        manifest: otherManifest,
+        storageRef: storageRef(),
+      });
+    } catch (error) {
+      matchError = error;
+    }
+    try {
+      template = createRootlessWorkerTemplate({
+        attachment: attachment(),
+        lease: lease(),
+        manifest: otherManifest,
+        storageRef: storageRef(),
+      });
+    } catch (error) {
+      templateError = error;
+    }
+  } finally {
+    Object.defineProperty(Array.prototype, "every", everyDescriptor);
+  }
+
+  assert(poisonedCalls > 0);
+  assert.equal(poisonedEveryResult, true);
+  assert.ok(assertCode("stale_fence")(matchError));
+  assert.ok(assertCode("stale_fence")(templateError));
+  assert.equal(template, undefined);
+});
+
+test("worker template ignores post-import clone and freeze poisoning across session bindings", () => {
+  const manifest = sessionManifest();
+  const storage = storageRef();
+  const writerLease = lease();
+  const mounted = attachment();
+  const originalStructuredClone = globalThis.structuredClone;
+  const objectTargets = ["freeze", "isFrozen", "values"].map((key) => ({
+    descriptor: Object.getOwnPropertyDescriptor(Object, key),
+    key,
+  }));
+  const alternateRootPath = "/var/lib/portable-codex/other-session";
+  let poisonedObjectCalls = 0;
+  let poisonedCalls = 0;
+  let template;
+  try {
+    for (const target of objectTargets) {
+      Object.defineProperty(Object, target.key, {
+        ...target.descriptor,
+        value() {
+          poisonedObjectCalls += 1;
+          throw new Error(`poisoned Object.${target.key}`);
+        },
+      });
+    }
+    globalThis.structuredClone = (value) => {
+      poisonedCalls += 1;
+      const clone = Reflect.apply(originalStructuredClone, globalThis, [value]);
+      if (clone && typeof clone === "object" && "sessionId" in clone) {
+        clone.sessionId = OTHER_RUNTIME_SESSION_ID;
+      }
+      if (clone && typeof clone === "object" && "rootPath" in clone) {
+        clone.rootPath = alternateRootPath;
+      }
+      return clone;
+    };
+    template = createRootlessWorkerTemplate({
+      attachment: mounted,
+      lease: writerLease,
+      manifest,
+      storageRef: storage,
+    });
+  } finally {
+    globalThis.structuredClone = originalStructuredClone;
+    for (const target of objectTargets) {
+      Object.defineProperty(Object, target.key, target.descriptor);
+    }
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.equal(poisonedObjectCalls, 0);
+  assert.equal(template.mount.source, mounted.rootPath);
+  assert.notEqual(template.mount.source, alternateRootPath);
 });
 
 test("storage backend contract requires directory, exclusivity, fencing, and all operations", () => {

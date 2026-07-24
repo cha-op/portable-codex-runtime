@@ -14,9 +14,13 @@
     "probe:external-auth:live": "node scripts/probe-live-app-server-auth.mjs",
     "probe:auth-refresh:live": "node scripts/probe-live-auth-refresh-authority.mjs",
     "probe:turn-recovery": "node scripts/probe-interrupted-turn-recovery.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "test:postgres": "node --test integration/postgres-session-authority.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "8.22.0"
   }
 }
