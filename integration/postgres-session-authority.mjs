@@ -66,10 +66,11 @@ function registrationInput(
   };
 }
 
-function firstRegistrationQueryBarrierPool(
+function firstMatchingQueryBarrierPool(
   pool,
   expectedParticipants,
   label,
+  matches,
 ) {
   let arrivals = 0;
   let release;
@@ -97,9 +98,7 @@ function firstRegistrationQueryBarrierPool(
             typeof input === "string" ? input : input?.text;
           if (
             typeof text === "string" &&
-            text.startsWith(
-              "INSERT INTO session_authority.sessions",
-            ) &&
+            matches(text) &&
             arrivals < expectedParticipants
           ) {
             arrivals += 1;
@@ -116,6 +115,35 @@ function firstRegistrationQueryBarrierPool(
   });
 }
 
+function firstRegistrationQueryBarrierPool(
+  pool,
+  expectedParticipants,
+  label,
+) {
+  return firstMatchingQueryBarrierPool(
+    pool,
+    expectedParticipants,
+    label,
+    (text) =>
+      text.startsWith("INSERT INTO session_authority.sessions"),
+  );
+}
+
+function firstSessionLockQueryBarrierPool(
+  pool,
+  expectedParticipants,
+  label,
+) {
+  return firstMatchingQueryBarrierPool(
+    pool,
+    expectedParticipants,
+    label,
+    (text) =>
+      text.includes("FROM session_authority.sessions") &&
+      text.includes("FOR UPDATE"),
+  );
+}
+
 function assertIdentityConflict(error) {
   assert.ok(error instanceof PostgresSessionAuthorityError);
   assert.equal(error.name, "PostgresSessionAuthorityError");
@@ -123,6 +151,54 @@ function assertIdentityConflict(error) {
   assert.equal(error.retryable, false);
   assert.equal(Object.hasOwn(error, "cause"), false);
   return true;
+}
+
+function assertAuthorityCode(code) {
+  return (error) => {
+    assert.ok(error instanceof PostgresSessionAuthorityError);
+    assert.equal(error.name, "PostgresSessionAuthorityError");
+    assert.equal(error.code, code);
+    assert.equal(error.retryable, false);
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  };
+}
+
+function operationInput(
+  expectedSession,
+  {
+    operationId = `operation-${randomUUID()}`,
+    kind = "writer-acquire",
+    request = {
+      action: "reserve-writer",
+      nonce: randomUUID(),
+    },
+  } = {},
+) {
+  return {
+    expectedSession,
+    operationId,
+    kind,
+    request,
+  };
+}
+
+function assertOperationReceipt(receipt, state) {
+  assert.equal(receipt.status, state);
+  assert.equal(receipt.operation.state, state);
+  assert.equal(
+    receipt.reservation.state,
+    state === "committed" ? "released" : state,
+  );
+  assert.equal(
+    receipt.session.document.activeOperation?.operationId ??
+      null,
+    state === "committed" ? null : receipt.operation.operationId,
+  );
+  assert.equal(Object.isFrozen(receipt), true);
+  assert.equal(Object.isFrozen(receipt.operation), true);
+  assert.equal(Object.isFrozen(receipt.reservation), true);
+  assert.equal(Object.isFrozen(receipt.session), true);
 }
 
 function assertInitialSession(snapshot, input) {
@@ -624,6 +700,20 @@ test(
         if (sessionIds.length > 0) {
           await pool.query(
             [
+              "DELETE FROM session_authority.reservations",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
               "DELETE FROM session_authority.sessions",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
@@ -789,6 +879,355 @@ test(
         );
         assert.equal(stored.rows.length, 1);
         assert.deepEqual(stored.rows[0].document, canonical.document);
+      },
+    );
+
+    await t.test(
+      "operation phases replay exactly and uncertain state survives restart",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
+        assert.equal(reserved.session.revision, "1");
+        assert.equal(reserved.operation.revision, "0");
+        assert.equal(
+          reserved.reservation.expectedSessionRevision,
+          "0",
+        );
+
+        const replayed = await authority.reserveOperation(
+          structuredClone(input),
+        );
+        assertOperationReceipt(replayed, "prepared");
+        assert.equal(replayed.acquired, false);
+        assert.deepEqual(replayed.operation, reserved.operation);
+        assert.deepEqual(replayed.reservation, reserved.reservation);
+        assert.deepEqual(replayed.session, reserved.session);
+
+        const starting = await authority.claimOperationDispatch({
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        });
+        assertOperationReceipt(starting, "starting");
+        assert.equal(starting.dispatchGranted, true);
+        assert.equal(starting.session.revision, "2");
+        assert.equal(starting.operation.revision, "1");
+
+        const startingReplay =
+          await authority.claimOperationDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(startingReplay, "starting");
+        assert.equal(startingReplay.dispatchGranted, false);
+        assert.deepEqual(startingReplay.session, starting.session);
+
+        const uncertain = await authority.markOperationUncertain({
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(uncertain, "uncertain");
+        assert.equal(uncertain.changed, true);
+        assert.equal(uncertain.session.revision, "3");
+        assert.equal(uncertain.operation.revision, "2");
+
+        const restarted = new PostgresSessionAuthority({ store });
+        const reconciled = await restarted.reconcileOperation(
+          structuredClone(input),
+        );
+        assertOperationReceipt(reconciled, "uncertain");
+        assert.deepEqual(reconciled.session, uncertain.session);
+        await assert.rejects(
+          restarted.reserveOperation(
+            operationInput(registered, {
+              operationId: `operation-${randomUUID()}`,
+            }),
+          ),
+          assertAuthorityCode("session_operation_conflict"),
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims",
+            "WHERE session_id = $1 AND retired_at IS NULL)",
+            "AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations",
+            "WHERE session_id = $1 AND released_at IS NULL)",
+            "AS reservation_count",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.deepEqual(stored.rows[0], {
+          operation_count: 1,
+          reservation_count: 1,
+        });
+      },
+    );
+
+    await t.test(
+      "prepared cancellation releases the blocker and replays one terminal result",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+        await authority.reserveOperation(input);
+
+        const cancellation = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+          reason: "caller-abandoned-before-dispatch",
+        };
+        const cancelled =
+          await authority.cancelPreparedOperation(cancellation);
+        assertOperationReceipt(cancelled, "committed");
+        assert.equal(cancelled.cancelled, true);
+        assert.equal(cancelled.session.revision, "2");
+        assert.deepEqual(cancelled.operation.result, {
+          resultVersion: 1,
+          outcome: "cancelled-before-dispatch",
+          reason: cancellation.reason,
+        });
+
+        const replayed =
+          await authority.cancelPreparedOperation(
+            structuredClone(cancellation),
+          );
+        assertOperationReceipt(replayed, "committed");
+        assert.equal(replayed.cancelled, false);
+        assert.deepEqual(replayed.operation, cancelled.operation);
+        assert.deepEqual(replayed.reservation, cancelled.reservation);
+
+        const replacement = await authority.reserveOperation(
+          operationInput(cancelled.session),
+        );
+        assertOperationReceipt(replacement, "prepared");
+        assert.equal(replacement.acquired, true);
+        assert.equal(replacement.session.revision, "3");
+      },
+    );
+
+    await t.test(
+      "concurrent identical reserve converges on one durable claim",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+        const concurrentStore = new PostgresSerializableStore({
+          dedicatedPool: firstSessionLockQueryBarrierPool(
+            pool,
+            2,
+            "identical operation reserve barrier",
+          ),
+          maxTransactionAttempts: 3,
+        });
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: concurrentStore,
+        });
+
+        const receipts = await Promise.all([
+          concurrentAuthority.reserveOperation(input),
+          concurrentAuthority.reserveOperation(structuredClone(input)),
+        ]);
+        assert.equal(
+          receipts.filter(({ acquired }) => acquired).length,
+          1,
+        );
+        assert.equal(
+          receipts.filter(({ acquired }) => !acquired).length,
+          1,
+        );
+        assert.deepEqual(receipts[0].operation, receipts[1].operation);
+        assert.deepEqual(
+          receipts[0].reservation,
+          receipts[1].reservation,
+        );
+        assert.deepEqual(receipts[0].session, receipts[1].session);
+
+        const stored = await pool.query(
+          [
+            "SELECT s.revision,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims o",
+            "WHERE o.session_id = s.session_id) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations r",
+            "WHERE r.session_id = s.session_id) AS reservation_count",
+            "FROM session_authority.sessions s",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.equal(stored.rows[0].revision, "1");
+        assert.equal(stored.rows[0].operation_count, 1);
+        assert.equal(stored.rows[0].reservation_count, 1);
+      },
+    );
+
+    await t.test(
+      "concurrent different operations admit exactly one per session",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const first = operationInput(registered);
+        const second = operationInput(registered);
+        const concurrentStore = new PostgresSerializableStore({
+          dedicatedPool: firstSessionLockQueryBarrierPool(
+            pool,
+            2,
+            "conflicting operation reserve barrier",
+          ),
+          maxTransactionAttempts: 3,
+        });
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: concurrentStore,
+        });
+
+        const outcomes = await Promise.allSettled([
+          concurrentAuthority.reserveOperation(first),
+          concurrentAuthority.reserveOperation(second),
+        ]);
+        const fulfilled = outcomes.filter(
+          ({ status }) => status === "fulfilled",
+        );
+        const rejected = outcomes.filter(
+          ({ status }) => status === "rejected",
+        );
+        assert.equal(fulfilled.length, 1);
+        assert.equal(rejected.length, 1);
+        assertAuthorityCode("session_operation_conflict")(
+          rejected[0].reason,
+        );
+        assertOperationReceipt(fulfilled[0].value, "prepared");
+      },
+    );
+
+    await t.test(
+      "a global operation ID binds exactly one session under concurrency",
+      async () => {
+        const firstSessionId = randomUUID();
+        const secondSessionId = randomUUID();
+        sessionIds.push(firstSessionId, secondSessionId);
+        const firstSession = await authority.registerSession(
+          registrationInput(firstSessionId),
+        );
+        const secondSession = await authority.registerSession(
+          registrationInput(secondSessionId),
+        );
+        const operationId = `operation-${randomUUID()}`;
+        const request = {
+          action: "reserve-writer",
+          nonce: randomUUID(),
+        };
+        const first = operationInput(firstSession, {
+          operationId,
+          request,
+        });
+        const second = operationInput(secondSession, {
+          operationId,
+          request: structuredClone(request),
+        });
+        const concurrentStore = new PostgresSerializableStore({
+          dedicatedPool: firstSessionLockQueryBarrierPool(
+            pool,
+            2,
+            "global operation identity barrier",
+          ),
+          maxTransactionAttempts: 3,
+        });
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: concurrentStore,
+        });
+
+        const outcomes = await Promise.allSettled([
+          concurrentAuthority.reserveOperation(first),
+          concurrentAuthority.reserveOperation(second),
+        ]);
+        const fulfilledIndex = outcomes.findIndex(
+          ({ status }) => status === "fulfilled",
+        );
+        const rejectedIndex = outcomes.findIndex(
+          ({ status }) => status === "rejected",
+        );
+        assert.notEqual(fulfilledIndex, -1);
+        assert.notEqual(rejectedIndex, -1);
+        assertAuthorityCode("operation_identity_conflict")(
+          outcomes[rejectedIndex].reason,
+        );
+        const losingSession =
+          rejectedIndex === 0 ? firstSession : secondSession;
+        assert.deepEqual(
+          await authority.readSession({
+            sessionId: losingSession.sessionId,
+          }),
+          losingSession,
+        );
+      },
+    );
+
+    await t.test(
+      "concurrent dispatch claims grant exactly once",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+        await authority.reserveOperation(input);
+        const concurrentStore = new PostgresSerializableStore({
+          dedicatedPool: firstSessionLockQueryBarrierPool(
+            pool,
+            2,
+            "dispatch claim barrier",
+          ),
+          maxTransactionAttempts: 3,
+        });
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: concurrentStore,
+        });
+        const transition = {
+          ...input,
+          expectedOperationRevision: "0",
+        };
+
+        const receipts = await Promise.all([
+          concurrentAuthority.claimOperationDispatch(transition),
+          concurrentAuthority.claimOperationDispatch(
+            structuredClone(transition),
+          ),
+        ]);
+        assert.equal(
+          receipts.filter(({ dispatchGranted }) => dispatchGranted)
+            .length,
+          1,
+        );
+        assert.equal(
+          receipts.filter(({ dispatchGranted }) => !dispatchGranted)
+            .length,
+          1,
+        );
+        assert.deepEqual(receipts[0].operation, receipts[1].operation);
+        assert.equal(receipts[0].operation.state, "starting");
+        assert.equal(receipts[0].session.revision, "2");
       },
     );
   },

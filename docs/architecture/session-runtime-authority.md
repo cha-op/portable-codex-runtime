@@ -10,28 +10,32 @@ The implemented authority provides:
 - a checksum-bound initial authority schema;
 - real-PostgreSQL migration and concurrency tests; and
 - bounded OCI/Docker runnable-image inspection plus a one-use reservation
-  capability; and
-- canonical, idempotent session registration with strict readback.
+  capability;
+- canonical, idempotent session registration with strict readback; and
+- a durable session-wide operation and reservation phase kernel.
 
 Registration binds one immutable session manifest, storage reference, and
-backend capability set to a canonical initial `DETACHED` document. Subsequent
-authority slices will turn the remaining structural records in
-`session-storage-contracts.mjs` into serializable admission decisions for:
+backend capability set to a canonical initial `DETACHED` document. The
+operation kernel then binds one exact request to one active session reservation
+before any external dispatch can begin. Subsequent authority slices will turn
+the remaining structural records in `session-storage-contracts.mjs` into
+serializable admission decisions for:
 
-- durable operation and reservation claims;
 - writable lease allocation and renewal;
 - attachment, release, and force-fence transitions;
 - checkpoint-catalogue finalization; and
 - logical launcher admission.
 
-Registration is identity persistence, not writer admission: it does not
+Registration and operation reservation are not writer admission: they do not
 allocate a lease or epoch, create an attachment, invoke a provider, or authorize
-a launcher. The authority also does not mount storage, launch a container,
-resolve a registry tag, verify an image publisher, stop a writer, or prove a
-physical fence. Those effects remain provider operations that a later
-authority can invoke only after a reservation has committed. The current
-stopped-directory backend declares `fencing: "manual"` and therefore cannot use
-lease expiration alone for automatic host takeover.
+a launcher. The kernel exposes a durable `starting` claim but deliberately does
+not execute a provider callback. The authority also does not mount storage,
+launch a container, resolve a registry tag, verify an image publisher, stop a
+writer, or prove a physical fence. Those effects remain provider operations
+that a later typed authority can invoke only after a reservation and dispatch
+claim have committed. The current stopped-directory backend declares
+`fencing: "manual"` and therefore cannot use lease expiration alone for
+automatic host takeover.
 
 ## Protected Properties
 
@@ -47,10 +51,11 @@ The authority protects three different properties and keeps them distinct:
    stale writer can no longer mutate storage. A higher database epoch blocks
    new logical admissions, but does not itself provide that proof.
 
-The PostgreSQL registry now protects the immutable part of canonical identity.
-The executor and schema provide the admission-order mechanism, while the
-remaining lifecycle transitions arrive in later slices. Physical exclusion
-evidence must be supplied by a capable storage backend or supervisor.
+The PostgreSQL registry protects the immutable part of canonical identity. The
+operation kernel uses the executor and schema to provide the first
+admission-order mechanism, while the remaining lifecycle transitions arrive in
+later slices. Physical exclusion evidence must be supplied by a capable storage
+backend or supervisor.
 
 ## Implemented Canonical Session Registry
 
@@ -78,16 +83,88 @@ storage reference must name the same session. Registration uses PostgreSQL
 complete canonical identity:
 
 - an exact replay returns the existing revision and timestamps without a
-  write;
+  write, including after mutable operation state has progressed;
 - reusing the session ID with any different immutable identity returns
   `session_identity_conflict` and never overwrites the row; and
 - database `transaction_timestamp()` supplies both initial timestamps.
 
 `readSession()` validates the complete relational and JSON document shape,
-identity bindings, initial state, revision, and timestamps before returning a
-deep-frozen snapshot. Missing sessions return `session_not_found`; malformed or
+immutable identity bindings, current mutable state, revision, timestamps, and
+any active operation/reservation linkage before returning a deep-frozen
+snapshot. Missing sessions return `session_not_found`; malformed or
 inconsistent stored state returns `session_state_invalid`. Readback never
 repairs or normalizes stored authority state implicitly.
+
+## Implemented Operation and Reservation Kernel
+
+The kernel uses one conservative conflict class,
+`session-mutation`. Every authority-changing operation for one session
+conflicts with every other such operation until a later schema and proof set
+justify narrower classes. `kind` describes an operation; it does not weaken
+this session-wide exclusion rule.
+
+`reserveOperation()` binds a globally unique operation ID to the exact session,
+kind, bounded canonical request, and complete caller-observed session snapshot.
+In one `SERIALIZABLE` transaction it:
+
+1. locks the canonical session row;
+2. proves the expected immutable identity, lifecycle, and revision;
+3. claims one operation row and one authority-generated reservation row; and
+4. writes the matching `activeOperation` pointer while incrementing the session
+   revision.
+
+The stored request, relational rows, and session pointer bind the same IDs,
+kind, conflict class, request digest, expected session revision, phase, and
+operation revision. Readback cross-checks all three representations. A missing,
+dangling, or mismatched representation is corruption and fails closed; it is
+never repaired implicitly.
+
+The durable pre-dispatch state machine is:
+
+```text
+absent
+  └── reserve ───────────────> prepared
+prepared
+  ├── claim dispatch ────────> starting
+  └── cancel before dispatch > committed + released
+starting
+  └── outcome not provable ──> uncertain
+```
+
+`claimOperationDispatch()` performs only the `prepared -> starting` database
+CAS. It returns a dispatch grant only when that exact call definitely committed
+the transition. A replay that observes `starting` or `uncertain`, a lost commit
+acknowledgement, or a restart never produces another grant. The caller must
+wait for this method to return before invoking a provider, and no provider
+callback runs inside the database transaction.
+
+`markOperationUncertain()` durably changes the operation, reservation, and
+session pointer together while leaving both claim rows active.
+`cancelPreparedOperation()` is the only generic terminal path in this slice:
+it can release a reservation only while dispatch is still durably unclaimed,
+records a canonical `cancelled-before-dispatch` result, and preserves the
+operation ID permanently for exact replay. A `starting` or `uncertain`
+operation cannot use this cancellation path.
+
+`reconcileOperation()` is read-only and reports whether the exact request is
+absent, prepared, starting, uncertain, or already committed. Reserve,
+dispatch-claim, uncertainty, and cancellation retries replay exact durable
+state without rewriting revisions or timestamps. Reusing an operation ID with
+a different session, kind, expected snapshot, or request fails closed.
+
+All real phase changes increment the session revision exactly once; operation
+phase changes increment the operation revision exactly once. The reservation's
+`expected_session_revision` remains the revision observed before the original
+reserve. Writer epoch, session revision, and operation revision are independent
+counters and are never inferred from one another. Every operation timestamp is
+database time.
+
+The kernel has no expiry, steal, or automatic release rule. `starting` and
+`uncertain` survive process restart and continue to block the session. A later
+typed lease, attachment, fencing, catalogue, or launch authority must verify
+its own completion evidence and atomically combine the business-state update
+with operation finalization. It must not call a generic finalizer first and
+update the canonical lifecycle in a second transaction.
 
 ## Implemented PostgreSQL Transaction Boundary
 
@@ -185,11 +262,15 @@ rollback, so stale or forged `commitState` evidence cannot cross operation
 boundaries. Store errors define frozen own data fields rather than consulting
 mutable prototype accessors for their reported state.
 
-The next authority slice must use that executor to lock the canonical session
-row, claim operation and reservation rows, validate the complete expected
-identity and revision, and commit a durable reservation before any external
-provider callback starts. An external callback must not be held inside a
-database transaction. Its required protocol is:
+The operation kernel uses that executor to lock the canonical session row,
+claim operation and reservation rows, validate the complete expected identity
+and revision, and commit durable `prepared` and `starting` phases before any
+external provider callback starts. The owning session's current active
+operation and reservation are locked in that order. A foreign or already
+retired operation ID is read only as snapshot-consistent identity evidence,
+not locked, so crossed foreign IDs cannot introduce a second lock order.
+An external callback must not be held inside a database transaction. Later
+typed lifecycle methods must preserve this protocol:
 
 ```text
 serializable reserve commit
@@ -201,11 +282,11 @@ external physical operation
 serializable exact-CAS finalize
 ```
 
-That future durable reservation must close launch, detach, fence, restore, and
-other conflicting admission while the callback is in flight. If the callback
-or finalization acknowledgement is uncertain, the reservation and blocked
-state must remain visible for explicit reconciliation; the authority must
-never roll back to an apparently safe state.
+The durable reservation closes launch, detach, fence, restore, and other
+conflicting admission while the callback is in flight. If the callback or
+finalization acknowledgement is uncertain, the reservation and operation phase
+remain visible for explicit reconciliation; the authority never rolls back to
+an apparently safe state.
 
 ## Required Canonical Session Lifecycle
 
@@ -335,7 +416,7 @@ Success records the returned process and writer incarnation bindings; failure
 is launchable again only when the supervisor has proved the complete old writer
 boundary stopped and the authority has finalized that proof.
 
-The next authority slice will introduce this launcher callback seam. A later
+The later logical-launcher slice will introduce this launcher callback seam. A
 concrete Podman/Docker adapter must hold directory identity through the bind,
 enforce rootless execution, fix the Codex CLI/config surface, and register the
 exact writer with `StoppedWriterCapabilityCoordinator`.
@@ -364,11 +445,13 @@ The foundation unit suite uses deterministic transaction doubles to cover
 database time, query-capability lifetime, provenance-aware retry, migration,
 commit uncertainty, fire-and-forget query rejection, and release failure.
 Registry unit tests cover validation, exact replay, identity conflict, strict
-readback, and immutable snapshots. Image tests cover exact bytes,
-pre-allocation resource limits, descriptor and config identity, measurement
-drift, and one-use capability semantics. A separate GitHub Actions job runs the
-schema plus identical and conflicting concurrent registration against a real
-PostgreSQL service. Later authority slices must add lifecycle, epoch,
-reservation, catalogue, and launch transition tests. Physical-backend pull
-requests must add crash, detach/fence, container-launch, and cross-host
-conformance evidence.
+readback, and immutable snapshots. Operation-kernel unit tests cover canonical
+request bounds, exact claim replay, dispatch-grant single use, retained
+uncertainty, safe pre-dispatch cancellation, relational-pointer corruption, and
+revision CAS. Image tests cover exact bytes, pre-allocation resource limits,
+descriptor and config identity, measurement drift, and one-use capability
+semantics. A separate GitHub Actions job runs the schema plus registration and
+operation/reservation concurrency against a real PostgreSQL service. Later
+authority slices must add lease, lifecycle, epoch, catalogue, and launch
+transition tests. Physical-backend pull requests must add crash, detach/fence,
+container-launch, and cross-host conformance evidence.

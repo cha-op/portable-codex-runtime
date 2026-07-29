@@ -85,9 +85,13 @@ backend interface, NFS/image constraints, and Codex source basis.
 The control-plane foundation supplies a single-client PostgreSQL
 `SERIALIZABLE` transaction executor, a checksum-bound initial schema for
 canonical sessions, operation and reservation claims, capture tombstones, and
-the checkpoint catalogue, plus real-PostgreSQL concurrency coverage. Business
-lifecycle transitions and launcher admission will be added in the next
-authority slice; the schema or executor alone does not authorize a writer.
+the checkpoint catalogue, plus real-PostgreSQL concurrency coverage. The
+canonical registry and durable operation kernel now bind immutable session
+identity, one exact session-wide mutation reservation, a single definite
+dispatch claim, retained uncertainty, and safe pre-dispatch cancellation.
+Writer leases, attachment evidence, physical callbacks, typed success
+finalization, and launcher admission remain later authority slices; neither a
+database reservation nor a higher revision is a physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
