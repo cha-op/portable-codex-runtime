@@ -29,9 +29,18 @@
 - [done] Add a bounded OCI/Docker runnable-image and Codex-executable
   reservation plus the PostgreSQL serializable transaction, schema, and
   real-concurrency foundation for central runtime authority.
-- [pending] Implement production session lifecycle, lease, reservation,
-  catalogue, fencing, attachment, and launcher-admission transitions behind
-  the validated backend seam.
+- [pending] Implement the durable operation and reservation kernel for exact
+  idempotent replay, conflict exclusion, and explicit uncertain-outcome
+  reconciliation.
+- [pending] Implement database-clock writer lease acquisition and renewal plus
+  exact attachment finalization with monotonic uint64 fencing epochs.
+- [pending] Implement release, force-fence, `FENCING`, and `BLOCKED`
+  reconciliation without treating database epoch allocation as a physical
+  fence.
+- [pending] Implement the production checkpoint mutation-authority and
+  catalogue adapter.
+- [pending] Implement logical launcher admission and durable launch-attempt
+  lifecycle around the measured-image reservation.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

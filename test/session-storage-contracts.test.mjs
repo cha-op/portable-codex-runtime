@@ -28,6 +28,7 @@ import {
   assertSessionProvisionResult,
   assertSessionStorageRef,
   assertStorageBackend,
+  assertStorageBackendCapabilities,
   assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
   assertStorageMutationResult,
@@ -839,6 +840,12 @@ test("worker template ignores post-import clone and freeze poisoning across sess
 
 test("storage backend contract requires directory, exclusivity, fencing, and all operations", () => {
   const backend = storageBackend();
+  const mutableCapabilities = structuredClone(backend.capabilities);
+  const checkedCapabilities =
+    assertStorageBackendCapabilities(mutableCapabilities);
+  mutableCapabilities.fencing = "manual";
+  assert.deepEqual(checkedCapabilities, backend.capabilities);
+  assert.equal(Object.isFrozen(checkedCapabilities), true);
   assert.equal(assertStorageBackend(backend), backend);
   assert.throws(
     () => assertStorageBackend({ ...backend, forceFence: undefined }),

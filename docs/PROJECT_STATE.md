@@ -56,8 +56,12 @@
   retry, a checksum-bound control-plane schema, and real PostgreSQL concurrency
   coverage. A bounded OCI/Docker runnable-image resolver binds exact
   descriptor and config bytes, layer/rootfs structure, and measured Codex
-  executable identity to a one-use process-local reservation. Neither
-  foundation component yet authorizes a writer or launches a container.
+  executable identity to a one-use process-local reservation.
+- A canonical PostgreSQL session registry now persists one immutable manifest,
+  storage reference, and backend capability set in an initial `DETACHED`
+  document. Exact registration replay is idempotent, conflicting reuse fails
+  closed, and strict readback returns a frozen validated snapshot. Registration
+  does not allocate a writer lease, attach storage, or authorize a launch.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -90,6 +94,8 @@
   `docs/project_journal/2026/07/2026-07-14-capture-reconciliation-91eac4.md`
 - Session authority foundation:
   `docs/project_journal/2026/07/2026-07-23-session-authority-foundation-b7419e.md`
+- Canonical session registry:
+  `docs/project_journal/2026/07/2026-07-29-canonical-session-registry-4e8a2d.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

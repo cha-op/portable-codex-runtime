@@ -74,11 +74,34 @@ plane.
       runnable-image reservation without claiming writer lifecycle or
       container launch.
 
-The sequence through PR #14 is complete. The next pull request owns production
-session lifecycle, lease/reservation/catalogue, fencing/attachment, and
-launcher-admission transitions on that foundation. Later pull requests own an
-ext4 or filesystem-image backend, differential export and content-addressed
-storage, cross-host migration, and operational hardening.
+The sequence through PR #14 is complete. The next six serial pull requests do
+not preallocate GitHub PR numbers:
+
+1. **Canonical session registry**
+   - Register one immutable manifest, storage reference, and backend capability
+     set per session; add strict canonical readback and serializable
+     concurrent-replay coverage without authorizing a writer.
+2. **Durable operation and reservation kernel**
+   - Claim canonical operation IDs, reserve conflicting mutations, and retain
+     uncertain outcomes for explicit reconciliation.
+3. **Writer lease and attachment acquisition**
+   - Allocate and renew database-clock leases, advance uint64 fencing epochs,
+     and finalize exact writable attachment evidence.
+4. **Release and force-fence reconciliation**
+   - Close writer admission, release exact owners, force-fence stale writers,
+     and preserve `FENCING` or `BLOCKED` state when physical outcomes are
+     unresolved.
+5. **Checkpoint catalogue authority**
+   - Implement the production mutation-authority adapter and bind durable
+     capture attempts to exact checkpoint-catalogue finalization.
+6. **Logical launcher admission**
+   - Reserve an exact launch attempt, consume the measured-image capability,
+     and retain ambiguous starts until the old writer boundary is proved
+     stopped.
+
+Later pull requests own an ext4 or filesystem-image backend, differential
+export and content-addressed storage, cross-host migration, and operational
+hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

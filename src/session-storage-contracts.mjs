@@ -5,6 +5,7 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const isProxyValue = utilTypes.isProxy;
 const numberIsSafeInteger = Number.isSafeInteger;
+const objectCreate = Object.create;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
@@ -15,6 +16,7 @@ const objectValues = Object.values;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
+const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
 const structuredCloneIntrinsic = globalThis.structuredClone;
 
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
@@ -74,7 +76,6 @@ const MAX_JSON_NESTING_DEPTH = 16;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
-const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const CODEX_VERSION_PATTERN = /^codex-cli [0-9]+\.[0-9]+\.[0-9]+$/u;
 const JSON_STRING_AT_PATTERN =
   /"(?:\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|[^"\\\u0000-\u001F])*"/y;
@@ -131,23 +132,23 @@ function defensiveClone(value, code, label) {
 
 function inspectPlainDataObject(value, code, label) {
   if (
-    utilTypes.isProxy(value) ||
+    isProxyValue(value) ||
     value === null ||
     typeof value !== "object" ||
-    Array.isArray(value)
+    arrayIsArray(value)
   ) {
     fail(code, `${label} must be a plain object`);
   }
   let prototype;
   let actual;
   try {
-    prototype = Object.getPrototypeOf(value);
-    actual = Reflect.ownKeys(value);
+    prototype = objectGetPrototypeOf(value);
+    actual = reflectOwnKeys(value);
   } catch {
     fail(code, `${label} must be a plain object`);
   }
   ensure(
-    [Object.prototype, null].includes(prototype),
+    prototype === objectPrototype || prototype === null,
     code,
     `${label} must be a plain object`,
   );
@@ -157,12 +158,12 @@ function inspectPlainDataObject(value, code, label) {
 function plainDataDescriptor(value, key, code, label) {
   let descriptor;
   try {
-    descriptor = Object.getOwnPropertyDescriptor(value, key);
+    descriptor = objectGetOwnPropertyDescriptor(value, key);
   } catch {
     fail(code, `${label} fields must be enumerable plain data properties`);
   }
   ensure(
-    descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+    descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
     code,
     `${label} fields must be enumerable plain data properties`,
   );
@@ -171,25 +172,37 @@ function plainDataDescriptor(value, key, code, label) {
 
 function assertExactObject(value, keys, code, label) {
   const actual = inspectPlainDataObject(value, code, label);
-  ensure(
-    actual.length === keys.length &&
-      actual.every((key) => typeof key === "string" && keys.includes(key)),
-    code,
-    `${label} contains unexpected or missing fields`,
-  );
-  for (const key of actual) plainDataDescriptor(value, key, code, label);
+  let exact = actual.length === keys.length;
+  for (let index = 0; exact && index < actual.length; index += 1) {
+    const key = actual[index];
+    exact =
+      typeof key === "string" &&
+      reflectApply(arrayIncludesIntrinsic, keys, [key]);
+  }
+  ensure(exact, code, `${label} contains unexpected or missing fields`);
+  for (let index = 0; index < actual.length; index += 1) {
+    plainDataDescriptor(value, actual[index], code, label);
+  }
 }
 
 function assertOptionsObject(value, allowedKeys, requiredKeys, code, label) {
   const actual = inspectPlainDataObject(value, code, label);
-  ensure(
-    actual.every((key) => typeof key === "string" && allowedKeys.includes(key)) &&
-      requiredKeys.every((key) => actual.includes(key)),
-    code,
-    `${label} contains unexpected or missing fields`,
-  );
-  const normalized = Object.create(null);
-  for (const key of actual) {
+  let exact = true;
+  for (let index = 0; exact && index < actual.length; index += 1) {
+    const key = actual[index];
+    exact =
+      typeof key === "string" &&
+      reflectApply(arrayIncludesIntrinsic, allowedKeys, [key]);
+  }
+  for (let index = 0; exact && index < requiredKeys.length; index += 1) {
+    exact = reflectApply(arrayIncludesIntrinsic, actual, [
+      requiredKeys[index],
+    ]);
+  }
+  ensure(exact, code, `${label} contains unexpected or missing fields`);
+  const normalized = objectCreate(null);
+  for (let index = 0; index < actual.length; index += 1) {
+    const key = actual[index];
     const descriptor = plainDataDescriptor(value, key, code, label);
     normalized[key] = descriptor.value;
   }
@@ -197,15 +210,84 @@ function assertOptionsObject(value, allowedKeys, requiredKeys, code, label) {
 }
 
 function assertUuid(value, code, label) {
-  ensure(typeof value === "string" && UUID_PATTERN.test(value), code, `${label} must be a UUID`);
+  ensure(
+    isCanonicalUuid(value),
+    code,
+    `${label} must be a UUID`,
+  );
 }
 
 function assertOpaqueId(value, code, label) {
   ensure(
-    typeof value === "string" && OPAQUE_ID_PATTERN.test(value),
+    isOpaqueId(value),
     code,
     `${label} must be an opaque identifier`,
   );
+}
+
+function stringCharCodeAt(value, index) {
+  return reflectApply(stringCharCodeAtIntrinsic, value, [index]);
+}
+
+function isAsciiAlphaNumeric(code) {
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122)
+  );
+}
+
+function isLowerHex(code) {
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 97 && code <= 102)
+  );
+}
+
+function isCanonicalUuid(value) {
+  if (typeof value !== "string" || value.length !== 36) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = stringCharCodeAt(value, index);
+    if (index === 8 || index === 13 || index === 18 || index === 23) {
+      if (code !== 45) return false;
+    } else if (!isLowerHex(code)) {
+      return false;
+    }
+  }
+  const version = stringCharCodeAt(value, 14);
+  const variant = stringCharCodeAt(value, 19);
+  return (
+    version >= 49 &&
+    version <= 56 &&
+    (variant === 56 ||
+      variant === 57 ||
+      variant === 97 ||
+      variant === 98)
+  );
+}
+
+function isOpaqueId(value) {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 128 ||
+    !isAsciiAlphaNumeric(stringCharCodeAt(value, 0))
+  ) {
+    return false;
+  }
+  for (let index = 1; index < value.length; index += 1) {
+    const code = stringCharCodeAt(value, index);
+    if (
+      !isAsciiAlphaNumeric(code) &&
+      code !== 45 &&
+      code !== 46 &&
+      code !== 58 &&
+      code !== 95
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function assertIsoTimestamp(value, code, label) {
@@ -921,8 +1003,20 @@ export function assertStorageBackend(value) {
     "storage backend contract version is unsupported",
   );
   assertOpaqueId(value.backendId, "invalid_storage_backend", "storage backend ID");
+  assertStorageBackendCapabilities(value.capabilities);
+  for (const method of STORAGE_BACKEND_METHODS) {
+    ensure(
+      typeof value[method] === "function",
+      "invalid_storage_backend",
+      "storage backend is missing a required operation",
+    );
+  }
+  return value;
+}
+
+export function assertStorageBackendCapabilities(value) {
   assertExactObject(
-    value.capabilities,
+    value,
     [
       "atomicPointInTimeCheckpoint",
       "exclusiveWriterAttachment",
@@ -933,21 +1027,24 @@ export function assertStorageBackend(value) {
     "storage backend capabilities",
   );
   ensure(
-    value.capabilities.normalDirectoryAttachment === true &&
-      value.capabilities.exclusiveWriterAttachment === true &&
-      typeof value.capabilities.atomicPointInTimeCheckpoint === "boolean" &&
-      ["epoch-enforced", "verified-detach", "manual"].includes(value.capabilities.fencing),
+    value.normalDirectoryAttachment === true &&
+      value.exclusiveWriterAttachment === true &&
+      typeof value.atomicPointInTimeCheckpoint === "boolean" &&
+      reflectApply(
+        arrayIncludesIntrinsic,
+        ["epoch-enforced", "verified-detach", "manual"],
+        [value.fencing],
+      ),
     "invalid_storage_backend",
     "storage backend capabilities are unsupported",
   );
-  for (const method of STORAGE_BACKEND_METHODS) {
-    ensure(
-      typeof value[method] === "function",
+  return deepFreeze(
+    defensiveClone(
+      value,
       "invalid_storage_backend",
-      "storage backend is missing a required operation",
-    );
-  }
-  return value;
+      "storage backend capabilities",
+    ),
+  );
 }
 
 /**
