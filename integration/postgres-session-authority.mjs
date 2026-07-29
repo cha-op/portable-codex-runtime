@@ -5,11 +5,17 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  PostgresSessionAuthority,
+  PostgresSessionAuthorityError,
+} from "../src/postgres-session-authority.mjs";
+import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
+import { createSessionManifest } from "../src/session-storage-contracts.mjs";
 
 const EMPTY_JSON_OBJECT = "{}";
+const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const databaseUrl = process.env.SESSION_AUTHORITY_DATABASE_URL;
 const databaseConfigured =
   typeof databaseUrl === "string" && databaseUrl.length > 0;
@@ -18,6 +24,128 @@ if (!databaseConfigured) {
   throw new Error(
     "SESSION_AUTHORITY_DATABASE_URL is required for the PostgreSQL integration gate",
   );
+}
+
+function registrationInput(
+  sessionId,
+  {
+    storageId = `volume-${randomUUID()}`,
+  } = {},
+) {
+  const codexSessionId = randomUUID();
+  return {
+    manifest: createSessionManifest({
+      sessionId,
+      codex: {
+        rootThreadId: codexSessionId,
+        sessionId: codexSessionId,
+        ephemeral: false,
+        historyMode: "paginated",
+      },
+      runtime: {
+        imageDigest: IMAGE_DIGEST,
+        imageMediaType:
+          "application/vnd.oci.image.manifest.v1+json",
+        platform: "linux/arm64",
+        codexVersion: "codex-cli 0.142.4",
+        codexSandbox: "danger-full-access",
+      },
+    }),
+    storageRef: {
+      contractVersion: 1,
+      backendId: "postgres-authority-integration",
+      storageId,
+      sessionId,
+    },
+    backendCapabilities: {
+      atomicPointInTimeCheckpoint: true,
+      exclusiveWriterAttachment: true,
+      fencing: "epoch-enforced",
+      normalDirectoryAttachment: true,
+    },
+  };
+}
+
+function firstRegistrationQueryBarrierPool(
+  pool,
+  expectedParticipants,
+  label,
+) {
+  let arrivals = 0;
+  let release;
+  let timer;
+  const barrier = new Promise((resolve, reject) => {
+    release = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out`)),
+      10_000,
+    );
+    timer.unref();
+  });
+
+  return Object.freeze({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        connection: client.connection,
+        async query(...args) {
+          const input = args[0];
+          const text =
+            typeof input === "string" ? input : input?.text;
+          if (
+            typeof text === "string" &&
+            text.startsWith(
+              "INSERT INTO session_authority.sessions",
+            ) &&
+            arrivals < expectedParticipants
+          ) {
+            arrivals += 1;
+            if (arrivals === expectedParticipants) release();
+            await barrier;
+          }
+          return Reflect.apply(client.query, client, args);
+        },
+        release(...args) {
+          return Reflect.apply(client.release, client, args);
+        },
+      };
+    },
+  });
+}
+
+function assertIdentityConflict(error) {
+  assert.ok(error instanceof PostgresSessionAuthorityError);
+  assert.equal(error.name, "PostgresSessionAuthorityError");
+  assert.equal(error.code, "session_identity_conflict");
+  assert.equal(error.retryable, false);
+  assert.equal(Object.hasOwn(error, "cause"), false);
+  return true;
+}
+
+function assertInitialSession(snapshot, input) {
+  assert.equal(snapshot.sessionId, input.manifest.sessionId);
+  assert.equal(snapshot.revision, "0");
+  assert.deepEqual(snapshot.document, {
+    documentVersion: 1,
+    manifest: input.manifest,
+    storageRef: input.storageRef,
+    backendCapabilities: input.backendCapabilities,
+    lifecycle: "DETACHED",
+    writerEpoch: "0",
+    lease: null,
+    attachment: null,
+    activeOperation: null,
+    recovery: null,
+    launch: null,
+  });
+  assert.match(
+    snapshot.createdAt,
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u,
+  );
+  assert.equal(snapshot.updatedAt, snapshot.createdAt);
 }
 
 test(
@@ -475,6 +603,192 @@ test(
         assert.equal(error.commitState, "not-committed");
         assert.equal("cause" in error, false);
         return true;
+      },
+    );
+  },
+);
+
+test(
+  "PostgresSessionAuthority registration is canonical under replay and concurrency",
+  { timeout: 30_000 },
+  async (t) => {
+    const pool = new Pool({
+      application_name:
+        "portable-codex-runtime-session-registry-integration-test",
+      connectionString: databaseUrl,
+      max: 2,
+    });
+    const sessionIds = [];
+    t.after(async () => {
+      try {
+        if (sessionIds.length > 0) {
+          await pool.query(
+            [
+              "DELETE FROM session_authority.sessions",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+        }
+      } finally {
+        await pool.end();
+      }
+    });
+    const store = new PostgresSerializableStore({
+      dedicatedPool: pool,
+      maxTransactionAttempts: 3,
+    });
+    await store.migrate();
+    const authority = new PostgresSessionAuthority({ store });
+
+    await t.test(
+      "registration reads back and exact replay preserves one row",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const input = registrationInput(sessionId);
+
+        const registered = await authority.registerSession(input);
+        assertInitialSession(registered, input);
+        assert.equal(Object.isFrozen(registered), true);
+        assert.equal(Object.isFrozen(registered.document), true);
+
+        const readBack = await authority.readSession({ sessionId });
+        assert.deepEqual(readBack, registered);
+
+        const replayed = await authority.registerSession(
+          structuredClone(input),
+        );
+        assert.deepEqual(replayed, registered);
+
+        const stored = await pool.query(
+          [
+            "SELECT count(*)::integer AS row_count,",
+            "min(created_at) AS created_at,",
+            "max(updated_at) AS updated_at",
+            "FROM session_authority.sessions",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.equal(stored.rows[0].row_count, 1);
+        assert.equal(
+          stored.rows[0].created_at.toISOString(),
+          registered.createdAt,
+        );
+        assert.equal(
+          stored.rows[0].updated_at.toISOString(),
+          registered.updatedAt,
+        );
+      },
+    );
+
+    await t.test(
+      "concurrent identical registration converges on one canonical row",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const input = registrationInput(sessionId);
+        const concurrentStore = new PostgresSerializableStore({
+          dedicatedPool: firstRegistrationQueryBarrierPool(
+            pool,
+            2,
+            "identical registration barrier",
+          ),
+          maxTransactionAttempts: 3,
+        });
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: concurrentStore,
+        });
+
+        const registrations = await Promise.all([
+          concurrentAuthority.registerSession(input),
+          concurrentAuthority.registerSession(structuredClone(input)),
+        ]);
+        assertInitialSession(registrations[0], input);
+        assert.deepEqual(registrations[1], registrations[0]);
+        assert.deepEqual(
+          await authority.readSession({ sessionId }),
+          registrations[0],
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT count(*)::integer AS row_count",
+            "FROM session_authority.sessions",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.equal(stored.rows[0].row_count, 1);
+      },
+    );
+
+    await t.test(
+      "concurrent conflicting registration preserves one identity and rejects the other",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const firstInput = registrationInput(sessionId);
+        const secondInput = {
+          ...firstInput,
+          storageRef: {
+            ...firstInput.storageRef,
+            storageId: `conflicting-volume-${randomUUID()}`,
+          },
+        };
+        const concurrentStore = new PostgresSerializableStore({
+          dedicatedPool: firstRegistrationQueryBarrierPool(
+            pool,
+            2,
+            "conflicting registration barrier",
+          ),
+          maxTransactionAttempts: 3,
+        });
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: concurrentStore,
+        });
+
+        const outcomes = await Promise.allSettled([
+          concurrentAuthority.registerSession(firstInput),
+          concurrentAuthority.registerSession(secondInput),
+        ]);
+        const fulfilled = outcomes.filter(
+          ({ status }) => status === "fulfilled",
+        );
+        const rejected = outcomes.filter(
+          ({ status }) => status === "rejected",
+        );
+        assert.equal(fulfilled.length, 1);
+        assert.equal(rejected.length, 1);
+        assertIdentityConflict(rejected[0].reason);
+
+        const canonical = await authority.readSession({ sessionId });
+        assert.deepEqual(canonical, fulfilled[0].value);
+        const winningInput =
+          outcomes[0].status === "fulfilled"
+            ? firstInput
+            : secondInput;
+        const losingInput =
+          outcomes[0].status === "fulfilled"
+            ? secondInput
+            : firstInput;
+        assertInitialSession(canonical, winningInput);
+        await assert.rejects(
+          authority.registerSession(losingInput),
+          assertIdentityConflict,
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT document",
+            "FROM session_authority.sessions",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.equal(stored.rows.length, 1);
+        assert.deepEqual(stored.rows[0].document, canonical.document);
       },
     );
   },

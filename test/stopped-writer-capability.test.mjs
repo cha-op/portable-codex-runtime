@@ -1347,6 +1347,35 @@ test("fresh-slot registration validates fencing epochs with captured intrinsics"
 test("registration validation ignores RegExp exec prototype poisoning", () => {
   const originalExec = RegExp.prototype.exec;
   let poisonedExecCalls = 0;
+  const observations = [];
+
+  function observeRejectedRegistration(label, coordinator, operation) {
+    const before = poisonedExecCalls;
+    let error;
+    let result;
+    try {
+      result = operation();
+    } catch (caught) {
+      error = caught;
+    }
+    const after = poisonedExecCalls;
+    let disposeError;
+    let disposeResult;
+    try {
+      disposeResult = coordinator.dispose();
+    } catch (caught) {
+      disposeError = caught;
+    }
+    observations.push({
+      after,
+      before,
+      disposeError,
+      disposeResult,
+      error,
+      label,
+      result,
+    });
+  }
 
   try {
     RegExp.prototype.exec = () => {
@@ -1355,19 +1384,20 @@ test("registration validation ignores RegExp exec prototype poisoning", () => {
     };
 
     const identityCoordinator = new StoppedWriterCapabilityCoordinator();
-    syncCapabilityError(
+    observeRejectedRegistration(
+      "process incarnation",
+      identityCoordinator,
       () =>
         identityCoordinator.registerWriter(
           registerOptions({ processIncarnationId: "" }),
         ),
-      "invalid_stopped_writer_request",
     );
-    assert.equal(poisonedExecCalls, 0);
-    assert.equal(identityCoordinator.dispose(), undefined);
 
     const fenceCoordinator = new StoppedWriterCapabilityCoordinator();
     const invalidLease = lease({ fencingEpoch: "-1" });
-    syncCapabilityError(
+    observeRejectedRegistration(
+      "fencing epoch",
+      fenceCoordinator,
       () =>
         fenceCoordinator.registerWriter(
           registerOptions({
@@ -1375,10 +1405,7 @@ test("registration validation ignores RegExp exec prototype poisoning", () => {
             canonicalLease: invalidLease,
           }),
         ),
-      "invalid_stopped_writer_request",
     );
-    assert(poisonedExecCalls > 0);
-    assert.equal(fenceCoordinator.dispose(), undefined);
 
     const bindingScenarios = [
       [{ attachmentId: "" }, {}],
@@ -1393,8 +1420,9 @@ test("registration validation ignores RegExp exec prototype poisoning", () => {
     for (const [attachmentOverrides, leaseOverrides] of bindingScenarios) {
       const invalidLease = lease(leaseOverrides);
       const coordinator = new StoppedWriterCapabilityCoordinator();
-      const before = poisonedExecCalls;
-      syncCapabilityError(
+      observeRejectedRegistration(
+        "binding identity",
+        coordinator,
         () =>
           coordinator.registerWriter(
             registerOptions({
@@ -1402,13 +1430,25 @@ test("registration validation ignores RegExp exec prototype poisoning", () => {
               canonicalLease: invalidLease,
             }),
           ),
-        "invalid_stopped_writer_request",
       );
-      assert(poisonedExecCalls > before);
-      assert.equal(coordinator.dispose(), undefined);
     }
   } finally {
     RegExp.prototype.exec = originalExec;
+  }
+
+  for (const observation of observations) {
+    assert.equal(observation.result, undefined, observation.label);
+    assertCapabilityError(
+      observation.error,
+      "invalid_stopped_writer_request",
+    );
+    assert.equal(observation.disposeError, undefined, observation.label);
+    assert.equal(observation.disposeResult, undefined, observation.label);
+  }
+  assert.equal(observations[0].after, observations[0].before);
+  assert(observations[1].after > observations[1].before);
+  for (const observation of observations.slice(2)) {
+    assert.equal(observation.after, observation.before, observation.label);
   }
 });
 

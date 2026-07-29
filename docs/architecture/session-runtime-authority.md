@@ -2,7 +2,7 @@
 
 ## Scope
 
-The implemented foundation provides:
+The implemented authority provides:
 
 - a single-client PostgreSQL `SERIALIZABLE` transaction executor;
 - database-authoritative transaction time;
@@ -10,27 +10,28 @@ The implemented foundation provides:
 - a checksum-bound initial authority schema;
 - real-PostgreSQL migration and concurrency tests; and
 - bounded OCI/Docker runnable-image inspection plus a one-use reservation
-  capability.
+  capability; and
+- canonical, idempotent session registration with strict readback.
 
-The next authority slice will use that foundation as the central,
-single-primary PostgreSQL authority for one portable session's writer
-lifecycle. It will turn the structural records in
+Registration binds one immutable session manifest, storage reference, and
+backend capability set to a canonical initial `DETACHED` document. Subsequent
+authority slices will turn the remaining structural records in
 `session-storage-contracts.mjs` into serializable admission decisions for:
 
-- session and storage registration;
+- durable operation and reservation claims;
 - writable lease allocation and renewal;
 - attachment, release, and force-fence transitions;
-- operation and checkpoint-catalogue claims;
-- exact platform-image reservations; and
+- checkpoint-catalogue finalization; and
 - logical launcher admission.
 
-The present foundation does not yet implement those business transitions or
-authorize a writer. It also does not mount storage, launch a container, resolve
-a registry tag, verify an image publisher, stop a writer, or prove a physical
-fence. Those effects remain provider operations that a later authority can
-invoke only after a reservation has committed. The current stopped-directory
-backend declares `fencing: "manual"` and therefore cannot use lease expiration
-alone for automatic host takeover.
+Registration is identity persistence, not writer admission: it does not
+allocate a lease or epoch, create an attachment, invoke a provider, or authorize
+a launcher. The authority also does not mount storage, launch a container,
+resolve a registry tag, verify an image publisher, stop a writer, or prove a
+physical fence. Those effects remain provider operations that a later
+authority can invoke only after a reservation has committed. The current
+stopped-directory backend declares `fencing: "manual"` and therefore cannot use
+lease expiration alone for automatic host takeover.
 
 ## Protected Properties
 
@@ -46,9 +47,47 @@ The authority protects three different properties and keeps them distinct:
    stale writer can no longer mutate storage. A higher database epoch blocks
    new logical admissions, but does not itself provide that proof.
 
-The PostgreSQL foundation provides the transaction mechanism and schema for the
-first two; their lifecycle transitions arrive in the next slice. The third must
-be supplied by a capable storage backend or supervisor.
+The PostgreSQL registry now protects the immutable part of canonical identity.
+The executor and schema provide the admission-order mechanism, while the
+remaining lifecycle transitions arrive in later slices. Physical exclusion
+evidence must be supplied by a capable storage backend or supervisor.
+
+## Implemented Canonical Session Registry
+
+`PostgresSessionAuthority.registerSession()` validates and stores one canonical
+document:
+
+```text
+documentVersion
+manifest
+storageRef
+backendCapabilities
+lifecycle = DETACHED
+writerEpoch = 0
+lease = null
+attachment = null
+activeOperation = null
+recovery = null
+launch = null
+```
+
+The manifest, storage reference, and backend capabilities are defensively
+copied and frozen before they cross the transaction boundary. The manifest and
+storage reference must name the same session. Registration uses PostgreSQL
+`SERIALIZABLE` isolation and an insert-on-conflict path, then compares the
+complete canonical identity:
+
+- an exact replay returns the existing revision and timestamps without a
+  write;
+- reusing the session ID with any different immutable identity returns
+  `session_identity_conflict` and never overwrites the row; and
+- database `transaction_timestamp()` supplies both initial timestamps.
+
+`readSession()` validates the complete relational and JSON document shape,
+identity bindings, initial state, revision, and timestamps before returning a
+deep-frozen snapshot. Missing sessions return `session_not_found`; malformed or
+inconsistent stored state returns `session_state_invalid`. Readback never
+repairs or normalizes stored authority state implicitly.
 
 ## Implemented PostgreSQL Transaction Boundary
 
@@ -146,11 +185,11 @@ rollback, so stale or forged `commitState` evidence cannot cross operation
 boundaries. Store errors define frozen own data fields rather than consulting
 mutable prototype accessors for their reported state.
 
-The next authority slice must use that executor to lock or insert canonical
-session and claim rows, validate the complete expected identity and revision,
-and commit a durable reservation before any external provider callback starts.
-An external callback must not be held inside a database transaction. Its
-required protocol is:
+The next authority slice must use that executor to lock the canonical session
+row, claim operation and reservation rows, validate the complete expected
+identity and revision, and commit a durable reservation before any external
+provider callback starts. An external callback must not be held inside a
+database transaction. Its required protocol is:
 
 ```text
 serializable reserve commit
@@ -324,10 +363,12 @@ promote an unfenced session merely because a lease timestamp has passed.
 The foundation unit suite uses deterministic transaction doubles to cover
 database time, query-capability lifetime, provenance-aware retry, migration,
 commit uncertainty, fire-and-forget query rejection, and release failure.
-Image tests cover exact bytes, pre-allocation resource limits, descriptor and
-config identity, measurement drift, and one-use capability semantics. A
-separate GitHub Actions job runs the schema and competing authority clients
-against a real PostgreSQL service. The next authority slice must add lifecycle,
-idempotency, epoch, reservation, catalogue, and launch transition tests. Later
-physical-backend pull requests must add crash, detach/fence, container-launch,
-and cross-host conformance evidence.
+Registry unit tests cover validation, exact replay, identity conflict, strict
+readback, and immutable snapshots. Image tests cover exact bytes,
+pre-allocation resource limits, descriptor and config identity, measurement
+drift, and one-use capability semantics. A separate GitHub Actions job runs the
+schema plus identical and conflicting concurrent registration against a real
+PostgreSQL service. Later authority slices must add lifecycle, epoch,
+reservation, catalogue, and launch transition tests. Physical-backend pull
+requests must add crash, detach/fence, container-launch, and cross-host
+conformance evidence.

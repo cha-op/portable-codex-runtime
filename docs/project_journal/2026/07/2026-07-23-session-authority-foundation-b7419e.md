@@ -3,7 +3,7 @@ id: 20260723-b7419e
 title: Session Authority Foundation
 status: completed
 created: 2026-07-23
-updated: 2026-07-23
+updated: 2026-07-29
 branch: wip/production-runtime-authority
 pr:
 supersedes: []
@@ -133,8 +133,10 @@ superseded_by:
 
 ## Next Steps
 
-- Implement canonical session registration and readback.
-- Add database-clock lease acquisition and renewal with uint64 fencing epochs.
+- Continue from the completed canonical session registry with durable operation
+  and reservation claims.
+- Then add database-clock lease acquisition and renewal with uint64 fencing
+  epochs.
 - Add reserved attachment, release, force-fence, catalogue, and launcher
   transitions with exact revision finalization and explicit reconciliation.
 - Keep the manual-fencing stopped-directory backend ineligible for automatic
@@ -149,3 +151,4 @@ superseded_by:
 - `integration/postgres-session-authority.mjs`
 - `test/platform-image-reservation.test.mjs`
 - `docs/architecture/session-runtime-authority.md`
+- `docs/project_journal/2026/07/2026-07-29-canonical-session-registry-4e8a2d.md`
