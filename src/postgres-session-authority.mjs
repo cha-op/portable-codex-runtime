@@ -46,10 +46,10 @@ const ERROR_MESSAGES = Object.freeze({
 });
 
 const BigIntConstructor = BigInt;
+const ArrayConstructor = Array;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
-const dateParseIntrinsic = Date.parse;
 const dateGetTimeIntrinsic = Date.prototype.getTime;
 const datePrototype = Date.prototype;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
@@ -63,6 +63,7 @@ const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
+const objectSetPrototypeOf = Object.setPrototypeOf;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -312,8 +313,31 @@ function deepFreeze(value) {
   return value;
 }
 
+function nullPrototypeJsonDataTree(value) {
+  if (value === null || typeof value !== "object") return value;
+  const keys = reflectOwnKeys(value);
+  let copy;
+  if (arrayIsArray(value)) {
+    copy = new ArrayConstructor(value.length);
+    objectSetPrototypeOf(copy, null);
+  } else {
+    copy = objectCreate(null);
+  }
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === "length") continue;
+    const descriptor = objectGetOwnPropertyDescriptor(value, key);
+    if (descriptor && objectHasOwn(descriptor, "value")) {
+      copy[key] = nullPrototypeJsonDataTree(descriptor.value);
+    }
+  }
+  return copy;
+}
+
 function canonicalSerialize(document) {
-  return reflectApply(jsonStringifyIntrinsic, JSON, [document]);
+  return reflectApply(jsonStringifyIntrinsic, JSON, [
+    nullPrototypeJsonDataTree(document),
+  ]);
 }
 
 function canonicalRevision(value) {
@@ -376,6 +400,7 @@ function snapshotFromRow(row, expectedSessionId) {
   );
   ensure(sessionId === expectedSessionId, "session_state_invalid");
   const revision = canonicalRevision(normalized.revision);
+  ensure(revision === "0", "session_state_invalid");
   const document = canonicalDocument(
     normalized.document,
     "session_state_invalid",
@@ -383,10 +408,7 @@ function snapshotFromRow(row, expectedSessionId) {
   ensure(document.manifest.sessionId === sessionId, "session_state_invalid");
   const createdAt = canonicalTimestamp(normalized.created_at);
   const updatedAt = canonicalTimestamp(normalized.updated_at);
-  ensure(
-    dateParseIntrinsic(updatedAt) >= dateParseIntrinsic(createdAt),
-    "session_state_invalid",
-  );
+  ensure(createdAt === updatedAt, "session_state_invalid");
   return deepFreeze({
     sessionId,
     revision,

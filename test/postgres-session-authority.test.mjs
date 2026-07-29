@@ -337,6 +337,46 @@ test("registerSession serialization is canonical across reordered identity input
   clients[0].assertExhausted();
 });
 
+test("registerSession serialization ignores inherited Object.prototype.toJSON", async () => {
+  const input = registration();
+  const expectedSerialization = JSON.stringify(document());
+  const { authority, clients } = authorityWithScripts([
+    { rows: [row()] },
+  ]);
+  const priorToJson = Object.getOwnPropertyDescriptor(
+    Object.prototype,
+    "toJSON",
+  );
+  let poisonCalls = 0;
+  let snapshot;
+
+  try {
+    Object.defineProperty(Object.prototype, "toJSON", {
+      configurable: true,
+      value() {
+        poisonCalls += 1;
+        return { poisoned: true };
+      },
+      writable: true,
+    });
+    snapshot = await authority.registerSession(input);
+  } finally {
+    if (priorToJson === undefined) {
+      Reflect.deleteProperty(Object.prototype, "toJSON");
+    } else {
+      Object.defineProperty(Object.prototype, "toJSON", priorToJson);
+    }
+  }
+
+  assert.equal(poisonCalls, 0);
+  assert.equal(
+    userQueries(clients[0])[0][0].values[1],
+    expectedSerialization,
+  );
+  assert.deepEqual(snapshot.document, document());
+  clients[0].assertExhausted();
+});
+
 test("registerSession replays an exact existing document without overwrite", async () => {
   const existing = row();
   const { authority, clients } = authorityWithScripts([
@@ -364,6 +404,28 @@ test("registerSession replays an exact existing document without overwrite", asy
     ],
   ]);
   clients[0].assertExhausted();
+});
+
+test("registerSession rejects non-initial revision and timestamps during replay", async () => {
+  const corruptRows = [
+    row({ revision: "1" }),
+    row({ updated_at: new Date("2026-07-29T12:34:57.000Z") }),
+  ];
+  const { authority, clients } = authorityWithScripts(
+    ...corruptRows.map((corrupt) => [
+      { rows: [] },
+      { rows: [corrupt] },
+    ]),
+  );
+
+  for (let index = 0; index < corruptRows.length; index += 1) {
+    await assertAuthorityError(
+      authority.registerSession(registration()),
+      "session_state_invalid",
+    );
+    assert.equal(userQueries(clients[index]).length, 2);
+    clients[index].assertExhausted();
+  }
 });
 
 test("registerSession rejects a different canonical identity without overwrite", async () => {
@@ -426,11 +488,13 @@ test("readSession fails closed on malformed and corrupt rows", async () => {
   const corruptRows = [
     { ...row(), unknown: true },
     row({ revision: 0 }),
+    row({ revision: "1" }),
     row({ revision: "9223372036854775808" }),
     row({ document: { ...document(), lifecycle: "ATTACHED" } }),
     row({ document: { ...document(), unknown: true } }),
     row({ created_at: NOW }),
     row({ updated_at: new Date("2026-07-29T12:34:55.000Z") }),
+    row({ updated_at: new Date("2026-07-29T12:34:57.000Z") }),
     row({ session_id: OTHER_SESSION_ID }),
   ];
   const { authority, clients } = authorityWithScripts(
