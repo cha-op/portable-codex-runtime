@@ -3,7 +3,7 @@ id: 20260701-6f13a8
 title: Portable Runtime Delivery Plan
 status: active
 created: 2026-07-01
-updated: 2026-07-15
+updated: 2026-07-23
 branch:
 pr:
 supersedes: []
@@ -28,13 +28,17 @@ superseded_by:
   stopped-writer capability, backend composition, and committed capture
   reconciliation, pinned-executable resume evidence, and offline rollout-tail
   repair before writable recovery are complete through PR #13.
+- The PostgreSQL serializable authority foundation, initial durable schema,
+  real concurrency coverage, and bounded OCI/Docker runnable-image reservation
+  are complete in PR #14 without claiming session lifecycle or container
+  launch.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Implement the production linearizable lease, reservation, catalogue, trusted
-  OCI resolution, and launcher-admission authority behind the validated
+- Implement the production session lifecycle, lease, reservation, catalogue,
+  fencing, attachment, and launcher-admission transitions behind the validated
   backend seam.
 
 ## Evidence

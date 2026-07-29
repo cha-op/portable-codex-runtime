@@ -68,10 +68,16 @@ plane.
     - Repair a missing final LF or one invalid unterminated tail on a detached
       writable copy, bind every rollout to the audited writer version, and
       preserve six-scenario same-pinned-executable recovery evidence.
+14. **PR #14: session authority foundation**
+    - Add a same-client PostgreSQL serializable executor, checksum-bound
+      authority schema, real concurrency tests, and a bounded OCI/Docker
+      runnable-image reservation without claiming writer lifecycle or
+      container launch.
 
-The sequence through PR #13 is complete. Later pull requests own a production
-linearizable lease/reservation/catalogue and launcher-admission implementation,
-an ext4 or filesystem-image backend, differential export and content-addressed
+The sequence through PR #14 is complete. The next pull request owns production
+session lifecycle, lease/reservation/catalogue, fencing/attachment, and
+launcher-admission transitions on that foundation. Later pull requests own an
+ext4 or filesystem-image backend, differential export and content-addressed
 storage, cross-host migration, and operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower

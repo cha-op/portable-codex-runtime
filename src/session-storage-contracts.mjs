@@ -1,6 +1,22 @@
 import { isAbsolute, parse, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
+const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayIsArray = Array.isArray;
+const isProxyValue = utilTypes.isProxy;
+const numberIsSafeInteger = Number.isSafeInteger;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const objectIsFrozen = Object.isFrozen;
+const objectPrototype = Object.prototype;
+const objectValues = Object.values;
+const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
+const regexpExecIntrinsic = RegExp.prototype.exec;
+const structuredCloneIntrinsic = globalThis.structuredClone;
+
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
 export const STORAGE_CONTRACT_VERSION = 1;
@@ -91,16 +107,23 @@ function ensure(condition, code, message) {
 }
 
 function deepFreeze(value) {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const child of Object.values(value)) deepFreeze(child);
+  if (value && typeof value === "object" && !objectIsFrozen(value)) {
+    objectFreeze(value);
+    const children = objectValues(value);
+    for (let index = 0; index < children.length; index += 1) {
+      deepFreeze(children[index]);
+    }
   }
   return value;
 }
 
+function deepFreezeManifest(value) {
+  return deepFreeze(value);
+}
+
 function defensiveClone(value, code, label) {
   try {
-    return structuredClone(value);
+    return reflectApply(structuredCloneIntrinsic, globalThis, [value]);
   } catch {
     fail(code, `${label} must contain cloneable data`);
   }
@@ -299,25 +322,91 @@ function assertNoDuplicateJsonObjectKeys(serialized) {
   );
 }
 
+function inspectManifestPlainDataObject(value, code, label) {
+  if (
+    isProxyValue(value) ||
+    value === null ||
+    typeof value !== "object" ||
+    arrayIsArray(value)
+  ) {
+    fail(code, `${label} must be a plain object`);
+  }
+  let prototype;
+  let actual;
+  try {
+    prototype = objectGetPrototypeOf(value);
+    actual = reflectOwnKeys(value);
+  } catch {
+    fail(code, `${label} must be a plain object`);
+  }
+  ensure(
+    prototype === objectPrototype || prototype === null,
+    code,
+    `${label} must be a plain object`,
+  );
+  return actual;
+}
+
+function manifestPlainDataDescriptor(value, key, code, label) {
+  let descriptor;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(value, key);
+  } catch {
+    fail(code, `${label} fields must be enumerable plain data properties`);
+  }
+  ensure(
+    descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+    code,
+    `${label} fields must be enumerable plain data properties`,
+  );
+  return descriptor;
+}
+
+function assertManifestExactObject(value, keys, code, label) {
+  const actual = inspectManifestPlainDataObject(value, code, label);
+  let exact = actual.length === keys.length;
+  for (let index = 0; exact && index < actual.length; index += 1) {
+    const key = actual[index];
+    exact =
+      typeof key === "string" &&
+      reflectApply(arrayIncludesIntrinsic, keys, [key]);
+  }
+  ensure(exact, code, `${label} contains unexpected or missing fields`);
+  for (let index = 0; index < actual.length; index += 1) {
+    manifestPlainDataDescriptor(value, actual[index], code, label);
+  }
+}
+
+function assertManifestUuid(value, label) {
+  ensure(
+    typeof value === "string" &&
+      reflectApply(regexpExecIntrinsic, UUID_PATTERN, [value]) !== null,
+    "invalid_session_manifest",
+    `${label} must be a UUID`,
+  );
+}
+
 function assertAgentPolicy(value) {
-  assertExactObject(
+  assertManifestExactObject(
     value,
     ["defaultMaxSubagents", "maxDepth", "maxSubagents"],
     "invalid_session_manifest",
     "session agent policy",
   );
   ensure(
-    Number.isSafeInteger(value.maxSubagents) && value.maxSubagents === MAX_SUBAGENTS,
+    numberIsSafeInteger(value.maxSubagents) &&
+      value.maxSubagents === MAX_SUBAGENTS,
     "invalid_session_manifest",
     "session subagent hard limit is unsupported",
   );
   ensure(
-    Number.isSafeInteger(value.maxDepth) && value.maxDepth === MAX_AGENT_DEPTH,
+    numberIsSafeInteger(value.maxDepth) &&
+      value.maxDepth === MAX_AGENT_DEPTH,
     "invalid_session_manifest",
     "session agent depth limit is unsupported",
   );
   ensure(
-    Number.isSafeInteger(value.defaultMaxSubagents) &&
+    numberIsSafeInteger(value.defaultMaxSubagents) &&
       value.defaultMaxSubagents >= 1 &&
       value.defaultMaxSubagents <= value.maxSubagents,
     "invalid_session_manifest",
@@ -326,7 +415,7 @@ function assertAgentPolicy(value) {
 }
 
 export function assertSessionManifest(value) {
-  assertExactObject(
+  assertManifestExactObject(
     value,
     ["agents", "authMode", "codex", "layoutVersion", "runtime", "schemaVersion", "sessionId"],
     "invalid_session_manifest",
@@ -337,15 +426,15 @@ export function assertSessionManifest(value) {
     "unsupported_manifest_version",
     "session manifest schema version is unsupported",
   );
-  assertUuid(value.sessionId, "invalid_session_manifest", "runtime session ID");
-  assertExactObject(
+  assertManifestUuid(value.sessionId, "runtime session ID");
+  assertManifestExactObject(
     value.codex,
     ["ephemeral", "historyMode", "rootThreadId", "sessionId"],
     "invalid_session_manifest",
     "Codex session binding",
   );
-  assertUuid(value.codex.rootThreadId, "invalid_session_manifest", "Codex root thread ID");
-  assertUuid(value.codex.sessionId, "invalid_session_manifest", "Codex session-tree ID");
+  assertManifestUuid(value.codex.rootThreadId, "Codex root thread ID");
+  assertManifestUuid(value.codex.sessionId, "Codex session-tree ID");
   ensure(
     value.codex.sessionId === value.codex.rootThreadId,
     "invalid_session_manifest",
@@ -353,11 +442,13 @@ export function assertSessionManifest(value) {
   );
   ensure(value.codex.ephemeral === false, "invalid_session_manifest", "Codex thread must persist");
   ensure(
-    ["legacy", "paginated"].includes(value.codex.historyMode),
+    reflectApply(arrayIncludesIntrinsic, ["legacy", "paginated"], [
+      value.codex.historyMode,
+    ]),
     "invalid_session_manifest",
     "Codex history mode is unsupported",
   );
-  assertExactObject(
+  assertManifestExactObject(
     value.runtime,
     ["codexSandbox", "codexVersion", "imageDigest", "imageMediaType", "platform"],
     "invalid_session_manifest",
@@ -365,24 +456,32 @@ export function assertSessionManifest(value) {
   );
   ensure(
     typeof value.runtime.imageDigest === "string" &&
-      OCI_DIGEST_PATTERN.test(value.runtime.imageDigest),
+      reflectApply(regexpExecIntrinsic, OCI_DIGEST_PATTERN, [
+        value.runtime.imageDigest,
+      ]) !== null,
     "invalid_session_manifest",
     "runtime image must use a concrete lowercase sha256 digest",
   );
   ensure(
-    PLATFORM_IMAGE_MEDIA_TYPES.includes(value.runtime.imageMediaType),
+    reflectApply(arrayIncludesIntrinsic, PLATFORM_IMAGE_MEDIA_TYPES, [
+      value.runtime.imageMediaType,
+    ]),
     "invalid_session_manifest",
     "runtime image media type must describe a platform manifest",
   );
   ensure(
-    ["linux/amd64", "linux/arm64"].includes(value.runtime.platform),
+    reflectApply(arrayIncludesIntrinsic, ["linux/amd64", "linux/arm64"], [
+      value.runtime.platform,
+    ]),
     "invalid_session_manifest",
     "runtime platform is unsupported",
   );
   ensure(
     typeof value.runtime.codexVersion === "string" &&
       value.runtime.codexVersion.length <= 128 &&
-      CODEX_VERSION_PATTERN.test(value.runtime.codexVersion),
+      reflectApply(regexpExecIntrinsic, CODEX_VERSION_PATTERN, [
+        value.runtime.codexVersion,
+      ]) !== null,
     "invalid_session_manifest",
     "Codex version is invalid",
   );
@@ -402,7 +501,9 @@ export function assertSessionManifest(value) {
     "session auth mode is unsupported",
   );
   assertAgentPolicy(value.agents);
-  return deepFreeze(defensiveClone(value, "invalid_session_manifest", "session manifest"));
+  return deepFreezeManifest(
+    defensiveClone(value, "invalid_session_manifest", "session manifest"),
+  );
 }
 
 export function createSessionManifest(input) {
@@ -789,9 +890,9 @@ export function assertSessionAttachmentMatches(options) {
   const writerLease = assertLeaseGrant(lease);
   const mounted = assertSessionAttachment(attachment);
   ensure(
-    [storage.sessionId, writerLease.sessionId, mounted.sessionId].every(
-      (sessionId) => sessionId === sessionManifest.sessionId,
-    ) &&
+    storage.sessionId === sessionManifest.sessionId &&
+      writerLease.sessionId === sessionManifest.sessionId &&
+      mounted.sessionId === sessionManifest.sessionId &&
       mounted.backendId === storage.backendId &&
       mounted.storageId === storage.storageId &&
       mounted.leaseId === writerLease.leaseId &&

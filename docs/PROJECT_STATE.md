@@ -51,6 +51,13 @@
   canonical attempt and source-free verify only its exact committed journal
   record and artefact; it never reuses a stopped-writer capability or advances
   `prepared` or `materialized` evidence.
+- The authority foundation now supplies a same-client PostgreSQL
+  `SERIALIZABLE` executor, database transaction time, provenance-aware bounded
+  retry, a checksum-bound control-plane schema, and real PostgreSQL concurrency
+  coverage. A bounded OCI/Docker runnable-image resolver binds exact
+  descriptor and config bytes, layer/rootfs structure, and measured Codex
+  executable identity to a one-use process-local reservation. Neither
+  foundation component yet authorizes a writer or launches a container.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -81,6 +88,8 @@
   `docs/project_journal/2026/07/2026-07-14-stopped-directory-backend-c5a91e.md`
 - Committed capture reconciliation:
   `docs/project_journal/2026/07/2026-07-14-capture-reconciliation-91eac4.md`
+- Session authority foundation:
+  `docs/project_journal/2026/07/2026-07-23-session-authority-foundation-b7419e.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

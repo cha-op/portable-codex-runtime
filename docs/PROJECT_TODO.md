@@ -26,9 +26,12 @@
   committed-only uncertain-outcome reconciliation.
 - [done] Verify same-pinned-executable resume and implement offline
   rollout-tail repair for the pinned plain-JSONL framing contract.
-- [pending] Bind recovery to an exact platform OCI manifest and implement the
-  production linearizable lease, reservation, catalogue, fencing, attachment,
-  and launcher-admission authority behind the validated backend seam.
+- [done] Add a bounded OCI/Docker runnable-image and Codex-executable
+  reservation plus the PostgreSQL serializable transaction, schema, and
+  real-concurrency foundation for central runtime authority.
+- [pending] Implement production session lifecycle, lease, reservation,
+  catalogue, fencing, attachment, and launcher-admission transitions behind
+  the validated backend seam.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.
