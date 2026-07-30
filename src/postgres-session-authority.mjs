@@ -1097,6 +1097,11 @@ function validateSessionRevisionState(snapshot, code) {
     }
     return;
   }
+  ensure(
+    snapshot.document.documentVersion ===
+      SESSION_AUTHORITY_DOCUMENT_VERSION,
+    code,
+  );
   const expected = BigIntConstructor(active.expectedSessionRevision);
   const operationRevision = BigIntConstructor(active.operationRevision);
   ensure(

@@ -902,84 +902,61 @@ test("a legacy v1 reserve keeps its request identity and upgrades the session to
   for (const client of clients) client.assertExhausted();
 });
 
-test("an existing legacy v1 active operation keeps its hash until a phase write upgrades v2", async () => {
+test("legacy v1 active documents fail closed before relation reads or phase repair", async () => {
   const legacySessionDocument = legacyDocument();
   const options = reserveOptions({
     expectedSession: sessionSnapshot({
       sessionDocument: legacySessionDocument,
     }),
   });
-  const preparedOperation = operationRow("prepared", { options });
-  const preparedReservation = reservationRow("prepared", { options });
   const legacyPreparedSession = legacyPhaseSessionRow("prepared", {
     options,
   });
-  const startingOperation = operationRow("starting", { options });
-  const startingReservation = reservationRow("starting", { options });
-  const startingSession = phaseSessionRow("starting", { options });
-  const activeSteps = [
-    rows(legacyPreparedSession),
-    rows(preparedOperation),
-    rows(preparedReservation),
-  ];
-  const { authority, clients } = authorityWithScripts(
-    activeSteps,
-    activeSteps,
-    {
-      options: { now: LATEST },
-      steps: [
-        ...activeSteps,
-        rows(startingOperation),
-        rows(startingReservation),
-        rows(startingSession),
-      ],
-    },
-  );
-
-  const readback = await authority.readSession({ sessionId: SESSION_ID });
-  const reconciled = await authority.reconcileOperation(options);
-  const claimed = await authority.claimOperationDispatch({
-    ...options,
-    expectedOperationRevision: "0",
+  const legacyStartingSession = legacyPhaseSessionRow("starting", {
+    options,
   });
+  const legacyUncertainSession = legacyPhaseSessionRow("uncertain", {
+    options,
+  });
+  const { authority, clients } = authorityWithScripts(
+    [rows(legacyPreparedSession)],
+    [rows(legacyPreparedSession)],
+    [rows(legacyStartingSession)],
+    [rows(legacyUncertainSession)],
+  );
 
-  assert.deepEqual(
-    readback,
-    snapshotFromSessionRow(legacyPreparedSession),
+  await assertAuthorityError(
+    authority.readSession({ sessionId: SESSION_ID }),
+    { code: "session_state_invalid" },
   );
-  assert.equal(readback.document.documentVersion, 1);
-  assert.deepEqual(
-    reconciled.operation.expectedSession.document,
-    legacySessionDocument,
+  await assertAuthorityError(
+    authority.claimOperationDispatch({
+      ...options,
+      expectedOperationRevision: "0",
+    }),
+    { code: "session_state_invalid" },
   );
-  assert.equal(
-    reconciled.operation.requestSha256,
-    sha256(JSON.stringify(operationEnvelope(options))),
+  await assertAuthorityError(
+    authority.markOperationUncertain({
+      ...options,
+      expectedOperationRevision: "1",
+    }),
+    { code: "session_state_invalid" },
   );
-  assert.equal(claimed.dispatchGranted, true);
-  assert.equal(
-    claimed.session.document.documentVersion,
-    SESSION_AUTHORITY_DOCUMENT_VERSION,
+  await assertAuthorityError(
+    authority.readSession({ sessionId: SESSION_ID }),
+    { code: "session_state_invalid" },
   );
-  assert.equal(claimed.session.document.lastOperation, null);
-  assert.deepEqual(
-    authorityQueries(clients[2]).slice(3),
-    [
-      extendedQuery(START_OPERATION_QUERY, [
-        OPERATION_ID,
-        "0",
-        LATEST,
-      ]),
-      extendedQuery(START_RESERVATION_QUERY, [OPERATION_ID, LATEST]),
-      extendedQuery(UPDATE_SESSION_QUERY, [
-        SESSION_ID,
-        "1",
-        JSON.stringify(startingSession.document),
-        LATEST,
-      ]),
-    ],
-  );
-  for (const client of clients) client.assertExhausted();
+  for (const client of clients) {
+    assert.equal(authorityQueries(client).length, 1);
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
 });
 
 test("exact reserve and reconcile replay prepared state without rewriting it", async () => {

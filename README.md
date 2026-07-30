@@ -91,7 +91,8 @@ identity, one exact session-wide mutation reservation, a single definite
 dispatch claim, retained uncertainty, and safe pre-dispatch cancellation. A
 versioned terminal anchor ties every progressed inactive session to the latest
 committed operation and released reservation; legacy version 1 snapshots keep
-their exact request identity until the next state write upgrades them.
+their exact revision-zero request identity until the next state write upgrades
+them.
 Writer leases, attachment evidence, physical callbacks, typed success
 finalization, and launcher admission remain later authority slices; neither a
 database reservation nor a higher revision is a physical writer fence.

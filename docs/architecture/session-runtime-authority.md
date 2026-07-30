@@ -92,9 +92,11 @@ complete canonical identity:
 Version 2 adds a bounded `lastOperation` terminal anchor. A canonical version 1
 document remains readable with its exact original shape and serialization so
 operation requests already bound to that snapshot retain the same digest.
-Version 1 is accepted only at revision zero or while the first operation based
-on revision zero is active. The next state-changing session write upgrades it
-to version 2; readback never rewrites it merely to normalize the version.
+Version 1 is accepted only as an inactive revision-zero snapshot. The first
+state-changing session write upgrades it to version 2 before an active pointer
+is stored; any active version 1 document is an impossible downgrade and fails
+closed. Readback never rewrites a stored document merely to normalize its
+version.
 The previously merged version 1 registry exposed no session-state mutation
 method, so its supported persisted state was revision zero; progressed version
 1 operation states existed only in intermediate commits of this unmerged
@@ -478,11 +480,12 @@ readback, and immutable snapshots. Operation-kernel unit tests cover
 incremental canonical-request byte and structure bounds, exact claim replay,
 dispatch-grant single use, retained uncertainty, safe pre-dispatch
 cancellation, cancellation acknowledgement loss, version 1 exact request
-compatibility and upgrade-on-write, terminal-anchor relational corruption, and
-revision CAS. Image tests cover exact bytes, pre-allocation resource limits,
-descriptor and config identity, measurement drift, and one-use capability
-semantics. A separate GitHub Actions job runs the schema, registration,
-operation/reservation concurrency, consecutive terminal-anchor replacement
+compatibility and upgrade-on-write, active-document downgrade rejection,
+terminal-anchor relational corruption, and revision CAS. Image tests cover
+exact bytes, pre-allocation resource limits, descriptor and config identity,
+measurement drift, and one-use capability semantics. A separate GitHub Actions
+job runs the schema, registration, operation/reservation concurrency,
+active-document downgrade rejection, consecutive terminal-anchor replacement
 and historical replay, terminal-row corruption, and a post-commit dispatch
 acknowledgement-loss recovery case against a real PostgreSQL service. Later
 authority slices must add lease, lifecycle, epoch, catalogue, and launch

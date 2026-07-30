@@ -1233,6 +1233,70 @@ test(
     );
 
     await t.test(
+      "downgraded active v1 documents fail closed without phase repair",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+
+        const downgraded = structuredClone(reserved.session.document);
+        downgraded.documentVersion = 1;
+        Reflect.deleteProperty(downgraded, "lastOperation");
+        await pool.query(
+          [
+            "UPDATE session_authority.sessions",
+            "SET document = $2::jsonb",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId, JSON.stringify(downgraded)],
+        );
+
+        await assert.rejects(
+          authority.readSession({ sessionId }),
+          assertAuthorityCode("session_state_invalid"),
+        );
+        await assert.rejects(
+          authority.claimOperationDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          }),
+          assertAuthorityCode("session_state_invalid"),
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT s.revision::text AS session_revision,",
+            "s.document ->> 'documentVersion' AS document_version,",
+            "o.state AS operation_state,",
+            "o.revision::text AS operation_revision,",
+            "r.state AS reservation_state",
+            "FROM session_authority.sessions s",
+            "JOIN session_authority.operation_claims o",
+            "ON o.session_id = s.session_id",
+            "JOIN session_authority.reservations r",
+            "ON r.operation_id = o.operation_id",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.deepEqual(stored.rows, [
+          {
+            document_version: "1",
+            operation_revision: "0",
+            operation_state: "prepared",
+            reservation_state: "prepared",
+            session_revision: "1",
+          },
+        ]);
+      },
+    );
+
+    await t.test(
       "missing terminal anchor rows fail closed before a replacement claim",
       async () => {
         const sessionId = randomUUID();

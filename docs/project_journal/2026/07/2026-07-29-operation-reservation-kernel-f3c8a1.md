@@ -50,7 +50,9 @@ superseded_by:
   Missing or mismatched terminal rows fail closed.
 - Legacy version 1 snapshots retain their exact serialized request identity.
   Revision-zero registration replay remains read-only, and the first subsequent
-  session state write upgrades the document to version 2.
+  session state write upgrades the document to version 2. An active version 1
+  document is not a supported persisted state and fails closed instead of being
+  silently repaired by a later phase transition.
 - Strict readback cross-validates the canonical session pointer with the
   operation and reservation rows. Missing, partial, malformed, or mismatched
   state fails closed without repair.
