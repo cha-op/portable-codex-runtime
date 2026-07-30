@@ -7,6 +7,7 @@ import { Pool } from "pg";
 import {
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
+  SESSION_AUTHORITY_DOCUMENT_VERSION,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -228,6 +229,16 @@ function assertOperationReceipt(receipt, state) {
       null,
     state === "committed" ? null : receipt.operation.operationId,
   );
+  if (state === "committed") {
+    assert.equal(
+      receipt.session.document.lastOperation?.operationId,
+      receipt.operation.operationId,
+    );
+    assert.equal(
+      receipt.session.document.lastOperation?.reservationId,
+      receipt.reservation.reservationId,
+    );
+  }
   assert.equal(Object.isFrozen(receipt), true);
   assert.equal(Object.isFrozen(receipt.operation), true);
   assert.equal(Object.isFrozen(receipt.reservation), true);
@@ -238,7 +249,7 @@ function assertInitialSession(snapshot, input) {
   assert.equal(snapshot.sessionId, input.manifest.sessionId);
   assert.equal(snapshot.revision, "0");
   assert.deepEqual(snapshot.document, {
-    documentVersion: 1,
+    documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
     manifest: input.manifest,
     storageRef: input.storageRef,
     backendCapabilities: input.backendCapabilities,
@@ -247,6 +258,7 @@ function assertInitialSession(snapshot, input) {
     lease: null,
     attachment: null,
     activeOperation: null,
+    lastOperation: null,
     recovery: null,
     launch: null,
   });
@@ -1111,12 +1123,167 @@ test(
         assert.deepEqual(replayed.operation, cancelled.operation);
         assert.deepEqual(replayed.reservation, cancelled.reservation);
 
+        const replacementInput = operationInput(cancelled.session);
         const replacement = await authority.reserveOperation(
-          operationInput(cancelled.session),
+          replacementInput,
         );
         assertOperationReceipt(replacement, "prepared");
         assert.equal(replacement.acquired, true);
         assert.equal(replacement.session.revision, "3");
+        assert.deepEqual(
+          replacement.session.document.lastOperation,
+          cancelled.session.document.lastOperation,
+        );
+
+        const replacementCancellation = {
+          ...structuredClone(replacementInput),
+          expectedOperationRevision: "0",
+          reason: "replacement-abandoned-before-dispatch",
+        };
+        const replacementCancelled =
+          await authority.cancelPreparedOperation(
+            replacementCancellation,
+          );
+        assertOperationReceipt(replacementCancelled, "committed");
+        assert.equal(replacementCancelled.cancelled, true);
+        assert.equal(replacementCancelled.session.revision, "4");
+        assert.equal(
+          replacementCancelled.session.document.lastOperation.operationId,
+          replacementInput.operationId,
+        );
+        assert.notEqual(
+          replacementCancelled.session.document.lastOperation.operationId,
+          cancelled.session.document.lastOperation.operationId,
+        );
+
+        const restarted = new PostgresSessionAuthority({ store });
+        const readback = await restarted.readSession({ sessionId });
+        assert.deepEqual(readback, replacementCancelled.session);
+
+        const historical = await restarted.reconcileOperation(
+          structuredClone(input),
+        );
+        assertOperationReceipt(historical, "committed");
+        assert.deepEqual(historical.session, replacementCancelled.session);
+        assert.deepEqual(historical.operation, cancelled.operation);
+        assert.deepEqual(historical.reservation, cancelled.reservation);
+
+        const historicalReplay =
+          await restarted.cancelPreparedOperation(
+            structuredClone(cancellation),
+          );
+        assertOperationReceipt(historicalReplay, "committed");
+        assert.equal(historicalReplay.cancelled, false);
+        assert.deepEqual(
+          historicalReplay.session,
+          replacementCancelled.session,
+        );
+        assert.deepEqual(historicalReplay.operation, cancelled.operation);
+        assert.deepEqual(
+          historicalReplay.reservation,
+          cancelled.reservation,
+        );
+
+        const terminalReplay =
+          await restarted.cancelPreparedOperation(
+            structuredClone(replacementCancellation),
+          );
+        assertOperationReceipt(terminalReplay, "committed");
+        assert.equal(terminalReplay.cancelled, false);
+        assert.deepEqual(
+          terminalReplay.session,
+          replacementCancelled.session,
+        );
+        assert.deepEqual(
+          terminalReplay.operation,
+          replacementCancelled.operation,
+        );
+        assert.deepEqual(
+          terminalReplay.reservation,
+          replacementCancelled.reservation,
+        );
+
+        const terminalRows = await pool.query(
+          [
+            "SELECT o.state AS operation_state,",
+            "r.state AS reservation_state,",
+            "r.expected_session_revision::text",
+            "AS expected_session_revision",
+            "FROM session_authority.operation_claims o",
+            "JOIN session_authority.reservations r",
+            "ON r.operation_id = o.operation_id",
+            "WHERE o.session_id = $1",
+            "ORDER BY r.expected_session_revision",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.deepEqual(terminalRows.rows, [
+          {
+            expected_session_revision: "0",
+            operation_state: "committed",
+            reservation_state: "released",
+          },
+          {
+            expected_session_revision: "2",
+            operation_state: "committed",
+            reservation_state: "released",
+          },
+        ]);
+      },
+    );
+
+    await t.test(
+      "missing terminal anchor rows fail closed before a replacement claim",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+        await authority.reserveOperation(input);
+        const cancelled =
+          await authority.cancelPreparedOperation({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+            reason: "terminal-anchor-corruption-probe",
+          });
+
+        await pool.query(
+          "DELETE FROM session_authority.reservations WHERE operation_id = $1",
+          [input.operationId],
+        );
+        await pool.query(
+          "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+          [input.operationId],
+        );
+
+        await assert.rejects(
+          authority.readSession({ sessionId }),
+          assertAuthorityCode("operation_state_invalid"),
+        );
+        await assert.rejects(
+          authority.reserveOperation(
+            operationInput(cancelled.session),
+          ),
+          assertAuthorityCode("operation_state_invalid"),
+        );
+        const claims = await pool.query(
+          [
+            "SELECT",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims",
+            "WHERE session_id = $1) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations",
+            "WHERE session_id = $1) AS reservation_count",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.deepEqual(claims.rows[0], {
+          operation_count: 0,
+          reservation_count: 0,
+        });
       },
     );
 

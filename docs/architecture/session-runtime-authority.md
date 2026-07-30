@@ -63,7 +63,7 @@ backend or supervisor.
 document:
 
 ```text
-documentVersion
+documentVersion = 2
 manifest
 storageRef
 backendCapabilities
@@ -72,6 +72,7 @@ writerEpoch = 0
 lease = null
 attachment = null
 activeOperation = null
+lastOperation = null
 recovery = null
 launch = null
 ```
@@ -88,12 +89,27 @@ complete canonical identity:
   `session_identity_conflict` and never overwrites the row; and
 - database `transaction_timestamp()` supplies both initial timestamps.
 
+Version 2 adds a bounded `lastOperation` terminal anchor. A canonical version 1
+document remains readable with its exact original shape and serialization so
+operation requests already bound to that snapshot retain the same digest.
+Version 1 is accepted only at revision zero or while the first operation based
+on revision zero is active. The next state-changing session write upgrades it
+to version 2; readback never rewrites it merely to normalize the version.
+The previously merged version 1 registry exposed no session-state mutation
+method, so its supported persisted state was revision zero; progressed version
+1 operation states existed only in intermediate commits of this unmerged
+operation-kernel workstream and are not a migration input.
+
 `readSession()` validates the complete relational and JSON document shape,
 immutable identity bindings, current mutable state, revision, timestamps, and
 any active operation/reservation linkage before returning a deep-frozen
-snapshot. Missing sessions return `session_not_found`; malformed or
-inconsistent stored state returns `session_state_invalid`. Readback never
-repairs or normalizes stored authority state implicitly.
+snapshot. For a progressed version 2 session, it also resolves the
+`lastOperation` primary keys and proves that they name a matching committed
+operation and released reservation, including request and result digests,
+revisions, and terminal timestamps. Missing sessions return
+`session_not_found`; malformed or inconsistent stored state returns
+`session_state_invalid` or `operation_state_invalid`. Readback never repairs or
+normalizes stored authority state implicitly.
 
 ## Implemented Operation and Reservation Kernel
 
@@ -143,8 +159,11 @@ session pointer together while leaving both claim rows active.
 `cancelPreparedOperation()` is the only generic terminal path in this slice:
 it can release a reservation only while dispatch is still durably unclaimed,
 records a canonical `cancelled-before-dispatch` result, and preserves the
-operation ID permanently for exact replay. A `starting` or `uncertain`
-operation cannot use this cancellation path.
+operation ID permanently for exact replay. The same transaction clears the
+active pointer and replaces `lastOperation` with a terminal anchor containing
+the operation and reservation identities plus canonical request and result
+digests. A `starting` or `uncertain` operation cannot use this cancellation
+path.
 
 `reconcileOperation()` is read-only and reports whether the exact request is
 absent, prepared, starting, uncertain, or already committed. Reserve,
@@ -158,6 +177,16 @@ phase changes increment the operation revision exactly once. The reservation's
 reserve. Writer epoch, session revision, and operation revision are independent
 counters and are never inferred from one another. Every operation timestamp is
 database time.
+
+For version 2, an inactive revision-zero session has no terminal anchor. An
+inactive progressed session has revision
+`lastOperation.expectedSessionRevision + 2`; an active session either starts
+from revision zero with no prior anchor or preserves the immediately preceding
+anchor in its expected snapshot. Terminal validation performs bounded
+primary-key reads and does not scan the complete operation history. This
+protects the current session transition source under the authority's ordinary
+database-integrity model; coordinated rewriting of the session document,
+operation, reservation, and their bound hashes is outside that model.
 
 The kernel has no expiry, steal, or automatic release rule. `starting` and
 `uncertain` survive process restart and continue to block the session. A later
@@ -448,12 +477,14 @@ Registry unit tests cover validation, exact replay, identity conflict, strict
 readback, and immutable snapshots. Operation-kernel unit tests cover
 incremental canonical-request byte and structure bounds, exact claim replay,
 dispatch-grant single use, retained uncertainty, safe pre-dispatch
-cancellation, relational-pointer corruption, and revision CAS. Image tests
-cover exact bytes, pre-allocation resource limits, descriptor and config
-identity, measurement drift, and one-use capability semantics. A separate
-GitHub Actions job runs the schema, registration, operation/reservation
-concurrency, and a post-commit dispatch acknowledgement-loss recovery case
-against a real PostgreSQL service. Later authority slices must add lease,
-lifecycle, epoch, catalogue, and launch transition tests. Physical-backend pull
-requests must add crash, detach/fence, container-launch, and cross-host
-conformance evidence.
+cancellation, cancellation acknowledgement loss, version 1 exact request
+compatibility and upgrade-on-write, terminal-anchor relational corruption, and
+revision CAS. Image tests cover exact bytes, pre-allocation resource limits,
+descriptor and config identity, measurement drift, and one-use capability
+semantics. A separate GitHub Actions job runs the schema, registration,
+operation/reservation concurrency, consecutive terminal-anchor replacement
+and historical replay, terminal-row corruption, and a post-commit dispatch
+acknowledgement-loss recovery case against a real PostgreSQL service. Later
+authority slices must add lease, lifecycle, epoch, catalogue, and launch
+transition tests. Physical-backend pull requests must add crash, detach/fence,
+container-launch, and cross-host conformance evidence.

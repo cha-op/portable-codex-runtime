@@ -10,7 +10,7 @@ import {
   assertStorageBackendCapabilities,
 } from "./session-storage-contracts.mjs";
 
-export const SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
+export const SESSION_AUTHORITY_DOCUMENT_VERSION = 2;
 export const SESSION_OPERATION_CONFLICT_CLASS = "session-mutation";
 
 const UUID_PATTERN =
@@ -26,7 +26,8 @@ const MAX_OPERATION_JSON_NODES = 4_096;
 const OPERATION_REQUEST_VERSION = 1;
 const RESERVATION_PAYLOAD_VERSION = 1;
 const OPERATION_RESULT_VERSION = 1;
-const DOCUMENT_KEYS = Object.freeze([
+const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
+const LEGACY_DOCUMENT_KEYS = Object.freeze([
   "activeOperation",
   "attachment",
   "backendCapabilities",
@@ -39,6 +40,10 @@ const DOCUMENT_KEYS = Object.freeze([
   "storageRef",
   "writerEpoch",
 ]);
+const DOCUMENT_KEYS = Object.freeze([
+  ...LEGACY_DOCUMENT_KEYS,
+  "lastOperation",
+]);
 const ACTIVE_OPERATION_KEYS = Object.freeze([
   "conflictClass",
   "expectedSessionRevision",
@@ -48,6 +53,10 @@ const ACTIVE_OPERATION_KEYS = Object.freeze([
   "requestSha256",
   "reservationId",
   "state",
+]);
+const LAST_OPERATION_KEYS = Object.freeze([
+  ...ACTIVE_OPERATION_KEYS,
+  "resultSha256",
 ]);
 const ROW_KEYS = Object.freeze([
   "created_at",
@@ -757,10 +766,63 @@ function canonicalActiveOperation(value, code) {
   });
 }
 
-function canonicalDocument(value, code) {
-  const document = exactPlainObject(value, DOCUMENT_KEYS, code);
+function canonicalLastOperation(value, code) {
+  const operation = exactPlainObject(value, LAST_OPERATION_KEYS, code);
+  const expectedSessionRevision = canonicalRevisionForCode(
+    operation.expectedSessionRevision,
+    code,
+  );
+  const operationRevision = canonicalRevisionForCode(
+    operation.operationRevision,
+    code,
+  );
   ensure(
-    document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+    operation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      operation.state === "committed" &&
+      operationRevision === "1" &&
+      typeof operation.requestSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, operation.requestSha256) &&
+      typeof operation.resultSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, operation.resultSha256),
+    code,
+  );
+  return deepFreeze({
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision,
+    kind: canonicalOpaqueId(operation.kind, 64, code),
+    operationId: canonicalOpaqueId(operation.operationId, 128, code),
+    operationRevision,
+    requestSha256: operation.requestSha256,
+    reservationId: canonicalOpaqueId(operation.reservationId, 128, code),
+    resultSha256: operation.resultSha256,
+    state: "committed",
+  });
+}
+
+function canonicalDocument(value, code) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    arrayIsArray(value) ||
+    isProxyValue(value)
+  ) {
+    fail(code);
+  }
+  const documentVersion = ownDataValue(value, "documentVersion", code);
+  ensure(
+    documentVersion === LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION ||
+      documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION,
+    code,
+  );
+  const document = exactPlainObject(
+    value,
+    documentVersion === LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION
+      ? LEGACY_DOCUMENT_KEYS
+      : DOCUMENT_KEYS,
+    code,
+  );
+  ensure(
+    document.documentVersion === documentVersion &&
       document.lifecycle === "DETACHED" &&
       document.writerEpoch === "0" &&
       document.lease === null &&
@@ -786,9 +848,16 @@ function canonicalDocument(value, code) {
     document.activeOperation === null
       ? null
       : canonicalActiveOperation(document.activeOperation, code);
+  const lastOperation =
+    documentVersion === LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION ||
+    document.lastOperation === null
+      ? null
+      : canonicalLastOperation(document.lastOperation, code);
   return assembleCanonicalDocument({
     activeOperation,
     backendCapabilities,
+    documentVersion,
+    lastOperation,
     manifest,
     storageRef,
   });
@@ -826,11 +895,12 @@ function registrationDocument(options) {
 function assembleCanonicalDocument({
   activeOperation = null,
   backendCapabilities,
+  documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION,
+  lastOperation = null,
   manifest,
   storageRef,
 }) {
-  return deepFreeze({
-    documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
+  const common = {
     manifest: {
       schemaVersion: manifest.schemaVersion,
       sessionId: manifest.sessionId,
@@ -875,6 +945,23 @@ function assembleCanonicalDocument({
     lease: null,
     attachment: null,
     activeOperation,
+  };
+  if (documentVersion === LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION) {
+    return deepFreeze({
+      documentVersion: LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION,
+      ...common,
+      recovery: null,
+      launch: null,
+    });
+  }
+  ensure(
+    documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION,
+    "session_state_invalid",
+  );
+  return deepFreeze({
+    documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
+    ...common,
+    lastOperation,
     recovery: null,
     launch: null,
   });
@@ -977,6 +1064,17 @@ function timestampMilliseconds(value) {
   return reflectApply(dateParseIntrinsic, DateConstructor, [value]);
 }
 
+function documentLastOperation(document) {
+  return document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION
+    ? document.lastOperation
+    : null;
+}
+
+function sameLastOperation(left, right) {
+  if (left === null || right === null) return left === right;
+  return canonicalSerialize(left) === canonicalSerialize(right);
+}
+
 function validateSessionRevisionState(snapshot, code) {
   const revision = BigIntConstructor(snapshot.revision);
   ensure(
@@ -985,9 +1083,16 @@ function validateSessionRevisionState(snapshot, code) {
     code,
   );
   const active = snapshot.document.activeOperation;
+  const last = documentLastOperation(snapshot.document);
   if (active === null) {
-    if (revision === 0n) {
+    if (last === null) {
+      ensure(revision === 0n, code);
       ensure(snapshot.createdAt === snapshot.updatedAt, code);
+    } else {
+      ensure(
+        BigIntConstructor(last.expectedSessionRevision) + 2n === revision,
+        code,
+      );
     }
     return;
   }
@@ -998,6 +1103,14 @@ function validateSessionRevisionState(snapshot, code) {
       revision <= MAX_POSTGRES_BIGINT,
     code,
   );
+  if (last === null) {
+    ensure(expected === 0n, code);
+  } else {
+    ensure(
+      BigIntConstructor(last.expectedSessionRevision) + 2n === expected,
+      code,
+    );
+  }
 }
 
 function rowsFromResult(result, code = "session_state_invalid") {
@@ -1451,6 +1564,41 @@ function validateActivePointer(session, operation, reservation) {
   );
 }
 
+function validateLastOperationPointer(
+  terminalBase,
+  operation,
+  reservation,
+) {
+  const last = documentLastOperation(terminalBase.document);
+  ensure(
+    last !== null &&
+      terminalBase.document.activeOperation === null &&
+      operation.state === "committed" &&
+      operation.revision === "1" &&
+      last.operationId === operation.operationId &&
+      last.reservationId === reservation.reservationId &&
+      last.kind === operation.kind &&
+      last.state === operation.state &&
+      last.expectedSessionRevision === operation.expectedSession.revision &&
+      last.operationRevision === operation.revision &&
+      last.requestSha256 === operation.requestSha256 &&
+      last.resultSha256 === sha256(canonicalSerialize(operation.result)) &&
+      last.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      terminalBase.sessionId === operation.sessionId &&
+      canonicalIdentityBytes(terminalBase.document) ===
+        canonicalIdentityBytes(operation.expectedSession.document) &&
+      terminalBase.createdAt === operation.expectedSession.createdAt &&
+      terminalBase.updatedAt === operation.updatedAt &&
+      operation.retiredAt === operation.updatedAt &&
+      reservation.releasedAt === operation.updatedAt &&
+      reservation.updatedAt === operation.updatedAt,
+    "operation_state_invalid",
+  );
+  validateOperationReservation(operation, reservation, {
+    reservationId: last.reservationId,
+  });
+}
+
 function activePointerFor(input, state, operationRevision) {
   return deepFreeze({
     conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
@@ -1464,9 +1612,37 @@ function activePointerFor(input, state, operationRevision) {
   });
 }
 
-function documentWithActiveOperation(document, activeOperation) {
+function lastPointerFor(operation, reservation) {
+  ensure(
+    operation.state === "committed" &&
+      operation.revision === "1" &&
+      operation.result !== null &&
+      reservation.state === "released",
+    "operation_state_invalid",
+  );
+  return canonicalLastOperation(
+    {
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      expectedSessionRevision: operation.expectedSession.revision,
+      kind: operation.kind,
+      operationId: operation.operationId,
+      operationRevision: operation.revision,
+      requestSha256: operation.requestSha256,
+      reservationId: reservation.reservationId,
+      resultSha256: sha256(canonicalSerialize(operation.result)),
+      state: operation.state,
+    },
+    "operation_state_invalid",
+  );
+}
+
+function documentWithActiveOperation(
+  document,
+  activeOperation,
+  lastOperation = documentLastOperation(document),
+) {
   return deepFreeze({
-    documentVersion: document.documentVersion,
+    documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
     manifest: document.manifest,
     storageRef: document.storageRef,
     backendCapabilities: document.backendCapabilities,
@@ -1475,6 +1651,7 @@ function documentWithActiveOperation(document, activeOperation) {
     lease: document.lease,
     attachment: document.attachment,
     activeOperation,
+    lastOperation,
     recovery: document.recovery,
     launch: document.launch,
   });
@@ -1557,28 +1734,57 @@ async function ensureNoActiveRows(transaction, sessionId) {
 }
 
 async function validateSessionRelations(transaction, session, forUpdate) {
-  const active = session.document.activeOperation;
-  if (active === null) {
+  const activePointer = session.document.activeOperation;
+  let active = null;
+  if (activePointer === null) {
     await ensureNoActiveRows(transaction, session.sessionId);
-    return null;
+  } else {
+    const operation = await readOperationSnapshot(
+      transaction,
+      activePointer.operationId,
+      forUpdate,
+    );
+    ensure(operation !== null, "operation_state_invalid");
+    const reservation = await readReservationSnapshot(
+      transaction,
+      activePointer.operationId,
+      forUpdate,
+    );
+    ensure(reservation !== null, "operation_state_invalid");
+    validateOperationReservation(operation, reservation, {
+      reservationId: activePointer.reservationId,
+    });
+    validateActivePointer(session, operation, reservation);
+    active = deepFreeze({ operation, reservation });
   }
-  const operation = await readOperationSnapshot(
-    transaction,
-    active.operationId,
-    forUpdate,
+
+  const currentLast = documentLastOperation(session.document);
+  const terminalBase =
+    active === null ? session : active.operation.expectedSession;
+  const expectedLast = documentLastOperation(terminalBase.document);
+  ensure(
+    sameLastOperation(currentLast, expectedLast),
+    "operation_state_invalid",
   );
-  ensure(operation !== null, "operation_state_invalid");
-  const reservation = await readReservationSnapshot(
-    transaction,
-    active.operationId,
-    forUpdate,
-  );
-  ensure(reservation !== null, "operation_state_invalid");
-  validateOperationReservation(operation, reservation, {
-    reservationId: active.reservationId,
-  });
-  validateActivePointer(session, operation, reservation);
-  return deepFreeze({ operation, reservation });
+
+  let terminal = null;
+  if (expectedLast !== null) {
+    const operation = await readOperationSnapshot(
+      transaction,
+      expectedLast.operationId,
+      false,
+    );
+    ensure(operation !== null, "operation_state_invalid");
+    const reservation = await readReservationSnapshot(
+      transaction,
+      expectedLast.operationId,
+      false,
+    );
+    ensure(reservation !== null, "operation_state_invalid");
+    validateLastOperationPointer(terminalBase, operation, reservation);
+    terminal = deepFreeze({ operation, reservation });
+  }
+  return deepFreeze({ active, terminal });
 }
 
 async function readRequestedOperation(
@@ -1587,40 +1793,60 @@ async function readRequestedOperation(
   input,
   forUpdate,
 ) {
-  const active = await validateSessionRelations(
+  const relations = await validateSessionRelations(
     transaction,
     session,
     forUpdate,
   );
   const requestedIsActive =
-    active?.operation.operationId === input.operationId;
+    relations.active?.operation.operationId === input.operationId;
+  const requestedIsTerminal =
+    relations.terminal?.operation.operationId === input.operationId;
+  const current =
+    requestedIsActive
+      ? relations.active
+      : requestedIsTerminal
+        ? relations.terminal
+        : null;
   // Mutations already hold this session row and its active relation locks.
   // A foreign or retired operation is identity evidence only; locking it
   // would allow crossed foreign IDs to create an avoidable lock cycle.
-  let operation = requestedIsActive
-    ? active.operation
-    : await readOperationSnapshot(
-        transaction,
-        input.operationId,
-        false,
-      );
+  const operation =
+    current === null
+      ? await readOperationSnapshot(
+          transaction,
+          input.operationId,
+          false,
+        )
+      : current.operation;
   if (operation === null) {
-    return deepFreeze({ active, operation: null, reservation: null });
+    return deepFreeze({
+      active: relations.active,
+      terminal: relations.terminal,
+      operation: null,
+      reservation: null,
+    });
   }
   validateOperationIdentity(operation, input);
-  const reservation = requestedIsActive
-    ? active.reservation
-    : await readReservationSnapshot(
-        transaction,
-        input.operationId,
-        false,
-      );
+  const reservation =
+    current === null
+      ? await readReservationSnapshot(
+          transaction,
+          input.operationId,
+          false,
+        )
+      : current.reservation;
   ensure(reservation !== null, "operation_state_invalid");
   validateOperationReservation(operation, reservation, input);
   if (operation.state !== "committed") {
     validateActivePointer(session, operation, reservation);
   }
-  return deepFreeze({ active, operation, reservation });
+  return deepFreeze({
+    active: relations.active,
+    terminal: relations.terminal,
+    operation,
+    reservation,
+  });
 }
 
 function ensureExactExpectedSession(session, expected) {
@@ -1655,10 +1881,12 @@ async function updateSessionPhase(
   session,
   input,
   activeOperation,
+  lastOperation = documentLastOperation(session.document),
 ) {
   const nextDocument = documentWithActiveOperation(
     session.document,
     activeOperation,
+    lastOperation,
   );
   const rows = rowsFromResult(
     await transaction.query(UPDATE_SESSION_QUERY.text, [
@@ -2115,6 +2343,12 @@ export class PostgresSessionAuthority {
         session,
         input,
         null,
+        lastPointerFor(operation, reservation),
+      );
+      validateLastOperationPointer(
+        updatedSession,
+        operation,
+        reservation,
       );
       return operationReceipt({
         cancelled: true,

@@ -300,10 +300,20 @@ function document(sessionId = SESSION_ID, overrides = {}) {
     lease: null,
     attachment: null,
     activeOperation: null,
+    lastOperation: null,
     recovery: null,
     launch: null,
     ...overrides,
   };
+}
+
+function legacyDocument(sessionId = SESSION_ID, overrides = {}) {
+  const value = document(sessionId, {
+    documentVersion: 1,
+    ...overrides,
+  });
+  Reflect.deleteProperty(value, "lastOperation");
+  return value;
 }
 
 function sessionRow({
@@ -424,6 +434,24 @@ function activeOperation(
   };
 }
 
+function lastOperation({
+  options = reserveOptions(),
+  reason = "caller-abandoned-before-dispatch",
+} = {}) {
+  const binding = operationBinding(options);
+  return {
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision: options.expectedSession.revision,
+    kind: options.kind,
+    operationId: options.operationId,
+    operationRevision: "1",
+    requestSha256: binding.requestSha256,
+    reservationId: binding.reservationId,
+    resultSha256: sha256(JSON.stringify(cancellationResult(reason))),
+    state: "committed",
+  };
+}
+
 function operationRow(
   state = "prepared",
   {
@@ -505,8 +533,10 @@ function phaseSessionRow(
   state,
   {
     options = reserveOptions(),
-    revision =
-      state === "prepared" ? "1" : state === "starting" ? "2" : "3",
+    revision = (
+      BigInt(options.expectedSession.revision) +
+      (state === "prepared" ? 1n : state === "starting" ? 2n : 3n)
+    ).toString(),
     updatedAt =
       state === "prepared" ? LATER : state === "starting" ? LATEST : FINAL,
     active = activeOperation(state, { options }),
@@ -517,10 +547,22 @@ function phaseSessionRow(
     revision,
     sessionDocument: document(options.expectedSession.sessionId, {
       activeOperation: active,
+      lastOperation:
+        options.expectedSession.document.lastOperation === undefined
+          ? null
+          : structuredClone(options.expectedSession.document.lastOperation),
     }),
     createdAt: options.expectedSession.createdAt,
     updatedAt,
   });
+}
+
+function legacyPhaseSessionRow(state, { options = reserveOptions() } = {}) {
+  const value = phaseSessionRow(state, { options });
+  value.document = legacyDocument(options.expectedSession.sessionId, {
+    activeOperation: activeOperation(state, { options }),
+  });
+  return value;
 }
 
 function snapshotFromSessionRow(value) {
@@ -612,12 +654,17 @@ function activePhaseSteps(state, options = reserveOptions()) {
 
 function cancelledSessionRow({
   options = reserveOptions(),
+  reason = "caller-abandoned-before-dispatch",
   updatedAt = LATEST,
 } = {}) {
   return sessionRow({
     sessionId: options.expectedSession.sessionId,
-    revision: "2",
-    sessionDocument: document(options.expectedSession.sessionId),
+    revision: (
+      BigInt(options.expectedSession.revision) + 2n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      lastOperation: lastOperation({ options, reason }),
+    }),
     createdAt: options.expectedSession.createdAt,
     updatedAt,
   });
@@ -799,6 +846,142 @@ test("reserveOperation atomically persists the canonical prepared claim", async 
   clients[0].assertExhausted();
 });
 
+test("a legacy v1 reserve keeps its request identity and upgrades the session to v2", async () => {
+  const legacySessionDocument = legacyDocument();
+  const options = reserveOptions({
+    expectedSession: sessionSnapshot({
+      sessionDocument: legacySessionDocument,
+    }),
+  });
+  const initialSession = sessionRow({
+    sessionDocument: legacySessionDocument,
+  });
+  const preparedOperation = operationRow("prepared", { options });
+  const preparedReservation = reservationRow("prepared", { options });
+  const preparedSession = phaseSessionRow("prepared", { options });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: LATER },
+      steps: [
+        rows(initialSession),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(),
+        rows(preparedOperation),
+        rows(preparedReservation),
+        rows(preparedSession),
+      ],
+    },
+    activePhaseSteps("prepared", options),
+  );
+
+  const acquired = await authority.reserveOperation(options);
+  const replayed = await authority.reserveOperation(options);
+
+  assert.equal(acquired.acquired, true);
+  assert.equal(replayed.acquired, false);
+  assert.equal(
+    acquired.operation.requestSha256,
+    sha256(JSON.stringify(operationEnvelope(options))),
+  );
+  assert.deepEqual(
+    acquired.operation.expectedSession.document,
+    legacySessionDocument,
+  );
+  assert.equal(
+    acquired.session.document.documentVersion,
+    SESSION_AUTHORITY_DOCUMENT_VERSION,
+  );
+  assert.equal(acquired.session.document.lastOperation, null);
+  assert.deepEqual(replayed.operation, acquired.operation);
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      queryText(args).startsWith("UPDATE "),
+    ),
+    false,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("an existing legacy v1 active operation keeps its hash until a phase write upgrades v2", async () => {
+  const legacySessionDocument = legacyDocument();
+  const options = reserveOptions({
+    expectedSession: sessionSnapshot({
+      sessionDocument: legacySessionDocument,
+    }),
+  });
+  const preparedOperation = operationRow("prepared", { options });
+  const preparedReservation = reservationRow("prepared", { options });
+  const legacyPreparedSession = legacyPhaseSessionRow("prepared", {
+    options,
+  });
+  const startingOperation = operationRow("starting", { options });
+  const startingReservation = reservationRow("starting", { options });
+  const startingSession = phaseSessionRow("starting", { options });
+  const activeSteps = [
+    rows(legacyPreparedSession),
+    rows(preparedOperation),
+    rows(preparedReservation),
+  ];
+  const { authority, clients } = authorityWithScripts(
+    activeSteps,
+    activeSteps,
+    {
+      options: { now: LATEST },
+      steps: [
+        ...activeSteps,
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+  );
+
+  const readback = await authority.readSession({ sessionId: SESSION_ID });
+  const reconciled = await authority.reconcileOperation(options);
+  const claimed = await authority.claimOperationDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.deepEqual(
+    readback,
+    snapshotFromSessionRow(legacyPreparedSession),
+  );
+  assert.equal(readback.document.documentVersion, 1);
+  assert.deepEqual(
+    reconciled.operation.expectedSession.document,
+    legacySessionDocument,
+  );
+  assert.equal(
+    reconciled.operation.requestSha256,
+    sha256(JSON.stringify(operationEnvelope(options))),
+  );
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(
+    claimed.session.document.documentVersion,
+    SESSION_AUTHORITY_DOCUMENT_VERSION,
+  );
+  assert.equal(claimed.session.document.lastOperation, null);
+  assert.deepEqual(
+    authorityQueries(clients[2]).slice(3),
+    [
+      extendedQuery(START_OPERATION_QUERY, [
+        OPERATION_ID,
+        "0",
+        LATEST,
+      ]),
+      extendedQuery(START_RESERVATION_QUERY, [OPERATION_ID, LATEST]),
+      extendedQuery(UPDATE_SESSION_QUERY, [
+        SESSION_ID,
+        "1",
+        JSON.stringify(startingSession.document),
+        LATEST,
+      ]),
+    ],
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
 test("exact reserve and reconcile replay prepared state without rewriting it", async () => {
   const options = reserveOptions();
   const preparedOperation = operationRow("prepared", { options });
@@ -917,13 +1100,15 @@ test("a different operation on the same session is blocked without mutation", as
 
 test("a stale expected session snapshot fails before any claim is inserted", async () => {
   const stale = reserveOptions();
-  const current = sessionRow({
-    revision: "1",
-    updatedAt: LATER,
+  const prior = reserveOptions({
+    operationId: OTHER_OPERATION_ID,
   });
+  const current = cancelledSessionRow({ options: prior });
   const { authority, clients } = authorityWithScripts([
     rows(current),
     rows({ operation_count: 0, reservation_count: 0 }),
+    rows(committedOperationRow({ options: prior })),
+    rows(releasedReservationRow({ options: prior })),
     rows(),
   ]);
 
@@ -1204,7 +1389,7 @@ test("prepared cancellation commits once and exact terminal replay is stable", a
     extendedQuery(UPDATE_SESSION_QUERY, [
       SESSION_ID,
       "1",
-      JSON.stringify(document()),
+      JSON.stringify(releasedSession.document),
       LATEST,
     ]),
   ]);
@@ -1217,6 +1402,79 @@ test("prepared cancellation commits once and exact terminal replay is stable", a
     );
   }
   for (const client of clients) client.assertExhausted();
+});
+
+test("cancellation commit acknowledgement loss reconciles the terminal anchor", async () => {
+  const options = reserveOptions();
+  const reason = "caller-abandoned-before-dispatch";
+  const committedOperation = committedOperationRow({ options, reason });
+  const releasedReservation = releasedReservationRow({ options });
+  const releasedSession = cancelledSessionRow({ options, reason });
+  const input = {
+    ...options,
+    expectedOperationRevision: "0",
+    reason,
+  };
+  const terminalSteps = [
+    rows(releasedSession),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(committedOperation),
+    rows(releasedReservation),
+  ];
+  const commitError = new Error(
+    "sensitive cancellation commit acknowledgement lost",
+  );
+  const { authority, clients, pool } = authorityWithScripts(
+    {
+      options: { commitError, now: LATEST },
+      steps: [
+        ...activePhaseSteps("prepared", options),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(releasedSession),
+      ],
+    },
+    terminalSteps,
+    terminalSteps,
+  );
+
+  await assert.rejects(
+    authority.cancelPreparedOperation(input),
+    assertStoreCommitUncertain,
+  );
+  const reconciled = await authority.reconcileOperation(options);
+  const replayed = await authority.cancelPreparedOperation(input);
+
+  const stable = {
+    status: "committed",
+    session: snapshotFromSessionRow(releasedSession),
+    operation: operationView(committedOperation),
+    reservation: reservationView(releasedReservation),
+  };
+  assert.deepEqual(reconciled, stable);
+  assert.deepEqual(replayed, {
+    ...stable,
+    cancelled: false,
+  });
+  assertDeepFrozen(reconciled);
+  assertDeepFrozen(replayed);
+  assert.equal(pool.connectCalls, 3);
+  assert.equal(
+    queryTexts(clients[0]).filter((text) => text === "COMMIT").length,
+    1,
+  );
+  assert.equal(queryTexts(clients[0]).at(-1), "ROLLBACK");
+  for (const client of clients.slice(1)) {
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+  }
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+  clients[2].assertExhausted();
 });
 
 test("starting and uncertain operations cannot use prepared cancellation", async () => {
@@ -1445,6 +1703,24 @@ test("session readback fails closed on pointer, operation, and reservation corru
     ...reservationRow("prepared", { options }),
     reservation_id: "reservation-corrupt",
   };
+  const unanchoredTerminalSession = sessionRow({
+    revision: "2",
+    sessionDocument: document(),
+    updatedAt: LATEST,
+  });
+  const terminalSession = cancelledSessionRow({ options });
+  const committedOperation = committedOperationRow({ options });
+  const releasedReservation = releasedReservationRow({ options });
+  const wrongResultAnchorSession = cancelledSessionRow({ options });
+  wrongResultAnchorSession.document.lastOperation.resultSha256 = "0".repeat(64);
+  const wrongTimestampOperation = committedOperationRow({
+    options,
+    updatedAt: FINAL,
+  });
+  const wrongTimestampReservation = releasedReservationRow({
+    options,
+    updatedAt: FINAL,
+  });
   const { authority, clients } = authorityWithScripts(
     [rows(malformedPointer)],
     [rows(danglingPointer), rows()],
@@ -1458,8 +1734,37 @@ test("session readback fails closed on pointer, operation, and reservation corru
       rows(sessionRow()),
       rows({ operation_count: 1, reservation_count: 1 }),
     ],
+    [rows(unanchoredTerminalSession)],
+    [
+      rows(terminalSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(),
+    ],
+    [
+      rows(terminalSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(),
+    ],
+    [
+      rows(wrongResultAnchorSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(releasedReservation),
+    ],
+    [
+      rows(terminalSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(wrongTimestampOperation),
+      rows(wrongTimestampReservation),
+    ],
   );
   const expectedCodes = [
+    "session_state_invalid",
+    "operation_state_invalid",
+    "operation_state_invalid",
+    "operation_state_invalid",
+    "operation_state_invalid",
     "session_state_invalid",
     "operation_state_invalid",
     "operation_state_invalid",
@@ -1485,6 +1790,64 @@ test("session readback fails closed on pointer, operation, and reservation corru
   }
 });
 
+test("terminal anchor binding mismatches fail after only bounded primary-key reads", async () => {
+  const options = reserveOptions();
+  const terminalSession = cancelledSessionRow({ options });
+  const committedOperation = committedOperationRow({ options });
+  const releasedReservation = releasedReservationRow({ options });
+  const wrongKindOperation = {
+    ...committedOperation,
+    kind: "checkpoint-restore",
+  };
+  const wrongKindReservation = {
+    ...releasedReservation,
+    kind: "checkpoint-restore",
+  };
+  const wrongReservationId = {
+    ...releasedReservation,
+    reservation_id: "reservation-corrupt",
+  };
+  const wrongRequestOptions = reserveOptions({
+    request: operationRequest({
+      checkpointId: "checkpoint-corrupt",
+    }),
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      rows(terminalSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(wrongKindOperation),
+      rows(wrongKindReservation),
+    ],
+    [
+      rows(terminalSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(wrongReservationId),
+    ],
+    [
+      rows(terminalSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperationRow({ options: wrongRequestOptions })),
+      rows(releasedReservationRow({ options: wrongRequestOptions })),
+    ],
+  );
+
+  for (const client of clients) {
+    await assertAuthorityError(
+      authority.readSession({ sessionId: SESSION_ID }),
+      { code: "operation_state_invalid" },
+    );
+    assert.deepEqual(authorityQueries(client), [
+      extendedQuery(READ_SESSION_QUERY, [SESSION_ID]),
+      extendedQuery(READ_ACTIVE_COUNTS_QUERY, [SESSION_ID]),
+      extendedQuery(READ_OPERATION_QUERY, [OPERATION_ID]),
+      extendedQuery(READ_RESERVATION_QUERY, [OPERATION_ID]),
+    ]);
+    client.assertExhausted();
+  }
+});
+
 test("registration replay and readSession accept valid progressed phases", async () => {
   const options = reserveOptions();
   const preparedSession = phaseSessionRow("prepared", { options });
@@ -1506,10 +1869,14 @@ test("registration replay and readSession accept valid progressed phases", async
       rows(),
       rows(releasedSession),
       rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperationRow({ options })),
+      rows(releasedReservationRow({ options })),
     ],
     [
       rows(releasedSession),
       rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperationRow({ options })),
+      rows(releasedReservationRow({ options })),
     ],
   );
 

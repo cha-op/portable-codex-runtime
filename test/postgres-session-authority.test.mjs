@@ -161,10 +161,20 @@ function document(overrides = {}) {
     lease: null,
     attachment: null,
     activeOperation: null,
+    lastOperation: null,
     recovery: null,
     launch: null,
     ...overrides,
   };
+}
+
+function legacyDocument(overrides = {}) {
+  const value = document({
+    documentVersion: 1,
+    ...overrides,
+  });
+  Reflect.deleteProperty(value, "lastOperation");
+  return value;
 }
 
 function row(overrides = {}) {
@@ -410,6 +420,30 @@ test("registerSession replays an exact existing document without overwrite", asy
   clients[0].assertExhausted();
 });
 
+test("registration replay preserves a legacy revision-zero document", async () => {
+  const existing = row({ document: legacyDocument() });
+  const { authority, clients } = authorityWithScripts([
+    { rows: [] },
+    { rows: [existing] },
+    NO_ACTIVE_ROWS,
+  ]);
+
+  const snapshot = await authority.registerSession(registration());
+
+  assert.deepEqual(snapshot, {
+    sessionId: SESSION_ID,
+    revision: "0",
+    document: legacyDocument(),
+    createdAt: NOW,
+    updatedAt: NOW,
+  });
+  assert.equal(
+    queryTexts(clients[0]).some((text) => text.startsWith("UPDATE ")),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
 test("registerSession rejects malformed revision and timestamps during replay", async () => {
   const corruptRows = [
     row({ revision: 0 }),
@@ -493,6 +527,7 @@ test("readSession fails closed on malformed and corrupt rows", async () => {
     { ...row(), unknown: true },
     row({ revision: 0 }),
     row({ revision: "9223372036854775808" }),
+    row({ revision: "2" }),
     row({ document: { ...document(), lifecycle: "ATTACHED" } }),
     row({ document: { ...document(), unknown: true } }),
     row({ created_at: NOW }),

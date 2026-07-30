@@ -67,8 +67,11 @@
   the active rows to the session pointer and revision, grants dispatch only
   through one definite `prepared -> starting` CAS, and retains `starting` or
   `uncertain` blockers across replay and restart. Only a still-`prepared`
-  operation can be cancelled generically; lease, attachment, physical
-  callbacks, and typed success finalization remain later work.
+  operation can be cancelled generically. A versioned terminal anchor binds
+  each progressed inactive session to its latest committed operation and
+  released reservation while preserving legacy request hashes; lease,
+  attachment, physical callbacks, and typed success finalization remain later
+  work.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers

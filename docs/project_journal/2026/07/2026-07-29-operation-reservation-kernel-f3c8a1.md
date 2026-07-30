@@ -41,7 +41,16 @@ superseded_by:
 - A still-`prepared` operation can be cancelled before dispatch. Cancellation
   records one exact terminal result, releases the reservation, clears the
   session pointer, and remains permanently replayable under the same operation
-  ID.
+  ID. A lost cancellation COMMIT acknowledgement reconciles to that terminal
+  state and cannot perform a second mutation.
+- Canonical session document version 2 retains the latest committed/released
+  operation as a bounded terminal anchor. Inactive revision derivation,
+  operation and reservation identities, request and result digests, and
+  terminal timestamps are revalidated before readback or another reservation.
+  Missing or mismatched terminal rows fail closed.
+- Legacy version 1 snapshots retain their exact serialized request identity.
+  Revision-zero registration replay remains read-only, and the first subsequent
+  session state write upgrades the document to version 2.
 - Strict readback cross-validates the canonical session pointer with the
   operation and reservation rows. Missing, partial, malformed, or mismatched
   state fails closed without repair.
@@ -62,6 +71,7 @@ superseded_by:
 
 - `src/postgres-session-authority.mjs`
 - `test/postgres-session-operation-kernel.test.mjs`
+- `test/postgres-session-authority.test.mjs`
 - `integration/postgres-session-authority.mjs`
 - `docs/architecture/session-runtime-authority.md`
 - `docs/architecture/runtime-delivery-plan.md`
