@@ -247,8 +247,10 @@ and exact attachment proof bound to that request, lease, holder, epoch,
 operation, storage identity, attachment ID, proof ID, and canonical host-local
 `rootPath`. The provider mutation result must carry the same `rootPath`; a
 caller cannot splice a different structurally valid directory into the
-attachment evidence. It can finalize an operation from `starting` revision 1
-or `uncertain` revision 2. In one
+attachment evidence. This writer-specific evidence validates its root-path-free
+projection against the unchanged generic storage contract v1 result shape. It
+can finalize an operation from `starting` revision 1 or `uncertain` revision 2.
+In one
 transaction it commits the exact `writer-attached` result, retires the
 operation, releases the reservation, clears `activeOperation`, persists the
 attachment and lease, changes the lifecycle to `ATTACHED`, and writes the

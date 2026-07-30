@@ -52,7 +52,13 @@ superseded_by:
   physical attachment evidence, and writes `lastOperation`.
 - Attachment and attach-result path validation scans for NUL with a captured
   string intrinsic, so post-import `String.prototype` poisoning cannot admit
-  an invalid provider path.
+  an invalid provider path. The PostgreSQL authority rejects an oversized path
+  with a constant-time code-unit bound before the bounded UTF-8 byte count,
+  path normalization, shared validation, or cloning.
+- The generic storage contract v1 result keeps its original exact,
+  root-path-free shape. Only this writer-finalization extension requires the
+  provider-selected path, validates the remaining projection as v1, and binds
+  the path to the attachment evidence.
 - Exact physical evidence remains durable even when the provider finishes
   after lease expiry. Expiry closes subsequent admission; it does not erase
   attachment evidence, change the physical state, or prove a fence.

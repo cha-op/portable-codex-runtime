@@ -1233,23 +1233,8 @@ export function assertStorageMutationResult(value, options) {
     "invalid_storage_mutation",
     "storage mutation result options",
   );
-  const result = assertOptionsObject(
+  assertExactObject(
     value,
-    [
-      "backendId",
-      "contractVersion",
-      "fencingEpoch",
-      "holderId",
-      "leaseId",
-      "operation",
-      "operationId",
-      "proofId",
-      "sessionId",
-      "status",
-      "storageId",
-      "target",
-      "rootPath",
-    ],
     [
       "backendId",
       "contractVersion",
@@ -1267,34 +1252,20 @@ export function assertStorageMutationResult(value, options) {
     "invalid_storage_mutation",
     "storage mutation result",
   );
-  const hasRootPath = objectHasOwn(result, "rootPath");
-  ensure(
-    (result.operation === "attach" && hasRootPath) ||
-      (result.operation !== "attach" && !hasRootPath),
-    "invalid_storage_mutation",
-    "only attach results must bind the attachment root",
-  );
-  if (hasRootPath) {
-    assertAttachmentRootPath(
-      result.rootPath,
-      "invalid_storage_mutation",
-      "mutation attachment root",
-    );
-  }
   const expected = assertStorageMutationRequest(request);
   const actualRequest = assertStorageMutationRequest({
-    backendId: result.backendId,
-    contractVersion: result.contractVersion,
-    fencingEpoch: result.fencingEpoch,
-    holderId: result.holderId,
-    leaseId: result.leaseId,
-    operation: result.operation,
-    operationId: result.operationId,
-    sessionId: result.sessionId,
-    storageId: result.storageId,
-    target: result.target,
+    backendId: value.backendId,
+    contractVersion: value.contractVersion,
+    fencingEpoch: value.fencingEpoch,
+    holderId: value.holderId,
+    leaseId: value.leaseId,
+    operation: value.operation,
+    operationId: value.operationId,
+    sessionId: value.sessionId,
+    storageId: value.storageId,
+    target: value.target,
   });
-  assertOpaqueId(result.proofId, "invalid_storage_mutation", "mutation proof ID");
+  assertOpaqueId(value.proofId, "invalid_storage_mutation", "mutation proof ID");
   ensure(
     {
       attach: "attached",
@@ -1302,7 +1273,7 @@ export function assertStorageMutationResult(value, options) {
       destroy: "destroyed",
       detach: "detached",
       restore: "restored",
-    }[result.operation] === result.status,
+    }[value.operation] === value.status,
     "invalid_storage_mutation",
     "storage mutation result status is unsupported",
   );

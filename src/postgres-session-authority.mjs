@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute, parse, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -192,7 +193,7 @@ const ATTACH_MUTATION_REQUEST_KEYS = Object.freeze([
   "storageId",
   "target",
 ]);
-const ATTACH_MUTATION_RESULT_KEYS = Object.freeze([
+const WRITER_ATTACH_MUTATION_RESULT_KEYS = Object.freeze([
   "backendId",
   "contractVersion",
   "fencingEpoch",
@@ -274,6 +275,9 @@ const objectIs = Object.is;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
 const objectSetPrototypeOf = Object.setPrototypeOf;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathParseIntrinsic = parse;
+const pathResolveIntrinsic = resolve;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -924,20 +928,64 @@ function canonicalLeaseGrant(value, code) {
   });
 }
 
+function canonicalAttachmentRootPath(value, code) {
+  ensure(
+    typeof value === "string" &&
+      value.length <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
+    code,
+  );
+  ensure(
+    reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
+      value,
+      "utf8",
+    ]) <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
+    code,
+  );
+  for (let index = 0; index < value.length; index += 1) {
+    ensure(
+      reflectApply(stringCharCodeAtIntrinsic, value, [index]) !== 0,
+      code,
+    );
+  }
+  ensure(
+    pathIsAbsoluteIntrinsic(value) &&
+      pathResolveIntrinsic(value) === value &&
+      value !== pathParseIntrinsic(value).root,
+    code,
+  );
+  return value;
+}
+
+function attachmentRootPathFromPlainRecord(value, code) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    arrayIsArray(value) ||
+    isProxyValue(value)
+  ) {
+    fail(code);
+  }
+  let prototype;
+  try {
+    prototype = objectGetPrototypeOf(value);
+  } catch {
+    fail(code);
+  }
+  ensure(prototype === objectPrototype || prototype === null, code);
+  return canonicalAttachmentRootPath(
+    ownDataValue(value, "rootPath", code),
+    code,
+  );
+}
+
 function canonicalSessionAttachment(value, code) {
+  const rootPath = attachmentRootPathFromPlainRecord(value, code);
   let attachment;
   try {
     attachment = assertSessionAttachment(value);
   } catch {
     fail(code);
   }
-  ensure(
-    reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
-      attachment.rootPath,
-      "utf8",
-    ]) <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
-    code,
-  );
   return deepFreeze({
     contractVersion: STORAGE_CONTRACT_VERSION,
     backendId: canonicalOpaqueId(attachment.backendId, 128, code),
@@ -954,21 +1002,9 @@ function canonicalSessionAttachment(value, code) {
     operationId: canonicalOpaqueId(attachment.operationId, 128, code),
     proofId: canonicalOpaqueId(attachment.proofId, 128, code),
     kind: "directory",
-    rootPath: attachment.rootPath,
+    rootPath,
     mode: "read-write",
   });
-}
-
-function canonicalAttachmentRootPath(value, code) {
-  ensure(
-    typeof value === "string" &&
-      reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
-        value,
-        "utf8",
-      ]) <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
-    code,
-  );
-  return value;
 }
 
 function canonicalLeaseAttachmentBinding({
@@ -1805,9 +1841,10 @@ function attachMutationRequestFor(input, lease, code) {
 }
 
 function canonicalAttachMutationResult(value, request, code) {
+  const rootPath = attachmentRootPathFromPlainRecord(value, code);
   const normalized = exactPlainObject(
     value,
-    ATTACH_MUTATION_RESULT_KEYS,
+    WRITER_ATTACH_MUTATION_RESULT_KEYS,
     code,
   );
   exactPlainObject(
@@ -1817,7 +1854,23 @@ function canonicalAttachMutationResult(value, request, code) {
   );
   let result;
   try {
-    result = assertStorageMutationResult(value, { request });
+    result = assertStorageMutationResult(
+      {
+        backendId: normalized.backendId,
+        contractVersion: normalized.contractVersion,
+        fencingEpoch: normalized.fencingEpoch,
+        holderId: normalized.holderId,
+        leaseId: normalized.leaseId,
+        operation: normalized.operation,
+        operationId: normalized.operationId,
+        proofId: normalized.proofId,
+        sessionId: normalized.sessionId,
+        status: normalized.status,
+        storageId: normalized.storageId,
+        target: normalized.target,
+      },
+      { request },
+    );
   } catch {
     fail(code);
   }
@@ -1866,14 +1919,15 @@ function canonicalAttachMutationResult(value, request, code) {
     }),
     status: "attached",
     proofId: canonicalOpaqueId(result.proofId, 128, code),
-    rootPath: canonicalAttachmentRootPath(result.rootPath, code),
+    rootPath,
   });
 }
 
 function structurallyCanonicalAttachMutationResult(value, code) {
+  attachmentRootPathFromPlainRecord(value, code);
   const normalized = exactPlainObject(
     value,
-    ATTACH_MUTATION_RESULT_KEYS,
+    WRITER_ATTACH_MUTATION_RESULT_KEYS,
     code,
   );
   const request = canonicalAttachMutationRequest(

@@ -242,11 +242,13 @@ conformance test must show that epoch-1 checkpoint, detach, and destroy requests
 fail after an epoch-2 takeover, and that reusing an operation ID with a different
 target fails.
 
-An attach mutation result additionally carries the canonical host-local
-`rootPath` selected by the provider. Finalization must compare that field with
-the complete attachment record before persisting `ATTACHED`; a matching
-`proofId` does not authorize a caller-substituted path. Other mutation result
-variants reject `rootPath`.
+For backward compatibility, the generic storage contract v1 result retains its
+original exact shape and rejects `rootPath` for every mutation, including
+attach. The writer-attachment finalization extension uses a separately scoped
+provider result that requires a canonical host-local `rootPath`; it validates
+the root-path-free projection against the generic v1 contract and compares the
+path with the complete attachment record before persisting `ATTACHED`. A
+matching `proofId` does not authorize a caller-substituted path.
 
 Lease expiry closes control-plane admission; it does not prove that a stale
 host stopped writing. Automatic takeover requires either a storage-native

@@ -794,15 +794,7 @@ test("attachment paths reject NUL despite String prototype poisoning", () => {
     "includes",
   );
   const invalidRootPath = "/var/lib/portable-codex/session-001\0substituted";
-  const request = mutationRequest({ operation: "attach" });
-  const result = {
-    ...request,
-    proofId: "proof-attachment-001",
-    rootPath: invalidRootPath,
-    status: "attached",
-  };
   let attachmentError;
-  let mutationError;
   let poisonedCharCodeAtCalls = 0;
   let poisonedCalls = 0;
   let charCodeAtCallsBeforeValidation;
@@ -831,11 +823,6 @@ test("attachment paths reject NUL despite String prototype poisoning", () => {
     } catch (error) {
       attachmentError = error;
     }
-    try {
-      assertStorageMutationResult(result, { request });
-    } catch (error) {
-      mutationError = error;
-    }
   } finally {
     Object.defineProperty(
       String.prototype,
@@ -855,7 +842,6 @@ test("attachment paths reject NUL despite String prototype poisoning", () => {
   );
   assert.equal(poisonedCalls, callsBeforeValidation);
   assert.ok(assertCode("invalid_storage_attachment")(attachmentError));
-  assert.ok(assertCode("invalid_storage_mutation")(mutationError));
 });
 
 test("worker template ignores post-import clone and freeze poisoning across session bindings", () => {
@@ -1126,34 +1112,23 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
     assert.deepEqual(assertStorageMutationRequest(mutationRequest({ operation })).target, target);
   }
   const attachRequest = mutationRequest({ operation: "attach" });
-  const attachResult = {
+  const legacyAttachResult = {
     ...attachRequest,
     proofId: "proof-attachment-001",
-    rootPath: "/var/lib/portable-codex/session-001",
     status: "attached",
   };
   assert.deepEqual(
-    assertStorageMutationResult(attachResult, { request: attachRequest }),
-    attachResult,
+    assertStorageMutationResult(legacyAttachResult, {
+      request: attachRequest,
+    }),
+    legacyAttachResult,
   );
   assert.throws(
     () =>
       assertStorageMutationResult(
         {
-          ...attachRequest,
-          proofId: "proof-attachment-001",
-          status: "attached",
-        },
-        { request: attachRequest },
-      ),
-    assertCode("invalid_storage_mutation"),
-  );
-  assert.throws(
-    () =>
-      assertStorageMutationResult(
-        {
-          ...attachResult,
-          rootPath: "/var/lib/portable-codex/../other-session",
+          ...legacyAttachResult,
+          rootPath: "/var/lib/portable-codex/session-001",
         },
         { request: attachRequest },
       ),

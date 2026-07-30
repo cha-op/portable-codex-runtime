@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -2776,10 +2778,14 @@ test("writer dispatch reserves revisions for uncertain recovery and finalize", a
   clients[0].assertExhausted();
 });
 
-test("exact attachment proof finalizes atomically even after lease expiry", async () => {
+test("exact-bound attachment proof finalizes atomically after lease expiry", async () => {
   const options = writerAcquireOptions();
   const lease = writerLease(options);
-  const result = writerAttachmentResult(options, lease);
+  const rootPath = `/${"a".repeat(4_095)}`;
+  const result = writerAttachmentResult(options, lease, {
+    attachment: writerAttachment(options, lease, { rootPath }),
+    mutationResult: writerMutationResult(options, lease, { rootPath }),
+  });
   const startingSession = writerStartingSessionRow({ options, lease });
   const committedOperation = writerCommittedOperationRow({
     options,
@@ -2821,6 +2827,7 @@ test("exact attachment proof finalizes atomically even after lease expiry", asyn
   assert.equal(receipt.operation.revision, "2");
   assert.equal(receipt.reservation.state, "released");
   assert.equal(receipt.session.document.lifecycle, "ATTACHED");
+  assert.equal(Buffer.byteLength(rootPath, "utf8"), 4_096);
   assert.deepEqual(receipt.session.document.attachment, result.attachment);
   assert.equal(
     authorityQueries(clients[0]).some(
@@ -3715,6 +3722,179 @@ test("writer lease and attachment APIs reject invalid typed input before Postgre
       code: "invalid_operation_request",
     });
   }
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer attachment finalization bounds provider paths before PostgreSQL", async () => {
+  const { authority, pool } = authorityWithScripts();
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const asciiOversizedPath = `/${"a".repeat(4_096)}`;
+  const utf8OversizedPath = `/${"\u00e9".repeat(2_048)}`;
+  const byteLengthDescriptor = Object.getOwnPropertyDescriptor(
+    Buffer,
+    "byteLength",
+  );
+  const charCodeAtDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    "charCodeAt",
+  );
+  const structuredCloneDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "structuredClone",
+  );
+  const originalPathResolve = path.resolve;
+  let poisonedByteLengthCalls = 0;
+  let poisonedCharCodeAtCalls = 0;
+  let poisonedCloneCalls = 0;
+  let poisonedPathResolveCalls = 0;
+  const errors = [];
+  const cases = [
+    {
+      attachment: {
+        ...result.attachment,
+        rootPath: asciiOversizedPath,
+      },
+      mutationResult: result.mutationResult,
+    },
+    {
+      attachment: {
+        ...result.attachment,
+        rootPath: utf8OversizedPath,
+      },
+      mutationResult: result.mutationResult,
+    },
+    {
+      attachment: result.attachment,
+      mutationResult: {
+        ...result.mutationResult,
+        rootPath: asciiOversizedPath,
+      },
+    },
+    {
+      attachment: result.attachment,
+      mutationResult: {
+        ...result.mutationResult,
+        rootPath: utf8OversizedPath,
+      },
+    },
+    {
+      attachment: {
+        ...result.attachment,
+        rootPath: "/var/lib/portable-codex/session-001\0substituted",
+      },
+      mutationResult: result.mutationResult,
+    },
+    {
+      attachment: result.attachment,
+      mutationResult: {
+        ...result.mutationResult,
+        rootPath: "/var/lib/portable-codex/session-001\0substituted",
+      },
+    },
+    {
+      attachment: {
+        ...result.attachment,
+        rootPath: "/var/lib/portable-codex/../etc",
+      },
+      mutationResult: result.mutationResult,
+    },
+    {
+      attachment: result.attachment,
+      mutationResult: {
+        ...result.mutationResult,
+        rootPath: "/var/lib/portable-codex/../etc",
+      },
+    },
+  ];
+
+  try {
+    Object.defineProperty(Buffer, "byteLength", {
+      ...byteLengthDescriptor,
+      value() {
+        poisonedByteLengthCalls += 1;
+        return 0;
+      },
+    });
+    Object.defineProperty(String.prototype, "charCodeAt", {
+      ...charCodeAtDescriptor,
+      value() {
+        poisonedCharCodeAtCalls += 1;
+        return 47;
+      },
+    });
+    Object.defineProperty(globalThis, "structuredClone", {
+      ...structuredCloneDescriptor,
+      value() {
+        poisonedCloneCalls += 1;
+        return null;
+      },
+    });
+    path.resolve = (value) => {
+      poisonedPathResolveCalls += 1;
+      return value;
+    };
+    syncBuiltinESMExports();
+    for (const providerEvidence of cases) {
+      try {
+        await authority.finalizeWriterAttachment({
+          ...options,
+          expectedOperationRevision: "1",
+          ...providerEvidence,
+        });
+        errors.push(null);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+  } finally {
+    Object.defineProperty(Buffer, "byteLength", byteLengthDescriptor);
+    Object.defineProperty(
+      String.prototype,
+      "charCodeAt",
+      charCodeAtDescriptor,
+    );
+    Object.defineProperty(
+      globalThis,
+      "structuredClone",
+      structuredCloneDescriptor,
+    );
+    path.resolve = originalPathResolve;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(asciiOversizedPath.length, 4_097);
+  assert.equal(Buffer.byteLength(utf8OversizedPath, "utf8"), 4_097);
+  assert.equal(poisonedByteLengthCalls, 0);
+  assert.equal(poisonedCharCodeAtCalls, 0);
+  assert.equal(poisonedCloneCalls, 0);
+  assert(poisonedPathResolveCalls > 0);
+  assert.equal(errors.length, cases.length);
+  for (const error of errors) {
+    assert.ok(error instanceof PostgresSessionAuthorityError);
+    assert.equal(error.code, "invalid_operation_request");
+  }
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer finalization rejects a generic v1 attach result without rootPath", async () => {
+  const { authority, pool } = authorityWithScripts();
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const legacyMutationResult = { ...result.mutationResult };
+  delete legacyMutationResult.rootPath;
+
+  await assertAuthorityError(
+    authority.finalizeWriterAttachment({
+      ...options,
+      expectedOperationRevision: "1",
+      attachment: result.attachment,
+      mutationResult: legacyMutationResult,
+    }),
+    { code: "invalid_operation_request" },
+  );
   assert.equal(pool.connectCalls, 0);
 });
 
