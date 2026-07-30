@@ -144,6 +144,39 @@ function firstSessionLockQueryBarrierPool(
   );
 }
 
+function firstCommitAcknowledgementLossPool(pool) {
+  let acknowledgementLost = false;
+
+  return Object.freeze({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        connection: client.connection,
+        async query(...args) {
+          const input = args[0];
+          const text =
+            typeof input === "string" ? input : input?.text;
+          const result = await Reflect.apply(
+            client.query,
+            client,
+            args,
+          );
+          if (text === "COMMIT" && !acknowledgementLost) {
+            acknowledgementLost = true;
+            throw new Error(
+              "synthetic dispatch COMMIT acknowledgement loss",
+            );
+          }
+          return result;
+        },
+        release(...args) {
+          return Reflect.apply(client.release, client, args);
+        },
+      };
+    },
+  });
+}
+
 function assertIdentityConflict(error) {
   assert.ok(error instanceof PostgresSessionAuthorityError);
   assert.equal(error.name, "PostgresSessionAuthorityError");
@@ -971,6 +1004,74 @@ test(
           operation_count: 1,
           reservation_count: 1,
         });
+      },
+    );
+
+    await t.test(
+      "dispatch COMMIT acknowledgement loss reconciles without regranting",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = operationInput(registered);
+        await authority.reserveOperation(input);
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const acknowledgementLossStore =
+          new PostgresSerializableStore({
+            dedicatedPool:
+              firstCommitAcknowledgementLossPool(pool),
+          });
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: acknowledgementLossStore,
+          });
+
+        await assert.rejects(
+          acknowledgementLossAuthority.claimOperationDispatch(
+            transition,
+          ),
+          (error) => {
+            assert.ok(
+              error instanceof PostgresSerializableStoreError,
+            );
+            assert.equal(
+              error.code,
+              "transaction_commit_outcome_uncertain",
+            );
+            assert.equal(error.commitState, "uncertain");
+            assert.equal(error.retryable, false);
+            assert.equal("cause" in error, false);
+            return true;
+          },
+        );
+
+        const restarted = new PostgresSessionAuthority({ store });
+        const reconciled = await restarted.reconcileOperation(
+          structuredClone(input),
+        );
+        assertOperationReceipt(reconciled, "starting");
+        assert.equal(reconciled.session.revision, "2");
+        assert.equal(reconciled.operation.revision, "1");
+
+        for (let replayIndex = 0; replayIndex < 2; replayIndex += 1) {
+          const replayed =
+            await restarted.claimOperationDispatch(
+              structuredClone(transition),
+            );
+          assertOperationReceipt(replayed, "starting");
+          assert.equal(replayed.dispatchGranted, false);
+          assert.deepEqual(replayed.session, reconciled.session);
+          assert.deepEqual(replayed.operation, reconciled.operation);
+          assert.deepEqual(
+            replayed.reservation,
+            reconciled.reservation,
+          );
+        }
       },
     );
 

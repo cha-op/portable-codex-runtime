@@ -420,6 +420,49 @@ function assertLosslessString(value, code) {
   return value;
 }
 
+function consumeOperationJsonBytes(state, additionalBytes, code) {
+  ensure(
+    numberIsSafeInteger(additionalBytes) &&
+      additionalBytes >= 0 &&
+      state.budget.bytes <= MAX_OPERATION_JSON_BYTES - additionalBytes,
+    code,
+  );
+  state.budget.bytes += additionalBytes;
+}
+
+function consumeOperationJsonString(state, value, code) {
+  ensure(typeof value === "string", code);
+  consumeOperationJsonBytes(state, 2, code);
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = reflectApply(stringCharCodeAtIntrinsic, value, [index]);
+    if (unit === 0x22 || unit === 0x5c) {
+      consumeOperationJsonBytes(state, 2, code);
+    } else if (unit <= 0x1f) {
+      const shortEscape =
+        unit === 0x08 ||
+        unit === 0x09 ||
+        unit === 0x0a ||
+        unit === 0x0c ||
+        unit === 0x0d;
+      consumeOperationJsonBytes(state, shortEscape ? 2 : 6, code);
+    } else if (unit <= 0x7f) {
+      consumeOperationJsonBytes(state, 1, code);
+    } else if (unit <= 0x7ff) {
+      consumeOperationJsonBytes(state, 2, code);
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      ensure(index + 1 < value.length, code);
+      const next = reflectApply(stringCharCodeAtIntrinsic, value, [index + 1]);
+      ensure(next >= 0xdc00 && next <= 0xdfff, code);
+      consumeOperationJsonBytes(state, 4, code);
+      index += 1;
+    } else {
+      ensure(unit < 0xdc00 || unit > 0xdfff, code);
+      consumeOperationJsonBytes(state, 3, code);
+    }
+  }
+  return value;
+}
+
 function canonicalOpaqueId(value, maxLength, code) {
   assertLosslessString(value, code);
   ensure(value.length >= 1 && value.length <= maxLength, code);
@@ -455,24 +498,38 @@ function sortedStringKeys(keys, code) {
 }
 
 function canonicalJsonValue(value, state, code) {
-  state.nodes += 1;
+  state.budget.nodes += 1;
   ensure(
-    state.nodes <= MAX_OPERATION_JSON_NODES &&
+    state.budget.nodes <= MAX_OPERATION_JSON_NODES &&
       state.depth <= MAX_OPERATION_JSON_DEPTH,
     code,
   );
-  if (
-    value === null ||
-    typeof value === "boolean"
-  ) {
+  if (value === null) {
+    consumeOperationJsonBytes(state, 4, code);
+    return value;
+  }
+  if (typeof value === "boolean") {
+    consumeOperationJsonBytes(state, value ? 4 : 5, code);
     return value;
   }
   if (typeof value === "string") {
-    return assertLosslessString(value, code);
+    return consumeOperationJsonString(state, value, code);
   }
   if (typeof value === "number") {
     ensure(numberIsFinite(value), code);
-    return objectIs(value, -0) ? 0 : value;
+    const normalized = objectIs(value, -0) ? 0 : value;
+    const serialized = reflectApply(jsonStringifyIntrinsic, JSON, [
+      normalized,
+    ]);
+    consumeOperationJsonBytes(
+      state,
+      reflectApply(bufferByteLengthIntrinsic, Buffer, [
+        serialized,
+        "utf8",
+      ]),
+      code,
+    );
+    return normalized;
   }
   ensure(
     typeof value === "object" &&
@@ -485,7 +542,13 @@ function canonicalJsonValue(value, state, code) {
   if (arrayIsArray(value)) {
     ensure(
       numberIsSafeInteger(value.length) &&
-        value.length <= MAX_OPERATION_JSON_NODES - state.nodes,
+        value.length <=
+          MAX_OPERATION_JSON_NODES - state.budget.nodes,
+      code,
+    );
+    consumeOperationJsonBytes(
+      state,
+      2 + (value.length === 0 ? 0 : value.length - 1),
       code,
     );
     const ownKeys = reflectOwnKeys(value);
@@ -500,8 +563,8 @@ function canonicalJsonValue(value, state, code) {
         code,
       );
       const childState = {
+        budget: state.budget,
         depth: state.depth + 1,
-        nodes: state.nodes,
         seen: state.seen,
       };
       result[index] = canonicalJsonValue(
@@ -509,7 +572,6 @@ function canonicalJsonValue(value, state, code) {
         childState,
         code,
       );
-      state.nodes = childState.nodes;
     }
     const lengthDescriptor = objectGetOwnPropertyDescriptor(value, "length");
     ensure(
@@ -529,14 +591,28 @@ function canonicalJsonValue(value, state, code) {
     }
     ensure(prototype === objectPrototype || prototype === null, code);
     ensure(
-      ownKeys.length <= MAX_OPERATION_JSON_NODES - state.nodes,
+      ownKeys.length <=
+        MAX_OPERATION_JSON_NODES - state.budget.nodes,
       code,
     );
+    consumeOperationJsonBytes(
+      state,
+      2 + (ownKeys.length === 0 ? 0 : ownKeys.length - 1),
+      code,
+    );
+    for (let index = 0; index < ownKeys.length; index += 1) {
+      const key = consumeOperationJsonString(
+        state,
+        ownKeys[index],
+        code,
+      );
+      ensure(!regexpTest(SENSITIVE_OPERATION_KEY_PATTERN, key), code);
+      consumeOperationJsonBytes(state, 1, code);
+    }
     const keys = sortedStringKeys(ownKeys, code);
     result = objectCreate(null);
     for (let index = 0; index < keys.length; index += 1) {
-      const key = assertLosslessString(keys[index], code);
-      ensure(!regexpTest(SENSITIVE_OPERATION_KEY_PATTERN, key), code);
+      const key = keys[index];
       const descriptor = objectGetOwnPropertyDescriptor(value, key);
       ensure(
         descriptor?.enumerable === true &&
@@ -544,12 +620,11 @@ function canonicalJsonValue(value, state, code) {
         code,
       );
       const childState = {
+        budget: state.budget,
         depth: state.depth + 1,
-        nodes: state.nodes,
         seen: state.seen,
       };
       result[key] = canonicalJsonValue(descriptor.value, childState, code);
-      state.nodes = childState.nodes;
     }
   }
   reflectApply(weakSetDeleteIntrinsic, state.seen, [value]);
@@ -558,8 +633,11 @@ function canonicalJsonValue(value, state, code) {
 
 function canonicalJsonObject(value, code = "invalid_operation_request") {
   const state = {
+    budget: {
+      bytes: 0,
+      nodes: 0,
+    },
     depth: 0,
-    nodes: 0,
     seen: new WeakSetConstructor(),
   };
   const canonical = canonicalJsonValue(value, state, code);
@@ -570,10 +648,15 @@ function canonicalJsonObject(value, code = "invalid_operation_request") {
     code,
   );
   const serialized = reflectApply(jsonStringifyIntrinsic, JSON, [canonical]);
+  const serializedBytes = reflectApply(
+    bufferByteLengthIntrinsic,
+    Buffer,
+    [serialized, "utf8"],
+  );
   ensure(
     typeof serialized === "string" &&
-      reflectApply(bufferByteLengthIntrinsic, Buffer, [serialized, "utf8"]) <=
-        MAX_OPERATION_JSON_BYTES,
+      serializedBytes === state.budget.bytes &&
+      serializedBytes <= MAX_OPERATION_JSON_BYTES,
     code,
   );
   return deepFreeze(canonical);

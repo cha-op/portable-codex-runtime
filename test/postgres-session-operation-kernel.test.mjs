@@ -1009,6 +1009,73 @@ test("dispatch claim grants exactly once and starting replay grants false", asyn
   clients[1].assertExhausted();
 });
 
+test("dispatch commit acknowledgement loss never returns or regrants dispatch", async () => {
+  const options = reserveOptions();
+  const startingOperation = operationRow("starting", { options });
+  const startingReservation = reservationRow("starting", { options });
+  const startingSession = phaseSessionRow("starting", { options });
+  const input = {
+    ...options,
+    expectedOperationRevision: "0",
+  };
+  const commitError = new Error("sensitive dispatch commit acknowledgement lost");
+  const { authority, clients, pool } = authorityWithScripts(
+    {
+      options: { commitError, now: LATEST },
+      steps: [
+        ...activePhaseSteps("prepared", options),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    activePhaseSteps("starting", options),
+    activePhaseSteps("starting", options),
+  );
+
+  await assert.rejects(
+    authority.claimOperationDispatch(input),
+    assertStoreCommitUncertain,
+  );
+  const reconciled = await authority.reconcileOperation(options);
+  const replay = await authority.claimOperationDispatch(input);
+
+  const stable = {
+    status: "starting",
+    session: snapshotFromSessionRow(startingSession),
+    operation: operationView(startingOperation),
+    reservation: reservationView(startingReservation),
+  };
+  assert.deepEqual(reconciled, stable);
+  assert.deepEqual(replay, {
+    ...stable,
+    dispatchGranted: false,
+  });
+  assertDeepFrozen(reconciled);
+  assertDeepFrozen(replay);
+  assert.equal(pool.connectCalls, 3);
+  assert.equal(
+    queryTexts(clients[0]).filter((text) => text === "COMMIT").length,
+    1,
+  );
+  assert.equal(queryTexts(clients[0]).at(-1), "ROLLBACK");
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(
+    authorityQueries(clients[2]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+  clients[2].assertExhausted();
+});
+
 test("mark uncertain replays exactly and retains the session blocker", async () => {
   const options = reserveOptions();
   const uncertainOperation = operationRow("uncertain", { options });

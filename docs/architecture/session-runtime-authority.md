@@ -445,13 +445,15 @@ The foundation unit suite uses deterministic transaction doubles to cover
 database time, query-capability lifetime, provenance-aware retry, migration,
 commit uncertainty, fire-and-forget query rejection, and release failure.
 Registry unit tests cover validation, exact replay, identity conflict, strict
-readback, and immutable snapshots. Operation-kernel unit tests cover canonical
-request bounds, exact claim replay, dispatch-grant single use, retained
-uncertainty, safe pre-dispatch cancellation, relational-pointer corruption, and
-revision CAS. Image tests cover exact bytes, pre-allocation resource limits,
-descriptor and config identity, measurement drift, and one-use capability
-semantics. A separate GitHub Actions job runs the schema plus registration and
-operation/reservation concurrency against a real PostgreSQL service. Later
-authority slices must add lease, lifecycle, epoch, catalogue, and launch
-transition tests. Physical-backend pull requests must add crash, detach/fence,
-container-launch, and cross-host conformance evidence.
+readback, and immutable snapshots. Operation-kernel unit tests cover
+incremental canonical-request byte and structure bounds, exact claim replay,
+dispatch-grant single use, retained uncertainty, safe pre-dispatch
+cancellation, relational-pointer corruption, and revision CAS. Image tests
+cover exact bytes, pre-allocation resource limits, descriptor and config
+identity, measurement drift, and one-use capability semantics. A separate
+GitHub Actions job runs the schema, registration, operation/reservation
+concurrency, and a post-commit dispatch acknowledgement-loss recovery case
+against a real PostgreSQL service. Later authority slices must add lease,
+lifecycle, epoch, catalogue, and launch transition tests. Physical-backend pull
+requests must add crash, detach/fence, container-launch, and cross-host
+conformance evidence.

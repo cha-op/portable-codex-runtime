@@ -3,7 +3,7 @@ id: 20260729-f3c8a1
 title: Durable Operation and Reservation Kernel
 status: completed
 created: 2026-07-29
-updated: 2026-07-29
+updated: 2026-07-30
 branch: wip/session-operation-reservation
 pr:
 supersedes: []
@@ -26,12 +26,16 @@ superseded_by:
   exclusion.
 - An exact operation request binds the complete caller-observed session
   snapshot, operation ID, kind, bounded canonical request, request digest, and
-  one authority-owned reservation.
+  one authority-owned reservation. Canonicalization enforces the JSON byte and
+  structure budgets incrementally before sorting, copying, or serializing the
+  accepted request.
 - Reserve atomically claims the operation and reservation, writes the matching
   session `activeOperation` pointer, and increments the session revision.
 - Dispatch admission is a separate durable `prepared -> starting` CAS. Only
   the call that definitely commits that transition receives a dispatch grant;
   replay, restart, or commit uncertainty cannot grant a second dispatch.
+  PostgreSQL integration coverage includes a COMMIT that lands before its
+  acknowledgement is synthetically lost, followed by reconcile and replay.
 - `starting -> uncertain` retains the operation and reservation as an active
   blocker. No timeout, process restart, or lease observation releases it.
 - A still-`prepared` operation can be cancelled before dispatch. Cancellation
