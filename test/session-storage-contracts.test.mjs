@@ -1051,6 +1051,51 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
   ]) {
     assert.deepEqual(assertStorageMutationRequest(mutationRequest({ operation })).target, target);
   }
+  const attachRequest = mutationRequest({ operation: "attach" });
+  const attachResult = {
+    ...attachRequest,
+    proofId: "proof-attachment-001",
+    rootPath: "/var/lib/portable-codex/session-001",
+    status: "attached",
+  };
+  assert.deepEqual(
+    assertStorageMutationResult(attachResult, { request: attachRequest }),
+    attachResult,
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        {
+          ...attachRequest,
+          proofId: "proof-attachment-001",
+          status: "attached",
+        },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        {
+          ...attachResult,
+          rootPath: "/var/lib/portable-codex/../other-session",
+        },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        {
+          ...result,
+          rootPath: "/var/lib/portable-codex/session-001",
+        },
+        { request },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
   for (const [operation, field] of [
     ["attach", "attachmentId"],
     ["checkpoint", "artifactId"],

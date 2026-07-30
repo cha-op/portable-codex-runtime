@@ -290,11 +290,13 @@ function writerAttachmentInput(
 
 function attachmentEvidence(mutationRequest) {
   const proofId = `proof-${randomUUID()}`;
+  const rootPath = `/var/lib/portable-codex/${mutationRequest.sessionId}`;
   return {
     mutationResult: {
       ...structuredClone(mutationRequest),
       status: "attached",
       proofId,
+      rootPath,
     },
     attachment: {
       contractVersion: mutationRequest.contractVersion,
@@ -308,7 +310,7 @@ function attachmentEvidence(mutationRequest) {
       operationId: mutationRequest.operationId,
       proofId,
       kind: "directory",
-      rootPath: `/var/lib/portable-codex/${mutationRequest.sessionId}`,
+      rootPath,
       mode: "read-write",
     },
   };

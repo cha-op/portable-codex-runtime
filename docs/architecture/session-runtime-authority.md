@@ -244,8 +244,11 @@ counter reached its limit.
 
 `finalizeWriterAttachment()` accepts only the exact successful mutation result
 and exact attachment proof bound to that request, lease, holder, epoch,
-operation, storage identity, attachment ID, and proof ID. It can finalize an
-operation from `starting` revision 1 or `uncertain` revision 2. In one
+operation, storage identity, attachment ID, proof ID, and canonical host-local
+`rootPath`. The provider mutation result must carry the same `rootPath`; a
+caller cannot splice a different structurally valid directory into the
+attachment evidence. It can finalize an operation from `starting` revision 1
+or `uncertain` revision 2. In one
 transaction it commits the exact `writer-attached` result, retires the
 operation, releases the reservation, clears `activeOperation`, persists the
 attachment and lease, changes the lifecycle to `ATTACHED`, and writes the

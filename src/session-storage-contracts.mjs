@@ -217,6 +217,18 @@ function assertUuid(value, code, label) {
   );
 }
 
+function assertAttachmentRootPath(value, code, label) {
+  ensure(
+    typeof value === "string" &&
+      !value.includes("\0") &&
+      isAbsolute(value) &&
+      resolve(value) === value &&
+      value !== parse(value).root,
+    code,
+    `${label} must be an absolute host-local directory path`,
+  );
+}
+
 function assertOpaqueId(value, code, label) {
   ensure(
     isOpaqueId(value),
@@ -940,14 +952,10 @@ export function assertSessionAttachment(value) {
     "invalid_storage_attachment",
     "attachment must expose a normal directory",
   );
-  ensure(
-    typeof value.rootPath === "string" &&
-      !value.rootPath.includes("\0") &&
-      isAbsolute(value.rootPath) &&
-      resolve(value.rootPath) === value.rootPath &&
-      value.rootPath !== parse(value.rootPath).root,
+  assertAttachmentRootPath(
+    value.rootPath,
     "invalid_storage_attachment",
-    "attachment root must be an absolute host-local directory path",
+    "attachment root",
   );
   ensure(
     value.mode === "read-write",
@@ -1218,8 +1226,23 @@ export function assertStorageMutationResult(value, options) {
     "invalid_storage_mutation",
     "storage mutation result options",
   );
-  assertExactObject(
+  const result = assertOptionsObject(
     value,
+    [
+      "backendId",
+      "contractVersion",
+      "fencingEpoch",
+      "holderId",
+      "leaseId",
+      "operation",
+      "operationId",
+      "proofId",
+      "sessionId",
+      "status",
+      "storageId",
+      "target",
+      "rootPath",
+    ],
     [
       "backendId",
       "contractVersion",
@@ -1237,20 +1260,34 @@ export function assertStorageMutationResult(value, options) {
     "invalid_storage_mutation",
     "storage mutation result",
   );
+  const hasRootPath = objectHasOwn(result, "rootPath");
+  ensure(
+    (result.operation === "attach" && hasRootPath) ||
+      (result.operation !== "attach" && !hasRootPath),
+    "invalid_storage_mutation",
+    "only attach results must bind the attachment root",
+  );
+  if (hasRootPath) {
+    assertAttachmentRootPath(
+      result.rootPath,
+      "invalid_storage_mutation",
+      "mutation attachment root",
+    );
+  }
   const expected = assertStorageMutationRequest(request);
   const actualRequest = assertStorageMutationRequest({
-    backendId: value.backendId,
-    contractVersion: value.contractVersion,
-    fencingEpoch: value.fencingEpoch,
-    holderId: value.holderId,
-    leaseId: value.leaseId,
-    operation: value.operation,
-    operationId: value.operationId,
-    sessionId: value.sessionId,
-    storageId: value.storageId,
-    target: value.target,
+    backendId: result.backendId,
+    contractVersion: result.contractVersion,
+    fencingEpoch: result.fencingEpoch,
+    holderId: result.holderId,
+    leaseId: result.leaseId,
+    operation: result.operation,
+    operationId: result.operationId,
+    sessionId: result.sessionId,
+    storageId: result.storageId,
+    target: result.target,
   });
-  assertOpaqueId(value.proofId, "invalid_storage_mutation", "mutation proof ID");
+  assertOpaqueId(result.proofId, "invalid_storage_mutation", "mutation proof ID");
   ensure(
     {
       attach: "attached",
@@ -1258,7 +1295,7 @@ export function assertStorageMutationResult(value, options) {
       destroy: "destroyed",
       detach: "detached",
       restore: "restored",
-    }[value.operation] === value.status,
+    }[result.operation] === result.status,
     "invalid_storage_mutation",
     "storage mutation result status is unsupported",
   );

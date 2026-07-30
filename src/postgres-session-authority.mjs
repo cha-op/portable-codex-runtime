@@ -201,6 +201,7 @@ const ATTACH_MUTATION_RESULT_KEYS = Object.freeze([
   "operation",
   "operationId",
   "proofId",
+  "rootPath",
   "sessionId",
   "status",
   "storageId",
@@ -956,6 +957,18 @@ function canonicalSessionAttachment(value, code) {
     rootPath: attachment.rootPath,
     mode: "read-write",
   });
+}
+
+function canonicalAttachmentRootPath(value, code) {
+  ensure(
+    typeof value === "string" &&
+      reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
+        value,
+        "utf8",
+      ]) <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
+    code,
+  );
+  return value;
 }
 
 function canonicalLeaseAttachmentBinding({
@@ -1853,6 +1866,7 @@ function canonicalAttachMutationResult(value, request, code) {
     }),
     status: "attached",
     proofId: canonicalOpaqueId(result.proofId, 128, code),
+    rootPath: canonicalAttachmentRootPath(result.rootPath, code),
   });
 }
 
@@ -2059,7 +2073,8 @@ function canonicalWriterAttachmentResult(
   ensure(
     mounted.operationId === input.operationId &&
       mounted.attachmentId === expectedMutation.target.attachmentId &&
-      mounted.proofId === mutation.proofId,
+      mounted.proofId === mutation.proofId &&
+      mounted.rootPath === mutation.rootPath,
     code,
   );
   return deepFreeze({

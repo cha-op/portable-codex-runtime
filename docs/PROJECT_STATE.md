@@ -77,7 +77,8 @@
   attachment IDs, and the next uint64 epoch, and persists `ATTACHING`.
   Dispatch is granted only when enough PostgreSQL bigint revision capacity
   remains to record an uncertain outcome and its exact finalization. Providers
-  remain outside transactions. Exact attachment evidence can finalize
+  remain outside transactions. Exact attachment evidence, including a
+  provider-result binding for the canonical host-local `rootPath`, can finalize
   `starting` or `uncertain` to `ATTACHED`, including after lease expiry, while
   retiring the operation, releasing the reservation, clearing the active
   pointer, and writing the terminal anchor. Database-clock renewal is

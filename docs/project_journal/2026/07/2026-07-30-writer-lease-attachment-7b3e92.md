@@ -38,9 +38,11 @@ superseded_by:
 - The dispatch receipt carries the exact attach mutation request. The caller
   invokes the provider only after that transaction commits; the authority
   never runs a provider callback inside the transaction.
-- `finalizeWriterAttachment()` binds the exact successful mutation result to
-  the exact attachment proof and can atomically finalize either `starting` or
-  `uncertain` to `ATTACHED`. The same transaction commits the operation,
+- `finalizeWriterAttachment()` binds the exact successful mutation result,
+  including its canonical host-local `rootPath`, to the exact attachment proof
+  and can atomically finalize either `starting` or `uncertain` to `ATTACHED`.
+  Substituting another structurally valid path while retaining the same proof
+  fails closed before any write. The same transaction commits the operation,
   releases the reservation, clears `activeOperation`, persists the lease and
   physical attachment evidence, and writes `lastOperation`.
 - Exact physical evidence remains durable even when the provider finishes
@@ -67,6 +69,7 @@ superseded_by:
 ## Evidence
 
 - `src/postgres-session-authority.mjs`
+- `src/session-storage-contracts.mjs`
 - `test/postgres-session-operation-kernel.test.mjs`
 - `integration/postgres-session-authority.mjs`
 - `docs/architecture/session-runtime-authority.md`

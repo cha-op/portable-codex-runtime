@@ -651,6 +651,7 @@ function writerMutationResult(
     ...request,
     status: "attached",
     proofId: "proof-attachment-001",
+    rootPath: "/var/lib/portable-codex/session-001",
     ...overrides,
   };
 }
@@ -3067,6 +3068,14 @@ test("attachment finalization rejects every exact attachment/result binding mism
     ],
     ["attachment proof", { attachment: { proofId: "other-proof" } }],
     [
+      "attachment root",
+      {
+        attachment: {
+          rootPath: "/var/lib/portable-codex/substituted-session",
+        },
+      },
+    ],
+    [
       "result backend",
       { mutationResult: { backendId: "other-backend" } },
     ],
@@ -3097,6 +3106,14 @@ test("attachment finalization rejects every exact attachment/result binding mism
       },
     ],
     ["result proof", { mutationResult: { proofId: "other-proof" } }],
+    [
+      "result root",
+      {
+        mutationResult: {
+          rootPath: "/var/lib/portable-codex/substituted-session",
+        },
+      },
+    ],
   ];
   const { authority, clients } = authorityWithScripts(
     ...cases.map(() => [
