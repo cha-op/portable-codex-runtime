@@ -28,7 +28,9 @@ superseded_by:
   snapshot, operation ID, kind, bounded canonical request, request digest, and
   one authority-owned reservation. Canonicalization enforces the JSON byte and
   structure budgets incrementally before sorting, copying, or serializing the
-  accepted request.
+  accepted request, rejects U+0000 before PostgreSQL `jsonb` access, and stays
+  stable under post-import `String`, `JSON`, `Buffer`, and indexed
+  `Array.prototype` mutation.
 - Reserve atomically claims the operation and reservation, writes the matching
   session `activeOperation` pointer, and increments the session revision.
 - Dispatch admission is a separate durable `prepared -> starting` CAS. Only

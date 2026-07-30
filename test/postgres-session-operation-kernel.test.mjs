@@ -1950,6 +1950,8 @@ test("operation requests reject hostile and noncanonical JSON before PostgreSQL 
     operationRequest({ value: Number.NaN }),
     operationRequest({ value: Number.POSITIVE_INFINITY }),
     operationRequest({ value: "\ud800" }),
+    operationRequest({ value: "\u0000" }),
+    operationRequest({ ["key\u0000suffix"]: true }),
     operationRequest({ deep }),
     operationRequest({ wide }),
     operationRequest({ values: new Array(10_000).fill(null) }),
@@ -2006,6 +2008,71 @@ test("operation key sorting ignores poisoned Array prototype indices", async () 
     omittedText: "sensitive accessor sentinel",
   });
   assert.equal(setterCalls, 0);
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("operation canonicalization uses captured post-import global intrinsics", async () => {
+  const { authority, pool } = authorityWithScripts();
+  const input = {
+    ...reserveOptions(),
+    expectedOperationRevision: "9",
+  };
+  const originalString = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "String",
+  );
+  const originalJson = Object.getOwnPropertyDescriptor(globalThis, "JSON");
+  const originalBuffer = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "Buffer",
+  );
+  assert.notEqual(originalString, undefined);
+  assert.notEqual(originalJson, undefined);
+  assert.notEqual(originalBuffer, undefined);
+  const reads = {
+    buffer: 0,
+    json: 0,
+    string: 0,
+  };
+  let pending;
+
+  try {
+    Object.defineProperty(globalThis, "String", {
+      configurable: true,
+      get() {
+        reads.string += 1;
+        return originalString.value;
+      },
+    });
+    Object.defineProperty(globalThis, "JSON", {
+      configurable: true,
+      get() {
+        reads.json += 1;
+        return originalJson.value;
+      },
+    });
+    Object.defineProperty(globalThis, "Buffer", {
+      configurable: true,
+      get() {
+        reads.buffer += 1;
+        return originalBuffer.value;
+      },
+    });
+    pending = authority.claimOperationDispatch(input);
+  } finally {
+    Object.defineProperty(globalThis, "String", originalString);
+    Object.defineProperty(globalThis, "JSON", originalJson);
+    Object.defineProperty(globalThis, "Buffer", originalBuffer);
+  }
+
+  await assertAuthorityError(pending, {
+    code: "invalid_operation_request",
+  });
+  assert.deepEqual(reads, {
+    buffer: 0,
+    json: 0,
+    string: 0,
+  });
   assert.equal(pool.connectCalls, 0);
 });
 

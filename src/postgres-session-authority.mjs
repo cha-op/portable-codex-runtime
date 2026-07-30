@@ -168,7 +168,8 @@ const ArrayConstructor = Array;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
-const bufferByteLengthIntrinsic = Buffer.byteLength;
+const BufferConstructor = Buffer;
+const bufferByteLengthIntrinsic = BufferConstructor.byteLength;
 const createHashIntrinsic = createHash;
 const DateConstructor = Date;
 const dateGetTimeIntrinsic = Date.prototype.getTime;
@@ -178,7 +179,8 @@ const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const hashPrototype = Object.getPrototypeOf(createHash("sha256"));
 const hashDigestIntrinsic = hashPrototype.digest;
 const hashUpdateIntrinsic = hashPrototype.update;
-const jsonStringifyIntrinsic = JSON.stringify;
+const JsonObject = JSON;
+const jsonStringifyIntrinsic = JsonObject.stringify;
 const isProxyValue = utilTypes.isProxy;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
@@ -196,6 +198,7 @@ const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const runSerializableIntrinsic =
   PostgresSerializableStore.prototype.runSerializable;
+const StringConstructor = String;
 const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
@@ -444,6 +447,7 @@ function consumeOperationJsonString(state, value, code) {
   consumeOperationJsonBytes(state, 2, code);
   for (let index = 0; index < value.length; index += 1) {
     const unit = reflectApply(stringCharCodeAtIntrinsic, value, [index]);
+    ensure(unit !== 0, code);
     if (unit === 0x22 || unit === 0x5c) {
       consumeOperationJsonBytes(state, 2, code);
     } else if (unit <= 0x1f) {
@@ -528,12 +532,12 @@ function canonicalJsonValue(value, state, code) {
   if (typeof value === "number") {
     ensure(numberIsFinite(value), code);
     const normalized = objectIs(value, -0) ? 0 : value;
-    const serialized = reflectApply(jsonStringifyIntrinsic, JSON, [
+    const serialized = reflectApply(jsonStringifyIntrinsic, JsonObject, [
       normalized,
     ]);
     consumeOperationJsonBytes(
       state,
-      reflectApply(bufferByteLengthIntrinsic, Buffer, [
+      reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
         serialized,
         "utf8",
       ]),
@@ -566,7 +570,10 @@ function canonicalJsonValue(value, state, code) {
     result = new ArrayConstructor(value.length);
     objectSetPrototypeOf(result, null);
     for (let index = 0; index < value.length; index += 1) {
-      const descriptor = objectGetOwnPropertyDescriptor(value, String(index));
+      const descriptor = objectGetOwnPropertyDescriptor(
+        value,
+        reflectApply(StringConstructor, undefined, [index]),
+      );
       ensure(
         descriptor?.enumerable === true &&
           objectHasOwn(descriptor, "value"),
@@ -657,10 +664,14 @@ function canonicalJsonObject(value, code = "invalid_operation_request") {
       !arrayIsArray(canonical),
     code,
   );
-  const serialized = reflectApply(jsonStringifyIntrinsic, JSON, [canonical]);
+  const serialized = reflectApply(
+    jsonStringifyIntrinsic,
+    JsonObject,
+    [canonical],
+  );
   const serializedBytes = reflectApply(
     bufferByteLengthIntrinsic,
-    Buffer,
+    BufferConstructor,
     [serialized, "utf8"],
   );
   ensure(
@@ -1008,7 +1019,7 @@ function nullPrototypeJsonDataTree(value) {
 }
 
 function canonicalSerialize(document) {
-  return reflectApply(jsonStringifyIntrinsic, JSON, [
+  return reflectApply(jsonStringifyIntrinsic, JsonObject, [
     nullPrototypeJsonDataTree(document),
   ]);
 }
@@ -1134,7 +1145,11 @@ function rowsFromResult(result, code = "session_state_invalid") {
     code,
   );
   for (let index = 0; index < rows.length; index += 1) {
-    ownDataValue(rows, String(index), code);
+    ownDataValue(
+      rows,
+      reflectApply(StringConstructor, undefined, [index]),
+      code,
+    );
   }
   return rows;
 }

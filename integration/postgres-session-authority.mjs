@@ -217,7 +217,11 @@ function operationInput(
   };
 }
 
-function assertOperationReceipt(receipt, state) {
+function assertOperationReceipt(
+  receipt,
+  state,
+  { currentTerminal = state === "committed" } = {},
+) {
   assert.equal(receipt.status, state);
   assert.equal(receipt.operation.state, state);
   assert.equal(
@@ -229,7 +233,8 @@ function assertOperationReceipt(receipt, state) {
       null,
     state === "committed" ? null : receipt.operation.operationId,
   );
-  if (state === "committed") {
+  if (currentTerminal) {
+    assert.equal(state, "committed");
     assert.equal(
       receipt.session.document.lastOperation?.operationId,
       receipt.operation.operationId,
@@ -1163,7 +1168,9 @@ test(
         const historical = await restarted.reconcileOperation(
           structuredClone(input),
         );
-        assertOperationReceipt(historical, "committed");
+        assertOperationReceipt(historical, "committed", {
+          currentTerminal: false,
+        });
         assert.deepEqual(historical.session, replacementCancelled.session);
         assert.deepEqual(historical.operation, cancelled.operation);
         assert.deepEqual(historical.reservation, cancelled.reservation);
@@ -1172,7 +1179,9 @@ test(
           await restarted.cancelPreparedOperation(
             structuredClone(cancellation),
           );
-        assertOperationReceipt(historicalReplay, "committed");
+        assertOperationReceipt(historicalReplay, "committed", {
+          currentTerminal: false,
+        });
         assert.equal(historicalReplay.cancelled, false);
         assert.deepEqual(
           historicalReplay.session,

@@ -123,6 +123,11 @@ this session-wide exclusion rule.
 
 `reserveOperation()` binds a globally unique operation ID to the exact session,
 kind, bounded canonical request, and complete caller-observed session snapshot.
+Canonicalization incrementally bounds JSON nodes and UTF-8 bytes, rejects
+accessors, proxies, lone surrogates, and U+0000 before PostgreSQL access, and
+uses captured `String`, `JSON`, and `Buffer` intrinsics plus null-prototype
+temporary arrays so post-import global or prototype mutation cannot change the
+request digest.
 In one `SERIALIZABLE` transaction it:
 
 1. locks the canonical session row;
@@ -481,6 +486,7 @@ incremental canonical-request byte and structure bounds, exact claim replay,
 dispatch-grant single use, retained uncertainty, safe pre-dispatch
 cancellation, cancellation acknowledgement loss, version 1 exact request
 compatibility and upgrade-on-write, active-document downgrade rejection,
+post-import global/prototype mutation, pre-database U+0000 rejection,
 terminal-anchor relational corruption, and revision CAS. Image tests cover
 exact bytes, pre-allocation resource limits, descriptor and config identity,
 measurement drift, and one-use capability semantics. A separate GitHub Actions
