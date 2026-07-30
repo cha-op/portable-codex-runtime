@@ -24,6 +24,9 @@ const TRANSACTION_TIMESTAMP_QUERY =
 const TRANSACTION_ID_QUERY =
   "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const DURABLE_COMMIT_QUERY = "SET LOCAL synchronous_commit = on";
+const NO_ACTIVE_ROWS = {
+  rows: [{ operation_count: 0, reservation_count: 0 }],
+};
 const INSERT_QUERY = [
   "INSERT INTO session_authority.sessions",
   "(session_id, revision, document, created_at, updated_at)",
@@ -158,10 +161,20 @@ function document(overrides = {}) {
     lease: null,
     attachment: null,
     activeOperation: null,
+    lastOperation: null,
     recovery: null,
     launch: null,
     ...overrides,
   };
+}
+
+function legacyDocument(overrides = {}) {
+  const value = document({
+    documentVersion: 1,
+    ...overrides,
+  });
+  Reflect.deleteProperty(value, "lastOperation");
+  return value;
 }
 
 function row(overrides = {}) {
@@ -382,6 +395,7 @@ test("registerSession replays an exact existing document without overwrite", asy
   const { authority, clients } = authorityWithScripts([
     { rows: [] },
     { rows: [existing] },
+    NO_ACTIVE_ROWS,
   ]);
 
   const snapshot = await authority.registerSession(registration());
@@ -406,9 +420,33 @@ test("registerSession replays an exact existing document without overwrite", asy
   clients[0].assertExhausted();
 });
 
-test("registerSession rejects non-initial revision and timestamps during replay", async () => {
+test("registration replay preserves a legacy revision-zero document", async () => {
+  const existing = row({ document: legacyDocument() });
+  const { authority, clients } = authorityWithScripts([
+    { rows: [] },
+    { rows: [existing] },
+    NO_ACTIVE_ROWS,
+  ]);
+
+  const snapshot = await authority.registerSession(registration());
+
+  assert.deepEqual(snapshot, {
+    sessionId: SESSION_ID,
+    revision: "0",
+    document: legacyDocument(),
+    createdAt: NOW,
+    updatedAt: NOW,
+  });
+  assert.equal(
+    queryTexts(clients[0]).some((text) => text.startsWith("UPDATE ")),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("registerSession rejects malformed revision and timestamps during replay", async () => {
   const corruptRows = [
-    row({ revision: "1" }),
+    row({ revision: 0 }),
     row({ updated_at: new Date("2026-07-29T12:34:57.000Z") }),
   ];
   const { authority, clients } = authorityWithScripts(
@@ -455,7 +493,7 @@ test("registerSession rejects a different canonical identity without overwrite",
 
 test("readSession returns a canonical snapshot and rejects a missing session", async () => {
   const { authority, clients } = authorityWithScripts(
-    [{ rows: [row()] }],
+    [{ rows: [row()] }, NO_ACTIVE_ROWS],
     [{ rows: [] }],
   );
 
@@ -488,13 +526,12 @@ test("readSession fails closed on malformed and corrupt rows", async () => {
   const corruptRows = [
     { ...row(), unknown: true },
     row({ revision: 0 }),
-    row({ revision: "1" }),
     row({ revision: "9223372036854775808" }),
+    row({ revision: "2" }),
     row({ document: { ...document(), lifecycle: "ATTACHED" } }),
     row({ document: { ...document(), unknown: true } }),
     row({ created_at: NOW }),
     row({ updated_at: new Date("2026-07-29T12:34:55.000Z") }),
-    row({ updated_at: new Date("2026-07-29T12:34:57.000Z") }),
     row({ session_id: OTHER_SESSION_ID }),
   ];
   const { authority, clients } = authorityWithScripts(
@@ -586,6 +623,7 @@ test("public snapshots are deeply frozen defensive copies", async () => {
   const sourceRow = row();
   const { authority, clients } = authorityWithScripts([
     { rows: [sourceRow] },
+    NO_ACTIVE_ROWS,
   ]);
 
   const snapshot = await authority.readSession({ sessionId: SESSION_ID });
@@ -614,6 +652,7 @@ test("public snapshots are deeply frozen defensive copies", async () => {
 test("authority validation uses captured intrinsic decisions", async () => {
   const { authority, clients } = authorityWithScripts([
     { rows: [row()] },
+    NO_ACTIVE_ROWS,
   ]);
   const originalEvery = Array.prototype.every;
   const originalDateParse = Date.parse;

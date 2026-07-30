@@ -29,7 +29,7 @@
 - [done] Add a bounded OCI/Docker runnable-image and Codex-executable
   reservation plus the PostgreSQL serializable transaction, schema, and
   real-concurrency foundation for central runtime authority.
-- [pending] Implement the durable operation and reservation kernel for exact
+- [done] Implement the durable operation and reservation kernel for exact
   idempotent replay, conflict exclusion, and explicit uncertain-outcome
   reconciliation.
 - [pending] Implement database-clock writer lease acquisition and renewal plus

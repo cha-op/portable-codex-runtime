@@ -62,6 +62,16 @@
   document. Exact registration replay is idempotent, conflicting reuse fails
   closed, and strict readback returns a frozen validated snapshot. Registration
   does not allocate a writer lease, attach storage, or authorize a launch.
+- A durable PostgreSQL operation/reservation kernel now claims one exact
+  canonical request under a conservative session-wide conflict class, binds
+  the active rows to the session pointer and revision, grants dispatch only
+  through one definite `prepared -> starting` CAS, and retains `starting` or
+  `uncertain` blockers across replay and restart. Only a still-`prepared`
+  operation can be cancelled generically. A versioned terminal anchor binds
+  each progressed inactive session to its latest committed operation and
+  released reservation while preserving legacy request hashes; lease,
+  attachment, physical callbacks, and typed success finalization remain later
+  work.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -96,6 +106,8 @@
   `docs/project_journal/2026/07/2026-07-23-session-authority-foundation-b7419e.md`
 - Canonical session registry:
   `docs/project_journal/2026/07/2026-07-29-canonical-session-registry-4e8a2d.md`
+- Durable operation and reservation kernel:
+  `docs/project_journal/2026/07/2026-07-29-operation-reservation-kernel-f3c8a1.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

@@ -74,14 +74,15 @@ plane.
       runnable-image reservation without claiming writer lifecycle or
       container launch.
 
-The sequence through PR #14 is complete. The next six serial pull requests do
-not preallocate GitHub PR numbers:
+The sequence through PR #14 plus the canonical registry and durable
+operation/reservation kernel is complete. The six follow-on serial pull
+requests do not preallocate GitHub PR numbers:
 
-1. **Canonical session registry**
+1. **Canonical session registry (complete)**
    - Register one immutable manifest, storage reference, and backend capability
      set per session; add strict canonical readback and serializable
      concurrent-replay coverage without authorizing a writer.
-2. **Durable operation and reservation kernel**
+2. **Durable operation and reservation kernel (complete)**
    - Claim canonical operation IDs, reserve conflicting mutations, and retain
      uncertain outcomes for explicit reconciliation.
 3. **Writer lease and attachment acquisition**
