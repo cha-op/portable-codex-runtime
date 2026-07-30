@@ -1994,6 +1994,44 @@ test("operation requests reject hostile and noncanonical JSON before PostgreSQL 
   assert.equal(pool.connectCalls, 0);
 });
 
+test("operation key sorting ignores poisoned Array prototype indices", async () => {
+  const { authority, pool } = authorityWithScripts();
+  const request = operationRequest();
+  Object.defineProperty(request, "metadata", {
+    enumerable: true,
+    get() {
+      throw new Error("sensitive accessor sentinel");
+    },
+  });
+  const options = reserveOptions({ request });
+  const original = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+  let setterCalls = 0;
+  let pending;
+
+  try {
+    Object.defineProperty(Array.prototype, "0", {
+      configurable: true,
+      set() {
+        setterCalls += 1;
+      },
+    });
+    pending = authority.reserveOperation(options);
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(Array.prototype, "0");
+    } else {
+      Object.defineProperty(Array.prototype, "0", original);
+    }
+  }
+
+  await assertAuthorityError(pending, {
+    code: "invalid_operation_request",
+    omittedText: "sensitive accessor sentinel",
+  });
+  assert.equal(setterCalls, 0);
+  assert.equal(pool.connectCalls, 0);
+});
+
 test("all operation APIs require exact own-data option fields", async () => {
   const { authority, pool } = authorityWithScripts();
   const prepared = {

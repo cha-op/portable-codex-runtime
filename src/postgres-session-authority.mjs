@@ -490,6 +490,7 @@ function canonicalOpaqueId(value, maxLength, code) {
 
 function sortedStringKeys(keys, code) {
   const copy = new ArrayConstructor(keys.length);
+  objectSetPrototypeOf(copy, null);
   for (let index = 0; index < keys.length; index += 1) {
     ensure(typeof keys[index] === "string", code);
     copy[index] = keys[index];
