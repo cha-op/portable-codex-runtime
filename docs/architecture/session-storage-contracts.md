@@ -268,7 +268,7 @@ stateDiagram-v2
   ATTACHING --> ATTACHED: backend attachment proof
   ATTACHED --> RELEASING: stop admission and worker
   RELEASING --> DETACHED: verified detach
-  ATTACHING --> FENCING: ambiguous or expired
+  ATTACHING --> FENCING: later cleanup after ambiguous outcome or expiry
   ATTACHED --> FENCING: expired or forced takeover
   RELEASING --> FENCING: detach uncertain
   FENCING --> DETACHED: verified fence
@@ -277,9 +277,13 @@ stateDiagram-v2
   FENCING --> BLOCKED: fence unavailable
 ```
 
-An ambiguous attach, detach, or fence never rolls back optimistically to
-`DETACHED`. A force-fence failure retains the advanced epoch and remains
-blocked.
+An exact matching attachment proof may still finalize `ATTACHING -> ATTACHED`
+after lease expiry because it records the physical outcome; expiry closes new
+admission but does not erase evidence or prove a fence. An attach with no exact
+proof, an ambiguous detach, or an ambiguous fence never rolls back
+optimistically to `DETACHED`. A later cleanup/fence decision may move an
+unresolved or expired attach into `FENCING`, and a force-fence failure retains
+the advanced epoch and remains blocked.
 
 ## Storage Backend Contract
 

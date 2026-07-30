@@ -74,9 +74,8 @@ plane.
       runnable-image reservation without claiming writer lifecycle or
       container launch.
 
-The sequence through PR #14 plus the canonical registry and durable
-operation/reservation kernel is complete. The six follow-on serial pull
-requests do not preallocate GitHub PR numbers:
+The sequence through PR #14 plus the first three follow-on slices is complete.
+The six-item follow-on sequence does not preallocate GitHub PR numbers:
 
 1. **Canonical session registry (complete)**
    - Register one immutable manifest, storage reference, and backend capability
@@ -85,9 +84,16 @@ requests do not preallocate GitHub PR numbers:
 2. **Durable operation and reservation kernel (complete)**
    - Claim canonical operation IDs, reserve conflicting mutations, and retain
      uncertain outcomes for explicit reconciliation.
-3. **Writer lease and attachment acquisition**
-   - Allocate and renew database-clock leases, advance uint64 fencing epochs,
-     and finalize exact writable attachment evidence.
+3. **Writer lease and attachment acquisition (complete)**
+   - Reuse the existing schema and JSONB documents without DDL. After generic
+     reservation, atomically allocate a bounded database-clock lease,
+     deterministic lease and attachment IDs, and the next uint64 fencing epoch
+     while claiming typed dispatch and entering `ATTACHING`.
+   - Keep the provider outside the transaction, then atomically finalize exact
+     mutation and attachment evidence to `ATTACHED` from `starting` or
+     `uncertain`, even if the lease expired while the provider ran.
+   - Renew only `expiresAt` in one database-clock, globally operation-ID
+     idempotent terminal transaction; expiry equality cannot be renewed.
 4. **Release and force-fence reconciliation**
    - Close writer admission, release exact owners, force-fence stale writers,
      and preserve `FENCING` or `BLOCKED` state when physical outcomes are

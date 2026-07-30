@@ -8,6 +8,8 @@ import {
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
+  WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  WRITER_LEASE_RENEW_OPERATION_KIND,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -145,6 +147,55 @@ function firstSessionLockQueryBarrierPool(
   );
 }
 
+function firstSessionLockQueryNotificationPool(pool, label) {
+  let matched = false;
+  let notifyMatch;
+  let timer;
+  const firstMatch = new Promise((resolve, reject) => {
+    notifyMatch = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out`)),
+      10_000,
+    );
+    timer.unref();
+  });
+
+  return Object.freeze({
+    dedicatedPool: Object.freeze({
+      async connect() {
+        const client = await pool.connect();
+        return {
+          connection: client.connection,
+          async query(...args) {
+            const input = args[0];
+            const text =
+              typeof input === "string" ? input : input?.text;
+            if (
+              !matched &&
+              typeof text === "string" &&
+              text.includes("FROM session_authority.sessions") &&
+              text.includes("FOR UPDATE")
+            ) {
+              matched = true;
+              notifyMatch();
+            }
+            return Reflect.apply(client.query, client, args);
+          },
+          release(...args) {
+            return Reflect.apply(client.release, client, args);
+          },
+        };
+      },
+    }),
+    waitForFirstMatch() {
+      return firstMatch;
+    },
+  });
+}
+
 function firstCommitAcknowledgementLossPool(pool) {
   let acknowledgementLost = false;
 
@@ -214,6 +265,84 @@ function operationInput(
     operationId,
     kind,
     request,
+  };
+}
+
+function writerAttachmentInput(
+  expectedSession,
+  {
+    holderId = `host-${randomUUID()}`,
+    leaseDurationMilliseconds = 120_000,
+    operationId = `operation-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    expectedSession,
+    operationId,
+    kind: WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      holderId,
+      leaseDurationMilliseconds,
+    },
+  };
+}
+
+function attachmentEvidence(mutationRequest) {
+  const proofId = `proof-${randomUUID()}`;
+  return {
+    mutationResult: {
+      ...structuredClone(mutationRequest),
+      status: "attached",
+      proofId,
+    },
+    attachment: {
+      contractVersion: mutationRequest.contractVersion,
+      backendId: mutationRequest.backendId,
+      storageId: mutationRequest.storageId,
+      sessionId: mutationRequest.sessionId,
+      attachmentId: mutationRequest.target.attachmentId,
+      leaseId: mutationRequest.leaseId,
+      holderId: mutationRequest.holderId,
+      fencingEpoch: mutationRequest.fencingEpoch,
+      operationId: mutationRequest.operationId,
+      proofId,
+      kind: "directory",
+      rootPath: `/var/lib/portable-codex/${mutationRequest.sessionId}`,
+      mode: "read-write",
+    },
+  };
+}
+
+async function attachWriter(authority, registered, options) {
+  const input = writerAttachmentInput(registered, options);
+  await authority.reserveOperation(input);
+  const starting = await authority.claimWriterAttachmentDispatch({
+    ...structuredClone(input),
+    expectedOperationRevision: "0",
+  });
+  return authority.finalizeWriterAttachment({
+    ...structuredClone(input),
+    expectedOperationRevision: "1",
+    ...attachmentEvidence(starting.mutationRequest),
+  });
+}
+
+function writerLeaseRenewalInput(
+  expectedSession,
+  {
+    leaseDurationMilliseconds = 300_000,
+    operationId = `operation-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    expectedSession,
+    operationId,
+    kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      leaseDurationMilliseconds,
+    },
   };
 }
 
@@ -1569,6 +1698,534 @@ test(
         assert.deepEqual(receipts[0].operation, receipts[1].operation);
         assert.equal(receipts[0].operation.state, "starting");
         assert.equal(receipts[0].session.revision, "2");
+      },
+    );
+
+    await t.test(
+      "writer attachment and lease renewal persist exact typed authority",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = writerAttachmentInput(registered);
+
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.session.document.lifecycle, "DETACHED");
+        assert.equal(reserved.session.document.writerEpoch, "0");
+
+        const starting =
+          await authority.claimWriterAttachmentDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(starting, "starting");
+        assert.equal(starting.dispatchGranted, true);
+        assert.equal(starting.session.revision, "2");
+        assert.equal(starting.session.document.lifecycle, "ATTACHING");
+        assert.equal(starting.session.document.writerEpoch, "1");
+        assert.deepEqual(starting.session.document.lease, starting.lease);
+        assert.equal(starting.session.document.attachment, null);
+        assert.equal(
+          Date.parse(starting.lease.expiresAt),
+          Date.parse(starting.authorityNow) +
+            input.request.leaseDurationMilliseconds,
+        );
+
+        const replay =
+          await authority.claimWriterAttachmentDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(replay, "starting");
+        assert.equal(replay.dispatchGranted, false);
+        assert.deepEqual(replay.session, starting.session);
+
+        const evidence = attachmentEvidence(starting.mutationRequest);
+        const attached = await authority.finalizeWriterAttachment({
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+          ...evidence,
+        });
+        assertOperationReceipt(attached, "committed");
+        assert.equal(attached.finalized, true);
+        assert.equal(attached.operation.revision, "2");
+        assert.equal(attached.session.revision, "3");
+        assert.equal(attached.session.document.lifecycle, "ATTACHED");
+        assert.deepEqual(
+          attached.session.document.attachment,
+          evidence.attachment,
+        );
+        assert.deepEqual(
+          attached.operation.result.mutationResult,
+          evidence.mutationResult,
+        );
+
+        const renewalInput = writerLeaseRenewalInput(attached.session);
+        const renewed = await authority.renewWriterLease(renewalInput);
+        assertOperationReceipt(renewed, "committed");
+        assert.equal(renewed.renewed, true);
+        assert.equal(renewed.operation.revision, "0");
+        assert.equal(renewed.session.revision, "4");
+        assert.equal(
+          renewed.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+        assert.equal(
+          renewed.session.document.lease.leaseId,
+          attached.session.document.lease.leaseId,
+        );
+        assert.equal(
+          renewed.session.document.lease.holderId,
+          attached.session.document.lease.holderId,
+        );
+        assert.ok(
+          Date.parse(renewed.session.document.lease.expiresAt) >
+            Date.parse(attached.session.document.lease.expiresAt),
+        );
+        assert.deepEqual(
+          renewed.session.document.attachment,
+          attached.session.document.attachment,
+        );
+
+        const renewedReplay = await authority.renewWriterLease(
+          structuredClone(renewalInput),
+        );
+        assertOperationReceipt(renewedReplay, "committed");
+        assert.equal(renewedReplay.renewed, false);
+        assert.deepEqual(renewedReplay.operation, renewed.operation);
+        assert.deepEqual(renewedReplay.reservation, renewed.reservation);
+        assert.deepEqual(renewedReplay.session, renewed.session);
+
+        const stored = await pool.query(
+          [
+            "SELECT kind, state, revision::text, result->>'outcome' AS outcome",
+            "FROM session_authority.operation_claims",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        assert.deepEqual(
+          stored.rows
+            .map(({ kind, outcome, revision, state }) => ({
+              kind,
+              outcome,
+              revision,
+              state,
+            }))
+            .sort((left, right) => left.kind.localeCompare(right.kind)),
+          [
+            {
+              kind: WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+              outcome: "writer-attached",
+              revision: "2",
+              state: "committed",
+            },
+            {
+              kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+              outcome: "writer-lease-renewed",
+              revision: "0",
+              state: "committed",
+            },
+          ],
+        );
+      },
+    );
+
+    await t.test(
+      "writer renewal checks the authority clock after a blocking row lock",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered, {
+          leaseDurationMilliseconds: 3_000,
+        });
+        const renewalInput = writerLeaseRenewalInput(
+          attached.session,
+        );
+        const storedAuthorityQuery = [
+          "SELECT to_jsonb(s) AS session,",
+          "(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.operation_id)",
+          "FROM session_authority.operation_claims o",
+          "WHERE o.session_id = s.session_id) AS operations,",
+          "(SELECT jsonb_agg(to_jsonb(r) ORDER BY r.reservation_id)",
+          "FROM session_authority.reservations r",
+          "WHERE r.session_id = s.session_id) AS reservations",
+          "FROM session_authority.sessions s",
+          "WHERE s.session_id = $1",
+        ].join(" ");
+        const storedBefore = await pool.query(
+          storedAuthorityQuery,
+          [sessionId],
+        );
+        const lockClient = await pool.connect();
+        let lockHeld = false;
+        try {
+          await lockClient.query("BEGIN");
+          lockHeld = true;
+          await lockClient.query(
+            [
+              "SELECT session_id",
+              "FROM session_authority.sessions",
+              "WHERE session_id = $1",
+              "FOR UPDATE",
+            ].join(" "),
+            [sessionId],
+          );
+
+          const notification =
+            firstSessionLockQueryNotificationPool(
+              pool,
+              "blocked writer renewal session lock",
+            );
+          const blockedAuthority =
+            new PostgresSessionAuthority({
+              store: new PostgresSerializableStore({
+                dedicatedPool: notification.dedicatedPool,
+                maxTransactionAttempts: 3,
+              }),
+            });
+          let renewalSettled = false;
+          const renewalPromise = blockedAuthority.renewWriterLease(
+            renewalInput,
+          );
+          const expectedRejection = assert.rejects(
+            renewalPromise,
+            assertAuthorityCode("writer_lease_expired"),
+          );
+          void renewalPromise.then(
+            () => {
+              renewalSettled = true;
+            },
+            () => {
+              renewalSettled = true;
+            },
+          );
+          await notification.waitForFirstMatch();
+          assert.equal(renewalSettled, false);
+
+          const beforeExpiry = await lockClient.query(
+            [
+              "SELECT pg_catalog.clock_timestamp() < $1::timestamptz",
+              "AS lease_active",
+            ].join(" "),
+            [attached.session.document.lease.expiresAt],
+          );
+          assert.equal(beforeExpiry.rows[0].lease_active, true);
+          await lockClient.query(
+            [
+              "SELECT pg_catalog.pg_sleep(",
+              "GREATEST(EXTRACT(EPOCH FROM",
+              "($1::timestamptz - pg_catalog.clock_timestamp())), 0)",
+              "::double precision + 0.2)",
+            ].join(" "),
+            [attached.session.document.lease.expiresAt],
+          );
+          const afterExpiry = await lockClient.query(
+            [
+              "SELECT pg_catalog.clock_timestamp() >= $1::timestamptz",
+              "AS lease_expired",
+            ].join(" "),
+            [attached.session.document.lease.expiresAt],
+          );
+          assert.equal(afterExpiry.rows[0].lease_expired, true);
+          assert.equal(renewalSettled, false);
+
+          await lockClient.query("ROLLBACK");
+          lockHeld = false;
+          await expectedRejection;
+        } finally {
+          if (lockHeld) {
+            await lockClient.query("ROLLBACK");
+          }
+          lockClient.release();
+        }
+
+        assert.deepEqual(
+          await authority.readSession({ sessionId }),
+          attached.session,
+        );
+        const storedAfter = await pool.query(
+          storedAuthorityQuery,
+          [sessionId],
+        );
+        assert.deepEqual(storedAfter.rows, storedBefore.rows);
+        const stored = await pool.query(
+          [
+            "SELECT",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = $1) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations",
+            "WHERE operation_id = $1) AS reservation_count",
+          ].join(" "),
+          [renewalInput.operationId],
+        );
+        assert.deepEqual(stored.rows[0], {
+          operation_count: 0,
+          reservation_count: 0,
+        });
+      },
+    );
+
+    await t.test(
+      "concurrent identical writer renewal commits once and replays exactly",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerLeaseRenewalInput(attached.session);
+        const concurrentAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstSessionLockQueryBarrierPool(
+                pool,
+                2,
+                "identical writer renewal barrier",
+              ),
+              maxTransactionAttempts: 3,
+            }),
+          });
+
+        const receipts = await Promise.all([
+          concurrentAuthority.renewWriterLease(input),
+          concurrentAuthority.renewWriterLease(
+            structuredClone(input),
+          ),
+        ]);
+        assert.equal(
+          receipts.filter(({ renewed }) => renewed).length,
+          1,
+        );
+        assert.equal(
+          receipts.filter(({ renewed }) => !renewed).length,
+          1,
+        );
+        for (const receipt of receipts) {
+          assertOperationReceipt(receipt, "committed");
+        }
+        assert.deepEqual(receipts[0].operation, receipts[1].operation);
+        assert.deepEqual(
+          receipts[0].reservation,
+          receipts[1].reservation,
+        );
+        assert.deepEqual(receipts[0].session, receipts[1].session);
+        assert.equal(receipts[0].session.revision, "4");
+        assert.equal(
+          receipts[0].session.document.lastOperation.operationId,
+          input.operationId,
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT s.revision::text AS revision,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims o",
+            "WHERE o.operation_id = $2) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations r",
+            "WHERE r.operation_id = $2) AS reservation_count",
+            "FROM session_authority.sessions s",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [sessionId, input.operationId],
+        );
+        assert.deepEqual(stored.rows[0], {
+          operation_count: 1,
+          reservation_count: 1,
+          revision: "4",
+        });
+      },
+    );
+
+    await t.test(
+      "concurrent distinct writer renewals reject the stale snapshot",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const first = writerLeaseRenewalInput(attached.session);
+        const second = writerLeaseRenewalInput(attached.session);
+        const concurrentAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstSessionLockQueryBarrierPool(
+                pool,
+                2,
+                "distinct writer renewal barrier",
+              ),
+              maxTransactionAttempts: 3,
+            }),
+          });
+
+        const outcomes = await Promise.allSettled([
+          concurrentAuthority.renewWriterLease(first),
+          concurrentAuthority.renewWriterLease(second),
+        ]);
+        const fulfilled = outcomes.filter(
+          ({ status }) => status === "fulfilled",
+        );
+        const rejected = outcomes.filter(
+          ({ status }) => status === "rejected",
+        );
+        assert.equal(fulfilled.length, 1);
+        assert.equal(rejected.length, 1);
+        assertOperationReceipt(fulfilled[0].value, "committed");
+        assert.equal(fulfilled[0].value.renewed, true);
+        assertAuthorityCode("session_revision_conflict")(
+          rejected[0].reason,
+        );
+        assert.equal(fulfilled[0].value.session.revision, "4");
+
+        const stored = await pool.query(
+          [
+            "SELECT s.revision::text AS revision,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims o",
+            "WHERE o.operation_id = ANY($2::text[]))",
+            "AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations r",
+            "WHERE r.operation_id = ANY($2::text[]))",
+            "AS reservation_count",
+            "FROM session_authority.sessions s",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [sessionId, [first.operationId, second.operationId]],
+        );
+        assert.deepEqual(stored.rows[0], {
+          operation_count: 1,
+          reservation_count: 1,
+          revision: "4",
+        });
+      },
+    );
+
+    await t.test(
+      "typed dispatch COMMIT loss preserves one epoch and never regrants",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = writerAttachmentInput(registered);
+        await authority.reserveOperation(input);
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool:
+                firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+
+        await assert.rejects(
+          acknowledgementLossAuthority.claimWriterAttachmentDispatch(
+            transition,
+          ),
+          (error) => {
+            assert.ok(
+              error instanceof PostgresSerializableStoreError,
+            );
+            assert.equal(
+              error.code,
+              "transaction_commit_outcome_uncertain",
+            );
+            assert.equal(error.commitState, "uncertain");
+            return true;
+          },
+        );
+
+        const reconciled = await authority.reconcileOperation(input);
+        assertOperationReceipt(reconciled, "starting");
+        assert.equal(
+          reconciled.session.document.lifecycle,
+          "ATTACHING",
+        );
+        assert.equal(reconciled.session.document.writerEpoch, "1");
+        const replay =
+          await authority.claimWriterAttachmentDispatch(transition);
+        assertOperationReceipt(replay, "starting");
+        assert.equal(replay.dispatchGranted, false);
+        assert.equal(replay.session.document.writerEpoch, "1");
+        assert.deepEqual(replay.session, reconciled.session);
+      },
+    );
+
+    await t.test(
+      "attachment finalize COMMIT loss reconciles the exact proof",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = writerAttachmentInput(registered);
+        await authority.reserveOperation(input);
+        const starting =
+          await authority.claimWriterAttachmentDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        const finalization = {
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+          ...attachmentEvidence(starting.mutationRequest),
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool:
+                firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+
+        await assert.rejects(
+          acknowledgementLossAuthority.finalizeWriterAttachment(
+            finalization,
+          ),
+          (error) => {
+            assert.ok(
+              error instanceof PostgresSerializableStoreError,
+            );
+            assert.equal(
+              error.code,
+              "transaction_commit_outcome_uncertain",
+            );
+            assert.equal(error.commitState, "uncertain");
+            return true;
+          },
+        );
+
+        const reconciled = await authority.reconcileOperation(input);
+        assertOperationReceipt(reconciled, "committed");
+        assert.equal(reconciled.operation.revision, "2");
+        assert.equal(
+          reconciled.session.document.lifecycle,
+          "ATTACHED",
+        );
+        const replay =
+          await authority.finalizeWriterAttachment(finalization);
+        assertOperationReceipt(replay, "committed");
+        assert.equal(replay.finalized, false);
+        assert.deepEqual(replay.operation, reconciled.operation);
+        assert.deepEqual(replay.session, reconciled.session);
       },
     );
   },

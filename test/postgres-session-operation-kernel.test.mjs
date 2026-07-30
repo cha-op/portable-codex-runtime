@@ -10,8 +10,11 @@ import {
 import {
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
+  MAX_WRITER_LEASE_DURATION_MILLISECONDS,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
+  WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  WRITER_LEASE_RENEW_OPERATION_KIND,
 } from "../src/postgres-session-authority.mjs";
 import {
   createSessionManifest,
@@ -27,11 +30,18 @@ const NOW = "2026-07-29T12:34:56.789Z";
 const LATER = "2026-07-29T12:34:57.789Z";
 const LATEST = "2026-07-29T12:34:58.789Z";
 const FINAL = "2026-07-29T12:34:59.789Z";
+const AUTHORITY_NOW = "2026-07-29T12:34:58.900Z";
+const HIGH_EPOCH_AUTHORITY_NOW = "2026-07-29T12:35:00.000Z";
+const RENEW_TRANSACTION_NOW = "2026-07-29T12:35:10.000Z";
+const RENEW_AUTHORITY_NOW = "2026-07-29T12:35:20.000Z";
+const EXPIRED_FINALIZE_NOW = "2026-07-29T12:40:00.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
   "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const DURABLE_COMMIT_QUERY = "SET LOCAL synchronous_commit = on";
+const READ_AUTHORITY_CLOCK_QUERY =
+  "SELECT pg_catalog.clock_timestamp() AS authority_now";
 const SESSION_COLUMNS =
   "session_id, revision, document, created_at, updated_at";
 const READ_SESSION_QUERY = [
@@ -149,6 +159,39 @@ const RELEASE_RESERVATION_QUERY = [
   "WHERE operation_id = $1 AND state = 'prepared' AND released_at IS NULL",
   `RETURNING ${RESERVATION_COLUMNS}`,
 ].join(" ");
+const COMMIT_ACTIVE_OPERATION_QUERY = [
+  "UPDATE session_authority.operation_claims",
+  "SET state = 'committed', result = $3::jsonb,",
+  "revision = revision + 1, updated_at = $4, retired_at = $4",
+  "WHERE operation_id = $1 AND revision = $2::bigint",
+  "AND state = $5 AND retired_at IS NULL",
+  `RETURNING ${OPERATION_COLUMNS}`,
+].join(" ");
+const RELEASE_ACTIVE_RESERVATION_QUERY = [
+  "UPDATE session_authority.reservations",
+  "SET state = 'released', updated_at = $2, released_at = $2",
+  "WHERE operation_id = $1 AND state = $3 AND released_at IS NULL",
+  `RETURNING ${RESERVATION_COLUMNS}`,
+].join(" ");
+const INSERT_COMMITTED_OPERATION_QUERY = [
+  "INSERT INTO session_authority.operation_claims",
+  "(operation_id, session_id, kind, request, result, state, revision,",
+  "created_at, updated_at, retired_at)",
+  "VALUES ($1, $2::uuid, $3, $4::jsonb, $5::jsonb, 'committed', 0,",
+  "$6, $6, $6)",
+  "ON CONFLICT (operation_id) DO NOTHING",
+  `RETURNING ${OPERATION_COLUMNS}`,
+].join(" ");
+const INSERT_RELEASED_RESERVATION_QUERY = [
+  "INSERT INTO session_authority.reservations",
+  "(reservation_id, operation_id, session_id, kind,",
+  "expected_session_revision, state, payload, created_at, updated_at,",
+  "expires_at, released_at)",
+  "VALUES ($1, $2, $3::uuid, $4, $5::bigint, 'released',",
+  "$6::jsonb, $7, $7, NULL, $7)",
+  "ON CONFLICT (reservation_id) DO NOTHING",
+  `RETURNING ${RESERVATION_COLUMNS}`,
+].join(" ");
 const TRANSACTION_INFRASTRUCTURE_QUERIES = new Set([
   "DISCARD ALL",
   "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
@@ -170,12 +213,14 @@ class ScriptedClient {
       commitError,
       commitResult = { command: "COMMIT" },
       now = NOW,
+      authorityNow = now,
       transactionId = "100",
     } = {},
   ) {
     this.commitError = commitError;
     this.commitResult = commitResult;
     this.connection = new EventEmitter();
+    this.authorityNow = authorityNow;
     this.now = now;
     this.queries = [];
     this.releaseCalls = [];
@@ -200,6 +245,11 @@ class ScriptedClient {
     }
     if (text === TRANSACTION_ID_QUERY) {
       return { rows: [{ transaction_id: this.transactionId }] };
+    }
+    if (text === READ_AUTHORITY_CLOCK_QUERY) {
+      return {
+        rows: [{ authority_now: new Date(this.authorityNow) }],
+      };
     }
     if (text === DURABLE_COMMIT_QUERY) return { command: "SET" };
     if (text === "COMMIT") {
@@ -527,6 +577,292 @@ function cancellationResult(reason = "caller-abandoned-before-dispatch") {
     outcome: "cancelled-before-dispatch",
     reason,
   };
+}
+
+function writerAcquireOptions(overrides = {}) {
+  return {
+    expectedSession: sessionSnapshot(),
+    operationId: OPERATION_ID,
+    kind: WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      holderId: "host-001",
+      leaseDurationMilliseconds: 60_000,
+    },
+    ...overrides,
+  };
+}
+
+function derivedLeaseId(operationId) {
+  return `lease-${sha256(`writer-lease:${operationId}`)}`;
+}
+
+function derivedAttachmentId(operationId) {
+  return `attachment-${sha256(`writer-attachment:${operationId}`)}`;
+}
+
+function writerLease(
+  options = writerAcquireOptions(),
+  authorityNow = AUTHORITY_NOW,
+) {
+  return {
+    contractVersion: 1,
+    sessionId: options.expectedSession.sessionId,
+    leaseId: derivedLeaseId(options.operationId),
+    holderId: options.request.holderId,
+    fencingEpoch: (
+      BigInt(options.expectedSession.document.writerEpoch) + 1n
+    ).toString(),
+    expiresAt: new Date(
+      Date.parse(authorityNow) +
+        options.request.leaseDurationMilliseconds,
+    ).toISOString(),
+  };
+}
+
+function writerMutationRequest(
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+) {
+  return {
+    contractVersion: 1,
+    backendId: options.expectedSession.document.storageRef.backendId,
+    storageId: options.expectedSession.document.storageRef.storageId,
+    sessionId: options.expectedSession.sessionId,
+    leaseId: lease.leaseId,
+    holderId: lease.holderId,
+    fencingEpoch: lease.fencingEpoch,
+    operation: "attach",
+    operationId: options.operationId,
+    target: {
+      attachmentId: derivedAttachmentId(options.operationId),
+      kind: "attachment",
+    },
+  };
+}
+
+function writerMutationResult(
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  overrides = {},
+) {
+  const request = writerMutationRequest(options, lease);
+  return {
+    ...request,
+    status: "attached",
+    proofId: "proof-attachment-001",
+    ...overrides,
+  };
+}
+
+function writerAttachment(
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  overrides = {},
+) {
+  return {
+    contractVersion: 1,
+    backendId: options.expectedSession.document.storageRef.backendId,
+    storageId: options.expectedSession.document.storageRef.storageId,
+    sessionId: options.expectedSession.sessionId,
+    attachmentId: derivedAttachmentId(options.operationId),
+    leaseId: lease.leaseId,
+    holderId: lease.holderId,
+    fencingEpoch: lease.fencingEpoch,
+    operationId: options.operationId,
+    proofId: "proof-attachment-001",
+    kind: "directory",
+    rootPath: "/var/lib/portable-codex/session-001",
+    mode: "read-write",
+    ...overrides,
+  };
+}
+
+function writerAttachmentResult(
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  overrides = {},
+) {
+  return {
+    resultVersion: 1,
+    outcome: "writer-attached",
+    lease: structuredClone(lease),
+    attachment: writerAttachment(options, lease),
+    mutationResult: writerMutationResult(options, lease),
+    ...overrides,
+  };
+}
+
+function terminalPointer({ options, operationRevision, result }) {
+  const binding = operationBinding(options);
+  return {
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision: options.expectedSession.revision,
+    kind: options.kind,
+    operationId: options.operationId,
+    operationRevision,
+    requestSha256: binding.requestSha256,
+    reservationId: binding.reservationId,
+    resultSha256: sha256(JSON.stringify(result)),
+    state: "committed",
+  };
+}
+
+function writerStartingSessionRow({
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  updatedAt = LATEST,
+} = {}) {
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) + 2n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      lifecycle: "ATTACHING",
+      writerEpoch: lease.fencingEpoch,
+      lease: structuredClone(lease),
+      activeOperation: activeOperation("starting", { options }),
+      lastOperation:
+        options.expectedSession.document.lastOperation === undefined
+          ? null
+          : structuredClone(options.expectedSession.document.lastOperation),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerUncertainSessionRow({
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  updatedAt = FINAL,
+} = {}) {
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) + 3n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      lifecycle: "ATTACHING",
+      writerEpoch: lease.fencingEpoch,
+      lease: structuredClone(lease),
+      activeOperation: activeOperation("uncertain", { options }),
+      lastOperation:
+        options.expectedSession.document.lastOperation === undefined
+          ? null
+          : structuredClone(options.expectedSession.document.lastOperation),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerAttachedSessionRow({
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  result = writerAttachmentResult(options, lease),
+  operationRevision = "2",
+  updatedAt = FINAL,
+} = {}) {
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      lifecycle: "ATTACHED",
+      writerEpoch: lease.fencingEpoch,
+      lease: structuredClone(result.lease),
+      attachment: structuredClone(result.attachment),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options,
+        operationRevision,
+        result,
+      }),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerCommittedOperationRow({
+  options = writerAcquireOptions(),
+  lease = writerLease(options),
+  result = writerAttachmentResult(options, lease),
+  revision = "2",
+  updatedAt = FINAL,
+} = {}) {
+  return operationRow("committed", {
+    options,
+    revision,
+    result,
+    retiredAt: updatedAt,
+    updatedAt,
+  });
+}
+
+function renewOptions(expectedSession, overrides = {}) {
+  return {
+    expectedSession,
+    operationId: OTHER_OPERATION_ID,
+    kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      leaseDurationMilliseconds: 60_000,
+    },
+    ...overrides,
+  };
+}
+
+function renewalResult(
+  options,
+  authorityNow = RENEW_AUTHORITY_NOW,
+) {
+  const lease = {
+    ...structuredClone(options.expectedSession.document.lease),
+    expiresAt: new Date(
+      Date.parse(authorityNow) +
+        options.request.leaseDurationMilliseconds,
+    ).toISOString(),
+  };
+  return {
+    resultVersion: 1,
+    outcome: "writer-lease-renewed",
+    lease,
+    attachment: structuredClone(
+      options.expectedSession.document.attachment,
+    ),
+  };
+}
+
+function renewedSessionRow({
+  options,
+  result = renewalResult(options),
+  updatedAt = RENEW_TRANSACTION_NOW,
+} = {}) {
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) + 1n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      lifecycle: "ATTACHED",
+      writerEpoch: result.lease.fencingEpoch,
+      lease: structuredClone(result.lease),
+      attachment: structuredClone(result.attachment),
+      lastOperation: terminalPointer({
+        options,
+        operationRevision: "0",
+        result,
+      }),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
 }
 
 function phaseSessionRow(
@@ -2116,5 +2452,1296 @@ test("all operation APIs require exact own-data option fields", async () => {
       code: "invalid_operation_request",
     });
   }
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer attachment dispatch allocates one DB-clock lease and uint64 epoch", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const preparedSession = phaseSessionRow("prepared", { options });
+  const startingSession = writerStartingSessionRow({ options, lease });
+  const startingOperation = operationRow("starting", { options });
+  const startingReservation = reservationRow("starting", { options });
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: AUTHORITY_NOW,
+      now: LATEST,
+    },
+    steps: [
+      rows(preparedSession),
+      rows(operationRow("prepared", { options })),
+      rows(reservationRow("prepared", { options })),
+      rows(startingOperation),
+      rows(startingReservation),
+      rows(startingSession),
+    ],
+  });
+
+  const receipt = await authority.claimWriterAttachmentDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(receipt.dispatchGranted, true);
+  assert.equal(receipt.authorityNow, AUTHORITY_NOW);
+  assert.deepEqual(receipt.lease, lease);
+  assert.deepEqual(
+    receipt.mutationRequest,
+    writerMutationRequest(options, lease),
+  );
+  assert.equal(receipt.session.document.lifecycle, "ATTACHING");
+  assert.equal(receipt.session.document.writerEpoch, "1");
+  assert.deepEqual(receipt.session.document.lease, lease);
+  assert.equal(receipt.session.document.attachment, null);
+  assert.deepEqual(authorityQueries(clients[0]), [
+    extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [SESSION_ID]),
+    extendedQuery(`${READ_OPERATION_QUERY} FOR UPDATE`, [OPERATION_ID]),
+    extendedQuery(`${READ_RESERVATION_QUERY} FOR UPDATE`, [OPERATION_ID]),
+    extendedQuery(READ_AUTHORITY_CLOCK_QUERY, []),
+    extendedQuery(START_OPERATION_QUERY, [OPERATION_ID, "0", LATEST]),
+    extendedQuery(START_RESERVATION_QUERY, [OPERATION_ID, LATEST]),
+    extendedQuery(UPDATE_SESSION_QUERY, [
+      SESSION_ID,
+      "1",
+      JSON.stringify(startingSession.document),
+      LATEST,
+    ]),
+  ]);
+  clients[0].assertExhausted();
+});
+
+test("writer attachment dispatch replay returns evidence without regranting", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const startingSession = writerStartingSessionRow({ options, lease });
+  const { authority, clients } = authorityWithScripts({
+    steps: [
+      rows(startingSession),
+      rows(operationRow("starting", { options })),
+      rows(reservationRow("starting", { options })),
+    ],
+  });
+
+  const receipt = await authority.claimWriterAttachmentDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(receipt.dispatchGranted, false);
+  assert.deepEqual(receipt.lease, lease);
+  assert.deepEqual(
+    receipt.mutationRequest,
+    writerMutationRequest(options, lease),
+  );
+  assert.deepEqual(receipt.session, snapshotFromSessionRow(startingSession));
+  assert.deepEqual(
+    authorityQueries(clients[0]),
+    [
+      extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [SESSION_ID]),
+      extendedQuery(`${READ_OPERATION_QUERY} FOR UPDATE`, [OPERATION_ID]),
+      extendedQuery(`${READ_RESERVATION_QUERY} FOR UPDATE`, [OPERATION_ID]),
+    ],
+  );
+  clients[0].assertExhausted();
+});
+
+test("cancelled writer dispatch replay never borrows a later writer lease", async () => {
+  const oldOptions = writerAcquireOptions();
+  const cancelledRow = cancelledSessionRow({ options: oldOptions });
+  const newOptions = writerAcquireOptions({
+    expectedSession: snapshotFromSessionRow(cancelledRow),
+    operationId: OTHER_OPERATION_ID,
+  });
+  const newLease = writerLease(newOptions);
+  const newResult = writerAttachmentResult(newOptions, newLease);
+  const attachedRow = writerAttachedSessionRow({
+    options: newOptions,
+    lease: newLease,
+    result: newResult,
+  });
+  const oldOperation = committedOperationRow({ options: oldOptions });
+  const oldReservation = releasedReservationRow({ options: oldOptions });
+  const { authority, clients } = authorityWithScripts([
+    rows(attachedRow),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(
+      writerCommittedOperationRow({
+        options: newOptions,
+        lease: newLease,
+        result: newResult,
+      }),
+    ),
+    rows(
+      reservationRow("released", {
+        options: newOptions,
+        updatedAt: FINAL,
+        releasedAt: FINAL,
+      }),
+    ),
+    rows(oldOperation),
+    rows(oldReservation),
+  ]);
+
+  const receipt = await authority.claimWriterAttachmentDispatch({
+    ...oldOptions,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(receipt.dispatchGranted, false);
+  assert.equal(receipt.operation.result.outcome, "cancelled-before-dispatch");
+  assert.equal(Object.hasOwn(receipt, "lease"), false);
+  assert.equal(Object.hasOwn(receipt, "mutationRequest"), false);
+  assert.deepEqual(receipt.session, snapshotFromSessionRow(attachedRow));
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer attachment dispatch supports epochs above signed bigint", async () => {
+  const writerEpoch = "9223372036854775807";
+  const expectedSession = sessionSnapshot({
+    sessionDocument: document(SESSION_ID, {
+      writerEpoch,
+    }),
+  });
+  const options = writerAcquireOptions({ expectedSession });
+  const binding = operationBinding(options);
+  const preparedSession = sessionRow({
+    revision: "1",
+    sessionDocument: document(SESSION_ID, {
+      writerEpoch,
+      activeOperation: activeOperation("prepared", { options }),
+    }),
+    createdAt: NOW,
+    updatedAt: LATER,
+  });
+  const lease = writerLease(options, HIGH_EPOCH_AUTHORITY_NOW);
+  const startingSession = writerStartingSessionRow({
+    options,
+    lease,
+    updatedAt: FINAL,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: HIGH_EPOCH_AUTHORITY_NOW,
+      now: FINAL,
+    },
+    steps: [
+      rows(preparedSession),
+      rows(
+        operationRow("prepared", {
+          options,
+          createdAt: LATER,
+          updatedAt: LATER,
+        }),
+      ),
+      rows(
+        reservationRow("prepared", {
+          options,
+          createdAt: LATER,
+          updatedAt: LATER,
+        }),
+      ),
+      rows(
+        operationRow("starting", {
+          options,
+          createdAt: LATER,
+          updatedAt: FINAL,
+        }),
+      ),
+      rows(
+        reservationRow("starting", {
+          options,
+          createdAt: LATER,
+          updatedAt: FINAL,
+        }),
+      ),
+      rows(startingSession),
+    ],
+  });
+
+  const receipt = await authority.claimWriterAttachmentDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(
+    receipt.lease.fencingEpoch,
+    "9223372036854775808",
+  );
+  assert.equal(
+    receipt.session.document.writerEpoch,
+    "9223372036854775808",
+  );
+  assert.equal(
+    receipt.operation.requestSha256,
+    binding.requestSha256,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer epoch exhaustion fails before PostgreSQL access", async () => {
+  const prior = lastOperation();
+  const expectedSession = sessionSnapshot({
+    revision: "2",
+    sessionDocument: document(SESSION_ID, {
+      writerEpoch: "18446744073709551615",
+      lastOperation: prior,
+    }),
+    updatedAt: LATER,
+  });
+  const { authority, pool } = authorityWithScripts();
+
+  await assertAuthorityError(
+    authority.reserveOperation(
+      writerAcquireOptions({ expectedSession }),
+    ),
+    { code: "writer_epoch_exhausted" },
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer dispatch reserves revisions for uncertain recovery and finalize", async () => {
+  const ancient = lastOperation();
+  ancient.expectedSessionRevision = "9223372036854775800";
+  const priorExpectedSession = sessionSnapshot({
+    revision: "9223372036854775802",
+    sessionDocument: document(SESSION_ID, {
+      lastOperation: ancient,
+    }),
+  });
+  const priorOptions = reserveOptions({
+    expectedSession: priorExpectedSession,
+    operationId: OTHER_OPERATION_ID,
+  });
+  const prior = lastOperation({ options: priorOptions });
+  const expectedSession = sessionSnapshot({
+    revision: "9223372036854775804",
+    sessionDocument: document(SESSION_ID, {
+      lastOperation: prior,
+    }),
+  });
+  const options = writerAcquireOptions({ expectedSession });
+  const preparedSession = phaseSessionRow("prepared", { options });
+  const priorOperation = operationRow("committed", {
+    options: priorOptions,
+    createdAt: NOW,
+    updatedAt: NOW,
+    retiredAt: NOW,
+    result: cancellationResult(),
+  });
+  const priorReservation = reservationRow("released", {
+    options: priorOptions,
+    createdAt: NOW,
+    updatedAt: NOW,
+    releasedAt: NOW,
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(preparedSession),
+    rows(operationRow("prepared", { options })),
+    rows(reservationRow("prepared", { options })),
+    rows(priorOperation),
+    rows(priorReservation),
+  ]);
+
+  assert.equal(preparedSession.revision, "9223372036854775805");
+  await assertAuthorityError(
+    authority.claimWriterAttachmentDispatch({
+      ...options,
+      expectedOperationRevision: "0",
+    }),
+    { code: "session_revision_exhausted" },
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).map(queryText),
+    [
+      `${READ_SESSION_QUERY} FOR UPDATE`,
+      `${READ_OPERATION_QUERY} FOR UPDATE`,
+      `${READ_RESERVATION_QUERY} FOR UPDATE`,
+      READ_OPERATION_QUERY,
+      READ_RESERVATION_QUERY,
+    ],
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("exact attachment proof finalizes atomically even after lease expiry", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const startingSession = writerStartingSessionRow({ options, lease });
+  const committedOperation = writerCommittedOperationRow({
+    options,
+    lease,
+    result,
+    updatedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    updatedAt: EXPIRED_FINALIZE_NOW,
+    releasedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const attachedSession = writerAttachedSessionRow({
+    options,
+    lease,
+    result,
+    updatedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: EXPIRED_FINALIZE_NOW },
+    steps: [
+      rows(startingSession),
+      rows(operationRow("starting", { options })),
+      rows(reservationRow("starting", { options })),
+      rows(committedOperation),
+      rows(releasedReservation),
+      rows(attachedSession),
+    ],
+  });
+
+  const receipt = await authority.finalizeWriterAttachment({
+    ...options,
+    expectedOperationRevision: "1",
+    attachment: result.attachment,
+    mutationResult: result.mutationResult,
+  });
+
+  assert.equal(receipt.finalized, true);
+  assert.equal(receipt.operation.revision, "2");
+  assert.equal(receipt.reservation.state, "released");
+  assert.equal(receipt.session.document.lifecycle, "ATTACHED");
+  assert.deepEqual(receipt.session.document.attachment, result.attachment);
+  assert.equal(
+    authorityQueries(clients[0]).some(
+      (args) => queryText(args) === READ_AUTHORITY_CLOCK_QUERY,
+    ),
+    false,
+  );
+  assert.deepEqual(authorityQueries(clients[0]), [
+    extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [SESSION_ID]),
+    extendedQuery(`${READ_OPERATION_QUERY} FOR UPDATE`, [OPERATION_ID]),
+    extendedQuery(`${READ_RESERVATION_QUERY} FOR UPDATE`, [OPERATION_ID]),
+    extendedQuery(COMMIT_ACTIVE_OPERATION_QUERY, [
+      OPERATION_ID,
+      "1",
+      JSON.stringify(result),
+      EXPIRED_FINALIZE_NOW,
+      "starting",
+    ]),
+    extendedQuery(RELEASE_ACTIVE_RESERVATION_QUERY, [
+      OPERATION_ID,
+      EXPIRED_FINALIZE_NOW,
+      "starting",
+    ]),
+    extendedQuery(UPDATE_SESSION_QUERY, [
+      SESSION_ID,
+      "2",
+      JSON.stringify(attachedSession.document),
+      EXPIRED_FINALIZE_NOW,
+    ]),
+  ]);
+  clients[0].assertExhausted();
+});
+
+test("an exact proof can reconcile an uncertain attachment operation", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const committedOperation = writerCommittedOperationRow({
+    options,
+    lease,
+    result,
+    revision: "3",
+    updatedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    updatedAt: EXPIRED_FINALIZE_NOW,
+    releasedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const attachedSession = writerAttachedSessionRow({
+    options,
+    lease,
+    result,
+    operationRevision: "3",
+    updatedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: EXPIRED_FINALIZE_NOW },
+    steps: [
+      rows(writerUncertainSessionRow({ options, lease })),
+      rows(operationRow("uncertain", { options })),
+      rows(reservationRow("uncertain", { options })),
+      rows(committedOperation),
+      rows(releasedReservation),
+      rows(attachedSession),
+    ],
+  });
+
+  const receipt = await authority.finalizeWriterAttachment({
+    ...options,
+    expectedOperationRevision: "2",
+    attachment: result.attachment,
+    mutationResult: result.mutationResult,
+  });
+
+  assert.equal(receipt.finalized, true);
+  assert.equal(receipt.operation.revision, "3");
+  assert.equal(receipt.session.revision, "4");
+  assert.equal(
+    receipt.session.document.lastOperation.operationRevision,
+    "3",
+  );
+  clients[0].assertExhausted();
+});
+
+test("typed writer dispatch can become uncertain and finalize with the exact grant", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const preparedSession = phaseSessionRow("prepared", { options });
+  const startingOperation = operationRow("starting", { options });
+  const startingReservation = reservationRow("starting", { options });
+  const startingSession = writerStartingSessionRow({ options, lease });
+  const uncertainOperation = operationRow("uncertain", { options });
+  const uncertainReservation = reservationRow("uncertain", { options });
+  const uncertainSession = writerUncertainSessionRow({ options, lease });
+  const committedOperation = writerCommittedOperationRow({
+    options,
+    lease,
+    result,
+    revision: "3",
+    updatedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    updatedAt: EXPIRED_FINALIZE_NOW,
+    releasedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const attachedSession = writerAttachedSessionRow({
+    options,
+    lease,
+    result,
+    operationRevision: "3",
+    updatedAt: EXPIRED_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: AUTHORITY_NOW,
+        now: LATEST,
+      },
+      steps: [
+        rows(preparedSession),
+        rows(operationRow("prepared", { options })),
+        rows(reservationRow("prepared", { options })),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    {
+      options: { now: FINAL },
+      steps: [
+        rows(startingSession),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(uncertainOperation),
+        rows(uncertainReservation),
+        rows(uncertainSession),
+      ],
+    },
+    {
+      options: { now: EXPIRED_FINALIZE_NOW },
+      steps: [
+        rows(uncertainSession),
+        rows(uncertainOperation),
+        rows(uncertainReservation),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(attachedSession),
+      ],
+    },
+  );
+
+  const dispatched = await authority.claimWriterAttachmentDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+  const uncertain = await authority.markOperationUncertain({
+    ...options,
+    expectedOperationRevision: "1",
+  });
+  const finalized = await authority.finalizeWriterAttachment({
+    ...options,
+    expectedOperationRevision: "2",
+    attachment: result.attachment,
+    mutationResult: result.mutationResult,
+  });
+
+  assert.equal(dispatched.dispatchGranted, true);
+  assert.deepEqual(dispatched.lease, lease);
+  assert.deepEqual(
+    dispatched.mutationRequest,
+    writerMutationRequest(options, lease),
+  );
+  assert.equal(dispatched.session.document.lifecycle, "ATTACHING");
+  assert.equal(uncertain.changed, true);
+  assert.equal(uncertain.session.document.lifecycle, "ATTACHING");
+  assert.equal(uncertain.session.document.writerEpoch, lease.fencingEpoch);
+  assert.deepEqual(uncertain.session.document.lease, lease);
+  assert.equal(uncertain.session.document.attachment, null);
+  assert.equal(finalized.finalized, true);
+  assert.deepEqual(finalized.operation.result, result);
+  assert.equal(finalized.session.document.lifecycle, "ATTACHED");
+  assert.equal(finalized.session.document.writerEpoch, lease.fencingEpoch);
+  assert.deepEqual(finalized.session.document.lease, lease);
+  assert.deepEqual(finalized.session.document.attachment, result.attachment);
+  for (const client of clients) client.assertExhausted();
+});
+
+test("attachment finalization binds the mutation proof to the exact attachment", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const { authority, clients } = authorityWithScripts({
+    options: { now: FINAL },
+    steps: [
+      rows(writerStartingSessionRow({ options, lease })),
+      rows(operationRow("starting", { options })),
+      rows(reservationRow("starting", { options })),
+    ],
+  });
+
+  await assertAuthorityError(
+    authority.finalizeWriterAttachment({
+      ...options,
+      expectedOperationRevision: "1",
+      attachment: {
+        ...result.attachment,
+        proofId: "different-proof",
+      },
+      mutationResult: result.mutationResult,
+    }),
+    { code: "invalid_operation_request" },
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).map(queryText),
+    [
+      `${READ_SESSION_QUERY} FOR UPDATE`,
+      `${READ_OPERATION_QUERY} FOR UPDATE`,
+      `${READ_RESERVATION_QUERY} FOR UPDATE`,
+    ],
+  );
+  clients[0].assertExhausted();
+});
+
+test("attachment finalization rejects every exact attachment/result binding mismatch", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const cases = [
+    ["attachment backend", { attachment: { backendId: "other-backend" } }],
+    ["attachment storage", { attachment: { storageId: "other-storage" } }],
+    ["attachment session", { attachment: { sessionId: OTHER_SESSION_ID } }],
+    ["attachment lease", { attachment: { leaseId: "other-lease" } }],
+    ["attachment holder", { attachment: { holderId: "other-holder" } }],
+    ["attachment epoch", { attachment: { fencingEpoch: "2" } }],
+    [
+      "attachment operation",
+      { attachment: { operationId: OTHER_OPERATION_ID } },
+    ],
+    [
+      "attachment identity",
+      { attachment: { attachmentId: "other-attachment" } },
+    ],
+    ["attachment proof", { attachment: { proofId: "other-proof" } }],
+    [
+      "result backend",
+      { mutationResult: { backendId: "other-backend" } },
+    ],
+    [
+      "result storage",
+      { mutationResult: { storageId: "other-storage" } },
+    ],
+    [
+      "result session",
+      { mutationResult: { sessionId: OTHER_SESSION_ID } },
+    ],
+    ["result lease", { mutationResult: { leaseId: "other-lease" } }],
+    ["result holder", { mutationResult: { holderId: "other-holder" } }],
+    ["result epoch", { mutationResult: { fencingEpoch: "2" } }],
+    [
+      "result operation",
+      { mutationResult: { operationId: OTHER_OPERATION_ID } },
+    ],
+    [
+      "result attachment",
+      {
+        mutationResult: {
+          target: {
+            ...result.mutationResult.target,
+            attachmentId: "other-attachment",
+          },
+        },
+      },
+    ],
+    ["result proof", { mutationResult: { proofId: "other-proof" } }],
+  ];
+  const { authority, clients } = authorityWithScripts(
+    ...cases.map(() => [
+      rows(writerStartingSessionRow({ options, lease })),
+      rows(operationRow("starting", { options })),
+      rows(reservationRow("starting", { options })),
+    ]),
+  );
+
+  for (const [index, [field, mismatch]] of cases.entries()) {
+    await assertAuthorityError(
+      authority.finalizeWriterAttachment({
+        ...options,
+        expectedOperationRevision: "1",
+        attachment: {
+          ...result.attachment,
+          ...mismatch.attachment,
+        },
+        mutationResult: {
+          ...result.mutationResult,
+          ...mismatch.mutationResult,
+        },
+      }),
+      { code: "invalid_operation_request" },
+    );
+    assert.deepEqual(
+      authorityQueries(clients[index]).map(queryText),
+      [
+        `${READ_SESSION_QUERY} FOR UPDATE`,
+        `${READ_OPERATION_QUERY} FOR UPDATE`,
+        `${READ_RESERVATION_QUERY} FOR UPDATE`,
+      ],
+      `${field} mismatch must fail before any write`,
+    );
+    clients[index].assertExhausted();
+  }
+});
+
+test("exact attachment finalization replay returns the original terminal proof", async () => {
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const attachedSession = writerAttachedSessionRow({
+    options,
+    lease,
+    result,
+  });
+  const committedOperation = writerCommittedOperationRow({
+    options,
+    lease,
+    result,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    updatedAt: FINAL,
+    releasedAt: FINAL,
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(attachedSession),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(committedOperation),
+    rows(releasedReservation),
+  ]);
+
+  const receipt = await authority.finalizeWriterAttachment({
+    ...options,
+    expectedOperationRevision: "1",
+    attachment: result.attachment,
+    mutationResult: result.mutationResult,
+  });
+
+  assert.equal(receipt.finalized, false);
+  assert.deepEqual(receipt.operation.result, result);
+  assert.deepEqual(receipt.session, snapshotFromSessionRow(attachedSession));
+  assert.deepEqual(
+    authorityQueries(clients[0]).map(queryText),
+    [
+      `${READ_SESSION_QUERY} FOR UPDATE`,
+      READ_ACTIVE_COUNTS_QUERY,
+      READ_OPERATION_QUERY,
+      READ_RESERVATION_QUERY,
+    ],
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer lease renewal is one exact DB-clock terminal transaction", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const lease = writerLease(acquireOptions);
+  const acquireResult = writerAttachmentResult(acquireOptions, lease);
+  const attachedRow = writerAttachedSessionRow({
+    options: acquireOptions,
+    lease,
+    result: acquireResult,
+  });
+  const expectedSession = snapshotFromSessionRow(attachedRow);
+  const options = renewOptions(expectedSession);
+  const binding = operationBinding(options);
+  const result = renewalResult(options);
+  const committedOperation = operationRow("committed", {
+    options,
+    revision: "0",
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    retiredAt: RENEW_TRANSACTION_NOW,
+    result,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    releasedAt: RENEW_TRANSACTION_NOW,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: RENEW_AUTHORITY_NOW,
+      now: RENEW_TRANSACTION_NOW,
+    },
+    steps: [
+      rows(attachedRow),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(
+        writerCommittedOperationRow({
+          options: acquireOptions,
+          lease,
+          result: acquireResult,
+        }),
+      ),
+      rows(
+        reservationRow("released", {
+          options: acquireOptions,
+          updatedAt: FINAL,
+          releasedAt: FINAL,
+        }),
+      ),
+      rows(),
+      rows(committedOperation),
+      rows(releasedReservation),
+      rows(renewedSessionRow({ options, result })),
+    ],
+  });
+
+  const receipt = await authority.renewWriterLease(options);
+
+  assert.equal(receipt.renewed, true);
+  assert.equal(receipt.authorityNow, RENEW_AUTHORITY_NOW);
+  assert.equal(receipt.operation.revision, "0");
+  assert.equal(receipt.session.revision, "4");
+  assert.equal(
+    receipt.session.document.lease.expiresAt,
+    result.lease.expiresAt,
+  );
+  assert.equal(
+    receipt.session.document.writerEpoch,
+    lease.fencingEpoch,
+  );
+  assert.deepEqual(
+    receipt.session.document.attachment,
+    acquireResult.attachment,
+  );
+  assert.deepEqual(authorityQueries(clients[0]), [
+    extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [SESSION_ID]),
+    extendedQuery(READ_ACTIVE_COUNTS_QUERY, [SESSION_ID]),
+    extendedQuery(READ_OPERATION_QUERY, [OPERATION_ID]),
+    extendedQuery(READ_RESERVATION_QUERY, [OPERATION_ID]),
+    extendedQuery(READ_OPERATION_QUERY, [OTHER_OPERATION_ID]),
+    extendedQuery(READ_AUTHORITY_CLOCK_QUERY, []),
+    extendedQuery(INSERT_COMMITTED_OPERATION_QUERY, [
+      OTHER_OPERATION_ID,
+      SESSION_ID,
+      WRITER_LEASE_RENEW_OPERATION_KIND,
+      binding.serializedEnvelope,
+      JSON.stringify(result),
+      RENEW_TRANSACTION_NOW,
+    ]),
+    extendedQuery(INSERT_RELEASED_RESERVATION_QUERY, [
+      binding.reservationId,
+      OTHER_OPERATION_ID,
+      SESSION_ID,
+      WRITER_LEASE_RENEW_OPERATION_KIND,
+      expectedSession.revision,
+      JSON.stringify(reservationRow("released", {
+        options,
+        createdAt: RENEW_TRANSACTION_NOW,
+        updatedAt: RENEW_TRANSACTION_NOW,
+        releasedAt: RENEW_TRANSACTION_NOW,
+      }).payload),
+      RENEW_TRANSACTION_NOW,
+    ]),
+    extendedQuery(UPDATE_SESSION_QUERY, [
+      SESSION_ID,
+      expectedSession.revision,
+      JSON.stringify(renewedSessionRow({ options, result }).document),
+      RENEW_TRANSACTION_NOW,
+    ]),
+  ]);
+  clients[0].assertExhausted();
+});
+
+test("renewal COMMIT acknowledgement loss replays without extending twice", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const lease = writerLease(acquireOptions);
+  const acquireResult = writerAttachmentResult(acquireOptions, lease);
+  const attachedRow = writerAttachedSessionRow({
+    options: acquireOptions,
+    lease,
+    result: acquireResult,
+  });
+  const options = renewOptions(snapshotFromSessionRow(attachedRow));
+  const binding = operationBinding(options);
+  const result = renewalResult(options);
+  const committedOperation = operationRow("committed", {
+    options,
+    revision: "0",
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    retiredAt: RENEW_TRANSACTION_NOW,
+    result,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    releasedAt: RENEW_TRANSACTION_NOW,
+  });
+  const renewedRow = renewedSessionRow({ options, result });
+  const commitError = new Error(
+    "sensitive renewal commit acknowledgement lost",
+  );
+  const { authority, clients, pool } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: RENEW_AUTHORITY_NOW,
+        commitError,
+        now: RENEW_TRANSACTION_NOW,
+      },
+      steps: [
+        rows(attachedRow),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(
+          writerCommittedOperationRow({
+            options: acquireOptions,
+            lease,
+            result: acquireResult,
+          }),
+        ),
+        rows(
+          reservationRow("released", {
+            options: acquireOptions,
+            updatedAt: FINAL,
+            releasedAt: FINAL,
+          }),
+        ),
+        rows(),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(renewedRow),
+      ],
+    },
+    [
+      rows(renewedRow),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(releasedReservation),
+    ],
+  );
+
+  await assert.rejects(
+    authority.renewWriterLease(options),
+    assertStoreCommitUncertain,
+  );
+  const replay = await authority.renewWriterLease(options);
+
+  assert.equal(replay.renewed, false);
+  assert.equal(
+    replay.operation.result.lease.expiresAt,
+    result.lease.expiresAt,
+  );
+  assert.deepEqual(replay.session, snapshotFromSessionRow(renewedRow));
+  assert.equal(pool.connectCalls, 2);
+  assert.equal(
+    queryTexts(clients[0]).filter((text) => text === "COMMIT").length,
+    1,
+  );
+  assert.equal(queryTexts(clients[0]).at(-1), "ROLLBACK");
+  assert.equal(
+    authorityQueries(clients[0]).filter(
+      (args) => queryText(args) === INSERT_COMMITTED_OPERATION_QUERY,
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) => queryText(args) === INSERT_COMMITTED_OPERATION_QUERY,
+    ),
+    extendedQuery(INSERT_COMMITTED_OPERATION_QUERY, [
+      OTHER_OPERATION_ID,
+      SESSION_ID,
+      WRITER_LEASE_RENEW_OPERATION_KIND,
+      binding.serializedEnvelope,
+      JSON.stringify(result),
+      RENEW_TRANSACTION_NOW,
+    ]),
+  );
+  assert.equal(
+    authorityQueries(clients[1]).some(
+      (args) =>
+        queryText(args) === READ_AUTHORITY_CLOCK_QUERY ||
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+});
+
+test("exact lease renewal replay never extends expiration twice", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const lease = writerLease(acquireOptions);
+  const acquireResult = writerAttachmentResult(acquireOptions, lease);
+  const attachedRow = writerAttachedSessionRow({
+    options: acquireOptions,
+    lease,
+    result: acquireResult,
+  });
+  const options = renewOptions(snapshotFromSessionRow(attachedRow));
+  const result = renewalResult(options);
+  const renewedRow = renewedSessionRow({ options, result });
+  const committedOperation = operationRow("committed", {
+    options,
+    revision: "0",
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    retiredAt: RENEW_TRANSACTION_NOW,
+    result,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    releasedAt: RENEW_TRANSACTION_NOW,
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(renewedRow),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(committedOperation),
+    rows(releasedReservation),
+  ]);
+
+  const receipt = await authority.renewWriterLease(options);
+
+  assert.equal(receipt.renewed, false);
+  assert.equal(receipt.operation.revision, "0");
+  assert.equal(receipt.operation.result.lease.expiresAt, result.lease.expiresAt);
+  assert.deepEqual(receipt.session, snapshotFromSessionRow(renewedRow));
+  assert.equal(
+    authorityQueries(clients[0]).some(
+      (args) => queryText(args) === READ_AUTHORITY_CLOCK_QUERY,
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("invisible renewal INSERT conflict retries to exact replay", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const lease = writerLease(acquireOptions);
+  const acquireResult = writerAttachmentResult(acquireOptions, lease);
+  const attachedRow = writerAttachedSessionRow({
+    options: acquireOptions,
+    lease,
+    result: acquireResult,
+  });
+  const options = renewOptions(snapshotFromSessionRow(attachedRow));
+  const result = renewalResult(options);
+  const renewedRow = renewedSessionRow({ options, result });
+  const committedOperation = operationRow("committed", {
+    options,
+    revision: "0",
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    retiredAt: RENEW_TRANSACTION_NOW,
+    result,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: RENEW_TRANSACTION_NOW,
+    updatedAt: RENEW_TRANSACTION_NOW,
+    releasedAt: RENEW_TRANSACTION_NOW,
+  });
+  const { authority, clients, pool } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: RENEW_AUTHORITY_NOW,
+        now: RENEW_TRANSACTION_NOW,
+      },
+      steps: [
+        rows(attachedRow),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(
+          writerCommittedOperationRow({
+            options: acquireOptions,
+            lease,
+            result: acquireResult,
+          }),
+        ),
+        rows(
+          reservationRow("released", {
+            options: acquireOptions,
+            updatedAt: FINAL,
+            releasedAt: FINAL,
+          }),
+        ),
+        rows(),
+        rows(),
+        rows(),
+      ],
+    },
+    [
+      rows(renewedRow),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(releasedReservation),
+    ],
+  );
+
+  const replay = await authority.renewWriterLease(options);
+
+  assert.equal(replay.renewed, false);
+  assert.deepEqual(replay.operation.result, result);
+  assert.deepEqual(replay.session, snapshotFromSessionRow(renewedRow));
+  assert.equal(pool.connectCalls, 2);
+  assert.deepEqual(
+    authorityQueries(clients[0]).map(queryText),
+    [
+      `${READ_SESSION_QUERY} FOR UPDATE`,
+      READ_ACTIVE_COUNTS_QUERY,
+      READ_OPERATION_QUERY,
+      READ_RESERVATION_QUERY,
+      READ_OPERATION_QUERY,
+      READ_AUTHORITY_CLOCK_QUERY,
+      INSERT_COMMITTED_OPERATION_QUERY,
+      `${READ_OPERATION_QUERY} FOR UPDATE`,
+    ],
+  );
+  assert.deepEqual(queryTexts(clients[0]).slice(-3), [
+    TRANSACTION_ID_QUERY,
+    "ROLLBACK",
+    "DISCARD ALL",
+  ]);
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+  clients[1].assertExhausted();
+});
+
+test("unexpired writer lease that would not extend performs zero writes", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const lease = writerLease(acquireOptions);
+  const acquireResult = writerAttachmentResult(acquireOptions, lease);
+  const attachedRow = writerAttachedSessionRow({
+    options: acquireOptions,
+    lease,
+    result: acquireResult,
+  });
+  const options = renewOptions(snapshotFromSessionRow(attachedRow), {
+    request: {
+      contractVersion: 1,
+      leaseDurationMilliseconds: 1,
+    },
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: HIGH_EPOCH_AUTHORITY_NOW,
+      now: FINAL,
+    },
+    steps: [
+      rows(attachedRow),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(
+        writerCommittedOperationRow({
+          options: acquireOptions,
+          lease,
+          result: acquireResult,
+        }),
+      ),
+      rows(
+        reservationRow("released", {
+          options: acquireOptions,
+          updatedAt: FINAL,
+          releasedAt: FINAL,
+        }),
+      ),
+      rows(),
+    ],
+  });
+
+  assert.ok(Date.parse(lease.expiresAt) > Date.parse(HIGH_EPOCH_AUTHORITY_NOW));
+  await assertAuthorityError(authority.renewWriterLease(options), {
+    code: "writer_lease_not_extended",
+  });
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(
+    authorityQueries(clients[0]).at(-1)?.[0]?.text,
+    READ_AUTHORITY_CLOCK_QUERY,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer lease renewal cannot resurrect the lease at expiry equality", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const lease = writerLease(acquireOptions);
+  const acquireResult = writerAttachmentResult(acquireOptions, lease);
+  const attachedRow = writerAttachedSessionRow({
+    options: acquireOptions,
+    lease,
+    result: acquireResult,
+  });
+  const options = renewOptions(snapshotFromSessionRow(attachedRow));
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: lease.expiresAt,
+      now: RENEW_TRANSACTION_NOW,
+    },
+    steps: [
+      rows(attachedRow),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(
+        writerCommittedOperationRow({
+          options: acquireOptions,
+          lease,
+          result: acquireResult,
+        }),
+      ),
+      rows(
+        reservationRow("released", {
+          options: acquireOptions,
+          updatedAt: FINAL,
+          releasedAt: FINAL,
+        }),
+      ),
+      rows(),
+    ],
+  });
+
+  await assertAuthorityError(authority.renewWriterLease(options), {
+    code: "writer_lease_expired",
+  });
+  assert.equal(
+    authorityQueries(clients[0]).at(-1)?.[0]?.text,
+    READ_AUTHORITY_CLOCK_QUERY,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer lease and attachment APIs reject invalid typed input before PostgreSQL", async () => {
+  const { authority, pool } = authorityWithScripts();
+  const acquire = writerAcquireOptions();
+  const cases = [
+    () =>
+      authority.reserveOperation({
+        ...acquire,
+        request: {
+          ...acquire.request,
+          leaseDurationMilliseconds: 0,
+        },
+      }),
+    () =>
+      authority.reserveOperation({
+        ...acquire,
+        request: {
+          ...acquire.request,
+          leaseDurationMilliseconds:
+            MAX_WRITER_LEASE_DURATION_MILLISECONDS + 1,
+        },
+      }),
+    () =>
+      authority.claimOperationDispatch({
+        ...acquire,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.renewWriterLease({
+        ...renewOptions(sessionSnapshot()),
+      }),
+  ];
+
+  for (const invoke of cases) {
+    await assertAuthorityError(invoke(), {
+      code: "invalid_operation_request",
+    });
+  }
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("typed writer transitions reject hostile non-exact inputs before PostgreSQL", async () => {
+  const { authority, pool } = authorityWithScripts();
+  const options = writerAcquireOptions();
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const claim = {
+    ...options,
+    expectedOperationRevision: "0",
+  };
+  const finalize = {
+    ...options,
+    expectedOperationRevision: "1",
+    attachment: result.attachment,
+    mutationResult: result.mutationResult,
+  };
+  let accessorCalls = 0;
+  const accessorClaim = { ...claim };
+  Object.defineProperty(accessorClaim, "operationId", {
+    enumerable: true,
+    get() {
+      accessorCalls += 1;
+      throw new Error("sensitive typed writer accessor");
+    },
+  });
+  const symbolFinalize = { ...finalize };
+  symbolFinalize[Symbol("unexpected")] = true;
+  const cases = [
+    () =>
+      authority.claimWriterAttachmentDispatch(new Proxy(claim, {})),
+    () => authority.claimWriterAttachmentDispatch(accessorClaim),
+    () =>
+      authority.finalizeWriterAttachment(new Proxy(finalize, {})),
+    () => authority.finalizeWriterAttachment(symbolFinalize),
+  ];
+
+  for (const invoke of cases) {
+    await assertAuthorityError(invoke(), {
+      code: "invalid_operation_request",
+      omittedText: "sensitive typed writer accessor",
+    });
+  }
+  assert.equal(accessorCalls, 0);
   assert.equal(pool.connectCalls, 0);
 });
