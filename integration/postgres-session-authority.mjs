@@ -115,6 +115,9 @@ function firstMatchingQueryBarrierPool(
         },
       };
     },
+    waitForBarrier() {
+      return barrier;
+    },
   });
 }
 
@@ -873,7 +876,7 @@ test(
       application_name:
         "portable-codex-runtime-session-registry-integration-test",
       connectionString: databaseUrl,
-      max: 2,
+      max: 3,
     });
     const sessionIds = [];
     t.after(async () => {
@@ -1700,6 +1703,160 @@ test(
         assert.deepEqual(receipts[0].operation, receipts[1].operation);
         assert.equal(receipts[0].operation.state, "starting");
         assert.equal(receipts[0].session.revision, "2");
+      },
+    );
+
+    await t.test(
+      "concurrent writer dispatch allocates one post-lock lease and replays exactly",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const input = writerAttachmentInput(registered, {
+          leaseDurationMilliseconds: 500,
+        });
+        await authority.reserveOperation(input);
+        const barrierPool = firstSessionLockQueryBarrierPool(
+          pool,
+          2,
+          "writer dispatch claim barrier",
+        );
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: barrierPool,
+            maxTransactionAttempts: 3,
+          }),
+        });
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const lockClient = await pool.connect();
+        let lockHeld = false;
+        let lockReleaseAt;
+        let receipts;
+        try {
+          await lockClient.query("BEGIN");
+          lockHeld = true;
+          await lockClient.query(
+            [
+              "SELECT session_id",
+              "FROM session_authority.sessions",
+              "WHERE session_id = $1",
+              "FOR UPDATE",
+            ].join(" "),
+            [sessionId],
+          );
+
+          const firstClaim =
+            concurrentAuthority.claimWriterAttachmentDispatch(
+              transition,
+            );
+          const secondClaim =
+            concurrentAuthority.claimWriterAttachmentDispatch(
+              structuredClone(transition),
+            );
+          const releaseLock = (async () => {
+            await barrierPool.waitForBarrier();
+            await lockClient.query(
+              "SELECT pg_catalog.pg_sleep(0.75)",
+            );
+            const observed = await lockClient.query(
+              [
+                "SELECT pg_catalog.clock_timestamp()",
+                "AS lock_release_at",
+              ].join(" "),
+            );
+            await lockClient.query("ROLLBACK");
+            lockHeld = false;
+            return observed.rows[0].lock_release_at;
+          })();
+
+          [lockReleaseAt, ...receipts] = await Promise.all([
+            releaseLock,
+            firstClaim,
+            secondClaim,
+          ]);
+        } finally {
+          if (lockHeld) {
+            await lockClient.query("ROLLBACK");
+          }
+          lockClient.release();
+        }
+
+        const granted = receipts.find(
+          ({ dispatchGranted }) => dispatchGranted,
+        );
+        const replay = receipts.find(
+          ({ dispatchGranted }) => !dispatchGranted,
+        );
+        assert.notEqual(granted, undefined);
+        assert.notEqual(replay, undefined);
+        assert.equal(
+          receipts.filter(({ dispatchGranted }) => dispatchGranted)
+            .length,
+          1,
+        );
+        assert.equal(
+          receipts.filter(({ dispatchGranted }) => !dispatchGranted)
+            .length,
+          1,
+        );
+        assertOperationReceipt(granted, "starting");
+        assertOperationReceipt(replay, "starting");
+        assert.deepEqual(replay.operation, granted.operation);
+        assert.deepEqual(replay.reservation, granted.reservation);
+        assert.deepEqual(replay.session, granted.session);
+        assert.deepEqual(replay.lease, granted.lease);
+        assert.deepEqual(
+          replay.mutationRequest,
+          granted.mutationRequest,
+        );
+        assert.equal(Object.hasOwn(replay, "authorityNow"), false);
+        assert.equal(granted.session.document.writerEpoch, "1");
+        assert.deepEqual(
+          granted.session.document.lease,
+          granted.lease,
+        );
+        assert.ok(
+          Date.parse(granted.authorityNow) >=
+            lockReleaseAt.getTime(),
+        );
+        assert.equal(
+          Date.parse(granted.lease.expiresAt) -
+            Date.parse(granted.authorityNow),
+          input.request.leaseDurationMilliseconds,
+        );
+        assert.ok(
+          Date.parse(granted.lease.expiresAt) >
+            lockReleaseAt.getTime(),
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT s.revision::text AS revision,",
+            "s.document->>'writerEpoch' AS writer_epoch,",
+            "s.document->'lease'->>'leaseId' AS lease_id,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims o",
+            "WHERE o.operation_id = $2) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations r",
+            "WHERE r.operation_id = $2) AS reservation_count",
+            "FROM session_authority.sessions s",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [sessionId, input.operationId],
+        );
+        assert.deepEqual(stored.rows[0], {
+          lease_id: granted.lease.leaseId,
+          operation_count: 1,
+          reservation_count: 1,
+          revision: "2",
+          writer_epoch: "1",
+        });
       },
     );
 

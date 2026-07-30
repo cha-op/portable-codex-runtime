@@ -444,7 +444,8 @@ Later pull requests own:
 
 - Podman/Docker launch and UID/SELinux mapping;
 - production local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
-- the linearizable binding database, renewer, idempotency store, and host fence;
+- exact-owner release, force-fence reconciliation, and the physical host fence
+  beyond the implemented PostgreSQL acquisition/finalization/renewal authority;
 - production held-directory launch authority, provider-specific mutation/fence
   transitions, proofs, and conformance validators beyond the stopped-directory
   adapter;

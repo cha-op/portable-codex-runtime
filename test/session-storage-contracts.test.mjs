@@ -784,6 +784,80 @@ test("attachment matching rejects cross-session authority despite Array every po
   assert.equal(template, undefined);
 });
 
+test("attachment paths reject NUL despite String prototype poisoning", () => {
+  const charCodeAtDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    "charCodeAt",
+  );
+  const includesDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    "includes",
+  );
+  const invalidRootPath = "/var/lib/portable-codex/session-001\0substituted";
+  const request = mutationRequest({ operation: "attach" });
+  const result = {
+    ...request,
+    proofId: "proof-attachment-001",
+    rootPath: invalidRootPath,
+    status: "attached",
+  };
+  let attachmentError;
+  let mutationError;
+  let poisonedCharCodeAtCalls = 0;
+  let poisonedCalls = 0;
+  let charCodeAtCallsBeforeValidation;
+  let callsBeforeValidation;
+  try {
+    Object.defineProperty(String.prototype, "charCodeAt", {
+      ...charCodeAtDescriptor,
+      value() {
+        poisonedCharCodeAtCalls += 1;
+        return 47;
+      },
+    });
+    Object.defineProperty(String.prototype, "includes", {
+      ...includesDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return false;
+      },
+    });
+    assert.equal("x".charCodeAt(0), 47);
+    assert.equal(invalidRootPath.includes("\0"), false);
+    charCodeAtCallsBeforeValidation = poisonedCharCodeAtCalls;
+    callsBeforeValidation = poisonedCalls;
+    try {
+      assertSessionAttachment(attachment({ rootPath: invalidRootPath }));
+    } catch (error) {
+      attachmentError = error;
+    }
+    try {
+      assertStorageMutationResult(result, { request });
+    } catch (error) {
+      mutationError = error;
+    }
+  } finally {
+    Object.defineProperty(
+      String.prototype,
+      "charCodeAt",
+      charCodeAtDescriptor,
+    );
+    Object.defineProperty(
+      String.prototype,
+      "includes",
+      includesDescriptor,
+    );
+  }
+
+  assert.equal(
+    poisonedCharCodeAtCalls,
+    charCodeAtCallsBeforeValidation,
+  );
+  assert.equal(poisonedCalls, callsBeforeValidation);
+  assert.ok(assertCode("invalid_storage_attachment")(attachmentError));
+  assert.ok(assertCode("invalid_storage_mutation")(mutationError));
+});
+
 test("worker template ignores post-import clone and freeze poisoning across session bindings", () => {
   const manifest = sessionManifest();
   const storage = storageRef();

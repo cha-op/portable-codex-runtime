@@ -38,6 +38,11 @@ superseded_by:
 - The dispatch receipt carries the exact attach mutation request. The caller
   invokes the provider only after that transaction commits; the authority
   never runs a provider callback inside the transaction.
+- Real PostgreSQL concurrency coverage holds the session row lock beyond the
+  requested lease duration before releasing two identical typed claims. It
+  proves that exactly one claim grants dispatch, the other replays the same
+  lease and mutation request, the epoch advances once, and the lease clock is
+  read only after the row lock is acquired.
 - `finalizeWriterAttachment()` binds the exact successful mutation result,
   including its canonical host-local `rootPath`, to the exact attachment proof
   and can atomically finalize either `starting` or `uncertain` to `ATTACHED`.
@@ -45,6 +50,9 @@ superseded_by:
   fails closed before any write. The same transaction commits the operation,
   releases the reservation, clears `activeOperation`, persists the lease and
   physical attachment evidence, and writes `lastOperation`.
+- Attachment and attach-result path validation scans for NUL with a captured
+  string intrinsic, so post-import `String.prototype` poisoning cannot admit
+  an invalid provider path.
 - Exact physical evidence remains durable even when the provider finishes
   after lease expiry. Expiry closes subsequent admission; it does not erase
   attachment evidence, change the physical state, or prove a fence.

@@ -93,9 +93,13 @@ versioned terminal anchor ties every progressed inactive session to the latest
 committed operation and released reservation; legacy version 1 snapshots keep
 their exact revision-zero request identity until the next state write upgrades
 them.
-Writer leases, attachment evidence, physical callbacks, typed success
-finalization, and launcher admission remain later authority slices; neither a
-database reservation nor a higher revision is a physical writer fence.
+Typed writer acquisition now allocates one database-clock lease and uint64
+epoch, finalizes exact provider mutation and attachment evidence from definite
+or uncertain dispatch, and renews only the lease expiration through an
+idempotent terminal operation. Concrete provider execution, exact-owner
+release, force-fence reconciliation, and launcher admission remain later
+authority slices; neither a database lease nor a higher epoch is a physical
+writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux

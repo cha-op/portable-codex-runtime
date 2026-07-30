@@ -220,7 +220,7 @@ function assertUuid(value, code, label) {
 function assertAttachmentRootPath(value, code, label) {
   ensure(
     typeof value === "string" &&
-      !value.includes("\0") &&
+      !containsNullCharacter(value) &&
       isAbsolute(value) &&
       resolve(value) === value &&
       value !== parse(value).root,
@@ -239,6 +239,13 @@ function assertOpaqueId(value, code, label) {
 
 function stringCharCodeAt(value, index) {
   return reflectApply(stringCharCodeAtIntrinsic, value, [index]);
+}
+
+function containsNullCharacter(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    if (stringCharCodeAt(value, index) === 0) return true;
+  }
+  return false;
 }
 
 function isAsciiAlphaNumeric(code) {

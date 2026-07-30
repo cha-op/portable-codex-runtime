@@ -1484,7 +1484,7 @@ test("registration independently validates timestamps", () => {
   }
 });
 
-test("registration independently rejects NUL root paths", () => {
+test("registration rejects NUL root paths without poisoned includes", () => {
   const originalIncludes = String.prototype.includes;
   let poisonedIncludesCalls = 0;
 
@@ -1505,7 +1505,7 @@ test("registration independently rejects NUL root paths", () => {
         ),
       "invalid_stopped_writer_request",
     );
-    assert(poisonedIncludesCalls > 0);
+    assert.equal(poisonedIncludesCalls, 0);
     assert.equal(coordinator.dispose(), undefined);
   } finally {
     String.prototype.includes = originalIncludes;
