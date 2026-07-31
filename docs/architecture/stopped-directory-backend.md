@@ -180,8 +180,10 @@ committed publication whose catalogue finalization acknowledgement was lost.
 Transport-only `replayed` is not durable attempt authority; the canonical
 catalogue stores the verified artefact proof and materialisation separately.
 
-This repository defines and tests that seam. A production database, catalogue,
-lease service, and launcher-admission implementation remain separate work.
+This repository defines and tests that seam. PostgreSQL session lease and
+checkpoint-catalogue authority are now implemented. A production
+crash-consistent physical backend plus canonical restore-destination and
+launcher-admission authority remain separate work.
 
 ## Capture Transaction
 

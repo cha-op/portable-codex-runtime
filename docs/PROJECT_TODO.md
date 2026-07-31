@@ -37,10 +37,18 @@
 - [done] Implement release, force-fence, `FENCING`, and `BLOCKED`
   reconciliation without treating database epoch allocation as a physical
   fence.
-- [pending] Implement the production checkpoint mutation authority and
-  catalogue.
-- [pending] Implement logical launcher admission and durable launch-attempt
-  lifecycle around the measured-image reservation.
+- [done] Implement the production clean-capture mutation authority and
+  checkpoint catalogue on the existing PostgreSQL schema, including
+  source-free committed reconciliation and permanent attempt claims.
+- [pending] Implement a bounded operational recovery enumerator and service
+  loop for retained `starting` or `uncertain` checkpoint capture operations.
+  Recover the exact checkpoint and mutation request only from durable
+  operation state, use stable artefact-root resolver configuration, and leave
+  unverifiable or guard-busy attempts durably blocked for later retry.
+- [pending] Implement canonical restore destination generations plus logical
+  launcher admission and the durable launch-attempt lifecycle around the
+  measured-image reservation; keep production restore fail-closed until both
+  authorities are composed.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

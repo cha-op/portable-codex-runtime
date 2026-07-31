@@ -5,6 +5,14 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  PostgresCheckpointMutationAuthorityError,
+  createPostgresCheckpointMutationAuthority,
+} from "../src/postgres-checkpoint-mutation-authority.mjs";
+import {
+  PostgresOperationGuard,
+} from "../src/postgres-operation-guard.mjs";
+import {
+  CHECKPOINT_CAPTURE_OPERATION_KIND,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
@@ -12,6 +20,7 @@ import {
   WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
+  createCheckpointCaptureOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -21,6 +30,10 @@ import { createSessionManifest } from "../src/session-storage-contracts.mjs";
 
 const EMPTY_JSON_OBJECT = "{}";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const CHECKPOINT_GUARD_APPLICATION_NAME =
+  "portable-codex-runtime-checkpoint-guard-integration-test";
+const SESSION_AUTHORITY_APPLICATION_NAME =
+  "portable-codex-runtime-session-registry-integration-test";
 const databaseUrl = process.env.SESSION_AUTHORITY_DATABASE_URL;
 const databaseConfigured =
   typeof databaseUrl === "string" && databaseUrl.length > 0;
@@ -234,6 +247,54 @@ function firstCommitAcknowledgementLossPool(pool) {
   });
 }
 
+function commitAcknowledgementLossAfterQueryPool(
+  pool,
+  label,
+  matches,
+) {
+  let armed = false;
+  let acknowledgementLost = false;
+
+  return Object.freeze({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        connection: client.connection,
+        async query(...args) {
+          const input = args[0];
+          const text =
+            typeof input === "string" ? input : input?.text;
+          const result = await Reflect.apply(
+            client.query,
+            client,
+            args,
+          );
+          if (
+            typeof text === "string" &&
+            matches(text)
+          ) {
+            armed = true;
+          }
+          if (
+            text === "COMMIT" &&
+            armed &&
+            !acknowledgementLost
+          ) {
+            acknowledgementLost = true;
+            throw new Error(
+              `synthetic ${label} COMMIT acknowledgement loss`,
+            );
+          }
+          return result;
+        },
+        release(...args) {
+          return Reflect.apply(client.release, client, args);
+        },
+      };
+    },
+  });
+}
+
 function assertIdentityConflict(error) {
   assert.ok(error instanceof PostgresSessionAuthorityError);
   assert.equal(error.name, "PostgresSessionAuthorityError");
@@ -264,6 +325,32 @@ function assertCommitOutcomeUncertain(error) {
   assert.equal(error.retryable, false);
   assert.equal("cause" in error, false);
   return true;
+}
+
+function assertCheckpointAuthorityCode(code) {
+  return (error) => {
+    assert.ok(
+      error instanceof PostgresCheckpointMutationAuthorityError,
+    );
+    assert.equal(
+      error.name,
+      "PostgresCheckpointMutationAuthorityError",
+    );
+    assert.equal(error.code, code);
+    assert.equal(error.retryable, false);
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 function operationInput(
@@ -421,6 +508,116 @@ function forceFenceEvidence(fenceRequest) {
     proofId: `proof-${randomUUID()}`,
     status: "fenced",
   };
+}
+
+function checkpointCaptureAdmission(
+  attached,
+  {
+    artifactId = `artifact-${randomUUID()}`,
+    captureAttemptId = randomUUID(),
+    checkpointId = `checkpoint-${randomUUID()}`,
+    operationId = `checkpoint-operation-${randomUUID()}`,
+  } = {},
+) {
+  const session = attached.session;
+  const { attachment, lease, manifest, storageRef } = session.document;
+  const request = {
+    backendId: storageRef.backendId,
+    contractVersion: 1,
+    fencingEpoch: lease.fencingEpoch,
+    holderId: lease.holderId,
+    leaseId: lease.leaseId,
+    operation: "checkpoint",
+    operationId,
+    sessionId: session.sessionId,
+    storageId: storageRef.storageId,
+    target: {
+      artifactId,
+      checkpointId,
+      kind: "checkpoint",
+    },
+  };
+  const checkpoint = {
+    artifactId,
+    backendId: storageRef.backendId,
+    checkpointClass: "clean",
+    checkpointId,
+    codexSessionId: manifest.codex.sessionId,
+    codexThreadId: manifest.codex.rootThreadId,
+    contractVersion: 1,
+    createdAt: new Date().toISOString(),
+    imageDigest: manifest.runtime.imageDigest,
+    sessionId: session.sessionId,
+    sourceFencingEpoch: lease.fencingEpoch,
+    storageId: storageRef.storageId,
+  };
+  return {
+    attachment,
+    captureAttemptId,
+    checkpoint,
+    processIncarnationId: `process-${randomUUID()}`,
+    request,
+    stopOperationId: `stop-${randomUUID()}`,
+    writerIncarnationId: `writer-${randomUUID()}`,
+  };
+}
+
+function checkpointOperationInput(expectedSession, admission) {
+  return {
+    expectedSession,
+    kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+    operationId: admission.request.operationId,
+    request: createCheckpointCaptureOperationRequest({
+      admission,
+      expectedSession,
+    }),
+  };
+}
+
+function integrationArtifactPaths({ checkpoint }) {
+  return {
+    artifactDirectory:
+      `/var/lib/portable-codex-checkpoints/${checkpoint.artifactId}`,
+    artifactOwnedRoot: "/var/lib/portable-codex-checkpoints",
+  };
+}
+
+function integrationSourceOwnedRoot({ canonicalAttachment }) {
+  return {
+    sourceDirectory: canonicalAttachment.rootPath,
+    sourceOwnedRoot: "/var/lib/portable-codex",
+  };
+}
+
+function checkpointCompletion(context, replayed) {
+  const result =
+    context.result ?? context.captureAttempt.result;
+  const operationId = result.mutation.operationId;
+  const artifactId = result.checkpoint.artifactId;
+  const artifactManifestDigest = "b".repeat(64);
+  const modeledDigest = "c".repeat(64);
+  return Object.freeze({
+    artifactProof: Object.freeze({
+      artifactManifestDigest,
+      captureOperationId: operationId,
+      modeledDigest,
+    }),
+    materialization: Object.freeze({
+      artifactManifestDigest,
+      contractVersion: 2,
+      modeledDigest,
+      publicationId: `publication-${operationId}`,
+      publicationKind: "checkpoint-artifact",
+      stagedRoot: Object.freeze({
+        filesystemId: "integration-filesystem",
+        objectIdentityScheme: "integration-object-v1",
+        objectId: `object-${artifactId}`,
+      }),
+      treeIdentityDigest: "d".repeat(64),
+    }),
+    replayed,
+    result,
+  });
 }
 
 function assertOperationReceipt(
@@ -946,14 +1143,40 @@ test(
   async (t) => {
     const pool = new Pool({
       application_name:
-        "portable-codex-runtime-session-registry-integration-test",
+        SESSION_AUTHORITY_APPLICATION_NAME,
       connectionString: databaseUrl,
       max: 3,
+    });
+    const guardPool = new Pool({
+      application_name: CHECKPOINT_GUARD_APPLICATION_NAME,
+      connectionString: databaseUrl,
+      max: 2,
     });
     const sessionIds = [];
     t.after(async () => {
       try {
         if (sessionIds.length > 0) {
+          await pool.query(
+            [
+              "DELETE FROM session_authority.checkpoint_catalogue",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.capture_attempt_tombstones",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.capture_attempt_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
           await pool.query(
             [
               "DELETE FROM session_authority.reservations",
@@ -977,7 +1200,11 @@ test(
           );
         }
       } finally {
-        await pool.end();
+        try {
+          await guardPool.end();
+        } finally {
+          await pool.end();
+        }
       }
     });
     const store = new PostgresSerializableStore({
@@ -986,6 +1213,16 @@ test(
     });
     await store.migrate();
     const authority = new PostgresSessionAuthority({ store });
+    const operationGuard = new PostgresOperationGuard({
+      dedicatedPool: guardPool,
+    });
+    const checkpointAuthority =
+      createPostgresCheckpointMutationAuthority({
+        authority,
+        operationGuard,
+        resolveArtifactPaths: integrationArtifactPaths,
+        resolveSourceOwnedRoot: integrationSourceOwnedRoot,
+      });
 
     await t.test(
       "registration reads back and exact replay preserves one row",
@@ -3384,6 +3621,336 @@ test(
         assert.equal(replay.finalized, false);
         assert.deepEqual(replay.operation, reconciled.operation);
         assert.deepEqual(replay.session, reconciled.session);
+      },
+    );
+
+    await t.test(
+      "checkpoint capture holds an independent guard and commits one atomic terminal result",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered, {
+          leaseDurationMilliseconds: 300_000,
+        });
+        const admission = checkpointCaptureAdmission(attached);
+        const publicationEntered = deferred();
+        const releasePublication = deferred();
+        let publicationCount = 0;
+        let competingPublicationCount = 0;
+        let publishedCompletion;
+
+        const capture = checkpointAuthority.runCapture(
+          admission,
+          async (context) => {
+            publicationCount += 1;
+            publicationEntered.resolve();
+            assert.deepEqual(Reflect.ownKeys(context), [
+              "artifactDirectory",
+              "artifactOwnedRoot",
+              "canonicalAttachment",
+              "canonicalLease",
+              "captureAttemptId",
+              "now",
+              "reservationId",
+              "result",
+              "sourceDirectory",
+              "sourceOwnedRoot",
+              "storageRef",
+            ]);
+            assert.equal(
+              context.sourceDirectory,
+              attached.session.document.attachment.rootPath,
+            );
+            assert.equal(
+              context.sourceOwnedRoot,
+              "/var/lib/portable-codex",
+            );
+            assert.equal(
+              context.artifactDirectory,
+              `/var/lib/portable-codex-checkpoints/${admission.checkpoint.artifactId}`,
+            );
+            assert.equal(
+              context.captureAttemptId,
+              admission.captureAttemptId,
+            );
+            assert.equal(Number.isFinite(context.now), true);
+
+            const guardState = await pool.query(
+              [
+                "SELECT count(*)::integer AS lock_count,",
+                "count(*) FILTER (WHERE a.xact_start IS NOT NULL)::integer",
+                "AS transaction_lock_count",
+                "FROM pg_catalog.pg_locks l",
+                "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
+                "WHERE l.locktype = 'advisory' AND l.granted",
+                "AND a.application_name = $1",
+              ].join(" "),
+              [CHECKPOINT_GUARD_APPLICATION_NAME],
+            );
+            assert.deepEqual(guardState.rows[0], {
+              lock_count: 1,
+              transaction_lock_count: 0,
+            });
+            const transactionState = await pool.query(
+              [
+                "SELECT count(*)::integer AS idle_transaction_count",
+                "FROM pg_catalog.pg_stat_activity",
+                "WHERE application_name = $1",
+                "AND state LIKE 'idle in transaction%'",
+              ].join(" "),
+              [SESSION_AUTHORITY_APPLICATION_NAME],
+            );
+            assert.equal(
+              transactionState.rows[0].idle_transaction_count,
+              0,
+            );
+
+            await releasePublication.promise;
+            publishedCompletion = checkpointCompletion(context, false);
+            return publishedCompletion;
+          },
+        );
+
+        await publicationEntered.promise;
+        try {
+          await assert.rejects(
+            checkpointAuthority.runCapture(
+              structuredClone(admission),
+              async () => {
+                competingPublicationCount += 1;
+              },
+            ),
+            assertCheckpointAuthorityCode(
+              "postgres_checkpoint_mutation_authority_outcome_uncertain",
+            ),
+          );
+        } finally {
+          releasePublication.resolve();
+        }
+
+        const captured = await capture;
+        assert.strictEqual(captured, publishedCompletion);
+        assert.equal(publicationCount, 1);
+        assert.equal(competingPublicationCount, 0);
+
+        const terminal = await authority.reconcileOperation(
+          checkpointOperationInput(attached.session, admission),
+        );
+        assertOperationReceipt(terminal, "committed");
+        assert.equal(
+          terminal.operation.result.outcome,
+          "checkpoint-captured",
+        );
+        assert.equal(
+          terminal.session.document.lifecycle,
+          "ATTACHED",
+        );
+        assert.equal(terminal.session.document.activeOperation, null);
+
+        const catalogue = await authority.readCheckpointCatalogue({
+          checkpoint: admission.checkpoint,
+        });
+        assert.equal(catalogue.attempt.state, "committed");
+        assert.equal(
+          catalogue.catalogue.captureAttemptId,
+          admission.captureAttemptId,
+        );
+        assert.deepEqual(catalogue.catalogue.document, {
+          artifactProof: publishedCompletion.artifactProof,
+          contractVersion: 1,
+          materialization: publishedCompletion.materialization,
+          result: publishedCompletion.result,
+        });
+        assert.deepEqual(catalogue.operation, terminal.operation);
+
+        const atomicState = await pool.query(
+          [
+            "SELECT o.state AS operation_state,",
+            "o.revision::text AS operation_revision,",
+            "o.result->>'outcome' AS operation_outcome,",
+            "r.state AS reservation_state,",
+            "(o.retired_at = r.released_at",
+            "AND o.retired_at = c.committed_at",
+            "AND o.retired_at = s.updated_at) AS terminal_times_match,",
+            "(s.document->'activeOperation' = 'null'::jsonb)",
+            "AS active_operation_cleared,",
+            "s.document->'lastOperation'->>'operationId'",
+            "AS terminal_operation_id,",
+            "a.capture_attempt_id::text AS capture_attempt_id,",
+            "c.checkpoint_id AS checkpoint_id",
+            "FROM session_authority.operation_claims o",
+            "JOIN session_authority.reservations r",
+            "ON r.operation_id = o.operation_id",
+            "JOIN session_authority.capture_attempt_claims a",
+            "ON a.operation_id = o.operation_id",
+            "JOIN session_authority.checkpoint_catalogue c",
+            "ON c.capture_attempt_id = a.capture_attempt_id",
+            "JOIN session_authority.sessions s",
+            "ON s.session_id = o.session_id",
+            "WHERE o.operation_id = $1",
+          ].join(" "),
+          [admission.request.operationId],
+        );
+        assert.deepEqual(atomicState.rows, [
+          {
+            active_operation_cleared: true,
+            capture_attempt_id: admission.captureAttemptId,
+            checkpoint_id: admission.checkpoint.checkpointId,
+            operation_outcome: "checkpoint-captured",
+            operation_revision: "2",
+            operation_state: "committed",
+            reservation_state: "released",
+            terminal_operation_id: admission.request.operationId,
+            terminal_times_match: true,
+          },
+        ]);
+
+        let verificationCount = 0;
+        let verifiedCompletion;
+        const reconciled =
+          await checkpointAuthority.runCaptureReconciliation(
+            {
+              checkpoint: admission.checkpoint,
+              request: admission.request,
+            },
+            async (context) => {
+              verificationCount += 1;
+              assert.deepEqual(Reflect.ownKeys(context), [
+                "artifactDirectory",
+                "artifactOwnedRoot",
+                "captureAttempt",
+              ]);
+              assert.equal(
+                Object.hasOwn(context, "sourceDirectory"),
+                false,
+              );
+              assert.equal(context.captureAttempt.state, "committed");
+              verifiedCompletion = checkpointCompletion(context, true);
+              return verifiedCompletion;
+            },
+          );
+        assert.strictEqual(reconciled, verifiedCompletion);
+        assert.equal(verificationCount, 1);
+        assert.equal(publicationCount, 1);
+
+        const releasedGuard = await pool.query(
+          [
+            "SELECT count(*)::integer AS lock_count",
+            "FROM pg_catalog.pg_locks l",
+            "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
+            "WHERE l.locktype = 'advisory' AND l.granted",
+            "AND a.application_name = $1",
+          ].join(" "),
+          [CHECKPOINT_GUARD_APPLICATION_NAME],
+        );
+        assert.equal(releasedGuard.rows[0].lock_count, 0);
+      },
+    );
+
+    await t.test(
+      "checkpoint finalize acknowledgement loss recovers by source-free verification",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered, {
+          leaseDurationMilliseconds: 300_000,
+        });
+        const admission = checkpointCaptureAdmission(attached);
+        const acknowledgementLossStore =
+          new PostgresSerializableStore({
+            dedicatedPool: commitAcknowledgementLossAfterQueryPool(
+              pool,
+              "checkpoint finalize",
+              (text) =>
+                text.startsWith(
+                  "INSERT INTO session_authority.checkpoint_catalogue",
+                ),
+            ),
+            maxTransactionAttempts: 2,
+          });
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: acknowledgementLossStore,
+          });
+        const acknowledgementLossCheckpointAuthority =
+          createPostgresCheckpointMutationAuthority({
+            authority: acknowledgementLossAuthority,
+            operationGuard,
+            resolveArtifactPaths: integrationArtifactPaths,
+            resolveSourceOwnedRoot: integrationSourceOwnedRoot,
+          });
+        let publicationCount = 0;
+        let publishedCompletion;
+
+        await assert.rejects(
+          acknowledgementLossCheckpointAuthority.runCapture(
+            admission,
+            async (context) => {
+              publicationCount += 1;
+              publishedCompletion = checkpointCompletion(
+                context,
+                false,
+              );
+              return publishedCompletion;
+            },
+          ),
+          assertCheckpointAuthorityCode(
+            "postgres_checkpoint_mutation_authority_outcome_uncertain",
+          ),
+        );
+        assert.equal(publicationCount, 1);
+
+        const committed = await authority.readCheckpointCatalogue({
+          checkpoint: admission.checkpoint,
+        });
+        assert.equal(committed.attempt.state, "committed");
+        assert.equal(committed.operation.state, "committed");
+        assert.deepEqual(committed.catalogue.document, {
+          artifactProof: publishedCompletion.artifactProof,
+          contractVersion: 1,
+          materialization: publishedCompletion.materialization,
+          result: publishedCompletion.result,
+        });
+
+        let verificationCount = 0;
+        let verifiedCompletion;
+        const recovered =
+          await checkpointAuthority.runCaptureReconciliation(
+            {
+              checkpoint: admission.checkpoint,
+              request: admission.request,
+            },
+            async (context) => {
+              verificationCount += 1;
+              assert.equal(
+                Object.hasOwn(context, "canonicalAttachment"),
+                false,
+              );
+              assert.equal(
+                Object.hasOwn(context, "sourceDirectory"),
+                false,
+              );
+              assert.equal(context.captureAttempt.state, "committed");
+              verifiedCompletion = checkpointCompletion(context, true);
+              return verifiedCompletion;
+            },
+          );
+        assert.strictEqual(recovered, verifiedCompletion);
+        assert.equal(verificationCount, 1);
+        assert.equal(publicationCount, 1);
+
+        const terminal = await authority.reconcileOperation(
+          checkpointOperationInput(attached.session, admission),
+        );
+        assertOperationReceipt(terminal, "committed");
+        assert.equal(terminal.operation.revision, "2");
+        assert.deepEqual(terminal.operation, committed.operation);
       },
     );
   },

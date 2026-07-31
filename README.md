@@ -107,8 +107,24 @@ epoch retained. These paths use generic reserve, typed dispatch, provider
 execution outside the transaction, and typed finalization without schema DDL.
 Unit and real-PostgreSQL coverage exercise exact replay, expiry, ambiguity,
 manual-backend rejection, epoch retention, and explicit
-`BLOCKED -> FENCING` recovery. Physical backend execution, checkpoint
-mutation/catalogue authority, and launcher admission remain later slices;
+`BLOCKED -> FENCING` recovery.
+
+Production clean-capture authority reuses the version 1 schema without DDL.
+It binds one exact session-wide operation and reservation to one globally
+unique capture-attempt claim, holds a per-operation PostgreSQL session
+advisory guard while local publication runs outside database transactions,
+and atomically finalizes the matching checkpoint catalogue entry, operation,
+reservation, and terminal anchor. Attempt and operation claims are retained
+permanently; a pre-existing tombstone is non-authorizing and always rejects
+reuse. A source-free reconciliation path may verify only the exact already
+committed journal record and artefact for that durable attempt, including
+after lease expiry or fence turnover. It cannot consume another stopped-writer
+capability or advance `prepared` or `materialized` publication.
+
+This production adapter is capture-only. Restore admission fails closed until
+a later slice defines the canonical detached destination generation and binds
+it to logical launcher admission. Production crash-consistent ext4 or
+filesystem-image backend execution and launcher admission remain later slices;
 neither a database lease nor a higher epoch is a physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
@@ -222,11 +238,18 @@ fence and admission guard, reserves a predetermined result, runs publication
 exactly once, and durably finalizes the catalogue before returning that same
 completion. Capture publication must atomically start from an absent journal
 operation; it never adopts an earlier prepared, materialized, or committed
-artifact as proof of the current stop. Restore applies the same protocol to a
-newer fence, trusted artefact proof, and isolated detached destination, while
-retaining exact committed replay. Runtime collaborator failures are fixed
-path-free uncertainty; the adapter performs no internal retry, speculative
-cleanup, or replacement-coordinator recovery.
+artifact as proof of the current stop. The production mutation authority keeps
+publication outside database transactions while a durable reservation and
+per-operation PostgreSQL session advisory guard serialize admission,
+publication, finalization, and each reconciliation attempt. The advisory lock
+is not durable across process, connection, or database restart, and reacquiring
+it does not prove an older publication callback has quiesced. The retained
+operation and session reservation prevent a second publisher; recovery remains
+source-free and read-only until the physical journal proves the exact artefact
+committed. A pre-commit journal phase therefore fails closed even if recovery
+overlaps an older callback. Runtime
+collaborator failures are fixed path-free uncertainty; the adapter performs no
+internal retry, speculative cleanup, or replacement-coordinator recovery.
 
 Inside the one-shot stopped-writer callback, the backend generates a fresh
 capture-attempt UUID. Before publication, the authority must atomically claim
@@ -247,8 +270,10 @@ The adapter advertises normal directory attachments, exclusive writers,
 `atomicPointInTimeCheckpoint: false`. It is therefore a trusted local
 filesystem development and conformance backend, not an NFS, live-volume, or
 automatic failover implementation. The durable authority interface and
-conformance tests are part of this slice; a production linearizable database
-and catalogue remain separate work. See
+conformance tests define the seam, and the PostgreSQL authority now implements
+the production clean-capture and committed-reconciliation side of it. Restore
+remains fail-closed until destination-generation and launcher authority are
+defined. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

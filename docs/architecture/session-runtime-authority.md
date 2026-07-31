@@ -12,10 +12,13 @@ The implemented authority provides:
 - bounded OCI/Docker runnable-image inspection plus a one-use reservation
   capability;
 - canonical, idempotent session registration with strict readback;
-- a durable session-wide operation and reservation phase kernel; and
+- a durable session-wide operation and reservation phase kernel;
 - typed database-clock writer attachment dispatch, exact attachment
   finalization, exact lease renewal, exact-owner release, and force-fence
-  reconciliation.
+  reconciliation;
+- production clean-checkpoint capture admission, durable attempt claims, and
+  exact checkpoint-catalogue finalization; and
+- committed-only, source-free capture reconciliation.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
@@ -24,8 +27,10 @@ before any external dispatch can begin. The typed writer lifecycle turns the
 lease, attachment, detach, and force-fence records in
 `session-storage-contracts.mjs` into serializable decisions for
 `ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, and `DETACHED`.
-Subsequent authority slices will implement checkpoint mutation/catalogue
-finalization and logical launcher admission.
+The checkpoint slice binds stopped-writer clean capture to the existing
+operation, reservation, capture-attempt, tombstone, and catalogue tables.
+Subsequent authority slices will implement canonical restore-destination
+generations and logical launcher admission.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -59,8 +64,10 @@ The PostgreSQL registry protects the immutable part of canonical identity. The
 operation kernel and typed writer lifecycle methods use the executor and
 schema to order reservation, lease allocation, attachment finalization,
 renewal, release, force-fence epoch advancement, and blocked reconciliation.
-Catalogue and launcher transitions remain later slices. Physical exclusion
-evidence must be supplied by a capable storage backend or supervisor.
+The capture authority uses the same ordering boundary for exact attempt
+admission and catalogue finalization. Restore-destination and launcher
+transitions remain later slices. Physical exclusion evidence must be supplied
+by a capable storage backend or supervisor.
 
 ## Implemented Canonical Session Registry
 
@@ -208,9 +215,9 @@ The generic kernel has no expiry, steal, or automatic release rule. `starting`
 and `uncertain` survive process restart and continue to block the session. The
 typed writer methods described below verify their own completion evidence and
 atomically combine the business-state update with operation finalization.
-Catalogue and launch methods must preserve that rule: they must not call a
-generic finalizer first and update the canonical lifecycle in a second
-transaction.
+Checkpoint catalogue finalization preserves that rule: it never calls a
+generic finalizer first and writes the catalogue in a second transaction.
+Future restore-destination and launch methods must preserve the same boundary.
 
 ## Implemented Writer Lease and Attachment Acquisition
 
@@ -463,6 +470,98 @@ finalization acknowledgement is uncertain, the reservation and operation phase
 remain visible for explicit reconciliation; the authority never rolls back to
 an apparently safe state.
 
+## Production Clean-Capture Mutation Authority
+
+The production checkpoint slice is deliberately capture-only. It reuses the
+version 1 authority schema without DDL and composes the existing session-wide
+operation/reservation kernel with `capture_attempt_claims`,
+`capture_attempt_tombstones`, and `checkpoint_catalogue`. Restore is not
+admitted by this slice: it fails closed until a later authority can name one
+canonical detached destination generation and bind its finalized state to
+logical launcher admission.
+
+Normal capture begins from the exact canonical `ATTACHED` session snapshot.
+Before publication, the authority uses database time to prove that the lease
+is unexpired and that the complete session identity, storage reference,
+attachment, lease, writer epoch, checkpoint descriptor, mutation request, and
+stopped-writer correlation binding all agree. One exact operation and active
+session reservation bind that admission. Capture never advances the writer
+epoch or changes the attachment, lease, or lifecycle.
+
+The capture order is:
+
+```text
+per-operation PostgreSQL session advisory guard
+                  │
+                  ▼
+generic serializable reserve commit
+                  │
+                  ▼
+typed prepared -> starting commit
++ globally unique durable capture-attempt claim
+                  │
+                  ▼
+external stopped-directory publication
+outside every database transaction
+                  │
+                  ▼
+typed serializable exact-CAS catalogue finalize
++ operation commit + reservation release + terminal anchor
+```
+
+Only a definitely committed typed dispatch may invoke publication. The
+capture-attempt UUID minted inside the one-use stopped-writer callback and the
+operation ID are globally non-reusable authority identities. Their single
+canonical claim binds the complete immutable capture attempt and predetermined
+result before physical publication begins. A collision or a matching retained
+tombstone rejects admission before publication. Production retains claims
+permanently; if a future retention workflow writes a tombstone, that tombstone
+is non-authorizing and cannot be removed to revive the old attempt.
+
+The PostgreSQL session advisory guard is keyed by the exact capture operation.
+One acquisition is held across claim activation, the complete asynchronous
+publication callback, and catalogue finalization; every committed
+reconciliation independently reacquires the same key around verification and
+finalization. The advisory lock is not durable across process, connection, or
+database restart, and reacquiring it does not prove an older publication
+callback has quiesced. The retained operation, attempt claim, and ordinary
+active session reservation prevent another publisher and block detach, fence,
+restore, launch, and any other conflicting session mutation while an
+unfinalized capture may have effects. Same-operation recovery may overlap an
+older callback after its database session is lost; that path is source-free
+and read-only until the physical journal proves the exact artefact committed.
+`absent`, `prepared`, and `materialized` publication therefore fail closed.
+
+Successful publication returns an exact path-free completion containing the
+trusted artefact proof, materialisation, and predetermined checkpoint mutation
+result. In one `SERIALIZABLE` finalization transaction, the authority locks and
+revalidates the same session, operation, reservation, canonical attempt, both
+claim identities, and absence of a tombstone; writes or confirms the exact
+catalogue entry; retires the operation; releases the reservation; clears the
+active pointer; and writes the terminal anchor. The catalogue entry and
+terminal operation result are two cross-checked representations of the same
+durable completion. Neither may commit alone.
+
+If dispatch acknowledgement is lost, no publication grant is returned and the
+durable blocker remains for explicit recovery. Once publication can have
+started, a callback failure or unprovable outcome moves the exact operation to
+`uncertain` when that transition can be confirmed; it never cancels the
+operation, reuses the stopped-writer capability, substitutes a new attempt, or
+speculatively cleans physical evidence. A finalization acknowledgement loss may
+therefore leave an `authorized` attempt beside an already committed physical
+artefact, or may already have committed the matching catalogue and terminal
+anchor.
+
+Committed capture reconciliation accepts only the original checkpoint
+descriptor and mutation request. It takes the same per-operation advisory
+guard, loads the exact non-tombstoned durable attempt by its original
+operation, and invokes the backend's source-free committed verifier. It has no
+writer, lease, attachment, authority clock, mutable source, or stopped-writer
+capability input. `absent`, `prepared`, and `materialized` journal phases never
+become success through this path. After asynchronous verification, the
+authority revalidates the same attempt and claims before it atomically
+finalizes or confirms the catalogue and returns the verifier's exact completion.
+
 ## Canonical Session Lifecycle
 
 The canonical document uses the lifecycle from the storage contract:
@@ -473,6 +572,7 @@ stateDiagram-v2
   DETACHED --> ATTACHING: typed dispatch allocates lease and next epoch
   ATTACHING --> ATTACHED: exact attachment proof, even after expiry
   ATTACHING --> BLOCKED: typed ambiguous-outcome finalization
+  ATTACHED --> ATTACHED: clean capture catalogue finalization
   ATTACHED --> RELEASING: exact-owner release dispatch
   RELEASING --> DETACHED: exact detach proof, even after expiry
   RELEASING --> BLOCKED: typed ambiguous-outcome finalization
@@ -482,11 +582,12 @@ stateDiagram-v2
   FENCING --> BLOCKED: unavailable or ambiguous fence finalization
 ```
 
-The acquisition, renewal, release, force-fence, `FENCING`, and `BLOCKED`
-authority transitions are implemented. A new writable acquisition and each
-force-fence dispatch advance the uint64 fencing epoch. Release and renewal do
-not. Renewal preserves the complete writer tuple and extends only the
-database-authoritative `expiresAt`. Epoch exhaustion fails closed.
+The acquisition, renewal, clean-capture, release, force-fence, `FENCING`, and
+`BLOCKED` authority transitions are implemented. A new writable acquisition
+and each force-fence dispatch advance the uint64 fencing epoch. Capture,
+release, and renewal do not. Renewal preserves the complete writer tuple and
+extends only the database-authoritative `expiresAt`. Epoch exhaustion fails
+closed.
 
 Lease expiry closes subsequent mutation, renewal, and launch admission. It does
 not change the physical attachment state, move the lifecycle to `FENCING`, or
@@ -518,12 +619,16 @@ while keeping identities, revisions, timestamps, and uniqueness constraints in
 relational columns. Business transitions remain in the authority code so a
 database migration cannot silently invent a new lifecycle.
 
-Writer acquisition, renewal, release, force-fence, and blocked finalization use
-those existing structures without DDL. The canonical session JSONB stores the
-lease, epoch, lifecycle, attachment, active pointer, and terminal anchor; the
-existing operation and reservation JSONB records store each exact typed
-request and terminal result. The established global operation identity and
-active session-conflict constraints remain the admission boundary.
+Writer acquisition, renewal, release, force-fence, blocked finalization, and
+checkpoint capture use those existing structures without DDL. The canonical
+session JSONB stores the lease, epoch, lifecycle, attachment, active pointer,
+and terminal anchor; the existing operation and reservation JSONB records
+store each exact typed request and terminal result. Capture-attempt claims bind
+the exact operation and coordinator binding, tombstones are permanent
+non-authorizing reuse fences, and each catalogue row binds one checkpoint to
+one exact attempt and path-free committed completion. The established global
+operation identity and active session-conflict constraints remain the
+admission boundary.
 
 ## Platform Image Reservation
 
@@ -608,6 +713,13 @@ concrete Podman/Docker adapter must hold directory identity through the bind,
 enforce rootless execution, fix the Codex CLI/config surface, and register the
 exact writer with `StoppedWriterCapabilityCoordinator`.
 
+That slice also owns restore destination generations. Until the authority can
+name one detached destination as a canonical generation, finalize its exact
+restore result, and feed that generation into the same launcher admission
+transaction, the production checkpoint adapter rejects restore. A published
+directory, restore journal record, checkpoint descriptor, or catalogue entry
+alone is never writable-launch authority.
+
 ## Operational Boundary
 
 Production deployment requires:
@@ -617,11 +729,29 @@ Production deployment requires:
 - one authoritative PostgreSQL primary for these tables;
 - a node-postgres pool dedicated to this executor so its verified
   `DISCARD ALL` lifecycle cannot invalidate another subsystem's session state;
+- a separate node-postgres pool dedicated to the operation guard so one
+  checked-out connection can hold its PostgreSQL session advisory lock across
+  out-of-transaction publication without sharing connection state with the
+  serializable executor;
+- both pools connected directly to the same authoritative database and primary;
+  the guard connection requires backend-session affinity and cannot use
+  PgBouncer transaction or statement pooling;
 - TLS, database authentication, backup, and access control outside this module;
 - migration application before serving authority requests;
 - durable database backups independent of session-volume snapshots;
+- authority-ledger promotion and recovery that never admits mutations from a
+  database state older than any retained artefact or session-volume
+  generation. Recovery must preserve or replay every later operation,
+  reservation, attempt claim, and tombstone from synchronous replication,
+  WAL, or an equivalent monotonic audit source. If that ordering cannot be
+  proved, operators must fence and rekey the affected backend and session
+  namespaces before reopening admission;
 - bounded retry and request deadlines at the service boundary; and
-- reconciliation tooling for retained ambiguous reservations.
+- a bounded recovery enumerator and service loop for retained `starting` or
+  `uncertain` checkpoint operations. It must recover the exact checkpoint and
+  mutation request from durable operation state, use stable artefact-root
+  resolver configuration, and leave guard-busy or unverifiable attempts
+  durably pending rather than reconstructing mutable source state.
 
 PostgreSQL availability is not storage fencing. A database failover must not
 promote an unfenced session merely because a lease timestamp has passed.
@@ -658,6 +788,12 @@ corruption, attachment acquisition and lease renewal, and post-commit dispatch
 and attachment-finalization acknowledgement-loss recovery against a real
 PostgreSQL service. Release and force-fence PostgreSQL integration coverage
 exercises exact dispatch/finalization replay, uncertain-to-blocked recovery,
-and retained advanced epochs. Later authority slices must add catalogue and
-launch transition tests. Physical-backend pull requests must add crash,
-detach/fence, container-launch, and cross-host conformance evidence.
+and retained advanced epochs. Checkpoint-authority validation must cover exact
+fresh admission, global attempt and operation conflicts, tombstone rejection,
+single dispatch, publication outside the transaction, advisory-guard
+serialization, atomic catalogue and terminal finalization, acknowledgement
+loss, restart replay, committed-only source-free reconciliation, claim
+revalidation after verification, and relational corruption. Later authority
+slices must add restore-generation and launch transition tests.
+Physical-backend pull requests must add crash, detach/fence, container-launch,
+and cross-host conformance evidence.

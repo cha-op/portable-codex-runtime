@@ -95,6 +95,22 @@
   epoch, and explicit recovery dispatch is required for
   `BLOCKED -> FENCING`. Manual backends cannot complete automatic fencing, and
   database expiry or epoch state is never physical fence evidence.
+- Production clean-checkpoint capture authority now reuses the version 1
+  PostgreSQL schema without DDL. One exact durable operation and reservation
+  binds the canonical stopped-writer admission, globally unique capture
+  attempt, predetermined result, and checkpoint catalogue entry. Publication
+  runs outside database transactions while a per-operation PostgreSQL session
+  advisory guard serializes each live invocation. The durable reservation and
+  attempt claim prevent a second publisher, but guard reacquisition after a
+  process, connection, or database restart does not prove the older callback
+  quiesced. Same-operation recovery therefore stays source-free and read-only
+  until it verifies the exact committed journal state; it cannot advance
+  `prepared` or `materialized` publication. Claims are retained permanently,
+  and tombstones always reject reuse.
+- The production checkpoint adapter remains capture-only. Restore fails closed
+  until canonical destination-generation authority and logical launcher
+  admission are implemented; no published restore path is writer-launch
+  authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -135,6 +151,8 @@
   `docs/project_journal/2026/07/2026-07-30-writer-lease-attachment-7b3e92.md`
 - Writer release and force-fence reconciliation:
   `docs/project_journal/2026/07/2026-07-31-release-force-fence-e4b9c7.md`
+- Production checkpoint mutation authority:
+  `docs/project_journal/2026/07/2026-07-31-checkpoint-mutation-authority-c3a8f2.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -146,3 +164,6 @@
   repair covers only pinned plain-JSONL tail framing on a detached restored
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
+- Restore remains intentionally unavailable in the production checkpoint
+  authority until one canonical detached destination generation can be bound
+  to the later logical launcher admission transaction.
