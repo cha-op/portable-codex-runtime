@@ -32,7 +32,7 @@
 - [done] Implement the durable operation and reservation kernel for exact
   idempotent replay, conflict exclusion, and explicit uncertain-outcome
   reconciliation.
-- [pending] Implement database-clock writer lease acquisition and renewal plus
+- [done] Implement database-clock writer lease acquisition and renewal plus
   exact attachment finalization with monotonic uint64 fencing epochs.
 - [pending] Implement release, force-fence, `FENCING`, and `BLOCKED`
   reconciliation without treating database epoch allocation as a physical

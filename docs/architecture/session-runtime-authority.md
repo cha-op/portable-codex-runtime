@@ -8,34 +8,37 @@ The implemented authority provides:
 - database-authoritative transaction time;
 - bounded, provenance-aware serialization and deadlock retry;
 - a checksum-bound initial authority schema;
-- real-PostgreSQL migration and concurrency tests; and
+- real-PostgreSQL migration and concurrency tests;
 - bounded OCI/Docker runnable-image inspection plus a one-use reservation
   capability;
-- canonical, idempotent session registration with strict readback; and
-- a durable session-wide operation and reservation phase kernel.
+- canonical, idempotent session registration with strict readback;
+- a durable session-wide operation and reservation phase kernel; and
+- typed database-clock writer attachment dispatch, exact attachment
+  finalization, and exact lease renewal.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
 operation kernel then binds one exact request to one active session reservation
-before any external dispatch can begin. Subsequent authority slices will turn
-the remaining structural records in `session-storage-contracts.mjs` into
-serializable admission decisions for:
+before any external dispatch can begin. The writer-acquisition slice turns the
+lease and attachment records in `session-storage-contracts.mjs` into typed
+serializable decisions for `ATTACHING` and `ATTACHED`. Subsequent authority
+slices will implement:
 
-- writable lease allocation and renewal;
-- attachment, release, and force-fence transitions;
+- release and force-fence transitions;
 - checkpoint-catalogue finalization; and
 - logical launcher admission.
 
-Registration and operation reservation are not writer admission: they do not
-allocate a lease or epoch, create an attachment, invoke a provider, or authorize
-a launcher. The kernel exposes a durable `starting` claim but deliberately does
-not execute a provider callback. The authority also does not mount storage,
-launch a container, resolve a registry tag, verify an image publisher, stop a
-writer, or prove a physical fence. Those effects remain provider operations
-that a later typed authority can invoke only after a reservation and dispatch
-claim have committed. The current stopped-directory backend declares
-`fencing: "manual"` and therefore cannot use lease expiration alone for
-automatic host takeover.
+Registration and generic operation reservation are not writer admission: they
+do not allocate a lease or epoch, create an attachment, invoke a provider, or
+authorize a launcher. Typed `claimWriterAttachmentDispatch()` allocates the
+logical writer tuple only after the generic reservation is durable, but it
+still does not execute a provider callback. The authority does not mount
+storage, launch a container, resolve a registry tag, verify an image publisher,
+stop a writer, or prove a physical fence. A caller invokes the exact provider
+request outside the transaction and returns its exact evidence for typed
+finalization. The current stopped-directory backend declares
+`fencing: "manual"` and therefore cannot use lease expiration or a higher
+database epoch alone for automatic host takeover.
 
 ## Protected Properties
 
@@ -52,9 +55,10 @@ The authority protects three different properties and keeps them distinct:
    new logical admissions, but does not itself provide that proof.
 
 The PostgreSQL registry protects the immutable part of canonical identity. The
-operation kernel uses the executor and schema to provide the first
-admission-order mechanism, while the remaining lifecycle transitions arrive in
-later slices. Physical exclusion evidence must be supplied by a capable storage
+operation kernel and typed writer-acquisition methods use the executor and
+schema to order reservation, lease allocation, attachment finalization, and
+renewal. Release, force-fence, catalogue, and launcher transitions remain later
+slices. Physical exclusion evidence must be supplied by a capable storage
 backend or supervisor.
 
 ## Implemented Canonical Session Registry
@@ -170,7 +174,10 @@ operation ID permanently for exact replay. The same transaction clears the
 active pointer and replaces `lastOperation` with a terminal anchor containing
 the operation and reservation identities plus canonical request and result
 digests. A `starting` or `uncertain` operation cannot use this cancellation
-path.
+path. Reserve refuses before creating a blocker when the PostgreSQL bigint
+session revision cannot also represent cancellation, and generic dispatch
+refuses before granting an external effect when no revision remains to record
+an uncertain outcome.
 
 `reconcileOperation()` is read-only and reports whether the exact request is
 absent, prepared, starting, uncertain, or already committed. Reserve,
@@ -187,20 +194,85 @@ database time.
 
 For version 2, an inactive revision-zero session has no terminal anchor. An
 inactive progressed session has revision
-`lastOperation.expectedSessionRevision + 2`; an active session either starts
-from revision zero with no prior anchor or preserves the immediately preceding
-anchor in its expected snapshot. Terminal validation performs bounded
-primary-key reads and does not scan the complete operation history. This
-protects the current session transition source under the authority's ordinary
-database-integrity model; coordinated rewriting of the session document,
-operation, reservation, and their bound hashes is outside that model.
+`lastOperation.expectedSessionRevision + lastOperation.operationRevision + 1`;
+an active session either starts from revision zero with no prior anchor or
+preserves the immediately preceding anchor in its expected snapshot. Terminal
+validation performs bounded primary-key reads and does not scan the complete
+operation history. This protects the current session transition source under
+the authority's ordinary database-integrity model; coordinated rewriting of
+the session document, operation, reservation, and their bound hashes is outside
+that model.
 
-The kernel has no expiry, steal, or automatic release rule. `starting` and
-`uncertain` survive process restart and continue to block the session. A later
-typed lease, attachment, fencing, catalogue, or launch authority must verify
-its own completion evidence and atomically combine the business-state update
-with operation finalization. It must not call a generic finalizer first and
-update the canonical lifecycle in a second transaction.
+The generic kernel has no expiry, steal, or automatic release rule. `starting`
+and `uncertain` survive process restart and continue to block the session. The
+typed writer-acquisition methods described below verify their own completion
+evidence and atomically combine the business-state update with operation
+finalization. Later fencing, catalogue, and launch methods must preserve that
+rule: they must not call a generic finalizer first and update the canonical
+lifecycle in a second transaction.
+
+## Implemented Writer Lease and Attachment Acquisition
+
+This slice reuses the existing relational schema and canonical version 2 JSONB
+documents; it requires no DDL. It defines two typed operation kinds:
+`writer-attachment-acquire-v1` and `writer-lease-renew-v1`.
+
+Acquisition begins with generic `reserveOperation()`, which persists the exact
+request as `prepared` without allocating writer authority.
+`claimWriterAttachmentDispatch()` then runs one typed `SERIALIZABLE`
+transaction. After it locks and validates the canonical session, operation, and
+reservation state, it reads PostgreSQL `clock_timestamp()` and atomically:
+
+1. advances the decimal-string writer epoch by one within the complete uint64
+   range, failing closed at exhaustion;
+2. allocates a lease duration bounded to 1 through 86,400,000 milliseconds from
+   that database clock;
+3. derives deterministic lease and attachment IDs from the globally unique
+   operation ID;
+4. changes the operation and reservation from `prepared` to `starting`; and
+5. persists the exact lease, next epoch, and `ATTACHING` lifecycle while the
+   attachment remains null.
+
+Only the call that definitely commits that typed transition receives
+`dispatchGranted: true` and the exact attach mutation request. Replay or commit
+uncertainty cannot allocate another epoch or grant dispatch again. The caller
+invokes the provider outside every database transaction. Before granting that
+external side effect, the authority also proves that the PostgreSQL bigint
+session revision has capacity for `starting -> uncertain -> committed`, so an
+otherwise valid exact proof cannot become unrecordable solely because the
+counter reached its limit.
+
+`finalizeWriterAttachment()` accepts only the exact successful mutation result
+and exact attachment proof bound to that request, lease, holder, epoch,
+operation, storage identity, attachment ID, proof ID, and canonical host-local
+`rootPath`. The provider mutation result must carry the same `rootPath`; a
+caller cannot splice a different structurally valid directory into the
+attachment evidence. This writer-specific evidence validates its root-path-free
+projection against the unchanged generic storage contract v1 result shape. It
+can finalize an operation from `starting` revision 1 or `uncertain` revision 2.
+In one
+transaction it commits the exact `writer-attached` result, retires the
+operation, releases the reservation, clears `activeOperation`, persists the
+attachment and lease, changes the lifecycle to `ATTACHED`, and writes the
+versioned `lastOperation` terminal anchor. A committed replay must reproduce
+the exact terminal result and performs no write.
+
+Finalization deliberately does not reject exact physical evidence because the
+lease expired while the provider was running. That evidence records what
+physically happened. Expiry closes later admission; it neither erases the
+attachment nor proves a fence.
+
+`renewWriterLease()` has no provider or prepared phase. It is one
+`SERIALIZABLE` transaction that locks and validates the exact `ATTACHED`
+session, proves that no active operation exists, reads `clock_timestamp()`, and
+requires the old `expiresAt` to be strictly later than that clock. Equality is
+already expired and cannot be renewed. A valid renewal preserves the complete
+lease and attachment tuple and changes only `expiresAt`, which must advance
+beyond the prior value. The transaction inserts a terminal committed operation
+at revision 0, a released reservation, the matching terminal anchor, and the
+updated session revision. The globally unique operation ID makes an exact
+replay return the original result without another clock read or extension;
+conflicting reuse fails closed.
 
 ## Implemented PostgreSQL Transaction Boundary
 
@@ -298,24 +370,29 @@ rollback, so stale or forged `commitState` evidence cannot cross operation
 boundaries. Store errors define frozen own data fields rather than consulting
 mutable prototype accessors for their reported state.
 
-The operation kernel uses that executor to lock the canonical session row,
-claim operation and reservation rows, validate the complete expected identity
-and revision, and commit durable `prepared` and `starting` phases before any
-external provider callback starts. The owning session's current active
-operation and reservation are locked in that order. A foreign or already
-retired operation ID is read only as snapshot-consistent identity evidence,
-not locked, so crossed foreign IDs cannot introduce a second lock order.
-An external callback must not be held inside a database transaction. Later
-typed lifecycle methods must preserve this protocol:
+The operation kernel and typed writer-acquisition path use that executor to
+lock the canonical session row, claim or validate operation and reservation
+rows, validate the complete expected identity and revision, and commit durable
+`prepared` and typed `starting` phases before any external provider callback
+starts. The owning session's current active operation and reservation are
+locked in that order. A foreign or already retired operation ID is read only as
+snapshot-consistent identity evidence, not locked, so crossed foreign IDs
+cannot introduce a second lock order. An external callback must not be held
+inside a database transaction. The implemented acquisition path and later
+typed lifecycle methods use this protocol:
 
 ```text
-serializable reserve commit
-          │
-          ▼
+generic serializable reserve commit
+                  │
+                  ▼
+typed prepared -> starting commit
+with DB-clock lease and next epoch
+                  │
+                  ▼
 external physical operation
-          │
-          ▼
-serializable exact-CAS finalize
+                  │
+                  ▼
+typed serializable exact-CAS finalize
 ```
 
 The durable reservation closes launch, detach, fence, restore, and other
@@ -324,18 +401,18 @@ finalization acknowledgement is uncertain, the reservation and operation phase
 remain visible for explicit reconciliation; the authority never rolls back to
 an apparently safe state.
 
-## Required Canonical Session Lifecycle
+## Canonical Session Lifecycle
 
 The canonical document uses the lifecycle from the storage contract:
 
 ```mermaid
 stateDiagram-v2
   [*] --> DETACHED
-  DETACHED --> ATTACHING: reserve lease + increment epoch
-  ATTACHING --> ATTACHED: exact attachment proof
+  DETACHED --> ATTACHING: typed dispatch allocates lease and next epoch
+  ATTACHING --> ATTACHED: exact attachment proof, even after expiry
   ATTACHED --> RELEASING: close launch admission
   RELEASING --> DETACHED: verified detach
-  ATTACHING --> FENCING: attach unknown or lease expired
+  ATTACHING --> FENCING: later cleanup or fence decision
   ATTACHED --> FENCING: forced takeover
   RELEASING --> FENCING: detach unknown
   FENCING --> DETACHED: verified physical fence
@@ -344,14 +421,19 @@ stateDiagram-v2
   FENCING --> BLOCKED: fence unavailable
 ```
 
-A new writable acquisition and the beginning of force-fence advance the uint64
-fencing epoch. Renewal preserves the complete writer tuple and extends only the
-database-authoritative expiration. Epoch exhaustion fails closed.
+The `DETACHED -> ATTACHING -> ATTACHED` acquisition path is implemented.
+Release, force-fence, `FENCING`, and `BLOCKED` transitions remain later work. A
+new writable acquisition advances the uint64 fencing epoch; the later
+force-fence transition must also advance it. Renewal preserves the complete
+writer tuple and extends only the database-authoritative `expiresAt`. Epoch
+exhaustion fails closed.
 
-Lease expiry closes mutation and launch admission. It does not change the
-physical attachment state. After expiry, only exact-owner cleanup for the
-unchanged tuple may attempt detach. Once a newer epoch has been allocated, the
-old tuple is stale even for cleanup.
+Lease expiry closes subsequent mutation, renewal, and launch admission. It does
+not change the physical attachment state, move the lifecycle, or prove a
+fence. Exact attachment finalization still persists matching physical evidence
+after expiry. Once release is implemented, only exact-owner cleanup for the
+unchanged tuple may attempt detach after expiry. Once a newer epoch has been
+allocated, the old tuple is stale even for cleanup.
 
 ## Schema for Durable Claims and Reservations
 
@@ -373,6 +455,13 @@ The PostgreSQL schema intentionally stores state-machine documents as `jsonb`
 while keeping identities, revisions, timestamps, and uniqueness constraints in
 relational columns. Business transitions remain in the authority code so a
 database migration cannot silently invent a new lifecycle.
+
+Writer acquisition and renewal use those existing structures without DDL. The
+canonical session JSONB stores the lease, epoch, lifecycle, attachment, active
+pointer, and terminal anchor; the existing operation and reservation JSONB
+records store the exact typed request and terminal result. The established
+global operation identity and active session-conflict constraints remain the
+admission boundary.
 
 ## Platform Image Reservation
 
@@ -487,13 +576,19 @@ dispatch-grant single use, retained uncertainty, safe pre-dispatch
 cancellation, cancellation acknowledgement loss, version 1 exact request
 compatibility and upgrade-on-write, active-document downgrade rejection,
 post-import global/prototype mutation, pre-database U+0000 rejection,
-terminal-anchor relational corruption, and revision CAS. Image tests cover
-exact bytes, pre-allocation resource limits, descriptor and config identity,
-measurement drift, and one-use capability semantics. A separate GitHub Actions
-job runs the schema, registration, operation/reservation concurrency,
-active-document downgrade rejection, consecutive terminal-anchor replacement
-and historical replay, terminal-row corruption, and a post-commit dispatch
-acknowledgement-loss recovery case against a real PostgreSQL service. Later
-authority slices must add lease, lifecycle, epoch, catalogue, and launch
-transition tests. Physical-backend pull requests must add crash, detach/fence,
-container-launch, and cross-host conformance evidence.
+terminal-anchor relational corruption, and revision CAS. Writer-acquisition
+unit tests cover bounded DB-clock leases, deterministic typed dispatch, the
+complete uint64 epoch range and exhaustion, exact finalization from `starting`
+or `uncertain` after expiry, mismatched-proof rejection, terminal replay,
+provider-free renewal, exact renewal replay, and the equality-expired boundary.
+Image tests cover exact bytes, pre-allocation resource limits, descriptor and
+config identity, measurement drift, and one-use capability semantics. A
+separate GitHub Actions job runs the schema, registration,
+operation/reservation concurrency, active-document downgrade rejection,
+consecutive terminal-anchor replacement and historical replay, terminal-row
+corruption, attachment acquisition and lease renewal, and post-commit dispatch
+and attachment-finalization acknowledgement-loss recovery against a real
+PostgreSQL service. Later authority slices must add release, force-fence,
+`FENCING`, `BLOCKED`, catalogue, and launch transition tests. Physical-backend
+pull requests must add crash, detach/fence, container-launch, and cross-host
+conformance evidence.

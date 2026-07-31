@@ -242,6 +242,14 @@ conformance test must show that epoch-1 checkpoint, detach, and destroy requests
 fail after an epoch-2 takeover, and that reusing an operation ID with a different
 target fails.
 
+For backward compatibility, the generic storage contract v1 result retains its
+original exact shape and rejects `rootPath` for every mutation, including
+attach. The writer-attachment finalization extension uses a separately scoped
+provider result that requires a canonical host-local `rootPath`; it validates
+the root-path-free projection against the generic v1 contract and compares the
+path with the complete attachment record before persisting `ATTACHED`. A
+matching `proofId` does not authorize a caller-substituted path.
+
 Lease expiry closes control-plane admission; it does not prove that a stale
 host stopped writing. Automatic takeover requires either a storage-native
 epoch/reservation that rejects the old writer or verified revocation/detach of
@@ -268,7 +276,7 @@ stateDiagram-v2
   ATTACHING --> ATTACHED: backend attachment proof
   ATTACHED --> RELEASING: stop admission and worker
   RELEASING --> DETACHED: verified detach
-  ATTACHING --> FENCING: ambiguous or expired
+  ATTACHING --> FENCING: later cleanup after ambiguous outcome or expiry
   ATTACHED --> FENCING: expired or forced takeover
   RELEASING --> FENCING: detach uncertain
   FENCING --> DETACHED: verified fence
@@ -277,9 +285,13 @@ stateDiagram-v2
   FENCING --> BLOCKED: fence unavailable
 ```
 
-An ambiguous attach, detach, or fence never rolls back optimistically to
-`DETACHED`. A force-fence failure retains the advanced epoch and remains
-blocked.
+An exact matching attachment proof may still finalize `ATTACHING -> ATTACHED`
+after lease expiry because it records the physical outcome; expiry closes new
+admission but does not erase evidence or prove a fence. An attach with no exact
+proof, an ambiguous detach, or an ambiguous fence never rolls back
+optimistically to `DETACHED`. A later cleanup/fence decision may move an
+unresolved or expired attach into `FENCING`, and a force-fence failure retains
+the advanced epoch and remains blocked.
 
 ## Storage Backend Contract
 
@@ -434,7 +446,8 @@ Later pull requests own:
 
 - Podman/Docker launch and UID/SELinux mapping;
 - production local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
-- the linearizable binding database, renewer, idempotency store, and host fence;
+- exact-owner release, force-fence reconciliation, and the physical host fence
+  beyond the implemented PostgreSQL acquisition/finalization/renewal authority;
 - production held-directory launch authority, provider-specific mutation/fence
   transitions, proofs, and conformance validators beyond the stopped-directory
   adapter;

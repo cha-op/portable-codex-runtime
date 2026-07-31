@@ -69,9 +69,22 @@
   `uncertain` blockers across replay and restart. Only a still-`prepared`
   operation can be cancelled generically. A versioned terminal anchor binds
   each progressed inactive session to its latest committed operation and
-  released reservation while preserving legacy request hashes; lease,
-  attachment, physical callbacks, and typed success finalization remain later
-  work.
+  released reservation while preserving legacy request hashes.
+- A typed PostgreSQL writer-acquisition layer now reuses generic reservation,
+  then atomically claims `prepared -> starting` after locking the exact
+  session, operation, and reservation state. It reads `clock_timestamp()` at
+  that decision point, allocates a bounded lease, deterministic lease and
+  attachment IDs, and the next uint64 epoch, and persists `ATTACHING`.
+  Dispatch is granted only when enough PostgreSQL bigint revision capacity
+  remains to record an uncertain outcome and its exact finalization. Providers
+  remain outside transactions. Exact attachment evidence, including a
+  provider-result binding for the canonical host-local `rootPath`, can finalize
+  `starting` or `uncertain` to `ATTACHED`, including after lease expiry, while
+  retiring the operation, releasing the reservation, clearing the active
+  pointer, and writing the terminal anchor. Database-clock renewal is
+  exact-operation idempotent and changes only `expiresAt`; expiry equality
+  fails closed, and neither expiry nor epoch allocation proves a physical
+  fence.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -108,6 +121,8 @@
   `docs/project_journal/2026/07/2026-07-29-canonical-session-registry-4e8a2d.md`
 - Durable operation and reservation kernel:
   `docs/project_journal/2026/07/2026-07-29-operation-reservation-kernel-f3c8a1.md`
+- Writer lease and attachment acquisition:
+  `docs/project_journal/2026/07/2026-07-30-writer-lease-attachment-7b3e92.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

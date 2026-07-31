@@ -217,6 +217,18 @@ function assertUuid(value, code, label) {
   );
 }
 
+function assertAttachmentRootPath(value, code, label) {
+  ensure(
+    typeof value === "string" &&
+      !containsNullCharacter(value) &&
+      isAbsolute(value) &&
+      resolve(value) === value &&
+      value !== parse(value).root,
+    code,
+    `${label} must be an absolute host-local directory path`,
+  );
+}
+
 function assertOpaqueId(value, code, label) {
   ensure(
     isOpaqueId(value),
@@ -227,6 +239,13 @@ function assertOpaqueId(value, code, label) {
 
 function stringCharCodeAt(value, index) {
   return reflectApply(stringCharCodeAtIntrinsic, value, [index]);
+}
+
+function containsNullCharacter(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    if (stringCharCodeAt(value, index) === 0) return true;
+  }
+  return false;
 }
 
 function isAsciiAlphaNumeric(code) {
@@ -940,14 +959,10 @@ export function assertSessionAttachment(value) {
     "invalid_storage_attachment",
     "attachment must expose a normal directory",
   );
-  ensure(
-    typeof value.rootPath === "string" &&
-      !value.rootPath.includes("\0") &&
-      isAbsolute(value.rootPath) &&
-      resolve(value.rootPath) === value.rootPath &&
-      value.rootPath !== parse(value.rootPath).root,
+  assertAttachmentRootPath(
+    value.rootPath,
     "invalid_storage_attachment",
-    "attachment root must be an absolute host-local directory path",
+    "attachment root",
   );
   ensure(
     value.mode === "read-write",

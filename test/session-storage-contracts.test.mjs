@@ -784,6 +784,66 @@ test("attachment matching rejects cross-session authority despite Array every po
   assert.equal(template, undefined);
 });
 
+test("attachment paths reject NUL despite String prototype poisoning", () => {
+  const charCodeAtDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    "charCodeAt",
+  );
+  const includesDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    "includes",
+  );
+  const invalidRootPath = "/var/lib/portable-codex/session-001\0substituted";
+  let attachmentError;
+  let poisonedCharCodeAtCalls = 0;
+  let poisonedCalls = 0;
+  let charCodeAtCallsBeforeValidation;
+  let callsBeforeValidation;
+  try {
+    Object.defineProperty(String.prototype, "charCodeAt", {
+      ...charCodeAtDescriptor,
+      value() {
+        poisonedCharCodeAtCalls += 1;
+        return 47;
+      },
+    });
+    Object.defineProperty(String.prototype, "includes", {
+      ...includesDescriptor,
+      value() {
+        poisonedCalls += 1;
+        return false;
+      },
+    });
+    assert.equal("x".charCodeAt(0), 47);
+    assert.equal(invalidRootPath.includes("\0"), false);
+    charCodeAtCallsBeforeValidation = poisonedCharCodeAtCalls;
+    callsBeforeValidation = poisonedCalls;
+    try {
+      assertSessionAttachment(attachment({ rootPath: invalidRootPath }));
+    } catch (error) {
+      attachmentError = error;
+    }
+  } finally {
+    Object.defineProperty(
+      String.prototype,
+      "charCodeAt",
+      charCodeAtDescriptor,
+    );
+    Object.defineProperty(
+      String.prototype,
+      "includes",
+      includesDescriptor,
+    );
+  }
+
+  assert.equal(
+    poisonedCharCodeAtCalls,
+    charCodeAtCallsBeforeValidation,
+  );
+  assert.equal(poisonedCalls, callsBeforeValidation);
+  assert.ok(assertCode("invalid_storage_attachment")(attachmentError));
+});
+
 test("worker template ignores post-import clone and freeze poisoning across session bindings", () => {
   const manifest = sessionManifest();
   const storage = storageRef();
@@ -1051,6 +1111,40 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
   ]) {
     assert.deepEqual(assertStorageMutationRequest(mutationRequest({ operation })).target, target);
   }
+  const attachRequest = mutationRequest({ operation: "attach" });
+  const legacyAttachResult = {
+    ...attachRequest,
+    proofId: "proof-attachment-001",
+    status: "attached",
+  };
+  assert.deepEqual(
+    assertStorageMutationResult(legacyAttachResult, {
+      request: attachRequest,
+    }),
+    legacyAttachResult,
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        {
+          ...legacyAttachResult,
+          rootPath: "/var/lib/portable-codex/session-001",
+        },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageMutationResult(
+        {
+          ...result,
+          rootPath: "/var/lib/portable-codex/session-001",
+        },
+        { request },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
   for (const [operation, field] of [
     ["attach", "attachmentId"],
     ["checkpoint", "artifactId"],
