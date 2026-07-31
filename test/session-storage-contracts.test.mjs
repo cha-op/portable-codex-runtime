@@ -29,6 +29,8 @@ import {
   assertSessionStorageRef,
   assertStorageBackend,
   assertStorageBackendCapabilities,
+  assertStorageForceFenceRequest,
+  assertStorageForceFenceResult,
   assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
   assertStorageMutationResult,
@@ -155,6 +157,27 @@ function provisionRequest(overrides = {}) {
     backendId: "single-attach-test",
     sessionId: RUNTIME_SESSION_ID,
     operationId: "operation-provision-001",
+    ...overrides,
+  };
+}
+
+function forceFenceRequest(overrides = {}) {
+  return {
+    contractVersion: 1,
+    backendId: "single-attach-test",
+    storageId: "volume-001",
+    sessionId: RUNTIME_SESSION_ID,
+    fencingEpoch: "9007199254740994",
+    operationId: "operation-force-fence-001",
+    revokedFence: {
+      fencingEpoch: "9007199254740993",
+      holderId: "host-001",
+      leaseId: "lease-001",
+    },
+    target: {
+      attachmentId: "attachment-001",
+      kind: "attachment",
+    },
     ...overrides,
   };
 }
@@ -998,6 +1021,365 @@ test("storage provisioning is an idempotent control-plane mutation without write
     () => assertStorageMutationRequest({ ...mutationRequest(), operation: "provision" }),
     assertCode("invalid_storage_mutation"),
   );
+});
+
+test("storage force-fence envelopes are exact frozen defensive proofs", () => {
+  const request = forceFenceRequest();
+  const checkedRequest = assertStorageForceFenceRequest(request);
+  assert.deepEqual(checkedRequest, request);
+  assert(Object.isFrozen(checkedRequest));
+  assert(Object.isFrozen(checkedRequest.revokedFence));
+  assert(Object.isFrozen(checkedRequest.target));
+
+  request.revokedFence.holderId = "host-mutated";
+  request.target.attachmentId = "attachment-mutated";
+  assert.equal(checkedRequest.revokedFence.holderId, "host-001");
+  assert.equal(checkedRequest.target.attachmentId, "attachment-001");
+
+  const canonicalRequest = forceFenceRequest();
+  const result = {
+    ...canonicalRequest,
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+  };
+  const checkedResult = assertStorageForceFenceResult(result, {
+    request: canonicalRequest,
+  });
+  assert.deepEqual(checkedResult, result);
+  assert(Object.isFrozen(checkedResult));
+  assert(Object.isFrozen(checkedResult.revokedFence));
+  assert(Object.isFrozen(checkedResult.target));
+
+  result.revokedFence.leaseId = "lease-mutated";
+  result.target.attachmentId = "attachment-mutated";
+  assert.equal(checkedResult.revokedFence.leaseId, "lease-001");
+  assert.equal(checkedResult.target.attachmentId, "attachment-001");
+
+  assert.throws(
+    () => assertStorageMutationRequest(forceFenceRequest()),
+    assertCode("invalid_storage_mutation"),
+  );
+});
+
+test("storage force-fence requests reject invalid exact fields and non-advancing epochs", () => {
+  const request = forceFenceRequest();
+  const { target: omittedTarget, ...missingTarget } = request;
+  assert.equal(omittedTarget, request.target);
+  for (const invalid of [
+    { ...request, contractVersion: 2 },
+    { ...request, unexpected: true },
+    missingTarget,
+    { ...request, backendId: "" },
+    { ...request, storageId: "volume/001" },
+    { ...request, sessionId: "not-a-uuid" },
+    { ...request, operationId: "operation force fence" },
+    {
+      ...request,
+      revokedFence: { ...request.revokedFence, holderId: "" },
+    },
+    {
+      ...request,
+      revokedFence: { ...request.revokedFence, leaseId: "lease/001" },
+    },
+    {
+      ...request,
+      revokedFence: { ...request.revokedFence, unexpected: true },
+    },
+    {
+      ...request,
+      target: { ...request.target, attachmentId: "" },
+    },
+    {
+      ...request,
+      target: { ...request.target, kind: "checkpoint" },
+    },
+    {
+      ...request,
+      target: { ...request.target, unexpected: true },
+    },
+  ]) {
+    assert.throws(
+      () => assertStorageForceFenceRequest(invalid),
+      assertCode("invalid_storage_force_fence"),
+    );
+  }
+
+  for (const fencingEpoch of [
+    2,
+    "",
+    "0",
+    "01",
+    "1e3",
+    "18446744073709551616",
+  ]) {
+    assert.throws(
+      () =>
+        assertStorageForceFenceRequest({
+          ...request,
+          fencingEpoch,
+        }),
+      assertCode("invalid_storage_force_fence"),
+    );
+    assert.throws(
+      () =>
+        assertStorageForceFenceRequest({
+          ...request,
+          revokedFence: {
+            ...request.revokedFence,
+            fencingEpoch,
+          },
+        }),
+      assertCode("invalid_storage_force_fence"),
+    );
+  }
+
+  for (const fencingEpoch of [
+    request.revokedFence.fencingEpoch,
+    "9007199254740992",
+  ]) {
+    assert.throws(
+      () =>
+        assertStorageForceFenceRequest({
+          ...request,
+          fencingEpoch,
+        }),
+      assertCode("invalid_storage_force_fence"),
+    );
+  }
+
+  assert.deepEqual(
+    assertStorageForceFenceRequest(
+      forceFenceRequest({
+        fencingEpoch: "18446744073709551615",
+        revokedFence: {
+          fencingEpoch: "18446744073709551614",
+          holderId: "host-001",
+          leaseId: "lease-001",
+        },
+      }),
+    ).fencingEpoch,
+    "18446744073709551615",
+  );
+});
+
+test("storage force-fence results must project the complete request", () => {
+  const request = forceFenceRequest();
+  const result = {
+    ...request,
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+  };
+  const { status: omittedStatus, ...missingStatus } = result;
+  assert.equal(omittedStatus, "fenced");
+  for (const invalid of [
+    { ...result, proofId: "" },
+    { ...result, status: "detached" },
+    { ...result, unexpected: true },
+    missingStatus,
+    { ...result, backendId: "other-backend" },
+    { ...result, fencingEpoch: "9007199254740995" },
+    { ...result, operationId: "operation-force-fence-002" },
+    { ...result, sessionId: OTHER_RUNTIME_SESSION_ID },
+    { ...result, storageId: "volume-002" },
+    {
+      ...result,
+      revokedFence: {
+        ...result.revokedFence,
+        fencingEpoch: "9007199254740992",
+      },
+    },
+    {
+      ...result,
+      revokedFence: {
+        ...result.revokedFence,
+        holderId: "host-002",
+      },
+    },
+    {
+      ...result,
+      revokedFence: {
+        ...result.revokedFence,
+        leaseId: "lease-002",
+      },
+    },
+    {
+      ...result,
+      target: {
+        ...result.target,
+        attachmentId: "attachment-002",
+      },
+    },
+  ]) {
+    assert.throws(
+      () => assertStorageForceFenceResult(invalid, { request }),
+      assertCode("invalid_storage_force_fence"),
+    );
+  }
+
+  assert.throws(
+    () => assertStorageForceFenceResult(result),
+    assertCode("invalid_storage_force_fence"),
+  );
+  assert.throws(
+    () =>
+      assertStorageForceFenceResult(result, {
+        request,
+        previousResult: result,
+      }),
+    assertCode("invalid_storage_force_fence"),
+  );
+});
+
+test("storage force-fence validators reject proxies and accessors without invoking them", () => {
+  let traps = 0;
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        traps += 1;
+        throw new Error("hostile getPrototypeOf trap");
+      },
+      ownKeys() {
+        traps += 1;
+        throw new Error("hostile ownKeys trap");
+      },
+    },
+  );
+  assert.throws(
+    () => assertStorageForceFenceRequest(hostile),
+    assertCode("invalid_storage_force_fence"),
+  );
+  assert.throws(
+    () =>
+      assertStorageForceFenceRequest(
+        forceFenceRequest({ revokedFence: hostile }),
+      ),
+    assertCode("invalid_storage_force_fence"),
+  );
+  assert.throws(
+    () =>
+      assertStorageForceFenceRequest(
+        forceFenceRequest({ target: hostile }),
+      ),
+    assertCode("invalid_storage_force_fence"),
+  );
+  assert.equal(traps, 0);
+
+  const accessorRequest = forceFenceRequest();
+  let reads = 0;
+  Object.defineProperty(accessorRequest, "fencingEpoch", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "9007199254740994";
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceRequest(accessorRequest),
+    assertCode("invalid_storage_force_fence"),
+  );
+
+  const nestedAccessorRequest = forceFenceRequest();
+  Object.defineProperty(nestedAccessorRequest.revokedFence, "leaseId", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "lease-001";
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceRequest(nestedAccessorRequest),
+    assertCode("invalid_storage_force_fence"),
+  );
+
+  const request = forceFenceRequest();
+  const result = {
+    ...request,
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+  };
+  const options = { request };
+  Object.defineProperty(options, "request", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return request;
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceResult(result, options),
+    assertCode("invalid_storage_force_fence"),
+  );
+  assert.equal(reads, 0);
+});
+
+test("storage force-fence validation uses captured intrinsics", () => {
+  const request = forceFenceRequest();
+  const result = {
+    ...request,
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+  };
+  const targets = [
+    [Array.prototype, "every"],
+    [Array.prototype, "includes"],
+    [Object, "freeze"],
+    [Object, "getOwnPropertyDescriptor"],
+    [Object, "getPrototypeOf"],
+    [Object, "hasOwn"],
+    [Object, "isFrozen"],
+    [Object, "keys"],
+    [Object, "values"],
+    [Reflect, "apply"],
+    [Reflect, "ownKeys"],
+    [RegExp.prototype, "exec"],
+    [RegExp.prototype, "test"],
+    [String.prototype, "charCodeAt"],
+    [globalThis, "BigInt"],
+    [globalThis, "structuredClone"],
+    [utilTypes, "isProxy"],
+  ].map(([owner, key]) => ({
+    descriptor: Object.getOwnPropertyDescriptor(owner, key),
+    key,
+    owner,
+  }));
+  let checkedRequest;
+  let checkedResult;
+  let poisonedCalls = 0;
+  let validationError;
+  try {
+    for (const target of targets) {
+      Object.defineProperty(target.owner, target.key, {
+        ...target.descriptor,
+        value() {
+          poisonedCalls += 1;
+          throw new Error(`poisoned ${target.key}`);
+        },
+      });
+    }
+    try {
+      checkedRequest = assertStorageForceFenceRequest(request);
+      checkedResult = assertStorageForceFenceResult(result, { request });
+    } catch (error) {
+      validationError = error;
+    }
+  } finally {
+    for (const target of targets) {
+      Object.defineProperty(
+        target.owner,
+        target.key,
+        target.descriptor,
+      );
+    }
+  }
+
+  assert.equal(validationError, undefined);
+  assert.equal(poisonedCalls, 0);
+  assert.deepEqual(checkedRequest, request);
+  assert.deepEqual(checkedResult, result);
+  assert(Object.isFrozen(checkedResult));
+  assert(Object.isFrozen(checkedResult.revokedFence));
+  assert(Object.isFrozen(checkedResult.target));
 });
 
 test("storage mutation envelopes bind operation IDs to the complete writer fence", () => {

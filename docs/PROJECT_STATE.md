@@ -85,6 +85,16 @@
   exact-operation idempotent and changes only `expiresAt`; expiry equality
   fails closed, and neither expiry nor epoch allocation proves a physical
   fence.
+- Typed writer release and force-fence reconciliation now reuse the same
+  schema and generic reservation kernel. Exact-owner release preserves the
+  lease tuple and epoch and may finalize a matching detach after expiry.
+  Force-fence dispatch starts only from `ATTACHED` or `BLOCKED`, advances the
+  uint64 epoch at its definite dispatch commit, and enters `FENCING`; only the
+  dedicated exact provider proof reaches `DETACHED`. Ambiguous or unavailable
+  outcomes finalize to `BLOCKED` while retaining the tuple, target, and current
+  epoch, and explicit recovery dispatch is required for
+  `BLOCKED -> FENCING`. Manual backends cannot complete automatic fencing, and
+  database expiry or epoch state is never physical fence evidence.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -123,6 +133,8 @@
   `docs/project_journal/2026/07/2026-07-29-operation-reservation-kernel-f3c8a1.md`
 - Writer lease and attachment acquisition:
   `docs/project_journal/2026/07/2026-07-30-writer-lease-attachment-7b3e92.md`
+- Writer release and force-fence reconciliation:
+  `docs/project_journal/2026/07/2026-07-31-release-force-fence-e4b9c7.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

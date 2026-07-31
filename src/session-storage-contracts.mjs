@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
+const bigIntIntrinsic = BigInt;
 const isProxyValue = utilTypes.isProxy;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
@@ -727,11 +728,23 @@ export function assertResolvedPlatformImageMatchesManifest(options) {
 
 function parseFencingEpochForRecord(value, code) {
   ensure(
-    typeof value === "string" && /^[1-9][0-9]{0,19}$/u.test(value),
+    typeof value === "string" &&
+      value.length >= 1 &&
+      value.length <= 20 &&
+      stringCharCodeAt(value, 0) >= 49 &&
+      stringCharCodeAt(value, 0) <= 57,
     code,
     "fencing epoch must be a canonical positive decimal string",
   );
-  const epoch = BigInt(value);
+  for (let index = 1; index < value.length; index += 1) {
+    const codePoint = stringCharCodeAt(value, index);
+    ensure(
+      codePoint >= 48 && codePoint <= 57,
+      code,
+      "fencing epoch must be a canonical positive decimal string",
+    );
+  }
+  const epoch = bigIntIntrinsic(value);
   ensure(epoch <= UINT64_MAX, code, "fencing epoch exceeds uint64");
   return epoch;
 }
@@ -1076,6 +1089,182 @@ export function assertCheckpointCaptureReconciliationBackend(value) {
     "storage backend does not support checkpoint capture reconciliation",
   );
   return backend;
+}
+
+function assertStorageForceFenceRevokedFence(value) {
+  assertExactObject(
+    value,
+    ["fencingEpoch", "holderId", "leaseId"],
+    "invalid_storage_force_fence",
+    "revoked storage fence",
+  );
+  assertOpaqueId(
+    value.holderId,
+    "invalid_storage_force_fence",
+    "revoked fence holder ID",
+  );
+  assertOpaqueId(
+    value.leaseId,
+    "invalid_storage_force_fence",
+    "revoked fence lease ID",
+  );
+  return parseFencingEpochForRecord(
+    value.fencingEpoch,
+    "invalid_storage_force_fence",
+  );
+}
+
+function assertStorageForceFenceTarget(value) {
+  assertExactObject(
+    value,
+    ["attachmentId", "kind"],
+    "invalid_storage_force_fence",
+    "storage force-fence target",
+  );
+  assertOpaqueId(
+    value.attachmentId,
+    "invalid_storage_force_fence",
+    "force-fence target attachment ID",
+  );
+  ensure(
+    value.kind === "attachment",
+    "invalid_storage_force_fence",
+    "storage force-fence target kind is unsupported",
+  );
+}
+
+export function assertStorageForceFenceRequest(value) {
+  assertExactObject(
+    value,
+    [
+      "backendId",
+      "contractVersion",
+      "fencingEpoch",
+      "operationId",
+      "revokedFence",
+      "sessionId",
+      "storageId",
+      "target",
+    ],
+    "invalid_storage_force_fence",
+    "storage force-fence request",
+  );
+  ensure(
+    value.contractVersion === STORAGE_CONTRACT_VERSION,
+    "invalid_storage_force_fence",
+    "storage force-fence contract version is unsupported",
+  );
+  assertOpaqueId(
+    value.backendId,
+    "invalid_storage_force_fence",
+    "force-fence backend ID",
+  );
+  assertOpaqueId(
+    value.storageId,
+    "invalid_storage_force_fence",
+    "force-fence storage ID",
+  );
+  assertUuid(
+    value.sessionId,
+    "invalid_storage_force_fence",
+    "force-fence session ID",
+  );
+  assertOpaqueId(
+    value.operationId,
+    "invalid_storage_force_fence",
+    "force-fence operation ID",
+  );
+  const fencingEpoch = parseFencingEpochForRecord(
+    value.fencingEpoch,
+    "invalid_storage_force_fence",
+  );
+  const revokedFencingEpoch = assertStorageForceFenceRevokedFence(
+    value.revokedFence,
+  );
+  ensure(
+    fencingEpoch > revokedFencingEpoch,
+    "invalid_storage_force_fence",
+    "storage force-fence epoch must advance the revoked fence",
+  );
+  assertStorageForceFenceTarget(value.target);
+  return deepFreeze(
+    defensiveClone(
+      value,
+      "invalid_storage_force_fence",
+      "storage force-fence request",
+    ),
+  );
+}
+
+export function assertStorageForceFenceResult(value, options) {
+  const { request } = assertOptionsObject(
+    options,
+    ["request"],
+    ["request"],
+    "invalid_storage_force_fence",
+    "storage force-fence result options",
+  );
+  assertExactObject(
+    value,
+    [
+      "backendId",
+      "contractVersion",
+      "fencingEpoch",
+      "operationId",
+      "proofId",
+      "revokedFence",
+      "sessionId",
+      "status",
+      "storageId",
+      "target",
+    ],
+    "invalid_storage_force_fence",
+    "storage force-fence result",
+  );
+  const expected = assertStorageForceFenceRequest(request);
+  const actual = assertStorageForceFenceRequest({
+    backendId: value.backendId,
+    contractVersion: value.contractVersion,
+    fencingEpoch: value.fencingEpoch,
+    operationId: value.operationId,
+    revokedFence: value.revokedFence,
+    sessionId: value.sessionId,
+    storageId: value.storageId,
+    target: value.target,
+  });
+  assertOpaqueId(
+    value.proofId,
+    "invalid_storage_force_fence",
+    "force-fence proof ID",
+  );
+  ensure(
+    value.status === "fenced",
+    "invalid_storage_force_fence",
+    "storage force-fence result status is unsupported",
+  );
+  ensure(
+    expected.backendId === actual.backendId &&
+      expected.contractVersion === actual.contractVersion &&
+      expected.fencingEpoch === actual.fencingEpoch &&
+      expected.operationId === actual.operationId &&
+      expected.sessionId === actual.sessionId &&
+      expected.storageId === actual.storageId &&
+      expected.revokedFence.fencingEpoch ===
+        actual.revokedFence.fencingEpoch &&
+      expected.revokedFence.holderId === actual.revokedFence.holderId &&
+      expected.revokedFence.leaseId === actual.revokedFence.leaseId &&
+      expected.target.attachmentId === actual.target.attachmentId &&
+      expected.target.kind === actual.target.kind,
+    "invalid_storage_force_fence",
+    "storage force-fence result does not match its request",
+  );
+  return deepFreeze(
+    defensiveClone(
+      value,
+      "invalid_storage_force_fence",
+      "storage force-fence result",
+    ),
+  );
 }
 
 function assertStorageMutationTarget(value, { operation, storageId }) {

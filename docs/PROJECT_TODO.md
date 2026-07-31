@@ -34,11 +34,11 @@
   reconciliation.
 - [done] Implement database-clock writer lease acquisition and renewal plus
   exact attachment finalization with monotonic uint64 fencing epochs.
-- [pending] Implement release, force-fence, `FENCING`, and `BLOCKED`
+- [done] Implement release, force-fence, `FENCING`, and `BLOCKED`
   reconciliation without treating database epoch allocation as a physical
   fence.
-- [pending] Implement the production checkpoint mutation-authority and
-  catalogue adapter.
+- [pending] Implement the production checkpoint mutation authority and
+  catalogue.
 - [pending] Implement logical launcher admission and durable launch-attempt
   lifecycle around the measured-image reservation.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by

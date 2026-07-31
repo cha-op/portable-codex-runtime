@@ -63,10 +63,11 @@ See `docs/architecture/auth-broker.md` for the security and recovery contract.
 
 The runtime now has executable v1 record validators for a secret-free session
 manifest, trusted OCI-resolution matching, uint64 fencing epochs,
-lease/attachment matching, declared storage backend capabilities, structural
-rootless worker directory binds, and recovery checkpoint classes. Physical
-launch, fencing, and snapshot authorization remain the responsibility of later
-concrete adapters and their conformance tests.
+lease/attachment matching, dedicated exact force-fence request/result
+envelopes, declared storage backend capabilities, structural rootless worker
+directory binds, and recovery checkpoint classes. Physical launch, fencing,
+and snapshot authorization remain the responsibility of later concrete
+adapters and their conformance tests.
 The worker sees one ordinary directory at `/session`; a host storage agent owns
 raw volumes, filesystem images, attach/mount operations, and stale-writer
 fencing. `CODEX_HOME`, the effective Codex `sqlite_home`, and the workspace
@@ -96,10 +97,19 @@ them.
 Typed writer acquisition now allocates one database-clock lease and uint64
 epoch, finalizes exact provider mutation and attachment evidence from definite
 or uncertain dispatch, and renews only the lease expiration through an
-idempotent terminal operation. Concrete provider execution, exact-owner
-release, force-fence reconciliation, and launcher admission remain later
-authority slices; neither a database lease nor a higher epoch is a physical
-writer fence.
+idempotent terminal operation. `writer-release-v1` preserves the exact owner
+tuple and epoch while dispatching detach, including unchanged-owner cleanup
+after expiry. `writer-force-fence-v1` advances the epoch only at its definite
+typed dispatch commit from `ATTACHED` or `BLOCKED`; only the matching dedicated
+provider proof can finalize `FENCING -> DETACHED`. Ambiguous or unavailable
+provider outcomes finalize to `BLOCKED` with the tuple, target, and current
+epoch retained. These paths use generic reserve, typed dispatch, provider
+execution outside the transaction, and typed finalization without schema DDL.
+Unit and real-PostgreSQL coverage exercise exact replay, expiry, ambiguity,
+manual-backend rejection, epoch retention, and explicit
+`BLOCKED -> FENCING` recovery. Physical backend execution, checkpoint
+mutation/catalogue authority, and launcher admission remain later slices;
+neither a database lease nor a higher epoch is a physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux

@@ -1263,7 +1263,7 @@ test("reentrant higher-fence registration cannot replace the only live slot writ
     globalThis.BigInt = originalBigInt;
   }
 
-  assert.equal(bigIntCalls, 2);
+  assert.equal(bigIntCalls, 0);
   assert.equal(innerWriter, undefined);
   assertOpaqueHandle(outerWriter);
   assert.equal(innerStopCalls, 0);
@@ -1339,7 +1339,7 @@ test("fresh-slot registration validates fencing epochs with captured intrinsics"
     globalThis.BigInt = originalBigInt;
   }
 
-  assert.equal(bigIntCalls, 2);
+  assert.equal(bigIntCalls, 0);
   assert.equal(stopCalls, 0);
   assert.equal(coordinator.dispose(), undefined);
 });
@@ -1446,7 +1446,7 @@ test("registration validation ignores RegExp exec prototype poisoning", () => {
     assert.equal(observation.disposeResult, undefined, observation.label);
   }
   assert.equal(observations[0].after, observations[0].before);
-  assert(observations[1].after > observations[1].before);
+  assert.equal(observations[1].after, observations[1].before);
   for (const observation of observations.slice(2)) {
     assert.equal(observation.after, observation.before, observation.label);
   }
