@@ -14,19 +14,18 @@ The implemented authority provides:
 - canonical, idempotent session registration with strict readback;
 - a durable session-wide operation and reservation phase kernel; and
 - typed database-clock writer attachment dispatch, exact attachment
-  finalization, and exact lease renewal.
+  finalization, exact lease renewal, exact-owner release, and force-fence
+  reconciliation.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
 operation kernel then binds one exact request to one active session reservation
-before any external dispatch can begin. The writer-acquisition slice turns the
-lease and attachment records in `session-storage-contracts.mjs` into typed
-serializable decisions for `ATTACHING` and `ATTACHED`. Subsequent authority
-slices will implement:
-
-- release and force-fence transitions;
-- checkpoint-catalogue finalization; and
-- logical launcher admission.
+before any external dispatch can begin. The typed writer lifecycle turns the
+lease, attachment, detach, and force-fence records in
+`session-storage-contracts.mjs` into serializable decisions for
+`ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, and `DETACHED`.
+Subsequent authority slices will implement checkpoint mutation/catalogue
+finalization and logical launcher admission.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -36,9 +35,11 @@ still does not execute a provider callback. The authority does not mount
 storage, launch a container, resolve a registry tag, verify an image publisher,
 stop a writer, or prove a physical fence. A caller invokes the exact provider
 request outside the transaction and returns its exact evidence for typed
-finalization. The current stopped-directory backend declares
-`fencing: "manual"` and therefore cannot use lease expiration or a higher
-database epoch alone for automatic host takeover.
+finalization. Release and force-fence use the same reserve, typed-dispatch,
+external-provider, and typed-finalization order. The current
+stopped-directory backend declares `fencing: "manual"` and therefore cannot
+successfully finalize an automatic force-fence proof or use lease expiration
+or a higher database epoch alone for host takeover.
 
 ## Protected Properties
 
@@ -55,11 +56,11 @@ The authority protects three different properties and keeps them distinct:
    new logical admissions, but does not itself provide that proof.
 
 The PostgreSQL registry protects the immutable part of canonical identity. The
-operation kernel and typed writer-acquisition methods use the executor and
-schema to order reservation, lease allocation, attachment finalization, and
-renewal. Release, force-fence, catalogue, and launcher transitions remain later
-slices. Physical exclusion evidence must be supplied by a capable storage
-backend or supervisor.
+operation kernel and typed writer lifecycle methods use the executor and
+schema to order reservation, lease allocation, attachment finalization,
+renewal, release, force-fence epoch advancement, and blocked reconciliation.
+Catalogue and launcher transitions remain later slices. Physical exclusion
+evidence must be supplied by a capable storage backend or supervisor.
 
 ## Implemented Canonical Session Registry
 
@@ -205,11 +206,11 @@ that model.
 
 The generic kernel has no expiry, steal, or automatic release rule. `starting`
 and `uncertain` survive process restart and continue to block the session. The
-typed writer-acquisition methods described below verify their own completion
-evidence and atomically combine the business-state update with operation
-finalization. Later fencing, catalogue, and launch methods must preserve that
-rule: they must not call a generic finalizer first and update the canonical
-lifecycle in a second transaction.
+typed writer methods described below verify their own completion evidence and
+atomically combine the business-state update with operation finalization.
+Catalogue and launch methods must preserve that rule: they must not call a
+generic finalizer first and update the canonical lifecycle in a second
+transaction.
 
 ## Implemented Writer Lease and Attachment Acquisition
 
@@ -273,6 +274,66 @@ at revision 0, a released reservation, the matching terminal anchor, and the
 updated session revision. The globally unique operation ID makes an exact
 replay return the original result without another clock read or extension;
 conflicting reuse fails closed.
+
+## Implemented Writer Release and Force-Fence Reconciliation
+
+This slice also reuses the existing schema and canonical version 2 JSONB
+documents without DDL. It adds the typed operation kinds `writer-release-v1`
+and `writer-force-fence-v1`. Both use the same ordered boundary as
+acquisition:
+
+```text
+generic reserve commit
+          │
+          ▼
+typed dispatch commit
+          │
+          ▼
+provider outside every database transaction
+          │
+          ▼
+typed exact-proof finalize
+```
+
+An ambiguous provider or acknowledgement outcome does not use a generic
+terminal path. The caller first records `starting -> uncertain`, then invokes
+`finalizeWriterOperationBlocked()` with the exact typed request and either
+`provider-outcome-unresolved` or `fence-unavailable`. That terminal transaction
+releases the reservation and enters `BLOCKED` while preserving the exact lease,
+attachment when known, force-fence target, and current epoch for explicit
+recovery.
+
+Release starts only from the exact `ATTACHED` snapshot and target.
+`claimWriterReleaseDispatch()` changes `prepared -> starting` and enters
+`RELEASING` without changing the lease tuple or writer epoch. The exact-owner
+detach request remains admissible after lease expiry, but only for that
+unchanged session, lease, holder, epoch, attachment target, storage identity,
+and operation. Expiry is not permission to detach a different or newer
+attachment. `finalizeWriterRelease()` accepts only the matching successful
+detach result and atomically enters `DETACHED`, clears the lease and
+attachment, retires the operation, releases the reservation, and writes the
+terminal anchor. Finalization may consume matching evidence from either
+`starting` or `uncertain`; an exact committed replay performs no write.
+
+Force-fence reservation starts only from an exact `ATTACHED` or `BLOCKED`
+snapshot with a retained lease and exact attachment target. On the definite
+typed dispatch commit, `claimWriterForceFenceDispatch()` advances the canonical
+decimal-string epoch once within uint64, changes `prepared -> starting`, and
+enters `FENCING`. Replay, restart, or commit uncertainty cannot grant dispatch
+or advance the epoch again. The provider receives a dedicated force-fence
+storage envelope that binds the new epoch, revoked old lease tuple, attachment
+target, storage identity, and operation ID. It runs outside the transaction.
+
+Only the independently validated matching force-fence result with
+`status: "fenced"` and an opaque provider proof can let
+`finalizeWriterForceFence()` enter `DETACHED`. A generic detach result, lease
+expiry, the advanced database epoch, or a caller assertion is not that proof.
+A backend declaring `fencing: "manual"` cannot successfully complete this
+automatic proof path. If fencing is unavailable or its outcome is ambiguous,
+typed blocked finalization enters `BLOCKED` and retains the already advanced
+epoch, revoked lease, known attachment, and target. Recovery from `BLOCKED`
+requires a new explicit force-fence reservation and dispatch; its dispatch
+advances the epoch again before re-entering `FENCING`.
 
 ## Implemented PostgreSQL Transaction Boundary
 
@@ -370,7 +431,7 @@ rollback, so stale or forged `commitState` evidence cannot cross operation
 boundaries. Store errors define frozen own data fields rather than consulting
 mutable prototype accessors for their reported state.
 
-The operation kernel and typed writer-acquisition path use that executor to
+The operation kernel and typed writer lifecycle paths use that executor to
 lock the canonical session row, claim or validate operation and reservation
 rows, validate the complete expected identity and revision, and commit durable
 `prepared` and typed `starting` phases before any external provider callback
@@ -378,21 +439,22 @@ starts. The owning session's current active operation and reservation are
 locked in that order. A foreign or already retired operation ID is read only as
 snapshot-consistent identity evidence, not locked, so crossed foreign IDs
 cannot introduce a second lock order. An external callback must not be held
-inside a database transaction. The implemented acquisition path and later
-typed lifecycle methods use this protocol:
+inside a database transaction. Acquisition, release, and force-fence use this
+protocol:
 
 ```text
 generic serializable reserve commit
                   │
                   ▼
 typed prepared -> starting commit
-with DB-clock lease and next epoch
+with lifecycle-specific tuple/epoch decision
                   │
                   ▼
 external physical operation
                   │
                   ▼
-typed serializable exact-CAS finalize
+typed serializable exact-CAS success finalize
+or uncertain -> typed BLOCKED finalize
 ```
 
 The durable reservation closes launch, detach, fence, restore, and other
@@ -410,30 +472,30 @@ stateDiagram-v2
   [*] --> DETACHED
   DETACHED --> ATTACHING: typed dispatch allocates lease and next epoch
   ATTACHING --> ATTACHED: exact attachment proof, even after expiry
-  ATTACHED --> RELEASING: close launch admission
-  RELEASING --> DETACHED: verified detach
-  ATTACHING --> FENCING: later cleanup or fence decision
-  ATTACHED --> FENCING: forced takeover
-  RELEASING --> FENCING: detach unknown
-  FENCING --> DETACHED: verified physical fence
-  ATTACHING --> BLOCKED: unresolved provider outcome
-  RELEASING --> BLOCKED: unresolved provider outcome
-  FENCING --> BLOCKED: fence unavailable
+  ATTACHING --> BLOCKED: typed ambiguous-outcome finalization
+  ATTACHED --> RELEASING: exact-owner release dispatch
+  RELEASING --> DETACHED: exact detach proof, even after expiry
+  RELEASING --> BLOCKED: typed ambiguous-outcome finalization
+  ATTACHED --> FENCING: force-fence dispatch advances epoch
+  BLOCKED --> FENCING: explicit recovery dispatch advances epoch
+  FENCING --> DETACHED: independent exact force-fence proof
+  FENCING --> BLOCKED: unavailable or ambiguous fence finalization
 ```
 
-The `DETACHED -> ATTACHING -> ATTACHED` acquisition path is implemented.
-Release, force-fence, `FENCING`, and `BLOCKED` transitions remain later work. A
-new writable acquisition advances the uint64 fencing epoch; the later
-force-fence transition must also advance it. Renewal preserves the complete
-writer tuple and extends only the database-authoritative `expiresAt`. Epoch
-exhaustion fails closed.
+The acquisition, renewal, release, force-fence, `FENCING`, and `BLOCKED`
+authority transitions are implemented. A new writable acquisition and each
+force-fence dispatch advance the uint64 fencing epoch. Release and renewal do
+not. Renewal preserves the complete writer tuple and extends only the
+database-authoritative `expiresAt`. Epoch exhaustion fails closed.
 
 Lease expiry closes subsequent mutation, renewal, and launch admission. It does
-not change the physical attachment state, move the lifecycle, or prove a
-fence. Exact attachment finalization still persists matching physical evidence
-after expiry. Once release is implemented, only exact-owner cleanup for the
-unchanged tuple may attempt detach after expiry. Once a newer epoch has been
-allocated, the old tuple is stale even for cleanup.
+not change the physical attachment state, move the lifecycle to `FENCING`, or
+prove a fence. Exact attachment finalization still persists matching physical
+evidence after expiry, and exact-owner cleanup for the unchanged tuple and
+target may detach after expiry. Once a newer epoch has been allocated, the old
+tuple is stale even for cleanup. Moving from `BLOCKED` to `FENCING` always
+requires a separately reserved force-fence operation and a definite typed
+dispatch commit.
 
 ## Schema for Durable Claims and Reservations
 
@@ -456,12 +518,12 @@ while keeping identities, revisions, timestamps, and uniqueness constraints in
 relational columns. Business transitions remain in the authority code so a
 database migration cannot silently invent a new lifecycle.
 
-Writer acquisition and renewal use those existing structures without DDL. The
-canonical session JSONB stores the lease, epoch, lifecycle, attachment, active
-pointer, and terminal anchor; the existing operation and reservation JSONB
-records store the exact typed request and terminal result. The established
-global operation identity and active session-conflict constraints remain the
-admission boundary.
+Writer acquisition, renewal, release, force-fence, and blocked finalization use
+those existing structures without DDL. The canonical session JSONB stores the
+lease, epoch, lifecycle, attachment, active pointer, and terminal anchor; the
+existing operation and reservation JSONB records store each exact typed
+request and terminal result. The established global operation identity and
+active session-conflict constraints remain the admission boundary.
 
 ## Platform Image Reservation
 
@@ -581,6 +643,12 @@ unit tests cover bounded DB-clock leases, deterministic typed dispatch, the
 complete uint64 epoch range and exhaustion, exact finalization from `starting`
 or `uncertain` after expiry, mismatched-proof rejection, terminal replay,
 provider-free renewal, exact renewal replay, and the equality-expired boundary.
+Writer lifecycle tests cover exact-owner release after expiry without epoch
+advancement, target and tuple mismatch rejection, exact detach replay,
+force-fence dispatch from `ATTACHED` or `BLOCKED`, single uint64 epoch
+advancement per dispatch, dedicated force-fence proof binding, manual-backend
+rejection, typed ambiguous/unavailable finalization to `BLOCKED`, retained
+tuple/target/epoch state, and explicit `BLOCKED -> FENCING` recovery.
 Image tests cover exact bytes, pre-allocation resource limits, descriptor and
 config identity, measurement drift, and one-use capability semantics. A
 separate GitHub Actions job runs the schema, registration,
@@ -588,7 +656,8 @@ operation/reservation concurrency, active-document downgrade rejection,
 consecutive terminal-anchor replacement and historical replay, terminal-row
 corruption, attachment acquisition and lease renewal, and post-commit dispatch
 and attachment-finalization acknowledgement-loss recovery against a real
-PostgreSQL service. Later authority slices must add release, force-fence,
-`FENCING`, `BLOCKED`, catalogue, and launch transition tests. Physical-backend
-pull requests must add crash, detach/fence, container-launch, and cross-host
-conformance evidence.
+PostgreSQL service. Release and force-fence PostgreSQL integration coverage
+exercises exact dispatch/finalization replay, uncertain-to-blocked recovery,
+and retained advanced epochs. Later authority slices must add catalogue and
+launch transition tests. Physical-backend pull requests must add crash,
+detach/fence, container-launch, and cross-host conformance evidence.

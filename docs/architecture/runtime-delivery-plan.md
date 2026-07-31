@@ -74,7 +74,7 @@ plane.
       runnable-image reservation without claiming writer lifecycle or
       container launch.
 
-The sequence through PR #14 plus the first three follow-on slices is complete.
+The sequence through PR #14 plus the first four follow-on slices is complete.
 The six-item follow-on sequence does not preallocate GitHub PR numbers:
 
 1. **Canonical session registry (complete)**
@@ -94,11 +94,22 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
      `uncertain`, even if the lease expired while the provider ran.
    - Renew only `expiresAt` in one database-clock, globally operation-ID
      idempotent terminal transaction; expiry equality cannot be renewed.
-4. **Release and force-fence reconciliation**
-   - Close writer admission, release exact owners, force-fence stale writers,
-     and preserve `FENCING` or `BLOCKED` state when physical outcomes are
-     unresolved.
-5. **Checkpoint catalogue authority**
+4. **Release and force-fence reconciliation (complete)**
+   - Reuse the existing schema without DDL. Add `writer-release-v1` and
+     `writer-force-fence-v1` to the generic reserve, typed dispatch,
+     provider-outside-transaction, and typed finalize protocol.
+   - Let only the exact owner detach the unchanged attachment after expiry
+     without advancing the epoch. Finalize ambiguous acquire, release, or
+     force-fence outcomes to `BLOCKED` while retaining their tuple, target, and
+     current epoch.
+   - Advance the uint64 epoch only when force-fence dispatch definitely commits
+     from `ATTACHED` or `BLOCKED`, then enter `FENCING`. Enter `DETACHED` only
+     from an independently validated dedicated force-fence proof; unavailable
+     fencing returns to `BLOCKED` with the advanced epoch retained.
+   - Keep manual backends incapable of completing the automatic proof. Lease
+     expiry and database epoch state remain logical admission evidence, never a
+     physical fence.
+5. **Production checkpoint mutation authority and catalogue**
    - Implement the production mutation-authority adapter and bind durable
      capture attempts to exact checkpoint-catalogue finalization.
 6. **Logical launcher admission**

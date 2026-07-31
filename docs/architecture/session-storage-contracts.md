@@ -16,10 +16,10 @@ The contract has four independent records:
    fencing state.
 
 `src/session-storage-contracts.mjs` makes the portable record shapes,
-fencing-number rules, declared backend capability surface, structural worker
-template, and checkpoint classes executable and testable. These pure
-validators do not perform a storage mutation, authorize a launch, stop a
-writer, or prove a physical fence.
+fencing-number rules, dedicated force-fence request/result envelopes, declared
+backend capability surface, structural worker template, and checkpoint classes
+executable and testable. These pure validators do not perform a storage
+mutation, authorize a launch, stop a writer, or prove a physical fence.
 
 ## Codex State Basis
 
@@ -259,39 +259,71 @@ writer must not start.
 After expiry, only an exact-owner detach for the unchanged canonical tuple and
 explicit attachment target may continue as cleanup. Checkpoint, destroy,
 restore, or other mutations cannot use the expired-lease exception. Force-fence
-is intentionally not represented by the generic mutation envelope: a concrete
-adapter must define a transition that identifies the revoked old tuple,
-advances to a distinct new canonical epoch, and returns provider evidence that
-the old attachment can no longer write. Once that transition advances the
-epoch, even the old detach is stale and must not affect the new attachment. A
-`manual` backend cannot provide this proof and therefore cannot automatically
-fail over.
+is intentionally not represented by the generic mutation envelope. The
+dedicated request validated by `assertStorageForceFenceRequest()` identifies
+the exact revoked lease tuple and attachment target while carrying a distinct
+new canonical epoch:
+
+```json
+{
+  "contractVersion": 1,
+  "backendId": "storage-backend-001",
+  "storageId": "volume-001",
+  "sessionId": "019f2100-0000-7000-8000-000000000001",
+  "operationId": "operation-force-fence-001",
+  "fencingEpoch": "43",
+  "revokedFence": {
+    "leaseId": "lease-001",
+    "holderId": "host-001",
+    "fencingEpoch": "42"
+  },
+  "target": {
+    "kind": "attachment",
+    "attachmentId": "attachment-001"
+  }
+}
+```
+
+The new epoch must be strictly greater than the revoked epoch. The matching
+result validated by `assertStorageForceFenceResult()` echoes that complete
+request, adds `status: "fenced"` and an opaque `proofId`, and rejects field,
+target, tuple, or epoch substitution. These envelopes are frozen defensive
+records, not physical authority by themselves: a concrete adapter must bind
+the operation ID and exact request to an atomic provider transition and return
+the result only after independently proving that the old attachment can no
+longer write. Once the authority dispatch commit advances the epoch, even the
+old exact-owner detach is stale. A `manual` backend cannot successfully
+complete this automatic proof and therefore cannot automatically fail over.
 
 The canonical lifecycle is:
 
 ```mermaid
 stateDiagram-v2
   [*] --> DETACHED
-  DETACHED --> ATTACHING: CAS allocate lease + higher epoch
-  ATTACHING --> ATTACHED: backend attachment proof
-  ATTACHED --> RELEASING: stop admission and worker
-  RELEASING --> DETACHED: verified detach
-  ATTACHING --> FENCING: later cleanup after ambiguous outcome or expiry
-  ATTACHED --> FENCING: expired or forced takeover
-  RELEASING --> FENCING: detach uncertain
-  FENCING --> DETACHED: verified fence
-  ATTACHING --> BLOCKED: state unknown
-  RELEASING --> BLOCKED: state unknown
-  FENCING --> BLOCKED: fence unavailable
+  DETACHED --> ATTACHING: typed dispatch allocates lease + higher epoch
+  ATTACHING --> ATTACHED: exact attachment proof, even after expiry
+  ATTACHING --> BLOCKED: typed ambiguous-outcome finalization
+  ATTACHED --> RELEASING: exact-owner release dispatch
+  RELEASING --> DETACHED: exact detach proof, even after expiry
+  RELEASING --> BLOCKED: typed ambiguous-outcome finalization
+  ATTACHED --> FENCING: force-fence dispatch advances epoch
+  BLOCKED --> FENCING: explicit recovery dispatch advances epoch
+  FENCING --> DETACHED: independent exact force-fence proof
+  FENCING --> BLOCKED: unavailable or ambiguous fence finalization
 ```
 
 An exact matching attachment proof may still finalize `ATTACHING -> ATTACHED`
 after lease expiry because it records the physical outcome; expiry closes new
-admission but does not erase evidence or prove a fence. An attach with no exact
-proof, an ambiguous detach, or an ambiguous fence never rolls back
-optimistically to `DETACHED`. A later cleanup/fence decision may move an
-unresolved or expired attach into `FENCING`, and a force-fence failure retains
-the advanced epoch and remains blocked.
+admission but does not erase evidence, advance the epoch, change the lifecycle,
+or prove a fence. Exact-owner release can likewise complete for the unchanged
+tuple and target after expiry without advancing the epoch. An attach with no
+exact proof, an ambiguous detach, or an ambiguous or unavailable fence first
+uses typed finalization to enter `BLOCKED`, preserving the lease, known
+attachment, target, and current epoch. `BLOCKED -> FENCING` is an explicit
+recovery edge: only a separately reserved force-fence operation that definitely
+commits typed dispatch may advance the uint64 epoch and enter `FENCING`. Only
+the dedicated successful force-fence proof may then enter `DETACHED`; an
+unavailable result returns to `BLOCKED` while retaining that advanced epoch.
 
 ## Storage Backend Contract
 
@@ -308,13 +340,15 @@ A v1 backend exposes these capabilities:
 
 It declares implementations of `provisionSession`, `prepareWritableAttachment`,
 `detachAttachment`, `forceFence`, `captureCheckpoint`, `restoreCheckpoint`,
-and `destroySession`. The portable storage reference contains only backend,
-storage, and runtime session IDs. The attachment adds the host-local absolute
-directory path, holder, operation, proof, and exact lease/epoch; it is ephemeral
-and must not be written to the session manifest, checkpoint descriptor, or
-portable evidence. Passing the capability validator confirms only this object
-shape and declaration; backend behavior remains untrusted until the concrete
-adapter passes its conformance suite.
+and `destroySession`. `forceFence` consumes the dedicated envelope above; it
+must not reinterpret a generic mutation result, database expiry, or epoch as
+provider proof. The portable storage reference contains only backend, storage,
+and runtime session IDs. The attachment adds the host-local absolute directory
+path, holder, operation, proof, and exact lease/epoch; it is ephemeral and must
+not be written to the session manifest, checkpoint descriptor, or portable
+evidence. Passing the capability validator confirms only this object shape and
+declaration; backend behavior remains untrusted until the concrete adapter
+passes its conformance suite.
 
 Checkpoint-capture reconciliation is an optional, separately versioned
 extension rather than a new required v1 storage method. A backend that exposes
@@ -446,11 +480,12 @@ Later pull requests own:
 
 - Podman/Docker launch and UID/SELinux mapping;
 - production local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
-- exact-owner release, force-fence reconciliation, and the physical host fence
-  beyond the implemented PostgreSQL acquisition/finalization/renewal authority;
+- physical exact-owner detach and host-fence implementations beyond the
+  PostgreSQL release/force-fence authority and structural proof envelopes;
 - production held-directory launch authority, provider-specific mutation/fence
   transitions, proofs, and conformance validators beyond the stopped-directory
   adapter;
+- the production checkpoint mutation-authority and catalogue adapter;
 - production graceful-abort storage barriers and crash-prefix atomic capture;
 - composition of the separate pinned-runtime rollout-tail repair primitive
   with trusted OCI resolution and launcher admission;

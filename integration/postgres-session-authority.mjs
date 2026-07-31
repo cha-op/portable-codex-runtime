@@ -9,7 +9,9 @@ import {
   PostgresSessionAuthorityError,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
+  WRITER_RELEASE_OPERATION_KIND,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -252,6 +254,18 @@ function assertAuthorityCode(code) {
   };
 }
 
+function assertCommitOutcomeUncertain(error) {
+  assert.ok(error instanceof PostgresSerializableStoreError);
+  assert.equal(
+    error.code,
+    "transaction_commit_outcome_uncertain",
+  );
+  assert.equal(error.commitState, "uncertain");
+  assert.equal(error.retryable, false);
+  assert.equal("cause" in error, false);
+  return true;
+}
+
 function operationInput(
   expectedSession,
   {
@@ -348,6 +362,64 @@ function writerLeaseRenewalInput(
       contractVersion: 1,
       leaseDurationMilliseconds,
     },
+  };
+}
+
+function writerReleaseInput(
+  expectedSession,
+  {
+    operationId = `operation-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    expectedSession,
+    operationId,
+    kind: WRITER_RELEASE_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      target: {
+        attachmentId:
+          expectedSession.document.attachment.attachmentId,
+        kind: "attachment",
+      },
+    },
+  };
+}
+
+function detachEvidence(mutationRequest) {
+  return {
+    ...structuredClone(mutationRequest),
+    proofId: `proof-${randomUUID()}`,
+    status: "detached",
+  };
+}
+
+function writerForceFenceInput(
+  expectedSession,
+  {
+    operationId = `operation-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    expectedSession,
+    operationId,
+    kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      target: {
+        attachmentId:
+          expectedSession.document.attachment.attachmentId,
+        kind: "attachment",
+      },
+    },
+  };
+}
+
+function forceFenceEvidence(fenceRequest) {
+  return {
+    ...structuredClone(fenceRequest),
+    proofId: `proof-${randomUUID()}`,
+    status: "fenced",
   };
 }
 
@@ -2269,6 +2341,933 @@ test(
           reservation_count: 1,
           revision: "4",
         });
+      },
+    );
+
+    await t.test(
+      "writer release reaches DETACHED and replays one exact terminal proof",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerReleaseInput(attached.session);
+
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
+        assert.equal(
+          reserved.session.document.lifecycle,
+          "ATTACHED",
+        );
+
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const starting =
+          await authority.claimWriterReleaseDispatch(transition);
+        assertOperationReceipt(starting, "starting");
+        assert.equal(starting.dispatchGranted, true);
+        assert.equal(
+          starting.session.document.lifecycle,
+          "RELEASING",
+        );
+        assert.equal(
+          starting.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+        assert.deepEqual(
+          starting.session.document.lease,
+          attached.session.document.lease,
+        );
+        assert.deepEqual(
+          starting.session.document.attachment,
+          attached.session.document.attachment,
+        );
+        assert.equal(starting.mutationRequest.operation, "detach");
+        assert.equal(
+          starting.mutationRequest.target.attachmentId,
+          attached.session.document.attachment.attachmentId,
+        );
+
+        const mutationResult = detachEvidence(
+          starting.mutationRequest,
+        );
+        const finalization = {
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+          mutationResult,
+        };
+        const released =
+          await authority.finalizeWriterRelease(finalization);
+        assertOperationReceipt(released, "committed");
+        assert.equal(released.finalized, true);
+        assert.equal(released.operation.revision, "2");
+        assert.equal(
+          released.operation.result.outcome,
+          "writer-released",
+        );
+        assert.deepEqual(
+          released.operation.result.lease,
+          attached.session.document.lease,
+        );
+        assert.deepEqual(
+          released.operation.result.attachment,
+          attached.session.document.attachment,
+        );
+        assert.deepEqual(
+          released.operation.result.mutationResult,
+          mutationResult,
+        );
+        assert.equal(
+          released.session.document.lifecycle,
+          "DETACHED",
+        );
+        assert.equal(
+          released.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+        assert.equal(released.session.document.lease, null);
+        assert.equal(released.session.document.attachment, null);
+
+        const replayedDispatch =
+          await authority.claimWriterReleaseDispatch(
+            structuredClone(transition),
+          );
+        assertOperationReceipt(replayedDispatch, "committed");
+        assert.equal(replayedDispatch.dispatchGranted, false);
+        assert.deepEqual(
+          replayedDispatch.mutationRequest,
+          starting.mutationRequest,
+        );
+        assert.deepEqual(
+          replayedDispatch.operation,
+          released.operation,
+        );
+        assert.deepEqual(
+          replayedDispatch.reservation,
+          released.reservation,
+        );
+        assert.deepEqual(replayedDispatch.session, released.session);
+
+        const replayedFinalization =
+          await authority.finalizeWriterRelease(
+            structuredClone(finalization),
+          );
+        assertOperationReceipt(replayedFinalization, "committed");
+        assert.equal(replayedFinalization.finalized, false);
+        assert.deepEqual(
+          replayedFinalization.operation,
+          released.operation,
+        );
+        assert.deepEqual(
+          replayedFinalization.reservation,
+          released.reservation,
+        );
+        assert.deepEqual(
+          replayedFinalization.session,
+          released.session,
+        );
+
+        const restarted = new PostgresSessionAuthority({ store });
+        const reconciled = await restarted.reconcileOperation(
+          structuredClone(input),
+        );
+        assertOperationReceipt(reconciled, "committed");
+        assert.deepEqual(reconciled.operation, released.operation);
+        assert.deepEqual(
+          reconciled.reservation,
+          released.reservation,
+        );
+        assert.deepEqual(reconciled.session, released.session);
+      },
+    );
+
+    await t.test(
+      "uncertain release blocks until force fence verifies DETACHED",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const releaseInput = writerReleaseInput(attached.session);
+        await authority.reserveOperation(releaseInput);
+        const releaseStarting =
+          await authority.claimWriterReleaseDispatch({
+            ...structuredClone(releaseInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(releaseStarting, "starting");
+
+        const releaseUncertain =
+          await authority.markOperationUncertain({
+            ...structuredClone(releaseInput),
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(releaseUncertain, "uncertain");
+        assert.equal(releaseUncertain.changed, true);
+        assert.equal(
+          releaseUncertain.session.document.lifecycle,
+          "RELEASING",
+        );
+        assert.equal(
+          releaseUncertain.session.document.writerEpoch,
+          releaseStarting.session.document.writerEpoch,
+        );
+
+        const blockedFinalization = {
+          ...structuredClone(releaseInput),
+          expectedOperationRevision: "2",
+          reason: "provider-outcome-unresolved",
+        };
+        const blocked =
+          await authority.finalizeWriterOperationBlocked(
+            blockedFinalization,
+          );
+        assertOperationReceipt(blocked, "committed");
+        assert.equal(blocked.finalized, true);
+        assert.equal(blocked.operation.revision, "3");
+        assert.equal(
+          blocked.operation.result.outcome,
+          "writer-blocked",
+        );
+        assert.equal(
+          blocked.operation.result.reason,
+          "provider-outcome-unresolved",
+        );
+        assert.equal(blocked.session.document.lifecycle, "BLOCKED");
+        assert.equal(
+          blocked.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+        assert.deepEqual(
+          blocked.session.document.lease,
+          attached.session.document.lease,
+        );
+        assert.deepEqual(
+          blocked.session.document.attachment,
+          attached.session.document.attachment,
+        );
+
+        const blockedReplay =
+          await authority.finalizeWriterOperationBlocked(
+            structuredClone(blockedFinalization),
+          );
+        assertOperationReceipt(blockedReplay, "committed");
+        assert.equal(blockedReplay.finalized, false);
+        assert.deepEqual(blockedReplay.operation, blocked.operation);
+        assert.deepEqual(blockedReplay.session, blocked.session);
+
+        const fenceInput = writerForceFenceInput(blocked.session);
+        const fenceReserved =
+          await authority.reserveOperation(fenceInput);
+        assertOperationReceipt(fenceReserved, "prepared");
+        assert.equal(fenceReserved.acquired, true);
+        assert.equal(
+          fenceReserved.session.document.lifecycle,
+          "BLOCKED",
+        );
+
+        const fenceStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(fenceInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(fenceStarting, "starting");
+        assert.equal(fenceStarting.dispatchGranted, true);
+        assert.equal(
+          fenceStarting.session.document.lifecycle,
+          "FENCING",
+        );
+        assert.equal(
+          BigInt(fenceStarting.writerEpoch),
+          BigInt(blocked.session.document.writerEpoch) + 1n,
+        );
+        assert.equal(
+          fenceStarting.fenceRequest.fencingEpoch,
+          fenceStarting.writerEpoch,
+        );
+        assert.deepEqual(
+          fenceStarting.fenceRequest.revokedFence,
+          {
+            fencingEpoch:
+              blocked.session.document.lease.fencingEpoch,
+            holderId: blocked.session.document.lease.holderId,
+            leaseId: blocked.session.document.lease.leaseId,
+          },
+        );
+
+        const fenceResult = forceFenceEvidence(
+          fenceStarting.fenceRequest,
+        );
+        const fenceFinalization = {
+          ...structuredClone(fenceInput),
+          expectedOperationRevision: "1",
+          fenceResult,
+        };
+        const fenced =
+          await authority.finalizeWriterForceFence(
+            fenceFinalization,
+          );
+        assertOperationReceipt(fenced, "committed");
+        assert.equal(fenced.finalized, true);
+        assert.equal(
+          fenced.operation.result.outcome,
+          "writer-fenced",
+        );
+        assert.equal(
+          fenced.operation.result.writerEpoch,
+          fenceStarting.writerEpoch,
+        );
+        assert.deepEqual(
+          fenced.operation.result.fenceResult,
+          fenceResult,
+        );
+        assert.equal(
+          fenced.session.document.lifecycle,
+          "DETACHED",
+        );
+        assert.equal(
+          fenced.session.document.writerEpoch,
+          fenceStarting.writerEpoch,
+        );
+        assert.equal(fenced.session.document.lease, null);
+        assert.equal(fenced.session.document.attachment, null);
+
+        const fenceReplay =
+          await authority.finalizeWriterForceFence(
+            structuredClone(fenceFinalization),
+          );
+        assertOperationReceipt(fenceReplay, "committed");
+        assert.equal(fenceReplay.finalized, false);
+        assert.deepEqual(fenceReplay.operation, fenced.operation);
+        assert.deepEqual(fenceReplay.session, fenced.session);
+      },
+    );
+
+    await t.test(
+      "uncertain force fence becomes BLOCKED without advancing epoch twice",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerForceFenceInput(attached.session);
+        await authority.reserveOperation(input);
+
+        const starting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(starting, "starting");
+        assert.equal(starting.dispatchGranted, true);
+        assert.equal(
+          BigInt(starting.writerEpoch),
+          BigInt(attached.session.document.writerEpoch) + 1n,
+        );
+
+        const uncertain = await authority.markOperationUncertain({
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(uncertain, "uncertain");
+        assert.equal(uncertain.changed, true);
+        assert.equal(
+          uncertain.session.document.lifecycle,
+          "FENCING",
+        );
+        assert.equal(
+          uncertain.session.document.writerEpoch,
+          starting.writerEpoch,
+        );
+
+        const finalization = {
+          ...structuredClone(input),
+          expectedOperationRevision: "2",
+          reason: "fence-unavailable",
+        };
+        const blocked =
+          await authority.finalizeWriterOperationBlocked(
+            finalization,
+          );
+        assertOperationReceipt(blocked, "committed");
+        assert.equal(blocked.finalized, true);
+        assert.equal(blocked.session.document.lifecycle, "BLOCKED");
+        assert.equal(
+          blocked.session.document.writerEpoch,
+          starting.writerEpoch,
+        );
+        assert.equal(
+          blocked.operation.result.writerEpoch,
+          starting.writerEpoch,
+        );
+        assert.equal(
+          blocked.operation.result.reason,
+          "fence-unavailable",
+        );
+        assert.deepEqual(
+          blocked.session.document.lease,
+          attached.session.document.lease,
+        );
+        assert.deepEqual(
+          blocked.session.document.attachment,
+          attached.session.document.attachment,
+        );
+
+        const replayed =
+          await authority.finalizeWriterOperationBlocked(
+            structuredClone(finalization),
+          );
+        assertOperationReceipt(replayed, "committed");
+        assert.equal(replayed.finalized, false);
+        assert.deepEqual(replayed.operation, blocked.operation);
+        assert.deepEqual(replayed.session, blocked.session);
+      },
+    );
+
+    await t.test(
+      "force-fence dispatch COMMIT loss restarts without regranting or re-advancing epoch",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerForceFenceInput(attached.session);
+        await authority.reserveOperation(input);
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool:
+                firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+
+        await assert.rejects(
+          acknowledgementLossAuthority.claimWriterForceFenceDispatch(
+            transition,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const restarted = new PostgresSessionAuthority({ store });
+        const readBack = await restarted.readSession({ sessionId });
+        assert.equal(readBack.document.lifecycle, "FENCING");
+        assert.equal(
+          BigInt(readBack.document.writerEpoch),
+          BigInt(attached.session.document.writerEpoch) + 1n,
+        );
+
+        const reconciled = await restarted.reconcileOperation(input);
+        assertOperationReceipt(reconciled, "starting");
+        assert.deepEqual(reconciled.session, readBack);
+        assert.equal(
+          reconciled.session.document.writerEpoch,
+          readBack.document.writerEpoch,
+        );
+
+        for (let replayIndex = 0; replayIndex < 2; replayIndex += 1) {
+          const replayed =
+            await restarted.claimWriterForceFenceDispatch(
+              structuredClone(transition),
+            );
+          assertOperationReceipt(replayed, "starting");
+          assert.equal(replayed.dispatchGranted, false);
+          assert.equal(
+            replayed.writerEpoch,
+            readBack.document.writerEpoch,
+          );
+          assert.deepEqual(replayed.operation, reconciled.operation);
+          assert.deepEqual(
+            replayed.reservation,
+            reconciled.reservation,
+          );
+          assert.deepEqual(replayed.session, readBack);
+          assert.deepEqual(
+            replayed.fenceRequest.revokedFence,
+            {
+              fencingEpoch:
+                attached.session.document.lease.fencingEpoch,
+              holderId: attached.session.document.lease.holderId,
+              leaseId: attached.session.document.lease.leaseId,
+            },
+          );
+        }
+      },
+    );
+
+    await t.test(
+      "force-fence finalize COMMIT loss restarts with one terminal proof",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerForceFenceInput(attached.session);
+        await authority.reserveOperation(input);
+        const starting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        const fenceResult = forceFenceEvidence(
+          starting.fenceRequest,
+        );
+        const finalization = {
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+          fenceResult,
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool:
+                firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+
+        await assert.rejects(
+          acknowledgementLossAuthority.finalizeWriterForceFence(
+            finalization,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const restarted = new PostgresSessionAuthority({ store });
+        const readBack = await restarted.readSession({ sessionId });
+        assert.equal(readBack.document.lifecycle, "DETACHED");
+        assert.equal(
+          readBack.document.writerEpoch,
+          starting.writerEpoch,
+        );
+        assert.equal(readBack.document.lease, null);
+        assert.equal(readBack.document.attachment, null);
+
+        const reconciled = await restarted.reconcileOperation(input);
+        assertOperationReceipt(reconciled, "committed");
+        assert.deepEqual(reconciled.session, readBack);
+        assert.equal(
+          reconciled.operation.result.outcome,
+          "writer-fenced",
+        );
+        assert.deepEqual(
+          reconciled.operation.result.fenceResult,
+          fenceResult,
+        );
+
+        const storedBeforeReplay = await pool.query(
+          [
+            "SELECT s.revision::text AS session_revision,",
+            "s.updated_at AS session_updated_at,",
+            "o.revision::text AS operation_revision,",
+            "o.updated_at AS operation_updated_at,",
+            "o.result AS operation_result",
+            "FROM session_authority.sessions s",
+            "JOIN session_authority.operation_claims o",
+            "ON o.session_id = s.session_id",
+            "WHERE s.session_id = $1 AND o.operation_id = $2",
+          ].join(" "),
+          [sessionId, input.operationId],
+        );
+        assert.equal(storedBeforeReplay.rows.length, 1);
+
+        const replayed =
+          await restarted.finalizeWriterForceFence(
+            structuredClone(finalization),
+          );
+        assertOperationReceipt(replayed, "committed");
+        assert.equal(replayed.finalized, false);
+        assert.deepEqual(replayed.operation, reconciled.operation);
+        assert.deepEqual(
+          replayed.reservation,
+          reconciled.reservation,
+        );
+        assert.deepEqual(replayed.session, readBack);
+
+        const storedAfterReplay = await pool.query(
+          [
+            "SELECT s.revision::text AS session_revision,",
+            "s.updated_at AS session_updated_at,",
+            "o.revision::text AS operation_revision,",
+            "o.updated_at AS operation_updated_at,",
+            "o.result AS operation_result",
+            "FROM session_authority.sessions s",
+            "JOIN session_authority.operation_claims o",
+            "ON o.session_id = s.session_id",
+            "WHERE s.session_id = $1 AND o.operation_id = $2",
+          ].join(" "),
+          [sessionId, input.operationId],
+        );
+        assert.deepEqual(
+          storedAfterReplay.rows,
+          storedBeforeReplay.rows,
+        );
+      },
+    );
+
+    await t.test(
+      "a second force fence from BLOCKED advances once and preserves the original fence",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const originalLease = structuredClone(
+          attached.session.document.lease,
+        );
+        const originalTarget = {
+          attachmentId:
+            attached.session.document.attachment.attachmentId,
+          kind: "attachment",
+        };
+
+        const firstInput = writerForceFenceInput(attached.session);
+        await authority.reserveOperation(firstInput);
+        const firstStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(firstInput),
+            expectedOperationRevision: "0",
+          });
+        const firstUncertain =
+          await authority.markOperationUncertain({
+            ...structuredClone(firstInput),
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(firstUncertain, "uncertain");
+        const firstBlocked =
+          await authority.finalizeWriterOperationBlocked({
+            ...structuredClone(firstInput),
+            expectedOperationRevision: "2",
+            reason: "fence-unavailable",
+          });
+        assertOperationReceipt(firstBlocked, "committed");
+        assert.equal(
+          firstBlocked.session.document.writerEpoch,
+          firstStarting.writerEpoch,
+        );
+        assert.deepEqual(
+          firstBlocked.session.document.lease,
+          originalLease,
+        );
+        assert.deepEqual(
+          firstBlocked.operation.result.fenceTarget,
+          originalTarget,
+        );
+
+        const secondInput = writerForceFenceInput(
+          firstBlocked.session,
+        );
+        const secondReserved =
+          await authority.reserveOperation(secondInput);
+        assertOperationReceipt(secondReserved, "prepared");
+        assert.equal(
+          secondReserved.session.document.lifecycle,
+          "BLOCKED",
+        );
+        assert.equal(
+          secondReserved.session.document.writerEpoch,
+          firstStarting.writerEpoch,
+        );
+        const secondTransition = {
+          ...structuredClone(secondInput),
+          expectedOperationRevision: "0",
+        };
+        const secondStarting =
+          await authority.claimWriterForceFenceDispatch(
+            secondTransition,
+          );
+        assertOperationReceipt(secondStarting, "starting");
+        assert.equal(secondStarting.dispatchGranted, true);
+        assert.equal(
+          BigInt(secondStarting.writerEpoch),
+          BigInt(firstStarting.writerEpoch) + 1n,
+        );
+        assert.deepEqual(
+          secondStarting.fenceRequest.revokedFence,
+          {
+            fencingEpoch: originalLease.fencingEpoch,
+            holderId: originalLease.holderId,
+            leaseId: originalLease.leaseId,
+          },
+        );
+        assert.deepEqual(
+          secondStarting.fenceRequest.target,
+          originalTarget,
+        );
+
+        const secondReplay =
+          await authority.claimWriterForceFenceDispatch(
+            structuredClone(secondTransition),
+          );
+        assertOperationReceipt(secondReplay, "starting");
+        assert.equal(secondReplay.dispatchGranted, false);
+        assert.equal(
+          secondReplay.writerEpoch,
+          secondStarting.writerEpoch,
+        );
+        assert.deepEqual(
+          secondReplay.fenceRequest,
+          secondStarting.fenceRequest,
+        );
+        assert.deepEqual(
+          secondReplay.session,
+          secondStarting.session,
+        );
+
+        const secondFenceResult = forceFenceEvidence(
+          secondStarting.fenceRequest,
+        );
+        const fenced = await authority.finalizeWriterForceFence({
+          ...structuredClone(secondInput),
+          expectedOperationRevision: "1",
+          fenceResult: secondFenceResult,
+        });
+        assertOperationReceipt(fenced, "committed");
+        assert.equal(fenced.finalized, true);
+        assert.equal(fenced.session.document.lifecycle, "DETACHED");
+        assert.equal(
+          fenced.session.document.writerEpoch,
+          secondStarting.writerEpoch,
+        );
+        assert.equal(fenced.session.document.lease, null);
+        assert.equal(fenced.session.document.attachment, null);
+        assert.deepEqual(
+          fenced.operation.result.fenceResult,
+          secondFenceResult,
+        );
+        assert.deepEqual(
+          fenced.operation.result.lease,
+          originalLease,
+        );
+        assert.deepEqual(
+          fenced.operation.result.fenceResult.target,
+          originalTarget,
+        );
+      },
+    );
+
+    await t.test(
+      "concurrent identical force-fence dispatch grants once at one epoch",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerForceFenceInput(attached.session);
+        await authority.reserveOperation(input);
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const concurrentAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstSessionLockQueryBarrierPool(
+                pool,
+                2,
+                "identical force-fence dispatch barrier",
+              ),
+              maxTransactionAttempts: 3,
+            }),
+          });
+
+        const receipts = await Promise.all([
+          concurrentAuthority.claimWriterForceFenceDispatch(
+            transition,
+          ),
+          concurrentAuthority.claimWriterForceFenceDispatch(
+            structuredClone(transition),
+          ),
+        ]);
+        assert.equal(
+          receipts.filter(({ dispatchGranted }) => dispatchGranted)
+            .length,
+          1,
+        );
+        assert.equal(
+          receipts.filter(({ dispatchGranted }) => !dispatchGranted)
+            .length,
+          1,
+        );
+        for (const receipt of receipts) {
+          assertOperationReceipt(receipt, "starting");
+          assert.equal(
+            BigInt(receipt.writerEpoch),
+            BigInt(attached.session.document.writerEpoch) + 1n,
+          );
+        }
+        assert.deepEqual(receipts[0].operation, receipts[1].operation);
+        assert.deepEqual(
+          receipts[0].reservation,
+          receipts[1].reservation,
+        );
+        assert.deepEqual(receipts[0].session, receipts[1].session);
+        assert.deepEqual(
+          receipts[0].fenceRequest,
+          receipts[1].fenceRequest,
+        );
+
+        const fenced = await authority.finalizeWriterForceFence({
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+          fenceResult: forceFenceEvidence(
+            receipts[0].fenceRequest,
+          ),
+        });
+        assertOperationReceipt(fenced, "committed");
+        assert.equal(fenced.finalized, true);
+        assert.equal(
+          fenced.session.document.writerEpoch,
+          receipts[0].writerEpoch,
+        );
+
+        const stored = await pool.query(
+          [
+            "SELECT s.document->>'writerEpoch' AS writer_epoch,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims o",
+            "WHERE o.operation_id = $2) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations r",
+            "WHERE r.operation_id = $2) AS reservation_count",
+            "FROM session_authority.sessions s",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [sessionId, input.operationId],
+        );
+        assert.deepEqual(stored.rows[0], {
+          operation_count: 1,
+          reservation_count: 1,
+          writer_epoch: receipts[0].writerEpoch,
+        });
+      },
+    );
+
+    await t.test(
+      "release dispatch and finalize COMMIT loss recover without duplicate effects",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const input = writerReleaseInput(attached.session);
+        await authority.reserveOperation(input);
+        const transition = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+
+        const dispatchLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool:
+                firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+        await assert.rejects(
+          dispatchLossAuthority.claimWriterReleaseDispatch(
+            transition,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const dispatchReconciled =
+          await authority.reconcileOperation(input);
+        assertOperationReceipt(dispatchReconciled, "starting");
+        assert.equal(
+          dispatchReconciled.session.document.lifecycle,
+          "RELEASING",
+        );
+        assert.equal(
+          dispatchReconciled.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+        const dispatchReplay =
+          await authority.claimWriterReleaseDispatch(
+            structuredClone(transition),
+          );
+        assertOperationReceipt(dispatchReplay, "starting");
+        assert.equal(dispatchReplay.dispatchGranted, false);
+        assert.deepEqual(
+          dispatchReplay.operation,
+          dispatchReconciled.operation,
+        );
+        assert.deepEqual(
+          dispatchReplay.session,
+          dispatchReconciled.session,
+        );
+
+        const finalization = {
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+          mutationResult: detachEvidence(
+            dispatchReplay.mutationRequest,
+          ),
+        };
+        const finalizeLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool:
+                firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+        await assert.rejects(
+          finalizeLossAuthority.finalizeWriterRelease(
+            finalization,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const finalizeReconciled =
+          await authority.reconcileOperation(input);
+        assertOperationReceipt(finalizeReconciled, "committed");
+        assert.equal(
+          finalizeReconciled.session.document.lifecycle,
+          "DETACHED",
+        );
+        assert.equal(
+          finalizeReconciled.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+        const finalizeReplay =
+          await authority.finalizeWriterRelease(
+            structuredClone(finalization),
+          );
+        assertOperationReceipt(finalizeReplay, "committed");
+        assert.equal(finalizeReplay.finalized, false);
+        assert.deepEqual(
+          finalizeReplay.operation,
+          finalizeReconciled.operation,
+        );
+        assert.deepEqual(
+          finalizeReplay.reservation,
+          finalizeReconciled.reservation,
+        );
+        assert.deepEqual(
+          finalizeReplay.session,
+          finalizeReconciled.session,
+        );
       },
     );
 

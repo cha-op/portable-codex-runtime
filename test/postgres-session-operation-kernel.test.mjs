@@ -16,7 +16,9 @@ import {
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
+  WRITER_RELEASE_OPERATION_KIND,
 } from "../src/postgres-session-authority.mjs";
 import {
   createSessionManifest,
@@ -37,6 +39,12 @@ const HIGH_EPOCH_AUTHORITY_NOW = "2026-07-29T12:35:00.000Z";
 const RENEW_TRANSACTION_NOW = "2026-07-29T12:35:10.000Z";
 const RENEW_AUTHORITY_NOW = "2026-07-29T12:35:20.000Z";
 const EXPIRED_FINALIZE_NOW = "2026-07-29T12:40:00.000Z";
+const WRITER_PREPARED_NOW = "2026-07-29T12:40:01.000Z";
+const WRITER_DISPATCH_NOW = "2026-07-29T12:40:02.000Z";
+const WRITER_UNCERTAIN_NOW = "2026-07-29T12:40:03.000Z";
+const WRITER_FINALIZE_NOW = "2026-07-29T12:40:04.000Z";
+const WRITER_RETRY_PREPARED_NOW = "2026-07-29T12:40:05.000Z";
+const WRITER_RETRY_DISPATCH_NOW = "2026-07-29T12:40:06.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
@@ -722,6 +730,7 @@ function writerStartingSessionRow({
       BigInt(options.expectedSession.revision) + 2n
     ).toString(),
     sessionDocument: document(options.expectedSession.sessionId, {
+      ...structuredClone(options.expectedSession.document),
       lifecycle: "ATTACHING",
       writerEpoch: lease.fencingEpoch,
       lease: structuredClone(lease),
@@ -747,6 +756,7 @@ function writerUncertainSessionRow({
       BigInt(options.expectedSession.revision) + 3n
     ).toString(),
     sessionDocument: document(options.expectedSession.sessionId, {
+      ...structuredClone(options.expectedSession.document),
       lifecycle: "ATTACHING",
       writerEpoch: lease.fencingEpoch,
       lease: structuredClone(lease),
@@ -776,6 +786,7 @@ function writerAttachedSessionRow({
       1n
     ).toString(),
     sessionDocument: document(options.expectedSession.sessionId, {
+      ...structuredClone(options.expectedSession.document),
       lifecycle: "ATTACHED",
       writerEpoch: lease.fencingEpoch,
       lease: structuredClone(result.lease),
@@ -818,6 +829,392 @@ function renewOptions(expectedSession, overrides = {}) {
       leaseDurationMilliseconds: 60_000,
     },
     ...overrides,
+  };
+}
+
+function writerAcquiredFixture({
+  capabilities = backendCapabilities(),
+  operationId = OPERATION_ID,
+} = {}) {
+  const expectedSession = sessionSnapshot({
+    sessionDocument: document(SESSION_ID, {
+      backendCapabilities: capabilities,
+    }),
+  });
+  const options = writerAcquireOptions({
+    expectedSession,
+    operationId,
+  });
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease);
+  const session = writerAttachedSessionRow({
+    options,
+    lease,
+    result,
+  });
+  return {
+    committedOperation: writerCommittedOperationRow({
+      options,
+      lease,
+      result,
+    }),
+    expectedSession: snapshotFromSessionRow(session),
+    lease,
+    options,
+    releasedReservation: reservationRow("released", {
+      options,
+      updatedAt: FINAL,
+      releasedAt: FINAL,
+    }),
+    result,
+    session,
+  };
+}
+
+function writerReleaseOptions(fixture, overrides = {}) {
+  return {
+    expectedSession: fixture.expectedSession,
+    operationId: OTHER_OPERATION_ID,
+    kind: WRITER_RELEASE_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      target: {
+        attachmentId: fixture.result.attachment.attachmentId,
+        kind: "attachment",
+      },
+    },
+    ...overrides,
+  };
+}
+
+function writerForceFenceOptions(fixture, overrides = {}) {
+  return {
+    expectedSession: fixture.expectedSession,
+    operationId: OTHER_OPERATION_ID,
+    kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+    request: {
+      contractVersion: 1,
+      target: {
+        attachmentId:
+          fixture.result?.attachment?.attachmentId ??
+          fixture.fenceTarget.attachmentId,
+        kind: "attachment",
+      },
+    },
+    ...overrides,
+  };
+}
+
+function writerReleaseMutationRequest(options) {
+  const lease = options.expectedSession.document.lease;
+  return {
+    contractVersion: 1,
+    backendId: options.expectedSession.document.storageRef.backendId,
+    storageId: options.expectedSession.document.storageRef.storageId,
+    sessionId: options.expectedSession.sessionId,
+    leaseId: lease.leaseId,
+    holderId: lease.holderId,
+    fencingEpoch: lease.fencingEpoch,
+    operation: "detach",
+    operationId: options.operationId,
+    target: structuredClone(options.request.target),
+  };
+}
+
+function writerReleaseMutationResult(options, overrides = {}) {
+  return {
+    ...writerReleaseMutationRequest(options),
+    proofId: "proof-detachment-001",
+    status: "detached",
+    ...overrides,
+  };
+}
+
+function writerReleaseResult(options, mutationResult) {
+  return {
+    resultVersion: 1,
+    outcome: "writer-released",
+    lease: structuredClone(options.expectedSession.document.lease),
+    attachment: structuredClone(
+      options.expectedSession.document.attachment,
+    ),
+    mutationResult: structuredClone(mutationResult),
+  };
+}
+
+function writerForceFenceRequest(options, writerEpoch) {
+  const lease = options.expectedSession.document.lease;
+  return {
+    backendId: options.expectedSession.document.storageRef.backendId,
+    contractVersion: 1,
+    fencingEpoch: writerEpoch,
+    operationId: options.operationId,
+    revokedFence: {
+      fencingEpoch: lease.fencingEpoch,
+      holderId: lease.holderId,
+      leaseId: lease.leaseId,
+    },
+    sessionId: options.expectedSession.sessionId,
+    storageId: options.expectedSession.document.storageRef.storageId,
+    target: structuredClone(options.request.target),
+  };
+}
+
+function writerForceFenceProof(options, writerEpoch, overrides = {}) {
+  return {
+    ...writerForceFenceRequest(options, writerEpoch),
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+    ...overrides,
+  };
+}
+
+function writerForceFenceResult(options, writerEpoch, fenceResult) {
+  return {
+    resultVersion: 1,
+    outcome: "writer-fenced",
+    writerEpoch,
+    lease: structuredClone(options.expectedSession.document.lease),
+    attachment: structuredClone(
+      options.expectedSession.document.attachment,
+    ),
+    fenceTarget: structuredClone(options.request.target),
+    fenceResult: structuredClone(fenceResult),
+  };
+}
+
+function writerLifecyclePhaseSessionRow(
+  state,
+  {
+    options,
+    lifecycle,
+    writerEpoch = options.expectedSession.document.writerEpoch,
+    updatedAt =
+      state === "prepared" ? LATER : state === "starting" ? LATEST : FINAL,
+  },
+) {
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) +
+      (state === "prepared" ? 1n : state === "starting" ? 2n : 3n)
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      ...structuredClone(options.expectedSession.document),
+      lifecycle:
+        state === "prepared"
+          ? options.expectedSession.document.lifecycle
+          : lifecycle,
+      writerEpoch,
+      activeOperation: activeOperation(state, { options }),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerReleasePhaseSessionRow(
+  state,
+  { options, updatedAt } = {},
+) {
+  return writerLifecyclePhaseSessionRow(state, {
+    options,
+    lifecycle: "RELEASING",
+    updatedAt,
+  });
+}
+
+function writerForceFencePhaseSessionRow(
+  state,
+  {
+    options,
+    writerEpoch = (
+      BigInt(options.expectedSession.document.writerEpoch) + 1n
+    ).toString(),
+    updatedAt,
+  } = {},
+) {
+  return writerLifecyclePhaseSessionRow(state, {
+    options,
+    lifecycle: "FENCING",
+    writerEpoch:
+      state === "prepared"
+        ? options.expectedSession.document.writerEpoch
+        : writerEpoch,
+    updatedAt,
+  });
+}
+
+function writerTerminalOperationRow({
+  createdAt,
+  options,
+  result,
+  revision,
+  updatedAt = FINAL,
+}) {
+  return operationRow("committed", {
+    createdAt,
+    options,
+    revision,
+    result,
+    retiredAt: updatedAt,
+    updatedAt,
+  });
+}
+
+function writerDetachedSessionRow({
+  options,
+  result,
+  operationRevision,
+  updatedAt = FINAL,
+}) {
+  const writerEpoch =
+    result.outcome === "writer-fenced"
+      ? result.writerEpoch
+      : result.lease.fencingEpoch;
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      ...structuredClone(options.expectedSession.document),
+      lifecycle: "DETACHED",
+      writerEpoch,
+      lease: null,
+      attachment: null,
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options,
+        operationRevision,
+        result,
+      }),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerBlockedResult({
+  options,
+  lease,
+  attachment,
+  writerEpoch,
+  reason = "provider-outcome-unresolved",
+}) {
+  const fenceTarget =
+    options.kind === WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND
+      ? {
+          attachmentId: derivedAttachmentId(options.operationId),
+          kind: "attachment",
+        }
+      : structuredClone(options.request.target);
+  return {
+    resultVersion: 1,
+    outcome: "writer-blocked",
+    reason,
+    writerEpoch,
+    lease: structuredClone(lease),
+    attachment: structuredClone(attachment),
+    fenceTarget,
+  };
+}
+
+function writerBlockedSessionRow({
+  options,
+  result,
+  updatedAt = EXPIRED_FINALIZE_NOW,
+}) {
+  return sessionRow({
+    sessionId: options.expectedSession.sessionId,
+    revision: (
+      BigInt(options.expectedSession.revision) + 4n
+    ).toString(),
+    sessionDocument: document(options.expectedSession.sessionId, {
+      ...structuredClone(options.expectedSession.document),
+      lifecycle: "BLOCKED",
+      writerEpoch: result.writerEpoch,
+      lease: structuredClone(result.lease),
+      attachment: structuredClone(result.attachment),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options,
+        operationRevision: "3",
+        result,
+      }),
+    }),
+    createdAt: options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function priorWriterTerminalSteps(fixture) {
+  return [
+    rows(fixture.committedOperation),
+    rows(fixture.releasedReservation),
+  ];
+}
+
+function activeWriterSteps({
+  createdAt,
+  fixture,
+  options,
+  session,
+  state,
+  updatedAt,
+}) {
+  return [
+    rows(session),
+    rows(operationRow(state, { createdAt, options, updatedAt })),
+    rows(reservationRow(state, { createdAt, options, updatedAt })),
+    ...priorWriterTerminalSteps(fixture),
+  ];
+}
+
+function anchoredDetachedEpochFixture(writerEpoch) {
+  const priorExpectedSession = sessionSnapshot({
+    revision: "2",
+    sessionDocument: document(SESSION_ID, {
+      writerEpoch,
+      lastOperation: lastOperation(),
+    }),
+  });
+  const priorOptions = reserveOptions({
+    expectedSession: priorExpectedSession,
+    operationId: "high-epoch-anchor-operation",
+  });
+  const result = cancellationResult();
+  const committedOperation = writerTerminalOperationRow({
+    options: priorOptions,
+    result,
+    revision: "1",
+    updatedAt: LATEST,
+  });
+  const releasedReservation = reservationRow("released", {
+    options: priorOptions,
+    updatedAt: LATEST,
+    releasedAt: LATEST,
+  });
+  const session = sessionRow({
+    revision: "4",
+    sessionDocument: document(SESSION_ID, {
+      writerEpoch,
+      lastOperation: terminalPointer({
+        options: priorOptions,
+        operationRevision: "1",
+        result,
+      }),
+    }),
+    createdAt: priorExpectedSession.createdAt,
+    updatedAt: LATEST,
+  });
+  return {
+    committedOperation,
+    expectedSession: snapshotFromSessionRow(session),
+    releasedReservation,
+    session,
   };
 }
 
@@ -2606,21 +3003,15 @@ test("cancelled writer dispatch replay never borrows a later writer lease", asyn
 
 test("writer attachment dispatch supports epochs above signed bigint", async () => {
   const writerEpoch = "9223372036854775807";
-  const expectedSession = sessionSnapshot({
-    sessionDocument: document(SESSION_ID, {
-      writerEpoch,
-    }),
-  });
+  const anchor = anchoredDetachedEpochFixture(writerEpoch);
+  const expectedSession = anchor.expectedSession;
   const options = writerAcquireOptions({ expectedSession });
   const binding = operationBinding(options);
-  const preparedSession = sessionRow({
-    revision: "1",
-    sessionDocument: document(SESSION_ID, {
-      writerEpoch,
-      activeOperation: activeOperation("prepared", { options }),
-    }),
-    createdAt: NOW,
-    updatedAt: LATER,
+  const preparedSession = writerLifecyclePhaseSessionRow("prepared", {
+    options,
+    lifecycle: "DETACHED",
+    writerEpoch,
+    updatedAt: LATEST,
   });
   const lease = writerLease(options, HIGH_EPOCH_AUTHORITY_NOW);
   const startingSession = writerStartingSessionRow({
@@ -2638,28 +3029,29 @@ test("writer attachment dispatch supports epochs above signed bigint", async () 
       rows(
         operationRow("prepared", {
           options,
-          createdAt: LATER,
-          updatedAt: LATER,
+          createdAt: LATEST,
+          updatedAt: LATEST,
         }),
       ),
       rows(
         reservationRow("prepared", {
           options,
-          createdAt: LATER,
-          updatedAt: LATER,
+          createdAt: LATEST,
+          updatedAt: LATEST,
         }),
       ),
+      ...priorWriterTerminalSteps(anchor),
       rows(
         operationRow("starting", {
           options,
-          createdAt: LATER,
+          createdAt: LATEST,
           updatedAt: FINAL,
         }),
       ),
       rows(
         reservationRow("starting", {
           options,
-          createdAt: LATER,
+          createdAt: LATEST,
           updatedAt: FINAL,
         }),
       ),
@@ -3685,9 +4077,15 @@ test("writer lease renewal cannot resurrect the lease at expiry equality", async
   clients[0].assertExhausted();
 });
 
-test("writer lease and attachment APIs reject invalid typed input before PostgreSQL", async () => {
+test("all typed writer kinds and generic dispatch bypasses reject invalid input before PostgreSQL", async () => {
   const { authority, pool } = authorityWithScripts();
   const acquire = writerAcquireOptions();
+  const fixture = writerAcquiredFixture();
+  const release = writerReleaseOptions(fixture);
+  const fence = writerForceFenceOptions(fixture);
+  const fenceEpoch = (
+    BigInt(fence.expectedSession.document.writerEpoch) + 1n
+  ).toString();
   const cases = [
     () =>
       authority.reserveOperation({
@@ -3710,6 +4108,46 @@ test("writer lease and attachment APIs reject invalid typed input before Postgre
       authority.claimOperationDispatch({
         ...acquire,
         expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.claimOperationDispatch({
+        ...release,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.claimOperationDispatch({
+        ...fence,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.claimWriterReleaseDispatch({
+        ...release,
+        expectedOperationRevision: "0",
+        extra: true,
+      }),
+    () =>
+      authority.claimWriterForceFenceDispatch({
+        ...fence,
+        expectedOperationRevision: "0",
+        extra: true,
+      }),
+    () =>
+      authority.finalizeWriterRelease({
+        ...release,
+        expectedOperationRevision: "0",
+        mutationResult: writerReleaseMutationResult(release),
+      }),
+    () =>
+      authority.finalizeWriterForceFence({
+        ...fence,
+        expectedOperationRevision: "0",
+        fenceResult: writerForceFenceProof(fence, fenceEpoch),
+      }),
+    () =>
+      authority.finalizeWriterOperationBlocked({
+        ...release,
+        expectedOperationRevision: "2",
+        reason: "fence-unavailable",
       }),
     () =>
       authority.renewWriterLease({
@@ -3941,4 +4379,1573 @@ test("typed writer transitions reject hostile non-exact inputs before PostgreSQL
   }
   assert.equal(accessorCalls, 0);
   assert.equal(pool.connectCalls, 0);
+});
+
+test("writer release dispatch grants one expired-lease detach request and replays evidence", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerReleaseOptions(fixture);
+  const preparedSession = writerReleasePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const startingSession = writerReleasePhaseSessionRow("starting", {
+    options,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const startingOperation = operationRow("starting", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const startingReservation = reservationRow("starting", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_DISPATCH_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: preparedSession,
+          state: "prepared",
+          updatedAt: WRITER_PREPARED_NOW,
+        }),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    activeWriterSteps({
+      createdAt: WRITER_PREPARED_NOW,
+      fixture,
+      options,
+      session: startingSession,
+      state: "starting",
+      updatedAt: WRITER_DISPATCH_NOW,
+    }),
+  );
+
+  const dispatched = await authority.claimWriterReleaseDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+  const replay = await authority.claimWriterReleaseDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(
+    Date.parse(fixture.lease.expiresAt) < Date.parse(WRITER_DISPATCH_NOW),
+    true,
+  );
+  assert.equal(dispatched.dispatchGranted, true);
+  assert.equal(replay.dispatchGranted, false);
+  assert.equal(dispatched.session.document.lifecycle, "RELEASING");
+  assert.equal(
+    dispatched.session.document.writerEpoch,
+    fixture.lease.fencingEpoch,
+  );
+  assert.deepEqual(dispatched.lease, fixture.lease);
+  assert.deepEqual(
+    dispatched.mutationRequest,
+    writerReleaseMutationRequest(options),
+  );
+  assert.deepEqual(replay.mutationRequest, dispatched.mutationRequest);
+  assert.equal(Object.hasOwn(dispatched, "fenceRequest"), false);
+  assert.deepEqual(authorityQueries(clients[0]), [
+    extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [SESSION_ID]),
+    extendedQuery(`${READ_OPERATION_QUERY} FOR UPDATE`, [
+      OTHER_OPERATION_ID,
+    ]),
+    extendedQuery(`${READ_RESERVATION_QUERY} FOR UPDATE`, [
+      OTHER_OPERATION_ID,
+    ]),
+    extendedQuery(READ_OPERATION_QUERY, [OPERATION_ID]),
+    extendedQuery(READ_RESERVATION_QUERY, [OPERATION_ID]),
+    extendedQuery(START_OPERATION_QUERY, [
+      OTHER_OPERATION_ID,
+      "0",
+      WRITER_DISPATCH_NOW,
+    ]),
+    extendedQuery(START_RESERVATION_QUERY, [
+      OTHER_OPERATION_ID,
+      WRITER_DISPATCH_NOW,
+    ]),
+    extendedQuery(UPDATE_SESSION_QUERY, [
+      SESSION_ID,
+      preparedSession.revision,
+      JSON.stringify(startingSession.document),
+      WRITER_DISPATCH_NOW,
+    ]),
+  ]);
+  assert.equal(
+    clients
+      .flatMap((client) => authorityQueries(client))
+      .filter((args) => queryText(args) === START_OPERATION_QUERY).length,
+    1,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("starting and uncertain release proofs detach atomically and replay the terminal anchor", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerReleaseOptions(fixture);
+  const mutationResult = writerReleaseMutationResult(options);
+  const result = writerReleaseResult(options, mutationResult);
+  const cases = [
+    {
+      expectedOperationRevision: "1",
+      operationRevision: "2",
+      state: "starting",
+      stateUpdatedAt: WRITER_DISPATCH_NOW,
+    },
+    {
+      expectedOperationRevision: "2",
+      operationRevision: "3",
+      state: "uncertain",
+      stateUpdatedAt: WRITER_UNCERTAIN_NOW,
+    },
+  ];
+  const scripts = [];
+  const expected = [];
+
+  for (const candidate of cases) {
+    const activeSession = writerReleasePhaseSessionRow(candidate.state, {
+      options,
+      updatedAt: candidate.stateUpdatedAt,
+    });
+    const committedOperation = writerTerminalOperationRow({
+      createdAt: WRITER_PREPARED_NOW,
+      options,
+      result,
+      revision: candidate.operationRevision,
+      updatedAt: WRITER_FINALIZE_NOW,
+    });
+    const releasedReservation = reservationRow("released", {
+      options,
+      createdAt: WRITER_PREPARED_NOW,
+      updatedAt: WRITER_FINALIZE_NOW,
+      releasedAt: WRITER_FINALIZE_NOW,
+    });
+    const detachedSession = writerDetachedSessionRow({
+      options,
+      result,
+      operationRevision: candidate.operationRevision,
+      updatedAt: WRITER_FINALIZE_NOW,
+    });
+    scripts.push(
+      {
+        options: { now: WRITER_FINALIZE_NOW },
+        steps: [
+          ...activeWriterSteps({
+            createdAt: WRITER_PREPARED_NOW,
+            fixture,
+            options,
+            session: activeSession,
+            state: candidate.state,
+            updatedAt: candidate.stateUpdatedAt,
+          }),
+          rows(committedOperation),
+          rows(releasedReservation),
+          rows(detachedSession),
+        ],
+      },
+      [
+        rows(detachedSession),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(committedOperation),
+        rows(releasedReservation),
+      ],
+    );
+    expected.push({
+      ...candidate,
+      activeSessionRevision: activeSession.revision,
+      committedOperation,
+      detachedSession,
+      releasedReservation,
+    });
+  }
+  const { authority, clients } = authorityWithScripts(...scripts);
+
+  for (const [index, candidate] of expected.entries()) {
+    const input = {
+      ...options,
+      expectedOperationRevision:
+        candidate.expectedOperationRevision,
+      mutationResult,
+    };
+    const finalized = await authority.finalizeWriterRelease(input);
+    const replay = await authority.finalizeWriterRelease(input);
+
+    assert.equal(finalized.finalized, true);
+    assert.equal(replay.finalized, false);
+    assert.equal(finalized.operation.revision, candidate.operationRevision);
+    assert.deepEqual(finalized.operation.result, result);
+    assert.deepEqual(replay.operation.result, result);
+    assert.equal(finalized.session.document.lifecycle, "DETACHED");
+    assert.equal(finalized.session.document.lease, null);
+    assert.equal(finalized.session.document.attachment, null);
+    assert.equal(
+      finalized.session.document.writerEpoch,
+      fixture.lease.fencingEpoch,
+    );
+    assert.deepEqual(
+      finalized.session.document.lastOperation,
+      terminalPointer({
+        options,
+        operationRevision: candidate.operationRevision,
+        result,
+      }),
+    );
+    assert.deepEqual(
+      replay.session,
+      snapshotFromSessionRow(candidate.detachedSession),
+    );
+    assert.equal(
+      authorityQueries(clients[index * 2]).some(
+        (args) => queryText(args) === READ_AUTHORITY_CLOCK_QUERY,
+      ),
+      false,
+    );
+    assert.deepEqual(
+      authorityQueries(clients[index * 2]).slice(-3),
+      [
+        extendedQuery(COMMIT_ACTIVE_OPERATION_QUERY, [
+          OTHER_OPERATION_ID,
+          candidate.expectedOperationRevision,
+          JSON.stringify(result),
+          WRITER_FINALIZE_NOW,
+          candidate.state,
+        ]),
+        extendedQuery(RELEASE_ACTIVE_RESERVATION_QUERY, [
+          OTHER_OPERATION_ID,
+          WRITER_FINALIZE_NOW,
+          candidate.state,
+        ]),
+        extendedQuery(UPDATE_SESSION_QUERY, [
+          SESSION_ID,
+          candidate.activeSessionRevision,
+          JSON.stringify(candidate.detachedSession.document),
+          WRITER_FINALIZE_NOW,
+        ]),
+      ],
+    );
+  }
+  assert.equal(
+    Date.parse(fixture.lease.expiresAt) < Date.parse(WRITER_FINALIZE_NOW),
+    true,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("force-fence dispatch advances the epoch once and replays one independent fence request", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceOptions(fixture);
+  const writerEpoch = (
+    BigInt(fixture.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const startingOperation = operationRow("starting", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const startingReservation = reservationRow("starting", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const expectedFenceRequest = writerForceFenceRequest(
+    options,
+    writerEpoch,
+  );
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_DISPATCH_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: preparedSession,
+          state: "prepared",
+          updatedAt: WRITER_PREPARED_NOW,
+        }),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    activeWriterSteps({
+      createdAt: WRITER_PREPARED_NOW,
+      fixture,
+      options,
+      session: startingSession,
+      state: "starting",
+      updatedAt: WRITER_DISPATCH_NOW,
+    }),
+  );
+
+  const dispatched = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+  const replay = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(dispatched.dispatchGranted, true);
+  assert.equal(replay.dispatchGranted, false);
+  assert.equal(dispatched.writerEpoch, writerEpoch);
+  assert.equal(replay.writerEpoch, writerEpoch);
+  assert.equal(dispatched.session.document.lifecycle, "FENCING");
+  assert.equal(dispatched.session.document.writerEpoch, writerEpoch);
+  assert.deepEqual(dispatched.fenceRequest, expectedFenceRequest);
+  assert.deepEqual(replay.fenceRequest, expectedFenceRequest);
+  assert.notStrictEqual(dispatched.fenceRequest, options.request);
+  assert.equal(Object.hasOwn(dispatched, "mutationRequest"), false);
+  assert.deepEqual(authorityQueries(clients[0]).slice(-3), [
+    extendedQuery(START_OPERATION_QUERY, [
+      OTHER_OPERATION_ID,
+      "0",
+      WRITER_DISPATCH_NOW,
+    ]),
+    extendedQuery(START_RESERVATION_QUERY, [
+      OTHER_OPERATION_ID,
+      WRITER_DISPATCH_NOW,
+    ]),
+    extendedQuery(UPDATE_SESSION_QUERY, [
+      SESSION_ID,
+      preparedSession.revision,
+      JSON.stringify(startingSession.document),
+      WRITER_DISPATCH_NOW,
+    ]),
+  ]);
+  assert.equal(
+    clients
+      .flatMap((client) => authorityQueries(client))
+      .filter((args) => queryText(args) === START_OPERATION_QUERY).length,
+    1,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("an exact force-fence proof detaches the writer and replays the same epoch anchor", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceOptions(fixture);
+  const writerEpoch = (
+    BigInt(fixture.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const fenceResult = writerForceFenceProof(options, writerEpoch);
+  const result = writerForceFenceResult(
+    options,
+    writerEpoch,
+    fenceResult,
+  );
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const committedOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options,
+    result,
+    revision: "2",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const detachedSession = writerDetachedSessionRow({
+    options,
+    result,
+    operationRevision: "2",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_FINALIZE_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: startingSession,
+          state: "starting",
+          updatedAt: WRITER_DISPATCH_NOW,
+        }),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(detachedSession),
+      ],
+    },
+    [
+      rows(detachedSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(releasedReservation),
+    ],
+  );
+  const input = {
+    ...options,
+    expectedOperationRevision: "1",
+    fenceResult,
+  };
+
+  const finalized = await authority.finalizeWriterForceFence(input);
+  const replay = await authority.finalizeWriterForceFence(input);
+
+  assert.equal(finalized.finalized, true);
+  assert.equal(replay.finalized, false);
+  assert.deepEqual(finalized.operation.result, result);
+  assert.deepEqual(replay.operation.result, result);
+  assert.equal(finalized.session.document.lifecycle, "DETACHED");
+  assert.equal(finalized.session.document.writerEpoch, writerEpoch);
+  assert.equal(finalized.session.document.lease, null);
+  assert.equal(finalized.session.document.attachment, null);
+  assert.deepEqual(
+    finalized.session.document.lastOperation,
+    terminalPointer({
+      options,
+      operationRevision: "2",
+      result,
+    }),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).slice(-3),
+    [
+      extendedQuery(COMMIT_ACTIVE_OPERATION_QUERY, [
+        OTHER_OPERATION_ID,
+        "1",
+        JSON.stringify(result),
+        WRITER_FINALIZE_NOW,
+        "starting",
+      ]),
+      extendedQuery(RELEASE_ACTIVE_RESERVATION_QUERY, [
+        OTHER_OPERATION_ID,
+        WRITER_FINALIZE_NOW,
+        "starting",
+      ]),
+      extendedQuery(UPDATE_SESSION_QUERY, [
+        SESSION_ID,
+        startingSession.revision,
+        JSON.stringify(detachedSession.document),
+        WRITER_FINALIZE_NOW,
+      ]),
+    ],
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("manual-fencing backends cannot turn a claimed force-fence into success", async () => {
+  const fixture = writerAcquiredFixture({
+    capabilities: backendCapabilities({ fencing: "manual" }),
+  });
+  const options = writerForceFenceOptions(fixture);
+  const writerEpoch = (
+    BigInt(fixture.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const { authority, pool } = authorityWithScripts();
+
+  await assertAuthorityError(
+    authority.finalizeWriterForceFence({
+      ...options,
+      expectedOperationRevision: "1",
+      fenceResult: writerForceFenceProof(options, writerEpoch),
+    }),
+    { code: "writer_fence_unsupported" },
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("uncertain acquire release and force-fence operations finalize BLOCKED with exact retained evidence", async () => {
+  const acquireOptions = writerAcquireOptions();
+  const acquireLease = writerLease(acquireOptions);
+  const releaseFixture = writerAcquiredFixture();
+  const releaseOptions = writerReleaseOptions(releaseFixture);
+  const fenceFixture = writerAcquiredFixture();
+  const fenceOptions = writerForceFenceOptions(fenceFixture);
+  const fenceEpoch = (
+    BigInt(fenceOptions.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const scenarios = [
+    {
+      attachment: null,
+      fixture: null,
+      lease: acquireLease,
+      options: acquireOptions,
+      reason: "provider-outcome-unresolved",
+      session: writerUncertainSessionRow({
+        options: acquireOptions,
+        lease: acquireLease,
+        updatedAt: WRITER_UNCERTAIN_NOW,
+      }),
+      writerEpoch: acquireLease.fencingEpoch,
+      createdAt: LATER,
+    },
+    {
+      attachment: releaseFixture.result.attachment,
+      fixture: releaseFixture,
+      lease: releaseFixture.lease,
+      options: releaseOptions,
+      reason: "provider-outcome-unresolved",
+      session: writerReleasePhaseSessionRow("uncertain", {
+        options: releaseOptions,
+        updatedAt: WRITER_UNCERTAIN_NOW,
+      }),
+      writerEpoch: releaseFixture.lease.fencingEpoch,
+      createdAt: WRITER_PREPARED_NOW,
+    },
+    {
+      attachment: fenceFixture.result.attachment,
+      fixture: fenceFixture,
+      lease: fenceFixture.lease,
+      options: fenceOptions,
+      reason: "fence-unavailable",
+      session: writerForceFencePhaseSessionRow("uncertain", {
+        options: fenceOptions,
+        writerEpoch: fenceEpoch,
+        updatedAt: WRITER_UNCERTAIN_NOW,
+      }),
+      writerEpoch: fenceEpoch,
+      createdAt: WRITER_PREPARED_NOW,
+    },
+  ];
+  const scripts = [];
+
+  for (const scenario of scenarios) {
+    scenario.result = writerBlockedResult({
+      options: scenario.options,
+      lease: scenario.lease,
+      attachment: scenario.attachment,
+      writerEpoch: scenario.writerEpoch,
+      reason: scenario.reason,
+    });
+    scenario.committedOperation = writerTerminalOperationRow({
+      createdAt: scenario.createdAt,
+      options: scenario.options,
+      result: scenario.result,
+      revision: "3",
+      updatedAt: WRITER_FINALIZE_NOW,
+    });
+    scenario.releasedReservation = reservationRow("released", {
+      options: scenario.options,
+      createdAt: scenario.createdAt,
+      updatedAt: WRITER_FINALIZE_NOW,
+      releasedAt: WRITER_FINALIZE_NOW,
+    });
+    scenario.blockedSession = writerBlockedSessionRow({
+      options: scenario.options,
+      result: scenario.result,
+      updatedAt: WRITER_FINALIZE_NOW,
+    });
+    const activeSteps =
+      scenario.fixture === null
+        ? [
+            rows(scenario.session),
+            rows(
+              operationRow("uncertain", {
+                options: scenario.options,
+                createdAt: scenario.createdAt,
+                updatedAt: WRITER_UNCERTAIN_NOW,
+              }),
+            ),
+            rows(
+              reservationRow("uncertain", {
+                options: scenario.options,
+                createdAt: scenario.createdAt,
+                updatedAt: WRITER_UNCERTAIN_NOW,
+              }),
+            ),
+          ]
+        : activeWriterSteps({
+            createdAt: scenario.createdAt,
+            fixture: scenario.fixture,
+            options: scenario.options,
+            session: scenario.session,
+            state: "uncertain",
+            updatedAt: WRITER_UNCERTAIN_NOW,
+          });
+    scripts.push(
+      {
+        options: { now: WRITER_FINALIZE_NOW },
+        steps: [
+          ...activeSteps,
+          rows(scenario.committedOperation),
+          rows(scenario.releasedReservation),
+          rows(scenario.blockedSession),
+        ],
+      },
+      [
+        rows(scenario.blockedSession),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(scenario.committedOperation),
+        rows(scenario.releasedReservation),
+      ],
+    );
+  }
+  const { authority, clients } = authorityWithScripts(...scripts);
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const input = {
+      ...scenario.options,
+      expectedOperationRevision: "2",
+      reason: scenario.reason,
+    };
+    const finalized =
+      await authority.finalizeWriterOperationBlocked(input);
+    const replay =
+      await authority.finalizeWriterOperationBlocked(input);
+
+    assert.equal(finalized.finalized, true);
+    assert.equal(replay.finalized, false);
+    assert.deepEqual(finalized.operation.result, scenario.result);
+    assert.deepEqual(replay.operation.result, scenario.result);
+    assert.equal(finalized.operation.revision, "3");
+    assert.equal(finalized.session.document.lifecycle, "BLOCKED");
+    assert.equal(
+      finalized.session.document.writerEpoch,
+      scenario.writerEpoch,
+    );
+    assert.deepEqual(finalized.session.document.lease, scenario.lease);
+    assert.deepEqual(
+      finalized.session.document.attachment,
+      scenario.attachment,
+    );
+    assert.deepEqual(
+      finalized.operation.result.fenceTarget,
+      scenario.result.fenceTarget,
+    );
+    assert.deepEqual(
+      finalized.session.document.lastOperation,
+      terminalPointer({
+        options: scenario.options,
+        operationRevision: "3",
+        result: scenario.result,
+      }),
+    );
+    assert.deepEqual(
+      replay.session,
+      snapshotFromSessionRow(scenario.blockedSession),
+    );
+    assert.deepEqual(
+      authorityQueries(clients[index * 2]).slice(-3),
+      [
+        extendedQuery(COMMIT_ACTIVE_OPERATION_QUERY, [
+          scenario.options.operationId,
+          "2",
+          JSON.stringify(scenario.result),
+          WRITER_FINALIZE_NOW,
+          "uncertain",
+        ]),
+        extendedQuery(RELEASE_ACTIVE_RESERVATION_QUERY, [
+          scenario.options.operationId,
+          WRITER_FINALIZE_NOW,
+          "uncertain",
+        ]),
+        extendedQuery(UPDATE_SESSION_QUERY, [
+          SESSION_ID,
+          scenario.session.revision,
+          JSON.stringify(scenario.blockedSession.document),
+          WRITER_FINALIZE_NOW,
+        ]),
+      ],
+    );
+  }
+  for (const client of clients) client.assertExhausted();
+});
+
+test("a BLOCKED acquire retries force-fence against its anchored target and advances one epoch", async () => {
+  const blockedOptions = writerAcquireOptions();
+  const blockedLease = writerLease(blockedOptions);
+  const blockedResult = writerBlockedResult({
+    options: blockedOptions,
+    lease: blockedLease,
+    attachment: null,
+    writerEpoch: blockedLease.fencingEpoch,
+  });
+  const blockedOperation = writerTerminalOperationRow({
+    options: blockedOptions,
+    result: blockedResult,
+    revision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedReservation = reservationRow("released", {
+    options: blockedOptions,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedSession = writerBlockedSessionRow({
+    options: blockedOptions,
+    result: blockedResult,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedFixture = {
+    committedOperation: blockedOperation,
+    expectedSession: snapshotFromSessionRow(blockedSession),
+    fenceTarget: blockedResult.fenceTarget,
+    releasedReservation: blockedReservation,
+    result: blockedResult,
+  };
+  const options = writerForceFenceOptions(blockedFixture);
+  const writerEpoch = (
+    BigInt(blockedResult.writerEpoch) + 1n
+  ).toString();
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_RETRY_PREPARED_NOW,
+  });
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_RETRY_DISPATCH_NOW,
+  });
+  const startingOperation = operationRow("starting", {
+    options,
+    createdAt: WRITER_RETRY_PREPARED_NOW,
+    updatedAt: WRITER_RETRY_DISPATCH_NOW,
+  });
+  const startingReservation = reservationRow("starting", {
+    options,
+    createdAt: WRITER_RETRY_PREPARED_NOW,
+    updatedAt: WRITER_RETRY_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: WRITER_RETRY_DISPATCH_NOW },
+    steps: [
+      ...activeWriterSteps({
+        createdAt: WRITER_RETRY_PREPARED_NOW,
+        fixture: blockedFixture,
+        options,
+        session: preparedSession,
+        state: "prepared",
+        updatedAt: WRITER_RETRY_PREPARED_NOW,
+      }),
+      rows(startingOperation),
+      rows(startingReservation),
+      rows(startingSession),
+    ],
+  });
+
+  const receipt = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(options.expectedSession.document.lifecycle, "BLOCKED");
+  assert.equal(options.expectedSession.document.attachment, null);
+  assert.equal(receipt.dispatchGranted, true);
+  assert.equal(receipt.writerEpoch, writerEpoch);
+  assert.equal(receipt.session.document.lifecycle, "FENCING");
+  assert.equal(receipt.session.document.writerEpoch, writerEpoch);
+  assert.deepEqual(receipt.fenceRequest.target, blockedResult.fenceTarget);
+  assert.deepEqual(
+    receipt.fenceRequest.revokedFence,
+    {
+      fencingEpoch: blockedLease.fencingEpoch,
+      holderId: blockedLease.holderId,
+      leaseId: blockedLease.leaseId,
+    },
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).slice(0, 5),
+    [
+      extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [SESSION_ID]),
+      extendedQuery(`${READ_OPERATION_QUERY} FOR UPDATE`, [
+        OTHER_OPERATION_ID,
+      ]),
+      extendedQuery(`${READ_RESERVATION_QUERY} FOR UPDATE`, [
+        OTHER_OPERATION_ID,
+      ]),
+      extendedQuery(READ_OPERATION_QUERY, [OPERATION_ID]),
+      extendedQuery(READ_RESERVATION_QUERY, [OPERATION_ID]),
+    ],
+  );
+  clients[0].assertExhausted();
+});
+
+test("BLOCKED force-fence target substitution and uint64 exhaustion fail before PostgreSQL", async () => {
+  const blockedOptions = writerAcquireOptions();
+  const blockedLease = writerLease(blockedOptions);
+  const blockedResult = writerBlockedResult({
+    options: blockedOptions,
+    lease: blockedLease,
+    attachment: null,
+    writerEpoch: blockedLease.fencingEpoch,
+  });
+  const blockedSession = writerBlockedSessionRow({
+    options: blockedOptions,
+    result: blockedResult,
+  });
+  const fixture = {
+    expectedSession: snapshotFromSessionRow(blockedSession),
+    fenceTarget: blockedResult.fenceTarget,
+    result: blockedResult,
+  };
+  const options = writerForceFenceOptions(fixture);
+  const exhaustedExpectedSession = structuredClone(
+    fixture.expectedSession,
+  );
+  exhaustedExpectedSession.document.writerEpoch =
+    "18446744073709551615";
+  const { authority, pool } = authorityWithScripts();
+
+  await assertAuthorityError(
+    authority.reserveOperation({
+      ...options,
+      request: {
+        ...options.request,
+        target: {
+          ...options.request.target,
+          attachmentId: "substituted-attachment",
+        },
+      },
+    }),
+    { code: "invalid_operation_request" },
+  );
+  await assertAuthorityError(
+    authority.reserveOperation({
+      ...options,
+      expectedSession: exhaustedExpectedSession,
+    }),
+    { code: "writer_epoch_exhausted" },
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("release and force-fence proof target tuple and terminal-result mismatches fail closed", async () => {
+  const fixture = writerAcquiredFixture();
+  const release = writerReleaseOptions(fixture);
+  const fence = writerForceFenceOptions(fixture);
+  const fenceEpoch = (
+    BigInt(fence.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const releaseStarting = writerReleasePhaseSessionRow("starting", {
+    options: release,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const fenceStarting = writerForceFencePhaseSessionRow("starting", {
+    options: fence,
+    writerEpoch: fenceEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const expectedFenceProof = writerForceFenceProof(fence, fenceEpoch);
+  const mismatchCases = [
+    {
+      invoke(authority) {
+        return authority.finalizeWriterRelease({
+          ...release,
+          expectedOperationRevision: "1",
+          mutationResult: writerReleaseMutationResult(release, {
+            target: {
+              ...release.request.target,
+              attachmentId: "substituted-attachment",
+            },
+          }),
+        });
+      },
+      options: release,
+      session: releaseStarting,
+    },
+    {
+      invoke(authority) {
+        return authority.finalizeWriterRelease({
+          ...release,
+          expectedOperationRevision: "1",
+          mutationResult: writerReleaseMutationResult(release, {
+            holderId: "substituted-holder",
+          }),
+        });
+      },
+      options: release,
+      session: releaseStarting,
+    },
+    {
+      invoke(authority) {
+        return authority.finalizeWriterForceFence({
+          ...fence,
+          expectedOperationRevision: "1",
+          fenceResult: writerForceFenceProof(fence, fenceEpoch, {
+            target: {
+              ...fence.request.target,
+              attachmentId: "substituted-attachment",
+            },
+          }),
+        });
+      },
+      options: fence,
+      session: fenceStarting,
+    },
+    {
+      invoke(authority) {
+        return authority.finalizeWriterForceFence({
+          ...fence,
+          expectedOperationRevision: "1",
+          fenceResult: writerForceFenceProof(fence, fenceEpoch, {
+            revokedFence: {
+              ...expectedFenceProof.revokedFence,
+              leaseId: "substituted-lease",
+            },
+          }),
+        });
+      },
+      options: fence,
+      session: fenceStarting,
+    },
+  ];
+  const releaseMutationResult = writerReleaseMutationResult(release);
+  const releaseResult = writerReleaseResult(
+    release,
+    releaseMutationResult,
+  );
+  const releaseCommitted = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options: release,
+    result: releaseResult,
+    revision: "2",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const releaseReservation = reservationRow("released", {
+    options: release,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const releaseDetached = writerDetachedSessionRow({
+    options: release,
+    result: releaseResult,
+    operationRevision: "2",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    ...mismatchCases.map((candidate) =>
+      activeWriterSteps({
+        createdAt: WRITER_PREPARED_NOW,
+        fixture,
+        options: candidate.options,
+        session: candidate.session,
+        state: "starting",
+        updatedAt: WRITER_DISPATCH_NOW,
+      }),
+    ),
+    [
+      rows(releaseDetached),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(releaseCommitted),
+      rows(releaseReservation),
+    ],
+  );
+
+  for (const [index, candidate] of mismatchCases.entries()) {
+    await assertAuthorityError(candidate.invoke(authority), {
+      code: "invalid_operation_request",
+    });
+    assert.equal(
+      authorityQueries(clients[index]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[index].assertExhausted();
+  }
+  await assertAuthorityError(
+    authority.finalizeWriterRelease({
+      ...release,
+      expectedOperationRevision: "1",
+      mutationResult: {
+        ...releaseMutationResult,
+        proofId: "different-terminal-proof",
+      },
+    }),
+    { code: "operation_result_conflict" },
+  );
+  assert.equal(
+    authorityQueries(clients.at(-1)).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients.at(-1).assertExhausted();
+});
+
+test("late release and force-fence successes cannot replace writer-blocked terminal anchors", async () => {
+  const releaseFixture = writerAcquiredFixture();
+  const releaseOptions = writerReleaseOptions(releaseFixture);
+  const fenceFixture = writerAcquiredFixture();
+  const fenceOptions = writerForceFenceOptions(fenceFixture);
+  const fenceEpoch = (
+    BigInt(fenceOptions.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const scenarios = [
+    {
+      attachment: releaseFixture.result.attachment,
+      fixture: releaseFixture,
+      invoke(authority) {
+        return authority.finalizeWriterRelease({
+          ...releaseOptions,
+          expectedOperationRevision: "2",
+          mutationResult: writerReleaseMutationResult(releaseOptions),
+        });
+      },
+      options: releaseOptions,
+      reason: "provider-outcome-unresolved",
+      writerEpoch: releaseFixture.lease.fencingEpoch,
+    },
+    {
+      attachment: fenceFixture.result.attachment,
+      fixture: fenceFixture,
+      invoke(authority) {
+        return authority.finalizeWriterForceFence({
+          ...fenceOptions,
+          expectedOperationRevision: "2",
+          fenceResult: writerForceFenceProof(
+            fenceOptions,
+            fenceEpoch,
+          ),
+        });
+      },
+      options: fenceOptions,
+      reason: "fence-unavailable",
+      writerEpoch: fenceEpoch,
+    },
+  ];
+  const scripts = [];
+
+  for (const scenario of scenarios) {
+    scenario.result = writerBlockedResult({
+      options: scenario.options,
+      lease: scenario.fixture.lease,
+      attachment: scenario.attachment,
+      writerEpoch: scenario.writerEpoch,
+      reason: scenario.reason,
+    });
+    scenario.operation = writerTerminalOperationRow({
+      createdAt: WRITER_PREPARED_NOW,
+      options: scenario.options,
+      result: scenario.result,
+      revision: "3",
+      updatedAt: WRITER_FINALIZE_NOW,
+    });
+    scenario.reservation = reservationRow("released", {
+      options: scenario.options,
+      createdAt: WRITER_PREPARED_NOW,
+      updatedAt: WRITER_FINALIZE_NOW,
+      releasedAt: WRITER_FINALIZE_NOW,
+    });
+    scenario.session = writerBlockedSessionRow({
+      options: scenario.options,
+      result: scenario.result,
+      updatedAt: WRITER_FINALIZE_NOW,
+    });
+    scripts.push([
+      rows(scenario.session),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(scenario.operation),
+      rows(scenario.reservation),
+    ]);
+  }
+  const { authority, clients } = authorityWithScripts(...scripts);
+
+  for (const [index, scenario] of scenarios.entries()) {
+    await assertAuthorityError(scenario.invoke(authority), {
+      code: "operation_transition_conflict",
+    });
+    assert.equal(
+      authorityQueries(clients[index]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[index].assertExhausted();
+  }
+});
+
+test("manual force-fence uncertainty terminalizes BLOCKED at the advanced epoch", async () => {
+  const fixture = writerAcquiredFixture({
+    capabilities: backendCapabilities({ fencing: "manual" }),
+  });
+  const options = writerForceFenceOptions(fixture);
+  const writerEpoch = (
+    BigInt(options.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const startingOperation = operationRow("starting", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const startingReservation = reservationRow("starting", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const uncertainOperation = operationRow("uncertain", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_UNCERTAIN_NOW,
+  });
+  const uncertainReservation = reservationRow("uncertain", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_UNCERTAIN_NOW,
+  });
+  const uncertainSession = writerForceFencePhaseSessionRow("uncertain", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_UNCERTAIN_NOW,
+  });
+  const result = writerBlockedResult({
+    options,
+    lease: fixture.lease,
+    attachment: fixture.result.attachment,
+    writerEpoch,
+    reason: "fence-unavailable",
+  });
+  const committedOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options,
+    result,
+    revision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedSession = writerBlockedSessionRow({
+    options,
+    result,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_DISPATCH_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: preparedSession,
+          state: "prepared",
+          updatedAt: WRITER_PREPARED_NOW,
+        }),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    {
+      options: { now: WRITER_UNCERTAIN_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: startingSession,
+          state: "starting",
+          updatedAt: WRITER_DISPATCH_NOW,
+        }),
+        rows(uncertainOperation),
+        rows(uncertainReservation),
+        rows(uncertainSession),
+      ],
+    },
+    {
+      options: { now: WRITER_FINALIZE_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: uncertainSession,
+          state: "uncertain",
+          updatedAt: WRITER_UNCERTAIN_NOW,
+        }),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(blockedSession),
+      ],
+    },
+  );
+
+  const dispatched = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+  const uncertain = await authority.markOperationUncertain({
+    ...options,
+    expectedOperationRevision: "1",
+  });
+  const finalized = await authority.finalizeWriterOperationBlocked({
+    ...options,
+    expectedOperationRevision: "2",
+    reason: "fence-unavailable",
+  });
+
+  assert.equal(
+    options.expectedSession.document.backendCapabilities.fencing,
+    "manual",
+  );
+  assert.equal(dispatched.dispatchGranted, true);
+  assert.equal(dispatched.writerEpoch, writerEpoch);
+  assert.equal(uncertain.changed, true);
+  assert.equal(uncertain.session.document.lifecycle, "FENCING");
+  assert.equal(uncertain.session.document.writerEpoch, writerEpoch);
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.session.document.lifecycle, "BLOCKED");
+  assert.equal(finalized.session.document.writerEpoch, writerEpoch);
+  assert.deepEqual(finalized.session.document.lease, fixture.lease);
+  assert.deepEqual(
+    finalized.session.document.attachment,
+    fixture.result.attachment,
+  );
+  assert.deepEqual(finalized.operation.result, result);
+  for (const client of clients) client.assertExhausted();
+});
+
+test("a failed force-fence can reserve and claim one anchored retry with one more epoch", async () => {
+  const fixture = writerAcquiredFixture();
+  const failedOptions = writerForceFenceOptions(fixture);
+  const failedEpoch = (
+    BigInt(failedOptions.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const failedResult = writerBlockedResult({
+    options: failedOptions,
+    lease: fixture.lease,
+    attachment: fixture.result.attachment,
+    writerEpoch: failedEpoch,
+    reason: "fence-unavailable",
+  });
+  const failedOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options: failedOptions,
+    result: failedResult,
+    revision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const failedReservation = reservationRow("released", {
+    options: failedOptions,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedSession = writerBlockedSessionRow({
+    options: failedOptions,
+    result: failedResult,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedFixture = {
+    committedOperation: failedOperation,
+    expectedSession: snapshotFromSessionRow(blockedSession),
+    fenceTarget: failedResult.fenceTarget,
+    releasedReservation: failedReservation,
+    result: failedResult,
+  };
+  const options = writerForceFenceOptions(blockedFixture, {
+    operationId: "operation-003",
+  });
+  const retryEpoch = (BigInt(failedEpoch) + 1n).toString();
+  const preparedOperation = operationRow("prepared", {
+    options,
+    createdAt: WRITER_RETRY_PREPARED_NOW,
+    updatedAt: WRITER_RETRY_PREPARED_NOW,
+  });
+  const preparedReservation = reservationRow("prepared", {
+    options,
+    createdAt: WRITER_RETRY_PREPARED_NOW,
+    updatedAt: WRITER_RETRY_PREPARED_NOW,
+  });
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_RETRY_PREPARED_NOW,
+  });
+  const startingOperation = operationRow("starting", {
+    options,
+    createdAt: WRITER_RETRY_PREPARED_NOW,
+    updatedAt: WRITER_RETRY_DISPATCH_NOW,
+  });
+  const startingReservation = reservationRow("starting", {
+    options,
+    createdAt: WRITER_RETRY_PREPARED_NOW,
+    updatedAt: WRITER_RETRY_DISPATCH_NOW,
+  });
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch: retryEpoch,
+    updatedAt: WRITER_RETRY_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_RETRY_PREPARED_NOW },
+      steps: [
+        rows(blockedSession),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(failedOperation),
+        rows(failedReservation),
+        rows(),
+        rows(preparedOperation),
+        rows(preparedReservation),
+        rows(preparedSession),
+      ],
+    },
+    {
+      options: { now: WRITER_RETRY_DISPATCH_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_RETRY_PREPARED_NOW,
+          fixture: blockedFixture,
+          options,
+          session: preparedSession,
+          state: "prepared",
+          updatedAt: WRITER_RETRY_PREPARED_NOW,
+        }),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    activeWriterSteps({
+      createdAt: WRITER_RETRY_PREPARED_NOW,
+      fixture: blockedFixture,
+      options,
+      session: startingSession,
+      state: "starting",
+      updatedAt: WRITER_RETRY_DISPATCH_NOW,
+    }),
+  );
+
+  const reserved = await authority.reserveOperation(options);
+  const dispatched = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+  const replay = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(reserved.acquired, true);
+  assert.equal(reserved.session.document.lifecycle, "BLOCKED");
+  assert.equal(reserved.session.document.writerEpoch, failedEpoch);
+  assert.equal(dispatched.dispatchGranted, true);
+  assert.equal(replay.dispatchGranted, false);
+  assert.equal(dispatched.writerEpoch, retryEpoch);
+  assert.equal(replay.writerEpoch, retryEpoch);
+  assert.equal(
+    BigInt(dispatched.writerEpoch),
+    BigInt(failedResult.writerEpoch) + 1n,
+  );
+  assert.deepEqual(
+    dispatched.fenceRequest.target,
+    failedResult.fenceTarget,
+  );
+  assert.deepEqual(replay.fenceRequest, dispatched.fenceRequest);
+  assert.deepEqual(dispatched.fenceRequest.revokedFence, {
+    fencingEpoch: fixture.lease.fencingEpoch,
+    holderId: fixture.lease.holderId,
+    leaseId: fixture.lease.leaseId,
+  });
+  assert.equal(
+    clients
+      .flatMap((client) => authorityQueries(client))
+      .filter((args) => queryText(args) === START_OPERATION_QUERY).length,
+    1,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("BLOCKED force-fence reserve requires capacity for its full terminal path", async () => {
+  const fixture = writerAcquiredFixture();
+  const highExpectedSession = structuredClone(fixture.expectedSession);
+  highExpectedSession.revision = "9223372036854775800";
+  highExpectedSession.document.lastOperation.expectedSessionRevision =
+    "9223372036854775797";
+  const highFixture = {
+    ...fixture,
+    expectedSession: highExpectedSession,
+  };
+  const failedOptions = writerForceFenceOptions(highFixture);
+  const failedEpoch = (
+    BigInt(failedOptions.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const failedResult = writerBlockedResult({
+    options: failedOptions,
+    lease: fixture.lease,
+    attachment: fixture.result.attachment,
+    writerEpoch: failedEpoch,
+    reason: "fence-unavailable",
+  });
+  const failedOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options: failedOptions,
+    result: failedResult,
+    revision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const failedReservation = reservationRow("released", {
+    options: failedOptions,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedSession = writerBlockedSessionRow({
+    options: failedOptions,
+    result: failedResult,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedFixture = {
+    expectedSession: snapshotFromSessionRow(blockedSession),
+    fenceTarget: failedResult.fenceTarget,
+    result: failedResult,
+  };
+  const options = writerForceFenceOptions(blockedFixture, {
+    operationId: "operation-003",
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(blockedSession),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(failedOperation),
+    rows(failedReservation),
+    rows(),
+  ]);
+
+  await assertAuthorityError(authority.reserveOperation(options), {
+    code: "session_revision_exhausted",
+  });
+
+  assert.deepEqual(
+    authorityQueries(clients[0]).map(queryText),
+    [
+      `${READ_SESSION_QUERY} FOR UPDATE`,
+      READ_ACTIVE_COUNTS_QUERY,
+      READ_OPERATION_QUERY,
+      READ_RESERVATION_QUERY,
+      READ_OPERATION_QUERY,
+    ],
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("uncertain force-fence accepts one exact proof and rejects a different replay proof", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceOptions(fixture);
+  const writerEpoch = (
+    BigInt(options.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const fenceResult = writerForceFenceProof(options, writerEpoch);
+  const result = writerForceFenceResult(
+    options,
+    writerEpoch,
+    fenceResult,
+  );
+  const uncertainSession = writerForceFencePhaseSessionRow("uncertain", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_UNCERTAIN_NOW,
+  });
+  const committedOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options,
+    result,
+    revision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+  });
+  const detachedSession = writerDetachedSessionRow({
+    options,
+    result,
+    operationRevision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_FINALIZE_NOW },
+      steps: [
+        ...activeWriterSteps({
+          createdAt: WRITER_PREPARED_NOW,
+          fixture,
+          options,
+          session: uncertainSession,
+          state: "uncertain",
+          updatedAt: WRITER_UNCERTAIN_NOW,
+        }),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(detachedSession),
+      ],
+    },
+    [
+      rows(detachedSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(releasedReservation),
+    ],
+  );
+
+  const finalized = await authority.finalizeWriterForceFence({
+    ...options,
+    expectedOperationRevision: "2",
+    fenceResult,
+  });
+  await assertAuthorityError(
+    authority.finalizeWriterForceFence({
+      ...options,
+      expectedOperationRevision: "2",
+      fenceResult: {
+        ...fenceResult,
+        proofId: "different-terminal-proof",
+      },
+    }),
+    { code: "operation_result_conflict" },
+  );
+
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.operation.revision, "3");
+  assert.equal(finalized.session.document.lifecycle, "DETACHED");
+  assert.equal(finalized.session.document.writerEpoch, writerEpoch);
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  for (const client of clients) client.assertExhausted();
 });
