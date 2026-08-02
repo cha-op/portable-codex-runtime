@@ -660,7 +660,9 @@ class FakeAuthority {
     } else if (this.state.finalizeMode === "materialization-v3") {
       forged.catalogue.document.materialization.contractVersion = 3;
     }
-    return deepFreeze(forged);
+    const result = deepFreeze(forged);
+    this.state.finalizeResults.push(result);
+    return result;
   }
 
   async readCheckpointCaptureAttempt() {
@@ -762,6 +764,7 @@ function fixture(overrides = {}) {
     expectedSession,
     finalizeInputs: [],
     finalizeMode: "success",
+    finalizeResults: [],
     guardFailureProbe: 0,
     laterSessionOnCommittedReplay: false,
     maximumHistoricalReadSession: false,
@@ -1364,6 +1367,67 @@ test("authorized and committed reconciliation are source-free and return verifie
       );
     });
   }
+});
+
+test("authorized reconciliation accepts an exact concurrent committed replay", async () => {
+  const value = fixture({
+    attemptPhase: "authorized",
+    authorizedRevision: "1",
+    laterSessionOnCommittedReplay: true,
+  });
+  let verifierCalls = 0;
+  const verifierCompletion = completion(value.state, true);
+
+  const result = await value.adapter.runCaptureReconciliation(
+    reconciliationAdmission(),
+    async (context) => {
+      value.state.trace.push("callback:verify");
+      verifierCalls += 1;
+      assert.equal(context.captureAttempt.state, "authorized");
+      value.state.trace.push("callback:concurrent-commit");
+      value.state.attemptPhase = "committed";
+      return verifierCompletion;
+    },
+  );
+
+  assert.strictEqual(result, verifierCompletion);
+  assert.equal(verifierCalls, 1);
+  assert.equal(value.state.finalizeInputs.length, 1);
+  assert.equal(
+    value.state.finalizeInputs[0].expectedOperationRevision,
+    "1",
+  );
+  assert.strictEqual(
+    value.state.finalizeInputs[0].completion,
+    verifierCompletion,
+  );
+  assert.equal(value.state.finalizeResults.length, 1);
+  assert.equal(value.state.finalizeResults[0].status, "committed");
+  assert.equal(value.state.finalizeResults[0].finalized, false);
+  assert.equal(
+    value.state.finalizeResults[0].attempt.captureAttemptId,
+    CAPTURE_ATTEMPT_ID,
+  );
+  assert.equal(
+    value.state.finalizeResults[0].attempt.state,
+    "committed",
+  );
+  assert.equal(value.state.finalizeResults[0].session.sessionId, SESSION_ID);
+  assert.equal(value.state.finalizeResults[0].session.revision, "42");
+  assert.equal(value.state.uncertainCalls, 0);
+  assert.equal(value.sourcePlannerCalls, 0);
+  assert.equal(value.artifactPlannerCalls, 1);
+  assert.deepEqual(value.state.trace, [
+    "guard:start",
+    "authority:read-attempt",
+    "planner:artifact",
+    "guard:probe:1",
+    "callback:verify",
+    "callback:concurrent-commit",
+    "guard:probe:2",
+    "authority:finalize",
+    "guard:end",
+  ]);
 });
 
 test("committed reconciliation tolerates later current session state", async () => {

@@ -1916,7 +1916,8 @@ function normalizeFinalizationReceipt(
     code,
   );
   ensure(
-    receipt.finalized === (expectedAttemptRecord.state === "authorized"),
+    expectedAttemptRecord.state === "authorized" ||
+      receipt.finalized === false,
     code,
   );
   const attempt = normalizeCaptureAttempt(
@@ -1945,7 +1946,7 @@ function normalizeFinalizationReceipt(
     { attempt, catalogue, typedRequest },
     code,
   );
-  if (expectedAttemptRecord.state === "committed") {
+  if (receipt.finalized === false) {
     validateHistoricalSessionIdentity(
       receipt.session,
       {

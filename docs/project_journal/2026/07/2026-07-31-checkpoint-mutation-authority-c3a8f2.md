@@ -57,7 +57,10 @@ superseded_by:
   the backend to verify only its already committed artefact, without a mutable
   source, writer, lease, attachment, clock, or stopped-writer capability.
   `prepared` and `materialized` publication never become success through this
-  path.
+  path. If the original publisher commits the same exact result during
+  asynchronous verification, reconciliation accepts the resulting committed
+  replay only after validating its terminal operation, attempt, catalogue,
+  completion, and historical session identity/revision.
 - Historical committed-operation reads require the current session to retain
   the operation's exact immutable document identity and session-incarnation
   `createdAt`, with a revision no earlier than the operation's terminal

@@ -561,6 +561,12 @@ capability input. `absent`, `prepared`, and `materialized` journal phases never
 become success through this path. After asynchronous verification, the
 authority revalidates the same attempt and claims before it atomically
 finalizes or confirms the catalogue and returns the verifier's exact completion.
+If the original publisher commits the same exact result while verification is
+in flight, finalization may return a committed replay instead of claiming the
+write. The facade accepts that race only after validating the committed
+operation, attempt, catalogue, exact completion, and historical session
+identity/revision; it does not misclassify the confirmed replay as an uncertain
+outcome.
 Every historical committed-operation read also requires the current canonical
 session to retain the operation's exact immutable document identity and
 session-incarnation `createdAt`, and its revision must be at least
