@@ -2474,6 +2474,7 @@ export function createPostgresCheckpointMutationAuthority(...args) {
       );
       const verify = assertCallback(verifyValue, requestCode);
       const operationId = admission.request.operationId;
+      let diagnosticStage = "guard";
       let dispatchDefinitelyBegan = false;
       let uncertaintyInput = null;
       let uncertaintyAttempted = false;
@@ -2503,6 +2504,7 @@ export function createPostgresCheckpointMutationAuthority(...args) {
             async (probeValue) => {
               const probe = normalizeProbe(probeValue, outcomeCode);
               try {
+                diagnosticStage = "read-attempt";
                 const read = normalizeReconciliationReadReceipt(
                   await invokeAsync(
                     authority,
@@ -2518,6 +2520,7 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                   admission,
                   outcomeCode,
                 );
+                diagnosticStage = "read-receipt";
                 const attempt = read.attempt;
                 const expectedOperationRevision =
                   read.expectedOperationRevision;
@@ -2540,7 +2543,9 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                   canonicalAdmission,
                   outcomeCode,
                 );
+                diagnosticStage = "preverify-probe";
                 await assertGuardHeld(probe, outcomeCode);
+                diagnosticStage = "verify";
                 const completion = normalizeCompletion(
                   await invokeCallback(
                     verify,
@@ -2554,7 +2559,9 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                   true,
                   outcomeCode,
                 );
+                diagnosticStage = "postverify-probe";
                 await assertGuardHeld(probe, outcomeCode);
+                diagnosticStage = "finalize";
                 normalizeFinalizationReceipt(
                   await invokeAsync(
                     authority,
@@ -2582,6 +2589,7 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                   },
                   outcomeCode,
                 );
+                diagnosticStage = "complete";
                 return completion;
               } catch {
                 await markUncertain();
@@ -2593,6 +2601,12 @@ export function createPostgresCheckpointMutationAuthority(...args) {
         );
       } catch {
         await markUncertain();
+        if (CHECKPOINT_CAPTURE_DIAGNOSTIC) {
+          process._rawDebug(
+            "checkpoint reconciliation diagnostic stage: %s",
+            diagnosticStage,
+          );
+        }
         fail(outcomeCode);
       }
     };

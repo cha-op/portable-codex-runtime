@@ -7,6 +7,8 @@ export const POSTGRES_OPERATION_GUARD_NAMESPACE =
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SIGNED_INT64_MIN = -(1n << 63n);
 const SIGNED_INT64_MAX = (1n << 63n) - 1n;
+const OPERATION_GUARD_DIAGNOSTIC =
+  process.env.PORTABLE_CODEX_RUNTIME_CHECKPOINT_DIAGNOSTIC === "1";
 
 const ERROR_MESSAGES = Object.freeze({
   invalid_postgres_operation_guard_options:
@@ -523,8 +525,21 @@ export class PostgresOperationGuard {
     const operationId = normalizeOperationId(args[0]);
     const callback = normalizeCallback(args[1]);
     const key = operationLockKey(operationId);
-    const binding = await acquireClient(this.#poolBinding);
+    let diagnosticStage = "acquire-client";
+    let binding;
+    try {
+      binding = await acquireClient(this.#poolBinding);
+    } catch (error) {
+      if (OPERATION_GUARD_DIAGNOSTIC) {
+        process._rawDebug(
+          "postgres operation guard diagnostic stage: %s",
+          diagnosticStage,
+        );
+      }
+      throw error;
+    }
 
+    diagnosticStage = "reset-client";
     try {
       await resetClient(binding);
     } catch {
@@ -535,6 +550,12 @@ export class PostgresOperationGuard {
         );
       } catch {
         // The pre-lock reset failure already requires a failed closed result.
+      }
+      if (OPERATION_GUARD_DIAGNOSTIC) {
+        process._rawDebug(
+          "postgres operation guard diagnostic stage: %s",
+          diagnosticStage,
+        );
       }
       fail("postgres_operation_guard_outcome_uncertain");
     }
@@ -550,6 +571,7 @@ export class PostgresOperationGuard {
     let callbackResult;
 
     try {
+      diagnosticStage = "acquire-lock";
       lockAttempted = true;
       const acquired = await acquireAdvisoryLock(binding, key);
       backendPid = acquired.backendPid;
@@ -559,6 +581,7 @@ export class PostgresOperationGuard {
       } else {
         lockHeld = true;
         await assertAdvisoryLockHeld(binding, key, backendPid);
+        diagnosticStage = "callback";
 
         let callbackOpen = true;
         let probeFailed = false;
@@ -609,6 +632,7 @@ export class PostgresOperationGuard {
           );
         }
         if (probeFailed) healthFailed = true;
+        diagnosticStage = "health-check";
         try {
           await assertAdvisoryLockHeld(binding, key, backendPid);
         } catch {
@@ -616,9 +640,16 @@ export class PostgresOperationGuard {
         }
       }
     } catch {
+      if (OPERATION_GUARD_DIAGNOSTIC) {
+        process._rawDebug(
+          "postgres operation guard diagnostic stage: %s",
+          diagnosticStage,
+        );
+      }
       healthFailed = true;
     }
 
+    diagnosticStage = "cleanup";
     try {
       await cleanAndRelease(binding, {
         backendPid,
@@ -628,13 +659,32 @@ export class PostgresOperationGuard {
       });
       lockHeld = false;
     } catch {
+      if (OPERATION_GUARD_DIAGNOSTIC) {
+        process._rawDebug(
+          "postgres operation guard diagnostic stage: %s",
+          diagnosticStage,
+        );
+      }
       fail("postgres_operation_guard_outcome_uncertain");
     }
 
     if (healthFailed || lockHeld) {
+      if (OPERATION_GUARD_DIAGNOSTIC) {
+        process._rawDebug(
+          "postgres operation guard diagnostic stage: %s",
+          diagnosticStage,
+        );
+      }
       fail("postgres_operation_guard_outcome_uncertain");
     }
-    if (busy) fail("postgres_operation_guard_busy");
+    if (busy) {
+      if (OPERATION_GUARD_DIAGNOSTIC) {
+        process._rawDebug(
+          "postgres operation guard diagnostic stage: busy",
+        );
+      }
+      fail("postgres_operation_guard_busy");
+    }
     if (callbackFailed) throw callbackError;
     return callbackResult;
   }
