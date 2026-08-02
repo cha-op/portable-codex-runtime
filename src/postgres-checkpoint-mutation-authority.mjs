@@ -26,7 +26,6 @@ const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const functionToStringIntrinsic = Function.prototype.toString;
 const createHashIntrinsic = createHashExport;
-const ErrorConstructor = Error;
 const isAsyncFunctionValue = utilTypes.isAsyncFunction;
 const isGeneratorFunctionValue = utilTypes.isGeneratorFunction;
 const isGeneratorObjectValue = utilTypes.isGeneratorObject;
@@ -2457,8 +2456,9 @@ export function createPostgresCheckpointMutationAuthority(...args) {
     } catch {
       await markUncertain();
       if (CHECKPOINT_CAPTURE_DIAGNOSTIC) {
-        throw new ErrorConstructor(
-          `checkpoint capture diagnostic stage: ${diagnosticStage}`,
+        process._rawDebug(
+          "checkpoint capture diagnostic stage: %s",
+          diagnosticStage,
         );
       }
       fail(outcomeCode);
