@@ -64,8 +64,6 @@ const UNLOCK_QUERY = Object.freeze({
   ].join(" "),
 });
 
-const ArrayConstructor = Array;
-const arrayFromIntrinsic = Array.from;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -87,19 +85,8 @@ const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectPrototype = Object.prototype;
-const PromiseConstructor = Promise;
-const promiseAllSettledIntrinsic = Promise.allSettled;
-const promiseThenIntrinsic = Promise.prototype.then;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpTestIntrinsic = RegExp.prototype.test;
-const SetConstructor = Set;
-const setAddIntrinsic = Set.prototype.add;
-const setDeleteIntrinsic = Set.prototype.delete;
-const setSizeGetter = objectGetOwnPropertyDescriptor(
-  Set.prototype,
-  "size",
-).get;
-const setValuesIntrinsic = Set.prototype.values;
 const TypeErrorConstructor = TypeError;
 
 function callIntrinsic(intrinsic, receiver, args) {
@@ -116,10 +103,6 @@ function arrayIncludes(value, candidate) {
 
 function regexpTest(pattern, value) {
   return callIntrinsic(regexpTestIntrinsic, pattern, [value]);
-}
-
-function setSize(value) {
-  return callIntrinsic(setSizeGetter, value, []);
 }
 
 function makeError(code) {
@@ -570,8 +553,9 @@ export class PostgresOperationGuard {
         await assertAdvisoryLockHeld(binding, key, backendPid);
 
         let callbackOpen = true;
+        let activeProbeHead = null;
+        let activeProbeTail = null;
         let probeFailed = false;
-        const activeProbes = new SetConstructor();
         const assertHeld = (...probeArgs) => {
           const pending = (async () => {
             ensure(
@@ -580,16 +564,37 @@ export class PostgresOperationGuard {
             );
             await assertAdvisoryLockHeld(binding, key, backendPid);
           })();
-          callIntrinsic(setAddIntrinsic, activeProbes, [pending]);
-          void callIntrinsic(promiseThenIntrinsic, pending, [
-            () => {
-              callIntrinsic(setDeleteIntrinsic, activeProbes, [pending]);
-            },
-            () => {
+          const node = objectCreate(null);
+          node.drain = undefined;
+          node.next = null;
+          node.previous = activeProbeTail;
+          if (activeProbeTail === null) {
+            activeProbeHead = node;
+          } else {
+            activeProbeTail.next = node;
+          }
+          activeProbeTail = node;
+          node.drain = (async () => {
+            try {
+              await pending;
+            } catch {
               probeFailed = true;
-              callIntrinsic(setDeleteIntrinsic, activeProbes, [pending]);
-            },
-          ]);
+            } finally {
+              if (node.previous === null) {
+                activeProbeHead = node.next;
+              } else {
+                node.previous.next = node.next;
+              }
+              if (node.next === null) {
+                activeProbeTail = node.previous;
+              } else {
+                node.next.previous = node.previous;
+              }
+              node.drain = undefined;
+              node.next = null;
+              node.previous = null;
+            }
+          })();
           return pending;
         };
         const probe = objectFreeze({ assertHeld });
@@ -603,19 +608,8 @@ export class PostgresOperationGuard {
           callbackOpen = false;
         }
 
-        while (setSize(activeProbes) > 0) {
-          const pending = callIntrinsic(
-            arrayFromIntrinsic,
-            ArrayConstructor,
-            [
-              callIntrinsic(setValuesIntrinsic, activeProbes, []),
-            ],
-          );
-          await callIntrinsic(
-            promiseAllSettledIntrinsic,
-            PromiseConstructor,
-            [pending],
-          );
+        while (activeProbeHead !== null) {
+          await activeProbeHead.drain;
         }
         if (probeFailed) healthFailed = true;
         try {

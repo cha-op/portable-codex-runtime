@@ -47,6 +47,7 @@ class FakeClient {
     failRelease = false,
     heldProbeGate = undefined,
     heldProbeGateCall = undefined,
+    heldProbeGates = undefined,
     loseTryLockResponse = false,
   }) {
     this.connectionLost = false;
@@ -56,6 +57,7 @@ class FakeClient {
     this.failUnlock = failUnlock;
     this.heldProbeGate = heldProbeGate;
     this.heldProbeGateCall = heldProbeGateCall;
+    this.heldProbeGates = heldProbeGates;
     this.loseTryLockResponse = loseTryLockResponse;
     this.manager = manager;
     this.pid = pid;
@@ -85,8 +87,9 @@ class FakeClient {
 
     if (this.connectionLost) throw new Error("connection lost");
 
-    const [key] =
+    const values =
       typeof query === "string" ? args[1] : query.values;
+    const key = values[0];
     if (text.includes("pg_try_advisory_lock")) {
       const acquired = this.manager.tryAcquire(key, this);
       if (this.loseTryLockResponse) {
@@ -104,8 +107,13 @@ class FakeClient {
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
       this.heldProbeCount += 1;
-      if (this.heldProbeCount === this.heldProbeGateCall) {
-        await this.heldProbeGate.promise;
+      const heldProbeGate =
+        this.heldProbeGates?.get(this.heldProbeCount) ??
+        (this.heldProbeCount === this.heldProbeGateCall
+          ? this.heldProbeGate
+          : undefined);
+      if (heldProbeGate !== undefined) {
+        await heldProbeGate.promise;
       }
       return {
         command: "SELECT",
@@ -312,7 +320,7 @@ test("returns callback result identity and exposes only a frozen lock probe", as
 });
 
 test(
-  "probe drain survives callback poisoning of mutable Set and Promise surfaces",
+  "probe drain avoids mutable Promise and iterator protocols",
   { timeout: 2_000 },
   async () => {
     const manager = new AdvisoryLockManager();
@@ -328,10 +336,24 @@ test(
       Promise,
       "allSettled",
     );
+    const promiseResolveDescriptor = Object.getOwnPropertyDescriptor(
+      Promise,
+      "resolve",
+    );
     const setSizeDescriptor = Object.getOwnPropertyDescriptor(
       Set.prototype,
       "size",
     );
+    const arrayIteratorPrototype = Object.getPrototypeOf(
+      [][Symbol.iterator](),
+    );
+    const arrayIteratorNextDescriptor =
+      Object.getOwnPropertyDescriptor(arrayIteratorPrototype, "next");
+    const setIteratorPrototype = Object.getPrototypeOf(
+      new Set()[Symbol.iterator](),
+    );
+    const setIteratorNextDescriptor =
+      Object.getOwnPropertyDescriptor(setIteratorPrototype, "next");
 
     try {
       const run = guard.runExclusive(
@@ -344,10 +366,28 @@ test(
               throw new Error("poisoned Promise.allSettled");
             },
           });
+          Object.defineProperty(Promise, "resolve", {
+            ...promiseResolveDescriptor,
+            value() {
+              throw new Error("poisoned Promise.resolve");
+            },
+          });
           Object.defineProperty(Set.prototype, "size", {
             ...setSizeDescriptor,
             get() {
               throw new Error("poisoned Set.prototype.size");
+            },
+          });
+          Object.defineProperty(arrayIteratorPrototype, "next", {
+            ...arrayIteratorNextDescriptor,
+            value() {
+              throw new Error("poisoned Array iterator");
+            },
+          });
+          Object.defineProperty(setIteratorPrototype, "next", {
+            ...setIteratorNextDescriptor,
+            value() {
+              throw new Error("poisoned Set iterator");
             },
           });
           setImmediate(() => heldProbeGate.resolve());
@@ -361,13 +401,64 @@ test(
         "allSettled",
         allSettledDescriptor,
       );
+      Object.defineProperty(
+        Promise,
+        "resolve",
+        promiseResolveDescriptor,
+      );
       Object.defineProperty(Set.prototype, "size", setSizeDescriptor);
+      Object.defineProperty(
+        arrayIteratorPrototype,
+        "next",
+        arrayIteratorNextDescriptor,
+      );
+      Object.defineProperty(
+        setIteratorPrototype,
+        "next",
+        setIteratorNextDescriptor,
+      );
     }
 
     assert.equal(client.heldProbeCount, 3);
     assert.equal(manager.holders.size, 0);
   },
 );
+
+test("probe drain unlinks out-of-order completions", async () => {
+  const manager = new AdvisoryLockManager();
+  const first = deferred();
+  const middle = deferred();
+  const last = deferred();
+  const client = new FakeClient(
+    clientOptions(manager, 104, {
+      heldProbeGates: new Map([
+        [2, first],
+        [3, middle],
+        [4, last],
+      ]),
+    }),
+  );
+  const { guard } = makeGuard(client);
+
+  const run = guard.runExclusive(
+    "out-of-order-probe-drain",
+    async ({ assertHeld }) => {
+      void assertHeld();
+      void assertHeld();
+      void assertHeld();
+      middle.resolve();
+      setImmediate(() => {
+        first.resolve();
+        setImmediate(() => last.resolve());
+      });
+      return "completed";
+    },
+  );
+
+  assert.equal(await run, "completed");
+  assert.equal(client.heldProbeCount, 5);
+  assert.equal(manager.holders.size, 0);
+});
 
 test("same operation ID is busy while the first callback holds the lock", async () => {
   const manager = new AdvisoryLockManager();
