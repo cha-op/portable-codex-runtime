@@ -3645,72 +3645,77 @@ test(
         const capture = checkpointAuthority.runCapture(
           admission,
           async (context) => {
-            publicationCount += 1;
-            publicationEntered.resolve();
-            assert.deepEqual(Reflect.ownKeys(context), [
-              "artifactDirectory",
-              "artifactOwnedRoot",
-              "canonicalAttachment",
-              "canonicalLease",
-              "captureAttemptId",
-              "now",
-              "reservationId",
-              "result",
-              "sourceDirectory",
-              "sourceOwnedRoot",
-              "storageRef",
-            ]);
-            assert.equal(
-              context.sourceDirectory,
-              attached.session.document.attachment.rootPath,
-            );
-            assert.equal(
-              context.sourceOwnedRoot,
-              "/var/lib/portable-codex",
-            );
-            assert.equal(
-              context.artifactDirectory,
-              `/var/lib/portable-codex-checkpoints/${admission.checkpoint.artifactId}`,
-            );
-            assert.equal(
-              context.captureAttemptId,
-              admission.captureAttemptId,
-            );
-            assert.equal(Number.isFinite(context.now), true);
+            try {
+              publicationCount += 1;
+              publicationEntered.resolve();
+              assert.deepEqual(Reflect.ownKeys(context), [
+                "artifactDirectory",
+                "artifactOwnedRoot",
+                "canonicalAttachment",
+                "canonicalLease",
+                "captureAttemptId",
+                "now",
+                "reservationId",
+                "result",
+                "sourceDirectory",
+                "sourceOwnedRoot",
+                "storageRef",
+              ]);
+              assert.equal(
+                context.sourceDirectory,
+                attached.session.document.attachment.rootPath,
+              );
+              assert.equal(
+                context.sourceOwnedRoot,
+                "/var/lib/portable-codex",
+              );
+              assert.equal(
+                context.artifactDirectory,
+                `/var/lib/portable-codex-checkpoints/${admission.checkpoint.artifactId}`,
+              );
+              assert.equal(
+                context.captureAttemptId,
+                admission.captureAttemptId,
+              );
+              assert.equal(Number.isFinite(context.now), true);
 
-            const guardState = await pool.query(
-              [
-                "SELECT count(*)::integer AS lock_count,",
-                "count(*) FILTER (WHERE a.xact_start IS NOT NULL)::integer",
-                "AS transaction_lock_count",
-                "FROM pg_catalog.pg_locks l",
-                "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
-                "WHERE l.locktype = 'advisory' AND l.granted",
-                "AND a.application_name = $1",
-              ].join(" "),
-              [CHECKPOINT_GUARD_APPLICATION_NAME],
-            );
-            assert.deepEqual(guardState.rows[0], {
-              lock_count: 1,
-              transaction_lock_count: 0,
-            });
-            const transactionState = await pool.query(
-              [
-                "SELECT count(*)::integer AS idle_transaction_count",
-                "FROM pg_catalog.pg_stat_activity",
-                "WHERE application_name = $1",
-                "AND state LIKE 'idle in transaction%'",
-              ].join(" "),
-              [SESSION_AUTHORITY_APPLICATION_NAME],
-            );
-            assert.equal(
-              transactionState.rows[0].idle_transaction_count,
-              0,
-            );
+              const guardState = await pool.query(
+                [
+                  "SELECT count(*)::integer AS lock_count,",
+                  "count(*) FILTER (WHERE a.xact_start IS NOT NULL)::integer",
+                  "AS transaction_lock_count",
+                  "FROM pg_catalog.pg_locks l",
+                  "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
+                  "WHERE l.locktype = 'advisory' AND l.granted",
+                  "AND a.application_name = $1",
+                ].join(" "),
+                [CHECKPOINT_GUARD_APPLICATION_NAME],
+              );
+              assert.deepEqual(guardState.rows[0], {
+                lock_count: 1,
+                transaction_lock_count: 0,
+              });
+              const transactionState = await pool.query(
+                [
+                  "SELECT count(*)::integer AS idle_transaction_count",
+                  "FROM pg_catalog.pg_stat_activity",
+                  "WHERE application_name = $1",
+                  "AND state LIKE 'idle in transaction%'",
+                ].join(" "),
+                [SESSION_AUTHORITY_APPLICATION_NAME],
+              );
+              assert.equal(
+                transactionState.rows[0].idle_transaction_count,
+                0,
+              );
 
-            await releasePublication.promise;
-            publishedCompletion = checkpointCompletion(context, false);
-            return publishedCompletion;
+              await releasePublication.promise;
+              publishedCompletion = checkpointCompletion(context, false);
+              return publishedCompletion;
+            } catch (error) {
+              console.error("checkpoint publication callback failed", error);
+              throw error;
+            }
           },
         );
 
@@ -3731,7 +3736,15 @@ test(
           releasePublication.resolve();
         }
 
-        const captured = await capture;
+        let captured;
+        try {
+          captured = await capture;
+        } catch (error) {
+          console.error("checkpoint capture failed", {
+            publicationCompleted: publishedCompletion !== undefined,
+          });
+          throw error;
+        }
         assert.strictEqual(captured, publishedCompletion);
         assert.equal(publicationCount, 1);
         assert.equal(competingPublicationCount, 0);
