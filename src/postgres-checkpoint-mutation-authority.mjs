@@ -26,7 +26,6 @@ const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const functionToStringIntrinsic = Function.prototype.toString;
 const createHashIntrinsic = createHashExport;
-const ErrorConstructor = Error;
 const isAsyncFunctionValue = utilTypes.isAsyncFunction;
 const isGeneratorFunctionValue = utilTypes.isGeneratorFunction;
 const isGeneratorObjectValue = utilTypes.isGeneratorObject;
@@ -81,8 +80,6 @@ const CHECKPOINT_CAPTURE_BINDING_CONTRACT_VERSION = 2;
 const CHECKPOINT_CAPTURE_OPERATION_CONTRACT_VERSION = 1;
 const CHECKPOINT_CATALOGUE_CONTRACT_VERSION = 1;
 const OPERATION_REQUEST_VERSION = 1;
-const CHECKPOINT_CAPTURE_DIAGNOSTIC =
-  process.env.PORTABLE_CODEX_RUNTIME_CHECKPOINT_DIAGNOSTIC === "1";
 
 const OPTION_KEYS = objectFreeze([
   "authority",
@@ -2109,7 +2106,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
     );
     const publish = assertCallback(publishValue, requestCode);
     const operationId = admission.request.operationId;
-    let diagnosticStage = "guard";
     let dispatchDefinitelyBegan = false;
     let uncertaintyInput = null;
     let uncertaintyAttempted = false;
@@ -2145,7 +2141,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
             let baseInput;
             let preparedRecoveryEligible = false;
             try {
-              diagnosticStage = "read-session";
               expectedSession = await invokeAsync(
                 authority,
                 "readSession",
@@ -2188,7 +2183,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
 
               let reserveReceipt;
               preparedRecoveryEligible = true;
-              diagnosticStage = "reserve";
               try {
                 reserveReceipt = await invokeAsync(
                   authority,
@@ -2200,7 +2194,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                 await recoverPrepared(baseInput);
                 fail(outcomeCode);
               }
-              diagnosticStage = "reserve-receipt";
               const reserve = exactDataObject(
                 reserveReceipt,
                 RESERVE_RECEIPT_KEYS,
@@ -2271,7 +2264,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
               );
 
               let claimReceipt;
-              diagnosticStage = "claim";
               try {
                 claimReceipt = await invokeAsync(
                   authority,
@@ -2290,7 +2282,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                 await recoverPrepared(baseInput);
                 fail(outcomeCode);
               }
-              diagnosticStage = "claim-receipt";
               const claim = exactDataObject(
                 claimReceipt,
                 CLAIM_RECEIPT_KEYS,
@@ -2379,7 +2370,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                 claimOperation.request,
               );
 
-              diagnosticStage = "prepublish-probe";
               await assertGuardHeld(probe, outcomeCode);
               const context = exactFrozenRecord({
                 artifactDirectory: artifact.directory,
@@ -2397,7 +2387,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                 sourceOwnedRoot: source.ownedRoot,
                 storageRef: claimDocument.storageRef,
               });
-              diagnosticStage = "publish";
               const completion = normalizeCompletion(
                 await invokeCallback(
                   publish,
@@ -2407,9 +2396,7 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                 false,
                 outcomeCode,
               );
-              diagnosticStage = "postpublish-probe";
               await assertGuardHeld(probe, outcomeCode);
-              diagnosticStage = "finalize";
               normalizeFinalizationReceipt(
                 await invokeAsync(
                   authority,
@@ -2437,7 +2424,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
                 },
                 outcomeCode,
               );
-              diagnosticStage = "complete";
               return completion;
             } catch {
               if (dispatchDefinitelyBegan) {
@@ -2456,11 +2442,6 @@ export function createPostgresCheckpointMutationAuthority(...args) {
       );
     } catch {
       await markUncertain();
-      if (CHECKPOINT_CAPTURE_DIAGNOSTIC) {
-        throw new ErrorConstructor(
-          `checkpoint capture diagnostic stage: ${diagnosticStage}`,
-        );
-      }
       fail(outcomeCode);
     }
   };
