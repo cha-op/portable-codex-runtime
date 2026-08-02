@@ -4900,8 +4900,11 @@ async function readRequestedOperation(
       "operation_state_invalid",
     );
     ensure(
-      BigIntConstructor(session.revision) >=
-        BigIntConstructor(terminalSessionRevision),
+      canonicalIdentityBytes(session.document) ===
+          canonicalIdentityBytes(operation.expectedSession.document) &&
+        session.createdAt === operation.expectedSession.createdAt &&
+        BigIntConstructor(session.revision) >=
+          BigIntConstructor(terminalSessionRevision),
       "operation_state_invalid",
     );
   }

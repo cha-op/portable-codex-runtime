@@ -562,11 +562,14 @@ become success through this path. After asynchronous verification, the
 authority revalidates the same attempt and claims before it atomically
 finalizes or confirms the catalogue and returns the verifier's exact completion.
 Every historical committed-operation read also requires the current canonical
-session revision to be at least
+session to retain the operation's exact immutable document identity and
+session-incarnation `createdAt`, and its revision must be at least
 `operation.expectedSession.revision + operation.revision + 1`. Immutable
 session identity alone is not ancestry evidence: a partially restored session
 row that predates the committed operation fails closed even when the newer
-operation, attempt, and catalogue rows remain present.
+operation, attempt, and catalogue rows remain present. Conversely, a newer
+revision from another session incarnation or identity cannot adopt that
+historical operation's attempt or catalogue.
 
 ## Canonical Session Lifecycle
 

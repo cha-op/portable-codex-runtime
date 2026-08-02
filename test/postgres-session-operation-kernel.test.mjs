@@ -1679,6 +1679,112 @@ function checkpointCaptureCommittedSteps(
   ];
 }
 
+function checkpointHistoricalReplacementFixture(
+  fixture,
+  {
+    capabilities = fixture.options.expectedSession.document
+      .backendCapabilities,
+    createdAt = fixture.options.expectedSession.createdAt,
+  } = {},
+) {
+  const writerExpected = sessionSnapshot({
+    sessionId: fixture.options.expectedSession.sessionId,
+    sessionDocument: document(
+      fixture.options.expectedSession.sessionId,
+      {
+        backendCapabilities: structuredClone(capabilities),
+      },
+    ),
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const writerOptions = writerAcquireOptions({
+    expectedSession: writerExpected,
+    operationId: "replacement-session-writer-attachment",
+  });
+  const lease = writerLease(writerOptions);
+  const writerResult = writerAttachmentResult(writerOptions, lease);
+  const attachedSession = writerAttachedSessionRow({
+    options: writerOptions,
+    lease,
+    result: writerResult,
+  });
+  const predecessorOptions = reserveOptions({
+    expectedSession: snapshotFromSessionRow(attachedSession),
+    operationId: "replacement-session-predecessor",
+    request: operationRequest({
+      checkpointId: "replacement-session-predecessor-checkpoint",
+    }),
+  });
+  const predecessorResult = cancellationResult(
+    "replacement-session-predecessor",
+  );
+  const replacementExpectedRow = sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (
+      BigInt(predecessorOptions.expectedSession.revision) + 2n
+    ).toString(),
+    sessionDocument: document(
+      fixture.options.expectedSession.sessionId,
+      {
+        ...structuredClone(predecessorOptions.expectedSession.document),
+        activeOperation: null,
+        lastOperation: terminalPointer({
+          options: predecessorOptions,
+          operationRevision: "1",
+          result: predecessorResult,
+        }),
+      },
+    ),
+    createdAt,
+    updatedAt: CAPTURE_PREPARED_NOW,
+  });
+  const replacementExpected = snapshotFromSessionRow(
+    replacementExpectedRow,
+  );
+  const options = reserveOptions({
+    expectedSession: replacementExpected,
+    operationId: "replacement-session-operation",
+    request: operationRequest({
+      checkpointId: "replacement-session-checkpoint",
+    }),
+  });
+  const result = cancellationResult("replacement-session-anchor");
+  const operation = operationRow("committed", {
+    options,
+    revision: "1",
+    createdAt: CAPTURE_PREPARED_NOW,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+    result,
+    retiredAt: CAPTURE_FINALIZE_NOW,
+  });
+  const reservation = reservationRow("released", {
+    options,
+    createdAt: CAPTURE_PREPARED_NOW,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+    releasedAt: CAPTURE_FINALIZE_NOW,
+  });
+  const session = sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (BigInt(replacementExpected.revision) + 2n).toString(),
+    sessionDocument: document(
+      fixture.options.expectedSession.sessionId,
+      {
+        ...structuredClone(replacementExpected.document),
+        activeOperation: null,
+        lastOperation: terminalPointer({
+          options,
+          operationRevision: "1",
+          result,
+        }),
+      },
+    ),
+    createdAt,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+  });
+  return { operation, reservation, session };
+}
+
 function phaseSessionRow(
   state,
   {
@@ -7115,6 +7221,137 @@ test("historical checkpoint catalogue rejects a session restored before commit",
     { code: "operation_state_invalid" },
   );
 
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint attempt rejects replacement document identity at the committed revision floor", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const replacement = checkpointHistoricalReplacementFixture(fixture, {
+    capabilities: backendCapabilities({ fencing: "manual" }),
+  });
+  assert.equal(
+    replacement.session.revision,
+    (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(committedOperation.revision) +
+      1n
+    ).toString(),
+  );
+  assert.notDeepEqual(
+    replacement.session.document.backendCapabilities,
+    fixture.options.expectedSession.document.backendCapabilities,
+  );
+  assert.equal(
+    replacement.session.created_at.toISOString(),
+    fixture.options.expectedSession.createdAt,
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(committedOperation),
+    rows(replacement.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(replacement.operation),
+    rows(replacement.reservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCaptureAttempt({
+      checkpoint: fixture.checkpoint,
+      request: fixture.mutationRequest,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.deepEqual(authorityQueries(clients[0]).map(queryText), [
+    READ_OPERATION_QUERY,
+    READ_SESSION_QUERY,
+    READ_ACTIVE_COUNTS_QUERY,
+    READ_OPERATION_QUERY,
+    READ_RESERVATION_QUERY,
+    READ_OPERATION_QUERY,
+  ]);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint catalogue rejects a replacement session incarnation at the committed revision floor", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const replacement = checkpointHistoricalReplacementFixture(fixture, {
+    createdAt: "2026-07-29T12:34:56.790Z",
+  });
+  assert.equal(
+    replacement.session.revision,
+    (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(committedOperation.revision) +
+      1n
+    ).toString(),
+  );
+  assert.deepEqual(
+    {
+      manifest: replacement.session.document.manifest,
+      storageRef: replacement.session.document.storageRef,
+      backendCapabilities:
+        replacement.session.document.backendCapabilities,
+    },
+    {
+      manifest: fixture.options.expectedSession.document.manifest,
+      storageRef: fixture.options.expectedSession.document.storageRef,
+      backendCapabilities:
+        fixture.options.expectedSession.document.backendCapabilities,
+    },
+  );
+  assert.notEqual(
+    replacement.session.created_at.toISOString(),
+    fixture.options.expectedSession.createdAt,
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(checkpointCatalogueRow(fixture)),
+    rows(checkpointCaptureAttemptRow(fixture)),
+    rows(committedOperation),
+    rows(replacement.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(replacement.operation),
+    rows(replacement.reservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCatalogue({
+      checkpoint: fixture.checkpoint,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.deepEqual(authorityQueries(clients[0]).map(queryText), [
+    READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY,
+    READ_CAPTURE_ATTEMPT_BY_ID_QUERY,
+    READ_OPERATION_QUERY,
+    READ_SESSION_QUERY,
+    READ_ACTIVE_COUNTS_QUERY,
+    READ_OPERATION_QUERY,
+    READ_RESERVATION_QUERY,
+    READ_OPERATION_QUERY,
+  ]);
   assert.equal(
     authorityQueries(clients[0]).some((args) =>
       /^(?:INSERT|UPDATE) /u.test(queryText(args)),
