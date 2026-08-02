@@ -20,6 +20,7 @@ const arrayJoinIntrinsic = Array.prototype.join;
 const arrayPushIntrinsic = Array.prototype.push;
 const arraySortIntrinsic = Array.prototype.sort;
 const BigIntConstructor = BigInt;
+const bigIntToStringIntrinsic = BigInt.prototype.toString;
 const DateConstructor = Date;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
@@ -41,10 +42,12 @@ const objectHasOwn = Object.hasOwn;
 const objectIs = Object.is;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
+const objectSetPrototypeOf = Object.setPrototypeOf;
 const hashPrototype = objectGetPrototypeOf(createHashExport("sha256"));
 const hashDigestIntrinsic = hashPrototype.digest;
 const hashUpdateIntrinsic = hashPrototype.update;
-const jsonStringifyIntrinsic = JSON.stringify;
+const jsonReceiver = JSON;
+const jsonStringifyIntrinsic = jsonReceiver.stringify;
 const pathBasename = pathBasenameExport;
 const pathDirname = pathDirnameExport;
 const pathIsAbsolute = pathIsAbsoluteExport;
@@ -53,8 +56,9 @@ const pathResolve = pathResolveExport;
 const PromiseConstructor = Promise;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
-const regexpTestIntrinsic = RegExp.prototype.test;
+const regexpExecIntrinsic = RegExp.prototype.exec;
 const stringStartsWithIntrinsic = String.prototype.startsWith;
+const TypeErrorConstructor = TypeError;
 const WeakSetConstructor = WeakSet;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
@@ -297,16 +301,40 @@ const RECONCILE_RECEIPT_KEYS = objectFreeze([
 ]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 
-const ERROR_MESSAGES = objectFreeze({
-  invalid_postgres_checkpoint_mutation_authority_options:
-    "PostgreSQL checkpoint mutation authority options are invalid",
-  invalid_postgres_checkpoint_mutation_authority_request:
-    "PostgreSQL checkpoint mutation authority request is invalid",
-  postgres_checkpoint_mutation_authority_outcome_uncertain:
-    "PostgreSQL checkpoint mutation authority outcome is uncertain",
-  postgres_checkpoint_restore_unavailable:
-    "PostgreSQL checkpoint restore is unavailable",
-});
+const ERROR_MESSAGES = objectCreate(null);
+objectDefineProperty(
+  ERROR_MESSAGES,
+  "invalid_postgres_checkpoint_mutation_authority_options",
+  {
+    enumerable: true,
+    value: "PostgreSQL checkpoint mutation authority options are invalid",
+  },
+);
+objectDefineProperty(
+  ERROR_MESSAGES,
+  "invalid_postgres_checkpoint_mutation_authority_request",
+  {
+    enumerable: true,
+    value: "PostgreSQL checkpoint mutation authority request is invalid",
+  },
+);
+objectDefineProperty(
+  ERROR_MESSAGES,
+  "postgres_checkpoint_mutation_authority_outcome_uncertain",
+  {
+    enumerable: true,
+    value: "PostgreSQL checkpoint mutation authority outcome is uncertain",
+  },
+);
+objectDefineProperty(
+  ERROR_MESSAGES,
+  "postgres_checkpoint_restore_unavailable",
+  {
+    enumerable: true,
+    value: "PostgreSQL checkpoint restore is unavailable",
+  },
+);
+objectFreeze(ERROR_MESSAGES);
 
 const CANCEL_REASON = "capture-dispatch-not-started";
 
@@ -319,7 +347,7 @@ function arrayIncludes(value, candidate) {
 }
 
 function regexpTest(pattern, value) {
-  return callIntrinsic(regexpTestIntrinsic, pattern, [value]);
+  return callIntrinsic(regexpExecIntrinsic, pattern, [value]) !== null;
 }
 
 function stringStartsWith(value, prefix) {
@@ -637,13 +665,15 @@ function canonicalDataJson(value, state, code) {
     typeof value === "string" ||
     typeof value === "boolean"
   ) {
-    const serialized = callIntrinsic(jsonStringifyIntrinsic, JSON, [value]);
+    const serialized = callIntrinsic(jsonStringifyIntrinsic, jsonReceiver, [
+      value,
+    ]);
     ensure(typeof serialized === "string", code);
     return serialized;
   }
   if (typeof value === "number") {
     ensure(numberIsFinite(value), code);
-    return callIntrinsic(jsonStringifyIntrinsic, JSON, [value]);
+    return callIntrinsic(jsonStringifyIntrinsic, jsonReceiver, [value]);
   }
   ensure(
     typeof value === "object" &&
@@ -662,6 +692,7 @@ function canonicalDataJson(value, state, code) {
   }
   ensure(arrayIncludes([objectPrototype, null], prototype), code);
   const keys = [];
+  callIntrinsic(objectSetPrototypeOf, undefined, [keys, null]);
   for (let index = 0; index < ownKeys.length; index += 1) {
     ensure(typeof ownKeys[index] === "string", code);
     callIntrinsic(arrayPushIntrinsic, keys, [ownKeys[index]]);
@@ -669,6 +700,7 @@ function canonicalDataJson(value, state, code) {
   callIntrinsic(arraySortIntrinsic, keys, []);
   weakSetAdd(state.seen, value);
   const fields = [];
+  callIntrinsic(objectSetPrototypeOf, undefined, [fields, null]);
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index];
     let descriptor;
@@ -687,7 +719,11 @@ function canonicalDataJson(value, state, code) {
       nodes: state.nodes,
       seen: state.seen,
     };
-    const serializedKey = callIntrinsic(jsonStringifyIntrinsic, JSON, [key]);
+    const serializedKey = callIntrinsic(
+      jsonStringifyIntrinsic,
+      jsonReceiver,
+      [key],
+    );
     const serializedValue = canonicalDataJson(
       descriptor.value,
       childState,
@@ -742,7 +778,9 @@ function serializedDataSha256(value, code) {
   );
   let serialized;
   try {
-    serialized = callIntrinsic(jsonStringifyIntrinsic, JSON, [snapshot]);
+    serialized = callIntrinsic(jsonStringifyIntrinsic, jsonReceiver, [
+      snapshot,
+    ]);
   } catch {
     fail(code);
   }
@@ -1800,7 +1838,11 @@ function normalizeReconciliationReadReceipt(value, admission, code) {
     catalogue,
     expectedOperationRevision:
       typeof expectedOperationRevision === "bigint"
-        ? expectedOperationRevision.toString()
+        ? reflectApply(
+            bigIntToStringIntrinsic,
+            expectedOperationRevision,
+            [],
+          )
         : expectedOperationRevision,
     operation,
     reservation: receipt.reservation,
@@ -2000,10 +2042,12 @@ async function bestEffortMarkUncertain(authority, input, code) {
 
 export class PostgresCheckpointMutationAuthorityError extends Error {
   constructor(code) {
-    const message = ERROR_MESSAGES[code];
-    if (message === undefined) {
-      throw new TypeError("Unsupported PostgreSQL checkpoint authority error");
+    if (typeof code !== "string" || !objectHasOwn(ERROR_MESSAGES, code)) {
+      throw new TypeErrorConstructor(
+        "Unsupported PostgreSQL checkpoint authority error",
+      );
     }
+    const message = ERROR_MESSAGES[code];
     super(message);
     objectDefineProperty(this, "name", {
       enumerable: false,

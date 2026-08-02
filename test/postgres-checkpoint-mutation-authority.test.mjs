@@ -31,6 +31,9 @@ const SOURCE_OWNED_ROOT = "/srv/portable-codex/sessions";
 const SOURCE_DIRECTORY = `${SOURCE_OWNED_ROOT}/session-001`;
 const ARTIFACT_OWNED_ROOT = "/srv/portable-codex/checkpoints";
 const ARTIFACT_DIRECTORY = `${ARTIFACT_OWNED_ROOT}/${ARTIFACT_ID}`;
+const jsonReceiver = JSON;
+const jsonStringifyIntrinsic = jsonReceiver.stringify;
+const reflectApply = Reflect.apply;
 const RESERVATION_ID = `reservation-${createHash("sha256")
   .update(OPERATION_ID, "utf8")
   .digest("hex")}`;
@@ -52,7 +55,10 @@ function exactKeys(value, keys) {
 
 function sha256(value) {
   return createHash("sha256")
-    .update(JSON.stringify(value), "utf8")
+    .update(
+      reflectApply(jsonStringifyIntrinsic, jsonReceiver, [value]),
+      "utf8",
+    )
     .digest("hex");
 }
 
@@ -815,6 +821,78 @@ test("factory returns an exact frozen stopped-directory authority facade", () =>
   assert.equal(typeof adapter.runRestore, "function");
 });
 
+test("error constructor rejects inherited and prototype-polluted codes", () => {
+  const inheritedError = (() => {
+    try {
+      return new PostgresCheckpointMutationAuthorityError("toString");
+    } catch (error) {
+      return error;
+    }
+  })();
+  assert.ok(inheritedError instanceof TypeError);
+
+  const pollutedCode = "postgres_checkpoint_prototype_polluted";
+  const pollutedDescriptor = Object.getOwnPropertyDescriptor(
+    Object.prototype,
+    pollutedCode,
+  );
+  let pollutedError;
+  try {
+    Object.defineProperty(Object.prototype, pollutedCode, {
+      configurable: true,
+      value: "Prototype pollution must not define an error code",
+    });
+    try {
+      pollutedError = new PostgresCheckpointMutationAuthorityError(
+        pollutedCode,
+      );
+    } catch (error) {
+      pollutedError = error;
+    }
+  } finally {
+    if (pollutedDescriptor === undefined) {
+      Reflect.deleteProperty(Object.prototype, pollutedCode);
+    } else {
+      Object.defineProperty(
+        Object.prototype,
+        pollutedCode,
+        pollutedDescriptor,
+      );
+    }
+  }
+
+  assert.ok(pollutedError instanceof TypeError);
+});
+
+test("error constructor uses TypeError captured before global replacement", () => {
+  const typeErrorDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "TypeError",
+  );
+  const OriginalTypeError = typeErrorDescriptor.value;
+  class ReplacementTypeError extends Error {}
+  let observedError;
+
+  try {
+    Object.defineProperty(globalThis, "TypeError", {
+      ...typeErrorDescriptor,
+      value: ReplacementTypeError,
+    });
+    try {
+      observedError = new PostgresCheckpointMutationAuthorityError(
+        "unsupported-error-code",
+      );
+    } catch (error) {
+      observedError = error;
+    }
+  } finally {
+    Object.defineProperty(globalThis, "TypeError", typeErrorDescriptor);
+  }
+
+  assert.ok(observedError instanceof OriginalTypeError);
+  assert.equal(observedError instanceof ReplacementTypeError, false);
+});
+
 test("capture plans before reserve, probes around publication, and returns callback completion by identity", async () => {
   const value = fixture();
   let callbackCalls = 0;
@@ -866,6 +944,127 @@ test("capture plans before reserve, probes around publication, and returns callb
     "authority:finalize",
     "guard:end",
   ]);
+});
+
+test("canonical operation-result hashing ignores inherited numeric array accessors", async () => {
+  const value = fixture();
+  const callbackCompletion = completion(value.state, false);
+  const numericDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    "4",
+  );
+  let replacementAttempts = 0;
+  let result;
+
+  try {
+    Object.defineProperty(Array.prototype, "4", {
+      configurable: true,
+      get() {
+        return undefined;
+      },
+      set(candidate) {
+        const replacement =
+          candidate === "resultVersion" ? "outcome" : candidate;
+        if (replacement !== candidate) replacementAttempts += 1;
+        Object.defineProperty(this, "4", {
+          configurable: true,
+          enumerable: true,
+          value: replacement,
+          writable: true,
+        });
+      },
+    });
+
+    result = await value.adapter.runCapture(
+      value.admission,
+      async () => callbackCompletion,
+    );
+  } finally {
+    if (numericDescriptor === undefined) {
+      Reflect.deleteProperty(Array.prototype, "4");
+    } else {
+      Object.defineProperty(Array.prototype, "4", numericDescriptor);
+    }
+  }
+
+  assert.strictEqual(result, callbackCompletion);
+  assert.equal(replacementAttempts, 0);
+  assert.equal(value.state.finalizeInputs.length, 1);
+});
+
+test("captured JSON receiver prevents global getter reentrancy", async () => {
+  const value = fixture();
+  const callbackCompletion = completion(value.state, false);
+  const jsonDescriptor = Object.getOwnPropertyDescriptor(globalThis, "JSON");
+  let getterCalls = 0;
+  let result;
+
+  try {
+    Object.defineProperty(globalThis, "JSON", {
+      configurable: true,
+      enumerable: jsonDescriptor.enumerable,
+      get() {
+        getterCalls += 1;
+        value.state.finalizeMode = "crossed-catalogue";
+        return jsonReceiver;
+      },
+    });
+
+    result = await value.adapter.runCapture(
+      value.admission,
+      async () => callbackCompletion,
+    );
+  } finally {
+    Object.defineProperty(globalThis, "JSON", jsonDescriptor);
+  }
+
+  assert.strictEqual(result, callbackCompletion);
+  assert.equal(getterCalls, 0);
+  assert.equal(value.state.finalizeMode, "success");
+  assert.equal(value.state.finalizeInputs.length, 1);
+});
+
+test("captured RegExp exec preserves validation after prototype poisoning", async () => {
+  const value = fixture();
+  const validAdmission = reconciliationAdmission();
+  const invalidAdmission = structuredClone(validAdmission);
+  invalidAdmission.checkpoint.sessionId = "invalid-session-id";
+  deepFreeze(invalidAdmission);
+  const execDescriptor = Object.getOwnPropertyDescriptor(
+    RegExp.prototype,
+    "exec",
+  );
+  let validPending;
+  let invalidPending;
+
+  try {
+    Object.defineProperty(RegExp.prototype, "exec", {
+      ...execDescriptor,
+      value() {
+        throw new Error("poisoned RegExp.prototype.exec");
+      },
+    });
+    validPending = value.adapter.runRestore(validAdmission, async () => {
+      assert.fail("restore callback must not run");
+    });
+    invalidPending = value.adapter.runRestore(
+      invalidAdmission,
+      async () => {
+        assert.fail("restore callback must not run");
+      },
+    );
+  } finally {
+    Object.defineProperty(RegExp.prototype, "exec", execDescriptor);
+  }
+
+  await assertAuthorityError(
+    validPending,
+    "postgres_checkpoint_restore_unavailable",
+  );
+  await assertAuthorityError(
+    invalidPending,
+    "invalid_postgres_checkpoint_mutation_authority_request",
+  );
 });
 
 test("planner failure occurs before durable reserve", async () => {
@@ -1154,6 +1353,46 @@ test("committed reconciliation tolerates later current session state", async () 
     value.state.finalizeInputs[0].expectedOperationRevision,
     "2",
   );
+});
+
+test("committed reconciliation uses the captured BigInt string conversion intrinsic", async () => {
+  const value = fixture({
+    attemptPhase: "committed",
+    committedRevision: "3",
+    laterSessionOnCommittedReplay: true,
+  });
+  const verifierCompletion = completion(value.state, true);
+  const toStringDescriptor = Object.getOwnPropertyDescriptor(
+    BigInt.prototype,
+    "toString",
+  );
+
+  try {
+    Object.defineProperty(BigInt.prototype, "toString", {
+      ...toStringDescriptor,
+      value() {
+        throw new Error("poisoned BigInt.prototype.toString");
+      },
+    });
+
+    const result = await value.adapter.runCaptureReconciliation(
+      reconciliationAdmission(),
+      async () => verifierCompletion,
+    );
+
+    assert.strictEqual(result, verifierCompletion);
+    assert.equal(value.state.finalizeInputs.length, 1);
+    assert.equal(
+      value.state.finalizeInputs[0].expectedOperationRevision,
+      "2",
+    );
+  } finally {
+    Object.defineProperty(
+      BigInt.prototype,
+      "toString",
+      toStringDescriptor,
+    );
+  }
 });
 
 test("committed reconciliation rejects historical identity mismatch with a poisoned Array iterator", async () => {
