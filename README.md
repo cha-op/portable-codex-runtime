@@ -121,6 +121,30 @@ committed journal record and artefact for that durable attempt, including
 after lease expiry or fence turnover. It cannot consume another stopped-writer
 capability or advance `prepared` or `materialized` publication.
 
+`PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()` adds a
+bounded read-only recovery page over retained `starting` or `uncertain`
+captures. It uses immutable `session_id` keyset order, the existing active-row
+index, a hard `limit + 1` query, and one serializable snapshot to cross-check
+the session pointer, reservation, attempt binding, tombstone absence, and
+catalogue absence. Each frozen candidate contains only the exact durable
+`{checkpoint, request}` admission; current lease, attachment, stopped writer,
+and mutable source state are never reconstructed.
+
+`createPostgresCheckpointRecoveryService()` exposes
+`runBatch({afterSessionId, limit, signal})`, which processes one bounded page
+sequentially against one backend and stable artefact-root configuration.
+One service instance admits at most one batch at a time; an overlapping valid
+call fails closed before it can enumerate or reconcile another candidate.
+Per-candidate receipts are `reconciled` or `pending`; the batch is
+`sweep-complete`, `limit-reached`, or `aborted`, and the cursor advances only
+after the current attempt settles. A completed sweep wraps to a null cursor for
+later replay. Abort signals stop only new admission and drain any in-flight
+guarded reconciliation without `Promise.race`; guard-busy or unverifiable work
+remains durably blocked, and an unresolved `starting` operation may advance to
+`uncertain`. The count bound does not provide a wall-clock bound because the
+committed verifier has no cooperative cancellation seam, so deployment still
+needs statement and request deadlines.
+
 This production adapter is capture-only. Restore admission fails closed until
 a later slice defines the canonical detached destination generation and binds
 it to logical launcher admission. Production crash-consistent ext4 or

@@ -40,7 +40,7 @@
 - [done] Implement the production clean-capture mutation authority and
   checkpoint catalogue on the existing PostgreSQL schema, including
   source-free committed reconciliation and permanent attempt claims.
-- [pending] Implement a bounded operational recovery enumerator and service
+- [done] Implement a bounded operational recovery enumerator and service
   loop for retained `starting` or `uncertain` checkpoint capture operations.
   Recover the exact checkpoint and mutation request only from durable
   operation state, use stable artefact-root resolver configuration, and leave
