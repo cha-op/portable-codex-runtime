@@ -359,7 +359,16 @@ async function acquireClient(poolBinding) {
 
 async function queryClient(binding, query, values = undefined) {
   try {
-    const args = values === undefined ? [query] : [query, values];
+    const args =
+      values === undefined
+        ? [query]
+        : [
+            objectFreeze({
+              queryMode: query.queryMode,
+              text: query.text,
+              values: objectFreeze(values),
+            }),
+          ];
     return await callIntrinsic(
       binding.query,
       binding.client,

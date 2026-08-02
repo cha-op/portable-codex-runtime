@@ -85,7 +85,8 @@ class FakeClient {
 
     if (this.connectionLost) throw new Error("connection lost");
 
-    const [key] = args[1];
+    const [key] =
+      typeof query === "string" ? args[1] : query.values;
     if (text.includes("pg_try_advisory_lock")) {
       const acquired = this.manager.tryAcquire(key, this);
       if (this.loseTryLockResponse) {
@@ -295,7 +296,13 @@ test("returns callback result identity and exposes only a frozen lock probe", as
   const tryLock = client.queries.find(([query]) =>
     query?.text?.includes("pg_try_advisory_lock"),
   );
-  assert.deepEqual(tryLock[1], [lockKeyFor("checkpoint:operation-001")]);
+  assert.equal(tryLock.length, 1);
+  assert.equal(tryLock[0].queryMode, "extended");
+  assert.equal(Object.isFrozen(tryLock[0]), true);
+  assert.deepEqual(tryLock[0].values, [
+    lockKeyFor("checkpoint:operation-001"),
+  ]);
+  assert.equal(Object.isFrozen(tryLock[0].values), true);
   assert.equal(
     queryTexts(client).some((text) =>
       /^(?:BEGIN|COMMIT|ROLLBACK)(?:\s|$)/u.test(text),
