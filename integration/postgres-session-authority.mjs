@@ -3686,12 +3686,9 @@ test(
                 "FROM pg_catalog.pg_locks l",
                 "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
                 "WHERE l.locktype = 'advisory' AND l.granted",
-                "AND l.mode = 'ExclusiveLock' AND l.objsubid = 1",
-                "AND l.database = (",
-                "SELECT oid FROM pg_catalog.pg_database",
-                "WHERE datname = pg_catalog.current_database()",
-                ")",
+                "AND a.application_name = $1",
               ].join(" "),
+              [CHECKPOINT_GUARD_APPLICATION_NAME],
             );
             assert.deepEqual(guardState.rows[0], {
               lock_count: 1,
@@ -3843,13 +3840,11 @@ test(
           [
             "SELECT count(*)::integer AS lock_count",
             "FROM pg_catalog.pg_locks l",
+            "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
             "WHERE l.locktype = 'advisory' AND l.granted",
-            "AND l.mode = 'ExclusiveLock' AND l.objsubid = 1",
-            "AND l.database = (",
-            "SELECT oid FROM pg_catalog.pg_database",
-            "WHERE datname = pg_catalog.current_database()",
-            ")",
+            "AND a.application_name = $1",
           ].join(" "),
+          [CHECKPOINT_GUARD_APPLICATION_NAME],
         );
         assert.equal(releasedGuard.rows[0].lock_count, 0);
       },
