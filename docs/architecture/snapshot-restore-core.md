@@ -62,7 +62,9 @@ fence and admission guard across publication, and durably finalize before
 success. Its optional capture-reconciliation extension authenticates a durable
 attempt and verifies only an already committed artefact without another writer
 stop. It is a manual-fencing local-filesystem backend; the production authority
-database remains separate work. See `stopped-directory-backend.md`.
+database and checkpoint catalogue are implemented separately, while a
+production crash-consistent physical backend remains later work. See
+`stopped-directory-backend.md`.
 
 `captureCleanCheckpoint()`, `reconcileCleanCheckpointCapture()`, and
 `restoreCleanCheckpoint()` are the orchestration entry points. All three reject

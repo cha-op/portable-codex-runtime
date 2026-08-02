@@ -505,5 +505,5 @@ long-goal capture, cross-host migration, or Git Summary. See
 The composed stopped-directory backend does not widen this physical boundary:
 it advertises manual fencing and no atomic point-in-time checkpoint. Its
 durable authority seam supplies canonical admission and catalogue ordering,
-while a production database and any NFS/shared-filesystem implementation
-remain separate work.
+while a production crash-consistent physical backend and any
+NFS/shared-filesystem implementation remain separate work.

@@ -6,6 +6,7 @@ import {
   PostgresSerializableStore,
 } from "./postgres-serializable-store.mjs";
 import {
+  assertCheckpointDescriptor,
   assertLeaseGrant,
   assertSessionAttachment,
   assertSessionAttachmentMatches,
@@ -14,6 +15,7 @@ import {
   assertStorageBackendCapabilities,
   assertStorageForceFenceRequest,
   assertStorageForceFenceResult,
+  assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
   assertStorageMutationResult,
   STORAGE_CONTRACT_VERSION,
@@ -26,12 +28,15 @@ export const WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND =
 export const WRITER_LEASE_RENEW_OPERATION_KIND = "writer-lease-renew-v1";
 export const WRITER_RELEASE_OPERATION_KIND = "writer-release-v1";
 export const WRITER_FORCE_FENCE_OPERATION_KIND = "writer-force-fence-v1";
+export const CHECKPOINT_CAPTURE_OPERATION_KIND = "checkpoint-capture-v1";
 export const MAX_WRITER_LEASE_DURATION_MILLISECONDS = 86_400_000;
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const REVISION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const PERSISTENT_OBJECT_ID_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const WRITER_EPOCH_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/u;
 const SENSITIVE_OPERATION_KEY_PATTERN =
   /(?:api[_-]?key|auth(?:json|orization)?|cookie|credential|password|private.?key|secret|token)/iu;
@@ -46,6 +51,11 @@ const OPERATION_REQUEST_VERSION = 1;
 const RESERVATION_PAYLOAD_VERSION = 1;
 const OPERATION_RESULT_VERSION = 1;
 const WRITER_OPERATION_CONTRACT_VERSION = 1;
+const CHECKPOINT_CAPTURE_OPERATION_CONTRACT_VERSION = 1;
+const CHECKPOINT_CAPTURE_ATTEMPT_CONTRACT_VERSION = 1;
+const CHECKPOINT_CAPTURE_BINDING_CONTRACT_VERSION = 2;
+const CHECKPOINT_CATALOGUE_CONTRACT_VERSION = 1;
+const CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION = 2;
 const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
 const LEGACY_DOCUMENT_KEYS = Object.freeze([
   "activeOperation",
@@ -146,6 +156,87 @@ const WRITER_BLOCKED_FINALIZATION_INPUT_KEYS = Object.freeze([
   "reason",
   "request",
 ]);
+const CHECKPOINT_CAPTURE_OPERATION_REQUEST_KEYS = Object.freeze([
+  "admission",
+  "contractVersion",
+  "predeterminedResult",
+]);
+const CHECKPOINT_CAPTURE_ADMISSION_KEYS = Object.freeze([
+  "attachment",
+  "captureAttemptId",
+  "checkpoint",
+  "processIncarnationId",
+  "request",
+  "stopOperationId",
+  "writerIncarnationId",
+]);
+const CHECKPOINT_CAPTURE_RESULT_KEYS = Object.freeze([
+  "checkpoint",
+  "mutation",
+]);
+const CHECKPOINT_CAPTURE_FINALIZATION_INPUT_KEYS = Object.freeze([
+  "completion",
+  "expectedOperationRevision",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+]);
+const CHECKPOINT_CAPTURE_READ_KEYS = Object.freeze([
+  "checkpoint",
+  "request",
+]);
+const CHECKPOINT_CATALOGUE_READ_KEYS = Object.freeze(["checkpoint"]);
+const CHECKPOINT_CAPTURE_COMPLETION_KEYS = Object.freeze([
+  "artifactProof",
+  "materialization",
+  "replayed",
+  "result",
+]);
+const CHECKPOINT_ARTIFACT_PROOF_KEYS = Object.freeze([
+  "artifactManifestDigest",
+  "captureOperationId",
+  "modeledDigest",
+]);
+const CHECKPOINT_MATERIALIZATION_KEYS = Object.freeze([
+  "artifactManifestDigest",
+  "contractVersion",
+  "modeledDigest",
+  "publicationId",
+  "publicationKind",
+  "stagedRoot",
+  "treeIdentityDigest",
+]);
+const CHECKPOINT_STAGED_ROOT_KEYS = Object.freeze([
+  "filesystemId",
+  "objectIdentityScheme",
+  "objectId",
+]);
+const CHECKPOINT_CAPTURE_BINDING_KEYS = Object.freeze([
+  "attachmentId",
+  "attachmentOperationId",
+  "attachmentProofId",
+  "captureAttemptId",
+  "checkpoint",
+  "contractVersion",
+  "processIncarnationId",
+  "reservationId",
+  "stopOperationId",
+  "writerIncarnationId",
+]);
+const CHECKPOINT_CATALOGUE_DOCUMENT_KEYS = Object.freeze([
+  "artifactProof",
+  "contractVersion",
+  "materialization",
+  "result",
+]);
+const CHECKPOINT_CAPTURE_TERMINAL_RESULT_KEYS = Object.freeze([
+  "captureAttemptId",
+  "catalogueSha256",
+  "checkpointId",
+  "outcome",
+  "resultVersion",
+]);
 const WRITER_ATTACHMENT_REQUEST_KEYS = Object.freeze([
   "contractVersion",
   "holderId",
@@ -194,6 +285,27 @@ const RESERVATION_ROW_KEYS = Object.freeze([
   "session_id",
   "state",
   "updated_at",
+]);
+const CAPTURE_ATTEMPT_ROW_KEYS = Object.freeze([
+  "binding",
+  "capture_attempt_id",
+  "claimed_at",
+  "operation_id",
+  "session_id",
+]);
+const CAPTURE_ATTEMPT_TOMBSTONE_ROW_KEYS = Object.freeze([
+  "capture_attempt_id",
+  "operation_id",
+  "retired_at",
+  "session_id",
+  "tombstone",
+]);
+const CHECKPOINT_CATALOGUE_ROW_KEYS = Object.freeze([
+  "capture_attempt_id",
+  "checkpoint_id",
+  "committed_at",
+  "document",
+  "session_id",
 ]);
 const CANCELLATION_RESULT_KEYS = Object.freeze([
   "outcome",
@@ -293,6 +405,11 @@ const ACTIVE_OPERATION_STATES = Object.freeze([
   "uncertain",
 ]);
 const ERROR_MESSAGES = Object.freeze({
+  checkpoint_capture_not_authorized:
+    "Checkpoint capture attempt is not actively authorized",
+  checkpoint_catalogue_not_found: "Checkpoint catalogue entry was not found",
+  checkpoint_identity_conflict:
+    "Checkpoint identity is already bound to a different capture",
   invalid_authority_options: "PostgreSQL session authority options are invalid",
   invalid_operation_request: "Session operation request is invalid",
   invalid_session_read: "Session read request is invalid",
@@ -593,6 +710,95 @@ const INSERT_RELEASED_RESERVATION_QUERY = Object.freeze({
     "$6::jsonb, $7, $7, NULL, $7)",
     "ON CONFLICT (reservation_id) DO NOTHING",
     `RETURNING ${RESERVATION_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const CAPTURE_ATTEMPT_RETURNING_COLUMNS = [
+  "capture_attempt_id",
+  "operation_id",
+  "session_id",
+  "binding",
+  "claimed_at",
+].join(", ");
+const CAPTURE_ATTEMPT_TOMBSTONE_RETURNING_COLUMNS = [
+  "capture_attempt_id",
+  "operation_id",
+  "session_id",
+  "retired_at",
+  "tombstone",
+].join(", ");
+const CHECKPOINT_CATALOGUE_RETURNING_COLUMNS = [
+  "checkpoint_id",
+  "session_id",
+  "capture_attempt_id",
+  "document",
+  "committed_at",
+].join(", ");
+const READ_CAPTURE_ATTEMPT_BY_OPERATION_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${CAPTURE_ATTEMPT_RETURNING_COLUMNS}`,
+    "FROM session_authority.capture_attempt_claims",
+    "WHERE operation_id = $1",
+  ].join(" "),
+});
+const READ_CAPTURE_ATTEMPT_BY_OPERATION_FOR_UPDATE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: `${READ_CAPTURE_ATTEMPT_BY_OPERATION_QUERY.text} FOR UPDATE`,
+});
+const READ_CAPTURE_ATTEMPT_BY_ID_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${CAPTURE_ATTEMPT_RETURNING_COLUMNS}`,
+    "FROM session_authority.capture_attempt_claims",
+    "WHERE capture_attempt_id = $1::uuid",
+  ].join(" "),
+});
+const INSERT_CAPTURE_ATTEMPT_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.capture_attempt_claims",
+    "(capture_attempt_id, operation_id, session_id, binding, claimed_at)",
+    "VALUES ($1::uuid, $2, $3::uuid, $4::jsonb, $5)",
+    "ON CONFLICT DO NOTHING",
+    `RETURNING ${CAPTURE_ATTEMPT_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const READ_CAPTURE_ATTEMPT_TOMBSTONE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${CAPTURE_ATTEMPT_TOMBSTONE_RETURNING_COLUMNS}`,
+    "FROM session_authority.capture_attempt_tombstones",
+    "WHERE operation_id = $1",
+  ].join(" "),
+});
+const READ_CAPTURE_ATTEMPT_TOMBSTONE_FOR_UPDATE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: `${READ_CAPTURE_ATTEMPT_TOMBSTONE_QUERY.text} FOR UPDATE`,
+});
+const READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${CHECKPOINT_CATALOGUE_RETURNING_COLUMNS}`,
+    "FROM session_authority.checkpoint_catalogue",
+    "WHERE checkpoint_id = $1",
+  ].join(" "),
+});
+const READ_CHECKPOINT_CATALOGUE_BY_ATTEMPT_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${CHECKPOINT_CATALOGUE_RETURNING_COLUMNS}`,
+    "FROM session_authority.checkpoint_catalogue",
+    "WHERE capture_attempt_id = $1::uuid",
+  ].join(" "),
+});
+const INSERT_CHECKPOINT_CATALOGUE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.checkpoint_catalogue",
+    "(checkpoint_id, session_id, capture_attempt_id, document, committed_at)",
+    "VALUES ($1, $2::uuid, $3::uuid, $4::jsonb, $5)",
+    "ON CONFLICT DO NOTHING",
+    `RETURNING ${CHECKPOINT_CATALOGUE_RETURNING_COLUMNS}`,
   ].join(" "),
 });
 
@@ -1726,6 +1932,214 @@ function canonicalBusinessBytes(document) {
   });
 }
 
+function canonicalCheckpointDescriptorForSession(value, expectedSession, code) {
+  let checkpoint;
+  try {
+    checkpoint = assertCheckpointDescriptor(value, {
+      manifest: expectedSession.document.manifest,
+      storageRef: expectedSession.document.storageRef,
+    });
+  } catch {
+    fail(code);
+  }
+  return canonicalJsonObject(checkpoint, code);
+}
+
+function canonicalCheckpointMutationRequest(value, code) {
+  let request;
+  try {
+    request = assertStorageMutationRequest(value);
+  } catch {
+    fail(code);
+  }
+  ensure(request.operation === "checkpoint", code);
+  return canonicalJsonObject(request, code);
+}
+
+function canonicalCheckpointMutationResult(value, request, code) {
+  let result;
+  try {
+    result = assertStorageMutationResult(value, { request });
+  } catch {
+    fail(code);
+  }
+  ensure(
+    result.operation === "checkpoint" &&
+      result.status === "checkpoint-created",
+    code,
+  );
+  return canonicalJsonObject(result, code);
+}
+
+function checkpointCaptureAdmission(value, expectedSession, code) {
+  const admission = exactPlainObject(
+    value,
+    CHECKPOINT_CAPTURE_ADMISSION_KEYS,
+    code,
+  );
+  const attachment = canonicalSessionAttachment(admission.attachment, code);
+  const captureAttemptId = canonicalSessionId(admission.captureAttemptId, code);
+  const checkpoint = canonicalCheckpointDescriptorForSession(
+    admission.checkpoint,
+    expectedSession,
+    code,
+  );
+  const request = canonicalCheckpointMutationRequest(admission.request, code);
+  const processIncarnationId = canonicalOpaqueId(
+    admission.processIncarnationId,
+    128,
+    code,
+  );
+  const stopOperationId = canonicalOpaqueId(
+    admission.stopOperationId,
+    128,
+    code,
+  );
+  const writerIncarnationId = canonicalOpaqueId(
+    admission.writerIncarnationId,
+    128,
+    code,
+  );
+  const document = expectedSession.document;
+  ensure(
+    document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+      document.lifecycle === "ATTACHED" &&
+      document.activeOperation === null &&
+      document.lease !== null &&
+      document.attachment !== null &&
+      canonicalSerialize(attachment) ===
+        canonicalSerialize(document.attachment) &&
+      request.operationId ===
+        canonicalOpaqueId(request.operationId, 128, code) &&
+      checkpoint.checkpointClass === "clean" &&
+      request.sessionId === expectedSession.sessionId &&
+      request.sessionId === checkpoint.sessionId &&
+      request.backendId === document.storageRef.backendId &&
+      request.storageId === document.storageRef.storageId &&
+      request.leaseId === document.lease.leaseId &&
+      request.holderId === document.lease.holderId &&
+      request.fencingEpoch === document.lease.fencingEpoch &&
+      request.fencingEpoch === checkpoint.sourceFencingEpoch &&
+      request.target.checkpointId === checkpoint.checkpointId &&
+      request.target.artifactId === checkpoint.artifactId,
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      attachment,
+      captureAttemptId,
+      checkpoint,
+      processIncarnationId,
+      request,
+      stopOperationId,
+      writerIncarnationId,
+    },
+    code,
+  );
+}
+
+function predeterminedCheckpointCaptureResult(admission, code) {
+  const mutation = canonicalCheckpointMutationResult(
+    {
+      ...admission.request,
+      proofId: `proof-checkpoint-${sha256(
+        `checkpoint-capture-proof:${admission.request.operationId}`,
+      )}`,
+      status: "checkpoint-created",
+    },
+    admission.request,
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      checkpoint: admission.checkpoint,
+      mutation,
+    },
+    code,
+  );
+}
+
+function canonicalCheckpointCaptureResult(value, admission, code) {
+  const result = exactPlainObject(
+    value,
+    CHECKPOINT_CAPTURE_RESULT_KEYS,
+    code,
+  );
+  const checkpoint = canonicalJsonObject(result.checkpoint, code);
+  const mutation = canonicalCheckpointMutationResult(
+    result.mutation,
+    admission.request,
+    code,
+  );
+  const expected = predeterminedCheckpointCaptureResult(admission, code);
+  ensure(
+    canonicalSerialize(checkpoint) ===
+      canonicalSerialize(admission.checkpoint) &&
+      canonicalSerialize(mutation) === canonicalSerialize(expected.mutation),
+    code,
+  );
+  return expected;
+}
+
+function checkpointCaptureOperationRequest(value, expectedSession, code) {
+  const request = exactPlainObject(
+    value,
+    CHECKPOINT_CAPTURE_OPERATION_REQUEST_KEYS,
+    code,
+  );
+  ensure(
+    request.contractVersion ===
+      CHECKPOINT_CAPTURE_OPERATION_CONTRACT_VERSION,
+    code,
+  );
+  const admission = checkpointCaptureAdmission(
+    request.admission,
+    expectedSession,
+    code,
+  );
+  const predeterminedResult = canonicalCheckpointCaptureResult(
+    request.predeterminedResult,
+    admission,
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      admission,
+      contractVersion: CHECKPOINT_CAPTURE_OPERATION_CONTRACT_VERSION,
+      predeterminedResult,
+    },
+    code,
+  );
+}
+
+export function createCheckpointCaptureOperationRequest(options) {
+  const normalized = exactPlainObject(
+    options,
+    ["admission", "expectedSession"],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  const admission = checkpointCaptureAdmission(
+    normalized.admission,
+    expectedSession,
+    "invalid_operation_request",
+  );
+  return canonicalJsonObject(
+    {
+      admission,
+      contractVersion: CHECKPOINT_CAPTURE_OPERATION_CONTRACT_VERSION,
+      predeterminedResult: predeterminedCheckpointCaptureResult(
+        admission,
+        "invalid_operation_request",
+      ),
+    },
+    "invalid_operation_request",
+  );
+}
+
 function canonicalOperationEnvelope(value, code) {
   const normalized = exactPlainObject(value, OPERATION_REQUEST_KEYS, code);
   ensure(
@@ -1970,6 +2384,16 @@ function validateTypedOperationInput(input) {
       input,
       "invalid_operation_request",
       "writer_epoch_exhausted",
+    );
+  } else if (input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND) {
+    const request = checkpointCaptureOperationRequest(
+      input.request,
+      input.expectedSession,
+      "invalid_operation_request",
+    );
+    ensure(
+      input.operationId === request.admission.request.operationId,
+      "invalid_operation_request",
     );
   }
 }
@@ -2450,6 +2874,288 @@ function operationInputWithExpectedRevision(options, expectedRevision) {
     ...input,
     expectedOperationRevision,
   });
+}
+
+function checkpointCaptureInput(
+  options,
+  keys = OPERATION_INPUT_KEYS,
+  code = "invalid_operation_request",
+) {
+  const input = canonicalOperationInput(options, keys);
+  ensure(input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND, code);
+  const request = checkpointCaptureOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  ensure(
+    input.operationId === request.admission.request.operationId,
+    code,
+  );
+  return deepFreeze({ ...input, request });
+}
+
+function checkpointCaptureTransitionInput(options) {
+  const input = checkpointCaptureInput(
+    options,
+    OPERATION_TRANSITION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    OPERATION_TRANSITION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(
+    expectedOperationRevision === "0",
+    "invalid_operation_request",
+  );
+  return deepFreeze({ ...input, expectedOperationRevision });
+}
+
+function canonicalCheckpointArtifactProof(value, operationId, code) {
+  const proof = exactPlainObject(
+    value,
+    CHECKPOINT_ARTIFACT_PROOF_KEYS,
+    code,
+  );
+  ensure(
+    typeof proof.artifactManifestDigest === "string" &&
+      regexpTest(SHA256_PATTERN, proof.artifactManifestDigest) &&
+      canonicalOpaqueId(proof.captureOperationId, 128, code) ===
+        operationId &&
+      typeof proof.modeledDigest === "string" &&
+      regexpTest(SHA256_PATTERN, proof.modeledDigest),
+    code,
+  );
+  return deepFreeze({
+    artifactManifestDigest: proof.artifactManifestDigest,
+    captureOperationId: proof.captureOperationId,
+    modeledDigest: proof.modeledDigest,
+  });
+}
+
+function canonicalCheckpointMaterialization(value, artifactProof, code) {
+  const materialization = exactPlainObject(
+    value,
+    CHECKPOINT_MATERIALIZATION_KEYS,
+    code,
+  );
+  const stagedRoot = exactPlainObject(
+    materialization.stagedRoot,
+    CHECKPOINT_STAGED_ROOT_KEYS,
+    code,
+  );
+  assertLosslessString(stagedRoot.objectId, code);
+  ensure(
+    materialization.contractVersion ===
+      CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION &&
+      typeof materialization.artifactManifestDigest === "string" &&
+      regexpTest(SHA256_PATTERN, materialization.artifactManifestDigest) &&
+      materialization.artifactManifestDigest ===
+        artifactProof.artifactManifestDigest &&
+      typeof materialization.modeledDigest === "string" &&
+      regexpTest(SHA256_PATTERN, materialization.modeledDigest) &&
+      materialization.modeledDigest === artifactProof.modeledDigest &&
+      canonicalOpaqueId(materialization.publicationId, 128, code) ===
+        materialization.publicationId &&
+      materialization.publicationKind === "checkpoint-artifact" &&
+      canonicalOpaqueId(stagedRoot.filesystemId, 128, code) ===
+        stagedRoot.filesystemId &&
+      canonicalOpaqueId(stagedRoot.objectIdentityScheme, 128, code) ===
+        stagedRoot.objectIdentityScheme &&
+      regexpTest(PERSISTENT_OBJECT_ID_PATTERN, stagedRoot.objectId) &&
+      typeof materialization.treeIdentityDigest === "string" &&
+      regexpTest(SHA256_PATTERN, materialization.treeIdentityDigest),
+    code,
+  );
+  return deepFreeze({
+    artifactManifestDigest: materialization.artifactManifestDigest,
+    contractVersion: materialization.contractVersion,
+    modeledDigest: materialization.modeledDigest,
+    publicationId: materialization.publicationId,
+    publicationKind: "checkpoint-artifact",
+    stagedRoot: deepFreeze({
+      filesystemId: stagedRoot.filesystemId,
+      objectIdentityScheme: stagedRoot.objectIdentityScheme,
+      objectId: stagedRoot.objectId,
+    }),
+    treeIdentityDigest: materialization.treeIdentityDigest,
+  });
+}
+
+function canonicalCheckpointCatalogueDocument(value, input, code) {
+  const document = exactPlainObject(
+    value,
+    CHECKPOINT_CATALOGUE_DOCUMENT_KEYS,
+    code,
+  );
+  ensure(
+    document.contractVersion === CHECKPOINT_CATALOGUE_CONTRACT_VERSION,
+    code,
+  );
+  const artifactProof = canonicalCheckpointArtifactProof(
+    document.artifactProof,
+    input.operationId,
+    code,
+  );
+  const materialization = canonicalCheckpointMaterialization(
+    document.materialization,
+    artifactProof,
+    code,
+  );
+  const result = canonicalCheckpointCaptureResult(
+    document.result,
+    input.request.admission,
+    code,
+  );
+  return deepFreeze({
+    artifactProof,
+    contractVersion: CHECKPOINT_CATALOGUE_CONTRACT_VERSION,
+    materialization,
+    result,
+  });
+}
+
+function canonicalCheckpointCompletion(value, input, code) {
+  const completion = exactPlainObject(
+    value,
+    CHECKPOINT_CAPTURE_COMPLETION_KEYS,
+    code,
+  );
+  ensure(typeof completion.replayed === "boolean", code);
+  const document = canonicalCheckpointCatalogueDocument(
+    {
+      artifactProof: completion.artifactProof,
+      contractVersion: CHECKPOINT_CATALOGUE_CONTRACT_VERSION,
+      materialization: completion.materialization,
+      result: completion.result,
+    },
+    input,
+    code,
+  );
+  return deepFreeze({
+    document,
+    replayed: completion.replayed,
+  });
+}
+
+function checkpointCaptureFinalizationInput(options) {
+  const input = checkpointCaptureInput(
+    options,
+    CHECKPOINT_CAPTURE_FINALIZATION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    CHECKPOINT_CAPTURE_FINALIZATION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(
+    expectedOperationRevision === "1" ||
+      expectedOperationRevision === "2",
+    "invalid_operation_request",
+  );
+  const completion = canonicalCheckpointCompletion(
+    normalized.completion,
+    input,
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    ...input,
+    completion,
+    expectedOperationRevision,
+  });
+}
+
+function checkpointCaptureReadInput(options, keys = CHECKPOINT_CAPTURE_READ_KEYS) {
+  const normalized = exactPlainObject(
+    options,
+    keys,
+    "invalid_operation_request",
+  );
+  let checkpoint;
+  try {
+    checkpoint = assertCheckpointDescriptor(normalized.checkpoint);
+  } catch {
+    fail("invalid_operation_request");
+  }
+  checkpoint = canonicalJsonObject(
+    checkpoint,
+    "invalid_operation_request",
+  );
+  const request = canonicalCheckpointMutationRequest(
+    normalized.request,
+    "invalid_operation_request",
+  );
+  ensure(
+    request.sessionId === checkpoint.sessionId &&
+      request.backendId === checkpoint.backendId &&
+      request.storageId === checkpoint.storageId &&
+      request.operation === "checkpoint" &&
+      request.target.checkpointId === checkpoint.checkpointId &&
+      request.target.artifactId === checkpoint.artifactId &&
+      request.fencingEpoch === checkpoint.sourceFencingEpoch,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ checkpoint, request });
+}
+
+function checkpointCatalogueReadInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    CHECKPOINT_CATALOGUE_READ_KEYS,
+    "invalid_operation_request",
+  );
+  let checkpoint;
+  try {
+    checkpoint = assertCheckpointDescriptor(normalized.checkpoint);
+  } catch {
+    fail("invalid_operation_request");
+  }
+  return deepFreeze({
+    checkpoint: canonicalJsonObject(
+      checkpoint,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function checkpointCaptureBinding(input) {
+  const admission = input.request.admission;
+  return deepFreeze({
+    attachmentId: admission.attachment.attachmentId,
+    attachmentOperationId: admission.attachment.operationId,
+    attachmentProofId: admission.attachment.proofId,
+    captureAttemptId: admission.captureAttemptId,
+    checkpoint: admission.checkpoint,
+    contractVersion: CHECKPOINT_CAPTURE_BINDING_CONTRACT_VERSION,
+    processIncarnationId: admission.processIncarnationId,
+    reservationId: input.reservationId,
+    stopOperationId: admission.stopOperationId,
+    writerIncarnationId: admission.writerIncarnationId,
+  });
+}
+
+function canonicalCheckpointCaptureBinding(value, input, code) {
+  const binding = exactPlainObject(
+    value,
+    CHECKPOINT_CAPTURE_BINDING_KEYS,
+    code,
+  );
+  const expected = checkpointCaptureBinding(input);
+  ensure(
+    canonicalSerialize(canonicalJsonObject(binding, code)) ===
+      canonicalSerialize(expected),
+    code,
+  );
+  return expected;
 }
 
 function writerAttachmentFinalizationInput(options) {
@@ -3077,6 +3783,41 @@ function canonicalWriterBlockedStoredResult(value, input, code) {
   );
 }
 
+function canonicalCheckpointCaptureStoredResult(value, input, code) {
+  const result = exactPlainObject(
+    value,
+    CHECKPOINT_CAPTURE_TERMINAL_RESULT_KEYS,
+    code,
+  );
+  const request = checkpointCaptureOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  const captureAttemptId = canonicalSessionId(
+    result.captureAttemptId,
+    code,
+  );
+  const checkpointId = canonicalOpaqueId(result.checkpointId, 128, code);
+  ensure(
+    input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+      result.resultVersion === OPERATION_RESULT_VERSION &&
+      result.outcome === "checkpoint-captured" &&
+      captureAttemptId === request.admission.captureAttemptId &&
+      checkpointId === request.admission.checkpoint.checkpointId &&
+      typeof result.catalogueSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, result.catalogueSha256),
+    code,
+  );
+  return deepFreeze({
+    captureAttemptId,
+    catalogueSha256: result.catalogueSha256,
+    checkpointId,
+    outcome: "checkpoint-captured",
+    resultVersion: OPERATION_RESULT_VERSION,
+  });
+}
+
 function canonicalCommittedResult(value, input, revision, code) {
   const outcome = ownDataValue(value, "outcome", code);
   if (outcome === "cancelled-before-dispatch") {
@@ -3124,6 +3865,14 @@ function canonicalCommittedResult(value, input, revision, code) {
       code,
     );
     return canonicalWriterBlockedStoredResult(value, input, code);
+  }
+  if (outcome === "checkpoint-captured") {
+    ensure(
+      input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+        (revision === "2" || revision === "3"),
+      code,
+    );
+    return canonicalCheckpointCaptureStoredResult(value, input, code);
   }
   fail(code);
 }
@@ -3328,6 +4077,185 @@ function reservationSnapshotFromRow(row) {
   });
 }
 
+function captureAttemptIdentityFromRow(row) {
+  const code = "operation_state_invalid";
+  const normalized = exactPlainObject(row, CAPTURE_ATTEMPT_ROW_KEYS, code);
+  return deepFreeze({
+    captureAttemptId: canonicalSessionId(
+      normalized.capture_attempt_id,
+      code,
+    ),
+    operationId: canonicalOpaqueId(
+      normalized.operation_id,
+      128,
+      code,
+    ),
+    sessionId: canonicalSessionId(normalized.session_id, code),
+  });
+}
+
+function checkpointCatalogueIdentityFromRow(row) {
+  const code = "operation_state_invalid";
+  const normalized = exactPlainObject(
+    row,
+    CHECKPOINT_CATALOGUE_ROW_KEYS,
+    code,
+  );
+  return deepFreeze({
+    captureAttemptId: canonicalSessionId(
+      normalized.capture_attempt_id,
+      code,
+    ),
+    checkpointId: canonicalOpaqueId(
+      normalized.checkpoint_id,
+      128,
+      code,
+    ),
+    sessionId: canonicalSessionId(normalized.session_id, code),
+  });
+}
+
+function captureAttemptSnapshotFromRow(row, input) {
+  const code = "operation_state_invalid";
+  const normalized = exactPlainObject(
+    row,
+    CAPTURE_ATTEMPT_ROW_KEYS,
+    code,
+  );
+  const captureAttemptId = canonicalSessionId(
+    normalized.capture_attempt_id,
+    code,
+  );
+  const operationId = canonicalOpaqueId(
+    normalized.operation_id,
+    128,
+    code,
+  );
+  const sessionId = canonicalSessionId(normalized.session_id, code);
+  const claimedAt = canonicalTimestampForCode(
+    normalized.claimed_at,
+    code,
+  );
+  ensure(
+    operationId === input.operationId &&
+      sessionId === input.expectedSession.sessionId &&
+      captureAttemptId === input.request.admission.captureAttemptId,
+    code,
+  );
+  const binding = canonicalCheckpointCaptureBinding(
+    normalized.binding,
+    input,
+    code,
+  );
+  return deepFreeze({
+    binding,
+    captureAttemptId,
+    claimedAt,
+    operationId,
+    sessionId,
+  });
+}
+
+function captureAttemptTombstoneSnapshotFromRow(row, input) {
+  const code = "operation_state_invalid";
+  const normalized = exactPlainObject(
+    row,
+    CAPTURE_ATTEMPT_TOMBSTONE_ROW_KEYS,
+    code,
+  );
+  const captureAttemptId = canonicalSessionId(
+    normalized.capture_attempt_id,
+    code,
+  );
+  const operationId = canonicalOpaqueId(
+    normalized.operation_id,
+    128,
+    code,
+  );
+  const sessionId = canonicalSessionId(normalized.session_id, code);
+  const retiredAt = canonicalTimestampForCode(
+    normalized.retired_at,
+    code,
+  );
+  const tombstone = canonicalJsonObject(normalized.tombstone, code);
+  ensure(
+    captureAttemptId === input.request.admission.captureAttemptId &&
+      operationId === input.operationId &&
+      sessionId === input.expectedSession.sessionId,
+    code,
+  );
+  return deepFreeze({
+    captureAttemptId,
+    operationId,
+    retiredAt,
+    sessionId,
+    tombstone,
+  });
+}
+
+function checkpointCatalogueSnapshotFromRow(row, input) {
+  const code = "operation_state_invalid";
+  const normalized = exactPlainObject(
+    row,
+    CHECKPOINT_CATALOGUE_ROW_KEYS,
+    code,
+  );
+  const checkpointId = canonicalOpaqueId(
+    normalized.checkpoint_id,
+    128,
+    code,
+  );
+  const sessionId = canonicalSessionId(normalized.session_id, code);
+  const captureAttemptId = canonicalSessionId(
+    normalized.capture_attempt_id,
+    code,
+  );
+  const committedAt = canonicalTimestampForCode(
+    normalized.committed_at,
+    code,
+  );
+  const document = canonicalCheckpointCatalogueDocument(
+    normalized.document,
+    input,
+    code,
+  );
+  ensure(
+    checkpointId === input.request.admission.checkpoint.checkpointId &&
+      sessionId === input.expectedSession.sessionId &&
+      captureAttemptId === input.request.admission.captureAttemptId,
+    code,
+  );
+  return deepFreeze({
+    captureAttemptId,
+    checkpointId,
+    committedAt,
+    document,
+    sessionId,
+  });
+}
+
+function checkpointCaptureAttemptRecord(input, attempt, catalogue) {
+  return deepFreeze({
+    binding: attempt.binding,
+    captureAttemptId: attempt.captureAttemptId,
+    contractVersion: CHECKPOINT_CAPTURE_ATTEMPT_CONTRACT_VERSION,
+    operationId: attempt.operationId,
+    request: input.request.admission.request,
+    result: input.request.predeterminedResult,
+    state: catalogue === null ? "authorized" : "committed",
+  });
+}
+
+function checkpointCaptureTerminalResult(input, catalogueDocument) {
+  return deepFreeze({
+    captureAttemptId: input.request.admission.captureAttemptId,
+    catalogueSha256: sha256(canonicalSerialize(catalogueDocument)),
+    checkpointId: input.request.admission.checkpoint.checkpointId,
+    outcome: "checkpoint-captured",
+    resultVersion: OPERATION_RESULT_VERSION,
+  });
+}
+
 function validateOperationIdentity(operation, input) {
   ensure(
     operation.operationId === input.operationId &&
@@ -3484,6 +4412,16 @@ function validateTerminalBusinessState(terminalBase, operation) {
         terminalBase.document.writerEpoch === result.writerEpoch &&
         terminalBase.document.lease === null &&
         terminalBase.document.attachment === null,
+      "operation_state_invalid",
+    );
+    return;
+  }
+  if (result.outcome === "checkpoint-captured") {
+    ensure(
+      operation.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+        operation.expectedSession.document.lifecycle === "ATTACHED" &&
+        canonicalBusinessBytes(terminalBase.document) ===
+          canonicalBusinessBytes(operation.expectedSession.document),
       "operation_state_invalid",
     );
     return;
@@ -3708,6 +4646,120 @@ async function readReservationSnapshot(
   return rows.length === 0 ? null : reservationSnapshotFromRow(rows[0]);
 }
 
+async function readCaptureAttemptSnapshot(transaction, input, forUpdate) {
+  const rows = rowsFromResult(
+    await transaction.query(
+      forUpdate
+        ? READ_CAPTURE_ATTEMPT_BY_OPERATION_FOR_UPDATE_QUERY.text
+        : READ_CAPTURE_ATTEMPT_BY_OPERATION_QUERY.text,
+      [input.operationId],
+    ),
+    "operation_state_invalid",
+  );
+  return rows.length === 0
+    ? null
+    : captureAttemptSnapshotFromRow(rows[0], input);
+}
+
+async function readCaptureAttemptTombstone(
+  transaction,
+  input,
+  forUpdate,
+) {
+  const rows = rowsFromResult(
+    await transaction.query(
+      forUpdate
+        ? READ_CAPTURE_ATTEMPT_TOMBSTONE_FOR_UPDATE_QUERY.text
+        : READ_CAPTURE_ATTEMPT_TOMBSTONE_QUERY.text,
+      [input.operationId],
+    ),
+    "operation_state_invalid",
+  );
+  return rows.length === 0
+    ? null
+    : captureAttemptTombstoneSnapshotFromRow(rows[0], input);
+}
+
+async function readCheckpointCatalogueByAttempt(transaction, input) {
+  const rows = rowsFromResult(
+    await transaction.query(
+      READ_CHECKPOINT_CATALOGUE_BY_ATTEMPT_QUERY.text,
+      [input.request.admission.captureAttemptId],
+    ),
+    "operation_state_invalid",
+  );
+  return rows.length === 0
+    ? null
+    : checkpointCatalogueSnapshotFromRow(rows[0], input);
+}
+
+async function validateCheckpointCaptureRelations(
+  transaction,
+  operation,
+  forUpdate,
+) {
+  if (operation.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND) return null;
+  const input = checkpointCaptureInput(inputForOperation(operation));
+  const attempt = await readCaptureAttemptSnapshot(
+    transaction,
+    input,
+    forUpdate,
+  );
+  const tombstone = await readCaptureAttemptTombstone(
+    transaction,
+    input,
+    forUpdate,
+  );
+  const catalogue =
+    attempt === null
+      ? null
+      : await readCheckpointCatalogueByAttempt(transaction, input);
+  if (operation.state === "prepared") {
+    ensure(
+      attempt === null && tombstone === null && catalogue === null,
+      "operation_state_invalid",
+    );
+    return deepFreeze({ attempt, catalogue, input });
+  }
+  if (
+    operation.state === "committed" &&
+    operation.result?.outcome === "cancelled-before-dispatch"
+  ) {
+    ensure(
+      attempt === null && tombstone === null && catalogue === null,
+      "operation_state_invalid",
+    );
+    return deepFreeze({ attempt, catalogue, input });
+  }
+  if (tombstone !== null) {
+    fail("checkpoint_capture_not_authorized");
+  }
+  ensure(
+    attempt !== null &&
+      timestampMilliseconds(attempt.claimedAt) >=
+        timestampMilliseconds(operation.createdAt) &&
+      timestampMilliseconds(attempt.claimedAt) <=
+        timestampMilliseconds(operation.updatedAt) &&
+      (operation.state !== "starting" ||
+        attempt.claimedAt === operation.updatedAt),
+    "operation_state_invalid",
+  );
+  if (operation.state === "starting" || operation.state === "uncertain") {
+    ensure(catalogue === null, "operation_state_invalid");
+  } else {
+    ensure(
+      operation.state === "committed" &&
+        catalogue !== null &&
+        operation.result?.outcome === "checkpoint-captured" &&
+        operation.result.catalogueSha256 ===
+          sha256(canonicalSerialize(catalogue.document)) &&
+        catalogue.committedAt === operation.updatedAt,
+      "operation_state_invalid",
+    );
+  }
+  return deepFreeze({ attempt, catalogue, input });
+}
+
 async function ensureNoActiveRows(transaction, sessionId) {
   const rows = rowsFromResult(
     await transaction.query(READ_ACTIVE_COUNTS_QUERY.text, [sessionId]),
@@ -3747,7 +4799,12 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       reservationId: activePointer.reservationId,
     });
     validateActivePointer(session, operation, reservation);
-    active = deepFreeze({ operation, reservation });
+    const checkpoint = await validateCheckpointCaptureRelations(
+      transaction,
+      operation,
+      forUpdate,
+    );
+    active = deepFreeze({ checkpoint, operation, reservation });
   }
 
   const currentLast = documentLastOperation(session.document);
@@ -3774,7 +4831,12 @@ async function validateSessionRelations(transaction, session, forUpdate) {
     );
     ensure(reservation !== null, "operation_state_invalid");
     validateLastOperationPointer(terminalBase, operation, reservation);
-    terminal = deepFreeze({ operation, reservation });
+    const checkpoint = await validateCheckpointCaptureRelations(
+      transaction,
+      operation,
+      false,
+    );
+    terminal = deepFreeze({ checkpoint, operation, reservation });
   }
   if (
     active?.operation.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
@@ -3824,12 +4886,28 @@ async function readRequestedOperation(
   if (operation === null) {
     return deepFreeze({
       active: relations.active,
+      checkpoint: null,
       terminal: relations.terminal,
       operation: null,
       reservation: null,
     });
   }
   validateOperationIdentity(operation, input);
+  if (current === null && operation.state === "committed") {
+    const terminalSessionRevision = revisionAfter(
+      operation.expectedSession.revision,
+      BigIntConstructor(operation.revision) + 1n,
+      "operation_state_invalid",
+    );
+    ensure(
+      canonicalIdentityBytes(session.document) ===
+          canonicalIdentityBytes(operation.expectedSession.document) &&
+        session.createdAt === operation.expectedSession.createdAt &&
+        BigIntConstructor(session.revision) >=
+          BigIntConstructor(terminalSessionRevision),
+      "operation_state_invalid",
+    );
+  }
   const reservation =
     current === null
       ? await readReservationSnapshot(
@@ -3840,11 +4918,20 @@ async function readRequestedOperation(
       : current.reservation;
   ensure(reservation !== null, "operation_state_invalid");
   validateOperationReservation(operation, reservation, input);
+  const checkpoint =
+    current === null
+      ? await validateCheckpointCaptureRelations(
+          transaction,
+          operation,
+          false,
+        )
+      : current.checkpoint;
   if (operation.state !== "committed") {
     validateActivePointer(session, operation, reservation);
   }
   return deepFreeze({
     active: relations.active,
+    checkpoint,
     terminal: relations.terminal,
     operation,
     reservation,
@@ -4197,7 +5284,8 @@ export class PostgresSessionAuthority {
       input.kind !== WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND &&
         input.kind !== WRITER_LEASE_RENEW_OPERATION_KIND &&
         input.kind !== WRITER_RELEASE_OPERATION_KIND &&
-        input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND,
+        input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND &&
+        input.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND,
       "invalid_operation_request",
     );
     return runSerializable(this.#store, async (transaction) => {
@@ -4262,6 +5350,419 @@ export class PostgresSessionAuthority {
         operation,
         reservation,
         session: updatedSession,
+      });
+    });
+  }
+
+  async claimCheckpointCaptureDispatch(options) {
+    const input = checkpointCaptureTransitionInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null && observed.reservation !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state !== "prepared") {
+        ensure(
+          observed.checkpoint?.attempt !== null &&
+            observed.checkpoint?.attempt !== undefined,
+          "checkpoint_capture_not_authorized",
+        );
+        return operationReceipt({
+          attempt: checkpointCaptureAttemptRecord(
+            input,
+            observed.checkpoint.attempt,
+            observed.checkpoint.catalogue,
+          ),
+          authorityNow: observed.checkpoint.attempt.claimedAt,
+          dispatchGranted: false,
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+        });
+      }
+      ensure(
+        observed.operation.revision === input.expectedOperationRevision &&
+          observed.checkpoint?.attempt === null &&
+          observed.checkpoint?.catalogue === null &&
+          session.document.lifecycle === "ATTACHED" &&
+          session.document.lease !== null &&
+          session.document.attachment !== null &&
+          canonicalSerialize(
+            canonicalJsonObject(
+              session.document.attachment,
+              "operation_state_invalid",
+            ),
+          ) ===
+            canonicalSerialize(input.request.admission.attachment),
+        "operation_transition_conflict",
+      );
+      revisionAfter(session.revision, 3);
+      const authorityNow = await readAuthorityClock(transaction);
+      ensure(
+        timestampMilliseconds(authorityNow) >=
+          timestampMilliseconds(transaction.now),
+        "session_state_invalid",
+      );
+      ensure(
+        timestampMilliseconds(session.document.lease.expiresAt) >
+          timestampMilliseconds(authorityNow),
+        "writer_lease_expired",
+      );
+      try {
+        assertStorageMutationMatchesLeaseSnapshot({
+          canonicalLease: session.document.lease,
+          now: timestampMilliseconds(authorityNow),
+          request: input.request.admission.request,
+          storageRef: session.document.storageRef,
+        });
+      } catch {
+        fail("operation_transition_conflict");
+      }
+
+      const binding = checkpointCaptureBinding(input);
+      const attemptRows = rowsFromResult(
+        await transaction.query(INSERT_CAPTURE_ATTEMPT_QUERY.text, [
+          input.request.admission.captureAttemptId,
+          input.operationId,
+          session.sessionId,
+          canonicalSerialize(binding),
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(attemptRows.length === 1, "checkpoint_identity_conflict");
+      const attempt = captureAttemptSnapshotFromRow(attemptRows[0], input);
+
+      const operationRows = rowsFromResult(
+        await transaction.query(START_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(START_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(reservationRows.length === 1, "operation_transition_conflict");
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(
+        reservationRows[0],
+      );
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      ensure(attempt.claimedAt === operation.updatedAt, "operation_state_invalid");
+      const updatedSession = await updateSessionPhase(
+        transaction,
+        session,
+        input,
+        activePointerFor(input, "starting", "1"),
+      );
+      validateActivePointer(updatedSession, operation, reservation);
+      return operationReceipt({
+        attempt: checkpointCaptureAttemptRecord(input, attempt, null),
+        authorityNow,
+        dispatchGranted: true,
+        operation,
+        reservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async finalizeCheckpointCapture(options) {
+    const input = checkpointCaptureFinalizationInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null && observed.reservation !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state === "committed") {
+        ensure(
+          observed.operation.result?.outcome === "checkpoint-captured" &&
+            BigIntConstructor(input.expectedOperationRevision) + 1n ===
+              BigIntConstructor(observed.operation.revision) &&
+            observed.checkpoint?.attempt !== null &&
+            observed.checkpoint?.attempt !== undefined &&
+            observed.checkpoint.catalogue !== null,
+          "operation_transition_conflict",
+        );
+        ensure(
+          canonicalSerialize(observed.checkpoint.catalogue.document) ===
+            canonicalSerialize(input.completion.document),
+          "operation_result_conflict",
+        );
+        return operationReceipt({
+          attempt: checkpointCaptureAttemptRecord(
+            input,
+            observed.checkpoint.attempt,
+            observed.checkpoint.catalogue,
+          ),
+          catalogue: observed.checkpoint.catalogue,
+          finalized: false,
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+        });
+      }
+      ensure(
+        (observed.operation.state === "starting" ||
+          observed.operation.state === "uncertain") &&
+          observed.operation.revision ===
+            input.expectedOperationRevision &&
+          observed.checkpoint?.attempt !== null &&
+          observed.checkpoint?.attempt !== undefined &&
+          observed.checkpoint.catalogue === null &&
+          session.document.lifecycle === "ATTACHED",
+        "operation_transition_conflict",
+      );
+      nextRevision(session.revision);
+
+      const catalogueRows = rowsFromResult(
+        await transaction.query(INSERT_CHECKPOINT_CATALOGUE_QUERY.text, [
+          input.request.admission.checkpoint.checkpointId,
+          session.sessionId,
+          input.request.admission.captureAttemptId,
+          canonicalSerialize(input.completion.document),
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(catalogueRows.length === 1, "checkpoint_identity_conflict");
+      const catalogue = checkpointCatalogueSnapshotFromRow(
+        catalogueRows[0],
+        input,
+      );
+      const result = checkpointCaptureTerminalResult(
+        input,
+        catalogue.document,
+      );
+      const serializedResult = canonicalSerialize(result);
+      const predecessorState = observed.operation.state;
+      const operationRows = rowsFromResult(
+        await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          serializedResult,
+          transaction.now,
+          predecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+          predecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(reservationRows.length === 1, "operation_transition_conflict");
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(
+        reservationRows[0],
+      );
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      ensure(
+        canonicalSerialize(operation.result) === serializedResult &&
+          catalogue.committedAt === operation.updatedAt,
+        "operation_result_conflict",
+      );
+      const nextDocument = documentWithAuthorityState(
+        session.document,
+        {
+          activeOperation: null,
+          lastOperation: lastPointerFor(operation, reservation),
+        },
+      );
+      const updatedSession = await updateSessionDocument(
+        transaction,
+        session,
+        input,
+        nextDocument,
+      );
+      validateLastOperationPointer(
+        updatedSession,
+        operation,
+        reservation,
+      );
+      return operationReceipt({
+        attempt: checkpointCaptureAttemptRecord(
+          input,
+          observed.checkpoint.attempt,
+          catalogue,
+        ),
+        catalogue,
+        finalized: true,
+        operation,
+        reservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async readCheckpointCaptureAttempt(options) {
+    const readInput = checkpointCaptureReadInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const operation = await readOperationSnapshot(
+        transaction,
+        readInput.request.operationId,
+        false,
+      );
+      ensure(operation !== null, "checkpoint_capture_not_authorized");
+      const input = checkpointCaptureInput(inputForOperation(operation));
+      ensure(
+        canonicalSerialize(input.request.admission.checkpoint) ===
+            canonicalSerialize(readInput.checkpoint) &&
+          canonicalSerialize(input.request.admission.request) ===
+            canonicalSerialize(readInput.request),
+        "checkpoint_capture_not_authorized",
+      );
+      const session = await readSessionSnapshot(
+        transaction,
+        operation.sessionId,
+        false,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        false,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.checkpoint?.attempt !== null &&
+          observed.checkpoint?.attempt !== undefined &&
+          observed.operation.state !== "prepared",
+        "checkpoint_capture_not_authorized",
+      );
+      const attempt = checkpointCaptureAttemptRecord(
+        input,
+        observed.checkpoint.attempt,
+        observed.checkpoint.catalogue,
+      );
+      return operationReceipt({
+        attempt,
+        catalogue: observed.checkpoint.catalogue,
+        operation: observed.operation,
+        reservation: observed.reservation,
+        session,
+        status: attempt.state,
+      });
+    });
+  }
+
+  async readCheckpointCatalogue(options) {
+    const readInput = checkpointCatalogueReadInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const catalogueRows = rowsFromResult(
+        await transaction.query(
+          READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY.text,
+          [readInput.checkpoint.checkpointId],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(catalogueRows.length === 1, "checkpoint_catalogue_not_found");
+      const catalogueIdentity = checkpointCatalogueIdentityFromRow(
+        catalogueRows[0],
+      );
+      ensure(
+        catalogueIdentity.checkpointId ===
+          readInput.checkpoint.checkpointId,
+        "operation_state_invalid",
+      );
+
+      const attemptRows = rowsFromResult(
+        await transaction.query(READ_CAPTURE_ATTEMPT_BY_ID_QUERY.text, [
+          catalogueIdentity.captureAttemptId,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(attemptRows.length === 1, "operation_state_invalid");
+      const attemptIdentity = captureAttemptIdentityFromRow(attemptRows[0]);
+      ensure(
+        attemptIdentity.captureAttemptId ===
+            catalogueIdentity.captureAttemptId &&
+          attemptIdentity.sessionId === catalogueIdentity.sessionId,
+        "operation_state_invalid",
+      );
+      const operation = await readOperationSnapshot(
+        transaction,
+        attemptIdentity.operationId,
+        false,
+      );
+      ensure(operation !== null, "operation_state_invalid");
+      const input = checkpointCaptureInput(inputForOperation(operation));
+      ensure(
+        canonicalSerialize(input.request.admission.checkpoint) ===
+          canonicalSerialize(readInput.checkpoint),
+        "checkpoint_catalogue_not_found",
+      );
+      const session = await readSessionSnapshot(
+        transaction,
+        operation.sessionId,
+        false,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        false,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.operation.state === "committed" &&
+          observed.operation.result?.outcome === "checkpoint-captured" &&
+          observed.checkpoint?.attempt !== null &&
+          observed.checkpoint?.attempt !== undefined &&
+          observed.checkpoint.catalogue !== null &&
+          canonicalSerialize(observed.checkpoint.catalogue) ===
+            canonicalSerialize(
+              checkpointCatalogueSnapshotFromRow(
+                catalogueRows[0],
+                input,
+              ),
+            ),
+        "operation_state_invalid",
+      );
+      return deepFreeze({
+        attempt: checkpointCaptureAttemptRecord(
+          input,
+          observed.checkpoint.attempt,
+          observed.checkpoint.catalogue,
+        ),
+        catalogue: observed.checkpoint.catalogue,
+        operation: observed.operation,
       });
     });
   }
@@ -5348,7 +6849,8 @@ export class PostgresSessionAuthority {
         session.revision,
         input.kind === WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND ||
           input.kind === WRITER_RELEASE_OPERATION_KIND ||
-          input.kind === WRITER_FORCE_FENCE_OPERATION_KIND
+          input.kind === WRITER_FORCE_FENCE_OPERATION_KIND ||
+          input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND
           ? 2
           : 1,
       );

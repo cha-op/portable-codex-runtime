@@ -74,7 +74,7 @@ plane.
       runnable-image reservation without claiming writer lifecycle or
       container launch.
 
-The sequence through PR #14 plus the first four follow-on slices is complete.
+The sequence through PR #14 plus the first five follow-on slices is complete.
 The six-item follow-on sequence does not preallocate GitHub PR numbers:
 
 1. **Canonical session registry (complete)**
@@ -109,13 +109,30 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
    - Keep manual backends incapable of completing the automatic proof. Lease
      expiry and database epoch state remain logical admission evidence, never a
      physical fence.
-5. **Production checkpoint mutation authority and catalogue**
-   - Implement the production mutation-authority adapter and bind durable
-     capture attempts to exact checkpoint-catalogue finalization.
-6. **Logical launcher admission**
+5. **Production checkpoint mutation authority and catalogue (complete)**
+   - Reuse the version 1 schema without DDL. Bind one exact durable clean
+     capture operation and reservation to the canonical stopped-writer
+     admission, globally unique capture-attempt claim, predetermined result,
+     and checkpoint-catalogue finalization.
+   - Keep publication outside database transactions while a per-operation
+     PostgreSQL session advisory guard and the active session reservation
+     serialize each live capture or reconciliation invocation. Treat the
+     durable operation, claim, and reservation—not an advisory lock
+     reacquisition—as the restart blocker; recovery remains source-free and
+     read-only until the physical journal proves exact commit.
+   - Retain claims permanently, reject pre-existing tombstones, and reconcile
+     only an exact already committed artefact without a source, writer, lease,
+     attachment, clock, or stopped-writer capability.
+   - Keep the production adapter capture-only. Restore fails closed until a
+     later slice binds one canonical detached destination generation to
+     launcher admission.
+6. **Logical launcher and restore-destination admission**
    - Reserve an exact launch attempt, consume the measured-image capability,
      and retain ambiguous starts until the old writer boundary is proved
      stopped.
+   - Define the canonical detached destination generation that can authorize a
+     restore, then make the successfully finalized generation an explicit
+     input to launcher admission.
 
 Later pull requests own an ext4 or filesystem-image backend, differential
 export and content-addressed storage, cross-host migration, and operational

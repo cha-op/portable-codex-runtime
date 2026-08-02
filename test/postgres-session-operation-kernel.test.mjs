@@ -10,6 +10,8 @@ import {
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
 import {
+  CHECKPOINT_CAPTURE_OPERATION_KIND,
+  createCheckpointCaptureOperationRequest,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
@@ -29,6 +31,13 @@ const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000002";
 const OPERATION_ID = "operation-001";
 const OTHER_OPERATION_ID = "operation-002";
+const CAPTURE_OPERATION_ID = "checkpoint-capture-operation-001";
+const CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000003";
+const CHECKPOINT_ID = "checkpoint-001";
+const ARTIFACT_ID = "checkpoint-artifact-001";
+const PROCESS_INCARNATION_ID = "process-incarnation-001";
+const STOP_OPERATION_ID = "stop-operation-001";
+const WRITER_INCARNATION_ID = "writer-incarnation-001";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const NOW = "2026-07-29T12:34:56.789Z";
 const LATER = "2026-07-29T12:34:57.789Z";
@@ -45,6 +54,11 @@ const WRITER_UNCERTAIN_NOW = "2026-07-29T12:40:03.000Z";
 const WRITER_FINALIZE_NOW = "2026-07-29T12:40:04.000Z";
 const WRITER_RETRY_PREPARED_NOW = "2026-07-29T12:40:05.000Z";
 const WRITER_RETRY_DISPATCH_NOW = "2026-07-29T12:40:06.000Z";
+const CAPTURE_PREPARED_NOW = "2026-07-29T12:35:01.000Z";
+const CAPTURE_DISPATCH_NOW = "2026-07-29T12:35:02.000Z";
+const CAPTURE_AUTHORITY_NOW = "2026-07-29T12:35:02.500Z";
+const CAPTURE_UNCERTAIN_NOW = "2026-07-29T12:35:03.000Z";
+const CAPTURE_FINALIZE_NOW = "2026-07-29T12:35:04.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
@@ -201,6 +215,66 @@ const INSERT_RELEASED_RESERVATION_QUERY = [
   "$6::jsonb, $7, $7, NULL, $7)",
   "ON CONFLICT (reservation_id) DO NOTHING",
   `RETURNING ${RESERVATION_COLUMNS}`,
+].join(" ");
+const CAPTURE_ATTEMPT_COLUMNS = [
+  "capture_attempt_id",
+  "operation_id",
+  "session_id",
+  "binding",
+  "claimed_at",
+].join(", ");
+const CAPTURE_ATTEMPT_TOMBSTONE_COLUMNS = [
+  "capture_attempt_id",
+  "operation_id",
+  "session_id",
+  "retired_at",
+  "tombstone",
+].join(", ");
+const CHECKPOINT_CATALOGUE_COLUMNS = [
+  "checkpoint_id",
+  "session_id",
+  "capture_attempt_id",
+  "document",
+  "committed_at",
+].join(", ");
+const READ_CAPTURE_ATTEMPT_QUERY = [
+  `SELECT ${CAPTURE_ATTEMPT_COLUMNS}`,
+  "FROM session_authority.capture_attempt_claims",
+  "WHERE operation_id = $1",
+].join(" ");
+const READ_CAPTURE_ATTEMPT_BY_ID_QUERY = [
+  `SELECT ${CAPTURE_ATTEMPT_COLUMNS}`,
+  "FROM session_authority.capture_attempt_claims",
+  "WHERE capture_attempt_id = $1::uuid",
+].join(" ");
+const INSERT_CAPTURE_ATTEMPT_QUERY = [
+  "INSERT INTO session_authority.capture_attempt_claims",
+  "(capture_attempt_id, operation_id, session_id, binding, claimed_at)",
+  "VALUES ($1::uuid, $2, $3::uuid, $4::jsonb, $5)",
+  "ON CONFLICT DO NOTHING",
+  `RETURNING ${CAPTURE_ATTEMPT_COLUMNS}`,
+].join(" ");
+const READ_CAPTURE_ATTEMPT_TOMBSTONE_QUERY = [
+  `SELECT ${CAPTURE_ATTEMPT_TOMBSTONE_COLUMNS}`,
+  "FROM session_authority.capture_attempt_tombstones",
+  "WHERE operation_id = $1",
+].join(" ");
+const READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY = [
+  `SELECT ${CHECKPOINT_CATALOGUE_COLUMNS}`,
+  "FROM session_authority.checkpoint_catalogue",
+  "WHERE checkpoint_id = $1",
+].join(" ");
+const READ_CHECKPOINT_CATALOGUE_BY_ATTEMPT_QUERY = [
+  `SELECT ${CHECKPOINT_CATALOGUE_COLUMNS}`,
+  "FROM session_authority.checkpoint_catalogue",
+  "WHERE capture_attempt_id = $1::uuid",
+].join(" ");
+const INSERT_CHECKPOINT_CATALOGUE_QUERY = [
+  "INSERT INTO session_authority.checkpoint_catalogue",
+  "(checkpoint_id, session_id, capture_attempt_id, document, committed_at)",
+  "VALUES ($1, $2::uuid, $3::uuid, $4::jsonb, $5)",
+  "ON CONFLICT DO NOTHING",
+  `RETURNING ${CHECKPOINT_CATALOGUE_COLUMNS}`,
 ].join(" ");
 const TRANSACTION_INFRASTRUCTURE_QUERIES = new Set([
   "DISCARD ALL",
@@ -1263,6 +1337,452 @@ function renewedSessionRow({
     createdAt: options.expectedSession.createdAt,
     updatedAt,
   });
+}
+
+function checkpointCaptureFixture() {
+  const writer = writerAcquiredFixture();
+  const checkpoint = {
+    artifactId: ARTIFACT_ID,
+    backendId: writer.expectedSession.document.storageRef.backendId,
+    checkpointClass: "clean",
+    checkpointId: CHECKPOINT_ID,
+    codexSessionId:
+      writer.expectedSession.document.manifest.codex.sessionId,
+    codexThreadId:
+      writer.expectedSession.document.manifest.codex.rootThreadId,
+    contractVersion: 1,
+    createdAt: CAPTURE_PREPARED_NOW,
+    imageDigest:
+      writer.expectedSession.document.manifest.runtime.imageDigest,
+    sessionId: writer.expectedSession.sessionId,
+    sourceFencingEpoch: writer.lease.fencingEpoch,
+    storageId: writer.expectedSession.document.storageRef.storageId,
+  };
+  const mutationRequest = {
+    backendId: checkpoint.backendId,
+    contractVersion: 1,
+    fencingEpoch: writer.lease.fencingEpoch,
+    holderId: writer.lease.holderId,
+    leaseId: writer.lease.leaseId,
+    operation: "checkpoint",
+    operationId: CAPTURE_OPERATION_ID,
+    sessionId: writer.expectedSession.sessionId,
+    storageId: checkpoint.storageId,
+    target: {
+      artifactId: ARTIFACT_ID,
+      checkpointId: CHECKPOINT_ID,
+      kind: "checkpoint",
+    },
+  };
+  const admission = {
+    attachment: structuredClone(
+      writer.expectedSession.document.attachment,
+    ),
+    captureAttemptId: CAPTURE_ATTEMPT_ID,
+    checkpoint,
+    processIncarnationId: PROCESS_INCARNATION_ID,
+    request: mutationRequest,
+    stopOperationId: STOP_OPERATION_ID,
+    writerIncarnationId: WRITER_INCARNATION_ID,
+  };
+  const request = createCheckpointCaptureOperationRequest({
+    admission,
+    expectedSession: writer.expectedSession,
+  });
+  const options = {
+    expectedSession: writer.expectedSession,
+    kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+    operationId: CAPTURE_OPERATION_ID,
+    request,
+  };
+  const artifactManifestDigest = "b".repeat(64);
+  const modeledDigest = "c".repeat(64);
+  const completion = {
+    artifactProof: {
+      artifactManifestDigest,
+      captureOperationId: CAPTURE_OPERATION_ID,
+      modeledDigest,
+    },
+    materialization: {
+      artifactManifestDigest,
+      contractVersion: 2,
+      modeledDigest,
+      publicationId: "checkpoint-publication-001",
+      publicationKind: "checkpoint-artifact",
+      stagedRoot: {
+        filesystemId: "filesystem-001",
+        objectIdentityScheme: "test-object-id-v1",
+        objectId: "test-object-001",
+      },
+      treeIdentityDigest: "d".repeat(64),
+    },
+    replayed: false,
+    result: request.predeterminedResult,
+  };
+  return {
+    admission,
+    checkpoint,
+    completion,
+    mutationRequest,
+    options,
+    request,
+    writer,
+  };
+}
+
+function checkpointCatalogueDocument(fixture) {
+  return {
+    artifactProof: structuredClone(fixture.completion.artifactProof),
+    contractVersion: 1,
+    materialization: structuredClone(fixture.completion.materialization),
+    result: structuredClone(fixture.completion.result),
+  };
+}
+
+function checkpointCaptureBinding(fixture) {
+  const { options, request } = fixture;
+  return {
+    attachmentId: request.admission.attachment.attachmentId,
+    attachmentOperationId: request.admission.attachment.operationId,
+    attachmentProofId: request.admission.attachment.proofId,
+    captureAttemptId: request.admission.captureAttemptId,
+    checkpoint: request.admission.checkpoint,
+    contractVersion: 2,
+    processIncarnationId: request.admission.processIncarnationId,
+    reservationId: operationBinding(options).reservationId,
+    stopOperationId: request.admission.stopOperationId,
+    writerIncarnationId: request.admission.writerIncarnationId,
+  };
+}
+
+function checkpointCaptureAttemptRow(
+  fixture,
+  { binding = checkpointCaptureBinding(fixture) } = {},
+) {
+  return {
+    binding: structuredClone(binding),
+    capture_attempt_id: CAPTURE_ATTEMPT_ID,
+    claimed_at: new Date(CAPTURE_DISPATCH_NOW),
+    operation_id: CAPTURE_OPERATION_ID,
+    session_id: SESSION_ID,
+  };
+}
+
+function checkpointCaptureTombstoneRow(fixture) {
+  return {
+    capture_attempt_id: CAPTURE_ATTEMPT_ID,
+    operation_id: CAPTURE_OPERATION_ID,
+    retired_at: new Date(CAPTURE_FINALIZE_NOW),
+    session_id: SESSION_ID,
+    tombstone: {
+      contractVersion: 1,
+      reason: "administratively-retired",
+    },
+  };
+}
+
+function checkpointCatalogueRow(
+  fixture,
+  { document: catalogueDocument = checkpointCatalogueDocument(fixture) } = {},
+) {
+  return {
+    capture_attempt_id: CAPTURE_ATTEMPT_ID,
+    checkpoint_id: CHECKPOINT_ID,
+    committed_at: new Date(CAPTURE_FINALIZE_NOW),
+    document: structuredClone(catalogueDocument),
+    session_id: SESSION_ID,
+  };
+}
+
+function checkpointCaptureTerminalResult(fixture) {
+  const catalogueDocument = checkpointCatalogueDocument(fixture);
+  return {
+    captureAttemptId: CAPTURE_ATTEMPT_ID,
+    catalogueSha256: sha256(
+      JSON.stringify(catalogueDocument),
+    ),
+    checkpointId: CHECKPOINT_ID,
+    outcome: "checkpoint-captured",
+    resultVersion: 1,
+  };
+}
+
+function checkpointCaptureOperationRow(
+  fixture,
+  state,
+  {
+    result =
+      state === "committed"
+        ? checkpointCaptureTerminalResult(fixture)
+        : null,
+    revision =
+      state === "prepared"
+        ? "0"
+        : state === "starting"
+          ? "1"
+          : state === "uncertain"
+            ? "2"
+            : "3",
+    updatedAt =
+      state === "prepared"
+        ? CAPTURE_PREPARED_NOW
+        : state === "starting"
+          ? CAPTURE_DISPATCH_NOW
+          : state === "uncertain"
+            ? CAPTURE_UNCERTAIN_NOW
+            : CAPTURE_FINALIZE_NOW,
+  } = {},
+) {
+  return operationRow(state, {
+    options: fixture.options,
+    revision,
+    createdAt: CAPTURE_PREPARED_NOW,
+    updatedAt,
+    result,
+    retiredAt: state === "committed" ? updatedAt : null,
+  });
+}
+
+function checkpointCaptureReservationRow(
+  fixture,
+  state,
+  {
+    updatedAt =
+      state === "prepared"
+        ? CAPTURE_PREPARED_NOW
+        : state === "starting"
+          ? CAPTURE_DISPATCH_NOW
+          : state === "uncertain"
+            ? CAPTURE_UNCERTAIN_NOW
+            : CAPTURE_FINALIZE_NOW,
+  } = {},
+) {
+  return reservationRow(state, {
+    options: fixture.options,
+    createdAt: CAPTURE_PREPARED_NOW,
+    updatedAt,
+    releasedAt: state === "released" ? updatedAt : null,
+  });
+}
+
+function checkpointCapturePhaseSessionRow(fixture, state) {
+  const operationRevision =
+    state === "prepared" ? "0" : state === "starting" ? "1" : "2";
+  const updatedAt =
+    state === "prepared"
+      ? CAPTURE_PREPARED_NOW
+      : state === "starting"
+        ? CAPTURE_DISPATCH_NOW
+        : CAPTURE_UNCERTAIN_NOW;
+  return sessionRow({
+    sessionId: SESSION_ID,
+    revision: (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(SESSION_ID, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: activeOperation(state, {
+        options: fixture.options,
+        operationRevision,
+      }),
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function checkpointCaptureCommittedSessionRow(
+  fixture,
+  { operationRevision = "3" } = {},
+) {
+  const result = checkpointCaptureTerminalResult(fixture);
+  return sessionRow({
+    sessionId: SESSION_ID,
+    revision: (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(SESSION_ID, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options: fixture.options,
+        operationRevision,
+        result,
+      }),
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+  });
+}
+
+function checkpointCaptureAttemptRecord(
+  fixture,
+  state = "authorized",
+) {
+  return {
+    binding: checkpointCaptureBinding(fixture),
+    captureAttemptId: CAPTURE_ATTEMPT_ID,
+    contractVersion: 1,
+    operationId: CAPTURE_OPERATION_ID,
+    request: fixture.request.admission.request,
+    result: fixture.request.predeterminedResult,
+    state,
+  };
+}
+
+function checkpointCaptureActiveSteps(fixture, state) {
+  const attempt =
+    state === "prepared" ? null : checkpointCaptureAttemptRow(fixture);
+  const steps = [
+    rows(checkpointCapturePhaseSessionRow(fixture, state)),
+    rows(checkpointCaptureOperationRow(fixture, state)),
+    rows(checkpointCaptureReservationRow(fixture, state)),
+    attempt === null ? rows() : rows(attempt),
+    rows(),
+  ];
+  if (attempt !== null) steps.push(rows());
+  steps.push(
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+  );
+  return steps;
+}
+
+function checkpointCaptureCommittedSteps(
+  fixture,
+  {
+    catalogue = checkpointCatalogueRow(fixture),
+    operationRevision = "3",
+    tombstone = null,
+  } = {},
+) {
+  return [
+    rows(
+      checkpointCaptureCommittedSessionRow(fixture, {
+        operationRevision,
+      }),
+    ),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(
+      checkpointCaptureOperationRow(fixture, "committed", {
+        revision: operationRevision,
+      }),
+    ),
+    rows(checkpointCaptureReservationRow(fixture, "released")),
+    rows(checkpointCaptureAttemptRow(fixture)),
+    tombstone === null ? rows() : rows(tombstone),
+    rows(catalogue),
+  ];
+}
+
+function checkpointHistoricalReplacementFixture(
+  fixture,
+  {
+    capabilities = fixture.options.expectedSession.document
+      .backendCapabilities,
+    createdAt = fixture.options.expectedSession.createdAt,
+  } = {},
+) {
+  const writerExpected = sessionSnapshot({
+    sessionId: fixture.options.expectedSession.sessionId,
+    sessionDocument: document(
+      fixture.options.expectedSession.sessionId,
+      {
+        backendCapabilities: structuredClone(capabilities),
+      },
+    ),
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const writerOptions = writerAcquireOptions({
+    expectedSession: writerExpected,
+    operationId: "replacement-session-writer-attachment",
+  });
+  const lease = writerLease(writerOptions);
+  const writerResult = writerAttachmentResult(writerOptions, lease);
+  const attachedSession = writerAttachedSessionRow({
+    options: writerOptions,
+    lease,
+    result: writerResult,
+  });
+  const predecessorOptions = reserveOptions({
+    expectedSession: snapshotFromSessionRow(attachedSession),
+    operationId: "replacement-session-predecessor",
+    request: operationRequest({
+      checkpointId: "replacement-session-predecessor-checkpoint",
+    }),
+  });
+  const predecessorResult = cancellationResult(
+    "replacement-session-predecessor",
+  );
+  const replacementExpectedRow = sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (
+      BigInt(predecessorOptions.expectedSession.revision) + 2n
+    ).toString(),
+    sessionDocument: document(
+      fixture.options.expectedSession.sessionId,
+      {
+        ...structuredClone(predecessorOptions.expectedSession.document),
+        activeOperation: null,
+        lastOperation: terminalPointer({
+          options: predecessorOptions,
+          operationRevision: "1",
+          result: predecessorResult,
+        }),
+      },
+    ),
+    createdAt,
+    updatedAt: CAPTURE_PREPARED_NOW,
+  });
+  const replacementExpected = snapshotFromSessionRow(
+    replacementExpectedRow,
+  );
+  const options = reserveOptions({
+    expectedSession: replacementExpected,
+    operationId: "replacement-session-operation",
+    request: operationRequest({
+      checkpointId: "replacement-session-checkpoint",
+    }),
+  });
+  const result = cancellationResult("replacement-session-anchor");
+  const operation = operationRow("committed", {
+    options,
+    revision: "1",
+    createdAt: CAPTURE_PREPARED_NOW,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+    result,
+    retiredAt: CAPTURE_FINALIZE_NOW,
+  });
+  const reservation = reservationRow("released", {
+    options,
+    createdAt: CAPTURE_PREPARED_NOW,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+    releasedAt: CAPTURE_FINALIZE_NOW,
+  });
+  const session = sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (BigInt(replacementExpected.revision) + 2n).toString(),
+    sessionDocument: document(
+      fixture.options.expectedSession.sessionId,
+      {
+        ...structuredClone(replacementExpected.document),
+        activeOperation: null,
+        lastOperation: terminalPointer({
+          options,
+          operationRevision: "1",
+          result,
+        }),
+      },
+    ),
+    createdAt,
+    updatedAt: CAPTURE_FINALIZE_NOW,
+  });
+  return { operation, reservation, session };
 }
 
 function phaseSessionRow(
@@ -4077,10 +4597,11 @@ test("writer lease renewal cannot resurrect the lease at expiry equality", async
   clients[0].assertExhausted();
 });
 
-test("all typed writer kinds and generic dispatch bypasses reject invalid input before PostgreSQL", async () => {
+test("all typed operation kinds and generic dispatch bypasses reject invalid input before PostgreSQL", async () => {
   const { authority, pool } = authorityWithScripts();
   const acquire = writerAcquireOptions();
   const fixture = writerAcquiredFixture();
+  const capture = checkpointCaptureFixture();
   const release = writerReleaseOptions(fixture);
   const fence = writerForceFenceOptions(fixture);
   const fenceEpoch = (
@@ -4117,6 +4638,11 @@ test("all typed writer kinds and generic dispatch bypasses reject invalid input 
     () =>
       authority.claimOperationDispatch({
         ...fence,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.claimOperationDispatch({
+        ...capture.options,
         expectedOperationRevision: "0",
       }),
     () =>
@@ -5948,4 +6474,917 @@ test("uncertain force-fence accepts one exact proof and rejects a different repl
     false,
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("checkpoint capture request builder owns the exact predetermined proof", () => {
+  const fixture = checkpointCaptureFixture();
+  const replay = createCheckpointCaptureOperationRequest({
+    admission: fixture.admission,
+    expectedSession: fixture.options.expectedSession,
+  });
+
+  assert.equal(
+    CHECKPOINT_CAPTURE_OPERATION_KIND,
+    "checkpoint-capture-v1",
+  );
+  assert.deepEqual(replay, fixture.request);
+  assert.equal(
+    replay.predeterminedResult.mutation.proofId,
+    `proof-checkpoint-${sha256(
+      `checkpoint-capture-proof:${CAPTURE_OPERATION_ID}`,
+    )}`,
+  );
+  assert.deepEqual(
+    replay.predeterminedResult.checkpoint,
+    canonicalPayload(fixture.checkpoint),
+  );
+  assertDeepFrozen(replay);
+});
+
+test("checkpoint capture dispatch, source-free reconciliation, uncertain finalize, and exact replay share one SQL authority", async () => {
+  const fixture = checkpointCaptureFixture();
+  const preparedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedReservation = checkpointCaptureReservationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "prepared",
+  );
+  const startingOperation = checkpointCaptureOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = checkpointCaptureReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const uncertainOperation = checkpointCaptureOperationRow(
+    fixture,
+    "uncertain",
+  );
+  const uncertainReservation = checkpointCaptureReservationRow(
+    fixture,
+    "uncertain",
+  );
+  const uncertainSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "uncertain",
+  );
+  const catalogue = checkpointCatalogueRow(fixture);
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const releasedReservation = checkpointCaptureReservationRow(
+    fixture,
+    "released",
+  );
+  const committedSession = checkpointCaptureCommittedSessionRow(
+    fixture,
+  );
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: CAPTURE_PREPARED_NOW },
+      steps: [
+        rows(fixture.writer.session),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(fixture.writer.committedOperation),
+        rows(fixture.writer.releasedReservation),
+        rows(),
+        rows(preparedOperation),
+        rows(preparedReservation),
+        rows(preparedSession),
+      ],
+    },
+    {
+      options: {
+        authorityNow: CAPTURE_AUTHORITY_NOW,
+        now: CAPTURE_DISPATCH_NOW,
+      },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "prepared"),
+        rows(checkpointCaptureAttemptRow(fixture)),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    [
+      rows(startingOperation),
+      ...checkpointCaptureActiveSteps(fixture, "starting"),
+    ],
+    {
+      options: { now: CAPTURE_UNCERTAIN_NOW },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "starting"),
+        rows(uncertainOperation),
+        rows(uncertainReservation),
+        rows(uncertainSession),
+      ],
+    },
+    {
+      options: { now: CAPTURE_FINALIZE_NOW },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "uncertain"),
+        rows(catalogue),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(committedSession),
+      ],
+    },
+    checkpointCaptureCommittedSteps(fixture),
+    [
+      rows(catalogue),
+      rows(checkpointCaptureAttemptRow(fixture)),
+      rows(committedOperation),
+      ...checkpointCaptureCommittedSteps(fixture),
+    ],
+  );
+
+  const reserved = await authority.reserveOperation(fixture.options);
+  const dispatched = await authority.claimCheckpointCaptureDispatch({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+  });
+  const preparedReconciliation =
+    await authority.readCheckpointCaptureAttempt({
+      checkpoint: fixture.checkpoint,
+      request: fixture.mutationRequest,
+    });
+  const uncertain = await authority.markOperationUncertain({
+    ...fixture.options,
+    expectedOperationRevision: "1",
+  });
+  const finalized = await authority.finalizeCheckpointCapture({
+    ...fixture.options,
+    completion: fixture.completion,
+    expectedOperationRevision: "2",
+  });
+  const replayed = await authority.finalizeCheckpointCapture({
+    ...fixture.options,
+    completion: {
+      ...fixture.completion,
+      replayed: true,
+    },
+    expectedOperationRevision: "2",
+  });
+  const catalogueRead = await authority.readCheckpointCatalogue({
+    checkpoint: fixture.checkpoint,
+  });
+
+  assert.equal(reserved.acquired, true);
+  assert.equal(reserved.operation.state, "prepared");
+  assert.equal(dispatched.dispatchGranted, true);
+  assert.equal(dispatched.authorityNow, CAPTURE_AUTHORITY_NOW);
+  assert.deepEqual(
+    dispatched.attempt,
+    checkpointCaptureAttemptRecord(fixture),
+  );
+  assert.equal(preparedReconciliation.status, "authorized");
+  assert.equal(preparedReconciliation.catalogue, null);
+  assert.deepEqual(
+    preparedReconciliation.attempt,
+    checkpointCaptureAttemptRecord(fixture),
+  );
+  assert.equal(uncertain.changed, true);
+  assert.equal(uncertain.operation.state, "uncertain");
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.operation.revision, "3");
+  assert.deepEqual(
+    finalized.attempt,
+    checkpointCaptureAttemptRecord(fixture, "committed"),
+  );
+  assert.equal(
+    finalized.operation.result.catalogueSha256,
+    checkpointCaptureTerminalResult(fixture).catalogueSha256,
+  );
+  assert.equal(replayed.finalized, false);
+  assert.deepEqual(replayed.catalogue, finalized.catalogue);
+  assert.deepEqual(catalogueRead, {
+    attempt: checkpointCaptureAttemptRecord(fixture, "committed"),
+    catalogue: finalized.catalogue,
+    operation: operationView(committedOperation),
+  });
+  assertDeepFrozen(finalized);
+
+  const dispatchTexts = authorityQueries(clients[1]).map(queryText);
+  assert.ok(
+    dispatchTexts.indexOf(INSERT_CAPTURE_ATTEMPT_QUERY) <
+      dispatchTexts.indexOf(START_OPERATION_QUERY),
+  );
+  const finalizeTexts = authorityQueries(clients[4]).map(queryText);
+  assert.ok(
+    finalizeTexts.indexOf(INSERT_CHECKPOINT_CATALOGUE_QUERY) <
+      finalizeTexts.indexOf(COMMIT_ACTIVE_OPERATION_QUERY),
+  );
+  assert.equal(
+    authorityQueries(clients[5]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.deepEqual(
+    authorityQueries(clients[6]).map(queryText).slice(0, 3),
+    [
+      READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY,
+      READ_CAPTURE_ATTEMPT_BY_ID_QUERY,
+      READ_OPERATION_QUERY,
+    ],
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("checkpoint finalization rejects a tombstone introduced after the reconciliation read", async () => {
+  const fixture = checkpointCaptureFixture();
+  const startingOperation = checkpointCaptureOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = checkpointCaptureReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const tombstone = checkpointCaptureTombstoneRow(fixture);
+  const { authority, clients } = authorityWithScripts(
+    [
+      rows(startingOperation),
+      ...checkpointCaptureActiveSteps(fixture, "starting"),
+    ],
+    {
+      options: { now: CAPTURE_FINALIZE_NOW },
+      steps: [
+        rows(startingSession),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(checkpointCaptureAttemptRow(fixture)),
+        rows(tombstone),
+        rows(),
+      ],
+    },
+  );
+
+  const authorized = await authority.readCheckpointCaptureAttempt({
+    checkpoint: fixture.checkpoint,
+    request: fixture.mutationRequest,
+  });
+
+  assert.equal(authorized.status, "authorized");
+  await assertAuthorityError(
+    authority.finalizeCheckpointCapture({
+      ...fixture.options,
+      completion: fixture.completion,
+      expectedOperationRevision: "1",
+    }),
+    { code: "checkpoint_capture_not_authorized" },
+  );
+
+  const finalizationTexts = authorityQueries(clients[1]).map(queryText);
+  for (const forbiddenQuery of [
+    INSERT_CHECKPOINT_CATALOGUE_QUERY,
+    COMMIT_ACTIVE_OPERATION_QUERY,
+    RELEASE_ACTIVE_RESERVATION_QUERY,
+    UPDATE_SESSION_QUERY,
+  ]) {
+    assert.equal(finalizationTexts.includes(forbiddenQuery), false);
+  }
+  assert.equal(queryTexts(clients[1]).includes("ROLLBACK"), true);
+  for (const client of clients) client.assertExhausted();
+});
+
+test("checkpoint finalization rejects attempt binding drift after the reconciliation read", async () => {
+  const fixture = checkpointCaptureFixture();
+  const startingOperation = checkpointCaptureOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = checkpointCaptureReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const mismatchedAttempt = checkpointCaptureAttemptRow(fixture, {
+    binding: {
+      ...checkpointCaptureBinding(fixture),
+      reservationId: "checkpoint-reservation-mismatched",
+    },
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      rows(startingOperation),
+      ...checkpointCaptureActiveSteps(fixture, "starting"),
+    ],
+    {
+      options: { now: CAPTURE_FINALIZE_NOW },
+      steps: [
+        rows(startingSession),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(mismatchedAttempt),
+      ],
+    },
+  );
+
+  const authorized = await authority.readCheckpointCaptureAttempt({
+    checkpoint: fixture.checkpoint,
+    request: fixture.mutationRequest,
+  });
+
+  assert.equal(authorized.status, "authorized");
+  await assertAuthorityError(
+    authority.finalizeCheckpointCapture({
+      ...fixture.options,
+      completion: fixture.completion,
+      expectedOperationRevision: "1",
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  const finalizationTexts = authorityQueries(clients[1]).map(queryText);
+  for (const forbiddenQuery of [
+    INSERT_CHECKPOINT_CATALOGUE_QUERY,
+    COMMIT_ACTIVE_OPERATION_QUERY,
+    RELEASE_ACTIVE_RESERVATION_QUERY,
+    UPDATE_SESSION_QUERY,
+  ]) {
+    assert.equal(finalizationTexts.includes(forbiddenQuery), false);
+  }
+  assert.equal(queryTexts(clients[1]).includes("ROLLBACK"), true);
+  for (const client of clients) client.assertExhausted();
+});
+
+test("checkpoint claim and catalogue collisions fail closed before either phase advances", async () => {
+  const fixture = checkpointCaptureFixture();
+  const differentCompletion = {
+    ...fixture.completion,
+    materialization: {
+      ...fixture.completion.materialization,
+      publicationId: "checkpoint-publication-different",
+    },
+    replayed: true,
+  };
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: CAPTURE_AUTHORITY_NOW,
+        now: CAPTURE_DISPATCH_NOW,
+      },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "prepared"),
+        rows(),
+      ],
+    },
+    {
+      options: { now: CAPTURE_FINALIZE_NOW },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "uncertain"),
+        rows(),
+      ],
+    },
+    checkpointCaptureCommittedSteps(fixture),
+  );
+
+  await assertAuthorityError(
+    authority.claimCheckpointCaptureDispatch({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+    }),
+    { code: "checkpoint_identity_conflict" },
+  );
+  await assertAuthorityError(
+    authority.finalizeCheckpointCapture({
+      ...fixture.options,
+      completion: fixture.completion,
+      expectedOperationRevision: "2",
+    }),
+    { code: "checkpoint_identity_conflict" },
+  );
+  await assertAuthorityError(
+    authority.finalizeCheckpointCapture({
+      ...fixture.options,
+      completion: differentCompletion,
+      expectedOperationRevision: "2",
+    }),
+    { code: "operation_result_conflict" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).at(-1)?.[0]?.text,
+    INSERT_CAPTURE_ATTEMPT_QUERY,
+  );
+  assert.equal(
+    authorityQueries(clients[1]).at(-1)?.[0]?.text,
+    INSERT_CHECKPOINT_CATALOGUE_QUERY,
+  );
+  for (const client of clients) {
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        queryText(args).startsWith("UPDATE "),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
+test("checkpoint claim and finalize acknowledgement loss reconcile durable exact state", async () => {
+  const fixture = checkpointCaptureFixture();
+  const startingOperation = checkpointCaptureOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = checkpointCaptureReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const catalogue = checkpointCatalogueRow(fixture);
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+    { revision: "2" },
+  );
+  const releasedReservation = checkpointCaptureReservationRow(
+    fixture,
+    "released",
+  );
+  const committedSession = checkpointCaptureCommittedSessionRow(
+    fixture,
+    { operationRevision: "2" },
+  );
+  const claimCommitError = new Error(
+    "sensitive checkpoint claim acknowledgement lost",
+  );
+  const finalizeCommitError = new Error(
+    "sensitive checkpoint finalize acknowledgement lost",
+  );
+  const { authority, clients, pool } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: CAPTURE_AUTHORITY_NOW,
+        commitError: claimCommitError,
+        now: CAPTURE_DISPATCH_NOW,
+      },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "prepared"),
+        rows(checkpointCaptureAttemptRow(fixture)),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    [
+      rows(startingOperation),
+      ...checkpointCaptureActiveSteps(fixture, "starting"),
+    ],
+    {
+      options: {
+        commitError: finalizeCommitError,
+        now: CAPTURE_FINALIZE_NOW,
+      },
+      steps: [
+        ...checkpointCaptureActiveSteps(fixture, "starting"),
+        rows(catalogue),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(committedSession),
+      ],
+    },
+    [
+      rows(catalogue),
+      rows(checkpointCaptureAttemptRow(fixture)),
+      rows(committedOperation),
+      ...checkpointCaptureCommittedSteps(fixture, {
+        operationRevision: "2",
+      }),
+    ],
+  );
+
+  await assert.rejects(
+    authority.claimCheckpointCaptureDispatch({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+    }),
+    assertStoreCommitUncertain,
+  );
+  const authorized = await authority.readCheckpointCaptureAttempt({
+    checkpoint: fixture.checkpoint,
+    request: fixture.mutationRequest,
+  });
+  await assert.rejects(
+    authority.finalizeCheckpointCapture({
+      ...fixture.options,
+      completion: fixture.completion,
+      expectedOperationRevision: "1",
+    }),
+    assertStoreCommitUncertain,
+  );
+  const committed = await authority.readCheckpointCatalogue({
+    checkpoint: fixture.checkpoint,
+  });
+
+  assert.equal(authorized.status, "authorized");
+  assert.equal(authorized.operation.state, "starting");
+  assert.equal(committed.operation.state, "committed");
+  assert.equal(committed.operation.revision, "2");
+  assert.equal(pool.connectCalls, 4);
+  for (const index of [0, 2]) {
+    assert.equal(
+      queryTexts(clients[index]).filter((text) => text === "COMMIT")
+        .length,
+      1,
+    );
+    assert.equal(queryTexts(clients[index]).at(-1), "ROLLBACK");
+    clients[index].assertExhausted({ destroyed: true });
+  }
+  for (const index of [1, 3]) {
+    assert.equal(
+      authorityQueries(clients[index]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[index].assertExhausted();
+  }
+});
+
+test("checkpoint dispatch uses database time and cannot authorize at lease expiry", async () => {
+  const fixture = checkpointCaptureFixture();
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: fixture.writer.lease.expiresAt,
+      now: CAPTURE_DISPATCH_NOW,
+    },
+    steps: checkpointCaptureActiveSteps(fixture, "prepared"),
+  });
+
+  await assertAuthorityError(
+    authority.claimCheckpointCaptureDispatch({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+    }),
+    { code: "writer_lease_expired" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).at(-1)?.[0]?.text,
+    READ_AUTHORITY_CLOCK_QUERY,
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("checkpoint typed APIs reject non-exact contracts before PostgreSQL", async () => {
+  const fixture = checkpointCaptureFixture();
+  const { authority, pool } = authorityWithScripts();
+  const cases = [
+    () =>
+      authority.reserveOperation({
+        ...fixture.options,
+        request: { malformed: true },
+      }),
+    () =>
+      authority.claimCheckpointCaptureDispatch({
+        ...fixture.options,
+        expectedOperationRevision: "0",
+        extra: true,
+      }),
+    () =>
+      authority.finalizeCheckpointCapture({
+        ...fixture.options,
+        completion: {
+          ...fixture.completion,
+          materialization: {
+            ...fixture.completion.materialization,
+            contractVersion: 1,
+          },
+        },
+        expectedOperationRevision: "1",
+      }),
+    () =>
+      authority.readCheckpointCaptureAttempt({
+        checkpoint: fixture.checkpoint,
+        extra: true,
+        request: fixture.mutationRequest,
+      }),
+    () =>
+      authority.readCheckpointCatalogue({
+        checkpoint: fixture.checkpoint,
+        extra: true,
+      }),
+  ];
+
+  assert.throws(
+    () =>
+      createCheckpointCaptureOperationRequest({
+        admission: {
+          ...fixture.admission,
+          extra: true,
+        },
+        expectedSession: fixture.options.expectedSession,
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
+  for (const checkpointClass of ["crash-prefix", "graceful-abort"]) {
+    assert.throws(
+      () =>
+        createCheckpointCaptureOperationRequest({
+          admission: {
+            ...fixture.admission,
+            checkpoint: {
+              ...fixture.checkpoint,
+              checkpointClass,
+            },
+          },
+          expectedSession: fixture.options.expectedSession,
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+  for (const invoke of cases) {
+    await assertAuthorityError(invoke(), {
+      code: "invalid_operation_request",
+    });
+  }
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("checkpoint capture tombstones are non-authorizing read evidence", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const tombstone = checkpointCaptureTombstoneRow(fixture);
+  const { authority, clients } = authorityWithScripts([
+    rows(committedOperation),
+    ...checkpointCaptureCommittedSteps(fixture, { tombstone }),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCaptureAttempt({
+      checkpoint: fixture.checkpoint,
+      request: fixture.mutationRequest,
+    }),
+    { code: "checkpoint_capture_not_authorized" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint reads reject a session restored before commit", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(committedOperation),
+    rows(fixture.writer.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCaptureAttempt({
+      checkpoint: fixture.checkpoint,
+      request: fixture.mutationRequest,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint catalogue rejects a session restored before commit", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(checkpointCatalogueRow(fixture)),
+    rows(checkpointCaptureAttemptRow(fixture)),
+    rows(committedOperation),
+    rows(fixture.writer.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCatalogue({
+      checkpoint: fixture.checkpoint,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint attempt rejects replacement document identity at the committed revision floor", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const replacement = checkpointHistoricalReplacementFixture(fixture, {
+    capabilities: backendCapabilities({ fencing: "manual" }),
+  });
+  assert.equal(
+    replacement.session.revision,
+    (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(committedOperation.revision) +
+      1n
+    ).toString(),
+  );
+  assert.notDeepEqual(
+    replacement.session.document.backendCapabilities,
+    fixture.options.expectedSession.document.backendCapabilities,
+  );
+  assert.equal(
+    replacement.session.created_at.toISOString(),
+    fixture.options.expectedSession.createdAt,
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(committedOperation),
+    rows(replacement.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(replacement.operation),
+    rows(replacement.reservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCaptureAttempt({
+      checkpoint: fixture.checkpoint,
+      request: fixture.mutationRequest,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.deepEqual(authorityQueries(clients[0]).map(queryText), [
+    READ_OPERATION_QUERY,
+    READ_SESSION_QUERY,
+    READ_ACTIVE_COUNTS_QUERY,
+    READ_OPERATION_QUERY,
+    READ_RESERVATION_QUERY,
+    READ_OPERATION_QUERY,
+  ]);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint catalogue rejects a replacement session incarnation at the committed revision floor", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const replacement = checkpointHistoricalReplacementFixture(fixture, {
+    createdAt: "2026-07-29T12:34:56.790Z",
+  });
+  assert.equal(
+    replacement.session.revision,
+    (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(committedOperation.revision) +
+      1n
+    ).toString(),
+  );
+  assert.deepEqual(
+    {
+      manifest: replacement.session.document.manifest,
+      storageRef: replacement.session.document.storageRef,
+      backendCapabilities:
+        replacement.session.document.backendCapabilities,
+    },
+    {
+      manifest: fixture.options.expectedSession.document.manifest,
+      storageRef: fixture.options.expectedSession.document.storageRef,
+      backendCapabilities:
+        fixture.options.expectedSession.document.backendCapabilities,
+    },
+  );
+  assert.notEqual(
+    replacement.session.created_at.toISOString(),
+    fixture.options.expectedSession.createdAt,
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(checkpointCatalogueRow(fixture)),
+    rows(checkpointCaptureAttemptRow(fixture)),
+    rows(committedOperation),
+    rows(replacement.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(replacement.operation),
+    rows(replacement.reservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCatalogue({
+      checkpoint: fixture.checkpoint,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.deepEqual(authorityQueries(clients[0]).map(queryText), [
+    READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY,
+    READ_CAPTURE_ATTEMPT_BY_ID_QUERY,
+    READ_OPERATION_QUERY,
+    READ_SESSION_QUERY,
+    READ_ACTIVE_COUNTS_QUERY,
+    READ_OPERATION_QUERY,
+    READ_RESERVATION_QUERY,
+    READ_OPERATION_QUERY,
+  ]);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("checkpoint catalogue digest tampering fails strict relational readback", async () => {
+  const fixture = checkpointCaptureFixture();
+  const tamperedDocument = checkpointCatalogueDocument(fixture);
+  tamperedDocument.materialization.publicationId =
+    "checkpoint-publication-tampered";
+  const tamperedCatalogue = checkpointCatalogueRow(fixture, {
+    document: tamperedDocument,
+  });
+  const { authority, clients } = authorityWithScripts(
+    checkpointCaptureCommittedSteps(fixture, {
+      catalogue: tamperedCatalogue,
+    }),
+  );
+
+  await assertAuthorityError(
+    authority.readSession({ sessionId: SESSION_ID }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
 });
