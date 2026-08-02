@@ -397,43 +397,13 @@ async function releaseClient(binding) {
 }
 
 async function acquireAdvisoryLock(binding, key) {
-  let result;
-  try {
-    result = await queryClient(binding, TRY_LOCK_QUERY, [key]);
-  } catch (error) {
-    if (OPERATION_GUARD_DIAGNOSTIC) {
-      process._rawDebug(
-        "postgres operation guard diagnostic stage: try-lock-query",
-      );
-    }
-    throw error;
-  }
-  let row;
-  try {
-    row = exactRow(result, ["acquired", "backend_pid"]);
-  } catch (error) {
-    if (OPERATION_GUARD_DIAGNOSTIC) {
-      process._rawDebug(
-        "postgres operation guard diagnostic stage: try-lock-row",
-      );
-    }
-    throw error;
-  }
-  let backendPid;
-  try {
-    backendPid = validatedBackendPid(row.backend_pid);
-    ensure(
-      typeof row.acquired === "boolean",
-      "postgres_operation_guard_outcome_uncertain",
-    );
-  } catch (error) {
-    if (OPERATION_GUARD_DIAGNOSTIC) {
-      process._rawDebug(
-        "postgres operation guard diagnostic stage: try-lock-values",
-      );
-    }
-    throw error;
-  }
+  const result = await queryClient(binding, TRY_LOCK_QUERY, [key]);
+  const row = exactRow(result, ["acquired", "backend_pid"]);
+  const backendPid = validatedBackendPid(row.backend_pid);
+  ensure(
+    typeof row.acquired === "boolean",
+    "postgres_operation_guard_outcome_uncertain",
+  );
   return objectFreeze({ acquired: row.acquired, backendPid });
 }
 
@@ -610,7 +580,6 @@ export class PostgresOperationGuard {
         busy = true;
       } else {
         lockHeld = true;
-        diagnosticStage = "initial-held-check";
         await assertAdvisoryLockHeld(binding, key, backendPid);
         diagnosticStage = "callback";
 
