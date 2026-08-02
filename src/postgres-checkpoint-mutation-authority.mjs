@@ -229,6 +229,12 @@ const SESSION_DOCUMENT_KEYS = objectFreeze([
   "storageRef",
   "writerEpoch",
 ]);
+const HISTORICAL_SESSION_IDENTITY_DOCUMENT_KEYS = objectFreeze([
+  "backendCapabilities",
+  "documentVersion",
+  "manifest",
+  "storageRef",
+]);
 const ACTIVE_OPERATION_KEYS = objectFreeze([
   "conflictClass",
   "expectedSessionRevision",
@@ -1649,12 +1655,12 @@ function validateHistoricalSessionIdentity(
       updatedAt >= createdAt,
     code,
   );
-  for (const key of [
-    "backendCapabilities",
-    "documentVersion",
-    "manifest",
-    "storageRef",
-  ]) {
+  for (
+    let index = 0;
+    index < HISTORICAL_SESSION_IDENTITY_DOCUMENT_KEYS.length;
+    index += 1
+  ) {
+    const key = HISTORICAL_SESSION_IDENTITY_DOCUMENT_KEYS[index];
     ensure(
       sameContent(document[key], expectedDocument[key], code),
       code,

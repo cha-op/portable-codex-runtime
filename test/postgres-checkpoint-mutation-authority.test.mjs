@@ -37,7 +37,10 @@ const RESERVATION_ID = `reservation-${createHash("sha256")
 
 function deepFreeze(value) {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) deepFreeze(child);
+    const children = Object.values(value);
+    for (let index = 0; index < children.length; index += 1) {
+      deepFreeze(children[index]);
+    }
     Object.freeze(value);
   }
   return value;
@@ -424,6 +427,14 @@ function laterAuthoritySession(state) {
   });
 }
 
+function mismatchedHistoricalAuthoritySession(state, phase, revision) {
+  const mismatched = structuredClone(
+    authoritySession(state, phase, revision),
+  );
+  mismatched.document.storageRef.storageId = "storage-crossed-001";
+  return deepFreeze(mismatched);
+}
+
 function forgedAttemptView(state, mode) {
   const attempt = structuredClone(attemptView(state, state.attemptPhase));
   if (mode === "capture-attempt-id") {
@@ -637,6 +648,21 @@ class FakeAuthority {
     const returnedAttempt = this.state.distinctAttemptData
       ? deepFreeze(structuredClone(attempt))
       : attempt;
+    let returnedSession =
+      phase === "committed" &&
+      this.state.laterSessionOnCommittedReplay
+        ? laterAuthoritySession(this.state)
+        : authoritySession(this.state, operationPhase, revision);
+    if (
+      phase === "committed" &&
+      this.state.mismatchedHistoricalSessionIdentity
+    ) {
+      returnedSession = mismatchedHistoricalAuthoritySession(
+        this.state,
+        operationPhase,
+        revision,
+      );
+    }
     return deepFreeze({
       attempt: returnedAttempt,
       catalogue:
@@ -649,11 +675,7 @@ class FakeAuthority {
         this.state,
         phase === "committed" ? "released" : operationPhase,
       ),
-      session:
-        phase === "committed" &&
-        this.state.laterSessionOnCommittedReplay
-          ? laterAuthoritySession(this.state)
-          : authoritySession(this.state, operationPhase, revision),
+      session: returnedSession,
       status: phase,
     });
   }
@@ -702,6 +724,7 @@ function fixture(overrides = {}) {
     finalizeMode: "success",
     guardFailureProbe: 0,
     laterSessionOnCommittedReplay: false,
+    mismatchedHistoricalSessionIdentity: false,
     readAttemptForgery: null,
     readAttemptGate: Promise.resolve(),
     readGate: Promise.resolve(),
@@ -1131,6 +1154,70 @@ test("committed reconciliation tolerates later current session state", async () 
     value.state.finalizeInputs[0].expectedOperationRevision,
     "2",
   );
+});
+
+test("committed reconciliation rejects historical identity mismatch with a poisoned Array iterator", async () => {
+  const value = fixture({
+    attemptPhase: "committed",
+    mismatchedHistoricalSessionIdentity: true,
+  });
+  value.adapter = createPostgresCheckpointMutationAuthority({
+    authority: value.authority,
+    operationGuard: Object.freeze(new FakeGuard(value.state)),
+    resolveArtifactPaths() {
+      return deepFreeze({
+        artifactDirectory: ARTIFACT_DIRECTORY,
+        artifactOwnedRoot: ARTIFACT_OWNED_ROOT,
+      });
+    },
+    resolveSourceOwnedRoot() {
+      return deepFreeze({
+        sourceDirectory: SOURCE_DIRECTORY,
+        sourceOwnedRoot: SOURCE_OWNED_ROOT,
+      });
+    },
+  });
+  const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    Symbol.iterator,
+  );
+  let verifierCalls = 0;
+  let observedError = null;
+
+  try {
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      ...iteratorDescriptor,
+      value: function* emptyArrayIterator() {},
+    });
+    try {
+      await value.adapter.runCaptureReconciliation(
+        reconciliationAdmission(),
+        async () => {
+          verifierCalls += 1;
+          return completion(value.state, true);
+        },
+      );
+    } catch (error) {
+      observedError = error;
+    }
+  } finally {
+    Object.defineProperty(
+      Array.prototype,
+      Symbol.iterator,
+      iteratorDescriptor,
+    );
+  }
+
+  assert.ok(
+    observedError instanceof PostgresCheckpointMutationAuthorityError,
+  );
+  assert.equal(
+    observedError.code,
+    "postgres_checkpoint_mutation_authority_outcome_uncertain",
+  );
+  assert.equal(verifierCalls, 0);
+  assert.equal(value.artifactPlannerCalls, 0);
+  assert.equal(value.state.finalizeInputs.length, 0);
 });
 
 test("reconciliation rejects forged attempt receipts before verification", async (t) => {
