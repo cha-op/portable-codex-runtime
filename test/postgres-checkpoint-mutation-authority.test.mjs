@@ -176,6 +176,20 @@ function session(overrides = {}) {
   });
 }
 
+function nearRevisionExhaustionSession() {
+  const revision = 9_223_372_036_854_775_805n;
+  const lastOperation = document().lastOperation;
+  return session({
+    document: document({
+      lastOperation: {
+        ...lastOperation,
+        expectedSessionRevision: (revision - 3n).toString(),
+      },
+    }),
+    revision: revision.toString(),
+  });
+}
+
 function checkpoint(overrides = {}) {
   return {
     artifactId: ARTIFACT_ID,
@@ -441,6 +455,19 @@ function mismatchedHistoricalAuthoritySession(state, phase, revision) {
   return deepFreeze(mismatched);
 }
 
+function staleHistoricalAuthoritySession(state) {
+  const stale = structuredClone(state.expectedSession);
+  stale.updatedAt = "2026-07-31T12:00:02.000Z";
+  return deepFreeze(stale);
+}
+
+function maximumHistoricalAuthoritySession(state) {
+  const current = structuredClone(state.expectedSession);
+  current.revision = "9223372036854775807";
+  current.updatedAt = "2026-07-31T12:00:02.000Z";
+  return deepFreeze(current);
+}
+
 function forgedAttemptView(state, mode) {
   const attempt = structuredClone(attemptView(state, state.attemptPhase));
   if (mode === "capture-attempt-id") {
@@ -603,7 +630,10 @@ class FakeAuthority {
       ),
       reservation: reservationView(this.state, "released"),
       session:
-        this.state.laterSessionOnCommittedReplay &&
+        this.state.staleHistoricalFinalizeSession &&
+        this.state.attemptPhase === "committed"
+          ? staleHistoricalAuthoritySession(this.state)
+          : this.state.laterSessionOnCommittedReplay &&
         this.state.attemptPhase === "committed"
           ? laterAuthoritySession(this.state)
           : authoritySession(
@@ -655,7 +685,11 @@ class FakeAuthority {
       ? deepFreeze(structuredClone(attempt))
       : attempt;
     let returnedSession =
-      phase === "committed" &&
+      phase === "committed" && this.state.maximumHistoricalReadSession
+        ? maximumHistoricalAuthoritySession(this.state)
+        : phase === "committed" && this.state.staleHistoricalReadSession
+        ? staleHistoricalAuthoritySession(this.state)
+        : phase === "committed" &&
       this.state.laterSessionOnCommittedReplay
         ? laterAuthoritySession(this.state)
         : authoritySession(this.state, operationPhase, revision);
@@ -730,6 +764,7 @@ function fixture(overrides = {}) {
     finalizeMode: "success",
     guardFailureProbe: 0,
     laterSessionOnCommittedReplay: false,
+    maximumHistoricalReadSession: false,
     mismatchedHistoricalSessionIdentity: false,
     readAttemptForgery: null,
     readAttemptGate: Promise.resolve(),
@@ -738,6 +773,8 @@ function fixture(overrides = {}) {
     reconcilePhase: "prepared",
     reserveCalls: 0,
     reserveMode: "fresh",
+    staleHistoricalFinalizeSession: false,
+    staleHistoricalReadSession: false,
     trace: [],
     uncertainCalls: 0,
     ...overrides,
@@ -1353,6 +1390,79 @@ test("committed reconciliation tolerates later current session state", async () 
     value.state.finalizeInputs[0].expectedOperationRevision,
     "2",
   );
+});
+
+test("committed reconciliation rejects a session restored before capture commit", async () => {
+  const value = fixture({
+    attemptPhase: "committed",
+    committedRevision: "3",
+    staleHistoricalReadSession: true,
+  });
+  let verifierCalls = 0;
+
+  await assertAuthorityError(
+    value.adapter.runCaptureReconciliation(
+      reconciliationAdmission(),
+      async () => {
+        verifierCalls += 1;
+        return completion(value.state, true);
+      },
+    ),
+    "postgres_checkpoint_mutation_authority_outcome_uncertain",
+  );
+
+  assert.equal(verifierCalls, 0);
+  assert.equal(value.artifactPlannerCalls, 0);
+  assert.equal(value.state.finalizeInputs.length, 0);
+});
+
+test("committed reconciliation rejects a terminal revision beyond PostgreSQL bigint", async () => {
+  const value = fixture({
+    attemptPhase: "committed",
+    committedRevision: "2",
+    expectedSession: nearRevisionExhaustionSession(),
+    maximumHistoricalReadSession: true,
+  });
+  let verifierCalls = 0;
+
+  await assertAuthorityError(
+    value.adapter.runCaptureReconciliation(
+      reconciliationAdmission(),
+      async () => {
+        verifierCalls += 1;
+        return completion(value.state, true);
+      },
+    ),
+    "postgres_checkpoint_mutation_authority_outcome_uncertain",
+  );
+
+  assert.equal(verifierCalls, 0);
+  assert.equal(value.artifactPlannerCalls, 0);
+  assert.equal(value.state.finalizeInputs.length, 0);
+});
+
+test("committed replay rejects a stale session finalization receipt", async () => {
+  const value = fixture({
+    attemptPhase: "committed",
+    committedRevision: "3",
+    staleHistoricalFinalizeSession: true,
+  });
+  let verifierCalls = 0;
+
+  await assertAuthorityError(
+    value.adapter.runCaptureReconciliation(
+      reconciliationAdmission(),
+      async () => {
+        verifierCalls += 1;
+        return completion(value.state, true);
+      },
+    ),
+    "postgres_checkpoint_mutation_authority_outcome_uncertain",
+  );
+
+  assert.equal(verifierCalls, 1);
+  assert.equal(value.artifactPlannerCalls, 1);
+  assert.equal(value.state.finalizeInputs.length, 1);
 });
 
 test("committed reconciliation uses the captured BigInt string conversion intrinsic", async () => {

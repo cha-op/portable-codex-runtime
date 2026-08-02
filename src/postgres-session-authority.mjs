@@ -4893,6 +4893,18 @@ async function readRequestedOperation(
     });
   }
   validateOperationIdentity(operation, input);
+  if (current === null && operation.state === "committed") {
+    const terminalSessionRevision = revisionAfter(
+      operation.expectedSession.revision,
+      BigIntConstructor(operation.revision) + 1n,
+      "operation_state_invalid",
+    );
+    ensure(
+      BigIntConstructor(session.revision) >=
+        BigIntConstructor(terminalSessionRevision),
+      "operation_state_invalid",
+    );
+  }
   const reservation =
     current === null
       ? await readReservationSnapshot(

@@ -7059,6 +7059,71 @@ test("checkpoint capture tombstones are non-authorizing read evidence", async ()
   clients[0].assertExhausted();
 });
 
+test("historical checkpoint reads reject a session restored before commit", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(committedOperation),
+    rows(fixture.writer.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCaptureAttempt({
+      checkpoint: fixture.checkpoint,
+      request: fixture.mutationRequest,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical checkpoint catalogue rejects a session restored before commit", async () => {
+  const fixture = checkpointCaptureFixture();
+  const committedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "committed",
+  );
+  const { authority, clients } = authorityWithScripts([
+    rows(checkpointCatalogueRow(fixture)),
+    rows(checkpointCaptureAttemptRow(fixture)),
+    rows(committedOperation),
+    rows(fixture.writer.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(committedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.readCheckpointCatalogue({
+      checkpoint: fixture.checkpoint,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
 test("checkpoint catalogue digest tampering fails strict relational readback", async () => {
   const fixture = checkpointCaptureFixture();
   const tamperedDocument = checkpointCatalogueDocument(fixture);

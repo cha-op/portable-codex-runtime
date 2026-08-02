@@ -58,6 +58,11 @@ superseded_by:
   source, writer, lease, attachment, clock, or stopped-writer capability.
   `prepared` and `materialized` publication never become success through this
   path.
+- Historical committed-operation reads require the current session revision
+  to be no earlier than the operation's terminal revision
+  (`expectedSession.revision + operation.revision + 1`). A same-identity
+  session row restored from before the checkpoint commit cannot authorize the
+  newer attempt or catalogue.
 - Production retains capture claims permanently. Any retained tombstone is
   non-authorizing and rejects reuse even if matching historical bytes,
   operation fields, or checkpoint metadata reappear from a session-volume

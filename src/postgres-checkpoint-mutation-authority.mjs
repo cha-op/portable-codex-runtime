@@ -68,6 +68,7 @@ const NATIVE_FUNCTION_SOURCE_PATTERN =
   /\{\s*\[\s*native\s+code\s*\]\s*\}\s*$/u;
 const NUL_PATTERN = /\0/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const MAX_POSTGRES_BIGINT = 9_223_372_036_854_775_807n;
 const PERSISTENT_OBJECT_ID_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -806,11 +807,14 @@ function revisionNumber(value, code) {
       regexpTest(/^(?:0|[1-9][0-9]{0,18})$/u, value),
     code,
   );
+  let revision;
   try {
-    return BigIntConstructor(value);
+    revision = BigIntConstructor(value);
   } catch {
     fail(code);
   }
+  ensure(revision <= MAX_POSTGRES_BIGINT, code);
+  return revision;
 }
 
 function assertSourceBackedFunction(
@@ -1685,12 +1689,18 @@ function validateHistoricalSessionIdentity(
     session.updatedAt,
     code,
   );
-  revisionNumber(session.revision, code);
+  const sessionRevision = revisionNumber(session.revision, code);
+  const terminalSessionRevision =
+    revisionNumber(expected.revision, code) +
+    revisionNumber(operation.revision, code) +
+    1n;
   ensure(
     session.sessionId === operation.sessionId &&
       session.sessionId === expected.sessionId &&
       session.createdAt === expected.createdAt &&
-      updatedAt >= createdAt,
+      updatedAt >= createdAt &&
+      terminalSessionRevision <= MAX_POSTGRES_BIGINT &&
+      sessionRevision >= terminalSessionRevision,
     code,
   );
   for (
