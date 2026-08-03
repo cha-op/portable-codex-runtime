@@ -3742,8 +3742,9 @@ test(
         assert.deepEqual(firstPage, {
           candidates: [
             {
-              checkpoint: startingAdmission.checkpoint,
-              request: startingAdmission.request,
+              checkpoint:
+                startingInput.request.admission.checkpoint,
+              request: startingInput.request.admission.request,
             },
           ],
           nextAfterSessionId: orderedSessionIds[0],
@@ -3751,6 +3752,13 @@ test(
         assert.equal(Object.isFrozen(firstPage), true);
         assert.equal(Object.isFrozen(firstPage.candidates), true);
         assert.equal(Object.isFrozen(firstPage.candidates[0]), true);
+        for (const canonicalValue of [
+          firstPage.candidates[0].checkpoint,
+          firstPage.candidates[0].request,
+          firstPage.candidates[0].request.target,
+        ]) {
+          assert.equal(Object.getPrototypeOf(canonicalValue), null);
+        }
 
         const secondPage =
           await authority.listCheckpointCaptureRecoveryCandidates({
@@ -3760,8 +3768,9 @@ test(
         assert.deepEqual(secondPage, {
           candidates: [
             {
-              checkpoint: uncertainAdmission.checkpoint,
-              request: uncertainAdmission.request,
+              checkpoint:
+                uncertainInput.request.admission.checkpoint,
+              request: uncertainInput.request.admission.request,
             },
           ],
           nextAfterSessionId: null,
