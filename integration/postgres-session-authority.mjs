@@ -131,8 +131,9 @@ async function assertRestoreGenerationConstraints(pool) {
   try {
     const fixtures = [0, 1].map(() => ({
       captureAttemptId: randomUUID(),
+      captureOperationId: `integration-capture-operation-${randomUUID()}`,
       checkpointId: `integration-checkpoint-${randomUUID()}`,
-      operationId: `integration-operation-${randomUUID()}`,
+      restoreOperationId: `integration-restore-operation-${randomUUID()}`,
       sessionId: randomUUID(),
     }));
     await client.query("BEGIN");
@@ -153,10 +154,21 @@ async function assertRestoreGenerationConstraints(pool) {
       await client.query(
         [
           "INSERT INTO session_authority.operation_claims",
-          "(operation_id, session_id, kind, request, state, created_at, updated_at)",
-          "VALUES ($1, $2, 'integration', $3::jsonb, 'active', $4, $4)",
+          [
+            "(operation_id, session_id, kind, request, result, state,",
+            "created_at, updated_at, retired_at)",
+          ].join(" "),
+          [
+            "VALUES ($1, $2, 'integration-capture', $3::jsonb, $3::jsonb,",
+            "'committed', $4, $4, $4)",
+          ].join(" "),
         ].join(" "),
-        [fixture.operationId, fixture.sessionId, EMPTY_JSON_OBJECT, now],
+        [
+          fixture.captureOperationId,
+          fixture.sessionId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
       );
       await client.query(
         [
@@ -166,7 +178,7 @@ async function assertRestoreGenerationConstraints(pool) {
         ].join(" "),
         [
           fixture.captureAttemptId,
-          fixture.operationId,
+          fixture.captureOperationId,
           fixture.sessionId,
           EMPTY_JSON_OBJECT,
           now,
@@ -186,6 +198,19 @@ async function assertRestoreGenerationConstraints(pool) {
           now,
         ],
       );
+      await client.query(
+        [
+          "INSERT INTO session_authority.operation_claims",
+          "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+          "VALUES ($1, $2, 'integration-restore', $3::jsonb, 'active', $4, $4)",
+        ].join(" "),
+        [
+          fixture.restoreOperationId,
+          fixture.sessionId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      );
     }
     const [first, second] = fixtures;
     await client.query("SAVEPOINT state_payload_check");
@@ -201,7 +226,7 @@ async function assertRestoreGenerationConstraints(pool) {
         ].join(" "),
         [
           `integration-generation-${randomUUID()}`,
-          first.operationId,
+          first.restoreOperationId,
           first.sessionId,
           first.checkpointId,
           EMPTY_JSON_OBJECT,
@@ -233,7 +258,7 @@ async function assertRestoreGenerationConstraints(pool) {
         ].join(" "),
         [
           `integration-generation-${randomUUID()}`,
-          second.operationId,
+          second.restoreOperationId,
           first.sessionId,
           first.checkpointId,
           EMPTY_JSON_OBJECT,
@@ -265,7 +290,7 @@ async function assertRestoreGenerationConstraints(pool) {
         ].join(" "),
         [
           `integration-generation-${randomUUID()}`,
-          first.operationId,
+          first.restoreOperationId,
           first.sessionId,
           second.checkpointId,
           EMPTY_JSON_OBJECT,
@@ -283,6 +308,205 @@ async function assertRestoreGenerationConstraints(pool) {
     );
     await client.query("ROLLBACK TO SAVEPOINT checkpoint_session_check");
     await client.query("RELEASE SAVEPOINT checkpoint_session_check");
+
+    const generationId = `integration-generation-${randomUUID()}`;
+    await client.query(
+      [
+        "INSERT INTO session_authority.restore_destination_generations",
+        [
+          "(generation_id, operation_id, session_id, checkpoint_id, state,",
+          "binding, document, claimed_at, committed_at)",
+        ].join(" "),
+        "VALUES ($1, $2, $3, $4, 'authorized', $5::jsonb, NULL, $6, NULL)",
+      ].join(" "),
+      [
+        generationId,
+        first.restoreOperationId,
+        first.sessionId,
+        first.checkpointId,
+        EMPTY_JSON_OBJECT,
+        now,
+      ],
+    );
+    const authorized = await client.query(
+      [
+        "SELECT generation_id, operation_id, session_id, checkpoint_id,",
+        "state, binding, document, claimed_at, committed_at",
+        "FROM session_authority.restore_destination_generations",
+        "WHERE generation_id = $1",
+      ].join(" "),
+      [generationId],
+    );
+    assert.equal(authorized.rowCount, 1);
+    assert.deepEqual(authorized.rows[0], {
+      generation_id: generationId,
+      operation_id: first.restoreOperationId,
+      session_id: first.sessionId,
+      checkpoint_id: first.checkpointId,
+      state: "authorized",
+      binding: {},
+      document: null,
+      claimed_at: now,
+      committed_at: null,
+    });
+
+    await client.query(
+      [
+        "UPDATE session_authority.restore_destination_generations",
+        "SET state = 'committed', document = $2::jsonb, committed_at = $3",
+        "WHERE generation_id = $1",
+      ].join(" "),
+      [generationId, EMPTY_JSON_OBJECT, now],
+    );
+    const committed = await client.query(
+      [
+        "SELECT generation_id, operation_id, session_id, checkpoint_id,",
+        "state, binding, document, claimed_at, committed_at",
+        "FROM session_authority.restore_destination_generations",
+        "WHERE generation_id = $1",
+      ].join(" "),
+      [generationId],
+    );
+    assert.equal(committed.rowCount, 1);
+    assert.deepEqual(committed.rows[0], {
+      generation_id: generationId,
+      operation_id: first.restoreOperationId,
+      session_id: first.sessionId,
+      checkpoint_id: first.checkpointId,
+      state: "committed",
+      binding: {},
+      document: {},
+      claimed_at: now,
+      committed_at: now,
+    });
+
+    await client.query("SAVEPOINT committed_at_order_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          [
+            "VALUES ($1, $2, $3, $4, 'committed', $5::jsonb,",
+            "$5::jsonb, $6, $7)",
+          ].join(" "),
+        ].join(" "),
+        [
+          `integration-generation-${randomUUID()}`,
+          second.restoreOperationId,
+          second.sessionId,
+          second.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+          new Date(now.getTime() - 1),
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "restore_destination_generations_committed_at_order",
+        );
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT committed_at_order_check");
+    await client.query("RELEASE SAVEPOINT committed_at_order_check");
+
+    await client.query("SAVEPOINT state_allowed_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          "VALUES ($1, $2, $3, $4, 'invalid', $5::jsonb, NULL, $6, NULL)",
+        ].join(" "),
+        [
+          `integration-generation-${randomUUID()}`,
+          second.restoreOperationId,
+          second.sessionId,
+          second.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "restore_destination_generations_state_allowed",
+        );
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT state_allowed_check");
+    await client.query("RELEASE SAVEPOINT state_allowed_check");
+
+    await client.query("SAVEPOINT identity_length_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          "VALUES ($1, $2, $3, $4, 'authorized', $5::jsonb, NULL, $6, NULL)",
+        ].join(" "),
+        [
+          "g".repeat(129),
+          second.restoreOperationId,
+          second.sessionId,
+          second.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "22001");
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT identity_length_check");
+    await client.query("RELEASE SAVEPOINT identity_length_check");
+
+    await client.query("SAVEPOINT operation_uniqueness_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          "VALUES ($1, $2, $3, $4, 'authorized', $5::jsonb, NULL, $6, NULL)",
+        ].join(" "),
+        [
+          `integration-generation-${randomUUID()}`,
+          first.restoreOperationId,
+          first.sessionId,
+          first.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "23505");
+        assert.equal(
+          error.constraint,
+          "restore_destination_generations_operation_id_key",
+        );
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT operation_uniqueness_check");
+    await client.query("RELEASE SAVEPOINT operation_uniqueness_check");
     await client.query("ROLLBACK");
     transactionOpen = false;
   } finally {
