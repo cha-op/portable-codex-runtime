@@ -7,7 +7,8 @@ The implemented authority provides:
 - a single-client PostgreSQL `SERIALIZABLE` transaction executor;
 - database-authoritative transaction time;
 - bounded, provenance-aware serialization and deadlock retry;
-- a checksum-bound initial authority schema;
+- an ordered, checksum-bound authority migration chain;
+- a permanent relational foundation for restore destination generations;
 - real-PostgreSQL migration and concurrency tests;
 - bounded OCI/Docker runnable-image inspection plus a one-use reservation
   capability;
@@ -27,10 +28,12 @@ before any external dispatch can begin. The typed writer lifecycle turns the
 lease, attachment, detach, and force-fence records in
 `session-storage-contracts.mjs` into serializable decisions for
 `ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, and `DETACHED`.
-The checkpoint slice binds stopped-writer clean capture to the existing
-operation, reservation, capture-attempt, tombstone, and catalogue tables.
-Subsequent authority slices will implement canonical restore-destination
-generations and logical launcher admission.
+The checkpoint slice binds stopped-writer clean capture to the operation,
+reservation, capture-attempt, tombstone, and catalogue tables. The migration
+chain now also installs the permanent relational identities and constraints
+needed by restore destination generations. It does not yet claim or finalize a
+generation. Subsequent authority slices will implement those typed
+transitions, durable launch attempts, and logical launcher composition.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -65,9 +68,12 @@ operation kernel and typed writer lifecycle methods use the executor and
 schema to order reservation, lease allocation, attachment finalization,
 renewal, release, force-fence epoch advancement, and blocked reconciliation.
 The capture authority uses the same ordering boundary for exact attempt
-admission and catalogue finalization. Restore-destination and launcher
-transitions remain later slices. Physical exclusion evidence must be supplied
-by a capable storage backend or supervisor.
+admission and catalogue finalization. The generation relation protects
+historical identity and cross-session linkage, but no generation row is
+authorizing until the later typed authority creates and finalizes it.
+Restore-destination and launcher transitions remain later slices. Physical
+exclusion evidence must be supplied by a capable storage backend or
+supervisor.
 
 ## Implemented Canonical Session Registry
 
@@ -692,7 +698,9 @@ identities rather than session-volume data:
 - capture-attempt IDs and their operation IDs remain claimed by active records
   or permanent tombstones; and
 - checkpoint catalogue entries are finalized only from the exact active
-  capture attempt.
+  capture attempt; and
+- restore destination generation IDs remain independent permanent identities,
+  each bound to one exact operation, session, and same-session checkpoint.
 
 The PostgreSQL schema intentionally stores state-machine documents as `jsonb`
 while keeping identities, revisions, timestamps, and uniqueness constraints in
@@ -709,6 +717,30 @@ non-authorizing reuse fences, and each catalogue row binds one checkpoint to
 one exact attempt and path-free committed completion. The established global
 operation identity and active session-conflict constraints remain the
 admission boundary.
+
+The ordered migration chain treats the installed
+`session_authority.schema_migrations` ledger as an exact contiguous prefix
+starting at version 1. Every installed checksum must match the corresponding
+immutable tracked SQL source. A gap, future version, malformed row, or checksum
+drift fails closed. One advisory-locked transaction applies every missing
+migration in order and records each checksum before the commit boundary.
+
+Migration version 2 adds
+`session_authority.restore_destination_generations`. Its relational columns
+keep `generation_id`, `operation_id`, `session_id`, and `checkpoint_id`
+separate instead of deriving authority from a session revision, writer epoch,
+or mutable session pointer. Composite foreign keys bind the row to the same
+session's permanent operation claim and checkpoint catalogue entry.
+`authorized` rows must have no finalized document or commit timestamp;
+`committed` rows must have both. The authority exposes no deletion or
+retirement API for these rows in this foundation.
+
+These constraints are necessary but not sufficient authority. This slice has
+no API that inserts or updates a generation row, does not change the canonical
+session document, and does not enable restore. The next typed slice must lock
+and validate the exact operation, session, catalogue, generation, destination
+isolation, and restore fence in one serializable transition before any
+publication callback can run.
 
 ## Platform Image Reservation
 
@@ -793,12 +825,13 @@ concrete Podman/Docker adapter must hold directory identity through the bind,
 enforce rootless execution, fix the Codex CLI/config surface, and register the
 exact writer with `StoppedWriterCapabilityCoordinator`.
 
-That slice also owns restore destination generations. Until the authority can
-name one detached destination as a canonical generation, finalize its exact
-restore result, and feed that generation into the same launcher admission
-transaction, the production checkpoint adapter rejects restore. A published
-directory, restore journal record, checkpoint descriptor, or catalogue entry
-alone is never writable-launch authority.
+The schema can now retain restore destination generations, but it exposes no
+typed claim or finalization transition. Until the authority can name one
+detached destination as a canonical generation, finalize its exact restore
+result, and feed that generation into the same launcher admission transaction,
+the production checkpoint adapter rejects restore. A database table row,
+published directory, restore journal record, checkpoint descriptor, or
+catalogue entry alone is never writable-launch authority.
 
 ## Operational Boundary
 
@@ -838,8 +871,9 @@ promote an unfenced session merely because a lease timestamp has passed.
 ## Validation
 
 The foundation unit suite uses deterministic transaction doubles to cover
-database time, query-capability lifetime, provenance-aware retry, migration,
-commit uncertainty, fire-and-forget query rejection, and release failure.
+database time, query-capability lifetime, provenance-aware retry, ordered
+migration application and ledger validation, commit uncertainty,
+fire-and-forget query rejection, and release failure.
 Registry unit tests cover validation, exact replay, identity conflict, strict
 readback, and immutable snapshots. Operation-kernel unit tests cover
 incremental canonical-request byte and structure bounds, exact claim replay,
@@ -860,7 +894,8 @@ rejection, typed ambiguous/unavailable finalization to `BLOCKED`, retained
 tuple/target/epoch state, and explicit `BLOCKED -> FENCING` recovery.
 Image tests cover exact bytes, pre-allocation resource limits, descriptor and
 config identity, measurement drift, and one-use capability semantics. A
-separate GitHub Actions job runs the schema, registration,
+separate GitHub Actions job runs the ordered migration chain,
+restore-generation relational constraints, schema, registration,
 operation/reservation concurrency, active-document downgrade rejection,
 consecutive terminal-anchor replacement and historical replay, terminal-row
 corruption, attachment acquisition and lease renewal, and post-commit dispatch
@@ -873,6 +908,6 @@ single dispatch, publication outside the transaction, advisory-guard
 serialization, atomic catalogue and terminal finalization, acknowledgement
 loss, restart replay, committed-only source-free reconciliation, claim
 revalidation after verification, and relational corruption. Later authority
-slices must add restore-generation and launch transition tests.
+slices must add restore-generation transition and launch transition tests.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

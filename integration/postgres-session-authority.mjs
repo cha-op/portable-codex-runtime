@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { Pool } from "pg";
@@ -28,6 +29,7 @@ import {
 import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
+  SESSION_AUTHORITY_MIGRATION_VERSION,
 } from "../src/postgres-serializable-store.mjs";
 import { createSessionManifest } from "../src/session-storage-contracts.mjs";
 
@@ -40,11 +42,253 @@ const SESSION_AUTHORITY_APPLICATION_NAME =
 const databaseUrl = process.env.SESSION_AUTHORITY_DATABASE_URL;
 const databaseConfigured =
   typeof databaseUrl === "string" && databaseUrl.length > 0;
+const AUTHORITY_MIGRATIONS = Object.freeze([
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/001-session-authority.sql",
+      import.meta.url,
+    ),
+    version: 1,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/002-restore-destination-generations.sql",
+      import.meta.url,
+    ),
+    version: 2,
+  }),
+]);
 
 if (!databaseConfigured) {
   throw new Error(
     "SESSION_AUTHORITY_DATABASE_URL is required for the PostgreSQL integration gate",
   );
+}
+
+async function readTrackedAuthorityMigrations() {
+  return Promise.all(
+    AUTHORITY_MIGRATIONS.map(async ({ url, version }) => {
+      const sql = await readFile(url, "utf8");
+      assert.notEqual(sql.length, 0);
+      assert.equal(sql.endsWith("\n"), true);
+      return {
+        checksum: createHash("sha256").update(sql, "utf8").digest("hex"),
+        sql,
+        version,
+      };
+    }),
+  );
+}
+
+async function readMigrationLedger(pool) {
+  const result = await pool.query(
+    [
+      "SELECT version, checksum",
+      "FROM session_authority.schema_migrations",
+      "ORDER BY version",
+    ].join(" "),
+  );
+  return result.rows;
+}
+
+async function installVersionOneAuthority(pool, migration) {
+  assert.equal(migration.version, 1);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL search_path = pg_catalog");
+    await client.query("CREATE SCHEMA session_authority");
+    await client.query(
+      [
+        "CREATE TABLE session_authority.schema_migrations (",
+        "version integer PRIMARY KEY CHECK (version > 0),",
+        "checksum character(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),",
+        "applied_at timestamp with time zone NOT NULL",
+        ")",
+      ].join(" "),
+    );
+    await client.query(migration.sql);
+    await client.query(
+      [
+        "INSERT INTO session_authority.schema_migrations",
+        "(version, checksum, applied_at)",
+        "VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      ].join(" "),
+      [migration.version, migration.checksum],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function assertRestoreGenerationConstraints(pool) {
+  const client = await pool.connect();
+  let transactionOpen = false;
+  try {
+    const fixtures = [0, 1].map(() => ({
+      captureAttemptId: randomUUID(),
+      checkpointId: `integration-checkpoint-${randomUUID()}`,
+      operationId: `integration-operation-${randomUUID()}`,
+      sessionId: randomUUID(),
+    }));
+    await client.query("BEGIN");
+    transactionOpen = true;
+    const timestamp = await client.query(
+      "SELECT pg_catalog.transaction_timestamp() AS value",
+    );
+    const now = timestamp.rows[0].value;
+    for (const fixture of fixtures) {
+      await client.query(
+        [
+          "INSERT INTO session_authority.sessions",
+          "(session_id, document, created_at, updated_at)",
+          "VALUES ($1, $2::jsonb, $3, $3)",
+        ].join(" "),
+        [fixture.sessionId, EMPTY_JSON_OBJECT, now],
+      );
+      await client.query(
+        [
+          "INSERT INTO session_authority.operation_claims",
+          "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+          "VALUES ($1, $2, 'integration', $3::jsonb, 'active', $4, $4)",
+        ].join(" "),
+        [fixture.operationId, fixture.sessionId, EMPTY_JSON_OBJECT, now],
+      );
+      await client.query(
+        [
+          "INSERT INTO session_authority.capture_attempt_claims",
+          "(capture_attempt_id, operation_id, session_id, binding, claimed_at)",
+          "VALUES ($1, $2, $3, $4::jsonb, $5)",
+        ].join(" "),
+        [
+          fixture.captureAttemptId,
+          fixture.operationId,
+          fixture.sessionId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      );
+      await client.query(
+        [
+          "INSERT INTO session_authority.checkpoint_catalogue",
+          "(checkpoint_id, session_id, capture_attempt_id, document, committed_at)",
+          "VALUES ($1, $2, $3, $4::jsonb, $5)",
+        ].join(" "),
+        [
+          fixture.checkpointId,
+          fixture.sessionId,
+          fixture.captureAttemptId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      );
+    }
+    const [first, second] = fixtures;
+    await client.query("SAVEPOINT state_payload_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          "VALUES ($1, $2, $3, $4, 'authorized', $5::jsonb, $5::jsonb, $6, NULL)",
+        ].join(" "),
+        [
+          `integration-generation-${randomUUID()}`,
+          first.operationId,
+          first.sessionId,
+          first.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "restore_destination_generations_state_payload_pair",
+        );
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT state_payload_check");
+    await client.query("RELEASE SAVEPOINT state_payload_check");
+
+    await client.query("SAVEPOINT operation_session_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          "VALUES ($1, $2, $3, $4, 'authorized', $5::jsonb, NULL, $6, NULL)",
+        ].join(" "),
+        [
+          `integration-generation-${randomUUID()}`,
+          second.operationId,
+          first.sessionId,
+          first.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "23503");
+        assert.equal(
+          error.constraint,
+          "restore_destination_generations_operation_session_fk",
+        );
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT operation_session_check");
+    await client.query("RELEASE SAVEPOINT operation_session_check");
+
+    await client.query("SAVEPOINT checkpoint_session_check");
+    await assert.rejects(
+      client.query(
+        [
+          "INSERT INTO session_authority.restore_destination_generations",
+          [
+            "(generation_id, operation_id, session_id, checkpoint_id, state,",
+            "binding, document, claimed_at, committed_at)",
+          ].join(" "),
+          "VALUES ($1, $2, $3, $4, 'authorized', $5::jsonb, NULL, $6, NULL)",
+        ].join(" "),
+        [
+          `integration-generation-${randomUUID()}`,
+          first.operationId,
+          first.sessionId,
+          second.checkpointId,
+          EMPTY_JSON_OBJECT,
+          now,
+        ],
+      ),
+      (error) => {
+        assert.equal(error.code, "23503");
+        assert.equal(
+          error.constraint,
+          "restore_destination_generations_checkpoint_session_fk",
+        );
+        return true;
+      },
+    );
+    await client.query("ROLLBACK TO SAVEPOINT checkpoint_session_check");
+    await client.query("RELEASE SAVEPOINT checkpoint_session_check");
+    await client.query("ROLLBACK");
+    transactionOpen = false;
+  } finally {
+    if (transactionOpen) await client.query("ROLLBACK");
+    client.release();
+  }
 }
 
 function registrationInput(
@@ -736,12 +980,63 @@ test(
       dedicatedPool: resetPool,
     });
 
-    const firstMigration = await store.migrate();
-    assert.equal(firstMigration.version, 1);
-    assert.equal(firstMigration.checksum.length, 64);
-    const secondMigration = await store.migrate();
-    assert.equal(secondMigration.applied, false);
-    assert.equal(secondMigration.checksum, firstMigration.checksum);
+    const trackedMigrations = await readTrackedAuthorityMigrations();
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 2);
+    assert.deepEqual(
+      trackedMigrations.map(({ version }) => version),
+      [1, 2],
+    );
+
+    await pool.query(
+      "DROP SCHEMA IF EXISTS session_authority CASCADE",
+    );
+    const freshMigration = await store.migrate();
+    assert.deepEqual(freshMigration, {
+      applied: true,
+      checksum: trackedMigrations[1].checksum,
+      version: 2,
+    });
+    assert.deepEqual(
+      await readMigrationLedger(pool),
+      trackedMigrations.map(({ checksum, version }) => ({
+        checksum,
+        version,
+      })),
+    );
+    const freshNoOpMigration = await store.migrate();
+    assert.deepEqual(freshNoOpMigration, {
+      applied: false,
+      checksum: trackedMigrations[1].checksum,
+      version: 2,
+    });
+
+    await pool.query("DROP SCHEMA session_authority CASCADE");
+    await installVersionOneAuthority(pool, trackedMigrations[0]);
+    assert.deepEqual(await readMigrationLedger(pool), [
+      {
+        checksum: trackedMigrations[0].checksum,
+        version: 1,
+      },
+    ]);
+    const upgradeMigration = await store.migrate();
+    assert.deepEqual(upgradeMigration, {
+      applied: true,
+      checksum: trackedMigrations[1].checksum,
+      version: 2,
+    });
+    assert.deepEqual(
+      await readMigrationLedger(pool),
+      trackedMigrations.map(({ checksum, version }) => ({
+        checksum,
+        version,
+      })),
+    );
+    assert.deepEqual(await store.migrate(), {
+      applied: false,
+      checksum: trackedMigrations[1].checksum,
+      version: 2,
+    });
+    await assertRestoreGenerationConstraints(pool);
 
     const baselineWorkMem = await resetStore.runSerializable(
       async (transaction) => {
@@ -850,6 +1145,7 @@ test(
           "to_regclass('session_authority.capture_attempt_claims')::text AS attempts,",
           "to_regclass('session_authority.capture_attempt_tombstones')::text AS tombstones,",
           "to_regclass('session_authority.checkpoint_catalogue')::text AS catalogue,",
+          "to_regclass('session_authority.restore_destination_generations')::text AS generations,",
           "to_regclass('session_authority.reservations')::text AS reservations",
         ].join(" "),
       );
@@ -862,6 +1158,8 @@ test(
     assert.deepEqual(schema, {
       attempts: "session_authority.capture_attempt_claims",
       catalogue: "session_authority.checkpoint_catalogue",
+      generations:
+        "session_authority.restore_destination_generations",
       operations: "session_authority.operation_claims",
       reservations: "session_authority.reservations",
       sessions: "session_authority.sessions",

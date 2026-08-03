@@ -121,6 +121,13 @@
   admits only one batch at a time, while overlapping valid invocations fail
   closed before enumeration. Guard-busy or unverifiable attempts remain
   durable blockers and `starting` may safely become `uncertain`.
+- The PostgreSQL authority now applies an ordered, checksum-bound migration
+  chain whose installed ledger must be an exact contiguous prefix. Migration
+  version 2 adds a permanent `restore_destination_generations` relation with
+  independent generation and operation identities, same-session operation and
+  checkpoint foreign keys, and exact authorized/committed row-shape
+  constraints. This schema foundation exposes no generation mutation API,
+  changes no session document, and does not enable restore.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   until canonical destination-generation authority and logical launcher
   admission are implemented; no published restore path is writer-launch
@@ -169,6 +176,8 @@
   `docs/project_journal/2026/07/2026-07-31-checkpoint-mutation-authority-c3a8f2.md`
 - Bounded checkpoint recovery service:
   `docs/project_journal/2026/08/2026-08-02-checkpoint-recovery-service-7d2c4a.md`
+- Restore-generation schema foundation:
+  `docs/project_journal/2026/08/2026-08-03-restore-generation-schema-c0a7f4.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

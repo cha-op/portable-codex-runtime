@@ -84,9 +84,12 @@ backend interface, NFS/image constraints, and Codex source basis.
 ## Session Authority Foundation
 
 The control-plane foundation supplies a single-client PostgreSQL
-`SERIALIZABLE` transaction executor, a checksum-bound initial schema for
-canonical sessions, operation and reservation claims, capture tombstones, and
-the checkpoint catalogue, plus real-PostgreSQL concurrency coverage. The
+`SERIALIZABLE` transaction executor and an ordered, checksum-bound migration
+chain for canonical sessions, operation and reservation claims, capture
+tombstones, the checkpoint catalogue, and restore-generation identities, plus
+real-PostgreSQL concurrency coverage. The installed migration ledger must be
+an exact contiguous prefix; gaps, future rows, malformed rows, or checksum
+drift fail closed. The
 canonical registry and durable operation kernel now bind immutable session
 identity, one exact session-wide mutation reservation, a single definite
 dispatch claim, retained uncertainty, and safe pre-dispatch cancellation. A
@@ -109,17 +112,17 @@ Unit and real-PostgreSQL coverage exercise exact replay, expiry, ambiguity,
 manual-backend rejection, epoch retention, and explicit
 `BLOCKED -> FENCING` recovery.
 
-Production clean-capture authority reuses the version 1 schema without DDL.
-It binds one exact session-wide operation and reservation to one globally
-unique capture-attempt claim, holds a per-operation PostgreSQL session
-advisory guard while local publication runs outside database transactions,
-and atomically finalizes the matching checkpoint catalogue entry, operation,
-reservation, and terminal anchor. Attempt and operation claims are retained
-permanently; a pre-existing tombstone is non-authorizing and always rejects
-reuse. A source-free reconciliation path may verify only the exact already
-committed journal record and artefact for that durable attempt, including
-after lease expiry or fence turnover. It cannot consume another stopped-writer
-capability or advance `prepared` or `materialized` publication.
+Production clean-capture authority adds no capture-specific DDL. It binds one
+exact session-wide operation and reservation to one globally unique
+capture-attempt claim, holds a per-operation PostgreSQL session advisory guard
+while local publication runs outside database transactions, and atomically
+finalizes the matching checkpoint catalogue entry, operation, reservation,
+and terminal anchor. Attempt and operation claims are retained permanently; a
+pre-existing tombstone is non-authorizing and always rejects reuse. A
+source-free reconciliation path may verify only the exact already committed
+journal record and artefact for that durable attempt, including after lease
+expiry or fence turnover. It cannot consume another stopped-writer capability
+or advance `prepared` or `materialized` publication.
 
 `PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()` adds a
 bounded read-only recovery page over retained `starting` or `uncertain`
@@ -146,10 +149,14 @@ committed verifier has no cooperative cancellation seam, so deployment still
 needs statement and request deadlines.
 
 This production adapter is capture-only. Restore admission fails closed until
-a later slice defines the canonical detached destination generation and binds
-it to logical launcher admission. Production crash-consistent ext4 or
-filesystem-image backend execution and launcher admission remain later slices;
-neither a database lease nor a higher epoch is a physical writer fence.
+a later slice adds typed transitions for the canonical detached destination
+generation and binds a finalized generation to logical launcher admission.
+Migration version 2 only provides its permanent relational identity,
+same-session foreign keys, and authorized/committed row-shape constraints; it
+does not expose a generation mutation API or authorize restore. Production
+crash-consistent ext4 or filesystem-image backend execution and launcher
+admission remain later slices; neither a database lease nor a higher epoch is
+a physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
