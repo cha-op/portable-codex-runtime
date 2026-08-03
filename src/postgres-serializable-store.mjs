@@ -5,14 +5,10 @@ import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 1;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 2;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
-const MIGRATION_URL = new URL(
-  "../migrations/authority/001-session-authority.sql",
-  import.meta.url,
-);
 const MIGRATION_LOCK_KEY = "7275632827684484689";
 const MIGRATION_SEARCH_PATH_QUERY =
   "SET LOCAL search_path = pg_catalog";
@@ -86,6 +82,22 @@ const protocolEmitDescriptor = objectFreeze({
   value: eventEmitterEmitIntrinsic,
   writable: false,
 });
+const MIGRATION_SOURCES = objectFreeze([
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/001-session-authority.sql",
+      import.meta.url,
+    ),
+    version: 1,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/002-restore-destination-generations.sql",
+      import.meta.url,
+    ),
+    version: 2,
+  }),
+]);
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
@@ -1121,18 +1133,29 @@ function createTransactionCapability(
   });
 }
 
-async function readMigration() {
-  let sql;
-  try {
-    sql = await protectPromise(readFile(MIGRATION_URL, "utf8"));
-  } catch {
-    throw storeError("migration_source_failed");
+async function readMigrations() {
+  const migrations = [];
+  for (let index = 0; index < MIGRATION_SOURCES.length; index += 1) {
+    const source = MIGRATION_SOURCES[index];
+    let sql;
+    try {
+      sql = await protectPromise(readFile(source.url, "utf8"));
+    } catch {
+      throw storeError("migration_source_failed");
+    }
+    if (sql.length === 0 || !stringEndsWith(sql, "\n")) {
+      throw storeError("migration_source_failed");
+    }
+    arrayPush(
+      migrations,
+      objectFreeze({
+        checksum: sha256Hex(sql, "utf8"),
+        sql,
+        version: source.version,
+      }),
+    );
   }
-  if (sql.length === 0 || !stringEndsWith(sql, "\n")) {
-    throw storeError("migration_source_failed");
-  }
-  const checksum = sha256Hex(sql, "utf8");
-  return objectFreeze({ checksum, sql });
+  return objectFreeze(migrations);
 }
 
 /**
@@ -1154,7 +1177,8 @@ export class PostgresSerializableStore {
   }
 
   async migrate() {
-    const migration = await protectPromise(readMigration());
+    const migrations = await protectPromise(readMigrations());
+    const latestMigration = migrations[migrations.length - 1];
     const { client, release } = await protectPromise(
       acquireCleanClient(this.#dedicatedPool),
     );
@@ -1229,13 +1253,32 @@ export class PostgresSerializableStore {
       ) {
         throw migrationError("migration_state_invalid");
       }
-      if (currentLength !== 0) {
-        const currentRow = ownDataValue(currentRows, "0");
+      if (currentLength > migrations.length) {
+        throw migrationError("migration_state_invalid");
+      }
+      for (let index = 0; index < currentLength; index += 1) {
+        const currentRow = ownDataValue(currentRows, StringConstructor(index));
+        const currentKeys =
+          currentRow !== null &&
+          typeof currentRow === "object" &&
+          !arrayIsArray(currentRow) &&
+          !isProxy(currentRow)
+            ? reflectOwnKeys(currentRow)
+            : undefined;
+        if (
+          !arrayIsArray(currentKeys) ||
+          currentKeys.length !== 2 ||
+          !arrayIncludes(currentKeys, "version") ||
+          !arrayIncludes(currentKeys, "checksum")
+        ) {
+          throw migrationError("migration_state_invalid");
+        }
         const currentVersion = ownDataValue(currentRow, "version");
         const currentChecksum = ownDataValue(currentRow, "checksum");
+        const migration = migrations[index];
         if (
-          currentLength !== 1 ||
-          currentVersion !== SESSION_AUTHORITY_MIGRATION_VERSION ||
+          currentVersion !== index + 1 ||
+          currentVersion !== migration.version ||
           typeof currentChecksum !== "string"
         ) {
           throw migrationError("migration_state_invalid");
@@ -1243,7 +1286,13 @@ export class PostgresSerializableStore {
         if (currentChecksum !== migration.checksum) {
           throw migrationError("migration_checksum_mismatch");
         }
-      } else {
+      }
+      for (
+        let index = currentLength;
+        index < migrations.length;
+        index += 1
+      ) {
+        const migration = migrations[index];
         await protectPromise(clientQuery(client, migration.sql));
         await protectPromise(
           clientQuery(
@@ -1256,7 +1305,7 @@ export class PostgresSerializableStore {
               ],
               " ",
             ),
-            [SESSION_AUTHORITY_MIGRATION_VERSION, migration.checksum],
+            [migration.version, migration.checksum],
           ),
         );
         applied = true;
@@ -1308,7 +1357,7 @@ export class PostgresSerializableStore {
     );
     return objectFreeze({
       applied,
-      checksum: migration.checksum,
+      checksum: latestMigration.checksum,
       version: SESSION_AUTHORITY_MIGRATION_VERSION,
     });
   }

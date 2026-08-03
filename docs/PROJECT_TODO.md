@@ -45,10 +45,19 @@
   Recover the exact checkpoint and mutation request only from durable
   operation state, use stable artefact-root resolver configuration, and leave
   unverifiable or guard-busy attempts durably blocked for later retry.
-- [pending] Implement canonical restore destination generations plus logical
-  launcher admission and the durable launch-attempt lifecycle around the
-  measured-image reservation; keep production restore fail-closed until both
-  authorities are composed.
+- [done] Add the ordered checksum-bound PostgreSQL migration chain and the
+  permanent relational schema foundation for canonical restore destination
+  generations.
+- [pending] Implement typed canonical restore destination generation claim,
+  dispatch, finalization, exact replay, and recovery authority while keeping
+  production restore fail-closed.
+- [pending] Implement the durable launch-attempt lifecycle around exact
+  generation, lease, attachment, fencing, measured-image, process, writer, and
+  supervisor bindings without invoking a launcher inside that slice.
+- [pending] Compose logical launcher admission from the typed generation,
+  one-use measured-image capability, durable launch attempt, external launcher,
+  and exact writer registration; enable production restore only after the
+  complete composition is fail-closed under ambiguous outcomes.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

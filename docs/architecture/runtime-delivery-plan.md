@@ -74,7 +74,7 @@ plane.
       runnable-image reservation without claiming writer lifecycle or
       container launch.
 
-The sequence through PR #14 plus the first five follow-on slices is complete.
+The sequence through PR #14 plus the first six follow-on slices is complete.
 The six-item follow-on sequence does not preallocate GitHub PR numbers:
 
 1. **Canonical session registry (complete)**
@@ -126,13 +126,44 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
    - Keep the production adapter capture-only. Restore fails closed until a
      later slice binds one canonical detached destination generation to
      launcher admission.
-6. **Logical launcher and restore-destination admission**
-   - Reserve an exact launch attempt, consume the measured-image capability,
-     and retain ambiguous starts until the old writer boundary is proved
-     stopped.
-   - Define the canonical detached destination generation that can authorize a
-     restore, then make the successfully finalized generation an explicit
-     input to launcher admission.
+6. **Bounded checkpoint recovery service (complete)**
+   - Enumerate only retained `starting` or `uncertain` capture operations in
+     bounded `session_id` keyset pages, reconstruct their exact durable
+     admissions, and invoke only committed, source-free reconciliation.
+   - Process one page sequentially, advance the cursor only after each item
+     settles, drain in-flight work on abort, and leave guard-busy or
+     unverifiable operations durably blocked for a later pass.
+
+Restore and launcher authority are now split into four serial pull requests:
+
+1. **Restore-generation schema foundation (complete)**
+   - Replace the single hard-coded migration with one ordered,
+     checksum-bound migration chain whose installed ledger must be an exact
+     contiguous prefix.
+   - Add a permanent `restore_destination_generations` relation with separate
+     generation and operation identities, cross-session-safe foreign keys, and
+     fail-closed authorized/committed row shapes.
+   - Do not claim, finalize, or authorize a generation in this slice.
+2. **Typed restore-generation authority**
+   - Claim one canonical destination generation from an exact committed
+     checkpoint, bind the restore fence and isolated destination, and finalize
+     the predetermined restore result through typed PostgreSQL transitions.
+   - Keep publication outside transactions and keep production restore
+     fail-closed until launcher composition is complete.
+3. **Durable launch-attempt lifecycle**
+   - Reserve and claim one exact launch attempt, persist every
+     `starting` or `uncertain` blocker, and accept only exact supervisor
+     evidence when finalizing a started or stopped attempt.
+   - Bind the finalized destination generation, session attachment, lease,
+     epoch, image measurement, process incarnation, and writer incarnation
+     without invoking a launcher in this slice.
+4. **Logical launcher composition and enablement**
+   - Atomically compose finalized generation admission, one-use measured-image
+     consumption, durable launch-attempt dispatch, the external launcher, and
+     exact writer registration.
+   - Enable production restore only after the complete composition preserves
+     the no-second-writer boundary across acknowledgement loss, restart, and
+     ambiguous launcher outcomes.
 
 Later pull requests own an ext4 or filesystem-image backend, differential
 export and content-addressed storage, cross-host migration, and operational
