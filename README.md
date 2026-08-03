@@ -148,15 +148,23 @@ remains durably blocked, and an unresolved `starting` operation may advance to
 committed verifier has no cooperative cancellation seam, so deployment still
 needs statement and request deadlines.
 
-This production adapter is capture-only. Restore admission fails closed until
-a later slice adds typed transitions for the canonical detached destination
-generation and binds a finalized generation to logical launcher admission.
-Migration version 2 only provides its permanent relational identity,
-same-session foreign keys, and authorized/committed row-shape constraints; it
-does not expose a generation mutation API or authorize restore. Production
-crash-consistent ext4 or filesystem-image backend execution and launcher
-admission remain later slices; neither a database lease nor a higher epoch is
-a physical writer fence.
+This production adapter is capture-only. The PostgreSQL authority now exposes
+typed restore-generation reservation, single-dispatch claim, finalisation,
+exact replay, read, and bounded recovery transitions. The durable request
+retains the backend's exact `{checkpoint, request}` admission; the claim binds
+one fresh generation identity and destination-isolation proof identity to the
+complete expected session, committed source catalogue, current destination
+lease, attachment, storage reference, and strictly newer restore fence. That
+proof identity must come from the trusted destination authority in later
+composition; the serialized ID is not self-authenticating.
+`authorized` and `committed` generation rows remain permanent, and a claim
+whose commit acknowledgement is lost never grants a second publication
+dispatch. Publication still runs outside the database transaction, and a
+committed generation is only input to the later logical launcher admission.
+Production restore therefore remains fail-closed. Crash-consistent ext4 or
+filesystem-image backend execution and launcher admission remain later
+slices; neither a database lease nor a higher epoch is a physical writer
+fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -302,9 +310,9 @@ The adapter advertises normal directory attachments, exclusive writers,
 filesystem development and conformance backend, not an NFS, live-volume, or
 automatic failover implementation. The durable authority interface and
 conformance tests define the seam, and the PostgreSQL authority now implements
-the production clean-capture and committed-reconciliation side of it. Restore
-remains fail-closed until destination-generation and launcher authority are
-defined. See
+clean capture, committed reconciliation, and typed destination-generation
+state. Restore remains fail-closed until the generation is bound to durable
+launcher admission and exact writer registration. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

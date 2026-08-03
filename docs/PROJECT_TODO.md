@@ -48,8 +48,8 @@
 - [done] Add the ordered checksum-bound PostgreSQL migration chain and the
   permanent relational schema foundation for canonical restore destination
   generations.
-- [pending] Implement typed canonical restore destination generation claim,
-  dispatch, finalization, exact replay, and recovery authority while keeping
+- [done] Implement typed canonical restore destination generation claim,
+  dispatch, finalisation, exact replay, and recovery authority while keeping
   production restore fail-closed.
 - [pending] Implement the durable launch-attempt lifecycle around exact
   generation, lease, attachment, fencing, measured-image, process, writer, and

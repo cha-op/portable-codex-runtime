@@ -126,12 +126,19 @@
   version 2 adds a permanent `restore_destination_generations` relation with
   independent generation and operation identities, same-session operation and
   checkpoint foreign keys, and exact authorized/committed row-shape
-  constraints. This schema foundation exposes no generation mutation API,
-  changes no session document, and does not enable restore.
+  constraints.
+- Typed restore-generation authority now reserves the exact
+  `{checkpoint, request}` admission, claims one generation and
+  destination-isolation proof under the database-clock lease and restore
+  fence, and atomically finalises the committed generation with its operation,
+  reservation, and session terminal anchor. Claim replay never grants a second
+  dispatch; exact finalisation replay and bounded `starting`/`uncertain`
+  recovery remain available without changing the session document version or
+  schema.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until canonical destination-generation authority and logical launcher
-  admission are implemented; no published restore path is writer-launch
-  authority by itself.
+  until a finalised destination generation is bound to durable logical
+  launcher admission and exact writer registration; no published restore path
+  or generation row is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -178,6 +185,8 @@
   `docs/project_journal/2026/08/2026-08-02-checkpoint-recovery-service-7d2c4a.md`
 - Restore-generation schema foundation:
   `docs/project_journal/2026/08/2026-08-03-restore-generation-schema-c0a7f4.md`
+- Typed restore-generation authority:
+  `docs/project_journal/2026/08/2026-08-04-restore-generation-authority-a4d912.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -190,5 +199,6 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  authority until one canonical detached destination generation can be bound
-  to the later logical launcher admission transaction.
+  authority until the canonical committed destination generation can be bound
+  to the later durable launch-attempt and logical launcher admission
+  transactions.

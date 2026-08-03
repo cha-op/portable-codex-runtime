@@ -735,12 +735,49 @@ session's permanent operation claim and checkpoint catalogue entry.
 `committed` rows must have both. The authority exposes no deletion or
 retirement API for these rows in this foundation.
 
-These constraints are necessary but not sufficient authority. This slice has
-no API that inserts or updates a generation row, does not change the canonical
-session document, and does not enable restore. The next typed slice must lock
-and validate the exact operation, session, catalogue, generation, destination
-isolation, and restore fence in one serializable transition before any
-publication callback can run.
+These constraints are necessary but not sufficient authority. The typed
+restore-generation layer now retains the backend's exact
+`{checkpoint, request}` admission unchanged inside an operation payload that
+also binds the contract version and predetermined result. The permanent
+operation envelope separately retains the complete expected session snapshot,
+including its lease, attachment, storage reference, revision, and terminal
+anchor.
+
+The `prepared -> starting` transition locks and revalidates the session,
+operation, reservation, source checkpoint catalogue, and generation relation
+in one serializable transaction. It requires an `ATTACHED` canonical session,
+an unexpired database-clock lease, an exact destination storage and fence, a
+clean committed source checkpoint, and a restore epoch strictly newer than the
+source epoch. The source checkpoint and destination request name the same
+backend and session but do not infer one another's storage identity.
+
+Fresh `generationId` and `destinationIsolationProofId` values enter only at
+this typed claim boundary. The generation binding retains those identities,
+the exact destination attachment and request, the full source checkpoint,
+capture-operation and attempt identities, and the checkpoint catalogue hash.
+`destinationState: "detached"` describes the isolated physical restore target;
+it does not change the canonical session lifecycle from `ATTACHED`. The proof
+ID is a durable correlation value rather than a self-authenticating
+capability, so later composition must obtain it from the trusted destination
+authority.
+
+Only a definitely committed claim returns `dispatchGranted: true`. A replay
+of `starting`, `uncertain`, or committed state returns the retained generation
+without authorising another publication. Exact finalisation may begin from
+`starting` or `uncertain` and atomically changes the generation to `committed`,
+retires the operation, releases the reservation, and advances the session
+terminal anchor. The committed document binds the source artefact proof, the
+`restore-destination` materialisation, and the predetermined restore result.
+Finalisation replay accepts only the same canonical document.
+
+Bounded recovery enumerates only retained `starting` or `uncertain`
+restore-generation operations whose exact authorised generation and source
+catalogue still validate. The generation relation has no deletion or
+retirement path. These transitions neither invoke publication inside a
+database transaction nor change the canonical session document version.
+Production restore remains disabled until a later durable launch-attempt and
+logical launcher composition consume the committed generation without
+weakening the no-second-writer boundary.
 
 ## Platform Image Reservation
 
