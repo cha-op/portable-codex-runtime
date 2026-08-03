@@ -3848,7 +3848,7 @@ test(
           releaseGuard.resolve();
           await heldGuard;
         }
-        assert.deepEqual(firstBatch, {
+        assert.deepEqual(structuredClone(firstBatch), {
           nextAfterSessionId: null,
           results: [
             {
@@ -3864,8 +3864,13 @@ test(
           ],
           status: "sweep-complete",
         });
+        assert.equal(Object.getPrototypeOf(firstBatch), null);
         assert.equal(Object.isFrozen(firstBatch), true);
         assert.equal(Object.isFrozen(firstBatch.results), true);
+        for (const result of firstBatch.results) {
+          assert.equal(Object.getPrototypeOf(result), null);
+          assert.equal(Object.isFrozen(result), true);
+        }
         assert.deepEqual(attemptedOperationIds, [
           startingAdmission.request.operationId,
           uncertainAdmission.request.operationId,
@@ -3895,7 +3900,7 @@ test(
           limit: 2,
           signal: null,
         });
-        assert.deepEqual(retryBatch, {
+        assert.deepEqual(structuredClone(retryBatch), {
           nextAfterSessionId: null,
           results: [
             {
@@ -3906,6 +3911,13 @@ test(
           ],
           status: "sweep-complete",
         });
+        assert.equal(Object.getPrototypeOf(retryBatch), null);
+        assert.equal(Object.isFrozen(retryBatch), true);
+        assert.equal(Object.isFrozen(retryBatch.results), true);
+        for (const result of retryBatch.results) {
+          assert.equal(Object.getPrototypeOf(result), null);
+          assert.equal(Object.isFrozen(result), true);
+        }
         assert.deepEqual(attemptedOperationIds, [
           startingAdmission.request.operationId,
         ]);
