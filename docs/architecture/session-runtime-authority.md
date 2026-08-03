@@ -577,6 +577,71 @@ operation, attempt, and catalogue rows remain present. Conversely, a newer
 revision from another session incarnation or identity cannot adopt that
 historical operation's attempt or catalogue.
 
+## Bounded Checkpoint Recovery Enumeration and Service
+
+`PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()` exposes
+one read-only operational page with exact `{afterSessionId, limit}` input. The
+limit is an integer from 1 through 100. Its SQL selects only unretired
+`checkpoint-capture-v1` operations in `starting` or `uncertain`, orders by the
+immutable `session_id`, and requests at most `limit + 1` rows. The extra row
+determines whether the page has a continuation without admitting extra work.
+The existing unique active-operation partial index is already ordered by
+`session_id`, so this slice requires no DDL or migration-runner change.
+
+Enumeration does not trust the selection query as an authorization join. In
+the same `SERIALIZABLE` snapshot it parses each complete canonical operation
+envelope and revalidates the current session active pointer, matching
+reservation, exact capture-attempt binding, tombstone absence, and catalogue
+absence. A missing, malformed, tombstoned, catalogued, or crossed
+relation fails the page closed instead of being hidden by SQL. A successful
+entry is a frozen object containing only the exact durable
+`{checkpoint, request}` reconciliation admission. The enumerator does not
+accept or reconstruct a current session, attachment, lease, source path,
+stopped-writer capability, publication plan, or replacement attempt.
+
+A non-null continuation cursor is the last settled candidate's session ID. It
+is a progress and fairness hint, not an authority token, durable worker claim,
+exactly-once boundary, or cross-page snapshot. Candidate and cursor rows share
+one snapshot, but later pages do not. A concurrent finalizer may turn an
+enumerated candidate into an exact committed replay; a new candidate at or
+behind the cursor waits for the next sweep. When enumeration reaches the end,
+the service returns a null cursor so the next scheduled pass begins at the
+start. This deliberate wrap makes retained work replayable and eventually
+revisits candidates that appeared behind an earlier cursor.
+
+`createPostgresCheckpointRecoveryService()` installs fixed candidate-list and
+committed-reconciliation collaborators for one backend. The backend identity
+and artefact-root resolver must be constructed once from copied, frozen startup
+configuration; the same backend ID cannot silently resolve to a different root
+between passes. `runBatch({afterSessionId, limit, signal})` reads one page and
+processes candidates sequentially with concurrency one. The service also admits
+at most one batch invocation at a time; an overlapping valid invocation fails
+closed before candidate enumeration or reconciliation and can retry after the
+in-flight batch drains. Each settled candidate produces an operation/session
+receipt with status `reconciled` or `pending`. The batch returns
+`sweep-complete`, `limit-reached`, or `aborted`, plus the cursor after the last
+settled candidate. A sanitized pending result does not prevent later
+already-admitted page candidates from running.
+
+AbortSignal is an admission boundary rather than physical cancellation. A
+signal already aborted before enumeration admits no work. Once reconciliation
+has begun, a later abort prevents the next candidate from starting but awaits
+the current verifier, authority finalization attempt, and advisory-guard
+release before returning. The service does not use `Promise.race`, detach the
+promise, abandon a guard, or report cancellation while provider work is still
+live.
+
+The page size and sequential batch give a hard count bound of 100 candidate
+attempts. They do not create a worst-case wall-clock bound: the current
+committed verifier has no cooperative cancellation seam, and the active-row
+index may still inspect other active operation kinds before filling a sparse
+checkpoint page. Production therefore retains statement, request, and
+scheduler deadlines outside this module. Guard-busy and physically
+unverifiable attempts report `pending` and preserve their durable operation,
+reservation, and capture claim for another pass. Under the existing exact
+reconciliation path, an unresolved `starting` attempt may durably advance to
+`uncertain`; neither state authorizes a new publisher or mutable-source retry.
+
 ## Canonical Session Lifecycle
 
 The canonical document uses the lifecycle from the storage contract:
@@ -762,11 +827,10 @@ Production deployment requires:
   proved, operators must fence and rekey the affected backend and session
   namespaces before reopening admission;
 - bounded retry and request deadlines at the service boundary; and
-- a bounded recovery enumerator and service loop for retained `starting` or
-  `uncertain` checkpoint operations. It must recover the exact checkpoint and
-  mutation request from durable operation state, use stable artefact-root
-  resolver configuration, and leave guard-busy or unverifiable attempts
-  durably pending rather than reconstructing mutable source state.
+- deployment scheduling for the bounded recovery enumerator and service loop.
+  It must preserve the stable frozen backend and artefact-root configuration,
+  enforce statement/request deadlines, and leave guard-busy or unverifiable
+  attempts durably pending.
 
 PostgreSQL availability is not storage fencing. A database failover must not
 promote an unfenced session merely because a lease timestamp has passed.

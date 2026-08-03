@@ -9,6 +9,9 @@ import {
   createPostgresCheckpointMutationAuthority,
 } from "../src/postgres-checkpoint-mutation-authority.mjs";
 import {
+  createPostgresCheckpointRecoveryService,
+} from "../src/postgres-checkpoint-recovery-service.mjs";
+import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
@@ -3621,6 +3624,325 @@ test(
         assert.equal(replay.finalized, false);
         assert.deepEqual(replay.operation, reconciled.operation);
         assert.deepEqual(replay.session, reconciled.session);
+      },
+    );
+
+    await t.test(
+      "bounded checkpoint recovery paginates durable candidates and retries a busy guard",
+      async () => {
+        const orderedSessionIds = Array.from(
+          { length: 4 },
+          () => randomUUID(),
+        ).sort();
+        sessionIds.push(...orderedSessionIds);
+        const attached = [];
+        for (const sessionId of orderedSessionIds) {
+          const registered = await authority.registerSession(
+            registrationInput(sessionId),
+          );
+          attached.push(
+            await attachWriter(authority, registered, {
+              leaseDurationMilliseconds: 300_000,
+            }),
+          );
+        }
+
+        const startingAdmission = checkpointCaptureAdmission(
+          attached[0],
+        );
+        const preparedAdmission = checkpointCaptureAdmission(
+          attached[1],
+        );
+        const committedAdmission = checkpointCaptureAdmission(
+          attached[2],
+        );
+        const uncertainAdmission = checkpointCaptureAdmission(
+          attached[3],
+        );
+        const startingInput = checkpointOperationInput(
+          attached[0].session,
+          startingAdmission,
+        );
+        const preparedInput = checkpointOperationInput(
+          attached[1].session,
+          preparedAdmission,
+        );
+        const uncertainInput = checkpointOperationInput(
+          attached[3].session,
+          uncertainAdmission,
+        );
+
+        await authority.reserveOperation(startingInput);
+        const starting =
+          await authority.claimCheckpointCaptureDispatch({
+            ...structuredClone(startingInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(starting, "starting");
+
+        const prepared =
+          await authority.reserveOperation(preparedInput);
+        assertOperationReceipt(prepared, "prepared");
+
+        const committedCompletion =
+          await checkpointAuthority.runCapture(
+            committedAdmission,
+            async (context) => checkpointCompletion(context, false),
+          );
+        assert.equal(committedCompletion.replayed, false);
+
+        await authority.reserveOperation(uncertainInput);
+        const uncertainStarting =
+          await authority.claimCheckpointCaptureDispatch({
+            ...structuredClone(uncertainInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(uncertainStarting, "starting");
+        const uncertain = await authority.markOperationUncertain({
+          ...structuredClone(uncertainInput),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(uncertain, "uncertain");
+
+        const durableStates = await pool.query(
+          [
+            "SELECT operation_id, state",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = ANY($1::varchar[])",
+          ].join(" "),
+          [
+            [
+              startingAdmission.request.operationId,
+              preparedAdmission.request.operationId,
+              committedAdmission.request.operationId,
+              uncertainAdmission.request.operationId,
+            ],
+          ],
+        );
+        assert.deepEqual(
+          Object.fromEntries(
+            durableStates.rows.map((row) => [
+              row.operation_id,
+              row.state,
+            ]),
+          ),
+          {
+            [startingAdmission.request.operationId]: "starting",
+            [preparedAdmission.request.operationId]: "prepared",
+            [committedAdmission.request.operationId]: "committed",
+            [uncertainAdmission.request.operationId]: "uncertain",
+          },
+        );
+
+        const firstPage =
+          await authority.listCheckpointCaptureRecoveryCandidates({
+            afterSessionId: null,
+            limit: 1,
+          });
+        assert.deepEqual(firstPage, {
+          candidates: [
+            {
+              checkpoint:
+                startingInput.request.admission.checkpoint,
+              request: startingInput.request.admission.request,
+            },
+          ],
+          nextAfterSessionId: orderedSessionIds[0],
+        });
+        assert.equal(Object.isFrozen(firstPage), true);
+        assert.equal(Object.isFrozen(firstPage.candidates), true);
+        assert.equal(Object.isFrozen(firstPage.candidates[0]), true);
+        for (const canonicalValue of [
+          firstPage.candidates[0].checkpoint,
+          firstPage.candidates[0].request,
+          firstPage.candidates[0].request.target,
+        ]) {
+          assert.equal(Object.getPrototypeOf(canonicalValue), null);
+        }
+
+        const secondPage =
+          await authority.listCheckpointCaptureRecoveryCandidates({
+            afterSessionId: firstPage.nextAfterSessionId,
+            limit: 1,
+          });
+        assert.deepEqual(secondPage, {
+          candidates: [
+            {
+              checkpoint:
+                uncertainInput.request.admission.checkpoint,
+              request: uncertainInput.request.admission.request,
+            },
+          ],
+          nextAfterSessionId: null,
+        });
+
+        const attemptedOperationIds = [];
+        const verifiedOperationIds = [];
+        let activeReconciliations = 0;
+        let maximumActiveReconciliations = 0;
+        const recoveryService =
+          createPostgresCheckpointRecoveryService({
+            async listCandidates(input) {
+              return authority.listCheckpointCaptureRecoveryCandidates(
+                input,
+              );
+            },
+            async reconcileCheckpointCapture(candidate) {
+              attemptedOperationIds.push(
+                candidate.request.operationId,
+              );
+              activeReconciliations += 1;
+              maximumActiveReconciliations = Math.max(
+                maximumActiveReconciliations,
+                activeReconciliations,
+              );
+              try {
+                return await checkpointAuthority.runCaptureReconciliation(
+                  candidate,
+                  async (context) => {
+                    verifiedOperationIds.push(
+                      candidate.request.operationId,
+                    );
+                    assert.deepEqual(Reflect.ownKeys(context), [
+                      "artifactDirectory",
+                      "artifactOwnedRoot",
+                      "captureAttempt",
+                    ]);
+                    assert.equal(
+                      Object.hasOwn(context, "sourceDirectory"),
+                      false,
+                    );
+                    assert.equal(
+                      Object.hasOwn(context, "canonicalAttachment"),
+                      false,
+                    );
+                    return checkpointCompletion(context, true);
+                  },
+                );
+              } finally {
+                activeReconciliations -= 1;
+              }
+            },
+          });
+
+        const guardEntered = deferred();
+        const releaseGuard = deferred();
+        const heldGuard = operationGuard.runExclusive(
+          startingAdmission.request.operationId,
+          async (probe) => {
+            await probe.assertHeld();
+            guardEntered.resolve();
+            await releaseGuard.promise;
+          },
+        );
+        await guardEntered.promise;
+
+        let firstBatch;
+        try {
+          firstBatch = await recoveryService.runBatch({
+            afterSessionId: null,
+            limit: 2,
+            signal: null,
+          });
+        } finally {
+          releaseGuard.resolve();
+          await heldGuard;
+        }
+        assert.deepEqual(structuredClone(firstBatch), {
+          nextAfterSessionId: null,
+          results: [
+            {
+              operationId: startingAdmission.request.operationId,
+              sessionId: orderedSessionIds[0],
+              status: "pending",
+            },
+            {
+              operationId: uncertainAdmission.request.operationId,
+              sessionId: orderedSessionIds[3],
+              status: "reconciled",
+            },
+          ],
+          status: "sweep-complete",
+        });
+        assert.equal(Object.getPrototypeOf(firstBatch), null);
+        assert.equal(Object.isFrozen(firstBatch), true);
+        assert.equal(Object.isFrozen(firstBatch.results), true);
+        for (const result of firstBatch.results) {
+          assert.equal(Object.getPrototypeOf(result), null);
+          assert.equal(Object.isFrozen(result), true);
+        }
+        assert.deepEqual(attemptedOperationIds, [
+          startingAdmission.request.operationId,
+          uncertainAdmission.request.operationId,
+        ]);
+        assert.deepEqual(verifiedOperationIds, [
+          uncertainAdmission.request.operationId,
+        ]);
+        assert.equal(maximumActiveReconciliations, 1);
+
+        const stillStarting = await authority.reconcileOperation(
+          startingInput,
+        );
+        assertOperationReceipt(stillStarting, "starting");
+        const uncertainTerminal = await authority.reconcileOperation(
+          uncertainInput,
+        );
+        assertOperationReceipt(uncertainTerminal, "committed");
+        assert.equal(
+          uncertainTerminal.operation.result.outcome,
+          "checkpoint-captured",
+        );
+
+        attemptedOperationIds.length = 0;
+        verifiedOperationIds.length = 0;
+        const retryBatch = await recoveryService.runBatch({
+          afterSessionId: null,
+          limit: 2,
+          signal: null,
+        });
+        assert.deepEqual(structuredClone(retryBatch), {
+          nextAfterSessionId: null,
+          results: [
+            {
+              operationId: startingAdmission.request.operationId,
+              sessionId: orderedSessionIds[0],
+              status: "reconciled",
+            },
+          ],
+          status: "sweep-complete",
+        });
+        assert.equal(Object.getPrototypeOf(retryBatch), null);
+        assert.equal(Object.isFrozen(retryBatch), true);
+        assert.equal(Object.isFrozen(retryBatch.results), true);
+        for (const result of retryBatch.results) {
+          assert.equal(Object.getPrototypeOf(result), null);
+          assert.equal(Object.isFrozen(result), true);
+        }
+        assert.deepEqual(attemptedOperationIds, [
+          startingAdmission.request.operationId,
+        ]);
+        assert.deepEqual(verifiedOperationIds, [
+          startingAdmission.request.operationId,
+        ]);
+        assert.equal(maximumActiveReconciliations, 1);
+
+        const startingTerminal = await authority.reconcileOperation(
+          startingInput,
+        );
+        assertOperationReceipt(startingTerminal, "committed");
+        assert.equal(
+          startingTerminal.operation.result.outcome,
+          "checkpoint-captured",
+        );
+        const exhausted =
+          await authority.listCheckpointCaptureRecoveryCandidates({
+            afterSessionId: null,
+            limit: 2,
+          });
+        assert.deepEqual(exhausted, {
+          candidates: [],
+          nextAfterSessionId: null,
+        });
       },
     );
 

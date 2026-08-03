@@ -107,6 +107,20 @@
   until it verifies the exact committed journal state; it cannot advance
   `prepared` or `materialized` publication. Claims are retained permanently,
   and tombstones always reject reuse.
+- Bounded checkpoint recovery now enumerates retained `starting` or `uncertain`
+  capture operations through
+  `PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()`. It uses
+  immutable `session_id` keyset order, the existing active-operation index, a
+  hard `limit + 1` page query, and same-snapshot relational validation without
+  schema DDL. The single-backend recovery service processes one page
+  sequentially from frozen startup configuration and passes only exact durable
+  `{checkpoint, request}` admissions to committed reconciliation. Its
+  `reconciled` and `pending` receipts advance the cursor only after settlement;
+  sweep completion wraps to null for later replay. Abort signals stop new
+  admission but drain the in-flight guard/reconciliation. A service instance
+  admits only one batch at a time, while overlapping valid invocations fail
+  closed before enumeration. Guard-busy or unverifiable attempts remain
+  durable blockers and `starting` may safely become `uncertain`.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   until canonical destination-generation authority and logical launcher
   admission are implemented; no published restore path is writer-launch
@@ -153,6 +167,8 @@
   `docs/project_journal/2026/07/2026-07-31-release-force-fence-e4b9c7.md`
 - Production checkpoint mutation authority:
   `docs/project_journal/2026/07/2026-07-31-checkpoint-mutation-authority-c3a8f2.md`
+- Bounded checkpoint recovery service:
+  `docs/project_journal/2026/08/2026-08-02-checkpoint-recovery-service-7d2c4a.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

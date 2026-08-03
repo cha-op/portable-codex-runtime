@@ -186,6 +186,10 @@ const CHECKPOINT_CAPTURE_READ_KEYS = Object.freeze([
   "checkpoint",
   "request",
 ]);
+const CHECKPOINT_CAPTURE_RECOVERY_LIST_KEYS = Object.freeze([
+  "afterSessionId",
+  "limit",
+]);
 const CHECKPOINT_CATALOGUE_READ_KEYS = Object.freeze(["checkpoint"]);
 const CHECKPOINT_CAPTURE_COMPLETION_KEYS = Object.freeze([
   "artifactProof",
@@ -441,6 +445,7 @@ const ERROR_MESSAGES = Object.freeze({
 const BigIntConstructor = BigInt;
 const bigIntToStringIntrinsic = BigInt.prototype.toString;
 const ArrayConstructor = Array;
+const arrayPrototype = Array.prototype;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -549,6 +554,31 @@ const READ_OPERATION_QUERY = Object.freeze({
 const READ_OPERATION_FOR_UPDATE_QUERY = Object.freeze({
   queryMode: "extended",
   text: `${READ_OPERATION_QUERY.text} FOR UPDATE`,
+});
+const LIST_CHECKPOINT_CAPTURE_RECOVERY_FIRST_PAGE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${OPERATION_RETURNING_COLUMNS}`,
+    "FROM session_authority.operation_claims",
+    "WHERE kind = 'checkpoint-capture-v1'",
+    "AND state IN ('starting', 'uncertain')",
+    "AND retired_at IS NULL",
+    "ORDER BY session_id ASC",
+    "LIMIT $1::integer",
+  ].join(" "),
+});
+const LIST_CHECKPOINT_CAPTURE_RECOVERY_AFTER_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${OPERATION_RETURNING_COLUMNS}`,
+    "FROM session_authority.operation_claims",
+    "WHERE kind = 'checkpoint-capture-v1'",
+    "AND state IN ('starting', 'uncertain')",
+    "AND retired_at IS NULL",
+    "AND session_id > $1::uuid",
+    "ORDER BY session_id ASC",
+    "LIMIT $2::integer",
+  ].join(" "),
 });
 const READ_RESERVATION_BY_OPERATION_QUERY = Object.freeze({
   queryMode: "extended",
@@ -1854,6 +1884,30 @@ function rowsFromResult(result, code = "session_state_invalid") {
   return rows;
 }
 
+function pageRowsFromResult(result, maximumRows, code) {
+  ensure(
+    result !== null &&
+      typeof result === "object" &&
+      !isProxyValue(result),
+    code,
+  );
+  const rows = ownDataValue(result, "rows", code);
+  ensure(
+    arrayIsArray(rows) &&
+      !isProxyValue(rows) &&
+      rows.length <= maximumRows,
+    code,
+  );
+  for (let index = 0; index < rows.length; index += 1) {
+    ownDataValue(
+      rows,
+      reflectApply(StringConstructor, undefined, [index]),
+      code,
+    );
+  }
+  return rows;
+}
+
 function snapshotFromRow(row, expectedSessionId) {
   const normalized = exactPlainObject(
     row,
@@ -3105,6 +3159,28 @@ function checkpointCaptureReadInput(options, keys = CHECKPOINT_CAPTURE_READ_KEYS
     "invalid_operation_request",
   );
   return deepFreeze({ checkpoint, request });
+}
+
+function checkpointCaptureRecoveryListInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    CHECKPOINT_CAPTURE_RECOVERY_LIST_KEYS,
+    "invalid_operation_request",
+  );
+  const afterSessionId =
+    normalized.afterSessionId === null
+      ? null
+      : canonicalSessionId(
+          normalized.afterSessionId,
+          "invalid_operation_request",
+        );
+  ensure(
+    numberIsSafeInteger(normalized.limit) &&
+      normalized.limit >= 1 &&
+      normalized.limit <= 100,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ afterSessionId, limit: normalized.limit });
 }
 
 function checkpointCatalogueReadInput(options) {
@@ -5118,6 +5194,117 @@ export class PostgresSessionAuthority {
       const snapshot = snapshotFromRow(rows[0], sessionId);
       await validateSessionRelations(transaction, snapshot, false);
       return snapshot;
+    });
+  }
+
+  async listCheckpointCaptureRecoveryCandidates(options) {
+    const listInput = checkpointCaptureRecoveryListInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const maximumRows = listInput.limit + 1;
+      const afterCursor = listInput.afterSessionId;
+      const query =
+        afterCursor === null
+          ? LIST_CHECKPOINT_CAPTURE_RECOVERY_FIRST_PAGE_QUERY
+          : LIST_CHECKPOINT_CAPTURE_RECOVERY_AFTER_QUERY;
+      const values =
+        afterCursor === null
+          ? [maximumRows]
+          : [afterCursor, maximumRows];
+      const operationRows = pageRowsFromResult(
+        await transaction.query(query.text, values),
+        maximumRows,
+        "operation_state_invalid",
+      );
+      const candidateCount =
+        operationRows.length > listInput.limit
+          ? listInput.limit
+          : operationRows.length;
+      const candidates = new ArrayConstructor(candidateCount);
+      objectSetPrototypeOf(candidates, null);
+      let previousSessionId = afterCursor;
+      let lastCandidateSessionId = null;
+
+      for (let index = 0; index < operationRows.length; index += 1) {
+        const operation = operationSnapshotFromRow(
+          ownDataValue(
+            operationRows,
+            reflectApply(StringConstructor, undefined, [index]),
+            "operation_state_invalid",
+          ),
+        );
+        ensure(
+          operation.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+            (operation.state === "starting" ||
+              operation.state === "uncertain") &&
+            operation.retiredAt === null &&
+            (previousSessionId === null ||
+              operation.sessionId > previousSessionId),
+          "operation_state_invalid",
+        );
+        const input = checkpointCaptureInput(
+          inputForOperation(operation),
+          OPERATION_INPUT_KEYS,
+          "operation_state_invalid",
+        );
+        const durableRequest = input.request.admission.request;
+        ensure(
+          durableRequest.sessionId === operation.sessionId,
+          "operation_state_invalid",
+        );
+        const session = await readSessionSnapshot(
+          transaction,
+          operation.sessionId,
+          false,
+        );
+        let observed;
+        try {
+          observed = await readRequestedOperation(
+            transaction,
+            session,
+            input,
+            false,
+          );
+        } catch (error) {
+          if (
+            error instanceof PostgresSessionAuthorityError &&
+            error.code === "checkpoint_capture_not_authorized"
+          ) {
+            fail("operation_state_invalid");
+          }
+          throw error;
+        }
+        ensure(
+          observed.active !== null &&
+            observed.active.operation.operationId === operation.operationId &&
+            observed.operation !== null &&
+            observed.reservation !== null &&
+            observed.checkpoint?.attempt !== null &&
+            observed.checkpoint?.attempt !== undefined &&
+            observed.checkpoint.catalogue === null &&
+            (observed.operation.state === "starting" ||
+              observed.operation.state === "uncertain") &&
+            canonicalSerialize(observed.operation) ===
+              canonicalSerialize(operation),
+          "operation_state_invalid",
+        );
+        if (index < candidateCount) {
+          candidates[index] = deepFreeze({
+            checkpoint: input.request.admission.checkpoint,
+            request: durableRequest,
+          });
+          lastCandidateSessionId = durableRequest.sessionId;
+        }
+        previousSessionId = durableRequest.sessionId;
+      }
+      objectSetPrototypeOf(candidates, arrayPrototype);
+
+      return deepFreeze({
+        candidates,
+        nextAfterSessionId:
+          operationRows.length > listInput.limit
+            ? lastCandidateSessionId
+            : null,
+      });
     });
   }
 
