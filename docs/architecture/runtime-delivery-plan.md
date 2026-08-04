@@ -150,17 +150,25 @@ Restore and launcher authority are now split into four serial pull requests:
      the predetermined restore result through typed PostgreSQL transitions.
    - Keep publication outside transactions and keep production restore
      fail-closed until launcher composition is complete.
-3. **Durable launch-attempt lifecycle**
+3. **Durable launch-attempt lifecycle (complete)**
    - Reserve and claim one exact launch attempt, persist every
      `starting` or `uncertain` blocker, and accept only exact supervisor
      evidence when finalizing a started or stopped attempt.
    - Bind the finalized destination generation, session attachment, lease,
      epoch, image measurement, process incarnation, and writer incarnation
      without invoking a launcher in this slice.
+   - Reuse the permanent operation and reservation rows with the operation ID
+     as the launch-attempt ID; no migration version 3 is required.
+   - Upgrade canonical session documents to version 3 on the next real write
+     so a started launch remains linked to its immutable operation after
+     `lastOperation` advances.
 4. **Logical launcher composition and enablement**
-   - Atomically compose finalized generation admission, one-use measured-image
+   - Compose finalized generation admission, one-use measured-image
      consumption, durable launch-attempt dispatch, the external launcher, and
-     exact writer registration.
+     exact writer registration as a fail-closed cross-boundary protocol.
+     Keep atomicity limited to each transactional reread, claim, and capability
+     consumption boundary; persist `starting` before invoking the external
+     launcher.
    - Enable production restore only after the complete composition preserves
      the no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous launcher outcomes.

@@ -26,10 +26,12 @@ import {
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
   WRITER_FORCE_FENCE_OPERATION_KIND,
+  WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
+  createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -641,7 +643,7 @@ function firstSessionLockQueryBarrierPool(
   );
 }
 
-function firstSessionLockQueryNotificationPool(pool, label) {
+function firstMatchingQueryNotificationPool(pool, label, matches) {
   let matched = false;
   let notifyMatch;
   let timer;
@@ -670,8 +672,7 @@ function firstSessionLockQueryNotificationPool(pool, label) {
             if (
               !matched &&
               typeof text === "string" &&
-              text.includes("FROM session_authority.sessions") &&
-              text.includes("FOR UPDATE")
+              matches(text)
             ) {
               matched = true;
               notifyMatch();
@@ -688,6 +689,32 @@ function firstSessionLockQueryNotificationPool(pool, label) {
       return firstMatch;
     },
   });
+}
+
+function firstSessionLockQueryNotificationPool(pool, label) {
+  return firstMatchingQueryNotificationPool(
+    pool,
+    label,
+    (text) =>
+      text.includes("FROM session_authority.sessions") &&
+      text.includes("FOR UPDATE"),
+  );
+}
+
+function firstRestoreGenerationLockQueryNotificationPool(
+  pool,
+  label,
+) {
+  return firstMatchingQueryNotificationPool(
+    pool,
+    label,
+    (text) =>
+      text.includes(
+        "FROM session_authority.restore_destination_generations",
+      ) &&
+      text.includes("WHERE generation_id = $1") &&
+      text.includes("FOR UPDATE"),
+  );
 }
 
 function firstCommitAcknowledgementLossPool(pool) {
@@ -1053,6 +1080,8 @@ function checkpointCaptureAdmission(
     captureAttemptId = randomUUID(),
     checkpointId = `checkpoint-${randomUUID()}`,
     operationId = `checkpoint-operation-${randomUUID()}`,
+    processIncarnationId = `process-${randomUUID()}`,
+    writerIncarnationId = `writer-${randomUUID()}`,
   } = {},
 ) {
   const session = attached.session;
@@ -1091,10 +1120,10 @@ function checkpointCaptureAdmission(
     attachment,
     captureAttemptId,
     checkpoint,
-    processIncarnationId: `process-${randomUUID()}`,
+    processIncarnationId,
     request,
     stopOperationId: `stop-${randomUUID()}`,
-    writerIncarnationId: `writer-${randomUUID()}`,
+    writerIncarnationId,
   };
 }
 
@@ -1175,10 +1204,85 @@ function restoreGenerationCompletion(input, claimed, replayed) {
   };
 }
 
+function writerLaunchMeasuredImage(expectedSession) {
+  const runtime = expectedSession.document.manifest.runtime;
+  const [os, architecture] = runtime.platform.split("/");
+  return {
+    projection: {
+      codexSandbox: runtime.codexSandbox,
+      codexVersion: runtime.codexVersion,
+      platformImage: {
+        architecture,
+        config: {
+          digest: `sha256:${"b".repeat(64)}`,
+          mediaType: "application/vnd.oci.image.config.v1+json",
+          size: 512,
+        },
+        digest: runtime.imageDigest,
+        mediaType: runtime.imageMediaType,
+        os,
+        size: 1024,
+      },
+    },
+    runtimeIdentity: {
+      codexBinaryPath: "/opt/portable-codex/bin/codex",
+      codexBinarySha256: "c".repeat(64),
+      codexVersion: runtime.codexVersion,
+      platformImageDigest: runtime.imageDigest,
+    },
+  };
+}
+
+function writerLaunchAttemptInput(
+  expectedSession,
+  generation,
+  {
+    operationId = `writer-launch-${randomUUID()}`,
+    supervisorId = `supervisor-${randomUUID()}`,
+  } = {},
+) {
+  const measuredImage = writerLaunchMeasuredImage(expectedSession);
+  const supervisor = {
+    contractVersion: 1,
+    supervisorId,
+  };
+  return {
+    expectedSession,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    operationId,
+    request: createWriterLaunchAttemptOperationRequest({
+      expectedSession,
+      generation,
+      measuredImage,
+      supervisor,
+    }),
+  };
+}
+
+function writerLaunchEvidence(input, status) {
+  const stoppedBeforeStart = status === "not-started";
+  return {
+    contractVersion: 1,
+    launchAttemptId: input.operationId,
+    processIncarnationId: stoppedBeforeStart
+      ? null
+      : `process-${randomUUID()}`,
+    proofId: `supervisor-proof-${randomUUID()}`,
+    status,
+    supervisorId: input.request.supervisor.supervisorId,
+    writerIncarnationId: stoppedBeforeStart
+      ? null
+      : `writer-${randomUUID()}`,
+  };
+}
+
 async function prepareRestoreGenerationFixture(
   authority,
   checkpointAuthority,
   sessionId,
+  {
+    finalAttachmentLeaseDurationMilliseconds = 300_000,
+  } = {},
 ) {
   const registered = await authority.registerSession(
     registrationInput(sessionId),
@@ -1200,7 +1304,8 @@ async function prepareRestoreGenerationFixture(
   assertOperationReceipt(captureTerminal, "committed");
   const released = await releaseWriter(authority, captureTerminal);
   const attached = await attachWriter(authority, released.session, {
-    leaseDurationMilliseconds: 300_000,
+    leaseDurationMilliseconds:
+      finalAttachmentLeaseDurationMilliseconds,
   });
   assert.equal(
     BigInt(attached.session.document.lease.fencingEpoch) >
@@ -1212,6 +1317,66 @@ async function prepareRestoreGenerationFixture(
     captureCompletion,
     checkpoint: captureAdmission.checkpoint,
   };
+}
+
+async function prepareCommittedRestoreGenerationFixture(
+  authority,
+  checkpointAuthority,
+  sessionId,
+  options,
+) {
+  const fixture = await prepareRestoreGenerationFixture(
+    authority,
+    checkpointAuthority,
+    sessionId,
+    options,
+  );
+  const admission = restoreGenerationAdmission(
+    fixture.attached,
+    fixture.checkpoint,
+  );
+  const input = restoreGenerationOperationInput(
+    fixture.attached.session,
+    admission,
+  );
+  await authority.reserveOperation(input);
+  const claimed =
+    await authority.claimRestoreDestinationGenerationDispatch({
+      ...structuredClone(input),
+      destinationIsolationProofId:
+        `restore-isolation-proof-${randomUUID()}`,
+      expectedOperationRevision: "0",
+      generationId: `restore-generation-${randomUUID()}`,
+    });
+  const finalized =
+    await authority.finalizeRestoreDestinationGeneration({
+      ...structuredClone(input),
+      completion: restoreGenerationCompletion(input, claimed, false),
+      expectedOperationRevision: "1",
+    });
+  assertOperationReceipt(finalized, "committed");
+  assert.equal(finalized.generation.state, "committed");
+  return { ...fixture, admission, finalized, input };
+}
+
+async function waitForDatabaseLeaseExpiry(queryable, expiresAt) {
+  await queryable.query(
+    [
+      "SELECT pg_catalog.pg_sleep(",
+      "GREATEST(EXTRACT(EPOCH FROM",
+      "($1::timestamptz - pg_catalog.clock_timestamp())), 0)",
+      "::double precision + 0.2)",
+    ].join(" "),
+    [expiresAt],
+  );
+  const expired = await queryable.query(
+    [
+      "SELECT pg_catalog.clock_timestamp() >= $1::timestamptz",
+      "AS lease_expired",
+    ].join(" "),
+    [expiresAt],
+  );
+  assert.equal(expired.rows[0].lease_expired, true);
 }
 
 async function readRestoreGenerationTransactionState(
@@ -1870,7 +2035,7 @@ test(
 
 test(
   "PostgresSessionAuthority registration is canonical under replay and concurrency",
-  { timeout: 30_000 },
+  { timeout: 60_000 },
   async (t) => {
     const pool = new Pool({
       application_name:
@@ -5516,6 +5681,793 @@ test(
             structuredClone(uncertainReadInput),
           ),
           finalizeLossRead,
+        );
+      },
+    );
+
+    await t.test(
+      "writer launch claim rechecks the authority clock after a blocking generation lock",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+          { finalAttachmentLeaseDurationMilliseconds: 3_000 },
+        );
+        const input = writerLaunchAttemptInput(
+          fixture.finalized.session,
+          fixture.finalized.generation,
+        );
+        const prepared = await authority.reserveOperation(input);
+        assertOperationReceipt(prepared, "prepared");
+
+        const lockClient = await pool.connect();
+        let lockHeld = false;
+        try {
+          await lockClient.query("BEGIN");
+          lockHeld = true;
+          await lockClient.query(
+            [
+              "SELECT generation_id",
+              "FROM session_authority.restore_destination_generations",
+              "WHERE generation_id = $1",
+              "FOR UPDATE",
+            ].join(" "),
+            [fixture.finalized.generation.generationId],
+          );
+
+          const notification =
+            firstRestoreGenerationLockQueryNotificationPool(
+              pool,
+              "blocked writer launch generation lock",
+            );
+          const blockedAuthority = new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: notification.dedicatedPool,
+              maxTransactionAttempts: 3,
+            }),
+          });
+          let claimSettled = false;
+          const claimPromise =
+            blockedAuthority.claimWriterLaunchAttemptDispatch({
+              ...structuredClone(input),
+              expectedOperationRevision: "0",
+            });
+          const expectedRejection = assert.rejects(
+            claimPromise,
+            assertAuthorityCode("writer_lease_expired"),
+          );
+          void claimPromise.then(
+            () => {
+              claimSettled = true;
+            },
+            () => {
+              claimSettled = true;
+            },
+          );
+
+          await notification.waitForFirstMatch();
+          assert.equal(claimSettled, false);
+          await waitForDatabaseLeaseExpiry(
+            lockClient,
+            fixture.finalized.session.document.lease.expiresAt,
+          );
+          assert.equal(claimSettled, false);
+
+          await lockClient.query("ROLLBACK");
+          lockHeld = false;
+          await expectedRejection;
+        } finally {
+          if (lockHeld) {
+            await lockClient.query("ROLLBACK");
+          }
+          lockClient.release();
+        }
+
+        const read = await authority.readWriterLaunchAttempt({
+          operationId: input.operationId,
+        });
+        assertOperationReceipt(read, "prepared");
+        assert.equal(read.attempt.state, "prepared");
+        assert.equal(read.operation.state, "prepared");
+        assert.equal(read.operation.revision, "0");
+        assert.equal(read.reservation.state, "prepared");
+        assert.equal(read.session.document.launch, null);
+        assert.equal(
+          read.session.document.activeOperation.operationId,
+          input.operationId,
+        );
+        assert.equal(
+          read.session.document.activeOperation.state,
+          "prepared",
+        );
+        assert.equal(
+          read.session.document.activeOperation.operationRevision,
+          "0",
+        );
+        assert.deepEqual(read.operation, prepared.operation);
+        assert.deepEqual(read.reservation, prepared.reservation);
+        assert.deepEqual(read.session, prepared.session);
+      },
+    );
+
+    await t.test(
+      "writer launch binds a committed restore, upgrades v2 history, and replays one started attempt",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const versionTwoDocument = structuredClone(
+          fixture.finalized.session.document,
+        );
+        versionTwoDocument.documentVersion = 2;
+        await pool.query(
+          [
+            "UPDATE session_authority.sessions",
+            "SET document = $2::jsonb",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId, JSON.stringify(versionTwoDocument)],
+        );
+
+        const historical = await authority.readSession({ sessionId });
+        assert.equal(historical.document.documentVersion, 2);
+        assert.equal(
+          historical.document.lastOperation.operationId,
+          fixture.input.operationId,
+        );
+        const historicalGeneration =
+          await authority.readRestoreDestinationGeneration({
+            checkpoint: fixture.admission.checkpoint,
+            generationId: fixture.finalized.generation.generationId,
+            request: fixture.admission.request,
+          });
+        assertOperationReceipt(historicalGeneration, "committed");
+        assert.deepEqual(
+          historicalGeneration.generation,
+          fixture.finalized.generation,
+        );
+        assert.deepEqual(
+          (await readMigrationLedger(pool)).map(({ version }) => version),
+          [1, 2],
+        );
+
+        const input = writerLaunchAttemptInput(
+          historical,
+          fixture.finalized.generation,
+        );
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(historical.document.documentVersion, 2);
+        assert.equal(
+          reserved.session.document.documentVersion,
+          SESSION_AUTHORITY_DOCUMENT_VERSION,
+        );
+        assert.equal(SESSION_AUTHORITY_DOCUMENT_VERSION, 3);
+
+        const claimInput = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const claimed =
+          await authority.claimWriterLaunchAttemptDispatch(claimInput);
+        assertOperationReceipt(claimed, "starting");
+        assert.equal(claimed.dispatchGranted, true);
+        assert.deepEqual(
+          claimed.generation,
+          fixture.finalized.generation,
+        );
+
+        const evidence = writerLaunchEvidence(input, "started");
+        const finalization = {
+          ...structuredClone(input),
+          evidence,
+          expectedOperationRevision: "1",
+        };
+        const finalized =
+          await authority.finalizeWriterLaunchAttemptStarted(
+            finalization,
+          );
+        assertOperationReceipt(finalized, "committed");
+        assert.equal(finalized.finalized, true);
+        assert.equal(
+          finalized.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.equal(
+          finalized.session.document.launch.launchAttemptId,
+          input.operationId,
+        );
+        assert.equal(
+          finalized.session.document.launch.processIncarnationId,
+          evidence.processIncarnationId,
+        );
+        assert.equal(
+          finalized.session.document.launch.writerIncarnationId,
+          evidence.writerIncarnationId,
+        );
+        assert.deepEqual(finalized.launch, finalized.session.document.launch);
+
+        const read = await authority.readWriterLaunchAttempt({
+          operationId: input.operationId,
+        });
+        assertOperationReceipt(read, "committed");
+        assert.equal(read.attempt.launchAttemptId, input.operationId);
+        assert.equal(read.attempt.state, "committed");
+        assert.deepEqual(read.attempt.request, input.request);
+        assert.deepEqual(read.launch, finalized.launch);
+
+        const claimReplay =
+          await authority.claimWriterLaunchAttemptDispatch(
+            structuredClone(claimInput),
+          );
+        assertOperationReceipt(claimReplay, "committed");
+        assert.equal(claimReplay.dispatchGranted, false);
+        const finalizeReplay =
+          await authority.finalizeWriterLaunchAttemptStarted(
+            structuredClone(finalization),
+          );
+        assertOperationReceipt(finalizeReplay, "committed");
+        assert.equal(finalizeReplay.finalized, false);
+        assert.deepEqual(finalizeReplay.launch, finalized.launch);
+
+        await assert.rejects(
+          authority.reserveOperation({
+            ...structuredClone(input),
+            expectedSession: finalized.session,
+            operationId: `writer-launch-${randomUUID()}`,
+          }),
+          assertAuthorityCode("invalid_operation_request"),
+        );
+      },
+    );
+
+    await t.test(
+      "writer launch readback survives renewal, checkpoint, and blocked fencing until exact fence success",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const input = writerLaunchAttemptInput(
+          fixture.finalized.session,
+          fixture.finalized.generation,
+        );
+        await authority.reserveOperation(input);
+        const claimed =
+          await authority.claimWriterLaunchAttemptDispatch({
+            ...structuredClone(input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(claimed, "starting");
+        const evidence = writerLaunchEvidence(input, "started");
+        const started =
+          await authority.finalizeWriterLaunchAttemptStarted({
+            ...structuredClone(input),
+            evidence,
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(started, "committed");
+        const launch = structuredClone(started.launch);
+
+        async function assertCurrentLaunch(lastOperationId) {
+          const currentSession = await authority.readSession({
+            sessionId,
+          });
+          const currentAttempt =
+            await authority.readWriterLaunchAttempt({
+              operationId: input.operationId,
+            });
+          assert.deepEqual(currentSession.document.launch, launch);
+          assert.deepEqual(currentAttempt.launch, launch);
+          assert.equal(
+            currentSession.document.lastOperation.operationId,
+            lastOperationId,
+          );
+          assert.equal(
+            currentAttempt.session.document.lastOperation.operationId,
+            lastOperationId,
+          );
+          assert.equal(
+            currentAttempt.operation.operationId,
+            input.operationId,
+          );
+          assert.equal(
+            currentAttempt.operation.result.outcome,
+            "writer-launch-started",
+          );
+          return currentSession;
+        }
+
+        await assertCurrentLaunch(input.operationId);
+
+        const renewalInput = writerLeaseRenewalInput(started.session);
+        const renewed = await authority.renewWriterLease(renewalInput);
+        assertOperationReceipt(renewed, "committed");
+        assert.deepEqual(renewed.session.document.launch, launch);
+        const renewedSession = await assertCurrentLaunch(
+          renewalInput.operationId,
+        );
+
+        const checkpointAdmission = checkpointCaptureAdmission(
+          { session: renewedSession },
+          {
+            processIncarnationId: evidence.processIncarnationId,
+            writerIncarnationId: evidence.writerIncarnationId,
+          },
+        );
+        await checkpointAuthority.runCapture(
+          checkpointAdmission,
+          async (context) => checkpointCompletion(context, false),
+        );
+        const checkpointTerminal = await authority.reconcileOperation(
+          checkpointOperationInput(
+            renewedSession,
+            checkpointAdmission,
+          ),
+        );
+        assertOperationReceipt(checkpointTerminal, "committed");
+        assert.deepEqual(
+          checkpointTerminal.session.document.launch,
+          launch,
+        );
+        const checkpointSession = await assertCurrentLaunch(
+          checkpointAdmission.request.operationId,
+        );
+
+        const firstFenceInput = writerForceFenceInput(
+          checkpointSession,
+        );
+        await authority.reserveOperation(firstFenceInput);
+        const firstFenceStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(firstFenceInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(firstFenceStarting, "starting");
+        const firstFenceUncertain =
+          await authority.markOperationUncertain({
+            ...structuredClone(firstFenceInput),
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(firstFenceUncertain, "uncertain");
+        const blocked =
+          await authority.finalizeWriterOperationBlocked({
+            ...structuredClone(firstFenceInput),
+            expectedOperationRevision: "2",
+            reason: "provider-outcome-unresolved",
+          });
+        assertOperationReceipt(blocked, "committed");
+        assert.equal(blocked.session.document.lifecycle, "BLOCKED");
+        assert.deepEqual(blocked.session.document.launch, launch);
+        const blockedSession = await assertCurrentLaunch(
+          firstFenceInput.operationId,
+        );
+
+        const exactFenceInput = writerForceFenceInput(blockedSession);
+        await authority.reserveOperation(exactFenceInput);
+        const exactFenceStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(exactFenceInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(exactFenceStarting, "starting");
+        const fenced = await authority.finalizeWriterForceFence({
+          ...structuredClone(exactFenceInput),
+          expectedOperationRevision: "1",
+          fenceResult: forceFenceEvidence(
+            exactFenceStarting.fenceRequest,
+          ),
+        });
+        assertOperationReceipt(fenced, "committed");
+        assert.equal(fenced.session.document.lifecycle, "DETACHED");
+        assert.equal(fenced.session.document.launch, null);
+
+        const detachedSession = await authority.readSession({
+          sessionId,
+        });
+        const historicalAttempt =
+          await authority.readWriterLaunchAttempt({
+            operationId: input.operationId,
+          });
+        assert.equal(detachedSession.document.launch, null);
+        assert.equal(historicalAttempt.launch, null);
+        assert.equal(
+          detachedSession.document.lastOperation.operationId,
+          exactFenceInput.operationId,
+        );
+        assert.equal(
+          historicalAttempt.session.document.lastOperation.operationId,
+          exactFenceInput.operationId,
+        );
+        assert.equal(
+          historicalAttempt.operation.result.outcome,
+          "writer-launch-started",
+        );
+      },
+    );
+
+    await t.test(
+      "writer launch exact finalization remains available after lease expiry",
+      async (t) => {
+        for (const scenario of [
+          {
+            finalizer: "started",
+            markUncertain: false,
+            operationRevision: "1",
+            status: "started",
+          },
+          {
+            finalizer: "stopped",
+            markUncertain: true,
+            operationRevision: "2",
+            status: "complete-stopped",
+          },
+        ]) {
+          await t.test(scenario.status, async () => {
+            const sessionId = randomUUID();
+            sessionIds.push(sessionId);
+            const fixture =
+              await prepareCommittedRestoreGenerationFixture(
+                authority,
+                checkpointAuthority,
+                sessionId,
+                {
+                  finalAttachmentLeaseDurationMilliseconds: 3_000,
+                },
+              );
+            const input = writerLaunchAttemptInput(
+              fixture.finalized.session,
+              fixture.finalized.generation,
+            );
+            await authority.reserveOperation(input);
+            const starting =
+              await authority.claimWriterLaunchAttemptDispatch({
+                ...structuredClone(input),
+                expectedOperationRevision: "0",
+              });
+            assertOperationReceipt(starting, "starting");
+
+            if (scenario.markUncertain) {
+              const uncertain = await authority.markOperationUncertain({
+                ...structuredClone(input),
+                expectedOperationRevision: "1",
+              });
+              assertOperationReceipt(uncertain, "uncertain");
+            }
+
+            await waitForDatabaseLeaseExpiry(
+              pool,
+              fixture.finalized.session.document.lease.expiresAt,
+            );
+            const finalization = {
+              ...structuredClone(input),
+              evidence: writerLaunchEvidence(input, scenario.status),
+              expectedOperationRevision: scenario.operationRevision,
+            };
+            const finalized =
+              scenario.finalizer === "started"
+                ? await authority.finalizeWriterLaunchAttemptStarted(
+                    finalization,
+                  )
+                : await authority.finalizeWriterLaunchAttemptStopped(
+                    finalization,
+                  );
+            assertOperationReceipt(finalized, "committed");
+            assert.equal(finalized.finalized, true);
+            assert.equal(
+              finalized.operation.result.evidence.status,
+              scenario.status,
+            );
+            assert.equal(
+              finalized.launch === null,
+              scenario.status === "complete-stopped",
+            );
+          });
+        }
+      },
+    );
+
+    await t.test(
+      "writer launch stop proofs replay exactly and release authority for a replacement attempt",
+      async (t) => {
+        for (const scenario of [
+          {
+            expectedOperationRevision: "1",
+            markUncertain: false,
+            outcome: "writer-launch-not-started",
+            status: "not-started",
+          },
+          {
+            expectedOperationRevision: "2",
+            markUncertain: true,
+            outcome: "writer-launch-complete-stopped",
+            status: "complete-stopped",
+          },
+        ]) {
+          await t.test(scenario.status, async () => {
+            const sessionId = randomUUID();
+            sessionIds.push(sessionId);
+            const fixture =
+              await prepareCommittedRestoreGenerationFixture(
+                authority,
+                checkpointAuthority,
+                sessionId,
+              );
+            const input = writerLaunchAttemptInput(
+              fixture.finalized.session,
+              fixture.finalized.generation,
+            );
+            await authority.reserveOperation(input);
+            const claimed =
+              await authority.claimWriterLaunchAttemptDispatch({
+                ...structuredClone(input),
+                expectedOperationRevision: "0",
+              });
+            assertOperationReceipt(claimed, "starting");
+
+            if (scenario.markUncertain) {
+              const uncertain = await authority.markOperationUncertain({
+                ...structuredClone(input),
+                expectedOperationRevision: "1",
+              });
+              assertOperationReceipt(uncertain, "uncertain");
+            }
+
+            const finalization = {
+              ...structuredClone(input),
+              evidence: writerLaunchEvidence(input, scenario.status),
+              expectedOperationRevision:
+                scenario.expectedOperationRevision,
+            };
+            const stopped =
+              await authority.finalizeWriterLaunchAttemptStopped(
+                finalization,
+              );
+            assertOperationReceipt(stopped, "committed");
+            assert.equal(stopped.finalized, true);
+            assert.equal(stopped.launch, null);
+            assert.equal(stopped.session.document.launch, null);
+            assert.equal(
+              stopped.operation.result.outcome,
+              scenario.outcome,
+            );
+
+            const replay =
+              await authority.finalizeWriterLaunchAttemptStopped(
+                structuredClone(finalization),
+              );
+            assertOperationReceipt(replay, "committed");
+            assert.equal(replay.finalized, false);
+            assert.deepEqual(replay.operation, stopped.operation);
+
+            const replacementInput = writerLaunchAttemptInput(
+              stopped.session,
+              fixture.finalized.generation,
+            );
+            const replacement =
+              await authority.reserveOperation(replacementInput);
+            assertOperationReceipt(replacement, "prepared");
+            assert.equal(replacement.acquired, true);
+          });
+        }
+      },
+    );
+
+    await t.test(
+      "writer launch claim and finalize acknowledgement loss recover without regranting",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const input = writerLaunchAttemptInput(
+          fixture.finalized.session,
+          fixture.finalized.generation,
+        );
+        await authority.reserveOperation(input);
+        const claimInput = {
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+        };
+        const claimLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+          }),
+        });
+
+        await assert.rejects(
+          claimLossAuthority.claimWriterLaunchAttemptDispatch(
+            claimInput,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+        const restarted = new PostgresSessionAuthority({ store });
+        const starting = await restarted.readWriterLaunchAttempt({
+          operationId: input.operationId,
+        });
+        assertOperationReceipt(starting, "starting");
+        assert.equal(starting.attempt.state, "starting");
+        const claimReplay =
+          await restarted.claimWriterLaunchAttemptDispatch(
+            structuredClone(claimInput),
+          );
+        assertOperationReceipt(claimReplay, "starting");
+        assert.equal(claimReplay.dispatchGranted, false);
+
+        const finalization = {
+          ...structuredClone(input),
+          evidence: writerLaunchEvidence(input, "started"),
+          expectedOperationRevision: "1",
+        };
+        const finalizeLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+          }),
+        });
+        await assert.rejects(
+          finalizeLossAuthority.finalizeWriterLaunchAttemptStarted(
+            finalization,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const committed = await restarted.readWriterLaunchAttempt({
+          operationId: input.operationId,
+        });
+        assertOperationReceipt(committed, "committed");
+        assert.equal(
+          committed.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.equal(
+          committed.launch.launchAttemptId,
+          input.operationId,
+        );
+        const finalizeReplay =
+          await restarted.finalizeWriterLaunchAttemptStarted(
+            structuredClone(finalization),
+          );
+        assertOperationReceipt(finalizeReplay, "committed");
+        assert.equal(finalizeReplay.finalized, false);
+        assert.deepEqual(finalizeReplay.launch, committed.launch);
+      },
+    );
+
+    await t.test(
+      "writer launch recovery is bounded and concurrent claims grant once",
+      async () => {
+        const orderedSessionIds = Array.from(
+          { length: 3 },
+          () => randomUUID(),
+        ).sort();
+        sessionIds.push(...orderedSessionIds);
+        const inputs = [];
+        for (const sessionId of orderedSessionIds) {
+          const fixture =
+            await prepareCommittedRestoreGenerationFixture(
+              authority,
+              checkpointAuthority,
+              sessionId,
+            );
+          const input = writerLaunchAttemptInput(
+            fixture.finalized.session,
+            fixture.finalized.generation,
+          );
+          inputs.push(input);
+          await authority.reserveOperation(input);
+        }
+
+        const concurrentAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstSessionLockQueryBarrierPool(
+              pool,
+              2,
+              "writer launch dispatch claim barrier",
+            ),
+            maxTransactionAttempts: 3,
+          }),
+        });
+        const concurrentClaimInput = {
+          ...structuredClone(inputs[0]),
+          expectedOperationRevision: "0",
+        };
+        const concurrentReceipts = await Promise.all([
+          concurrentAuthority.claimWriterLaunchAttemptDispatch(
+            concurrentClaimInput,
+          ),
+          concurrentAuthority.claimWriterLaunchAttemptDispatch(
+            structuredClone(concurrentClaimInput),
+          ),
+        ]);
+        assert.equal(
+          concurrentReceipts.filter(
+            ({ dispatchGranted }) => dispatchGranted,
+          ).length,
+          1,
+        );
+        assert.equal(
+          concurrentReceipts.filter(
+            ({ dispatchGranted }) => !dispatchGranted,
+          ).length,
+          1,
+        );
+        assert.deepEqual(
+          concurrentReceipts[0].operation,
+          concurrentReceipts[1].operation,
+        );
+
+        const uncertainStarting =
+          await authority.claimWriterLaunchAttemptDispatch({
+            ...structuredClone(inputs[1]),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(uncertainStarting, "starting");
+        const uncertain = await authority.markOperationUncertain({
+          ...structuredClone(inputs[1]),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(uncertain, "uncertain");
+
+        const firstPage =
+          await authority.listWriterLaunchAttemptRecoveryCandidates({
+            afterSessionId: null,
+            limit: 1,
+          });
+        assert.deepEqual(firstPage.candidates, [
+          {
+            launchAttemptId: inputs[0].operationId,
+            request: inputs[0].request,
+          },
+        ]);
+        assert.equal(
+          firstPage.nextAfterSessionId,
+          orderedSessionIds[0],
+        );
+
+        const secondPage =
+          await authority.listWriterLaunchAttemptRecoveryCandidates({
+            afterSessionId: firstPage.nextAfterSessionId,
+            limit: 1,
+          });
+        assert.deepEqual(secondPage.candidates, [
+          {
+            launchAttemptId: inputs[1].operationId,
+            request: inputs[1].request,
+          },
+        ]);
+        assert.equal(
+          secondPage.nextAfterSessionId,
+          null,
+        );
+
+        const terminalPage =
+          await authority.listWriterLaunchAttemptRecoveryCandidates({
+            afterSessionId: orderedSessionIds[1],
+            limit: 1,
+          });
+        assert.deepEqual(terminalPage, {
+          candidates: [],
+          nextAfterSessionId: null,
+        });
+        assert.equal(
+          inputs[2].operationId ===
+            firstPage.candidates[0].launchAttemptId ||
+            inputs[2].operationId ===
+              secondPage.candidates[0].launchAttemptId,
+          false,
         );
       },
     );

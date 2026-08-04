@@ -133,12 +133,29 @@
   fence, and atomically finalises the committed generation with its operation,
   reservation, and session terminal anchor. Claim replay never grants a second
   dispatch; exact finalisation replay and bounded `starting`/`uncertain`
-  recovery remain available without changing the session document version or
-  schema.
+  recovery remain available on the migration version 2 schema.
+- Typed durable writer-launch attempts now reuse the permanent operation and
+  reservation rows without migration version 3. One operation ID is also the
+  launch-attempt ID and binds a committed destination generation, exact
+  attachment, stable lease and fence tuple, bounded measured-image projection,
+  and trusted supervisor identity. Definite claim revalidates the generation's
+  committed session-history relation, acquires all relation locks, then checks
+  database-clock lease validity before granting dispatch once; `starting` and
+  `uncertain` remain durable blockers. Exact supervisor evidence finalises an
+  attempt as started, not started, or completely stopped.
+- Canonical session document version 3 adds a relationally checked current
+  launch pointer for a started writer. The pointer remains authoritative after
+  lease renewal, checkpoint capture, or another terminal operation replaces
+  `lastOperation`; readback follows its operation ID and revalidates the
+  permanent request, result, generation, attachment, stable lease tuple, image
+  measurement, process incarnation, writer incarnation, and supervisor proof.
+  Version 1 and version 2 documents retain exact-read and replay compatibility,
+  while the next real state write upgrades them to version 3.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until a finalised destination generation is bound to durable logical
-  launcher admission and exact writer registration; no published restore path
-  or generation row is writer-launch authority by itself.
+  until the durable attempt is composed with the original one-use image
+  capability, external launcher invocation, and exact writer registration. No
+  published restore path, generation row, serialized measurement, or durable
+  attempt record is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -187,6 +204,8 @@
   `docs/project_journal/2026/08/2026-08-03-restore-generation-schema-c0a7f4.md`
 - Typed restore-generation authority:
   `docs/project_journal/2026/08/2026-08-04-restore-generation-authority-a4d912.md`
+- Durable launch-attempt lifecycle:
+  `docs/project_journal/2026/08/2026-08-04-durable-launch-attempt-lifecycle-6e2f8b.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -199,6 +218,6 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  authority until the canonical committed destination generation can be bound
-  to the later durable launch-attempt and logical launcher admission
-  transactions.
+  authority until the durable attempt is composed with one-use image
+  capability consumption, external launch, exact writer registration, and
+  acknowledgement-loss recovery.

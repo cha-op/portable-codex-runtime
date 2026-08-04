@@ -94,9 +94,9 @@ canonical registry and durable operation kernel now bind immutable session
 identity, one exact session-wide mutation reservation, a single definite
 dispatch claim, retained uncertainty, and safe pre-dispatch cancellation. A
 versioned terminal anchor ties every progressed inactive session to the latest
-committed operation and released reservation; legacy version 1 snapshots keep
-their exact revision-zero request identity until the next state write upgrades
-them.
+committed operation and released reservation; legacy version 1 and version 2
+snapshots keep their exact request identity until the next state write upgrades
+them to canonical document version 3.
 Typed writer acquisition now allocates one database-clock lease and uint64
 epoch, finalizes exact provider mutation and attachment evidence from definite
 or uncertain dispatch, and renews only the lease expiration through an
@@ -161,10 +161,25 @@ composition; the serialized ID is not self-authenticating.
 whose commit acknowledgement is lost never grants a second publication
 dispatch. Publication still runs outside the database transaction, and a
 committed generation is only input to the later logical launcher admission.
-Production restore therefore remains fail-closed. Crash-consistent ext4 or
-filesystem-image backend execution and launcher admission remain later
-slices; neither a database lease nor a higher epoch is a physical writer
-fence.
+The same operation and reservation schema now also carries typed durable
+writer-launch attempts. One attempt binds an exact committed generation,
+attachment, lease and fence tuple, bounded measured-image projection, and
+trusted supervisor identity before granting a single dispatch. Claim validates
+the committed generation's session-history anchor and acquires its relation
+locks before the final database-clock lease check. `starting` and `uncertain`
+attempts remain durable blockers. Exact supervisor evidence can finalize an
+attempt as started, not started, or completely stopped; a started result is
+anchored by canonical session document version 3 even after later terminal
+operations replace `lastOperation`. No launch-specific table is required, and
+the serialized generation, measurement, process, writer, and proof identifiers
+are correlation values rather than launch capabilities.
+
+Production restore therefore remains fail-closed. The later logical-launcher
+slice must consume the original one-use image reservation, invoke the external
+launcher, and register the exact writer incarnation against the durable
+attempt. Crash-consistent ext4 or filesystem-image backend execution also
+remains later work; neither a database lease nor a higher epoch is a physical
+writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -311,8 +326,9 @@ filesystem development and conformance backend, not an NFS, live-volume, or
 automatic failover implementation. The durable authority interface and
 conformance tests define the seam, and the PostgreSQL authority now implements
 clean capture, committed reconciliation, and typed destination-generation
-state. Restore remains fail-closed until the generation is bound to durable
-launcher admission and exact writer registration. See
+state. Restore remains fail-closed until the durable launch attempt is composed
+with one-use image-capability consumption, external launch, and exact writer
+registration. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

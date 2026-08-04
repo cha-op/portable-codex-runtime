@@ -51,7 +51,7 @@
 - [done] Implement typed canonical restore destination generation claim,
   dispatch, finalisation, exact replay, and recovery authority while keeping
   production restore fail-closed.
-- [pending] Implement the durable launch-attempt lifecycle around exact
+- [done] Implement the durable launch-attempt lifecycle around exact
   generation, lease, attachment, fencing, measured-image, process, writer, and
   supervisor bindings without invoking a launcher inside that slice.
 - [pending] Compose logical launcher admission from the typed generation,
