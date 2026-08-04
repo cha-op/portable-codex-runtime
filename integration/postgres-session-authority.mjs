@@ -7098,7 +7098,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2],
+          [1, 2, 3],
         );
 
         const input = writerLaunchAttemptInput(
