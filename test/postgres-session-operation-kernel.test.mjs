@@ -148,6 +148,15 @@ const OPERATION_COLUMNS = [
   "updated_at",
   "retired_at",
 ].join(", ");
+const OPERATION_ID_CLAIM_COLUMNS = [
+  "operation_id",
+  "session_id",
+  "claim_type",
+  "claimant_operation_id",
+  "binding",
+  "claimed_at",
+  "materialized_at",
+].join(", ");
 const RESERVATION_COLUMNS = [
   "reservation_id",
   "operation_id",
@@ -166,6 +175,13 @@ const READ_OPERATION_QUERY = [
   "FROM session_authority.operation_claims",
   "WHERE operation_id = $1",
 ].join(" ");
+const READ_OPERATION_ID_CLAIM_QUERY = [
+  `SELECT ${OPERATION_ID_CLAIM_COLUMNS}`,
+  "FROM session_authority.operation_id_registry",
+  "WHERE operation_id = $1",
+].join(" ");
+const READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY =
+  `${READ_OPERATION_ID_CLAIM_QUERY} FOR UPDATE`;
 const LIST_CHECKPOINT_CAPTURE_RECOVERY_FIRST_PAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.operation_claims",
@@ -240,12 +256,52 @@ const READ_ACTIVE_COUNTS_QUERY = [
   "AS reservation_count",
 ].join(" ");
 const INSERT_OPERATION_QUERY = [
+  "WITH claimed_id AS (",
+  "INSERT INTO session_authority.operation_id_registry",
+  "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+  "claimed_at, materialized_at)",
+  "VALUES ($1, $2::uuid, 'direct-operation', NULL, NULL,",
+  "$5, $5)",
+  "ON CONFLICT (operation_id) DO NOTHING",
+  "RETURNING operation_id)",
   "INSERT INTO session_authority.operation_claims",
   "(operation_id, session_id, kind, request, result, state, revision,",
   "created_at, updated_at, retired_at)",
-  "VALUES ($1, $2::uuid, $3, $4::jsonb, NULL, 'prepared', 0, $5, $5, NULL)",
+  "SELECT $1, $2::uuid, $3, $4::jsonb, NULL, 'prepared', 0, $5, $5, NULL",
+  "FROM claimed_id",
   "ON CONFLICT (operation_id) DO NOTHING",
   `RETURNING ${OPERATION_COLUMNS}`,
+].join(" ");
+const INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY = [
+  "INSERT INTO session_authority.operation_id_registry",
+  "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+  "claimed_at, materialized_at)",
+  "VALUES ($1, $2::uuid, 'restore-launch-intent-v2',",
+  "$3, $4::jsonb, $5, NULL)",
+  "ON CONFLICT DO NOTHING",
+  `RETURNING ${OPERATION_ID_CLAIM_COLUMNS}`,
+].join(" ");
+const INSERT_PRECLAIMED_OPERATION_QUERY = [
+  "INSERT INTO session_authority.operation_claims",
+  "(operation_id, session_id, kind, request, result, state, revision,",
+  "created_at, updated_at, retired_at)",
+  "SELECT $1, $2::uuid, $3, $4::jsonb, NULL, 'prepared', 0, $5, $5, NULL",
+  "FROM session_authority.operation_id_registry",
+  "WHERE operation_id = $1 AND session_id = $2::uuid",
+  "AND claim_type = 'restore-launch-intent-v2'",
+  "AND claimant_operation_id = $6 AND binding = $7::jsonb",
+  "AND materialized_at IS NULL",
+  "ON CONFLICT (operation_id) DO NOTHING",
+  `RETURNING ${OPERATION_COLUMNS}`,
+].join(" ");
+const MATERIALIZE_RESTORE_LAUNCH_ID_CLAIM_QUERY = [
+  "UPDATE session_authority.operation_id_registry",
+  "SET materialized_at = $3",
+  "WHERE operation_id = $1 AND session_id = $2::uuid",
+  "AND claim_type = 'restore-launch-intent-v2'",
+  "AND claimant_operation_id = $4 AND binding = $5::jsonb",
+  "AND materialized_at IS NULL",
+  `RETURNING ${OPERATION_ID_CLAIM_COLUMNS}`,
 ].join(" ");
 const INSERT_RESERVATION_QUERY = [
   "INSERT INTO session_authority.reservations",
@@ -318,11 +374,20 @@ const RELEASE_ACTIVE_RESERVATION_QUERY = [
   `RETURNING ${RESERVATION_COLUMNS}`,
 ].join(" ");
 const INSERT_COMMITTED_OPERATION_QUERY = [
+  "WITH claimed_id AS (",
+  "INSERT INTO session_authority.operation_id_registry",
+  "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+  "claimed_at, materialized_at)",
+  "VALUES ($1, $2::uuid, 'direct-operation', NULL, NULL,",
+  "$6, $6)",
+  "ON CONFLICT (operation_id) DO NOTHING",
+  "RETURNING operation_id)",
   "INSERT INTO session_authority.operation_claims",
   "(operation_id, session_id, kind, request, result, state, revision,",
   "created_at, updated_at, retired_at)",
-  "VALUES ($1, $2::uuid, $3, $4::jsonb, $5::jsonb, 'committed', 0,",
-  "$6, $6, $6)",
+  "SELECT $1, $2::uuid, $3, $4::jsonb, $5::jsonb, 'committed', 0,",
+  "$6, $6, $6",
+  "FROM claimed_id",
   "ON CONFLICT (operation_id) DO NOTHING",
   `RETURNING ${OPERATION_COLUMNS}`,
 ].join(" ");
@@ -2154,6 +2219,53 @@ function restoreGenerationRow(
   };
 }
 
+function operationIdRegistryRow({
+  binding = null,
+  claimType = "direct-operation",
+  claimedAt = LATER,
+  claimantOperationId = OPERATION_ID,
+  materializedAt = claimedAt,
+  operationId = OPERATION_ID,
+  sessionId = SESSION_ID,
+} = {}) {
+  return {
+    operation_id: operationId,
+    session_id: sessionId,
+    claim_type: claimType,
+    claimant_operation_id: claimantOperationId,
+    binding: structuredClone(binding),
+    claimed_at: new Date(claimedAt),
+    materialized_at:
+      materializedAt === null ? null : new Date(materializedAt),
+  };
+}
+
+function restoreLaunchIdClaimRow(
+  fixture,
+  {
+    binding = undefined,
+    claimantOperationId = undefined,
+    materializedAt = null,
+    operationId = undefined,
+    sessionId = undefined,
+  } = {},
+) {
+  const restore = fixture.restore ?? fixture;
+  return operationIdRegistryRow({
+    binding:
+      binding === undefined
+        ? canonicalPayload(restore.launchIntent)
+        : binding,
+    claimType: "restore-launch-intent-v2",
+    claimedAt: RESTORE_DISPATCH_NOW,
+    claimantOperationId:
+      claimantOperationId ?? restore.options.operationId,
+    materializedAt,
+    operationId: operationId ?? restore.launchIntent.launchAttemptId,
+    sessionId: sessionId ?? restore.options.expectedSession.sessionId,
+  });
+}
+
 function restoreGenerationTerminalResult(fixture, completion = fixture.completion) {
   return {
     catalogueSha256: sha256(
@@ -2297,7 +2409,7 @@ function restoreCheckpointSourceSteps(fixture) {
 function restoreGenerationActiveSteps(
   fixture,
   state,
-  { generation = undefined } = {},
+  { generation = undefined, launchIdClaim = undefined } = {},
 ) {
   const durableGeneration =
     generation === undefined
@@ -2314,6 +2426,22 @@ function restoreGenerationActiveSteps(
   if (state !== "prepared") {
     steps.push(...restoreCheckpointSourceSteps(fixture));
   }
+  const durableLaunchIdClaim =
+    launchIdClaim === undefined &&
+    fixture.request.contractVersion === 2 &&
+    state !== "prepared"
+      ? restoreLaunchIdClaimRow(fixture, {
+          materializedAt:
+            state === "committed" ? RESTORE_FINALIZE_NOW : null,
+        })
+      : launchIdClaim;
+  if (durableLaunchIdClaim !== undefined) {
+    steps.push(
+      durableLaunchIdClaim === null
+        ? rows()
+        : rows(durableLaunchIdClaim),
+    );
+  }
   steps.push(
     rows(fixture.writer.committedOperation),
     rows(fixture.writer.releasedReservation),
@@ -2323,9 +2451,13 @@ function restoreGenerationActiveSteps(
 
 function restoreGenerationCommittedSteps(
   fixture,
-  { completion = fixture.completion, operationRevision = "3" } = {},
+  {
+    completion = fixture.completion,
+    launchIdClaim = undefined,
+    operationRevision = "3",
+  } = {},
 ) {
-  return [
+  const steps = [
     rows(
       restoreGenerationCommittedSessionRow(fixture, {
         completion,
@@ -2345,6 +2477,20 @@ function restoreGenerationCommittedSteps(
     })),
     ...restoreCheckpointSourceSteps(fixture),
   ];
+  const durableLaunchIdClaim =
+    launchIdClaim === undefined && fixture.request.contractVersion === 2
+      ? restoreLaunchIdClaimRow(fixture, {
+          materializedAt: RESTORE_FINALIZE_NOW,
+        })
+      : launchIdClaim;
+  if (durableLaunchIdClaim !== undefined) {
+    steps.push(
+      durableLaunchIdClaim === null
+        ? rows()
+        : rows(durableLaunchIdClaim),
+    );
+  }
+  return steps;
 }
 
 function restoreGenerationCancelledFixture(fixture) {
@@ -2668,10 +2814,13 @@ function writerLaunchPhaseSessionRow(
   });
 }
 
-function restoreLaunchHandoffActiveSteps(fixture) {
+function restoreLaunchHandoffActiveSteps(
+  fixture,
+  { launchIdClaim = undefined } = {},
+) {
   const restoreOperationRevision =
     fixture.options.expectedSession.document.lastOperation.operationRevision;
-  return [
+  const steps = [
     rows(
       writerLaunchPhaseSessionRow(fixture, "prepared", {
         updatedAt: RESTORE_FINALIZE_NOW,
@@ -2698,6 +2847,25 @@ function restoreLaunchHandoffActiveSteps(fixture) {
     rows(restoreGenerationRow(fixture.restore, "committed")),
     ...restoreCheckpointSourceSteps(fixture.restore),
   ];
+  const durableLaunchIdClaim =
+    launchIdClaim === undefined
+      ? restoreLaunchIdClaimRow(fixture, {
+          materializedAt: RESTORE_FINALIZE_NOW,
+        })
+      : launchIdClaim;
+  steps.push(
+    durableLaunchIdClaim === null
+      ? rows()
+      : rows(durableLaunchIdClaim),
+  );
+  return steps;
+}
+
+function restoreLaunchHandoffRestoreSteps(fixture, state) {
+  const restore = fixture.restore ?? fixture;
+  return restoreGenerationActiveSteps(restore, state, {
+    launchIdClaim: restoreLaunchIdClaimRow(restore),
+  });
 }
 
 function restoreLaunchHandoffWriteSteps(
@@ -2730,6 +2898,11 @@ function restoreLaunchHandoffWriteSteps(
       writerLaunchReservationRow(fixture, "prepared", {
         createdAt: RESTORE_FINALIZE_NOW,
         updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
+    rows(
+      restoreLaunchIdClaimRow(fixture, {
+        materializedAt: RESTORE_FINALIZE_NOW,
       }),
     ),
     finalSession === undefined
@@ -2790,7 +2963,7 @@ function writerLaunchBaseSessionRow(fixture) {
 function writerLaunchBaseSteps(fixture) {
   const restoreOperationRevision =
     fixture.options.expectedSession.document.lastOperation.operationRevision;
-  return [
+  const steps = [
     rows(writerLaunchBaseSessionRow(fixture)),
     rows({ operation_count: 0, reservation_count: 0 }),
     rows(
@@ -2802,6 +2975,16 @@ function writerLaunchBaseSteps(fixture) {
     rows(restoreGenerationRow(fixture.restore, "committed")),
     ...restoreCheckpointSourceSteps(fixture.restore),
   ];
+  if (fixture.restore.request.contractVersion === 2) {
+    steps.push(
+      rows(
+        restoreLaunchIdClaimRow(fixture, {
+          materializedAt: RESTORE_FINALIZE_NOW,
+        }),
+      ),
+    );
+  }
+  return steps;
 }
 
 function writerLaunchGenerationReferenceSteps(fixture) {
@@ -2844,6 +3027,15 @@ function writerLaunchActiveSteps(
     rows(restoreGenerationRow(fixture.restore, "committed")),
     ...restoreCheckpointSourceSteps(fixture.restore),
   );
+  if (fixture.restore.request.contractVersion === 2) {
+    steps.push(
+      rows(
+        restoreLaunchIdClaimRow(fixture, {
+          materializedAt: RESTORE_FINALIZE_NOW,
+        }),
+      ),
+    );
+  }
   return steps;
 }
 
@@ -4455,6 +4647,7 @@ test("invisible INSERT conflict retries in a fresh transaction to exact replay",
       rows(),
       rows(),
       rows(),
+      rows(),
     ],
     activePhaseSteps("prepared", options),
   );
@@ -4475,6 +4668,7 @@ test("invisible INSERT conflict retries in a fresh transaction to exact replay",
     READ_OPERATION_QUERY,
     INSERT_OPERATION_QUERY,
     `${READ_OPERATION_QUERY} FOR UPDATE`,
+    READ_OPERATION_ID_CLAIM_QUERY,
   ]);
   assert.deepEqual(queryTexts(clients[0]).slice(-3), [
     TRANSACTION_ID_QUERY,
@@ -4510,6 +4704,7 @@ test("invisible cross-session operation conflict retries before identity error",
     rows(),
     rows(),
     rows(),
+    rows(),
   ];
   const secondAttempt = [
     rows(otherSessionRow),
@@ -4540,6 +4735,42 @@ test("invisible cross-session operation conflict retries before identity error",
   );
   clients[0].assertExhausted();
   clients[1].assertExhausted();
+});
+
+test("a durable restore launch preclaim blocks generic reuse of its global operation ID", async () => {
+  const restore = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const options = reserveOptions({
+    operationId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(sessionRow()),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(),
+    rows(),
+    rows(),
+    rows(restoreLaunchIdClaimRow(restore)),
+  ]);
+
+  await assertAuthorityError(authority.reserveOperation(options), {
+    code: "operation_identity_conflict",
+  });
+
+  assert.deepEqual(authorityQueries(clients[0]).map(queryText), [
+    `${READ_SESSION_QUERY} FOR UPDATE`,
+    READ_ACTIVE_COUNTS_QUERY,
+    READ_OPERATION_QUERY,
+    INSERT_OPERATION_QUERY,
+    `${READ_OPERATION_QUERY} FOR UPDATE`,
+    READ_OPERATION_ID_CLAIM_QUERY,
+  ]);
+  assert.equal(
+    queryTexts(clients[0]).includes(INSERT_RESERVATION_QUERY),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes(UPDATE_SESSION_QUERY), false);
+  clients[0].assertExhausted();
 });
 
 test("session readback fails closed on pointer, operation, and reservation corruption", async () => {
@@ -6073,6 +6304,7 @@ test("invisible renewal INSERT conflict retries to exact replay", async () => {
         rows(),
         rows(),
         rows(),
+        rows(),
       ],
     },
     [
@@ -6100,6 +6332,7 @@ test("invisible renewal INSERT conflict retries to exact replay", async () => {
       READ_AUTHORITY_CLOCK_QUERY,
       INSERT_COMMITTED_OPERATION_QUERY,
       `${READ_OPERATION_QUERY} FOR UPDATE`,
+      READ_OPERATION_ID_CLAIM_QUERY,
     ],
   );
   assert.deepEqual(queryTexts(clients[0]).slice(-3), [
@@ -10696,7 +10929,7 @@ test("restore generation finalization atomically reserves one launch with the re
   const restore = fixture.restore;
   const writeSteps = restoreLaunchHandoffWriteSteps(fixture);
   writeSteps[4] = (args) => {
-    assert.equal(queryText(args), INSERT_OPERATION_QUERY);
+    assert.equal(queryText(args), INSERT_PRECLAIMED_OPERATION_QUERY);
     const envelope = JSON.parse(args[0].values[3]);
     assert.deepEqual(
       envelope.expectedSession,
@@ -10720,7 +10953,7 @@ test("restore generation finalization atomically reserves one launch with the re
   const { authority, clients } = authorityWithScripts({
     options: { now: RESTORE_FINALIZE_NOW },
     steps: [
-      ...restoreGenerationActiveSteps(restore, "starting"),
+      ...restoreLaunchHandoffRestoreSteps(restore, "starting"),
       ...writeSteps,
     ],
   });
@@ -10789,15 +11022,154 @@ test("restore generation finalization atomically reserves one launch with the re
     COMMIT_ACTIVE_OPERATION_QUERY,
     RELEASE_ACTIVE_RESERVATION_QUERY,
     UPDATE_SESSION_QUERY,
-    INSERT_OPERATION_QUERY,
+    INSERT_PRECLAIMED_OPERATION_QUERY,
     INSERT_RESERVATION_QUERY,
+    MATERIALIZE_RESTORE_LAUNCH_ID_CLAIM_QUERY,
     UPDATE_SESSION_QUERY,
   ]);
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) => queryText(args) === READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY,
+    ),
+    extendedQuery(READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY, [
+      restore.launchIntent.launchAttemptId,
+    ]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) => queryText(args) === MATERIALIZE_RESTORE_LAUNCH_ID_CLAIM_QUERY,
+    ),
+    extendedQuery(MATERIALIZE_RESTORE_LAUNCH_ID_CLAIM_QUERY, [
+      restore.launchIntent.launchAttemptId,
+      restore.options.expectedSession.sessionId,
+      RESTORE_FINALIZE_NOW,
+      restore.options.operationId,
+      JSON.stringify(canonicalPayload(restore.launchIntent)),
+    ]),
+  );
   assert.equal(
     queryTexts(clients[0]).filter((text) => text === "COMMIT").length,
     1,
   );
   clients[0].assertExhausted();
+});
+
+test("restore-to-launch handoff rejects missing or altered reserved launch claims before writes", async (t) => {
+  const scenarios = [
+    { claim: null, name: "missing" },
+    {
+      claim: restoreLaunchIdClaimRow(restoreLaunchHandoffFixture(), {
+        claimantOperationId: OTHER_OPERATION_ID,
+      }),
+      name: "different claimant",
+    },
+    {
+      claim: restoreLaunchIdClaimRow(restoreLaunchHandoffFixture(), {
+        binding: {
+          ...restoreLaunchHandoffFixture().restore.launchIntent,
+          supervisor: {
+            contractVersion: 1,
+            supervisorId: "supervisor-tampered",
+          },
+        },
+      }),
+      name: "altered binding",
+    },
+    {
+      claim: restoreLaunchIdClaimRow(restoreLaunchHandoffFixture(), {
+        materializedAt: RESTORE_FINALIZE_NOW,
+      }),
+      name: "premature materialization",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const fixture = restoreLaunchHandoffFixture();
+      const restore = fixture.restore;
+      const validationSteps = restoreGenerationActiveSteps(
+        restore,
+        "starting",
+        { launchIdClaim: scenario.claim },
+      ).slice(0, -2);
+      const { authority, clients } = authorityWithScripts(validationSteps);
+
+      await assertAuthorityError(
+        authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+          {
+            launch: restore.launchIntent,
+            restore: {
+              ...restore.options,
+              completion: restore.completion,
+              expectedOperationRevision: "1",
+            },
+          },
+        ),
+        { code: "operation_state_invalid" },
+      );
+
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+});
+
+test("restore-to-launch replay rejects missing or altered materialized launch claims", async (t) => {
+  const fixture = restoreLaunchHandoffFixture();
+  const claims = [
+    { claim: null, name: "missing" },
+    {
+      claim: restoreLaunchIdClaimRow(fixture, {
+        binding: {
+          ...fixture.restore.launchIntent,
+          launchAttemptId: "writer-launch-attempt-tampered",
+        },
+        materializedAt: RESTORE_FINALIZE_NOW,
+      }),
+      name: "altered binding",
+    },
+    {
+      claim: restoreLaunchIdClaimRow(fixture),
+      name: "not materialized",
+    },
+  ];
+
+  for (const scenario of claims) {
+    await t.test(scenario.name, async () => {
+      const { authority, clients } = authorityWithScripts(
+        restoreLaunchHandoffActiveSteps(fixture, {
+          launchIdClaim: scenario.claim,
+        }),
+      );
+
+      await assertAuthorityError(
+        authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+          {
+            launch: fixture.restore.launchIntent,
+            restore: {
+              ...fixture.restore.options,
+              completion: fixture.restore.completion,
+              expectedOperationRevision: "1",
+            },
+          },
+        ),
+        { code: "operation_state_invalid" },
+      );
+
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
 });
 
 test("restore-to-launch handoff rolls every generation and launch write back together", async () => {
@@ -10806,7 +11178,7 @@ test("restore-to-launch handoff rolls every generation and launch write back tog
   const { authority, clients } = authorityWithScripts({
     options: { now: RESTORE_FINALIZE_NOW },
     steps: [
-      ...restoreGenerationActiveSteps(restore, "starting"),
+      ...restoreLaunchHandoffRestoreSteps(restore, "starting"),
       ...restoreLaunchHandoffWriteSteps(fixture, {
         finalSession: rows(),
       }),
@@ -10828,7 +11200,7 @@ test("restore-to-launch handoff rolls every generation and launch write back tog
   );
 
   const texts = queryTexts(clients[0]);
-  assert.equal(texts.includes(INSERT_OPERATION_QUERY), true);
+  assert.equal(texts.includes(INSERT_PRECLAIMED_OPERATION_QUERY), true);
   assert.equal(texts.includes(INSERT_RESERVATION_QUERY), true);
   assert.equal(texts.includes("COMMIT"), false);
   assert.equal(texts.includes("ROLLBACK"), true);
@@ -10846,7 +11218,7 @@ test("restore-to-launch handoff acknowledgement loss replays the same prepared a
         now: RESTORE_FINALIZE_NOW,
       },
       steps: [
-        ...restoreGenerationActiveSteps(restore, "starting"),
+        ...restoreLaunchHandoffRestoreSteps(restore, "starting"),
         ...restoreLaunchHandoffWriteSteps(fixture),
       ],
     },
@@ -10897,7 +11269,11 @@ test("restore-to-launch prepared atomic handoff cannot be cancelled", async () =
   const fixture = restoreLaunchHandoffFixture();
   const reason = "caller-abandoned-before-launch-dispatch";
   const { authority, clients } = authorityWithScripts(
-    restoreLaunchHandoffActiveSteps(fixture),
+    restoreLaunchHandoffActiveSteps(fixture, {
+      launchIdClaim: restoreLaunchIdClaimRow(fixture, {
+        materializedAt: RESTORE_FINALIZE_NOW,
+      }),
+    }),
   );
 
   await assertAuthorityError(
@@ -10922,7 +11298,11 @@ test("restore-to-launch prepared atomic handoff cannot be cancelled", async () =
 
 test("restore-to-launch V2 candidate with non-atomic timestamps fails closed before cancellation", async () => {
   const fixture = restoreLaunchHandoffFixture();
-  const committedSteps = restoreLaunchHandoffActiveSteps(fixture);
+  const committedSteps = restoreLaunchHandoffActiveSteps(fixture, {
+    launchIdClaim: restoreLaunchIdClaimRow(fixture, {
+      materializedAt: RESTORE_FINALIZE_NOW,
+    }),
+  });
   const { authority, clients } = authorityWithScripts([
     rows(
       writerLaunchPhaseSessionRow(fixture, "prepared", {
@@ -11032,6 +11412,11 @@ test("restore-to-launch replay rejects a historical cancelled prepared launch", 
     rows(restoreGenerationReservationRow(restore, "released")),
     rows(restoreGenerationRow(restore, "committed")),
     ...restoreCheckpointSourceSteps(restore),
+    rows(
+      restoreLaunchIdClaimRow(fixture, {
+        materializedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
     ...terminalLaunchSteps,
   ]);
 
@@ -11285,6 +11670,123 @@ test("restore generation V2 claim rejects bigint max-6 before external publicati
   clients[0].assertExhausted();
 });
 
+test("restore generation V2 rejects a pre-existing global launch ID before publication", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: RESTORE_AUTHORITY_NOW,
+      now: RESTORE_DISPATCH_NOW,
+    },
+    steps: [
+      ...restoreGenerationActiveSteps(fixture, "prepared"),
+      ...restoreCheckpointSourceSteps(fixture),
+      rows(),
+    ],
+  });
+
+  await assertAuthorityError(
+    authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    }),
+    { code: "operation_identity_conflict" },
+  );
+
+  const texts = queryTexts(clients[0]);
+  assert.equal(texts.includes(INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY), true);
+  assert.equal(texts.includes(READ_AUTHORITY_CLOCK_QUERY), false);
+  assert.equal(texts.includes(INSERT_RESTORE_GENERATION_QUERY), false);
+  assert.equal(texts.includes(START_OPERATION_QUERY), false);
+  assert.equal(texts.includes(UPDATE_SESSION_QUERY), false);
+  clients[0].assertExhausted();
+});
+
+test("restore generation V2 launch ID preclaim survives acknowledgement loss and replays without writes", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const startingOperation = restoreGenerationOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = restoreGenerationReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: RESTORE_AUTHORITY_NOW,
+        commitError: new Error("restore claim acknowledgement lost"),
+        now: RESTORE_DISPATCH_NOW,
+      },
+      steps: [
+        ...restoreGenerationActiveSteps(fixture, "prepared"),
+        ...restoreCheckpointSourceSteps(fixture),
+        rows(restoreLaunchIdClaimRow(fixture)),
+        rows(restoreGenerationRow(fixture)),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    restoreGenerationActiveSteps(fixture, "starting"),
+  );
+  const input = {
+    ...fixture.options,
+    destinationIsolationProofId: fixture.destinationIsolationProofId,
+    expectedOperationRevision: "0",
+    generationId: fixture.generationId,
+  };
+
+  await assert.rejects(
+    authority.claimRestoreDestinationGenerationDispatch(input),
+    assertStoreCommitUncertain,
+  );
+  const replay =
+    await authority.claimRestoreDestinationGenerationDispatch(input);
+
+  assert.equal(replay.dispatchGranted, false);
+  assert.equal(replay.generation.state, "authorized");
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  const firstTexts = queryTexts(clients[0]);
+  assert.ok(
+    firstTexts.indexOf(INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY) <
+      firstTexts.indexOf(READ_AUTHORITY_CLOCK_QUERY),
+  );
+  assert.ok(
+    firstTexts.indexOf(INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY) <
+      firstTexts.indexOf(INSERT_RESTORE_GENERATION_QUERY),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) => queryText(args) === INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY,
+    ),
+    extendedQuery(INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY, [
+      LAUNCH_ATTEMPT_OPERATION_ID,
+      SESSION_ID,
+      RESTORE_OPERATION_ID,
+      JSON.stringify(canonicalPayload(fixture.launchIntent)),
+      RESTORE_DISPATCH_NOW,
+    ]),
+  );
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+});
+
 test("restore generation V2 claim at bigint max-7 covers both handoff routes", async (t) => {
   const routes = [
     {
@@ -11388,6 +11890,7 @@ test("restore generation V2 claim at bigint max-7 covers both handoff routes", a
           steps: [
             ...restoreGenerationActiveSteps(restore, "prepared"),
             ...restoreCheckpointSourceSteps(restore),
+            rows(restoreLaunchIdClaimRow(restore)),
             rows(restoreGenerationRow(restore)),
             rows(restoreStartingOperation),
             rows(restoreStartingReservation),
@@ -11410,7 +11913,7 @@ test("restore generation V2 claim at bigint max-7 covers both handoff routes", a
         {
           options: { now: RESTORE_FINALIZE_NOW },
           steps: [
-            ...restoreGenerationActiveSteps(
+            ...restoreLaunchHandoffRestoreSteps(
               restore,
               route.restoreUncertain ? "uncertain" : "starting",
             ),
@@ -11535,6 +12038,9 @@ test("restore generation V2 committed replay remains available at bigint max", a
   });
   const { authority, clients } = authorityWithScripts(
     restoreGenerationCommittedSteps(fixture, {
+      launchIdClaim: restoreLaunchIdClaimRow(fixture, {
+        materializedAt: RESTORE_FINALIZE_NOW,
+      }),
       operationRevision: "2",
     }),
   );
@@ -11618,7 +12124,7 @@ test("restore-to-launch handoff at bigint max-5 reaches terminal through uncerta
     {
       options: { now: RESTORE_FINALIZE_NOW },
       steps: [
-        ...restoreGenerationActiveSteps(restore, "starting"),
+        ...restoreLaunchHandoffRestoreSteps(restore, "starting"),
         ...restoreLaunchHandoffWriteSteps(fixture),
       ],
     },
@@ -12280,7 +12786,9 @@ test("restore generation v2 recovery returns the exact durable launch intent", a
   });
   const { authority, clients } = authorityWithScripts([
     rows(restoreGenerationOperationRow(fixture, "starting")),
-    ...restoreGenerationActiveSteps(fixture, "starting"),
+    ...restoreGenerationActiveSteps(fixture, "starting", {
+      launchIdClaim: restoreLaunchIdClaimRow(fixture),
+    }),
   ]);
 
   const page =
@@ -12301,6 +12809,14 @@ test("restore generation v2 recovery returns the exact durable launch intent", a
     nextAfterSessionId: null,
   });
   assertDeepFrozen(page);
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) => queryText(args) === READ_OPERATION_ID_CLAIM_QUERY,
+    ),
+    extendedQuery(READ_OPERATION_ID_CLAIM_QUERY, [
+      LAUNCH_ATTEMPT_OPERATION_ID,
+    ]),
+  );
   clients[0].assertExhausted();
 });
 

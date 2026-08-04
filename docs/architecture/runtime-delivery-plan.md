@@ -158,7 +158,7 @@ Restore and launcher authority are now split into seven serial pull requests:
      epoch, image measurement, process incarnation, and writer incarnation
      without invoking a launcher in this slice.
    - Reuse the permanent operation and reservation rows with the operation ID
-     as the launch-attempt ID; no migration version 3 is required.
+     as the launch-attempt ID; launch phase state needs no separate relation.
    - Upgrade canonical session documents to version 3 on the next real write
      so a started launch remains linked to its immutable operation after
      `lastOperation` advances.
@@ -175,13 +175,26 @@ Restore and launcher authority are now split into seven serial pull requests:
    - Add a version 2 restore-generation request that commits to the exact
      measured image, supervisor, and launch-attempt identity before physical
      publication begins.
+   - Add migration version 3's permanent global operation-ID registry. Direct
+     operations materialize their claim immediately; version 2 restore
+     dispatch durably claims the exact launch-attempt ID before authorizing
+     publication, so no other session or operation can steal it in the crash
+     gap. Drain in-flight legacy writes under an `ACCESS EXCLUSIVE` operation
+     table lock and retain a database trigger that blocks old binaries from
+     advancing V2 work without the exact claim while still allowing strict
+     cancellation before dispatch.
    - In one serializable transition, commit the authorized generation, retire
-     the restore operation, and reserve the exact existing
-     `writer-launch-attempt-v1` operation. Advance the canonical session first
-     to the restore terminal anchor and then to the prepared launch pointer.
+     the restore operation, materialize its exact registry claim as the
+     `writer-launch-attempt-v1` operation, and reserve that operation. Advance
+     the canonical session first to the restore terminal anchor and then to
+     the prepared launch pointer.
    - Prepare the process-local image reservation before publication and let
      the launcher claim only that already-reserved attempt. A crash cannot
      expose a committed generation without durable launch work.
+   - Preserve version 1 behavior, but fail the schema upgrade closed if an old
+     version 2 restore operation has progressed beyond `prepared`: only an
+     undispatched request can safely receive the missing pre-publication
+     registry claim.
 6. **Durable stop and recovery composition**
    - Gate version 2 creation on confirmed fleet-wide authority and recovery
      compatibility before production can persist the new request shape.

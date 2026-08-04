@@ -8,6 +8,8 @@ The implemented authority provides:
 - database-authoritative transaction time;
 - bounded, provenance-aware serialization and deadlock retry;
 - an ordered, checksum-bound authority migration chain;
+- a permanent global operation-ID registry shared by direct operations and
+  restore-bound launch intents;
 - permanent relational and typed state-machine authority for restore
   destination generations;
 - real-PostgreSQL migration and concurrency tests;
@@ -31,8 +33,9 @@ The implemented authority provides:
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
-operation kernel then binds one exact request to one active session reservation
-before any external dispatch can begin. The typed writer lifecycle turns the
+operation kernel then binds one exact request to one permanent global
+operation-ID claim and one active session reservation before any external
+dispatch can begin. The typed writer lifecycle turns the
 lease, attachment, detach, and force-fence records in
 `session-storage-contracts.mjs` into serializable decisions for
 `ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, and `DETACHED`.
@@ -82,10 +85,13 @@ The authority protects three different properties and keeps them distinct:
    stale writer can no longer mutate storage. A higher database epoch blocks
    new logical admissions, but does not itself provide that proof.
 
-The PostgreSQL registry protects the immutable part of canonical identity. The
-operation kernel and typed writer lifecycle methods use the executor and
-schema to order reservation, lease allocation, attachment finalization,
-renewal, release, force-fence epoch advancement, and blocked reconciliation.
+The PostgreSQL session registry protects the immutable part of canonical
+session identity. The global operation-ID registry separately protects
+permanent non-reuse across ordinary operation claims and version 2 restore
+launch intents. The operation kernel and typed writer lifecycle methods use
+the executor and schema to order reservation, lease allocation, attachment
+finalization, renewal, release, force-fence epoch advancement, and blocked
+reconciliation.
 The capture authority uses the same ordering boundary for exact attempt
 admission and catalogue finalisation. The generation relation and typed
 restore-generation transitions protect historical identity, same-session
@@ -173,6 +179,11 @@ this session-wide exclusion rule.
 
 `reserveOperation()` binds a globally unique operation ID to the exact session,
 kind, bounded canonical request, and complete caller-observed session snapshot.
+Before it creates the ordinary operation row, it claims the same identity in
+`session_authority.operation_id_registry` as a materialized
+`direct-operation`. The registry row is permanent: neither cancellation nor
+terminal completion makes that operation ID available for another direct
+operation or a restore-bound launch intent.
 Canonicalization incrementally bounds JSON nodes and UTF-8 bytes, rejects
 accessors, proxies, lone surrogates, and U+0000 before PostgreSQL access, and
 uses captured `String`, `JSON`, and `Buffer` intrinsics plus null-prototype
@@ -182,7 +193,8 @@ In one `SERIALIZABLE` transaction it:
 
 1. locks the canonical session row;
 2. proves the expected immutable identity, lifecycle, and revision;
-3. claims one operation row and one authority-generated reservation row; and
+3. claims one registry row, one operation row, and one authority-generated
+   reservation row; and
 4. writes the matching `activeOperation` pointer while incrementing the session
    revision.
 
@@ -727,8 +739,12 @@ identities rather than session-volume data:
 
 - an exact operation retry may replay only its complete canonical request and
   committed result;
-- reusing an operation ID with a different session, kind, or request fails
-  closed;
+- `operation_id_registry` permanently assigns every operation ID to exactly
+  one session and claim provenance before any external effect;
+- a registry claim is either a materialized `direct-operation`, or a
+  `restore-launch-intent-v2` owned by one claimant restore operation;
+- reusing an operation ID with a different session, claim type, claimant,
+  binding, kind, or request fails closed;
 - an active reservation is unique for the operation and session conflict
   class;
 - capture-attempt IDs and their operation IDs remain claimed by active records
@@ -737,14 +753,27 @@ identities rather than session-volume data:
   capture attempt; and
 - restore destination generation IDs remain independent permanent identities,
   each bound to one exact operation, session, and same-session checkpoint; and
-- each writer launch attempt reuses its globally unique operation ID and
+- each writer launch attempt uses its globally registered operation ID and
   permanent request/result row instead of duplicating phase state in another
-  relation.
+  lifecycle relation.
 
 The PostgreSQL schema intentionally stores state-machine documents as `jsonb`
 while keeping identities, revisions, timestamps, and uniqueness constraints in
 relational columns. Business transitions remain in the authority code so a
 database migration cannot silently invent a new lifecycle.
+
+`session_authority.operation_id_registry` is the one global namespace shared
+by every direct operation and every pre-publication version 2 launch intent.
+Its relational fields retain the operation ID, session ID, `claim_type`,
+optional `claimant_operation_id`, `claimed_at`, and optional
+`materialized_at`. A direct claim has no separate `binding`; a version 2
+restore claim stores the exact canonical launch-intent binding. A direct
+operation is claimed and materialized in the same transaction. A version 2
+restore launch intent is claimed before publication dispatch and remains
+unmaterialized until the atomic handoff creates the matching launch operation.
+The primary key prevents cross-type ID reuse; the unique claimant and
+same-session foreign key let one restore operation own only its one bound
+launch intent. Registry rows are never deleted or released.
 
 Writer acquisition, renewal, release, force-fence, blocked finalization, and
 checkpoint capture use those existing structures without DDL. The canonical
@@ -753,9 +782,9 @@ and terminal anchor; the existing operation and reservation JSONB records
 store each exact typed request and terminal result. Capture-attempt claims bind
 the exact operation and coordinator binding, tombstones are permanent
 non-authorizing reuse fences, and each catalogue row binds one checkpoint to
-one exact attempt and path-free committed completion. The established global
-operation identity and active session-conflict constraints remain the
-admission boundary.
+one exact attempt and path-free committed completion. The permanent registry
+identity and active session-conflict constraints remain the admission
+boundary.
 
 The ordered migration chain treats the installed
 `session_authority.schema_migrations` ledger as an exact contiguous prefix
@@ -773,6 +802,28 @@ session's permanent operation claim and checkpoint catalogue entry.
 `authorized` rows must have no finalized document or commit timestamp;
 `committed` rows must have both. The authority exposes no deletion or
 retirement API for these rows in this foundation.
+
+Migration version 3 adds `session_authority.operation_id_registry`, backfills
+every existing ordinary operation as a materialized `direct-operation`, and
+routes later operation creation through that permanent namespace. It first
+takes an `ACCESS EXCLUSIVE` lock on `operation_claims`, so the legacy-state
+gate observes every old writer that was already in flight. The installed
+`operation_claims_enforce_restore_v2_launch_id_claim` trigger then rejects any
+post-upgrade old-binary transition of a version 2 restore beyond `prepared`
+unless the exact durable launch-intent claim already exists. The only
+claim-free terminal exception is the exact
+`prepared -> committed/cancelled-before-dispatch` transition, which proves no
+restore publication was authorized. For an old
+version 2 restore request, only a still-`prepared` operation can cross the
+migration: it has not received publication dispatch, so its next claim under
+the upgraded authority can safely install the exact
+`restore-launch-intent-v2` row before any external effect. Migration fails
+closed with SQLSTATE `55000` if any
+`restore-destination-generation-v1` operation whose payload contract version
+is 2 is already `starting`, `uncertain`, or `committed`. Such state cannot
+prove that the launch-attempt ID was reserved before publication, and neither
+a completed handoff nor later readback may manufacture that missing
+provenance. Operators must drain or quarantine those rows before upgrade.
 
 These constraints are necessary but not sufficient authority. The typed
 restore-generation layer now retains the backend's exact
@@ -800,9 +851,16 @@ ID is a durable correlation value rather than a self-authenticating
 capability, so later composition must obtain it from the trusted destination
 authority.
 
-Only a definitely committed claim returns `dispatchGranted: true`. A replay
-of `starting`, `uncertain`, or committed state returns the retained generation
-without authorising another publication. Exact finalisation may begin from
+Only a definitely committed claim returns `dispatchGranted: true`. For a
+version 2 request, that same pre-publication transaction must first create or
+exactly replay the permanent `restore-launch-intent-v2` registry row for
+`launchIntent.launchAttemptId`, bound to the restore operation as its claimant.
+An ID already claimed by any different direct operation, restore request,
+session, or launch binding rejects dispatch before publication can occur. A
+version 1 request creates no launch-intent claim and preserves its historical
+dispatch and finalisation contract. A replay of `starting`, `uncertain`, or
+committed state returns the retained generation without authorising another
+publication. Exact finalisation may begin from
 `starting` or `uncertain` and atomically changes the generation to `committed`,
 retires the operation, releases the reservation, and advances the session
 terminal anchor. The committed document binds the source artefact proof, the
@@ -837,10 +895,12 @@ remains fail-closed until that composition exists.
 
 ## Implemented Durable Launch-Attempt Lifecycle
 
-`writer-launch-attempt-v1` reuses the migration version 2 operation and
-reservation schema. The operation ID is also the launch-attempt ID; no
-migration version 3 or launch-specific relation is required. The permanent
-operation request binds:
+`writer-launch-attempt-v1` reuses the operation and reservation lifecycle
+schema. The operation ID is also the launch-attempt ID. Migration version 3
+adds only the shared operation-ID registry needed to reserve that identity
+before a version 2 restore publication; it does not duplicate launch phase
+state in a launch-specific lifecycle relation. The permanent operation request
+binds:
 
 - one exact committed restore-generation identity plus hashes of its binding
   and finalized document;
@@ -1096,6 +1156,15 @@ measured-image projection, and supervisor identity. The request is fixed before
 physical publication starts; changing any part of the intent changes the
 durable restore request identity.
 
+The version 2 restore dispatch transaction claims
+`launchIntent.launchAttemptId` in the global registry before returning
+`dispatchGranted: true`. The row is a permanent, initially unmaterialized
+`restore-launch-intent-v2` claim bound to the exact session, claimant restore
+operation, and launch-intent binding. This closes the earlier race in which a
+different operation could claim the launch ID after publication but before
+handoff. An exact retry may read the same claim; a different claim can neither
+replace nor release it.
+
 `finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt()` performs
 one serializable authority transition. It validates the version 2 intent and
 then:
@@ -1106,13 +1175,16 @@ then:
 3. advances the canonical session to the restore terminal anchor;
 4. derives the existing `writer-launch-attempt-v1` request from that exact
    terminal snapshot and committed generation;
-5. inserts the prepared launch operation and reservation; and
+5. validates and materializes the pre-publication registry claim, inserts the
+   prepared launch operation and reservation, and records `materialized_at`;
+   and
 6. advances the session again so its active pointer names that launch attempt.
 
 The transaction exposes neither intermediate session revision. On rollback,
-none of the generation, terminal restore state, or launch reservation becomes
-visible. A lost commit acknowledgement is resolved by exact readback of both
-operations and the generation; replay cannot reserve a different attempt.
+none of the generation, terminal restore state, registry materialization, or
+launch reservation becomes visible. A lost commit acknowledgement is resolved
+by exact readback of both operations, the registry claim, and the generation;
+replay cannot reserve a different attempt.
 Before restore dispatch can authorize physical publication, a version 2
 request proves a seven-revision budget for restore claim, optional restore
 uncertainty, both handoff writes, and the launch claim, uncertainty, and
@@ -1126,6 +1198,15 @@ Version 1 restore requests remain readable and independently finalisable, but
 they have no durable launch intent and cannot use the atomic handoff.
 Version 1 recovery candidates also retain their historical three-field shape;
 only version 2 candidates carry `launchIntent`.
+
+The migration does not infer pre-publication provenance after the fact. It
+allows an old version 2 restore operation to cross the upgrade only while that
+operation is still `prepared`; the upgraded dispatch path creates its
+launch-intent registry claim before granting publication. Any old version 2
+operation already in `starting`, `uncertain`, or `committed` makes the upgrade
+fail closed; it must be drained or quarantined rather than being given a
+synthetic registry history. This also means an old completed handoff does not
+gain new provenance merely because its operation row can be backfilled.
 
 Version 2 creation is not yet reachable from production `runRestore()`. Before
 a later release enables that path, every authority and recovery node that can
@@ -1169,8 +1250,9 @@ durable correlation and full-measurement recovery binding, not a replacement
 for any image capability or a writer handle.
 
 The authority reconstructs the exact version 2 handoff from the terminal
-restore request, committed generation, launch intent, and same-transaction
-operation and reservation timestamps before accepting prepared cancellation.
+restore request, committed generation, launch intent, permanent registry
+claim, and same-transaction operation and reservation timestamps before
+accepting prepared cancellation.
 An exact atomic handoff is not cancellable; a generic reconciliation attempt
 without the matching image capability remains uncertain and leaves it
 prepared for `runPreparedLaunch()`. Standalone version 1 launch reservations

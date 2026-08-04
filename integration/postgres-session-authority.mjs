@@ -77,6 +77,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
     ),
     version: 2,
   }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/003-operation-id-registry.sql",
+      import.meta.url,
+    ),
+    version: 3,
+  }),
 ]);
 
 if (!databaseConfigured) {
@@ -111,8 +118,12 @@ async function readMigrationLedger(pool) {
   return result.rows;
 }
 
-async function installVersionOneAuthority(pool, migration) {
-  assert.equal(migration.version, 1);
+async function installAuthorityMigrations(pool, migrations) {
+  assert.notEqual(migrations.length, 0);
+  assert.deepEqual(
+    migrations.map(({ version }) => version),
+    migrations.map((_, index) => index + 1),
+  );
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -127,21 +138,369 @@ async function installVersionOneAuthority(pool, migration) {
         ")",
       ].join(" "),
     );
-    await client.query(migration.sql);
-    await client.query(
-      [
-        "INSERT INTO session_authority.schema_migrations",
-        "(version, checksum, applied_at)",
-        "VALUES ($1, $2, pg_catalog.transaction_timestamp())",
-      ].join(" "),
-      [migration.version, migration.checksum],
-    );
+    for (const migration of migrations) {
+      await client.query(migration.sql);
+      await client.query(
+        [
+          "INSERT INTO session_authority.schema_migrations",
+          "(version, checksum, applied_at)",
+          "VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+        ].join(" "),
+        [migration.version, migration.checksum],
+      );
+    }
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function installVersionOneAuthority(pool, migration) {
+  assert.equal(migration.version, 1);
+  return installAuthorityMigrations(pool, [migration]);
+}
+
+async function insertDirectOperationIdClaim(
+  queryable,
+  { claimedAt, operationId, sessionId },
+) {
+  await queryable.query(
+    [
+      "INSERT INTO session_authority.operation_id_registry",
+      "(operation_id, session_id, claim_type, claimant_operation_id,",
+      "binding, claimed_at, materialized_at)",
+      "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, $3)",
+    ].join(" "),
+    [operationId, sessionId, claimedAt],
+  );
+}
+
+async function waitForMigrationOperationTableLock(pool) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await pool.query(
+      [
+        "SELECT count(*)::integer AS value",
+        "FROM pg_catalog.pg_stat_activity",
+        "WHERE datname = pg_catalog.current_database()",
+        "AND wait_event_type = 'Lock'",
+        "AND position(",
+        "'LOCK TABLE session_authority.operation_claims IN ACCESS EXCLUSIVE MODE'",
+        "IN query) > 0",
+      ].join(" "),
+    );
+    if (result.rows[0]?.value >= 1) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail("operation ID registry migration did not wait for old writers");
+}
+
+async function assertLegacyRestoreV2MigrationGate(
+  pool,
+  store,
+  trackedMigrations,
+) {
+  await pool.query("DROP SCHEMA IF EXISTS session_authority CASCADE");
+  await installAuthorityMigrations(pool, trackedMigrations.slice(0, 2));
+
+  const blockedOperationId = `legacy-starting-restore-v2-${randomUUID()}`;
+  const sessionId = randomUUID();
+  const timestamp = await pool.query(
+    "SELECT pg_catalog.transaction_timestamp() AS value",
+  );
+  const now = timestamp.rows[0].value;
+  await pool.query(
+    [
+      "INSERT INTO session_authority.sessions",
+      "(session_id, document, created_at, updated_at)",
+      "VALUES ($1, $2::jsonb, $3, $3)",
+    ].join(" "),
+    [sessionId, EMPTY_JSON_OBJECT, now],
+  );
+  const inserted = await pool.query(
+    [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+      "VALUES ($1, $2, 'restore-destination-generation-v1',",
+      "$3::jsonb, 'prepared', $4, $4)",
+      "RETURNING created_at",
+    ].join(" "),
+    [
+      blockedOperationId,
+      sessionId,
+      JSON.stringify({ payload: { contractVersion: 2 } }),
+      now,
+    ],
+  );
+  assert.equal(inserted.rows.length, 1);
+
+  const oldWriter = await pool.connect();
+  let oldWriterTransactionOpen = false;
+  try {
+    await oldWriter.query("BEGIN");
+    oldWriterTransactionOpen = true;
+    await oldWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', updated_at = $2",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [blockedOperationId, now],
+    );
+    const migrationOutcome = store.migrate().then(
+      (value) => ({ error: null, value }),
+      (error) => ({ error, value: null }),
+    );
+    await waitForMigrationOperationTableLock(pool);
+    await oldWriter.query("COMMIT");
+    oldWriterTransactionOpen = false;
+    const outcome = await migrationOutcome;
+    assert.equal(outcome.value, null);
+    assert.ok(outcome.error instanceof PostgresSerializableStoreError);
+    assert.equal(outcome.error.code, "migration_failed");
+    assert.equal(outcome.error.commitState, "not-committed");
+  } finally {
+    if (oldWriterTransactionOpen) await oldWriter.query("ROLLBACK");
+    oldWriter.release();
+  }
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 2).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  const absentRegistry = await pool.query(
+    "SELECT pg_catalog.to_regclass('session_authority.operation_id_registry') AS value",
+  );
+  assert.equal(absentRegistry.rows[0].value, null);
+
+  await pool.query(
+    "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+    [blockedOperationId],
+  );
+  const operationId = `legacy-prepared-restore-v2-${randomUUID()}`;
+  await pool.query(
+    [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+      "VALUES ($1, $2, 'restore-destination-generation-v1',",
+      "$3::jsonb, 'prepared', $4, $4)",
+    ].join(" "),
+    [
+      operationId,
+      sessionId,
+      JSON.stringify({ payload: { contractVersion: 2 } }),
+      now,
+    ],
+  );
+  const upgraded = await store.migrate();
+  assert.deepEqual(upgraded, {
+    applied: true,
+    checksum: trackedMigrations[2].checksum,
+    version: 3,
+  });
+  const registry = await pool.query(
+    [
+      "SELECT operation_id, session_id, claim_type, claimant_operation_id,",
+      "binding, claimed_at, materialized_at",
+      "FROM session_authority.operation_id_registry",
+      "WHERE operation_id = $1",
+    ].join(" "),
+    [operationId],
+  );
+  assert.equal(registry.rows.length, 1);
+  assert.equal(registry.rows[0].operation_id, operationId);
+  assert.equal(registry.rows[0].session_id, sessionId);
+  assert.equal(registry.rows[0].claim_type, "direct-operation");
+  assert.equal(registry.rows[0].claimant_operation_id, null);
+  assert.equal(registry.rows[0].binding, null);
+  assert.equal(
+    registry.rows[0].materialized_at.getTime(),
+    registry.rows[0].claimed_at.getTime(),
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', updated_at = $2",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [operationId, now],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "operation_claims_restore_v2_launch_id_claim",
+      );
+      return true;
+    },
+  );
+  const cancelled = await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'committed',",
+      "result = $2::jsonb, revision = revision + 1,",
+      "updated_at = $3, retired_at = $3",
+      "WHERE operation_id = $1 AND state = 'prepared'",
+      "RETURNING state, result, revision, retired_at",
+    ].join(" "),
+    [
+      operationId,
+      JSON.stringify({
+        outcome: "cancelled-before-dispatch",
+        reason: "integration-upgrade-cancellation",
+        resultVersion: 1,
+      }),
+      now,
+    ],
+  );
+  assert.equal(cancelled.rows.length, 1);
+  assert.equal(cancelled.rows[0].state, "committed");
+  assert.equal(cancelled.rows[0].result.outcome, "cancelled-before-dispatch");
+  assert.equal(cancelled.rows[0].revision, "1");
+  assert.equal(cancelled.rows[0].retired_at.getTime(), now.getTime());
+
+  await pool.query(
+    "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+    [operationId],
+  );
+  await pool.query(
+    "DELETE FROM session_authority.operation_id_registry WHERE operation_id = $1",
+    [operationId],
+  );
+  await pool.query(
+    "DELETE FROM session_authority.sessions WHERE session_id = $1",
+    [sessionId],
+  );
+}
+
+async function waitForBackendLockWait(observer, backendPid) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await observer.query(
+      [
+        "SELECT wait_event_type",
+        "FROM pg_catalog.pg_stat_activity",
+        "WHERE pid = $1",
+      ].join(" "),
+      [backendPid],
+    );
+    if (result.rows[0]?.wait_event_type === "Lock") return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail("concurrent operation ID claimant did not wait on the registry");
+}
+
+async function assertOperationIdRegistryConcurrency(pool) {
+  const firstClient = await pool.connect();
+  const secondClient = await pool.connect();
+  const firstSessionId = randomUUID();
+  const secondSessionId = randomUUID();
+  const operationId = `concurrent-operation-${randomUUID()}`;
+  let firstTransactionOpen = false;
+  let secondTransactionOpen = false;
+  try {
+    const now = new Date();
+    await firstClient.query(
+      [
+        "INSERT INTO session_authority.sessions",
+        "(session_id, document, created_at, updated_at)",
+        "VALUES ($1, $3::jsonb, $4, $4), ($2, $3::jsonb, $4, $4)",
+      ].join(" "),
+      [firstSessionId, secondSessionId, EMPTY_JSON_OBJECT, now],
+    );
+    await assert.rejects(
+      firstClient.query(
+        [
+          "INSERT INTO session_authority.operation_id_registry",
+          "(operation_id, session_id, claim_type, claimant_operation_id,",
+          "binding, claimed_at, materialized_at)",
+          "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, NULL)",
+        ].join(" "),
+        [`invalid-direct-operation-${randomUUID()}`, firstSessionId, now],
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "operation_id_registry_claim_shape",
+        );
+        return true;
+      },
+    );
+
+    await firstClient.query("BEGIN");
+    firstTransactionOpen = true;
+    await insertDirectOperationIdClaim(firstClient, {
+      claimedAt: now,
+      operationId,
+      sessionId: firstSessionId,
+    });
+    await firstClient.query(
+      [
+        "INSERT INTO session_authority.operation_claims",
+        "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+        "VALUES ($1, $2, 'integration', $3::jsonb, 'active', $4, $4)",
+      ].join(" "),
+      [operationId, firstSessionId, EMPTY_JSON_OBJECT, now],
+    );
+
+    await secondClient.query("BEGIN");
+    secondTransactionOpen = true;
+    await secondClient.query("SET LOCAL lock_timeout = '5s'");
+    const backend = await secondClient.query(
+      "SELECT pg_catalog.pg_backend_pid() AS value",
+    );
+    const competingInsert = secondClient.query(
+      [
+        "INSERT INTO session_authority.operation_id_registry",
+        "(operation_id, session_id, claim_type, claimant_operation_id,",
+        "binding, claimed_at, materialized_at)",
+        "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, $3)",
+        "ON CONFLICT (operation_id) DO NOTHING",
+        "RETURNING operation_id",
+      ].join(" "),
+      [operationId, secondSessionId, now],
+    );
+    await waitForBackendLockWait(firstClient, backend.rows[0].value);
+    await firstClient.query("COMMIT");
+    firstTransactionOpen = false;
+    assert.deepEqual((await competingInsert).rows, []);
+    await secondClient.query("COMMIT");
+    secondTransactionOpen = false;
+
+    const existingConflict = await firstClient.query(
+      [
+        "INSERT INTO session_authority.operation_id_registry",
+        "(operation_id, session_id, claim_type, claimant_operation_id,",
+        "binding, claimed_at, materialized_at)",
+        "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, $3)",
+        "ON CONFLICT (operation_id) DO NOTHING",
+        "RETURNING operation_id",
+      ].join(" "),
+      [operationId, secondSessionId, now],
+    );
+    assert.deepEqual(existingConflict.rows, []);
+  } finally {
+    if (secondTransactionOpen) await secondClient.query("ROLLBACK");
+    if (firstTransactionOpen) await firstClient.query("ROLLBACK");
+    secondClient.release();
+    firstClient.release();
+    await pool.query(
+      "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+      [operationId],
+    );
+    await pool.query(
+      "DELETE FROM session_authority.operation_id_registry WHERE operation_id = $1",
+      [operationId],
+    );
+    await pool.query(
+      "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2)",
+      [firstSessionId, secondSessionId],
+    );
   }
 }
 
@@ -171,6 +530,11 @@ async function assertRestoreGenerationConstraints(pool) {
         ].join(" "),
         [fixture.sessionId, EMPTY_JSON_OBJECT, now],
       );
+      await insertDirectOperationIdClaim(client, {
+        claimedAt: now,
+        operationId: fixture.captureOperationId,
+        sessionId: fixture.sessionId,
+      });
       await client.query(
         [
           "INSERT INTO session_authority.operation_claims",
@@ -204,6 +568,11 @@ async function assertRestoreGenerationConstraints(pool) {
           now,
         ],
       );
+      await insertDirectOperationIdClaim(client, {
+        claimedAt: now,
+        operationId: fixture.restoreOperationId,
+        sessionId: fixture.sessionId,
+      });
       await client.query(
         [
           "INSERT INTO session_authority.checkpoint_catalogue",
@@ -1793,10 +2162,11 @@ test(
     });
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 2);
+    const latestMigration = trackedMigrations.at(-1);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 3);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2],
+      [1, 2, 3],
     );
 
     await pool.query(
@@ -1805,8 +2175,8 @@ test(
     const freshMigration = await store.migrate();
     assert.deepEqual(freshMigration, {
       applied: true,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -1818,8 +2188,8 @@ test(
     const freshNoOpMigration = await store.migrate();
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -1833,8 +2203,8 @@ test(
     const upgradeMigration = await store.migrate();
     assert.deepEqual(upgradeMigration, {
       applied: true,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -1845,9 +2215,15 @@ test(
     );
     assert.deepEqual(await store.migrate(), {
       applied: false,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
+    await assertLegacyRestoreV2MigrationGate(
+      pool,
+      store,
+      trackedMigrations,
+    );
+    await assertOperationIdRegistryConcurrency(pool);
     await assertRestoreGenerationConstraints(pool);
 
     const baselineWorkMem = await resetStore.runSerializable(
@@ -2153,6 +2529,11 @@ test(
           `integration-operation-${randomUUID()}`,
           `integration-operation-${randomUUID()}`,
         ]) {
+          await insertDirectOperationIdClaim(transaction, {
+            claimedAt: transaction.now,
+            operationId,
+            sessionId: activeOperationSessionId,
+          });
           await transaction.query(
             [
               "INSERT INTO session_authority.operation_claims",
@@ -2190,6 +2571,11 @@ test(
         );
         const retiredOperationId = `integration-operation-${randomUUID()}`;
         const activeOperationId = `integration-operation-${randomUUID()}`;
+        await insertDirectOperationIdClaim(transaction, {
+          claimedAt: transaction.now,
+          operationId: retiredOperationId,
+          sessionId: activeReservationSessionId,
+        });
         await transaction.query(
           [
             "INSERT INTO session_authority.operation_claims",
@@ -2203,6 +2589,11 @@ test(
             transaction.now,
           ],
         );
+        await insertDirectOperationIdClaim(transaction, {
+          claimedAt: transaction.now,
+          operationId: activeOperationId,
+          sessionId: activeReservationSessionId,
+        });
         await transaction.query(
           [
             "INSERT INTO session_authority.operation_claims",
@@ -2307,6 +2698,33 @@ test(
           await pool.query(
             [
               "DELETE FROM session_authority.operation_claims",
+              "WHERE operation_id IN (",
+              "SELECT operation_id",
+              "FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+              "AND claim_type = 'restore-launch-intent-v2'",
+              ")",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+              "AND claim_type = 'restore-launch-intent-v2'",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
             [sessionIds],

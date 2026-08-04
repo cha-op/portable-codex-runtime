@@ -16,9 +16,10 @@ superseded_by:
 
 Closed the durable crash gap between committing one restore destination
 generation and reserving its logical writer launch. Restore request version 2
-binds an exact launch intent before publication, one serializable PostgreSQL
-transition commits the generation and reserves that launch attempt, and the
-launcher consumes only the pre-reserved attempt with an exact opaque image
+binds an exact launch intent and durably claims its globally unique operation
+ID before publication. One later serializable PostgreSQL transition commits
+the generation, materializes that claim as the prepared launch attempt, and
+the launcher consumes only the pre-reserved attempt with an exact opaque image
 capability.
 
 ## Current State
@@ -27,14 +28,21 @@ capability.
   launch-attempt ID, measured-image projection, and supervisor identity in the
   restore operation request. Existing version 1 requests remain valid but have
   no launch intent.
+- Migration version 3 adds the permanent
+  `session_authority.operation_id_registry`. Ordinary operations claim and
+  materialize their ID together; version 2 restore dispatch instead records an
+  unmaterialized `restore-launch-intent-v2` claim bound to the claimant restore
+  operation before granting publication.
 - `finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt()` commits
   the authorized generation, restore operation, and released reservation;
   writes the restore terminal session revision; derives the existing
-  `writer-launch-attempt-v1` request from that exact snapshot; reserves it; and
-  writes the prepared-launch session revision in one serializable transaction.
+  `writer-launch-attempt-v1` request from that exact snapshot; validates and
+  materializes the pre-publication claim; reserves it; and writes the
+  prepared-launch session revision in one serializable transaction.
 - Exact replay returns the same generation and launch attempt. Intent changes,
-  revision exhaustion, standalone-finalize gaps, and partial-state conflicts
-  fail closed instead of fabricating a missing launch reservation.
+  registry ownership conflicts, revision exhaustion, standalone-finalize
+  gaps, and partial-state conflicts fail closed instead of fabricating a
+  missing launch reservation.
 - Restore-generation recovery candidates expose the exact durable launch
   intent for version 2 while preserving the historical three-field version 1
   candidate shape, without treating either form as an opaque image capability.
@@ -59,9 +67,11 @@ capability.
 ## Safety Decisions
 
 - The protected property is one-to-one durable continuity from the authorized
-  restore generation to its intended launch attempt. Generation commit and
-  launch reservation therefore share one transaction; two separately atomic
-  calls are insufficient.
+  restore generation to its intended launch attempt, including permanent
+  non-reuse of the launch-attempt ID. The ID is therefore durably claimed
+  before external publication, while generation commit, registry
+  materialization, and launch reservation share one later transaction; a
+  read-only existence check or two separately atomic calls are insufficient.
 - The first session revision records the committed restore terminal anchor.
   The launch request is derived from that exact snapshot, and the second
   revision records its active prepared pointer. Neither intermediate state is
@@ -85,13 +95,28 @@ capability.
 - Version 1 compatibility does not silently upgrade an already committed
   generation into launch authority. Production composition must use an exact
   version 2 request before physical publication begins.
+- Version 1 requests neither create nor require a launch-intent registry claim,
+  and retain their historical finalisation and recovery shapes. The migration
+  backfills existing ordinary operations as materialized `direct-operation`
+  claims without changing their lifecycle.
+- An old version 2 restore operation may gain the new launch-intent claim only
+  while it is still `prepared`, through its next upgraded dispatch before
+  publication. Migration drains in-flight legacy operation writers with an
+  `ACCESS EXCLUSIVE` table lock, then installs a trigger that rejects any
+  post-upgrade old-binary transition without the exact claim while preserving
+  the strict `prepared -> committed/cancelled-before-dispatch` escape path.
+  Migration
+  aborts with SQLSTATE `55000` on old `starting`,
+  `uncertain`, or `committed` version 2 work because neither a later row
+  insertion nor a completed operation can prove pre-publication ownership.
+  Operators must drain or quarantine that state first.
 - Version 2 remains dormant until production composition lands. Its rollout
   must upgrade every authority/recovery node sharing the database before an
   explicit fleet-capability gate allows any node to create version 2 work;
   version 1 recovery candidates keep their historical exact shape.
-- No new table is required: the handoff uses the permanent generation,
-  operation, reservation, and session relations already covered by the
-  authority migration chain.
+- The registry is an identity relation, not a second launch state machine.
+  Its rows are permanent, and `materialized_at` records the one transition from
+  a restore-bound launch intent into the ordinary operation lifecycle.
 
 ## Next Steps
 
@@ -118,6 +143,7 @@ capability.
 ## Evidence
 
 - `src/postgres-session-authority.mjs`
+- `migrations/authority/003-operation-id-registry.sql`
 - `src/postgres-logical-writer-launcher.mjs`
 - `test/postgres-session-operation-kernel.test.mjs`
 - `test/postgres-logical-writer-launcher.test.mjs`
