@@ -6220,6 +6220,11 @@ function writerLaunchStopRecord(input, operation) {
   });
 }
 
+function currentWriterLaunchForAttempt(session, launchAttemptId) {
+  const launch = session.document.launch;
+  return launch?.launchAttemptId === launchAttemptId ? launch : null;
+}
+
 function validateOperationIdentity(operation, input) {
   ensure(
     operation.operationId === input.operationId &&
@@ -7866,7 +7871,10 @@ async function finalizeWriterLaunchStop(store, options) {
       );
       return operationReceipt({
         finalized: false,
-        launch: session.document.launch,
+        launch: currentWriterLaunchForAttempt(
+          session,
+          input.request.launch.launchAttemptId,
+        ),
         operation: observed.operation,
         reservation: observed.reservation,
         session,
@@ -9610,7 +9618,10 @@ export class PostgresSessionAuthority {
       if (observed.operation.state !== "prepared") {
         return operationReceipt({
           dispatchGranted: false,
-          launch: session.document.launch,
+          launch: currentWriterLaunchForAttempt(
+            session,
+            input.request.launch.launchAttemptId,
+          ),
           operation: observed.operation,
           reservation: observed.reservation,
           session,

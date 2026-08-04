@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-04
 updated: 2026-08-04
 branch: wip/logical-launcher-composition
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/25
 supersedes: []
 superseded_by:
 ---
@@ -56,6 +56,16 @@ production restore remains fail-closed.
   attachment indexes so completed writers do not accumulate with launch
   history. A rejected or uncertain stop retains its local record because the
   writer may still be running.
+- The facade rejects committed authority outcomes unless cancellation uses
+  revision 1 and launch terminal outcomes use revision 2 or 3. A newly
+  finalised receipt must carry the complete terminal `lastOperation` anchor,
+  including its result digest. Historical readback may coexist with a later
+  active operation or retain a later committed anchor only while every current
+  launch digest and its durable start time still bind the original attempt.
+- Historical stop-finalization and stop-claim replays return a top-level
+  launch only when the current pointer still belongs to the original stopped
+  attempt. A later writer remains visible in the returned session snapshot
+  without being misattributed to the older stop receipt.
 
 ## Safety Decisions
 
@@ -74,6 +84,8 @@ production restore remains fail-closed.
 - Local record reclamation requires exact stop confirmation. A callback error
   or non-confirming result remains `lost` and retained for explicit stop or
   fencing recovery rather than being reclaimed speculatively.
+- Durable replay receipts separate current session state from operation-local
+  correlation: a successor launch never becomes evidence for an earlier stop.
 - The production checkpoint adapter remains capture-only and `runRestore()`
   remains fail-closed.
 - A historical started attempt with `launch: null` after a separate durable
@@ -105,6 +117,7 @@ production restore remains fail-closed.
 - `src/postgres-logical-writer-launcher.mjs`
 - `src/postgres-session-authority.mjs`
 - `test/postgres-logical-writer-launcher.test.mjs`
+- `test/postgres-session-operation-kernel.test.mjs`
 - `integration/postgres-session-authority.mjs`
 - `createPostgresLogicalWriterLauncher()`
 - `createWriterLaunchStopOperationRequest()`

@@ -52,13 +52,18 @@ const PREPARED_TIME = "2026-08-04T12:00:01.000Z";
 const STARTING_TIME = "2026-08-04T12:00:02.000Z";
 const UNCERTAIN_TIME = "2026-08-04T12:00:03.000Z";
 const COMMITTED_TIME = "2026-08-04T12:00:04.000Z";
+const jsonStringify = JSON.stringify;
 
 function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
 function jsonBytes(value) {
-  return Buffer.from(JSON.stringify(value), "utf8");
+  return Buffer.from(jsonStringify(value), "utf8");
+}
+
+function jsonSha256(value) {
+  return createHash("sha256").update(jsonStringify(value)).digest("hex");
 }
 
 function imageFixture() {
@@ -239,7 +244,7 @@ function activePointer(operation, reservation) {
 function terminalPointer(operation, reservation) {
   return {
     ...activePointer(operation, reservation),
-    resultSha256: "f".repeat(64),
+    resultSha256: jsonSha256(operation.result),
   };
 }
 
@@ -280,6 +285,12 @@ class MemoryLaunchAuthority {
     this.state = "absent";
     this.result = null;
     this.terminalRevision = null;
+    this.activeOperationOverride = undefined;
+    this.finalizationLastOperationMutation = null;
+    this.launchPointerMutation = null;
+    this.lastOperationOverride = undefined;
+    this.sessionRevisionOverride = undefined;
+    this.sessionUpdatedAtOverride = undefined;
     this.behaviour = Object.create(null);
     this.calls = {
       cancel: 0,
@@ -300,6 +311,12 @@ class MemoryLaunchAuthority {
     this.state = "absent";
     this.result = null;
     this.terminalRevision = null;
+    this.activeOperationOverride = undefined;
+    this.finalizationLastOperationMutation = null;
+    this.launchPointerMutation = null;
+    this.lastOperationOverride = undefined;
+    this.sessionRevisionOverride = undefined;
+    this.sessionUpdatedAtOverride = undefined;
     this.behaviour = Object.create(null);
     this.beforeFinalize = null;
   }
@@ -397,44 +414,60 @@ class MemoryLaunchAuthority {
       return null;
     }
     const launchEvidence = operation.result.evidence;
-    return {
+    const launch = {
       attachmentId: operation.request.attachment.attachmentId,
-      attachmentSha256: "1".repeat(64),
+      attachmentSha256: jsonSha256(operation.request.attachment),
       contractVersion: 1,
       fencingEpoch: operation.request.fencingEpoch,
       generation: clone(operation.request.generation),
       launchAttemptId: operation.operationId,
-      launchResultSha256: "2".repeat(64),
+      launchResultSha256: jsonSha256(operation.result),
       leaseId: operation.request.lease.leaseId,
-      leaseSha256: "3".repeat(64),
-      measuredImageSha256: "4".repeat(64),
+      leaseSha256: jsonSha256(operation.request.lease),
+      measuredImageSha256: jsonSha256(operation.request.measuredImage),
       processIncarnationId: launchEvidence.processIncarnationId,
       startedAt: operation.updatedAt,
       supervisorId: launchEvidence.supervisorId,
       supervisorProofId: launchEvidence.proofId,
       writerIncarnationId: launchEvidence.writerIncarnationId,
     };
+    return this.launchPointerMutation === null
+      ? launch
+      : this.launchPointerMutation(clone(launch));
   }
 
   session(operation = this.operation(), reservation = this.reservation(operation)) {
     const document = clone(this.expectedSession.document);
     document.documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION;
     if (operation.state === "committed") {
-      document.activeOperation = null;
-      document.lastOperation = terminalPointer(operation, reservation);
+      document.activeOperation =
+        this.activeOperationOverride === undefined
+          ? null
+          : clone(this.activeOperationOverride);
+      document.lastOperation =
+        this.lastOperationOverride === undefined
+          ? terminalPointer(operation, reservation)
+          : clone(this.lastOperationOverride);
       document.launch = this.launchPointer(operation);
     } else {
-      document.activeOperation = activePointer(operation, reservation);
+      document.activeOperation =
+        this.activeOperationOverride === undefined
+          ? activePointer(operation, reservation)
+          : clone(this.activeOperationOverride);
       document.launch = null;
     }
     return {
       sessionId: this.expectedSession.sessionId,
-      revision: (
-        BigInt(this.expectedSession.revision) + BigInt(operation.revision) + 1n
-      ).toString(),
+      revision:
+        this.sessionRevisionOverride ??
+        (
+          BigInt(this.expectedSession.revision) +
+          BigInt(operation.revision) +
+          1n
+        ).toString(),
       document,
       createdAt: this.expectedSession.createdAt,
-      updatedAt: operation.updatedAt,
+      updatedAt: this.sessionUpdatedAtOverride ?? operation.updatedAt,
     };
   }
 
@@ -570,6 +603,12 @@ class MemoryLaunchAuthority {
       throw new Error("lost finalize ack");
     }
     const receipt = this.receipt();
+    if (this.finalizationLastOperationMutation !== null) {
+      receipt.session.document.lastOperation =
+        this.finalizationLastOperationMutation(
+          clone(receipt.session.document.lastOperation),
+        );
+    }
     return {
       attempt: receipt.attempt,
       finalized: true,
@@ -1190,6 +1229,7 @@ test("keeps launch behavior stable after selected mutable intrinsics are poisone
   const value = await fixture();
   const originals = {
     arrayIsArray: Array.isArray,
+    jsonStringify: JSON.stringify,
     objectFreeze: Object.freeze,
     objectGetOwnPropertyDescriptor: Object.getOwnPropertyDescriptor,
     objectGetPrototypeOf: Object.getPrototypeOf,
@@ -1206,6 +1246,7 @@ test("keeps launch behavior stable after selected mutable intrinsics are poisone
   };
   const launchWriter = async () => {
     Array.isArray = poison("Array.isArray");
+    JSON.stringify = poison("JSON.stringify");
     Object.freeze = poison("Object.freeze");
     Object.getOwnPropertyDescriptor = poison("Object.getOwnPropertyDescriptor");
     Object.getPrototypeOf = poison("Object.getPrototypeOf");
@@ -1250,6 +1291,7 @@ test("keeps launch behavior stable after selected mutable intrinsics are poisone
     failure = error;
   } finally {
     Array.isArray = originals.arrayIsArray;
+    JSON.stringify = originals.jsonStringify;
     Object.freeze = originals.objectFreeze;
     Object.getOwnPropertyDescriptor =
       originals.objectGetOwnPropertyDescriptor;
@@ -1439,6 +1481,288 @@ test("finalization acknowledgement loss uses exact readback and returns the same
   });
   assert.strictEqual(replay.writer, result.writer);
   assert.equal(value.launchCalls, 1);
+});
+
+test("committed receipts reject impossible revision and outcome pairs", async (t) => {
+  const cases = [
+    ["cancelled-before-dispatch", null, "2"],
+    ["started", "started", "1"],
+    ["not-started", "not-started", "1"],
+    ["complete-stopped", "complete-stopped", "1"],
+  ];
+
+  for (const [name, evidenceStatus, revision] of cases) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const typedRequest = createWriterLaunchAttemptOperationRequest({
+        expectedSession: value.expectedSession,
+        generation: value.generation,
+        measuredImage: {
+          projection: value.reserved.projection,
+          runtimeIdentity: value.reserved.runtimeIdentity,
+        },
+        supervisor: { contractVersion: 1, supervisorId: SUPERVISOR_ID },
+      });
+      value.authority.seed(
+        typedRequest,
+        "committed",
+        evidenceStatus === null
+          ? null
+          : evidence(LAUNCH_ATTEMPT_ID, evidenceStatus),
+      );
+      value.authority.terminalRevision = revision;
+
+      await assert.rejects(
+        value.facade.reconcileLaunchAttempt({
+          launchAttemptId: LAUNCH_ATTEMPT_ID,
+        }),
+        assertLauncherError("logical_writer_launch_outcome_uncertain"),
+      );
+      assert.equal(value.launchCalls, 0);
+      assert.equal(value.reconcileCalls, 0);
+    });
+  }
+});
+
+test("new finalization receipts require a complete terminal anchor before readback", async (t) => {
+  const cases = [
+    ["missing", () => null],
+    [
+      "wrong operation",
+      (pointer) => ({
+        ...pointer,
+        operationId: "writer-launch-attempt-mismatch",
+      }),
+    ],
+    [
+      "wrong conflict class",
+      (pointer) => ({ ...pointer, conflictClass: "other-conflict" }),
+    ],
+    [
+      "wrong expected session revision",
+      (pointer) => ({ ...pointer, expectedSessionRevision: "7" }),
+    ],
+    [
+      "wrong revision",
+      (pointer) => ({ ...pointer, operationRevision: "3" }),
+    ],
+    [
+      "wrong request hash",
+      (pointer) => ({ ...pointer, requestSha256: "e".repeat(64) }),
+    ],
+    [
+      "wrong result hash",
+      (pointer) => ({ ...pointer, resultSha256: "d".repeat(64) }),
+    ],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      value.authority.finalizationLastOperationMutation = mutate;
+
+      const result = await value.facade.runLaunch(runInput(value));
+      assert.equal(result.status, "started");
+      assert.equal(value.authority.calls.finalizeStarted, 1);
+      assert.equal(value.authority.calls.read, 1);
+      assert.strictEqual(
+        value.facade.resolveStoppedWriter(resolverInput(value)).writer,
+        result.writer,
+      );
+    });
+  }
+});
+
+test("new finalization rejects a later active operation before historical readback", async () => {
+  const value = await fixture();
+  value.authority.beforeFinalize = () => {
+    value.authority.activeOperationOverride = {
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      expectedSessionRevision: "11",
+      kind: "checkpoint-capture-v1",
+      operationId: "checkpoint-capture-operation-after-launch",
+      operationRevision: "0",
+      requestSha256: "c".repeat(64),
+      reservationId: "reservation-checkpoint-after-launch",
+      state: "prepared",
+    };
+    value.authority.sessionRevisionOverride = "12";
+    value.authority.sessionUpdatedAtOverride =
+      "2026-08-04T12:00:06.000Z";
+  };
+
+  const result = await value.facade.runLaunch(runInput(value));
+  assert.equal(result.status, "started");
+  assert.equal(value.authority.calls.finalizeStarted, 1);
+  assert.equal(value.authority.calls.read, 1);
+  assert.strictEqual(
+    value.facade.resolveStoppedWriter(resolverInput(value)).writer,
+    result.writer,
+  );
+});
+
+test("historical readback accepts a later checkpoint anchor for the current launch", async () => {
+  const value = await fixture();
+  const started = await value.facade.runLaunch(runInput(value));
+  const launchRevision = started.session.revision;
+  value.authority.lastOperationOverride = {
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision: launchRevision,
+    kind: "checkpoint-capture-v1",
+    operationId: "checkpoint-capture-operation-after-launch",
+    operationRevision: "2",
+    requestSha256: "c".repeat(64),
+    reservationId: "reservation-checkpoint-after-launch",
+    resultSha256: "b".repeat(64),
+    state: "committed",
+  };
+  value.authority.sessionRevisionOverride = (
+    BigInt(launchRevision) + 3n
+  ).toString();
+  value.authority.sessionUpdatedAtOverride =
+    "2026-08-04T12:00:07.000Z";
+
+  const replay = await value.facade.reconcileLaunchAttempt({
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+  });
+  assert.equal(replay.status, "started");
+  assert.strictEqual(replay.writer, started.writer);
+  assert.equal(value.authority.calls.read, 1);
+  assert.equal(value.launchCalls, 1);
+  assert.equal(value.reconcileCalls, 0);
+});
+
+test("historical readback binds every current launch digest and start time", async (t) => {
+  const cases = [
+    [
+      "wrong attachment digest",
+      (pointer) => ({ ...pointer, attachmentSha256: "e".repeat(64) }),
+    ],
+    [
+      "wrong launch result digest",
+      (pointer) => ({ ...pointer, launchResultSha256: "e".repeat(64) }),
+    ],
+    [
+      "wrong lease digest",
+      (pointer) => ({ ...pointer, leaseSha256: "e".repeat(64) }),
+    ],
+    [
+      "wrong measured image digest",
+      (pointer) => ({ ...pointer, measuredImageSha256: "e".repeat(64) }),
+    ],
+    [
+      "wrong start time",
+      (pointer) => ({
+        ...pointer,
+        startedAt: "2026-08-04T12:00:05.000Z",
+      }),
+    ],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const started = await value.facade.runLaunch(runInput(value));
+      value.authority.lastOperationOverride = {
+        conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+        expectedSessionRevision: started.session.revision,
+        kind: "checkpoint-capture-v1",
+        operationId: "checkpoint-capture-operation-after-launch",
+        operationRevision: "2",
+        requestSha256: "c".repeat(64),
+        reservationId: "reservation-checkpoint-after-launch",
+        resultSha256: "b".repeat(64),
+        state: "committed",
+      };
+      value.authority.sessionRevisionOverride = (
+        BigInt(started.session.revision) + 3n
+      ).toString();
+      value.authority.sessionUpdatedAtOverride =
+        "2026-08-04T12:00:07.000Z";
+      value.authority.launchPointerMutation = mutate;
+
+      await assert.rejects(
+        value.facade.reconcileLaunchAttempt({
+          launchAttemptId: LAUNCH_ATTEMPT_ID,
+        }),
+        assertLauncherError("logical_writer_launch_outcome_uncertain"),
+      );
+      assert.equal(value.authority.calls.read, 1);
+      assert.equal(value.launchCalls, 1);
+      assert.equal(value.reconcileCalls, 0);
+    });
+  }
+});
+
+test("historical readback accepts the current launch during a later active operation", async () => {
+  const value = await fixture();
+  const started = await value.facade.runLaunch(runInput(value));
+  value.authority.activeOperationOverride = {
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision: started.session.revision,
+    kind: "checkpoint-capture-v1",
+    operationId: "checkpoint-capture-operation-after-launch",
+    operationRevision: "0",
+    requestSha256: "c".repeat(64),
+    reservationId: "reservation-checkpoint-after-launch",
+    state: "prepared",
+  };
+  value.authority.sessionRevisionOverride = (
+    BigInt(started.session.revision) + 1n
+  ).toString();
+  value.authority.sessionUpdatedAtOverride =
+    "2026-08-04T12:00:06.000Z";
+
+  const replay = await value.facade.reconcileLaunchAttempt({
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+  });
+  assert.equal(replay.status, "started");
+  assert.strictEqual(replay.writer, started.writer);
+  assert.equal(value.authority.calls.read, 1);
+  assert.equal(value.launchCalls, 1);
+  assert.equal(value.reconcileCalls, 0);
+});
+
+test("active receipts bind conflict class and expected session revision", async (t) => {
+  const cases = [
+    [
+      "wrong conflict class",
+      (pointer) => ({ ...pointer, conflictClass: "other-conflict" }),
+    ],
+    [
+      "wrong expected session revision",
+      (pointer) => ({ ...pointer, expectedSessionRevision: "7" }),
+    ],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const typedRequest = createWriterLaunchAttemptOperationRequest({
+        expectedSession: value.expectedSession,
+        generation: value.generation,
+        measuredImage: {
+          projection: value.reserved.projection,
+          runtimeIdentity: value.reserved.runtimeIdentity,
+        },
+        supervisor: { contractVersion: 1, supervisorId: SUPERVISOR_ID },
+      });
+      value.authority.seed(typedRequest, "starting");
+      const operation = value.authority.operation();
+      value.authority.activeOperationOverride = mutate(
+        activePointer(operation, value.authority.reservation(operation)),
+      );
+
+      await assert.rejects(
+        value.facade.reconcileLaunchAttempt({
+          launchAttemptId: LAUNCH_ATTEMPT_ID,
+        }),
+        assertLauncherError("logical_writer_launch_outcome_uncertain"),
+      );
+      assert.equal(value.launchCalls, 0);
+      assert.equal(value.reconcileCalls, 0);
+    });
+  }
 });
 
 test("prepared recovery cancels without image consumption or supervisor calls", async () => {

@@ -6022,10 +6022,19 @@ test(
           JSON.parse(JSON.stringify(read.operation.result.evidence)),
           JSON.parse(JSON.stringify(started.evidence)),
         );
-        assert.deepEqual(read.launch, started.launch);
-        assert.deepEqual(read.session.document.launch, started.launch);
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.session.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
         const current = await authority.readSession({ sessionId });
-        assert.deepEqual(current.document.launch, started.launch);
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(current.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
 
         const reconciled = await facade.reconcileLaunchAttempt({
           launchAttemptId,

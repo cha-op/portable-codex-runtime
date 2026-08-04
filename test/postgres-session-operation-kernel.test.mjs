@@ -102,6 +102,11 @@ const LAUNCH_STOP_PREPARED_NOW = "2026-07-29T12:36:00.000Z";
 const LAUNCH_STOP_DISPATCH_NOW = "2026-07-29T12:36:01.000Z";
 const LAUNCH_STOP_UNCERTAIN_NOW = "2026-07-29T12:36:02.000Z";
 const LAUNCH_STOP_FINALIZE_NOW = "2026-07-29T12:36:03.000Z";
+const REPLAY_STOP_PREPARED_NOW = "2026-07-29T12:35:24.000Z";
+const REPLAY_STOP_DISPATCH_NOW = "2026-07-29T12:35:25.000Z";
+const REPLAY_STOP_FINALIZE_NOW = "2026-07-29T12:35:26.000Z";
+const SUCCESSOR_LAUNCH_PREPARED_NOW = "2026-07-29T12:35:27.000Z";
+const SUCCESSOR_LAUNCH_FINALIZE_NOW = "2026-07-29T12:35:29.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
@@ -2361,6 +2366,7 @@ function writerLaunchMeasuredImage(expectedSession) {
 
 function writerLaunchFixture({
   destinationIsolationProofId = DESTINATION_ISOLATION_PROOF_ID,
+  expectedSession: suppliedExpectedSession,
   generationId = RESTORE_GENERATION_ID,
   launchOperationId = LAUNCH_ATTEMPT_OPERATION_ID,
   restoreOperationId = RESTORE_OPERATION_ID,
@@ -2376,7 +2382,10 @@ function writerLaunchFixture({
   const committedSession = restoreGenerationCommittedSessionRow(restore, {
     operationRevision: "2",
   });
-  const expectedSession = snapshotFromSessionRow(committedSession);
+  const expectedSession =
+    suppliedExpectedSession === undefined
+      ? snapshotFromSessionRow(committedSession)
+      : structuredClone(suppliedExpectedSession);
   if (sessionDocumentVersion === 2) {
     expectedSession.document = versionTwoDocument(sessionId, {
       ...expectedSession.document,
@@ -2468,6 +2477,7 @@ function writerLaunchOperationRow(
   fixture,
   state,
   {
+    createdAt = LAUNCH_PREPARED_NOW,
     result = state === "committed" ? writerLaunchResult(fixture) : null,
     revision =
       state === "prepared"
@@ -2490,7 +2500,7 @@ function writerLaunchOperationRow(
   return operationRow(state, {
     options: fixture.options,
     revision,
-    createdAt: LAUNCH_PREPARED_NOW,
+    createdAt,
     updatedAt,
     result,
     retiredAt: state === "committed" ? updatedAt : null,
@@ -2501,6 +2511,7 @@ function writerLaunchReservationRow(
   fixture,
   state,
   {
+    createdAt = LAUNCH_PREPARED_NOW,
     updatedAt =
       state === "prepared"
         ? LAUNCH_PREPARED_NOW
@@ -2513,7 +2524,7 @@ function writerLaunchReservationRow(
 ) {
   return reservationRow(state, {
     options: fixture.options,
-    createdAt: LAUNCH_PREPARED_NOW,
+    createdAt,
     updatedAt,
     releasedAt: state === "released" ? updatedAt : null,
   });
@@ -2646,6 +2657,7 @@ function writerLaunchActiveSteps(fixture, state) {
 function writerLaunchCommittedSteps(
   fixture,
   {
+    createdAt = LAUNCH_PREPARED_NOW,
     operationRevision = "2",
     result = writerLaunchResult(fixture),
     updatedAt = LAUNCH_FINALIZE_NOW,
@@ -2662,13 +2674,17 @@ function writerLaunchCommittedSteps(
     rows({ operation_count: 0, reservation_count: 0 }),
     rows(
       writerLaunchOperationRow(fixture, "committed", {
+        createdAt,
         result,
         revision: operationRevision,
         updatedAt,
       }),
     ),
     rows(
-      writerLaunchReservationRow(fixture, "released", { updatedAt }),
+      writerLaunchReservationRow(fixture, "released", {
+        createdAt,
+        updatedAt,
+      }),
     ),
     ...writerLaunchGenerationReferenceSteps(fixture),
   ];
@@ -2676,13 +2692,17 @@ function writerLaunchCommittedSteps(
     steps.push(
       rows(
         writerLaunchOperationRow(fixture, "committed", {
+          createdAt,
           result,
           revision: operationRevision,
           updatedAt,
         }),
       ),
       rows(
-        writerLaunchReservationRow(fixture, "released", { updatedAt }),
+        writerLaunchReservationRow(fixture, "released", {
+          createdAt,
+          updatedAt,
+        }),
       ),
       ...writerLaunchGenerationReferenceSteps(fixture),
     );
@@ -2693,6 +2713,7 @@ function writerLaunchCommittedSteps(
 function writerLaunchCommittedRelationSteps(
   fixture,
   {
+    createdAt = LAUNCH_PREPARED_NOW,
     operationRevision = "2",
     result = writerLaunchResult(fixture),
     updatedAt = LAUNCH_FINALIZE_NOW,
@@ -2701,13 +2722,17 @@ function writerLaunchCommittedRelationSteps(
   return [
     rows(
       writerLaunchOperationRow(fixture, "committed", {
+        createdAt,
         result,
         revision: operationRevision,
         updatedAt,
       }),
     ),
     rows(
-      writerLaunchReservationRow(fixture, "released", { updatedAt }),
+      writerLaunchReservationRow(fixture, "released", {
+        createdAt,
+        updatedAt,
+      }),
     ),
     ...writerLaunchGenerationReferenceSteps(fixture),
   ];
@@ -2751,6 +2776,7 @@ function writerLaunchStopOperationRow(
   fixture,
   state,
   {
+    createdAt = LAUNCH_STOP_PREPARED_NOW,
     result = state === "committed" ? fixture.result : null,
     revision =
       state === "prepared"
@@ -2773,7 +2799,7 @@ function writerLaunchStopOperationRow(
   return operationRow(state, {
     options: fixture.options,
     revision,
-    createdAt: LAUNCH_STOP_PREPARED_NOW,
+    createdAt,
     updatedAt,
     result,
     retiredAt: state === "committed" ? updatedAt : null,
@@ -2784,6 +2810,7 @@ function writerLaunchStopReservationRow(
   fixture,
   state,
   {
+    createdAt = LAUNCH_STOP_PREPARED_NOW,
     updatedAt =
       state === "prepared"
         ? LAUNCH_STOP_PREPARED_NOW
@@ -2796,21 +2823,26 @@ function writerLaunchStopReservationRow(
 ) {
   return reservationRow(state, {
     options: fixture.options,
-    createdAt: LAUNCH_STOP_PREPARED_NOW,
+    createdAt,
     updatedAt,
     releasedAt: state === "released" ? updatedAt : null,
   });
 }
 
-function writerLaunchStopPhaseSessionRow(fixture, state) {
+function writerLaunchStopPhaseSessionRow(
+  fixture,
+  state,
+  {
+    updatedAt =
+      state === "prepared"
+        ? LAUNCH_STOP_PREPARED_NOW
+        : state === "starting"
+          ? LAUNCH_STOP_DISPATCH_NOW
+          : LAUNCH_STOP_UNCERTAIN_NOW,
+  } = {},
+) {
   const operationRevision =
     state === "prepared" ? "0" : state === "starting" ? "1" : "2";
-  const updatedAt =
-    state === "prepared"
-      ? LAUNCH_STOP_PREPARED_NOW
-      : state === "starting"
-        ? LAUNCH_STOP_DISPATCH_NOW
-        : LAUNCH_STOP_UNCERTAIN_NOW;
   return sessionRow({
     sessionId: fixture.options.expectedSession.sessionId,
     revision: (
@@ -2856,11 +2888,11 @@ function writerLaunchStopCommittedSessionRow(
   });
 }
 
-function writerLaunchStopActiveSteps(fixture, state) {
+function writerLaunchStopActiveSteps(fixture, state, timing = {}) {
   return [
-    rows(writerLaunchStopPhaseSessionRow(fixture, state)),
-    rows(writerLaunchStopOperationRow(fixture, state)),
-    rows(writerLaunchStopReservationRow(fixture, state)),
+    rows(writerLaunchStopPhaseSessionRow(fixture, state, timing)),
+    rows(writerLaunchStopOperationRow(fixture, state, timing)),
+    rows(writerLaunchStopReservationRow(fixture, state, timing)),
     ...writerLaunchCommittedRelationSteps(fixture.launch, {
       result: fixture.launchResult,
     }),
@@ -9506,6 +9538,159 @@ test("writer launch stop claim, finalize, and exact replay clear only the curren
       false,
     );
     client.assertExhausted();
+  }
+});
+
+test("lost-ack writer launch stop replays do not expose a successor launch", async () => {
+  const stopped = writerLaunchStopFixture();
+  const successor = writerLaunchFixture({
+    expectedSession: snapshotFromSessionRow(
+      writerLaunchStopCommittedSessionRow(stopped, {
+        updatedAt: REPLAY_STOP_FINALIZE_NOW,
+      }),
+    ),
+    launchOperationId: "writer-launch-attempt-operation-successor",
+  });
+  const successorResult = writerLaunchResult(successor, "started", {
+    evidence: writerLaunchEvidence(successor, "started", {
+      processIncarnationId: "process-incarnation-successor",
+      proofId: "supervisor-proof-successor",
+      writerIncarnationId: "writer-incarnation-successor",
+    }),
+  });
+  const successorPointer = writerLaunchPointer(
+    successor,
+    successorResult,
+    SUCCESSOR_LAUNCH_FINALIZE_NOW,
+  );
+  const replaySteps = () => [
+    ...writerLaunchCommittedSteps(successor, {
+      createdAt: SUCCESSOR_LAUNCH_PREPARED_NOW,
+      result: successorResult,
+      updatedAt: SUCCESSOR_LAUNCH_FINALIZE_NOW,
+    }),
+    rows(
+      writerLaunchStopOperationRow(stopped, "committed", {
+        createdAt: REPLAY_STOP_PREPARED_NOW,
+        updatedAt: REPLAY_STOP_FINALIZE_NOW,
+      }),
+    ),
+    rows(
+      writerLaunchStopReservationRow(stopped, "released", {
+        createdAt: REPLAY_STOP_PREPARED_NOW,
+        updatedAt: REPLAY_STOP_FINALIZE_NOW,
+      }),
+    ),
+    ...writerLaunchCommittedRelationSteps(stopped.launch, {
+      result: stopped.launchResult,
+    }),
+  ];
+  const finalization = {
+    ...stopped.options,
+    evidence: stopped.evidence,
+    expectedOperationRevision: "1",
+  };
+  const claim = {
+    ...stopped.options,
+    expectedOperationRevision: "0",
+  };
+  const finalizeLoss = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("writer stop finalization acknowledgement lost"),
+        now: REPLAY_STOP_FINALIZE_NOW,
+      },
+      steps: [
+        ...writerLaunchStopActiveSteps(stopped, "starting", {
+          createdAt: REPLAY_STOP_PREPARED_NOW,
+          updatedAt: REPLAY_STOP_DISPATCH_NOW,
+        }),
+        rows(
+          writerLaunchStopOperationRow(stopped, "committed", {
+            createdAt: REPLAY_STOP_PREPARED_NOW,
+            updatedAt: REPLAY_STOP_FINALIZE_NOW,
+          }),
+        ),
+        rows(
+          writerLaunchStopReservationRow(stopped, "released", {
+            createdAt: REPLAY_STOP_PREPARED_NOW,
+            updatedAt: REPLAY_STOP_FINALIZE_NOW,
+          }),
+        ),
+        rows(
+          writerLaunchStopCommittedSessionRow(stopped, {
+            updatedAt: REPLAY_STOP_FINALIZE_NOW,
+          }),
+        ),
+      ],
+    },
+    replaySteps(),
+  );
+  const claimLoss = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("writer stop claim acknowledgement lost"),
+        now: REPLAY_STOP_DISPATCH_NOW,
+      },
+      steps: [
+        ...writerLaunchStopActiveSteps(stopped, "prepared", {
+          createdAt: REPLAY_STOP_PREPARED_NOW,
+          updatedAt: REPLAY_STOP_PREPARED_NOW,
+        }),
+        rows(
+          writerLaunchStopOperationRow(stopped, "starting", {
+            createdAt: REPLAY_STOP_PREPARED_NOW,
+            updatedAt: REPLAY_STOP_DISPATCH_NOW,
+          }),
+        ),
+        rows(
+          writerLaunchStopReservationRow(stopped, "starting", {
+            createdAt: REPLAY_STOP_PREPARED_NOW,
+            updatedAt: REPLAY_STOP_DISPATCH_NOW,
+          }),
+        ),
+        rows(
+          writerLaunchStopPhaseSessionRow(stopped, "starting", {
+            updatedAt: REPLAY_STOP_DISPATCH_NOW,
+          }),
+        ),
+      ],
+    },
+    replaySteps(),
+  );
+
+  await assert.rejects(
+    finalizeLoss.authority.finalizeWriterLaunchStopped(finalization),
+    assertStoreCommitUncertain,
+  );
+  const finalized =
+    await finalizeLoss.authority.finalizeWriterLaunchStopped(finalization);
+  await assert.rejects(
+    claimLoss.authority.claimWriterLaunchStopDispatch(claim),
+    assertStoreCommitUncertain,
+  );
+  const claimed =
+    await claimLoss.authority.claimWriterLaunchStopDispatch(claim);
+
+  assert.notEqual(
+    successorPointer.launchAttemptId,
+    stopped.request.launch.launchAttemptId,
+  );
+  assert.equal(finalized.finalized, false);
+  assert.equal(finalized.launch, null);
+  assert.deepEqual(finalized.session.document.launch, successorPointer);
+  assert.equal(claimed.dispatchGranted, false);
+  assert.equal(claimed.launch, null);
+  assert.deepEqual(claimed.session.document.launch, successorPointer);
+  const clients = [...finalizeLoss.clients, ...claimLoss.clients];
+  for (let index = 0; index < clients.length; index += 1) {
+    const client = clients[index];
+    assert.equal(
+      client.userSteps.length,
+      0,
+      `lost-ack replay client ${index} left scripted queries`,
+    );
+    client.assertExhausted({ destroyed: index === 0 || index === 2 });
   }
 });
 

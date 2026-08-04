@@ -158,14 +158,22 @@
   result. Prepared recovery cancels without launch. For `starting` or
   `uncertain`, an exact local provisional record retries started finalisation;
   otherwise recovery consults only the stopped-only supervisor path and never
-  relaunches. Exact local stop confirmation releases the facade's strong
-  attempt and attachment indexes; an uncertain stop retains the record
-  fail-closed instead of treating a possibly running writer as reclaimable.
+  relaunches. Committed outcomes must match their canonical revisions. A newly
+  finalised receipt requires a complete `lastOperation` anchor; historical
+  readback may instead coexist with a later active operation or retain a later
+  committed anchor while the digest-bound current launch pointer still binds
+  the original attempt. Exact local stop confirmation
+  releases the facade's strong attempt and attachment indexes; an uncertain
+  stop retains the record fail-closed instead of treating a possibly running
+  writer as reclaimable.
 - Typed `writer-launch-stop-v1` authority preserves the original started
   attempt and clears the current-launch relation only for exact
-  `complete-stopped` evidence from the bound supervisor. Bounded keyset
-  discovery returns prepared or active launch attempts and relationally
-  validated current launches without reconstructing process-local authority.
+  `complete-stopped` evidence from the bound supervisor. Historical stop or
+  claim replays expose a current launch only when it still belongs to that
+  stopped attempt, so a successor remains visible in the session snapshot but
+  is never attached to the old receipt. Bounded keyset discovery returns
+  prepared or active launch attempts and relationally validated current
+  launches without reconstructing process-local authority.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   until the next serial pull request binds exact generation publication to the
   launcher and no-relaunch recovery, routes the coordinator stop through the

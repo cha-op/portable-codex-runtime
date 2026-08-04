@@ -32,6 +32,8 @@ const imageConsumeReservationIntrinsic =
   PlatformImageReservationCoordinator.prototype.consumeReservation;
 const imageRevalidateReservationIntrinsic =
   PlatformImageReservationCoordinator.prototype.revalidateReservation;
+const JsonObject = JSON;
+const jsonStringifyIntrinsic = JSON.stringify;
 const mapDeleteIntrinsic = Map.prototype.delete;
 const mapGetIntrinsic = Map.prototype.get;
 const mapHasIntrinsic = Map.prototype.has;
@@ -760,6 +762,43 @@ function snapshotData(value, code) {
   );
 }
 
+function canonicalJsonDataTree(value) {
+  if (value === null || typeof value !== "object") return value;
+  if (arrayIsArray(value)) {
+    const result = new ArrayConstructor(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      objectDefineProperty(result, String(index), {
+        enumerable: true,
+        value: canonicalJsonDataTree(value[index]),
+      });
+    }
+    return objectFreeze(result);
+  }
+  const keys = reflectOwnKeys(value);
+  const sorted = new ArrayConstructor(keys.length);
+  for (let index = 0; index < keys.length; index += 1) {
+    sorted[index] = keys[index];
+  }
+  for (let outer = 1; outer < sorted.length; outer += 1) {
+    const key = sorted[outer];
+    let inner = outer - 1;
+    while (inner >= 0 && sorted[inner] > key) {
+      sorted[inner + 1] = sorted[inner];
+      inner -= 1;
+    }
+    sorted[inner + 1] = key;
+  }
+  const result = objectCreate(null);
+  for (let index = 0; index < sorted.length; index += 1) {
+    const key = sorted[index];
+    objectDefineProperty(result, key, {
+      enumerable: true,
+      value: canonicalJsonDataTree(value[key]),
+    });
+  }
+  return objectFreeze(result);
+}
+
 function sameDataTree(left, right, state, code) {
   consumeTreeNode(state, code);
   if (objectIs(left, right)) {
@@ -1139,29 +1178,40 @@ function normalizeSession(value, code) {
   );
 }
 
-function validateSessionPointer(session, operation, reservation, code) {
+function validateSessionPointer(
+  session,
+  operation,
+  reservation,
+  resultSha256,
+  code,
+) {
   const document = exactDataObject(
     session.document,
     SESSION_DOCUMENT_KEYS,
     code,
   );
   if (operation.state === "committed") {
-    if (document.lastOperation?.operationId === operation.operationId) {
-      const last = exactDataObject(
-        document.lastOperation,
-        LAST_OPERATION_KEYS,
-        code,
-      );
-      ensure(
-        last.kind === operation.kind &&
-          last.state === "committed" &&
-          last.operationRevision === operation.revision &&
-          last.reservationId === reservation.reservationId &&
-          last.requestSha256 === operation.requestSha256,
-        code,
-      );
+    if (document.lastOperation?.operationId !== operation.operationId) {
+      return false;
     }
-    return;
+    const last = exactDataObject(
+      document.lastOperation,
+      LAST_OPERATION_KEYS,
+      code,
+    );
+    ensure(
+      last.conflictClass === operation.conflictClass &&
+        last.expectedSessionRevision === operation.expectedSession.revision &&
+        last.operationId === operation.operationId &&
+        last.kind === operation.kind &&
+        last.state === operation.state &&
+        last.operationRevision === operation.revision &&
+        last.reservationId === reservation.reservationId &&
+        last.requestSha256 === operation.requestSha256 &&
+        last.resultSha256 === resultSha256,
+      code,
+    );
+    return document.activeOperation === null;
   }
   const active = exactDataObject(
     document.activeOperation,
@@ -1169,7 +1219,9 @@ function validateSessionPointer(session, operation, reservation, code) {
     code,
   );
   ensure(
-    active.operationId === operation.operationId &&
+    active.conflictClass === operation.conflictClass &&
+      active.expectedSessionRevision === operation.expectedSession.revision &&
+      active.operationId === operation.operationId &&
       active.kind === operation.kind &&
       active.state === operation.state &&
       active.operationRevision === operation.revision &&
@@ -1177,6 +1229,7 @@ function validateSessionPointer(session, operation, reservation, code) {
       active.requestSha256 === operation.requestSha256,
     code,
   );
+  return false;
 }
 
 function normalizeMeasuredImage(value, code) {
@@ -1294,11 +1347,26 @@ function normalizeTerminalEvidence(value, attempt, statuses, code) {
     assertOpaqueId(evidence.processIncarnationId, code);
     assertOpaqueId(evidence.writerIncarnationId, code);
   }
-  return snapshotData(value, code);
+  return exactFrozenRecord({
+    contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+    launchAttemptId: attempt.launchAttemptId,
+    processIncarnationId: evidence.processIncarnationId,
+    proofId: evidence.proofId,
+    status: evidence.status,
+    supervisorId: attempt.request.supervisor.supervisorId,
+    writerIncarnationId: evidence.writerIncarnationId,
+  });
 }
 
 function normalizeOperationResult(value, attempt, code) {
-  if (value === null) return exactFrozenRecord({ evidence: null, status: null });
+  if (value === null) {
+    return exactFrozenRecord({
+      evidence: null,
+      result: null,
+      resultSha256: null,
+      status: null,
+    });
+  }
   const outcomeDescriptor = objectGetOwnPropertyDescriptor(value, "outcome");
   ensure(outcomeDescriptor !== undefined && objectHasOwn(outcomeDescriptor, "value"), code);
   if (outcomeDescriptor.value === "cancelled-before-dispatch") {
@@ -1306,11 +1374,19 @@ function normalizeOperationResult(value, attempt, code) {
     ensure(
       result.resultVersion === 1 &&
         typeof result.reason === "string" &&
+        result.reason.length <= 64 &&
         regexpTest(OPAQUE_ID_PATTERN, result.reason),
       code,
     );
+    const canonicalResult = exactFrozenRecord({
+      resultVersion: 1,
+      outcome: "cancelled-before-dispatch",
+      reason: result.reason,
+    });
     return exactFrozenRecord({
       evidence: null,
+      result: canonicalResult,
+      resultSha256: canonicalJsonSha256(canonicalResult, code),
       status: "cancelled-before-dispatch",
     });
   }
@@ -1328,7 +1404,17 @@ function normalizeOperationResult(value, attempt, code) {
     started: "writer-launch-started",
   };
   ensure(result.outcome === outcomes[evidence.status], code);
-  return exactFrozenRecord({ evidence, status: evidence.status });
+  const canonicalResult = exactFrozenRecord({
+    evidence,
+    outcome: outcomes[evidence.status],
+    resultVersion: 1,
+  });
+  return exactFrozenRecord({
+    evidence,
+    result: canonicalResult,
+    resultSha256: canonicalJsonSha256(canonicalResult, code),
+    status: evidence.status,
+  });
 }
 
 function normalizeOperation(value, launchAttemptId, expectedRequest, code) {
@@ -1371,6 +1457,14 @@ function normalizeOperation(value, launchAttemptId, expectedRequest, code) {
   const terminal = normalizeOperationResult(
     normalized.result,
     provisionalAttempt,
+    code,
+  );
+  ensure(
+    normalized.state !== "committed" ||
+      (terminal.status === "cancelled-before-dispatch"
+        ? revision === "1"
+        : terminal.status !== null &&
+          (revision === "2" || revision === "3")),
     code,
   );
   ensure(
@@ -1434,16 +1528,20 @@ function normalizeLaunchPointer(value, operation, attempt, terminal, code) {
       launch.fencingEpoch === attempt.request.fencingEpoch &&
       launch.leaseId === attempt.request.lease.leaseId &&
       launch.processIncarnationId === terminal.evidence.processIncarnationId &&
+      launch.startedAt === operation.updatedAt &&
       launch.supervisorId === terminal.evidence.supervisorId &&
       launch.supervisorProofId === terminal.evidence.proofId &&
       launch.writerIncarnationId === terminal.evidence.writerIncarnationId &&
+      launch.attachmentSha256 ===
+        canonicalJsonProjectionSha256(attempt.request.attachment, code) &&
+      launch.launchResultSha256 === terminal.resultSha256 &&
+      launch.leaseSha256 ===
+        canonicalJsonProjectionSha256(attempt.request.lease, code) &&
+      launch.measuredImageSha256 ===
+        canonicalJsonProjectionSha256(attempt.request.measuredImage, code) &&
       sameContent(launch.generation, attempt.request.generation, code),
     code,
   );
-  assertSha256(launch.attachmentSha256, code);
-  assertSha256(launch.launchResultSha256, code);
-  assertSha256(launch.leaseSha256, code);
-  assertSha256(launch.measuredImageSha256, code);
   return snapshotData(value, code);
 }
 
@@ -1466,13 +1564,20 @@ function normalizeReceiptCommon(
   const reservation = normalizeReservation(receipt.reservation, operation, code);
   const session = normalizeSession(receipt.session, code);
   ensure(session.sessionId === operation.sessionId, code);
-  validateSessionPointer(session, operation, reservation, code);
+  const terminalAnchorMatches = validateSessionPointer(
+    session,
+    operation,
+    reservation,
+    normalizedOperation.terminal.resultSha256,
+    code,
+  );
   return {
     normalizedOperation,
     operation,
     receipt,
     reservation,
     session,
+    terminalAnchorMatches,
   };
 }
 
@@ -1613,7 +1718,8 @@ function normalizeFinalizeReceipt(
   );
   ensure(
     typeof common.receipt.finalized === "boolean" &&
-      common.operation.state === "committed",
+      common.operation.state === "committed" &&
+      (!common.receipt.finalized || common.terminalAnchorMatches),
     code,
   );
   const attempt = normalizeAttempt(
@@ -1660,6 +1766,7 @@ function normalizeCancelReceipt(value, launchAttemptId, expectedRequest, code) {
   ensure(
     typeof common.receipt.cancelled === "boolean" &&
       common.operation.state === "committed" &&
+      (!common.receipt.cancelled || common.terminalAnchorMatches) &&
       common.normalizedOperation.terminal.status ===
         "cancelled-before-dispatch",
     code,
@@ -1710,6 +1817,24 @@ function sha256Parts(parts, code) {
     if (isInternalError(error)) throw error;
     fail(code);
   }
+}
+
+function canonicalJsonSha256(value, code) {
+  let serialized;
+  try {
+    serialized = reflectApply(jsonStringifyIntrinsic, JsonObject, [value]);
+  } catch {
+    fail(code);
+  }
+  ensure(typeof serialized === "string", code);
+  return sha256Parts([serialized], code);
+}
+
+function canonicalJsonProjectionSha256(value, code) {
+  return canonicalJsonSha256(
+    canonicalJsonDataTree(snapshotData(value, code)),
+    code,
+  );
 }
 
 function stopOperationId(captureOperationId, launchAttemptId, code) {
