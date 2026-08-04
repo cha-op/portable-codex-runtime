@@ -20,6 +20,7 @@ import test from "node:test";
 
 import {
   FilesystemOperationJournal,
+  operationJournalBindingSha256,
   operationJournalRecordFilename,
 } from "../src/filesystem-operation-journal.mjs";
 import {
@@ -1693,6 +1694,11 @@ test("checkpoint publication creates one durable exact artifact bundle and commi
   ).record;
   assert.equal(journalRecord.state, "committed");
   assert.deepEqual(journalRecord.result, options.result);
+  assert.equal(journalRecord.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(journalRecord.materialization, "coordinatorBindingSha256"),
+    false,
+  );
   assert.equal(journalRecord.materialization.modeledDigest, manifest.modeledDigest);
   assert.deepEqual(result.materialization, journalRecord.materialization);
   const durablePublication = JSON.stringify({
@@ -1763,6 +1769,16 @@ test("restore publication publishes a raw isolated payload and preserves its art
     (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record.state,
     "committed",
   );
+  const journalRecord = (
+    await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })
+  ).record;
+  const expectedBindingSha256 = operationJournalBindingSha256(options.binding);
+  assert.equal(result.materialization.contractVersion, 3);
+  assert.equal(
+    result.materialization.coordinatorBindingSha256,
+    expectedBindingSha256,
+  );
+  assert.deepEqual(result.materialization, journalRecord.materialization);
 });
 
 test("restore preserves a modeled payload-root mode inside private storage", async (t) => {
@@ -5136,8 +5152,11 @@ test("restore replay rejects a materialized tree outside the trusted artifact pr
   await fixture.journal.markMaterialized({
     binding: prepared.binding,
     materialization: {
-      contractVersion: 2,
+      contractVersion: 3,
       artifactManifestDigest: mismatchedManifestDigest,
+      coordinatorBindingSha256: operationJournalBindingSha256(
+        prepared.binding.coordinator,
+      ),
       modeledDigest,
       publicationId: publicationId(
         RESTORE_OPERATION_ID,

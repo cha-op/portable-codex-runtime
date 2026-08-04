@@ -275,6 +275,10 @@ const MATERIALIZATION_KEYS = objectFreeze([
   "stagedRoot",
   "treeIdentityDigest",
 ]);
+const RESTORE_MATERIALIZATION_KEYS = objectFreeze([
+  ...MATERIALIZATION_KEYS,
+  "coordinatorBindingSha256",
+]);
 const STAGED_ROOT_KEYS = objectFreeze([
   "filesystemId",
   "objectIdentityScheme",
@@ -302,6 +306,8 @@ const ERROR_MESSAGES = objectFreeze({
 
 const CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION = 2;
 const RESTORE_JOURNAL_BINDING_CONTRACT_VERSION = 1;
+const CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION = 2;
+const RESTORE_MATERIALIZATION_CONTRACT_VERSION = 3;
 
 export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 2;
 
@@ -944,9 +950,12 @@ function normalizeStorageAndFence({
 }
 
 function normalizeMaterialization(value, kind, artifactProof = undefined) {
+  const restoreDestination = kind === "restore-destination";
   const materialization = assertExactDataObject(
     value,
-    MATERIALIZATION_KEYS,
+    restoreDestination
+      ? RESTORE_MATERIALIZATION_KEYS
+      : MATERIALIZATION_KEYS,
     failUncertain,
   );
   const stagedRoot = assertExactDataObject(
@@ -955,14 +964,22 @@ function normalizeMaterialization(value, kind, artifactProof = undefined) {
     failUncertain,
   );
   ensureUncertain(
-    numberIsSafeInteger(materialization.contractVersion) &&
-      materialization.contractVersion > 0 &&
+    materialization.contractVersion ===
+      (restoreDestination
+        ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
+        : CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION) &&
       typeof materialization.artifactManifestDigest === "string" &&
       regexpTest(DIGEST_PATTERN, materialization.artifactManifestDigest) &&
       typeof materialization.modeledDigest === "string" &&
       regexpTest(DIGEST_PATTERN, materialization.modeledDigest) &&
       typeof materialization.treeIdentityDigest === "string" &&
       regexpTest(DIGEST_PATTERN, materialization.treeIdentityDigest) &&
+      (!restoreDestination ||
+        (typeof materialization.coordinatorBindingSha256 === "string" &&
+          regexpTest(
+            DIGEST_PATTERN,
+            materialization.coordinatorBindingSha256,
+          ))) &&
       typeof materialization.publicationId === "string" &&
       regexpTest(OPAQUE_ID_PATTERN, materialization.publicationId) &&
       materialization.publicationKind === kind &&
@@ -979,6 +996,12 @@ function normalizeMaterialization(value, kind, artifactProof = undefined) {
   );
   return exactFrozenRecord({
     artifactManifestDigest: materialization.artifactManifestDigest,
+    ...(restoreDestination
+      ? {
+          coordinatorBindingSha256:
+            materialization.coordinatorBindingSha256,
+        }
+      : {}),
     contractVersion: materialization.contractVersion,
     modeledDigest: materialization.modeledDigest,
     publicationId: materialization.publicationId,

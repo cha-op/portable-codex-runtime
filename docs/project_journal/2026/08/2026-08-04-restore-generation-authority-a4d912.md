@@ -44,6 +44,11 @@ enabling production restore or launcher admission.
 - Committed replay requires the same canonical generation document.
   Acknowledgement loss after claim never grants a second dispatch, while an
   exact finalisation replay returns the retained committed generation.
+- Restore generation document v2 requires materialisation contract v3, which
+  carries the publication journal's domain-separated digest of the exact
+  coordinator generation binding. Finalisation verifies that digest against
+  the locked generation before any write, preventing cross-operation or
+  cross-generation proof splicing.
 - Bounded keyset recovery enumerates only retained `starting` or `uncertain`
   restore-generation operations with an exact authorised generation.
 
@@ -63,6 +68,9 @@ enabling production restore or launcher admission.
   trusted destination authority.
 - A committed generation is durable input for future launcher admission; it is
   not writable-launch authority by itself.
+- The current stopped-directory backend's legacy restore journal binding is
+  not accepted as a generation binding. Future production composition must
+  pass the exact claimed generation binding to the publisher.
 - No migration version 3 or canonical session document version 3 is required
   for this slice.
 - The production checkpoint adapter remains capture-only and `runRestore()`

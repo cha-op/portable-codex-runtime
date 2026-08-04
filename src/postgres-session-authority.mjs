@@ -58,9 +58,10 @@ const CHECKPOINT_CAPTURE_ATTEMPT_CONTRACT_VERSION = 1;
 const CHECKPOINT_CAPTURE_BINDING_CONTRACT_VERSION = 2;
 const CHECKPOINT_CATALOGUE_CONTRACT_VERSION = 1;
 const CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION = 2;
+const RESTORE_DESTINATION_MATERIALIZATION_CONTRACT_VERSION = 3;
 const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_BINDING_CONTRACT_VERSION = 1;
-const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 1;
+const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
 const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
 const LEGACY_DOCUMENT_KEYS = Object.freeze([
   "activeOperation",
@@ -215,6 +216,10 @@ const CHECKPOINT_MATERIALIZATION_KEYS = Object.freeze([
   "publicationKind",
   "stagedRoot",
   "treeIdentityDigest",
+]);
+const RESTORE_DESTINATION_MATERIALIZATION_KEYS = Object.freeze([
+  ...CHECKPOINT_MATERIALIZATION_KEYS,
+  "coordinatorBindingSha256",
 ]);
 const CHECKPOINT_STAGED_ROOT_KEYS = Object.freeze([
   "filesystemId",
@@ -1033,6 +1038,12 @@ function sha256(value) {
   const hash = createHashIntrinsic("sha256");
   reflectApply(hashUpdateIntrinsic, hash, [value, "utf8"]);
   return reflectApply(hashDigestIntrinsic, hash, ["hex"]);
+}
+
+function operationJournalBindingSha256(value) {
+  return sha256(
+    `portable-codex-operation-journal-binding-v1\0${canonicalSerialize(value)}\n`,
+  );
 }
 
 function assertLosslessString(value, code) {
@@ -3421,10 +3432,14 @@ function canonicalPublicationMaterialization(
   artifactProof,
   publicationKind,
   code,
+  coordinatorBinding = undefined,
 ) {
+  const restoreDestination = publicationKind === "restore-destination";
   const materialization = exactPlainObject(
     value,
-    CHECKPOINT_MATERIALIZATION_KEYS,
+    restoreDestination
+      ? RESTORE_DESTINATION_MATERIALIZATION_KEYS
+      : CHECKPOINT_MATERIALIZATION_KEYS,
     code,
   );
   const stagedRoot = exactPlainObject(
@@ -3433,9 +3448,20 @@ function canonicalPublicationMaterialization(
     code,
   );
   assertLosslessString(stagedRoot.objectId, code);
+  let expectedCoordinatorBindingSha256;
+  if (restoreDestination) {
+    try {
+      expectedCoordinatorBindingSha256 =
+        operationJournalBindingSha256(coordinatorBinding);
+    } catch {
+      fail(code);
+    }
+  }
   ensure(
     materialization.contractVersion ===
-      CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION &&
+      (restoreDestination
+        ? RESTORE_DESTINATION_MATERIALIZATION_CONTRACT_VERSION
+        : CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION) &&
       typeof materialization.artifactManifestDigest === "string" &&
       regexpTest(SHA256_PATTERN, materialization.artifactManifestDigest) &&
       materialization.artifactManifestDigest ===
@@ -3446,6 +3472,14 @@ function canonicalPublicationMaterialization(
       canonicalOpaqueId(materialization.publicationId, 128, code) ===
         materialization.publicationId &&
       materialization.publicationKind === publicationKind &&
+      (!restoreDestination ||
+        (typeof materialization.coordinatorBindingSha256 === "string" &&
+          regexpTest(
+            SHA256_PATTERN,
+            materialization.coordinatorBindingSha256,
+          ) &&
+          materialization.coordinatorBindingSha256 ===
+            expectedCoordinatorBindingSha256)) &&
       canonicalOpaqueId(stagedRoot.filesystemId, 128, code) ===
         stagedRoot.filesystemId &&
       canonicalOpaqueId(stagedRoot.objectIdentityScheme, 128, code) ===
@@ -3457,6 +3491,12 @@ function canonicalPublicationMaterialization(
   );
   return deepFreeze({
     artifactManifestDigest: materialization.artifactManifestDigest,
+    ...(restoreDestination
+      ? {
+          coordinatorBindingSha256:
+            materialization.coordinatorBindingSha256,
+        }
+      : {}),
     contractVersion: materialization.contractVersion,
     modeledDigest: materialization.modeledDigest,
     publicationId: materialization.publicationId,
@@ -3822,7 +3862,13 @@ function canonicalRestoreGenerationBinding(
   return expected;
 }
 
-function canonicalRestoreGenerationDocument(value, input, source, code) {
+function canonicalRestoreGenerationDocument(
+  value,
+  input,
+  source,
+  generationBinding,
+  code,
+) {
   const document = exactPlainObject(
     value,
     RESTORE_GENERATION_DOCUMENT_KEYS,
@@ -3848,6 +3894,7 @@ function canonicalRestoreGenerationDocument(value, input, source, code) {
     artifactProof,
     "restore-destination",
     code,
+    generationBinding,
   );
   const result = canonicalRestoreGenerationResult(
     document.result,
@@ -3863,7 +3910,13 @@ function canonicalRestoreGenerationDocument(value, input, source, code) {
   });
 }
 
-function canonicalRestoreGenerationCompletion(value, input, source, code) {
+function canonicalRestoreGenerationCompletion(
+  value,
+  input,
+  source,
+  generationBinding,
+  code,
+) {
   const completion = exactPlainObject(
     value,
     RESTORE_GENERATION_COMPLETION_KEYS,
@@ -3880,6 +3933,7 @@ function canonicalRestoreGenerationCompletion(value, input, source, code) {
     },
     input,
     source,
+    generationBinding,
     code,
   );
   return deepFreeze({
@@ -5071,6 +5125,7 @@ function restoreGenerationSnapshotFromRow(row, input, source) {
       normalized.document,
       input,
       source,
+      binding,
       code,
     );
     ensure(
@@ -7278,6 +7333,7 @@ export class PostgresSessionAuthority {
         input.completion,
         input,
         observed.generation.source,
+        observed.generation.generation.binding,
         "invalid_operation_request",
       );
       if (observed.operation.state === "committed") {

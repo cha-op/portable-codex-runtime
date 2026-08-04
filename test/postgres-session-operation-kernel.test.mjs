@@ -6,6 +6,9 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  operationJournalBindingSha256,
+} from "../src/filesystem-operation-journal.mjs";
+import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
@@ -1928,11 +1931,23 @@ function restoreGenerationFixture({
     operationId,
     request,
   };
+  const fixture = {
+    admission,
+    destinationIsolationProofId,
+    generationId,
+    mutationRequest,
+    options,
+    request,
+    source,
+    writer,
+  };
   const completion = {
     materialization: {
       artifactManifestDigest:
         source.completion.artifactProof.artifactManifestDigest,
-      contractVersion: 2,
+      coordinatorBindingSha256:
+        operationJournalBindingSha256(restoreGenerationBinding(fixture)),
+      contractVersion: 3,
       modeledDigest: source.completion.artifactProof.modeledDigest,
       publicationId: `restore-destination-publication-${suffix}`,
       publicationKind: "restore-destination",
@@ -1946,17 +1961,7 @@ function restoreGenerationFixture({
     replayed: false,
     result: request.predeterminedResult,
   };
-  return {
-    admission,
-    completion,
-    destinationIsolationProofId,
-    generationId,
-    mutationRequest,
-    options,
-    request,
-    source,
-    writer,
-  };
+  return { ...fixture, completion };
 }
 
 function restoreGenerationBinding(fixture) {
@@ -1982,7 +1987,7 @@ function restoreGenerationBinding(fixture) {
 function restoreGenerationDocument(fixture, completion = fixture.completion) {
   return {
     artifactProof: structuredClone(fixture.source.completion.artifactProof),
-    contractVersion: 1,
+    contractVersion: 2,
     materialization: structuredClone(completion.materialization),
     result: structuredClone(completion.result),
   };
@@ -7523,6 +7528,170 @@ test("restore generation dispatch grants once, starting finalization commits onc
     ],
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation finalization rejects materialization bound to another generation", async () => {
+  const fixture = restoreGenerationFixture();
+  const foreign = restoreGenerationFixture({
+    destinationIsolationProofId: "destination-isolation-proof-foreign",
+    generationId: "restore-generation-foreign",
+    operationId: "restore-generation-operation-foreign",
+  });
+  const completion = {
+    ...fixture.completion,
+    materialization: structuredClone(foreign.completion.materialization),
+  };
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationActiveSteps(fixture, "starting"),
+  );
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGeneration({
+      ...fixture.options,
+      completion,
+      expectedOperationRevision: "1",
+    }),
+    { code: "invalid_operation_request" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore generation binding validation ignores poisoned JSON and hash intrinsics", async () => {
+  const fixture = restoreGenerationFixture();
+  const foreign = restoreGenerationFixture({
+    destinationIsolationProofId: "destination-isolation-proof-poisoned",
+    generationId: "restore-generation-poisoned",
+    operationId: "restore-generation-operation-poisoned",
+  });
+  const completion = {
+    ...fixture.completion,
+    materialization: {
+      ...foreign.completion.materialization,
+      coordinatorBindingSha256: "0".repeat(64),
+    },
+  };
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationActiveSteps(fixture, "starting"),
+  );
+  const hashPrototype = Object.getPrototypeOf(createHash("sha256"));
+  const stringifyDescriptor = Object.getOwnPropertyDescriptor(
+    JSON,
+    "stringify",
+  );
+  const updateDescriptor = Object.getOwnPropertyDescriptor(
+    hashPrototype,
+    "update",
+  );
+  const digestDescriptor = Object.getOwnPropertyDescriptor(
+    hashPrototype,
+    "digest",
+  );
+  let poisonedStringifyCalls = 0;
+  let poisonedUpdateCalls = 0;
+  let poisonedDigestCalls = 0;
+
+  try {
+    Object.defineProperty(JSON, "stringify", {
+      ...stringifyDescriptor,
+      value() {
+        poisonedStringifyCalls += 1;
+        return "{}";
+      },
+    });
+    Object.defineProperty(hashPrototype, "update", {
+      ...updateDescriptor,
+      value() {
+        poisonedUpdateCalls += 1;
+        return this;
+      },
+    });
+    Object.defineProperty(hashPrototype, "digest", {
+      ...digestDescriptor,
+      value() {
+        poisonedDigestCalls += 1;
+        return "0".repeat(64);
+      },
+    });
+
+    await assertAuthorityError(
+      authority.finalizeRestoreDestinationGeneration({
+        ...fixture.options,
+        completion,
+        expectedOperationRevision: "1",
+      }),
+      { code: "invalid_operation_request" },
+    );
+  } finally {
+    Object.defineProperty(JSON, "stringify", stringifyDescriptor);
+    Object.defineProperty(hashPrototype, "update", updateDescriptor);
+    Object.defineProperty(hashPrototype, "digest", digestDescriptor);
+  }
+
+  assert.equal(poisonedStringifyCalls, 0);
+  assert.equal(poisonedUpdateCalls, 0);
+  assert.equal(poisonedDigestCalls, 0);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore generation committed read rejects a tampered materialization binding digest", async () => {
+  const fixture = restoreGenerationFixture();
+  const completion = {
+    ...fixture.completion,
+    materialization: {
+      ...fixture.completion.materialization,
+      coordinatorBindingSha256: "f".repeat(64),
+    },
+  };
+  const { authority, clients } = authorityWithScripts([
+    rows(
+      restoreGenerationRow(fixture, "committed", {
+        document: restoreGenerationDocument(fixture, completion),
+      }),
+    ),
+    rows(
+      restoreGenerationOperationRow(fixture, "committed", {
+        completion,
+        revision: "2",
+      }),
+    ),
+    ...restoreGenerationCommittedSteps(fixture, {
+      completion,
+      operationRevision: "2",
+    }),
+  ]);
+
+  await assertAuthorityError(
+    authority.readRestoreDestinationGeneration({
+      checkpoint: fixture.source.checkpoint,
+      generationId: fixture.generationId,
+      request: fixture.mutationRequest,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
 });
 
 test("restore generation starting and committed replays reject mismatched generation identity without mutation", async () => {

@@ -773,6 +773,12 @@ without authorising another publication. Exact finalisation may begin from
 retires the operation, releases the reservation, and advances the session
 terminal anchor. The committed document binds the source artefact proof, the
 `restore-destination` materialisation, and the predetermined restore result.
+Restore generation document v2 requires materialisation contract v3, which
+carries a domain-separated SHA-256 of the exact coordinator generation
+binding retained by the publication journal. Finalisation recomputes that
+digest from the locked generation before any write, so a materialisation from
+another operation, generation, isolation proof, reservation, or destination
+attachment cannot be spliced into the current predetermined result.
 Finalisation replay accepts only the same canonical document.
 
 Bounded recovery enumerates only retained `starting` or `uncertain`
@@ -783,6 +789,13 @@ database transaction nor change the canonical session document version.
 Production restore remains disabled until a later durable launch-attempt and
 logical launcher composition consume the committed generation without
 weakening the no-second-writer boundary.
+
+The current capture-oriented stopped-directory backend still constructs its
+legacy restore journal binding from only checkpoint, isolation-proof, and
+reservation context. Production composition must instead pass the exact
+claimed generation binding as the publisher's coordinator binding before it
+can produce a materialisation accepted by generation document v2. Restore
+remains fail-closed until that composition exists.
 
 ## Platform Image Reservation
 

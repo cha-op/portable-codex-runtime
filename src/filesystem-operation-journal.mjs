@@ -381,6 +381,14 @@ export function snapshotOperationJournalBinding(value) {
   return deepFreeze(binding);
 }
 
+export function operationJournalBindingSha256(value) {
+  const binding = snapshotOperationJournalBinding(value);
+  return createHash("sha256")
+    .update("portable-codex-operation-journal-binding-v1\0", "utf8")
+    .update(canonicalBytes(binding), "utf8")
+    .digest("hex");
+}
+
 function normalizeResult(value, request, code, budget) {
   const envelope = exactOptions(value, ["checkpoint", "mutation"], ["checkpoint", "mutation"], code);
   let checkpoint;

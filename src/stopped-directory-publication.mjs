@@ -15,6 +15,7 @@ import { acquireAdvisoryLock } from "./advisory-lock.mjs";
 import {
   FilesystemOperationJournal,
   OperationJournalError,
+  operationJournalBindingSha256,
   snapshotOperationJournalBinding,
 } from "./filesystem-operation-journal.mjs";
 import {
@@ -42,6 +43,7 @@ const reflectApply = Reflect.apply;
 export const STOPPED_DIRECTORY_ARTIFACT_VERSION = 1;
 
 const PUBLICATION_CONTRACT_VERSION = 2;
+const RESTORE_MATERIALIZATION_CONTRACT_VERSION = 3;
 const ARTIFACT_FORMAT = "portable-codex-stopped-directory";
 const LOCAL_DURABILITY_PROFILE = "local-fsync-rename";
 const PUBLICATION_CANDIDATE_PREFIX = ".publication-";
@@ -1052,13 +1054,22 @@ async function readArtifactManifest(path, expectedCheckpoint, expectedProof) {
 
 function validateMaterialization(
   value,
-  { artifactProof, committed = false, kind, operationId, finalName },
+  {
+    artifactProof,
+    committed = false,
+    coordinatorBindingSha256,
+    kind,
+    operationId,
+    finalName,
+  },
 ) {
   const code = committed ? "published_state_invalid" : "publication_integrity_failed";
   const commitState = committed ? "committed" : "not-committed";
+  const restoreDestination = kind === "restore-destination";
   const keys = [
     "contractVersion",
     "artifactManifestDigest",
+    ...(restoreDestination ? ["coordinatorBindingSha256"] : []),
     "modeledDigest",
     "publicationId",
     "publicationKind",
@@ -1073,7 +1084,10 @@ function validateMaterialization(
     code,
   );
   ensure(
-    materialization.contractVersion === PUBLICATION_CONTRACT_VERSION &&
+    materialization.contractVersion ===
+      (restoreDestination
+        ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
+        : PUBLICATION_CONTRACT_VERSION) &&
       materialization.publicationKind === kind &&
       materialization.publicationId === publicationId(operationId, finalName) &&
       typeof materialization.modeledDigest === "string" &&
@@ -1082,8 +1096,11 @@ function validateMaterialization(
       DIGEST_PATTERN.test(materialization.artifactManifestDigest) &&
       typeof materialization.treeIdentityDigest === "string" &&
       DIGEST_PATTERN.test(materialization.treeIdentityDigest) &&
-      (kind !== "restore-destination" ||
+      (!restoreDestination ||
         (artifactProof !== null &&
+          typeof materialization.coordinatorBindingSha256 === "string" &&
+          DIGEST_PATTERN.test(materialization.coordinatorBindingSha256) &&
+          materialization.coordinatorBindingSha256 === coordinatorBindingSha256 &&
           materialization.artifactManifestDigest ===
             artifactProof.artifactManifestDigest &&
           materialization.modeledDigest === artifactProof.modeledDigest)) &&
@@ -1105,6 +1122,7 @@ function validateMaterialization(
 
 function materializationFor({
   artifactManifestDigest,
+  coordinatorBindingSha256,
   filesystem,
   finalName,
   kind,
@@ -1113,9 +1131,13 @@ function materializationFor({
   operationId,
   treeIdentityDigest,
 }) {
+  const restoreDestination = kind === "restore-destination";
   return Object.freeze({
-    contractVersion: PUBLICATION_CONTRACT_VERSION,
+    contractVersion: restoreDestination
+      ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
+      : PUBLICATION_CONTRACT_VERSION,
     artifactManifestDigest,
+    ...(restoreDestination ? { coordinatorBindingSha256 } : {}),
     modeledDigest,
     publicationId: publicationId(operationId, finalName),
     publicationKind: kind,
@@ -2674,6 +2696,10 @@ export class StoppedDirectoryPublication {
         request,
         result,
       });
+      const coordinatorBindingSha256 =
+        options.kind === "restore-destination"
+          ? operationJournalBindingSha256(journalInput.binding.coordinator)
+          : null;
       const runJournalObservableOperation = async (operation) => {
         const previousPublicationMayHaveOccurred = publicationMayHaveOccurred;
         publicationMayHaveOccurred = true;
@@ -2792,6 +2818,7 @@ export class StoppedDirectoryPublication {
         const materialization = validateMaterialization(prepared.record.materialization, {
           artifactProof,
           committed: true,
+          coordinatorBindingSha256,
           finalName,
           kind: options.kind,
           operationId,
@@ -2815,6 +2842,7 @@ export class StoppedDirectoryPublication {
           const created = await this.#materializeCandidate({
             candidatePath,
             checkpoint: prepared.record.result.checkpoint,
+            coordinatorBindingSha256,
             finalName,
             journalAuthority,
             journalIdentity,
@@ -2890,6 +2918,7 @@ export class StoppedDirectoryPublication {
           materialized.record.materialization,
           {
             artifactProof,
+            coordinatorBindingSha256,
             finalName,
             kind: options.kind,
             operationId,
@@ -3186,6 +3215,7 @@ export class StoppedDirectoryPublication {
     artifactProof,
     candidatePath,
     checkpoint,
+    coordinatorBindingSha256,
     finalName,
     journalAuthority,
     journalIdentity,
@@ -3489,6 +3519,7 @@ export class StoppedDirectoryPublication {
     }
     const materialization = materializationFor({
       artifactManifestDigest,
+      coordinatorBindingSha256,
       filesystem: targetFilesystem,
       finalName,
       kind,

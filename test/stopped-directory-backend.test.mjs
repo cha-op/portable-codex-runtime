@@ -1923,6 +1923,11 @@ test("restore requires a newer current fence, trusted proof, and detached destin
   assert.equal(fixture.mutation.state.restoreRuns, 1);
   assert.strictEqual(completion, fixture.mutation.state.restoreCallbackCompletions[0]);
   assert.equal(completion.replayed, false);
+  assert.equal(completion.materialization.contractVersion, 3);
+  assert.match(
+    completion.materialization.coordinatorBindingSha256,
+    /^[0-9a-f]{64}$/u,
+  );
   assert.equal(await pathExists(fixture.destinationDirectory), true);
   assert.equal(
     fixture.mutation.state.restoreContexts[0].destinationState,
@@ -1959,6 +1964,10 @@ test("restore requires a newer current fence, trusted proof, and detached destin
   assert.equal(fixture.mutation.state.restoreRuns, 2);
   assert.equal(fixture.mutation.state.restoreFinalizations.length, 2);
   assert.equal(replayCompletion.replayed, true);
+  assert.equal(
+    replayCompletion.materialization.coordinatorBindingSha256,
+    completion.materialization.coordinatorBindingSha256,
+  );
   assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
   assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
   assert.equal(

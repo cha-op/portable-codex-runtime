@@ -21,6 +21,7 @@ import {
   OPERATION_JOURNAL_LOCK_NAME,
   OPERATION_JOURNAL_RECORD_VERSION,
   OperationJournalError,
+  operationJournalBindingSha256,
   operationJournalRecordFilename,
   snapshotOperationJournalBinding,
 } from "../src/filesystem-operation-journal.mjs";
@@ -53,6 +54,30 @@ test("journal binding snapshots detach and freeze nested caller state", () => {
   assert.equal(snapshot.metadata.lane, "original");
   assert.equal(Object.isFrozen(snapshot), true);
   assert.equal(Object.isFrozen(snapshot.metadata), true);
+});
+
+test("journal binding digests are canonical and detect semantic drift", () => {
+  const first = {
+    backendId: "single-attach-test",
+    metadata: { lane: "restore", ordinal: 1 },
+  };
+  const reordered = {
+    metadata: { ordinal: 1, lane: "restore" },
+    backendId: "single-attach-test",
+  };
+  const drifted = {
+    metadata: { ordinal: 2, lane: "restore" },
+    backendId: "single-attach-test",
+  };
+
+  assert.equal(
+    operationJournalBindingSha256(first),
+    operationJournalBindingSha256(reordered),
+  );
+  assert.notEqual(
+    operationJournalBindingSha256(first),
+    operationJournalBindingSha256(drifted),
+  );
 });
 
 function binding(overrides = {}) {

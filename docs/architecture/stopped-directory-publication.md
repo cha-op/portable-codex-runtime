@@ -186,6 +186,15 @@ before its first asynchronous publication-root lookup or queue wait. Caller
 mutation after invocation therefore cannot change the later durable journal
 record.
 
+Checkpoint materialisations remain contract v2. Restore materialisation
+contract v3 additionally retains a domain-separated SHA-256 of that exact
+snapshotted coordinator binding. Fresh publication, materialised replay, and
+committed replay all recompute and compare the digest before returning the
+record. The publication layer authenticates equality with the supplied
+binding; it does not decide whether a higher-layer restore binding is complete.
+A generation authority must therefore supply its exact claimed generation
+binding rather than a reduced backend-local projection.
+
 The source and destination trees reject nested mount points. A backend that
 permits the declared source root itself to be a mounted volume must distinguish
 that approved root mount from mounts below it and must pin the applicable mount

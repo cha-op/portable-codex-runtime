@@ -6,6 +6,9 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  operationJournalBindingSha256,
+} from "../src/filesystem-operation-journal.mjs";
+import {
   PostgresCheckpointMutationAuthorityError,
   createPostgresCheckpointMutationAuthority,
 } from "../src/postgres-checkpoint-mutation-authority.mjs";
@@ -837,10 +840,11 @@ function assertCommitOutcomeUncertain(error) {
   return true;
 }
 
-function assertTransactionQueryFailed(error) {
+function assertTransactionBoundaryLost(error) {
   assert.ok(error instanceof PostgresSerializableStoreError);
-  assert.equal(error.code, "transaction_query_failed");
-  assert.equal(error.commitState, "not-committed");
+  assert.equal(error.code, "transaction_boundary_lost");
+  assert.equal(error.commitState, "uncertain");
+  assert.equal(error.retryable, false);
   assert.equal("cause" in error, false);
   return true;
 }
@@ -1152,7 +1156,10 @@ function restoreGenerationCompletion(input, claimed, replayed) {
   return {
     materialization: {
       artifactManifestDigest: artifactProof.artifactManifestDigest,
-      contractVersion: 2,
+      contractVersion: 3,
+      coordinatorBindingSha256: operationJournalBindingSha256(
+        claimed.generation.binding,
+      ),
       modeledDigest: artifactProof.modeledDigest,
       publicationId: `restore-publication-${input.operationId}`,
       publicationKind: "restore-destination",
@@ -5073,7 +5080,7 @@ test(
           await assert.rejects(
             claimRollbackAuthority
               .claimRestoreDestinationGenerationDispatch(claimInput),
-            assertTransactionQueryFailed,
+            assertTransactionBoundaryLost,
           );
           assert.deepEqual(
             await readRestoreGenerationTransactionState(
@@ -5147,7 +5154,7 @@ test(
           await assert.rejects(
             finalizeRollbackAuthority
               .finalizeRestoreDestinationGeneration(finalization),
-            assertTransactionQueryFailed,
+            assertTransactionBoundaryLost,
           );
           assert.deepEqual(
             await readRestoreGenerationTransactionState(
