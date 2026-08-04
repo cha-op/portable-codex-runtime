@@ -134,7 +134,7 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
      settles, drain in-flight work on abort, and leave guard-busy or
      unverifiable operations durably blocked for a later pass.
 
-Restore and launcher authority are now split into four serial pull requests:
+Restore and launcher authority are now split into five serial pull requests:
 
 1. **Restore-generation schema foundation (complete)**
    - Replace the single hard-coded migration with one ordered,
@@ -162,16 +162,24 @@ Restore and launcher authority are now split into four serial pull requests:
    - Upgrade canonical session documents to version 3 on the next real write
      so a started launch remains linked to its immutable operation after
      `lastOperation` advances.
-4. **Logical launcher composition and enablement**
-   - Compose finalized generation admission, one-use measured-image
-     consumption, durable launch-attempt dispatch, the external launcher, and
-     exact writer registration as a fail-closed cross-boundary protocol.
-     Keep atomicity limited to each transactional reread, claim, and capability
-     consumption boundary; persist `starting` before invoking the external
-     launcher.
-   - Enable production restore only after the complete composition preserves
-     the no-second-writer boundary across acknowledgement loss, restart, and
-     ambiguous launcher outcomes.
+4. **Logical launcher foundation (complete)**
+   - Add a hardened PostgreSQL launcher facade that revalidates the original
+     image reservation, persists `starting`, consumes that reservation once,
+     invokes one external launch callback, and registers a provisional writer
+     before finalising a started attempt.
+   - Reconcile active attempts through supervisor evidence without relaunch,
+     add typed `writer-launch-stop-v1` authority, and enumerate bounded
+     prepared attempts and current launches without enabling production
+     restore or claiming production stop/capture composition.
+5. **Production restore composition and enablement**
+   - Bind typed generation claim and publication to the exact committed
+     generation consumed by launcher admission, then wire launcher dispatch,
+     no-relaunch recovery, durable stop callbacks, and bounded recovery
+     services through the production checkpoint adapter.
+   - Enable `runRestore()` only after the whole protocol preserves the
+     no-second-writer boundary across acknowledgement loss, restart, and
+     ambiguous publication, launch, registration, stop, or finalisation
+     outcomes.
 
 Later pull requests own an ext4 or filesystem-image backend, differential
 export and content-addressed storage, cross-host migration, and operational

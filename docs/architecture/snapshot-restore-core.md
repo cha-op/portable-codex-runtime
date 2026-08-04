@@ -186,8 +186,8 @@ rejected before dispatch.
 This core does not yet provide or compose:
 
 - a production storage barrier for the graceful `turn/interrupt` boundary;
-- atomic `crash-prefix` capture, launcher admission, or invocation of the
-  separate pinned-runtime rollout-tail repair primitive;
+- atomic `crash-prefix` capture, production `runRestore()` launcher admission,
+  or invocation of the separate pinned-runtime rollout-tail repair primitive;
 - repair or automatic continuation of `prepared` or `materialized` capture
   attempts;
 - an ext4 or filesystem-image physical backend;
@@ -214,9 +214,12 @@ pull-request order in the runtime delivery plan:
 7. PR #12, authenticated committed-result reconciliation (completed);
 8. same-pinned-executable resume verification and rollout-tail repair
    (completed separately from this core);
-9. production linearizable authority and trusted OCI launcher admission;
-10. ext4 or filesystem-image physical backend; and
-11. differential export.
+9. production linearizable authority and the process-local logical-launcher
+   foundation (completed separately from this core);
+10. exact generation publication, launcher/recovery, durable stop, and
+    production `runRestore()` composition;
+11. ext4 or filesystem-image physical backend; and
+12. differential export.
 
 This order keeps orchestration semantics testable before selecting a physical
 format, and establishes pinned-executable Codex recovery evidence before

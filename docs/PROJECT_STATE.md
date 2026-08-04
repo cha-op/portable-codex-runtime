@@ -151,11 +151,36 @@
   measurement, process incarnation, writer incarnation, and supervisor proof.
   Version 1 and version 2 documents retain exact-read and replay compatibility,
   while the next real state write upgrades them to version 3.
+- A hardened PostgreSQL logical-writer-launcher facade now revalidates the
+  original image reservation, durably reaches `starting`, consumes that exact
+  one-use capability, invokes one external launch callback, and registers a
+  provisional same-process writer before finalising and exposing a started
+  result. Prepared recovery cancels without launch. For `starting` or
+  `uncertain`, an exact local provisional record retries started finalisation;
+  otherwise recovery consults only the stopped-only supervisor path and never
+  relaunches. Committed outcomes must match their canonical revisions. A newly
+  finalised receipt requires a complete `lastOperation` anchor; historical
+  readback may instead coexist with a later active operation or retain a later
+  committed anchor while the digest-bound current launch pointer still binds
+  the original attempt. Exact local stop confirmation
+  releases the facade's strong attempt and attachment indexes; an uncertain
+  stop retains the record fail-closed instead of treating a possibly running
+  writer as reclaimable.
+- Typed `writer-launch-stop-v1` authority preserves the original started
+  attempt and clears the current-launch relation only for exact
+  `complete-stopped` evidence from the bound supervisor. Historical stop or
+  claim replays expose a current launch only when it still belongs to that
+  stopped attempt, so a successor remains visible in the session snapshot but
+  is never attached to the old receipt. Bounded keyset discovery returns
+  prepared or active launch attempts and relationally validated current
+  launches without reconstructing process-local authority.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until the durable attempt is composed with the original one-use image
-  capability, external launcher invocation, and exact writer registration. No
-  published restore path, generation row, serialized measurement, or durable
-  attempt record is writer-launch authority by itself.
+  until the next serial pull request binds exact generation publication to the
+  launcher and no-relaunch recovery, routes the coordinator stop through the
+  durable stop transition, adds the recovery service, and wires the complete
+  protocol into `runRestore()`. No published path, generation row, serialized
+  measurement, attempt record, or discovery result is writer-launch authority
+  by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -206,6 +231,8 @@
   `docs/project_journal/2026/08/2026-08-04-restore-generation-authority-a4d912.md`
 - Durable launch-attempt lifecycle:
   `docs/project_journal/2026/08/2026-08-04-durable-launch-attempt-lifecycle-6e2f8b.md`
+- Logical writer launcher foundation:
+  `docs/project_journal/2026/08/2026-08-04-logical-writer-launcher-foundation-b6d3e1.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -218,6 +245,6 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  authority until the durable attempt is composed with one-use image
-  capability consumption, external launch, exact writer registration, and
-  acknowledgement-loss recovery.
+  authority until exact generation publication, launcher and no-relaunch
+  recovery, durable stop/capture composition, and recovery-service wiring are
+  integrated into `runRestore()` and verified as one fail-closed protocol.

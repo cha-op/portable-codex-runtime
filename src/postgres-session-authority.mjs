@@ -37,6 +37,7 @@ export const RESTORE_DESTINATION_GENERATION_OPERATION_KIND =
   "restore-destination-generation-v1";
 export const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND =
   "writer-launch-attempt-v1";
+export const WRITER_LAUNCH_STOP_OPERATION_KIND = "writer-launch-stop-v1";
 export const MAX_WRITER_LEASE_DURATION_MILLISECONDS = 86_400_000;
 
 const UUID_PATTERN =
@@ -70,6 +71,7 @@ const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_BINDING_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
+const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_POINTER_CONTRACT_VERSION = 1;
 const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
@@ -342,6 +344,10 @@ const WRITER_LAUNCH_ATTEMPT_OPERATION_REQUEST_KEYS = Object.freeze([
   "measuredImage",
   "supervisor",
 ]);
+const WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS = Object.freeze([
+  "contractVersion",
+  "launch",
+]);
 const WRITER_LAUNCH_GENERATION_KEYS = Object.freeze([
   "bindingSha256",
   "checkpointId",
@@ -402,7 +408,20 @@ const WRITER_LAUNCH_FINALIZATION_INPUT_KEYS = Object.freeze([
   "operationId",
   "request",
 ]);
+const WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS = Object.freeze([
+  "evidence",
+  "expectedOperationRevision",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+]);
 const WRITER_LAUNCH_TERMINAL_RESULT_KEYS = Object.freeze([
+  "evidence",
+  "outcome",
+  "resultVersion",
+]);
+const WRITER_LAUNCH_STOP_TERMINAL_RESULT_KEYS = Object.freeze([
   "evidence",
   "outcome",
   "resultVersion",
@@ -426,6 +445,10 @@ const WRITER_LAUNCH_POINTER_KEYS = Object.freeze([
 ]);
 const WRITER_LAUNCH_READ_KEYS = Object.freeze(["operationId"]);
 const WRITER_LAUNCH_RECOVERY_LIST_KEYS = Object.freeze([
+  "afterSessionId",
+  "limit",
+]);
+const CURRENT_WRITER_LAUNCH_RECOVERY_LIST_KEYS = Object.freeze([
   "afterSessionId",
   "limit",
 ]);
@@ -732,6 +755,25 @@ const READ_SESSION_FOR_UPDATE_QUERY = Object.freeze({
   queryMode: "extended",
   text: `${READ_SESSION_QUERY.text} FOR UPDATE`,
 });
+const LIST_CURRENT_WRITER_LAUNCH_FIRST_PAGE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "SELECT session_id, revision, document, created_at, updated_at",
+    "FROM session_authority.sessions",
+    "ORDER BY session_id ASC",
+    "LIMIT $1::integer",
+  ].join(" "),
+});
+const LIST_CURRENT_WRITER_LAUNCH_AFTER_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "SELECT session_id, revision, document, created_at, updated_at",
+    "FROM session_authority.sessions",
+    "WHERE session_id > $1::uuid",
+    "ORDER BY session_id ASC",
+    "LIMIT $2::integer",
+  ].join(" "),
+});
 const READ_AUTHORITY_CLOCK_QUERY = Object.freeze({
   queryMode: "extended",
   text: "SELECT pg_catalog.clock_timestamp() AS authority_now",
@@ -829,7 +871,7 @@ const LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY = Object.freeze({
     `SELECT ${OPERATION_RETURNING_COLUMNS}`,
     "FROM session_authority.operation_claims",
     "WHERE kind = 'writer-launch-attempt-v1'",
-    "AND state IN ('starting', 'uncertain')",
+    "AND state IN ('prepared', 'starting', 'uncertain')",
     "AND retired_at IS NULL",
     "ORDER BY session_id ASC",
     "LIMIT $1::integer",
@@ -841,7 +883,7 @@ const LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY = Object.freeze({
     `SELECT ${OPERATION_RETURNING_COLUMNS}`,
     "FROM session_authority.operation_claims",
     "WHERE kind = 'writer-launch-attempt-v1'",
-    "AND state IN ('starting', 'uncertain')",
+    "AND state IN ('prepared', 'starting', 'uncertain')",
     "AND retired_at IS NULL",
     "AND session_id > $1::uuid",
     "ORDER BY session_id ASC",
@@ -3085,6 +3127,57 @@ export function createWriterLaunchAttemptOperationRequest(options) {
   );
 }
 
+function writerLaunchStopOperationRequest(value, expectedSession, code) {
+  const request = exactPlainObject(
+    value,
+    WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS,
+    code,
+  );
+  const document = expectedSession.document;
+  const launch = canonicalWriterLaunchPointer(
+    request.launch,
+    expectedSession.sessionId,
+    code,
+  );
+  ensure(
+    request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION &&
+      document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+      document.lifecycle === "ATTACHED" &&
+      document.activeOperation === null &&
+      document.launch !== null &&
+      canonicalSerialize(launch) === canonicalSerialize(document.launch),
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      contractVersion: WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+      launch,
+    },
+    code,
+  );
+}
+
+export function createWriterLaunchStopOperationRequest(options) {
+  const normalized = exactPlainObject(
+    options,
+    ["expectedSession"],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  return writerLaunchStopOperationRequest(
+    {
+      contractVersion: WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+      launch: expectedSession.document.launch,
+    },
+    expectedSession,
+    "invalid_operation_request",
+  );
+}
+
 function canonicalOperationEnvelope(value, code) {
   const normalized = exactPlainObject(value, OPERATION_REQUEST_KEYS, code);
   ensure(
@@ -3355,6 +3448,12 @@ function validateTypedOperationInput(input) {
     );
   } else if (input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND) {
     writerLaunchAttemptOperationRequest(
+      input.request,
+      input.expectedSession,
+      "invalid_operation_request",
+    );
+  } else if (input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND) {
+    writerLaunchStopOperationRequest(
       input.request,
       input.expectedSession,
       "invalid_operation_request",
@@ -3962,6 +4061,39 @@ function writerLaunchAttemptTransitionInput(options) {
   return deepFreeze({ ...input, expectedOperationRevision });
 }
 
+function writerLaunchStopInput(
+  options,
+  keys = OPERATION_INPUT_KEYS,
+  code = "invalid_operation_request",
+) {
+  const input = canonicalOperationInput(options, keys);
+  ensure(input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND, code);
+  const request = writerLaunchStopOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  return deepFreeze({ ...input, request });
+}
+
+function writerLaunchStopTransitionInput(options) {
+  const input = writerLaunchStopInput(
+    options,
+    OPERATION_TRANSITION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    OPERATION_TRANSITION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(expectedOperationRevision === "0", "invalid_operation_request");
+  return deepFreeze({ ...input, expectedOperationRevision });
+}
+
 function canonicalWriterLaunchEvidence(value, input, statuses, code) {
   const evidence = exactPlainObject(
     value,
@@ -4033,6 +4165,61 @@ function writerLaunchAttemptFinalizationInput(options, statuses) {
   return deepFreeze({ ...input, evidence, expectedOperationRevision });
 }
 
+function canonicalWriterLaunchStopEvidence(value, input, code) {
+  const evidence = exactPlainObject(
+    value,
+    WRITER_LAUNCH_EVIDENCE_KEYS,
+    code,
+  );
+  const launch = input.request.launch;
+  ensure(
+    evidence.contractVersion ===
+        WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION &&
+      evidence.status === "complete-stopped" &&
+      evidence.launchAttemptId === launch.launchAttemptId &&
+      evidence.supervisorId === launch.supervisorId &&
+      evidence.processIncarnationId === launch.processIncarnationId &&
+      evidence.writerIncarnationId === launch.writerIncarnationId,
+    code,
+  );
+  return deepFreeze({
+    contractVersion: WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION,
+    launchAttemptId: launch.launchAttemptId,
+    processIncarnationId: launch.processIncarnationId,
+    proofId: canonicalOpaqueId(evidence.proofId, 128, code),
+    status: "complete-stopped",
+    supervisorId: launch.supervisorId,
+    writerIncarnationId: launch.writerIncarnationId,
+  });
+}
+
+function writerLaunchStopFinalizationInput(options) {
+  const input = writerLaunchStopInput(
+    options,
+    WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(
+    expectedOperationRevision === "1" ||
+      expectedOperationRevision === "2",
+    "invalid_operation_request",
+  );
+  const evidence = canonicalWriterLaunchStopEvidence(
+    normalized.evidence,
+    input,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ ...input, evidence, expectedOperationRevision });
+}
+
 function writerLaunchAttemptReadInput(options) {
   const normalized = exactPlainObject(
     options,
@@ -4052,6 +4239,28 @@ function writerLaunchAttemptRecoveryListInput(options) {
   const normalized = exactPlainObject(
     options,
     WRITER_LAUNCH_RECOVERY_LIST_KEYS,
+    "invalid_operation_request",
+  );
+  const afterSessionId =
+    normalized.afterSessionId === null
+      ? null
+      : canonicalSessionId(
+          normalized.afterSessionId,
+          "invalid_operation_request",
+        );
+  ensure(
+    numberIsSafeInteger(normalized.limit) &&
+      normalized.limit >= 1 &&
+      normalized.limit <= 100,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ afterSessionId, limit: normalized.limit });
+}
+
+function currentWriterLaunchRecoveryListInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    CURRENT_WRITER_LAUNCH_RECOVERY_LIST_KEYS,
     "invalid_operation_request",
   );
   const afterSessionId =
@@ -5275,6 +5484,46 @@ function writerLaunchTerminalResult(input, evidence, code) {
   );
 }
 
+function canonicalWriterLaunchStopTerminalResult(value, input, code) {
+  const request = writerLaunchStopOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  const result = exactPlainObject(
+    value,
+    WRITER_LAUNCH_STOP_TERMINAL_RESULT_KEYS,
+    code,
+  );
+  ensure(
+    result.resultVersion === OPERATION_RESULT_VERSION &&
+      result.outcome === "writer-launch-stopped",
+    code,
+  );
+  const evidence = canonicalWriterLaunchStopEvidence(
+    result.evidence,
+    { ...input, request },
+    code,
+  );
+  return deepFreeze({
+    evidence,
+    outcome: "writer-launch-stopped",
+    resultVersion: OPERATION_RESULT_VERSION,
+  });
+}
+
+function writerLaunchStopTerminalResult(input, evidence, code) {
+  return canonicalWriterLaunchStopTerminalResult(
+    {
+      evidence,
+      outcome: "writer-launch-stopped",
+      resultVersion: OPERATION_RESULT_VERSION,
+    },
+    input,
+    code,
+  );
+}
+
 function writerLaunchPointerFor(input, result, startedAt, code) {
   ensure(
     result.outcome === "writer-launch-started" &&
@@ -5453,6 +5702,14 @@ function canonicalCommittedResult(value, input, revision, code) {
       code,
     );
     return canonicalWriterLaunchTerminalResult(value, input, code);
+  }
+  if (outcome === "writer-launch-stopped") {
+    ensure(
+      input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+        (revision === "2" || revision === "3"),
+      code,
+    );
+    return canonicalWriterLaunchStopTerminalResult(value, input, code);
   }
   fail(code);
 }
@@ -5952,6 +6209,22 @@ function writerLaunchAttemptRecord(input, operation) {
   });
 }
 
+function writerLaunchStopRecord(input, operation) {
+  return deepFreeze({
+    contractVersion: WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+    launchAttemptId: input.request.launch.launchAttemptId,
+    request: input.request,
+    result: operation.result,
+    state: operation.state,
+    stopOperationId: operation.operationId,
+  });
+}
+
+function currentWriterLaunchForAttempt(session, launchAttemptId) {
+  const launch = session.document.launch;
+  return launch?.launchAttemptId === launchAttemptId ? launch : null;
+}
+
 function validateOperationIdentity(operation, input) {
   ensure(
     operation.operationId === input.operationId &&
@@ -6198,6 +6471,25 @@ function validateTerminalBusinessState(terminalBase, operation) {
     ensure(
       canonicalBusinessBytes(terminalBase.document) ===
         canonicalBusinessBytes(operation.expectedSession.document),
+      "operation_state_invalid",
+    );
+    return;
+  }
+  if (result.outcome === "writer-launch-stopped") {
+    const input = writerLaunchStopInput(
+      inputForOperation(operation),
+      OPERATION_INPUT_KEYS,
+      "operation_state_invalid",
+    );
+    const expectedDocument = documentWithAuthorityState(
+      input.expectedSession.document,
+      { launch: null },
+    );
+    ensure(
+      terminalBase.document.lifecycle === "ATTACHED" &&
+        terminalBase.document.launch === null &&
+        canonicalBusinessBytes(terminalBase.document) ===
+          canonicalBusinessBytes(expectedDocument),
       "operation_state_invalid",
     );
     return;
@@ -6917,13 +7209,12 @@ async function validateWriterLaunchAttemptRelations(
   return deepFreeze({ generation, input, launch });
 }
 
-async function validateCurrentWriterLaunchRelation(
+async function validateWriterLaunchPointerRelations(
   transaction,
+  launch,
   session,
   forUpdate,
 ) {
-  const launch = session.document.launch;
-  if (launch === null) return null;
   const operation = await readOperationSnapshot(
     transaction,
     launch.launchAttemptId,
@@ -6956,8 +7247,73 @@ async function validateCurrentWriterLaunchRelation(
   ensure(
     relation !== null &&
       relation.launch !== null &&
-      canonicalSerialize(relation.launch) === canonicalSerialize(launch) &&
-      session.document.lease !== null &&
+      canonicalSerialize(relation.launch) === canonicalSerialize(launch),
+    "operation_state_invalid",
+  );
+  return deepFreeze({ operation, relation, reservation });
+}
+
+async function validateWriterLaunchStopRelations(
+  transaction,
+  operation,
+  currentSession,
+  forUpdate,
+) {
+  if (operation.kind !== WRITER_LAUNCH_STOP_OPERATION_KIND) {
+    return null;
+  }
+  const input = writerLaunchStopInput(
+    inputForOperation(operation),
+    OPERATION_INPUT_KEYS,
+    "operation_state_invalid",
+  );
+  const launch = input.request.launch;
+  ensure(
+    input.expectedSession.document.launch !== null &&
+      canonicalSerialize(input.expectedSession.document.launch) ===
+        canonicalSerialize(launch),
+    "operation_state_invalid",
+  );
+  const originalLaunch = await validateCurrentWriterLaunchRelation(
+    transaction,
+    input.expectedSession,
+    forUpdate,
+  );
+  ensure(originalLaunch !== null, "operation_state_invalid");
+  if (operation.state === "committed") {
+    ensure(
+      operation.result?.outcome === "writer-launch-stopped" ||
+        operation.result?.outcome === "cancelled-before-dispatch",
+      "operation_state_invalid",
+    );
+  }
+  if (operation.state !== "committed") {
+    ensure(
+      currentSession.document.launch !== null &&
+        canonicalSerialize(currentSession.document.launch) ===
+          canonicalSerialize(launch),
+      "operation_state_invalid",
+    );
+  }
+  return deepFreeze({ input, originalLaunch });
+}
+
+async function validateCurrentWriterLaunchRelation(
+  transaction,
+  session,
+  forUpdate,
+) {
+  const launch = session.document.launch;
+  if (launch === null) return null;
+  const current = await validateWriterLaunchPointerRelations(
+    transaction,
+    launch,
+    session,
+    forUpdate,
+  );
+  const { operation, relation, reservation } = current;
+  ensure(
+    session.document.lease !== null &&
       session.document.attachment !== null &&
       session.document.lease.sessionId === operation.sessionId &&
       session.document.lease.leaseId === relation.input.request.lease.leaseId &&
@@ -7035,10 +7391,17 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       session,
       forUpdate,
     );
+    const launchStop = await validateWriterLaunchStopRelations(
+      transaction,
+      operation,
+      session,
+      forUpdate,
+    );
     active = deepFreeze({
       checkpoint,
       generation,
       launchAttempt,
+      launchStop,
       operation,
       reservation,
     });
@@ -7085,10 +7448,17 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       terminalBase,
       false,
     );
+    const launchStop = await validateWriterLaunchStopRelations(
+      transaction,
+      operation,
+      session,
+      false,
+    );
     terminal = deepFreeze({
       checkpoint,
       generation,
       launchAttempt,
+      launchStop,
       operation,
       reservation,
     });
@@ -7149,6 +7519,7 @@ async function readRequestedOperation(
       checkpoint: null,
       generation: null,
       launchAttempt: null,
+      launchStop: null,
       terminal: relations.terminal,
       operation: null,
       reservation: null,
@@ -7194,6 +7565,15 @@ async function readRequestedOperation(
           false,
         )
       : current.launchAttempt;
+  const launchStop =
+    current === null
+      ? await validateWriterLaunchStopRelations(
+          transaction,
+          operation,
+          session,
+          false,
+        )
+      : current.launchStop;
   if (operation.state !== "committed") {
     validateActivePointer(session, operation, reservation);
   }
@@ -7202,6 +7582,7 @@ async function readRequestedOperation(
     checkpoint,
     generation,
     launchAttempt,
+    launchStop,
     terminal: relations.terminal,
     operation,
     reservation,
@@ -7448,6 +7829,118 @@ async function finalizeWriterLaunchAttempt(
       operation,
       reservation,
       session: updatedSession,
+    });
+  });
+}
+
+async function finalizeWriterLaunchStop(store, options) {
+  const input = writerLaunchStopFinalizationInput(options);
+  return runSerializable(store, async (transaction) => {
+    const session = await readSessionSnapshot(
+      transaction,
+      input.expectedSession.sessionId,
+      true,
+    );
+    const observed = await readRequestedOperation(
+      transaction,
+      session,
+      input,
+      true,
+    );
+    ensure(
+      observed.operation !== null &&
+        observed.reservation !== null &&
+        observed.launchStop !== null,
+      "operation_transition_conflict",
+    );
+    const result = writerLaunchStopTerminalResult(
+      input,
+      input.evidence,
+      "invalid_operation_request",
+    );
+    if (observed.operation.state === "committed") {
+      ensure(
+        BigIntConstructor(input.expectedOperationRevision) + 1n ===
+          BigIntConstructor(observed.operation.revision),
+        "operation_transition_conflict",
+      );
+      ensure(
+        canonicalSerialize(observed.operation.result) ===
+          canonicalSerialize(result),
+        "operation_result_conflict",
+      );
+      return operationReceipt({
+        finalized: false,
+        launch: currentWriterLaunchForAttempt(
+          session,
+          input.request.launch.launchAttemptId,
+        ),
+        operation: observed.operation,
+        reservation: observed.reservation,
+        session,
+        stop: writerLaunchStopRecord(input, observed.operation),
+      });
+    }
+    ensure(
+      (observed.operation.state === "starting" ||
+        observed.operation.state === "uncertain") &&
+        observed.operation.revision === input.expectedOperationRevision &&
+        session.document.lifecycle === "ATTACHED" &&
+        session.document.launch !== null &&
+        canonicalSerialize(session.document.launch) ===
+          canonicalSerialize(input.request.launch),
+      "operation_transition_conflict",
+    );
+    nextRevision(session.revision);
+    const serializedResult = canonicalSerialize(result);
+    const predecessorState = observed.operation.state;
+    const operationRows = rowsFromResult(
+      await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+        input.operationId,
+        input.expectedOperationRevision,
+        serializedResult,
+        transaction.now,
+        predecessorState,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(operationRows.length === 1, "operation_transition_conflict");
+    const reservationRows = rowsFromResult(
+      await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+        input.operationId,
+        transaction.now,
+        predecessorState,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(reservationRows.length === 1, "operation_transition_conflict");
+    const operation = operationSnapshotFromRow(operationRows[0]);
+    const reservation = reservationSnapshotFromRow(reservationRows[0]);
+    validateOperationIdentity(operation, input);
+    validateOperationReservation(operation, reservation, input);
+    ensure(
+      canonicalSerialize(operation.result) === serializedResult,
+      "operation_result_conflict",
+    );
+    const nextDocument = documentWithAuthorityState(session.document, {
+      activeOperation: null,
+      lastOperation: lastPointerFor(operation, reservation),
+      launch: null,
+    });
+    const updatedSession = await updateSessionDocument(
+      transaction,
+      session,
+      input,
+      nextDocument,
+    );
+    validateLastOperationPointer(updatedSession, operation, reservation);
+    return operationReceipt({
+      finalized: true,
+      launch: null,
+      operation,
+      reservation,
+      session: updatedSession,
+      stop: writerLaunchStopRecord(input, operation),
     });
   });
 }
@@ -7789,7 +8282,8 @@ export class PostgresSessionAuthority {
         );
         ensure(
           operation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
-            (operation.state === "starting" ||
+            (operation.state === "prepared" ||
+              operation.state === "starting" ||
               operation.state === "uncertain") &&
             operation.retiredAt === null &&
             (previousSessionId === null ||
@@ -7818,7 +8312,8 @@ export class PostgresSessionAuthority {
             observed.operation !== null &&
             observed.reservation !== null &&
             observed.launchAttempt !== null &&
-            (observed.operation.state === "starting" ||
+            (observed.operation.state === "prepared" ||
+              observed.operation.state === "starting" ||
               observed.operation.state === "uncertain") &&
             canonicalSerialize(observed.operation) ===
               canonicalSerialize(operation),
@@ -7828,6 +8323,7 @@ export class PostgresSessionAuthority {
           candidates[index] = deepFreeze({
             launchAttemptId: input.operationId,
             request: input.request,
+            state: observed.operation.state,
           });
           lastCandidateSessionId = operation.sessionId;
         }
@@ -7839,6 +8335,95 @@ export class PostgresSessionAuthority {
         nextAfterSessionId:
           operationRows.length > listInput.limit
             ? lastCandidateSessionId
+            : null,
+      });
+    });
+  }
+
+  async listCurrentWriterLaunchRecoveryCandidates(options) {
+    const listInput = currentWriterLaunchRecoveryListInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const maximumRows = listInput.limit + 1;
+      const afterCursor = listInput.afterSessionId;
+      const query =
+        afterCursor === null
+          ? LIST_CURRENT_WRITER_LAUNCH_FIRST_PAGE_QUERY
+          : LIST_CURRENT_WRITER_LAUNCH_AFTER_QUERY;
+      const values =
+        afterCursor === null
+          ? [maximumRows]
+          : [afterCursor, maximumRows];
+      const sessionRows = pageRowsFromResult(
+        await transaction.query(query.text, values),
+        maximumRows,
+        "session_state_invalid",
+      );
+      const scannedCount =
+        sessionRows.length > listInput.limit
+          ? listInput.limit
+          : sessionRows.length;
+      const scannedCandidates = new ArrayConstructor(scannedCount);
+      objectSetPrototypeOf(scannedCandidates, null);
+      let candidateCount = 0;
+      let previousSessionId = afterCursor;
+      let lastScannedSessionId = null;
+
+      for (let index = 0; index < sessionRows.length; index += 1) {
+        const row = ownDataValue(
+          sessionRows,
+          reflectApply(StringConstructor, undefined, [index]),
+          "session_state_invalid",
+        );
+        const sessionId = canonicalSessionId(
+          ownDataValue(row, "session_id", "session_state_invalid"),
+          "session_state_invalid",
+        );
+        ensure(
+          previousSessionId === null || sessionId > previousSessionId,
+          "session_state_invalid",
+        );
+        const session = snapshotFromRow(row, sessionId);
+        if (index < scannedCount) {
+          const relations = await validateSessionRelations(
+            transaction,
+            session,
+            false,
+          );
+          if (relations.currentLaunch !== null) {
+            const launch = session.document.launch;
+            ensure(
+              launch !== null &&
+                launch.launchAttemptId ===
+                  relations.currentLaunch.operation.operationId,
+              "operation_state_invalid",
+            );
+            scannedCandidates[candidateCount] = deepFreeze({
+              launch,
+              launchAttemptId: launch.launchAttemptId,
+              request: relations.currentLaunch.relation.input.request,
+            });
+            candidateCount += 1;
+          }
+          lastScannedSessionId = sessionId;
+        }
+        previousSessionId = sessionId;
+      }
+
+      const candidates = new ArrayConstructor(candidateCount);
+      objectSetPrototypeOf(candidates, null);
+      for (let index = 0; index < candidateCount; index += 1) {
+        candidates[index] = ownDataValue(
+          scannedCandidates,
+          reflectApply(StringConstructor, undefined, [index]),
+          "session_state_invalid",
+        );
+      }
+      objectSetPrototypeOf(candidates, arrayPrototype);
+      return deepFreeze({
+        candidates,
+        nextAfterSessionId:
+          sessionRows.length > listInput.limit
+            ? lastScannedSessionId
             : null,
       });
     });
@@ -8010,7 +8595,8 @@ export class PostgresSessionAuthority {
         input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND &&
         input.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND &&
         input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
-        input.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+        input.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+        input.kind !== WRITER_LAUNCH_STOP_OPERATION_KIND,
       "invalid_operation_request",
     );
     return runSerializable(this.#store, async (transaction) => {
@@ -9007,6 +9593,91 @@ export class PostgresSessionAuthority {
       "not-started",
       "complete-stopped",
     ]);
+  }
+
+  async claimWriterLaunchStopDispatch(options) {
+    const input = writerLaunchStopTransitionInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.launchStop !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state !== "prepared") {
+        return operationReceipt({
+          dispatchGranted: false,
+          launch: currentWriterLaunchForAttempt(
+            session,
+            input.request.launch.launchAttemptId,
+          ),
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+          stop: writerLaunchStopRecord(input, observed.operation),
+        });
+      }
+      ensure(
+        observed.operation.revision === input.expectedOperationRevision &&
+          session.document.lifecycle === "ATTACHED" &&
+          session.document.launch !== null &&
+          canonicalSerialize(session.document.launch) ===
+            canonicalSerialize(input.request.launch),
+        "operation_transition_conflict",
+      );
+      revisionAfter(session.revision, 3);
+      const operationRows = rowsFromResult(
+        await transaction.query(START_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(START_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(reservationRows.length === 1, "operation_transition_conflict");
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(reservationRows[0]);
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      const updatedSession = await updateSessionPhase(
+        transaction,
+        session,
+        input,
+        activePointerFor(input, "starting", "1"),
+      );
+      validateActivePointer(updatedSession, operation, reservation);
+      return operationReceipt({
+        dispatchGranted: true,
+        launch: updatedSession.document.launch,
+        operation,
+        reservation,
+        session: updatedSession,
+        stop: writerLaunchStopRecord(input, operation),
+      });
+    });
+  }
+
+  async finalizeWriterLaunchStopped(options) {
+    return finalizeWriterLaunchStop(this.#store, options);
   }
 
   async readWriterLaunchAttempt(options) {
@@ -10145,7 +10816,8 @@ export class PostgresSessionAuthority {
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND ||
           input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND ||
           input.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND ||
-          input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND
+          input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND ||
+          input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND
           ? 2
           : 1,
       );

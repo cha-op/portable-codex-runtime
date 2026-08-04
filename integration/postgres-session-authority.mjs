@@ -9,6 +9,9 @@ import {
   operationJournalBindingSha256,
 } from "../src/filesystem-operation-journal.mjs";
 import {
+  PlatformImageReservationCoordinator,
+} from "../src/platform-image-reservation.mjs";
+import {
   PostgresCheckpointMutationAuthorityError,
   createPostgresCheckpointMutationAuthority,
 } from "../src/postgres-checkpoint-mutation-authority.mjs";
@@ -19,6 +22,9 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
+  createPostgresLogicalWriterLauncher,
+} from "../src/postgres-logical-writer-launcher.mjs";
+import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
@@ -27,11 +33,13 @@ import {
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
   WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_STOP_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
   createWriterLaunchAttemptOperationRequest,
+  createWriterLaunchStopOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -39,6 +47,10 @@ import {
   SESSION_AUTHORITY_MIGRATION_VERSION,
 } from "../src/postgres-serializable-store.mjs";
 import { createSessionManifest } from "../src/session-storage-contracts.mjs";
+import {
+  STOPPED_WRITER_STOP_CONFIRMED,
+  StoppedWriterCapabilityCoordinator,
+} from "../src/stopped-writer-capability.mjs";
 
 const EMPTY_JSON_OBJECT = "{}";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -525,6 +537,7 @@ async function assertRestoreGenerationConstraints(pool) {
 function registrationInput(
   sessionId,
   {
+    imageDigest = IMAGE_DIGEST,
     storageId = `volume-${randomUUID()}`,
   } = {},
 ) {
@@ -539,7 +552,7 @@ function registrationInput(
         historyMode: "paginated",
       },
       runtime: {
-        imageDigest: IMAGE_DIGEST,
+        imageDigest,
         imageMediaType:
           "application/vnd.oci.image.manifest.v1+json",
         platform: "linux/arm64",
@@ -558,6 +571,54 @@ function registrationInput(
       exclusiveWriterAttachment: true,
       fencing: "epoch-enforced",
       normalDirectoryAttachment: true,
+    },
+  };
+}
+
+function integrationPlatformImageFixture() {
+  const configBytes = Buffer.from(
+    JSON.stringify({
+      architecture: "arm64",
+      config: { Env: ["PATH=/usr/local/bin:/usr/bin:/bin"] },
+      os: "linux",
+      rootfs: {
+        diff_ids: [`sha256:${"d".repeat(64)}`],
+        type: "layers",
+      },
+    }),
+    "utf8",
+  );
+  const configDigest = `sha256:${createHash("sha256")
+    .update(configBytes)
+    .digest("hex")}`;
+  const descriptorBytes = Buffer.from(
+    JSON.stringify({
+      config: {
+        digest: configDigest,
+        mediaType: "application/vnd.oci.image.config.v1+json",
+        size: configBytes.byteLength,
+      },
+      layers: [
+        {
+          digest: `sha256:${"c".repeat(64)}`,
+          mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+          size: 1024,
+        },
+      ],
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      schemaVersion: 2,
+    }),
+    "utf8",
+  );
+  return {
+    configBytes,
+    descriptor: {
+      bytes: descriptorBytes,
+      digest: `sha256:${createHash("sha256")
+        .update(descriptorBytes)
+        .digest("hex")}`,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      size: descriptorBytes.byteLength,
     },
   };
 }
@@ -1276,16 +1337,82 @@ function writerLaunchEvidence(input, status) {
   };
 }
 
+function writerLaunchStopInput(
+  expectedSession,
+  { operationId = `writer-launch-stop-${randomUUID()}` } = {},
+) {
+  return {
+    expectedSession,
+    kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+    operationId,
+    request: createWriterLaunchStopOperationRequest({ expectedSession }),
+  };
+}
+
+function writerLaunchStopEvidence(input) {
+  const launch = input.request.launch;
+  return {
+    contractVersion: 1,
+    launchAttemptId: launch.launchAttemptId,
+    processIncarnationId: launch.processIncarnationId,
+    proofId: `supervisor-stop-proof-${randomUUID()}`,
+    status: "complete-stopped",
+    supervisorId: launch.supervisorId,
+    writerIncarnationId: launch.writerIncarnationId,
+  };
+}
+
+function consecutiveFreshSessionIds(existingSessionIds, count) {
+  assert.equal(Number.isSafeInteger(count) && count > 0, true);
+  const existing = new Set(existingSessionIds);
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const candidates = Array.from(
+      { length: Math.max(8, count * 4) },
+      () => randomUUID(),
+    );
+    const candidateSet = new Set(candidates);
+    const ordered = [...existingSessionIds, ...candidates].sort();
+    for (
+      let index = 0;
+      index + count <= ordered.length;
+      index += 1
+    ) {
+      const sessionIds = ordered.slice(index, index + count);
+      if (
+        sessionIds.every(
+          (sessionId) =>
+            candidateSet.has(sessionId) && !existing.has(sessionId),
+        )
+      ) {
+        const fullSessionOrder = [
+          ...existingSessionIds,
+          ...sessionIds,
+        ].sort();
+        const firstSessionIndex = fullSessionOrder.indexOf(sessionIds[0]);
+        return {
+          afterSessionId:
+            firstSessionIndex === 0
+              ? null
+              : fullSessionOrder[firstSessionIndex - 1],
+          sessionIds,
+        };
+      }
+    }
+  }
+  throw new Error("could not allocate consecutive integration session IDs");
+}
+
 async function prepareRestoreGenerationFixture(
   authority,
   checkpointAuthority,
   sessionId,
   {
     finalAttachmentLeaseDurationMilliseconds = 300_000,
+    imageDigest = IMAGE_DIGEST,
   } = {},
 ) {
   const registered = await authority.registerSession(
-    registrationInput(sessionId),
+    registrationInput(sessionId, { imageDigest }),
   );
   const sourceAttachment = await attachWriter(authority, registered, {
     leaseDurationMilliseconds: 300_000,
@@ -5790,6 +5917,140 @@ test(
         assert.deepEqual(read.operation, prepared.operation);
         assert.deepEqual(read.reservation, prepared.reservation);
         assert.deepEqual(read.session, prepared.session);
+        const cancelled = await authority.cancelPreparedOperation({
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+          reason: "lease-expired-before-launch-dispatch",
+        });
+        assertOperationReceipt(cancelled, "committed");
+      },
+    );
+
+    await t.test(
+      "logical writer launcher commits one started writer and reconciles its original handle",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const image = integrationPlatformImageFixture();
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+          { imageDigest: image.descriptor.digest },
+        );
+        const imageReservations =
+          new PlatformImageReservationCoordinator();
+        const inspectCodex = async () => {
+          return {
+            codexBinaryPath: "/opt/portable-codex/bin/codex",
+            codexBinarySha256: "c".repeat(64),
+            codexVersion:
+              fixture.finalized.session.document.manifest.runtime
+                .codexVersion,
+          };
+        };
+        const reserved = await imageReservations.reservePlatformImage({
+          configBytes: image.configBytes,
+          descriptor: image.descriptor,
+          inspectCodex,
+          sessionManifest:
+            fixture.finalized.session.document.manifest,
+        });
+        const launchAttemptId = `writer-launch-${randomUUID()}`;
+        const supervisorId = `supervisor-${randomUUID()}`;
+        let launchCalls = 0;
+        const launchWriter = async (context) => {
+          launchCalls += 1;
+          assert.equal(
+            context.attempt.launchAttemptId,
+            launchAttemptId,
+          );
+          return {
+            receiptVersion: 1,
+            evidence: writerLaunchEvidence(
+              {
+                operationId: launchAttemptId,
+                request: context.attempt.request,
+              },
+              "started",
+            ),
+            stopWriter: async function stopWriter() {
+              return STOPPED_WRITER_STOP_CONFIRMED;
+            },
+          };
+        };
+        const reconcileWriterLaunch = async () => {
+          throw new Error("committed launches must not reach the supervisor");
+        };
+        const facade = createPostgresLogicalWriterLauncher({
+          authority,
+          imageReservations,
+          operationGuard,
+          stoppedWriterCoordinator:
+            new StoppedWriterCapabilityCoordinator(),
+          supervisor: {
+            contractVersion: 1,
+            launchWriter,
+            reconcileWriterLaunch,
+            supervisorId,
+          },
+        });
+
+        const started = await facade.runLaunch({
+          generation: fixture.finalized.generation,
+          imageReservation: {
+            configBytes: image.configBytes,
+            descriptor: image.descriptor,
+            inspectCodex,
+            reservation: reserved.reservation,
+          },
+          launchAttemptId,
+        });
+        assert.equal(started.status, "started");
+        assert.notEqual(started.writer, null);
+        assert.equal(launchCalls, 1);
+
+        const read = await authority.readWriterLaunchAttempt({
+          operationId: launchAttemptId,
+        });
+        assertOperationReceipt(read, "committed");
+        assert.equal(
+          read.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.operation.result.evidence)),
+          JSON.parse(JSON.stringify(started.evidence)),
+        );
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.session.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
+        const current = await authority.readSession({ sessionId });
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(current.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
+
+        const reconciled = await facade.reconcileLaunchAttempt({
+          launchAttemptId,
+        });
+        assert.equal(reconciled.status, "started");
+        assert.strictEqual(reconciled.writer, started.writer);
+        assert.equal(launchCalls, 1);
+
+        const guardResult = await operationGuard.runExclusive(
+          launchAttemptId,
+          async (probe) => {
+            await probe.assertHeld();
+            return "guard-reacquired";
+          },
+        );
+        assert.equal(guardResult, "guard-reacquired");
       },
     );
 
@@ -6347,12 +6608,261 @@ test(
     );
 
     await t.test(
+      "writer launch stop survives acknowledgement loss and clears one exact current launch",
+      async () => {
+        const existingRows = await pool.query(
+          [
+            "SELECT session_id::text AS session_id",
+            "FROM session_authority.sessions",
+            "ORDER BY session_id",
+          ].join(" "),
+        );
+        const consecutive = consecutiveFreshSessionIds(
+          existingRows.rows.map(({ session_id: sessionId }) => sessionId),
+          2,
+        );
+        const [detachedSessionId, launchedSessionId] =
+          consecutive.sessionIds;
+        sessionIds.push(detachedSessionId, launchedSessionId);
+        await authority.registerSession(
+          registrationInput(detachedSessionId),
+        );
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          launchedSessionId,
+          { finalAttachmentLeaseDurationMilliseconds: 3_000 },
+        );
+        const launchInput = writerLaunchAttemptInput(
+          fixture.finalized.session,
+          fixture.finalized.generation,
+        );
+        await authority.reserveOperation(launchInput);
+        const launchClaim =
+          await authority.claimWriterLaunchAttemptDispatch({
+            ...structuredClone(launchInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(launchClaim, "starting");
+        const launchEvidence = writerLaunchEvidence(
+          launchInput,
+          "started",
+        );
+        const launched =
+          await authority.finalizeWriterLaunchAttemptStarted({
+            ...structuredClone(launchInput),
+            evidence: launchEvidence,
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(launched, "committed");
+
+        const sparsePage =
+          await authority.listCurrentWriterLaunchRecoveryCandidates({
+            afterSessionId: consecutive.afterSessionId,
+            limit: 1,
+          });
+        assert.deepEqual(sparsePage, {
+          candidates: [],
+          nextAfterSessionId: detachedSessionId,
+        });
+        const currentPage =
+          await authority.listCurrentWriterLaunchRecoveryCandidates({
+            afterSessionId: sparsePage.nextAfterSessionId,
+            limit: 1,
+          });
+        assert.equal(currentPage.candidates.length, 1);
+        assert.deepEqual(currentPage.candidates[0], {
+          launch: launched.launch,
+          launchAttemptId: launchInput.operationId,
+          request: launchInput.request,
+        });
+
+        const originalBefore = await pool.query(
+          [
+            "SELECT request, result, state, revision, created_at, updated_at, retired_at",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [launchInput.operationId],
+        );
+        assert.equal(originalBefore.rows.length, 1);
+        const stopInput = writerLaunchStopInput(launched.session);
+        const prepared = await authority.reserveOperation(stopInput);
+        assertOperationReceipt(prepared, "prepared");
+
+        await waitForDatabaseLeaseExpiry(
+          pool,
+          launched.session.document.lease.expiresAt,
+        );
+        const claimInput = {
+          ...structuredClone(stopInput),
+          expectedOperationRevision: "0",
+        };
+        const claimLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+          }),
+        });
+        await assert.rejects(
+          claimLossAuthority.claimWriterLaunchStopDispatch(claimInput),
+          assertCommitOutcomeUncertain,
+        );
+        const claimReplay =
+          await authority.claimWriterLaunchStopDispatch(
+            structuredClone(claimInput),
+          );
+        assertOperationReceipt(claimReplay, "starting");
+        assert.equal(claimReplay.dispatchGranted, false);
+        assert.deepEqual(claimReplay.session.document.launch, launched.launch);
+
+        const uncertain = await authority.markOperationUncertain({
+          ...structuredClone(stopInput),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(uncertain, "uncertain");
+        assert.deepEqual(uncertain.session.document.launch, launched.launch);
+        const stopEvidence = writerLaunchStopEvidence(stopInput);
+        await assert.rejects(
+          authority.finalizeWriterLaunchStopped({
+            ...structuredClone(stopInput),
+            evidence: {
+              ...stopEvidence,
+              processIncarnationId: `process-mismatch-${randomUUID()}`,
+            },
+            expectedOperationRevision: "2",
+          }),
+          assertAuthorityCode("invalid_operation_request"),
+        );
+
+        const finalization = {
+          ...structuredClone(stopInput),
+          evidence: stopEvidence,
+          expectedOperationRevision: "2",
+        };
+        const finalizeLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+          }),
+        });
+        await assert.rejects(
+          finalizeLossAuthority.finalizeWriterLaunchStopped(finalization),
+          assertCommitOutcomeUncertain,
+        );
+        const committed = await authority.reconcileOperation(stopInput);
+        assertOperationReceipt(committed, "committed");
+        assert.equal(
+          committed.operation.result.outcome,
+          "writer-launch-stopped",
+        );
+        assert.equal(committed.session.document.launch, null);
+        assert.equal(
+          committed.session.document.lastOperation.operationId,
+          stopInput.operationId,
+        );
+        const replay = await authority.finalizeWriterLaunchStopped(
+          structuredClone(finalization),
+        );
+        assertOperationReceipt(replay, "committed");
+        assert.equal(replay.finalized, false);
+        assert.equal(replay.launch, null);
+        assert.deepEqual(replay.operation.result, committed.operation.result);
+
+        await assert.rejects(
+          authority.finalizeWriterLaunchStopped({
+            ...structuredClone(stopInput),
+            evidence: {
+              ...stopEvidence,
+              proofId: `stop-proof-mismatch-${randomUUID()}`,
+            },
+            expectedOperationRevision: "2",
+          }),
+          assertAuthorityCode("operation_result_conflict"),
+        );
+        await assert.rejects(
+          authority.finalizeWriterLaunchStopped({
+            ...structuredClone(stopInput),
+            evidence: stopEvidence,
+            expectedOperationRevision: "1",
+          }),
+          assertAuthorityCode("operation_transition_conflict"),
+        );
+
+        const originalAfter = await pool.query(
+          [
+            "SELECT request, result, state, revision, created_at, updated_at, retired_at",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [launchInput.operationId],
+        );
+        assert.deepEqual(originalAfter.rows, originalBefore.rows);
+        const historical = await authority.readWriterLaunchAttempt({
+          operationId: launchInput.operationId,
+        });
+        assertOperationReceipt(historical, "committed", {
+          currentTerminal: false,
+        });
+        assert.equal(
+          historical.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.equal(historical.launch, null);
+
+        const corruptedResult = structuredClone(
+          originalBefore.rows[0].result,
+        );
+        corruptedResult.evidence.proofId =
+          `corrupt-start-proof-${randomUUID()}`;
+        await pool.query(
+          [
+            "UPDATE session_authority.operation_claims",
+            "SET result = $2::jsonb",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [launchInput.operationId, JSON.stringify(corruptedResult)],
+        );
+        try {
+          await assert.rejects(
+            authority.readSession({
+              sessionId: launchedSessionId,
+            }),
+            assertAuthorityCode("operation_state_invalid"),
+          );
+        } finally {
+          await pool.query(
+            [
+              "UPDATE session_authority.operation_claims",
+              "SET result = $2::jsonb",
+              "WHERE operation_id = $1",
+            ].join(" "),
+            [
+              launchInput.operationId,
+              JSON.stringify(originalBefore.rows[0].result),
+            ],
+          );
+        }
+        const restored = await authority.readSession({
+          sessionId: launchedSessionId,
+        });
+        assert.equal(restored.document.launch, null);
+      },
+    );
+
+    await t.test(
       "writer launch recovery is bounded and concurrent claims grant once",
       async () => {
-        const orderedSessionIds = Array.from(
-          { length: 3 },
-          () => randomUUID(),
-        ).sort();
+        const existingRows = await pool.query(
+          [
+            "SELECT session_id::text AS session_id",
+            "FROM session_authority.sessions",
+            "ORDER BY session_id",
+          ].join(" "),
+        );
+        const consecutive = consecutiveFreshSessionIds(
+          existingRows.rows.map(({ session_id: sessionId }) => sessionId),
+          3,
+        );
+        const orderedSessionIds = consecutive.sessionIds;
         sessionIds.push(...orderedSessionIds);
         const inputs = [];
         for (const sessionId of orderedSessionIds) {
@@ -6423,13 +6933,14 @@ test(
 
         const firstPage =
           await authority.listWriterLaunchAttemptRecoveryCandidates({
-            afterSessionId: null,
+            afterSessionId: consecutive.afterSessionId,
             limit: 1,
           });
         assert.deepEqual(firstPage.candidates, [
           {
             launchAttemptId: inputs[0].operationId,
             request: inputs[0].request,
+            state: "starting",
           },
         ]);
         assert.equal(
@@ -6446,11 +6957,12 @@ test(
           {
             launchAttemptId: inputs[1].operationId,
             request: inputs[1].request,
+            state: "uncertain",
           },
         ]);
         assert.equal(
           secondPage.nextAfterSessionId,
-          null,
+          orderedSessionIds[1],
         );
 
         const terminalPage =
@@ -6458,10 +6970,18 @@ test(
             afterSessionId: orderedSessionIds[1],
             limit: 1,
           });
-        assert.deepEqual(terminalPage, {
-          candidates: [],
-          nextAfterSessionId: null,
-        });
+        assert.deepEqual(terminalPage.candidates, [
+          {
+            launchAttemptId: inputs[2].operationId,
+            request: inputs[2].request,
+            state: "prepared",
+          },
+        ]);
+        assert.equal(
+          terminalPage.nextAfterSessionId === null ||
+            terminalPage.nextAfterSessionId === orderedSessionIds[2],
+          true,
+        );
         assert.equal(
           inputs[2].operationId ===
             firstPage.candidates[0].launchAttemptId ||
