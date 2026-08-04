@@ -179,10 +179,10 @@ Restore and launcher authority are now split into seven serial pull requests:
      operations materialize their claim immediately; version 2 restore
      dispatch durably claims the exact launch-attempt ID before authorizing
      publication, so no other session or operation can steal it in the crash
-     gap. Drain in-flight legacy writes under an `ACCESS EXCLUSIVE` operation
-     table lock and retain a database trigger that blocks old binaries from
-     advancing V2 work without the exact claim while still allowing strict
-     cancellation before dispatch.
+     gap. Drain in-flight legacy writes by locking the session table before the
+     operation table, matching runtime lock order, and retain a database
+     trigger that blocks old binaries from advancing V2 work without the exact
+     claim while still allowing strict cancellation before dispatch.
    - In one serializable transition, commit the authorized generation, retire
      the restore operation, materialize its exact registry claim as the
      `writer-launch-attempt-v1` operation, and reserve that operation. Advance

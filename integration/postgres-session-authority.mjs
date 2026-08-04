@@ -178,9 +178,10 @@ async function insertDirectOperationIdClaim(
   );
 }
 
-async function waitForMigrationOperationTableLock(pool) {
+async function waitForMigrationOperationTableLock(queryable) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const result = await pool.query(
+    await queryable.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
+    const result = await queryable.query(
       [
         "SELECT count(*)::integer AS value",
         "FROM pg_catalog.pg_stat_activity",
@@ -195,6 +196,38 @@ async function waitForMigrationOperationTableLock(pool) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.fail("operation ID registry migration did not wait for old writers");
+}
+
+async function waitForMigrationSessionTableLock(queryable) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await queryable.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
+    const result = await queryable.query(
+      [
+        "SELECT count(*)::integer AS value",
+        "FROM pg_catalog.pg_locks AS locks",
+        "JOIN pg_catalog.pg_class AS relation",
+        "ON relation.oid = locks.relation",
+        "JOIN pg_catalog.pg_namespace AS namespace",
+        "ON namespace.oid = relation.relnamespace",
+        "JOIN pg_catalog.pg_stat_activity AS activity",
+        "ON activity.pid = locks.pid",
+        "WHERE locks.locktype = 'relation'",
+        "AND locks.mode = 'ExclusiveLock'",
+        "AND locks.granted = false",
+        "AND namespace.nspname = 'session_authority'",
+        "AND relation.relname = 'sessions'",
+        "AND activity.datname = pg_catalog.current_database()",
+        "AND position(",
+        "'LOCK TABLE session_authority.sessions IN EXCLUSIVE MODE'",
+        "IN activity.query) > 0",
+      ].join(" "),
+    );
+    if (result.rows[0]?.value >= 1) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(
+    "operation ID registry migration did not wait for session writers",
+  );
 }
 
 async function assertLegacyRestoreV2MigrationGate(
@@ -253,7 +286,11 @@ async function assertLegacyRestoreV2MigrationGate(
       (value) => ({ error: null, value }),
       (error) => ({ error, value: null }),
     );
-    await waitForMigrationOperationTableLock(pool);
+    // The integration pool intentionally has only two connections: this old
+    // writer and the blocked migrator. Observe the wait through the writer's
+    // existing connection so the probe itself cannot deadlock in the pool
+    // queue before releasing the table lock.
+    await waitForMigrationOperationTableLock(oldWriter);
     await oldWriter.query("COMMIT");
     oldWriterTransactionOpen = false;
     const outcome = await migrationOutcome;
@@ -296,7 +333,53 @@ async function assertLegacyRestoreV2MigrationGate(
       now,
     ],
   );
-  const upgraded = await store.migrate();
+  const sessionWriter = await pool.connect();
+  let sessionWriterTransactionOpen = false;
+  let migrationOutcome;
+  try {
+    // Enter the runtime's session-first lock order before the migration. The
+    // writer must still be able to touch its operation before releasing the
+    // session row, proving that the migration has not inverted that order.
+    await sessionWriter.query("BEGIN");
+    sessionWriterTransactionOpen = true;
+    const lockedSession = await sessionWriter.query(
+      [
+        "SELECT session_id",
+        "FROM session_authority.sessions",
+        "WHERE session_id = $1",
+        "FOR UPDATE",
+      ].join(" "),
+      [sessionId],
+    );
+    assert.equal(lockedSession.rows.length, 1);
+    migrationOutcome = store.migrate().then(
+      (value) => ({ error: null, value }),
+      (error) => ({ error, value: null }),
+    );
+    await waitForMigrationSessionTableLock(sessionWriter);
+    const touchedOperation = await sessionWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET updated_at = updated_at",
+        "WHERE operation_id = $1",
+        "RETURNING operation_id, state",
+      ].join(" "),
+      [operationId],
+    );
+    assert.deepEqual(touchedOperation.rows, [
+      { operation_id: operationId, state: "prepared" },
+    ]);
+    await sessionWriter.query("COMMIT");
+    sessionWriterTransactionOpen = false;
+  } finally {
+    if (sessionWriterTransactionOpen) {
+      await sessionWriter.query("ROLLBACK");
+    }
+    sessionWriter.release();
+  }
+  const upgradeOutcome = await migrationOutcome;
+  assert.equal(upgradeOutcome.error, null);
+  const upgraded = upgradeOutcome.value;
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations[2].checksum,

@@ -806,8 +806,11 @@ retirement API for these rows in this foundation.
 Migration version 3 adds `session_authority.operation_id_registry`, backfills
 every existing ordinary operation as a materialized `direct-operation`, and
 routes later operation creation through that permanent namespace. It first
-takes an `ACCESS EXCLUSIVE` lock on `operation_claims`, so the legacy-state
-gate observes every old writer that was already in flight. The installed
+takes an `EXCLUSIVE` lock on `sessions`, then an `ACCESS EXCLUSIVE` lock on
+`operation_claims`, matching the runtime's session-to-operation lock order
+while still allowing plain session reads. The legacy-state gate therefore
+observes every old operation writer already in flight without introducing a
+reverse-order deadlock against a writer holding a session row. The installed
 `operation_claims_enforce_restore_v2_launch_id_claim` trigger then rejects any
 post-upgrade old-binary transition of a version 2 restore beyond `prepared`
 unless the exact durable launch-intent claim already exists. The only

@@ -114,10 +114,12 @@ capability.
   claims without changing their lifecycle.
 - An old version 2 restore operation may gain the new launch-intent claim only
   while it is still `prepared`, through its next upgraded dispatch before
-  publication. Migration drains in-flight legacy operation writers with an
-  `ACCESS EXCLUSIVE` table lock, then installs a trigger that rejects any
-  post-upgrade old-binary transition without the exact claim while preserving
-  the strict `prepared -> committed/cancelled-before-dispatch` escape path.
+  publication. Migration drains in-flight legacy writers by taking an
+  `EXCLUSIVE` session-table lock before the `ACCESS EXCLUSIVE` operation-table
+  lock, matching the runtime's session-to-operation lock order. It then
+  installs a trigger that rejects any post-upgrade old-binary transition
+  without the exact claim while preserving the strict
+  `prepared -> committed/cancelled-before-dispatch` escape path.
   Migration
   aborts with SQLSTATE `55000` on old `starting`,
   `uncertain`, or `committed` version 2 work because neither a later row

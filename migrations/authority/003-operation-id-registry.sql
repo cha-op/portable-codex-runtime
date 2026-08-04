@@ -1,3 +1,8 @@
+-- Runtime writers lock the session row before touching operation relations.
+-- EXCLUSIVE conflicts with their ROW SHARE table lock while preserving plain
+-- reads, so the migration joins that same session-to-operation lock order.
+LOCK TABLE session_authority.sessions IN EXCLUSIVE MODE;
+
 LOCK TABLE session_authority.operation_claims IN ACCESS EXCLUSIVE MODE;
 
 DO $operation_id_registry_migration$
