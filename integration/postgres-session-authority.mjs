@@ -5108,7 +5108,7 @@ test(
           );
           assert.deepEqual(
             authorizedState.generation_binding,
-            claimed.generation.binding,
+            structuredClone(claimed.generation.binding),
           );
           assert.equal(authorizedState.generation_document, null);
           assert.equal(authorizedState.generation_committed_at, null);
