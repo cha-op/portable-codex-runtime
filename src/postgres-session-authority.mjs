@@ -9782,7 +9782,8 @@ export class PostgresSessionAuthority {
       );
 
       // R+1 commits the generation, R+2 makes the prepared launch active,
-      // and one further revision must remain available before either write.
+      // and the launch claim must retain its complete three-revision budget
+      // before either handoff write begins.
       ensure(
         session.revision ===
           restoreTerminalRevisionForLaunchHandoff(
@@ -9792,7 +9793,7 @@ export class PostgresSessionAuthority {
           ),
         "operation_state_invalid",
       );
-      revisionAfter(session.revision, 3);
+      revisionAfter(session.revision, 5);
 
       const generationRows = rowsFromResult(
         await transaction.query(COMMIT_RESTORE_GENERATION_QUERY.text, [

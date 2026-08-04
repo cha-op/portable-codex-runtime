@@ -59,6 +59,7 @@ const SUPERVISOR_ID = "supervisor-001";
 const SUPERVISOR_PROOF_ID = "supervisor-proof-001";
 const STOP_OPERATION_ID = "stop-operation-001";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
+const MAX_POSTGRES_BIGINT = 9_223_372_036_854_775_807n;
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const NOW = "2026-07-29T12:34:56.789Z";
 const LATER = "2026-07-29T12:34:57.789Z";
@@ -2809,11 +2810,15 @@ function writerLaunchGenerationReferenceSteps(fixture) {
   ];
 }
 
-function writerLaunchActiveSteps(fixture, state) {
+function writerLaunchActiveSteps(
+  fixture,
+  state,
+  { createdAt = LAUNCH_PREPARED_NOW } = {},
+) {
   const steps = [
     rows(writerLaunchPhaseSessionRow(fixture, state)),
-    rows(writerLaunchOperationRow(fixture, state)),
-    rows(writerLaunchReservationRow(fixture, state)),
+    rows(writerLaunchOperationRow(fixture, state, { createdAt })),
+    rows(writerLaunchReservationRow(fixture, state, { createdAt })),
   ];
   if (state !== "prepared") {
     steps.push(...writerLaunchGenerationReferenceSteps(fixture));
@@ -10949,17 +10954,102 @@ test("restore-to-launch handoff never backfills a separately committed generatio
   clients[0].assertExhausted();
 });
 
-test("restore-to-launch handoff reserves three revisions before its first write", async () => {
+test("restore-to-launch handoff at bigint max-5 reaches terminal through uncertainty", async () => {
+  const restoreStartingRevision = MAX_POSTGRES_BIGINT - 5n;
   const fixture = restoreLaunchHandoffFixture({
-    expectedSessionRevision: "9223372036854775803",
+    expectedSessionRevision: (restoreStartingRevision - 2n).toString(),
   });
   const restore = fixture.restore;
+  const startingOperation = writerLaunchOperationRow(fixture, "starting", {
+    createdAt: RESTORE_FINALIZE_NOW,
+  });
+  const startingReservation = writerLaunchReservationRow(
+    fixture,
+    "starting",
+    { createdAt: RESTORE_FINALIZE_NOW },
+  );
+  const startingSession = writerLaunchPhaseSessionRow(fixture, "starting");
+  const uncertainOperation = writerLaunchOperationRow(
+    fixture,
+    "uncertain",
+    { createdAt: RESTORE_FINALIZE_NOW },
+  );
+  const uncertainReservation = writerLaunchReservationRow(
+    fixture,
+    "uncertain",
+    { createdAt: RESTORE_FINALIZE_NOW },
+  );
+  const uncertainSession = writerLaunchPhaseSessionRow(
+    fixture,
+    "uncertain",
+  );
+  const evidence = writerLaunchEvidence(fixture);
+  const result = writerLaunchResult(fixture);
+  const committedOperation = writerLaunchOperationRow(
+    fixture,
+    "committed",
+    {
+      createdAt: RESTORE_FINALIZE_NOW,
+      result,
+      revision: "3",
+    },
+  );
+  const committedReservation = writerLaunchReservationRow(
+    fixture,
+    "released",
+    { createdAt: RESTORE_FINALIZE_NOW },
+  );
+  const committedSession = writerLaunchCommittedSessionRow(fixture, {
+    operationRevision: "3",
+    result,
+  });
   const { authority, clients } = authorityWithScripts(
-    restoreGenerationActiveSteps(restore, "starting"),
+    {
+      options: { now: RESTORE_FINALIZE_NOW },
+      steps: [
+        ...restoreGenerationActiveSteps(restore, "starting"),
+        ...restoreLaunchHandoffWriteSteps(fixture),
+      ],
+    },
+    {
+      options: {
+        authorityNow: LAUNCH_DISPATCH_NOW,
+        now: LAUNCH_DISPATCH_NOW,
+      },
+      steps: [
+        ...restoreLaunchHandoffActiveSteps(fixture),
+        ...writerLaunchGenerationReferenceSteps(fixture),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    {
+      options: { now: LAUNCH_UNCERTAIN_NOW },
+      steps: [
+        ...writerLaunchActiveSteps(fixture, "starting", {
+          createdAt: RESTORE_FINALIZE_NOW,
+        }),
+        rows(uncertainOperation),
+        rows(uncertainReservation),
+        rows(uncertainSession),
+      ],
+    },
+    {
+      options: { now: LAUNCH_FINALIZE_NOW },
+      steps: [
+        ...writerLaunchActiveSteps(fixture, "uncertain", {
+          createdAt: RESTORE_FINALIZE_NOW,
+        }),
+        rows(committedOperation),
+        rows(committedReservation),
+        rows(committedSession),
+      ],
+    },
   );
 
-  await assertAuthorityError(
-    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+  const handoff =
+    await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
       {
         launch: restore.launchIntent,
         restore: {
@@ -10968,17 +11058,85 @@ test("restore-to-launch handoff reserves three revisions before its first write"
           expectedOperationRevision: "1",
         },
       },
-    ),
-    { code: "session_revision_exhausted" },
-  );
+    );
+  const claimed = await authority.claimWriterLaunchAttemptDispatch({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+  });
+  const uncertain = await authority.markOperationUncertain({
+    ...fixture.options,
+    expectedOperationRevision: "1",
+  });
+  const finalized = await authority.finalizeWriterLaunchAttemptStarted({
+    ...fixture.options,
+    evidence,
+    expectedOperationRevision: "2",
+  });
 
   assert.equal(
-    authorityQueries(clients[0]).some((args) =>
-      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
-    ),
-    false,
+    restoreGenerationPhaseSessionRow(restore, "starting").revision,
+    restoreStartingRevision.toString(),
   );
-  clients[0].assertExhausted();
+  assert.equal(
+    handoff.session.revision,
+    (restoreStartingRevision + 2n).toString(),
+  );
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(
+    claimed.session.revision,
+    (restoreStartingRevision + 3n).toString(),
+  );
+  assert.equal(uncertain.changed, true);
+  assert.equal(
+    uncertain.session.revision,
+    (restoreStartingRevision + 4n).toString(),
+  );
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.attempt.state, "committed");
+  assert.equal(finalized.session.revision, MAX_POSTGRES_BIGINT.toString());
+  for (const client of clients) client.assertExhausted();
+});
+
+test("restore-to-launch handoff rejects an insufficient launch claim revision budget before its first write", async (t) => {
+  for (const remainingRevisions of [4n, 3n]) {
+    await t.test(`starting at bigint max-${remainingRevisions}`, async () => {
+      const restoreStartingRevision =
+        MAX_POSTGRES_BIGINT - remainingRevisions;
+      const fixture = restoreLaunchHandoffFixture({
+        expectedSessionRevision: (restoreStartingRevision - 2n).toString(),
+      });
+      const restore = fixture.restore;
+      const { authority, clients } = authorityWithScripts(
+        restoreGenerationActiveSteps(restore, "starting"),
+      );
+
+      await assertAuthorityError(
+        authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+          {
+            launch: restore.launchIntent,
+            restore: {
+              ...restore.options,
+              completion: restore.completion,
+              expectedOperationRevision: "1",
+            },
+          },
+        ),
+        { code: "session_revision_exhausted" },
+      );
+
+      assert.equal(
+        restoreGenerationPhaseSessionRow(restore, "starting").revision,
+        restoreStartingRevision.toString(),
+      );
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
 });
 
 test("restore-to-launch handoff rejects active session revision drift before its first write", async () => {

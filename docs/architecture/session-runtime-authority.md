@@ -1113,6 +1113,10 @@ The transaction exposes neither intermediate session revision. On rollback,
 none of the generation, terminal restore state, or launch reservation becomes
 visible. A lost commit acknowledgement is resolved by exact readback of both
 operations and the generation; replay cannot reserve a different attempt.
+Before the first write, the fresh handoff also proves that the session revision
+can advance five times: twice for the handoff and three more for launch claim,
+uncertainty, and terminal completion. It therefore cannot commit a prepared
+launch attempt that is already unable to enter the claim lifecycle.
 Version 1 restore requests remain readable and independently finalisable, but
 they have no durable launch intent and cannot use the atomic handoff.
 Version 1 recovery candidates also retain their historical three-field shape;

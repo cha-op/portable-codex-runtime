@@ -66,6 +66,10 @@ capability.
   The launch request is derived from that exact snapshot, and the second
   revision records its active prepared pointer. Neither intermediate state is
   externally visible before commit.
+- Before either handoff write, the authority reserves a five-revision budget:
+  two revisions for the atomic handoff and three for the prepared attempt's
+  claim, uncertainty, and terminal lifecycle. An attempt that cannot complete
+  that lifecycle is rejected before any generation or session mutation.
 - The serialized launch intent is only correlation and recovery data. It does
   not recreate the original image reservation, consume it, or authorize a
   process launch by itself.
