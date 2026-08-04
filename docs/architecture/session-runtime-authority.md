@@ -779,7 +779,11 @@ binding retained by the publication journal. Finalisation recomputes that
 digest from the locked generation before any write, so a materialisation from
 another operation, generation, isolation proof, reservation, or destination
 attachment cannot be spliced into the current predetermined result.
-Finalisation replay accepts only the same canonical document.
+Finalisation replay accepts only the same canonical document. The filesystem
+publication and stopped-directory backend may read-only replay a historical
+restore materialisation contract v2 after an upgrade, but this typed authority
+deliberately rejects that physical compatibility result because it lacks the
+coordinator-binding digest.
 
 Bounded recovery enumerates only retained `starting` or `uncertain`
 restore-generation operations whose exact authorised generation and source

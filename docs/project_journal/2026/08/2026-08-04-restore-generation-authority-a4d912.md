@@ -49,6 +49,10 @@ enabling production restore or launcher admission.
   coordinator generation binding. Finalisation verifies that digest against
   the locked generation before any write, preventing cross-operation or
   cross-generation proof splicing.
+- The filesystem publication and stopped-directory backend retain read-only
+  upgrade replay for historical restore materialisation contract v2, only on a
+  replayed journal outcome. Fresh publication remains v3, and the PostgreSQL
+  generation authority continues to reject legacy v2 materialisation.
 - Bounded keyset recovery enumerates only retained `starting` or `uncertain`
   restore-generation operations with an exact authorised generation.
 
@@ -100,7 +104,11 @@ enabling production restore or launcher admission.
 ## Evidence
 
 - `src/postgres-session-authority.mjs`
+- `src/stopped-directory-publication.mjs`
+- `src/stopped-directory-backend.mjs`
 - `test/postgres-session-operation-kernel.test.mjs`
+- `test/stopped-directory-publication.test.mjs`
+- `test/stopped-directory-backend.test.mjs`
 - `integration/postgres-session-authority.mjs`
 - `README.md`
 - `docs/architecture/runtime-delivery-plan.md`

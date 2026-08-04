@@ -307,6 +307,7 @@ const ERROR_MESSAGES = objectFreeze({
 const CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION = 2;
 const RESTORE_JOURNAL_BINDING_CONTRACT_VERSION = 1;
 const CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION = 2;
+const LEGACY_RESTORE_MATERIALIZATION_CONTRACT_VERSION = 2;
 const RESTORE_MATERIALIZATION_CONTRACT_VERSION = 3;
 
 export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 2;
@@ -368,7 +369,7 @@ function ensureUncertain(condition) {
   if (!condition) failUncertain();
 }
 
-function assertExactDataObject(value, keys, failure = failInvalid) {
+function assertExactDataObjectVariant(value, keySets, failure = failInvalid) {
   if (
     isProxyValue(value) ||
     value === null ||
@@ -386,13 +387,23 @@ function assertExactDataObject(value, keys, failure = failInvalid) {
   } catch {
     failure();
   }
+  let exactShape = false;
+  for (let index = 0; index < keySets.length; index += 1) {
+    const keys = keySets[index];
+    if (
+      actual.length === keys.length &&
+      arrayEvery(
+        actual,
+        (key) => typeof key === "string" && arrayIncludes(keys, key),
+      )
+    ) {
+      exactShape = true;
+      break;
+    }
+  }
   if (
     (prototype !== objectPrototype && prototype !== null) ||
-    actual.length !== keys.length ||
-    !arrayEvery(
-      actual,
-      (key) => typeof key === "string" && arrayIncludes(keys, key),
-    )
+    !exactShape
   ) {
     failure();
   }
@@ -415,6 +426,10 @@ function assertExactDataObject(value, keys, failure = failInvalid) {
     normalized[key] = descriptor.value;
   }
   return normalized;
+}
+
+function assertExactDataObject(value, keys, failure = failInvalid) {
+  return assertExactDataObjectVariant(value, [keys], failure);
 }
 
 function assertTrustedFunction(value, failure = failInvalid) {
@@ -949,15 +964,27 @@ function normalizeStorageAndFence({
   return exactFrozenRecord({ canonicalLease, storageRef });
 }
 
-function normalizeMaterialization(value, kind, artifactProof = undefined) {
+function normalizeMaterialization(
+  value,
+  kind,
+  artifactProof = undefined,
+  allowLegacyRestore = false,
+) {
   const restoreDestination = kind === "restore-destination";
-  const materialization = assertExactDataObject(
+  const materialization = assertExactDataObjectVariant(
     value,
-    restoreDestination
-      ? RESTORE_MATERIALIZATION_KEYS
-      : MATERIALIZATION_KEYS,
+    restoreDestination && allowLegacyRestore
+      ? [RESTORE_MATERIALIZATION_KEYS, MATERIALIZATION_KEYS]
+      : [
+          restoreDestination
+            ? RESTORE_MATERIALIZATION_KEYS
+            : MATERIALIZATION_KEYS,
+        ],
     failUncertain,
   );
+  const legacyRestore =
+    restoreDestination &&
+    !objectHasOwn(materialization, "coordinatorBindingSha256");
   const stagedRoot = assertExactDataObject(
     materialization.stagedRoot,
     STAGED_ROOT_KEYS,
@@ -965,9 +992,12 @@ function normalizeMaterialization(value, kind, artifactProof = undefined) {
   );
   ensureUncertain(
     materialization.contractVersion ===
-      (restoreDestination
-        ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
-        : CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION) &&
+      (legacyRestore
+        ? LEGACY_RESTORE_MATERIALIZATION_CONTRACT_VERSION
+        : restoreDestination
+          ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
+          : CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION) &&
+      (!legacyRestore || allowLegacyRestore) &&
       typeof materialization.artifactManifestDigest === "string" &&
       regexpTest(DIGEST_PATTERN, materialization.artifactManifestDigest) &&
       typeof materialization.modeledDigest === "string" &&
@@ -975,6 +1005,7 @@ function normalizeMaterialization(value, kind, artifactProof = undefined) {
       typeof materialization.treeIdentityDigest === "string" &&
       regexpTest(DIGEST_PATTERN, materialization.treeIdentityDigest) &&
       (!restoreDestination ||
+        legacyRestore ||
         (typeof materialization.coordinatorBindingSha256 === "string" &&
           regexpTest(
             DIGEST_PATTERN,
@@ -996,7 +1027,7 @@ function normalizeMaterialization(value, kind, artifactProof = undefined) {
   );
   return exactFrozenRecord({
     artifactManifestDigest: materialization.artifactManifestDigest,
-    ...(restoreDestination
+    ...(restoreDestination && !legacyRestore
       ? {
           coordinatorBindingSha256:
             materialization.coordinatorBindingSha256,
@@ -1059,6 +1090,7 @@ function normalizePublicationOutcome(
     outcome.materialization,
     kind,
     artifactProof,
+    kind === "restore-destination" && outcome.replayed,
   );
   return exactFrozenRecord({
     materialization,

@@ -412,6 +412,27 @@ async function publishFixtureArtifact(fixture) {
   return outcome;
 }
 
+async function rewriteRestoreMaterializationAsV2(
+  fixture,
+  expectedState = "committed",
+) {
+  const recordPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(RESTORE_OPERATION_ID),
+  );
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  assert.equal(record.state, expectedState);
+  assert.equal(record.materialization.contractVersion, 3);
+  assert.equal(
+    Object.hasOwn(record.materialization, "coordinatorBindingSha256"),
+    true,
+  );
+  record.materialization.contractVersion = 2;
+  delete record.materialization.coordinatorBindingSha256;
+  await writeFile(recordPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return record.materialization;
+}
+
 test("candidate names are deterministic, hashed, and path-safe", () => {
   const first = stoppedDirectoryPublicationCandidateName(
     CAPTURE_OPERATION_ID,
@@ -1779,6 +1800,123 @@ test("restore publication publishes a raw isolated payload and preserves its art
     expectedBindingSha256,
   );
   assert.deepEqual(result.materialization, journalRecord.materialization);
+});
+
+test("upgrade replays a historical committed restore materialization v2", async (t) => {
+  let afterCopyCalls = 0;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterCopy() {
+        afterCopyCalls += 1;
+      },
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  const first = await fixture.publication.publishRestoreDestination(options);
+  const destinationIdentity = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  const legacyMaterialization =
+    await rewriteRestoreMaterializationAsV2(fixture);
+  const copiesBeforeReplay = afterCopyCalls;
+
+  const replay = await fixture.publication.publishRestoreDestination(options);
+
+  assert.equal(first.materialization.contractVersion, 3);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.materialization, legacyMaterialization);
+  assert.equal(replay.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(replay.materialization, "coordinatorBindingSha256"),
+    false,
+  );
+  assert.equal(afterCopyCalls, copiesBeforeReplay);
+  const replayedIdentity = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  assert.equal(replayedIdentity.dev, destinationIdentity.dev);
+  assert.equal(replayedIdentity.ino, destinationIdentity.ino);
+});
+
+test("upgrade resumes a historical materialized restore materialization v2", async (t) => {
+  let interruptAfterMaterialized = false;
+  let afterCopyCalls = 0;
+  const fixture = await createFixture(t, {
+    faults: {
+      async afterCopy() {
+        afterCopyCalls += 1;
+      },
+      async afterMaterialized() {
+        if (interruptAfterMaterialized) throw new Error("materialized fault");
+      },
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  interruptAfterMaterialized = true;
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  const candidate = candidatePath(
+    fixture.destinationOwnedRoot,
+    RESTORE_OPERATION_ID,
+    fixture.destinationDirectory,
+  );
+  const candidateIdentity = await lstat(candidate, { bigint: true });
+  const legacyMaterialization = await rewriteRestoreMaterializationAsV2(
+    fixture,
+    "materialized",
+  );
+  const copiesBeforeReplay = afterCopyCalls;
+  interruptAfterMaterialized = false;
+
+  const replay = await fixture.publication.publishRestoreDestination(options);
+
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.materialization, legacyMaterialization);
+  assert.equal(replay.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(replay.materialization, "coordinatorBindingSha256"),
+    false,
+  );
+  assert.equal(afterCopyCalls, copiesBeforeReplay);
+  await assertPathAbsent(candidate);
+  const destinationIdentity = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  assert.equal(destinationIdentity.dev, candidateIdentity.dev);
+  assert.equal(destinationIdentity.ino, candidateIdentity.ino);
+  const committed = (
+    await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })
+  ).record;
+  assert.equal(committed.state, "committed");
+  assert.deepEqual(committed.materialization, legacyMaterialization);
+});
+
+test("restore materialization v2 is rejected without replay provenance", async (t) => {
+  const guard = { forceNonReplay: false };
+  class NonReplayedJournal extends FilesystemOperationJournal {
+    async prepare(options) {
+      const prepared = await super.prepare(options);
+      if (!guard.forceNonReplay) return prepared;
+      return Object.freeze({ ...prepared, replayed: false });
+    }
+  }
+  const fixture = await createFixture(t, { JournalClass: NonReplayedJournal });
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  await fixture.publication.publishRestoreDestination(options);
+  await rewriteRestoreMaterializationAsV2(fixture);
+  guard.forceNonReplay = true;
+
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
 });
 
 test("restore preserves a modeled payload-root mode inside private storage", async (t) => {
@@ -3535,7 +3673,7 @@ test("a materialized stage-only operation resumes without recopying", async (t) 
   const result = await fixture.publication.publishCheckpointArtifact(options);
 
   assert.deepEqual(result.result, options.result);
-  assert.equal(result.replayed, false);
+  assert.equal(result.replayed, true);
   assert.equal(afterCopyCalls, 1);
   assert.equal(await pathExists(candidate), false);
   assert.equal(await pathExists(fixture.artifactDirectory), true);
@@ -3629,7 +3767,7 @@ test("fresh checkpoint publication rejects every pre-existing journal phase", as
       }
 
       const replay = await fixture.publication.publishCheckpointArtifact(options);
-      assert.equal(replay.replayed, phase === "committed");
+      assert.equal(replay.replayed, true);
       assert.equal(afterCopyCalls, 1);
       assert.equal(
         (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record

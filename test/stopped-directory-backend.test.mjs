@@ -10,7 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
@@ -1320,6 +1320,61 @@ function captureCandidatePath(fixture) {
   );
 }
 
+function restoreCandidatePath(fixture) {
+  return join(
+    fixture.destinationOwnedRoot,
+    stoppedDirectoryPublicationCandidateName(
+      RESTORE_OPERATION_ID,
+      basename(fixture.destinationDirectory),
+    ),
+  );
+}
+
+async function rewriteRestoreMaterializationAsLegacyV2(
+  fixture,
+  expectedState,
+) {
+  const observed = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(observed.record.state, expectedState);
+  assert.equal(observed.record.binding.coordinator.contractVersion, 1);
+  assert.equal(observed.record.materialization.contractVersion, 3);
+  const legacyMaterialization = {
+    ...observed.record.materialization,
+    contractVersion: 2,
+  };
+  delete legacyMaterialization.coordinatorBindingSha256;
+  const legacyRecord = {
+    ...observed.record,
+    materialization: legacyMaterialization,
+  };
+  const journalPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(RESTORE_OPERATION_ID),
+  );
+  await writeFile(journalPath, `${JSON.stringify(legacyRecord)}\n`, {
+    mode: 0o600,
+  });
+  const legacyObserved = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(legacyObserved.record.state, expectedState);
+  assert.equal(legacyObserved.record.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(
+      legacyObserved.record.materialization,
+      "coordinatorBindingSha256",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    legacyObserved.record.materialization,
+    legacyMaterialization,
+  );
+  return legacyMaterialization;
+}
+
 function restoreCoreOptions(fixture, overrides = {}) {
   return {
     backend: fixture.backend,
@@ -1981,7 +2036,7 @@ test("restore requires a newer current fence, trusted proof, and detached destin
   ]);
 });
 
-test("adapter v2 replays a committed v1 restore journal binding", async (t) => {
+test("adapter v2 replays a committed v1 restore binding with legacy v2 materialization", async (t) => {
   const fixture = await createFixture(t);
   const capability = await issueCapability(fixture);
   await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
@@ -2000,6 +2055,11 @@ test("adapter v2 replays a committed v1 restore journal binding", async (t) => {
   });
   assert.equal(committed.record.state, "committed");
   assert.equal(committed.record.binding.coordinator.contractVersion, 1);
+  const legacyMaterialization =
+    await rewriteRestoreMaterializationAsLegacyV2(
+      fixture,
+      "committed",
+    );
   const destinationBeforeReplay = await lstat(fixture.destinationDirectory, {
     bigint: true,
   });
@@ -2014,6 +2074,22 @@ test("adapter v2 replays a committed v1 restore journal binding", async (t) => {
 
   assert.deepEqual(result, fixedResult(checkpoint(), options.request));
   assert.equal(completion.replayed, true);
+  assert(Object.isFrozen(completion.materialization));
+  exactKeys(completion.materialization, [
+    "artifactManifestDigest",
+    "contractVersion",
+    "modeledDigest",
+    "publicationId",
+    "publicationKind",
+    "stagedRoot",
+    "treeIdentityDigest",
+  ]);
+  assert.equal(completion.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(completion.materialization, "coordinatorBindingSha256"),
+    false,
+  );
+  assert.deepEqual(completion.materialization, legacyMaterialization);
   assert.equal(fixture.mutation.state.restoreRuns, 1);
   assert.equal(destinationAfterReplay.dev, destinationBeforeReplay.dev);
   assert.equal(destinationAfterReplay.ino, destinationBeforeReplay.ino);
@@ -2027,6 +2103,179 @@ test("adapter v2 replays a committed v1 restore journal binding", async (t) => {
     "authority:restore:end",
   ]);
 });
+
+test("adapter resumes a historical materialized v2 restore without recopying", async (t) => {
+  let interruptRestore = false;
+  const fixture = await createFixture(t, {
+    publicationFaults: {
+      async afterMaterialized() {
+        if (interruptRestore) {
+          throw new Error("interrupt restore after durable materialization");
+        }
+      },
+    },
+  });
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+  fixture.observation.events.length = 0;
+
+  const options = restoreCoreOptions(fixture);
+  interruptRestore = true;
+  try {
+    await assert.rejects(
+      () => restoreCleanCheckpoint(options),
+      (error) => assertCoreError(error, "restore_outcome_uncertain"),
+    );
+  } finally {
+    interruptRestore = false;
+  }
+  assert.equal(fixture.mutation.state.restoreRuns, 1);
+  assert.equal(fixture.mutation.state.restoreCallbackCompletions.length, 0);
+  assert.equal(fixture.mutation.state.restoreFinalizations.length, 0);
+  assert.equal(
+    fixture.observation.events.filter(
+      (event) => event === "publication:copied",
+    ).length,
+    1,
+  );
+  const candidate = restoreCandidatePath(fixture);
+  const candidateBeforeResume = await lstat(candidate, { bigint: true });
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+  const legacyMaterialization =
+    await rewriteRestoreMaterializationAsLegacyV2(
+      fixture,
+      "materialized",
+    );
+  fixture.observation.events.length = 0;
+
+  const result = await restoreCleanCheckpoint(options);
+  const completion = fixture.mutation.state.restoreFinalizations[0];
+  const destinationAfterResume = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+
+  assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+  assert.equal(fixture.mutation.state.restoreRuns, 2);
+  assert.equal(fixture.mutation.state.restoreCallbackCompletions.length, 1);
+  assert.equal(fixture.mutation.state.restoreFinalizations.length, 1);
+  assert.strictEqual(
+    completion,
+    fixture.mutation.state.restoreCallbackCompletions[0],
+  );
+  assert.equal(completion.replayed, true);
+  assert.equal(completion.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(completion.materialization, "coordinatorBindingSha256"),
+    false,
+  );
+  assert.deepEqual(completion.materialization, legacyMaterialization);
+  assert.equal(destinationAfterResume.dev, candidateBeforeResume.dev);
+  assert.equal(destinationAfterResume.ino, candidateBeforeResume.ino);
+  assert.equal(
+    destinationAfterResume.birthtimeNs,
+    candidateBeforeResume.birthtimeNs,
+  );
+  assert.equal(await pathExists(candidate), false);
+  assert.deepEqual(fixture.observation.events, [
+    "authority:restore:start",
+    "authority:restore:finalized",
+    "authority:restore:end",
+  ]);
+  const committed = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(committed.record.state, "committed");
+  assert.deepEqual(
+    committed.record.materialization,
+    legacyMaterialization,
+  );
+});
+
+test(
+  "adapter rejects a non-replayed restore with legacy v2 materialization",
+  { concurrency: false },
+  async (t) => {
+    const fixture = await createFixture(t);
+    const capability = await issueCapability(fixture);
+    await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+    const legacyMaterialization = Object.freeze({
+      artifactManifestDigest: fixture.artifactProof.artifactManifestDigest,
+      contractVersion: 2,
+      modeledDigest: fixture.artifactProof.modeledDigest,
+      publicationId: "publication-restore-legacy-v2",
+      publicationKind: "restore-destination",
+      stagedRoot: Object.freeze({
+        filesystemId: "test-filesystem-001",
+        objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+        objectId: "legacy-restore-object-001",
+      }),
+      treeIdentityDigest: "e".repeat(64),
+    });
+    const prototype = StoppedDirectoryPublication.prototype;
+    const original = Object.getOwnPropertyDescriptor(
+      prototype,
+      "publishRestoreDestination",
+    );
+    assert(original);
+    Object.defineProperty(prototype, "publishRestoreDestination", {
+      ...original,
+      value: async function publishFreshLegacyRestore(options) {
+        return Object.freeze({
+          materialization: legacyMaterialization,
+          replayed: false,
+          result: options.result,
+        });
+      },
+    });
+    // Capture the controlled publication intrinsic only in a query-keyed
+    // backend module, then restore the shared prototype before exercising it.
+    let isolatedBackendModule;
+    try {
+      isolatedBackendModule = await import(
+        "../src/stopped-directory-backend.mjs?fresh-legacy-restore-test=1",
+      );
+    } finally {
+      Object.defineProperty(prototype, "publishRestoreDestination", original);
+    }
+    assert.strictEqual(
+      Object.getOwnPropertyDescriptor(
+        prototype,
+        "publishRestoreDestination",
+      ).value,
+      original.value,
+    );
+    function resolveStoppedWriterForRestoreTest() {
+      throw new Error("restore does not resolve a stopped writer");
+    }
+    const backend = new isolatedBackendModule.StoppedDirectoryBackend({
+      backendId: BACKEND_ID,
+      coordinator: fixture.coordinator,
+      lifecycleBackend: fixture.lifecycle.backend,
+      mutationAuthority: fixture.mutation.authority,
+      publication: fixture.publication,
+      resolveStoppedWriter: resolveStoppedWriterForRestoreTest,
+    });
+
+    await assert.rejects(
+      () => backend.restoreCheckpoint(restoreDispatchInput(fixture)),
+      (error) => {
+        assert(
+          error instanceof isolatedBackendModule.StoppedDirectoryBackendError,
+        );
+        assert.equal(
+          error.code,
+          "stopped_directory_backend_outcome_uncertain",
+        );
+        assert.equal(error.retryable, false);
+        return true;
+      },
+    );
+    assert.equal(fixture.mutation.state.restoreRuns, 1);
+    assert.equal(fixture.mutation.state.restoreCallbackCompletions.length, 0);
+    assert.equal(fixture.mutation.state.restoreFinalizations.length, 0);
+    assert.equal(await pathExists(fixture.destinationDirectory), false);
+  },
+);
 
 test("restore rejects stale authority, attached destinations, and untrusted proofs", async (t) => {
   const cases = [
