@@ -52,6 +52,10 @@ production restore remains fail-closed.
   and the first complete normalized capture tuple. This slice does not yet
   route coordinator stop through the durable launch-stop transition or enable
   production capture/restore wiring.
+- Exact supervisor stop confirmation removes the facade's strong attempt and
+  attachment indexes so completed writers do not accumulate with launch
+  history. A rejected or uncertain stop retains its local record because the
+  writer may still be running.
 
 ## Safety Decisions
 
@@ -67,6 +71,9 @@ production restore remains fail-closed.
 - A stop operation does not rewrite or retire the original started attempt.
   PID disappearance, exit status, lease expiry, storage detach, and copied
   status fields do not clear the current launch.
+- Local record reclamation requires exact stop confirmation. A callback error
+  or non-confirming result remains `lost` and retained for explicit stop or
+  fencing recovery rather than being reclaimed speculatively.
 - The production checkpoint adapter remains capture-only and `runRestore()`
   remains fail-closed.
 - A historical started attempt with `launch: null` after a separate durable

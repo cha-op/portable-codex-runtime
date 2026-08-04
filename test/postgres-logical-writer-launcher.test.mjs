@@ -293,6 +293,17 @@ class MemoryLaunchAuthority {
     this.beforeFinalize = null;
   }
 
+  beginNextAttempt({ expectedSession, generation }) {
+    this.expectedSession = clone(expectedSession);
+    this.generation = clone(generation);
+    this.baseInput = null;
+    this.state = "absent";
+    this.result = null;
+    this.terminalRevision = null;
+    this.behaviour = Object.create(null);
+    this.beforeFinalize = null;
+  }
+
   seed(request, state, launchEvidence = null) {
     this.baseInput = {
       expectedSession: clone(this.expectedSession),
@@ -679,6 +690,7 @@ async function fixture({
   launchStatus = "started",
   reconcileStatus = "not-started",
   stoppedWriterCoordinator: providedStoppedWriterCoordinator = null,
+  supervisorStopThrows = false,
 } = {}) {
   const events = [];
   const image = imageFixture();
@@ -724,6 +736,7 @@ async function fixture({
     supervisorStopCalls += 1;
     events.push("supervisor.stop");
     assert.equal(Object.isFrozen(binding), true);
+    if (supervisorStopThrows) throw new Error("supervisor stop unavailable");
     return STOPPED_WRITER_STOP_CONFIRMED;
   };
   const launchWriter = async (context) => {
@@ -732,7 +745,7 @@ async function fixture({
     launchContext = context;
     return {
       receiptVersion: 1,
-      evidence: evidence(LAUNCH_ATTEMPT_ID, launchStatus),
+      evidence: evidence(context.attempt.launchAttemptId, launchStatus),
       stopWriter: launchStatus === "started" ? supervisorStopWriter : null,
     };
   };
@@ -798,11 +811,12 @@ async function fixture({
   };
 }
 
-function runInput(value) {
+function runInput(value, overrides = {}) {
   return {
     generation: value.generation,
     imageReservation: value.imageReservation,
     launchAttemptId: LAUNCH_ATTEMPT_ID,
+    ...overrides,
   };
 }
 
@@ -812,6 +826,85 @@ function resolverInput(value, overrides = {}) {
     checkpoint: checkpoint(value.image.manifest.runtime.imageDigest),
     request: captureRequest(),
     ...overrides,
+  };
+}
+
+async function prepareLaunchCycle(value, index) {
+  const ordinal = String(index + 1).padStart(3, "0");
+  const launchAttemptId = `writer-launch-attempt-${ordinal}`;
+  const writerLease = lease({
+    fencingEpoch: String(11 + index),
+    leaseId: `lease-${ordinal}`,
+  });
+  const mounted = attachment(writerLease, {
+    operationId: `operation-attach-${ordinal}`,
+    proofId: `proof-attachment-${ordinal}`,
+  });
+  const generation = generationSnapshot({
+    generationId: `restore-generation-${ordinal}`,
+    operationId: `restore-generation-operation-${ordinal}`,
+  });
+  let imageReservation = value.imageReservation;
+
+  if (index > 0) {
+    const revision = 8 + index * 3;
+    const expectedSession = sessionSnapshot(value.image.manifest, {
+      document: sessionDocument(value.image.manifest, {
+        attachment: mounted,
+        lastOperation: {
+          conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+          expectedSessionRevision: String(revision - 3),
+          kind: "writer-attachment-acquire-v1",
+          operationId: mounted.operationId,
+          operationRevision: "2",
+          requestSha256: "8".repeat(64),
+          reservationId: `reservation-${mounted.operationId}`,
+          resultSha256: "9".repeat(64),
+          state: "committed",
+        },
+        lease: writerLease,
+        writerEpoch: writerLease.fencingEpoch,
+      }),
+      revision: String(revision),
+    });
+    value.authority.beginNextAttempt({ expectedSession, generation });
+    const reserved = await value.imageReservations.reservePlatformImage({
+      configBytes: value.imageReservation.configBytes,
+      descriptor: value.imageReservation.descriptor,
+      inspectCodex: value.imageReservation.inspectCodex,
+      sessionManifest: value.image.manifest,
+    });
+    imageReservation = {
+      configBytes: value.imageReservation.configBytes,
+      descriptor: value.imageReservation.descriptor,
+      inspectCodex: value.imageReservation.inspectCodex,
+      reservation: reserved.reservation,
+    };
+  }
+
+  return {
+    generation,
+    imageReservation,
+    launchAttemptId,
+    mounted,
+    ordinal,
+    writerLease,
+  };
+}
+
+function cycleResolverInput(value, cycle) {
+  return {
+    attachment: cycle.mounted,
+    checkpoint: {
+      ...checkpoint(value.image.manifest.runtime.imageDigest),
+      sourceFencingEpoch: cycle.writerLease.fencingEpoch,
+    },
+    request: {
+      ...captureRequest(),
+      fencingEpoch: cycle.writerLease.fencingEpoch,
+      leaseId: cycle.writerLease.leaseId,
+      operationId: `checkpoint-capture-operation-${cycle.ordinal}`,
+    },
   };
 }
 
@@ -913,6 +1006,117 @@ test("exports one exact frozen facade and starts/registers before durable finali
     () => value.facade.resolveStoppedWriter(resolverInput(value)),
     assertLauncherError("invalid_logical_writer_launch_request"),
   );
+});
+
+test("releases stopped launch indexes across repeated writer lifecycles", async () => {
+  const value = await fixture();
+  const cycleCount = 3;
+
+  for (let index = 0; index < cycleCount; index += 1) {
+    const cycle = await prepareLaunchCycle(value, index);
+
+    const result = await value.facade.runLaunch(
+      runInput(value, {
+        generation: cycle.generation,
+        imageReservation: cycle.imageReservation,
+        launchAttemptId: cycle.launchAttemptId,
+      }),
+    );
+    assert.equal(result.status, "started");
+    assert.equal(
+      result.attempt.request.attachment.attachmentId,
+      cycle.mounted.attachmentId,
+    );
+    assert.equal(
+      result.attempt.request.lease.fencingEpoch,
+      cycle.writerLease.fencingEpoch,
+    );
+
+    const resolved = value.facade.resolveStoppedWriter(
+      cycleResolverInput(value, cycle),
+    );
+    const capability =
+      await value.stoppedWriterCoordinator.stopAndIssueCapability({
+        processIncarnationId: resolved.processIncarnationId,
+        stopOperationId: resolved.stopOperationId,
+        writer: resolved.writer,
+        writerIncarnationId: resolved.writerIncarnationId,
+      });
+
+    await assert.rejects(
+      value.facade.reconcileLaunchAttempt({
+        launchAttemptId: cycle.launchAttemptId,
+      }),
+      assertLauncherError("logical_writer_handle_unavailable"),
+    );
+    await value.stoppedWriterCoordinator.consumeCapability({
+      attachment: cycle.mounted,
+      canonicalLease: cycle.writerLease,
+      capability,
+      processIncarnationId: resolved.processIncarnationId,
+      runSnapshot: async () => `captured-${cycle.ordinal}`,
+      stopOperationId: resolved.stopOperationId,
+      writer: resolved.writer,
+      writerIncarnationId: resolved.writerIncarnationId,
+    });
+    value.stoppedWriterCoordinator.retireWriter({
+      processIncarnationId: resolved.processIncarnationId,
+      writer: resolved.writer,
+      writerIncarnationId: resolved.writerIncarnationId,
+    });
+  }
+
+  assert.equal(value.launchCalls, cycleCount);
+  assert.equal(value.supervisorStopCalls, cycleCount);
+});
+
+test("keeps a failed stop fail-closed for successor launch registration", async () => {
+  const value = await fixture({ supervisorStopThrows: true });
+  const first = await prepareLaunchCycle(value, 0);
+  const started = await value.facade.runLaunch(
+    runInput(value, {
+      generation: first.generation,
+      imageReservation: first.imageReservation,
+      launchAttemptId: first.launchAttemptId,
+    }),
+  );
+  assert.equal(started.status, "started");
+  const resolved = value.facade.resolveStoppedWriter(
+    cycleResolverInput(value, first),
+  );
+
+  await assert.rejects(
+    value.stoppedWriterCoordinator.stopAndIssueCapability({
+      processIncarnationId: resolved.processIncarnationId,
+      stopOperationId: resolved.stopOperationId,
+      writer: resolved.writer,
+      writerIncarnationId: resolved.writerIncarnationId,
+    }),
+    (error) =>
+      error instanceof StoppedWriterCapabilityError &&
+      error.code === "writer_stop_outcome_uncertain",
+  );
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.throws(
+    () => value.facade.resolveStoppedWriter(cycleResolverInput(value, first)),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+
+  const successor = await prepareLaunchCycle(value, 1);
+  await assert.rejects(
+    value.facade.runLaunch(
+      runInput(value, {
+        generation: successor.generation,
+        imageReservation: successor.imageReservation,
+        launchAttemptId: successor.launchAttemptId,
+      }),
+    ),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.launchCalls, 2);
+  assert.equal(value.authority.state, "uncertain");
+  assert.equal(value.authority.calls.finalizeStarted, 1);
+  assert.equal(value.authority.calls.markUncertain, 1);
 });
 
 test("resolver binds the complete attachment and one deterministic capture operation", async () => {

@@ -1362,28 +1362,44 @@ function writerLaunchStopEvidence(input) {
   };
 }
 
-function adjacentFreshSessionIds(existingSessionIds) {
+function consecutiveFreshSessionIds(existingSessionIds, count) {
+  assert.equal(Number.isSafeInteger(count) && count > 0, true);
   const existing = new Set(existingSessionIds);
   for (let attempt = 0; attempt < 32; attempt += 1) {
-    const candidates = Array.from({ length: 8 }, () => randomUUID());
+    const candidates = Array.from(
+      { length: Math.max(8, count * 4) },
+      () => randomUUID(),
+    );
     const candidateSet = new Set(candidates);
     const ordered = [...existingSessionIds, ...candidates].sort();
-    for (let index = 0; index + 1 < ordered.length; index += 1) {
+    for (
+      let index = 0;
+      index + count <= ordered.length;
+      index += 1
+    ) {
+      const sessionIds = ordered.slice(index, index + count);
       if (
-        candidateSet.has(ordered[index]) &&
-        candidateSet.has(ordered[index + 1]) &&
-        !existing.has(ordered[index]) &&
-        !existing.has(ordered[index + 1])
+        sessionIds.every(
+          (sessionId) =>
+            candidateSet.has(sessionId) && !existing.has(sessionId),
+        )
       ) {
+        const fullSessionOrder = [
+          ...existingSessionIds,
+          ...sessionIds,
+        ].sort();
+        const firstSessionIndex = fullSessionOrder.indexOf(sessionIds[0]);
         return {
-          afterSessionId: index === 0 ? null : ordered[index - 1],
-          detachedSessionId: ordered[index],
-          launchedSessionId: ordered[index + 1],
+          afterSessionId:
+            firstSessionIndex === 0
+              ? null
+              : fullSessionOrder[firstSessionIndex - 1],
+          sessionIds,
         };
       }
     }
   }
-  throw new Error("could not allocate adjacent integration session IDs");
+  throw new Error("could not allocate consecutive integration session IDs");
 }
 
 async function prepareRestoreGenerationFixture(
@@ -6003,8 +6019,8 @@ test(
           "writer-launch-started",
         );
         assert.deepEqual(
-          read.operation.result.evidence,
-          started.evidence,
+          JSON.parse(JSON.stringify(read.operation.result.evidence)),
+          JSON.parse(JSON.stringify(started.evidence)),
         );
         assert.deepEqual(read.launch, started.launch);
         assert.deepEqual(read.session.document.launch, started.launch);
@@ -6592,20 +6608,20 @@ test(
             "ORDER BY session_id",
           ].join(" "),
         );
-        const adjacent = adjacentFreshSessionIds(
+        const consecutive = consecutiveFreshSessionIds(
           existingRows.rows.map(({ session_id: sessionId }) => sessionId),
+          2,
         );
-        sessionIds.push(
-          adjacent.detachedSessionId,
-          adjacent.launchedSessionId,
-        );
+        const [detachedSessionId, launchedSessionId] =
+          consecutive.sessionIds;
+        sessionIds.push(detachedSessionId, launchedSessionId);
         await authority.registerSession(
-          registrationInput(adjacent.detachedSessionId),
+          registrationInput(detachedSessionId),
         );
         const fixture = await prepareCommittedRestoreGenerationFixture(
           authority,
           checkpointAuthority,
-          adjacent.launchedSessionId,
+          launchedSessionId,
           { finalAttachmentLeaseDurationMilliseconds: 3_000 },
         );
         const launchInput = writerLaunchAttemptInput(
@@ -6633,12 +6649,12 @@ test(
 
         const sparsePage =
           await authority.listCurrentWriterLaunchRecoveryCandidates({
-            afterSessionId: adjacent.afterSessionId,
+            afterSessionId: consecutive.afterSessionId,
             limit: 1,
           });
         assert.deepEqual(sparsePage, {
           candidates: [],
-          nextAfterSessionId: adjacent.detachedSessionId,
+          nextAfterSessionId: detachedSessionId,
         });
         const currentPage =
           await authority.listCurrentWriterLaunchRecoveryCandidates({
@@ -6774,7 +6790,9 @@ test(
         const historical = await authority.readWriterLaunchAttempt({
           operationId: launchInput.operationId,
         });
-        assertOperationReceipt(historical, "committed");
+        assertOperationReceipt(historical, "committed", {
+          currentTerminal: false,
+        });
         assert.equal(
           historical.operation.result.outcome,
           "writer-launch-started",
@@ -6797,7 +6815,7 @@ test(
         try {
           await assert.rejects(
             authority.readSession({
-              sessionId: adjacent.launchedSessionId,
+              sessionId: launchedSessionId,
             }),
             assertAuthorityCode("operation_state_invalid"),
           );
@@ -6815,7 +6833,7 @@ test(
           );
         }
         const restored = await authority.readSession({
-          sessionId: adjacent.launchedSessionId,
+          sessionId: launchedSessionId,
         });
         assert.equal(restored.document.launch, null);
       },
@@ -6824,10 +6842,18 @@ test(
     await t.test(
       "writer launch recovery is bounded and concurrent claims grant once",
       async () => {
-        const orderedSessionIds = Array.from(
-          { length: 3 },
-          () => randomUUID(),
-        ).sort();
+        const existingRows = await pool.query(
+          [
+            "SELECT session_id::text AS session_id",
+            "FROM session_authority.sessions",
+            "ORDER BY session_id",
+          ].join(" "),
+        );
+        const consecutive = consecutiveFreshSessionIds(
+          existingRows.rows.map(({ session_id: sessionId }) => sessionId),
+          3,
+        );
+        const orderedSessionIds = consecutive.sessionIds;
         sessionIds.push(...orderedSessionIds);
         const inputs = [];
         for (const sessionId of orderedSessionIds) {
@@ -6898,7 +6924,7 @@ test(
 
         const firstPage =
           await authority.listWriterLaunchAttemptRecoveryCandidates({
-            afterSessionId: null,
+            afterSessionId: consecutive.afterSessionId,
             limit: 1,
           });
         assert.deepEqual(firstPage.candidates, [
@@ -6935,16 +6961,18 @@ test(
             afterSessionId: orderedSessionIds[1],
             limit: 1,
           });
-        assert.deepEqual(terminalPage, {
-          candidates: [
-            {
-              launchAttemptId: inputs[2].operationId,
-              request: inputs[2].request,
-              state: "prepared",
-            },
-          ],
-          nextAfterSessionId: null,
-        });
+        assert.deepEqual(terminalPage.candidates, [
+          {
+            launchAttemptId: inputs[2].operationId,
+            request: inputs[2].request,
+            state: "prepared",
+          },
+        ]);
+        assert.equal(
+          terminalPage.nextAfterSessionId === null ||
+            terminalPage.nextAfterSessionId === orderedSessionIds[2],
+          true,
+        );
         assert.equal(
           inputs[2].operationId ===
             firstPage.candidates[0].launchAttemptId ||

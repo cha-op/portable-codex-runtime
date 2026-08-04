@@ -158,7 +158,9 @@
   result. Prepared recovery cancels without launch. For `starting` or
   `uncertain`, an exact local provisional record retries started finalisation;
   otherwise recovery consults only the stopped-only supervisor path and never
-  relaunches.
+  relaunches. Exact local stop confirmation releases the facade's strong
+  attempt and attachment indexes; an uncertain stop retains the record
+  fail-closed instead of treating a possibly running writer as reclaimable.
 - Typed `writer-launch-stop-v1` authority preserves the original started
   attempt and clears the current-launch relation only for exact
   `complete-stopped` evidence from the bound supervisor. Bounded keyset

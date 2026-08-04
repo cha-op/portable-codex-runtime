@@ -32,6 +32,7 @@ const imageConsumeReservationIntrinsic =
   PlatformImageReservationCoordinator.prototype.consumeReservation;
 const imageRevalidateReservationIntrinsic =
   PlatformImageReservationCoordinator.prototype.revalidateReservation;
+const mapDeleteIntrinsic = Map.prototype.delete;
 const mapGetIntrinsic = Map.prototype.get;
 const mapHasIntrinsic = Map.prototype.has;
 const mapSetIntrinsic = Map.prototype.set;
@@ -414,6 +415,10 @@ function arrayIncludes(value, candidate) {
 
 function mapGet(map, key) {
   return callIntrinsic(mapGetIntrinsic, map, [key]);
+}
+
+function mapDelete(map, key) {
+  return callIntrinsic(mapDeleteIntrinsic, map, [key]);
 }
 
 function mapHas(map, key) {
@@ -1885,6 +1890,27 @@ export function createPostgresLogicalWriterLauncher(...args) {
   const recordsByAttempt = new MapConstructor();
   const recordsByAttachmentId = new MapConstructor();
 
+  function releaseStoppedRecord(record) {
+    ensure(
+      record.state === "stopped" &&
+        mapGet(recordsByAttempt, record.launchAttemptId) === record &&
+        mapGet(
+          recordsByAttachmentId,
+          record.attachment.attachmentId,
+        ) === record,
+      outcomeCode,
+    );
+    const attemptDeleted = mapDelete(
+      recordsByAttempt,
+      record.launchAttemptId,
+    );
+    const attachmentDeleted = mapDelete(
+      recordsByAttachmentId,
+      record.attachment.attachmentId,
+    );
+    ensure(attemptDeleted && attachmentDeleted, outcomeCode);
+  }
+
   async function readAttempt(launchAttemptId) {
     return normalizeReadReceipt(
       await invokeAsync(
@@ -2088,6 +2114,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
         );
         ensure(stopped === STOPPED_WRITER_STOP_CONFIRMED, outcomeCode);
         record.state = "stopped";
+        releaseStoppedRecord(record);
         return STOPPED_WRITER_STOP_CONFIRMED;
       } catch {
         record.state = "lost";
