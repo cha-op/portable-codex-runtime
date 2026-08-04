@@ -38,6 +38,7 @@ import {
   WRITER_RELEASE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
+  createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
 } from "../src/postgres-session-authority.mjs";
@@ -1241,6 +1242,40 @@ function restoreGenerationOperationInput(expectedSession, admission) {
   };
 }
 
+function restoreGenerationOperationInputV2(
+  expectedSession,
+  admission,
+  launchIntent,
+) {
+  return {
+    expectedSession,
+    kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    operationId: admission.request.operationId,
+    request: createRestoreDestinationGenerationOperationRequestV2({
+      admission,
+      expectedSession,
+      launchIntent,
+    }),
+  };
+}
+
+function restoreGenerationLaunchIntent(
+  expectedSession,
+  {
+    launchAttemptId = `writer-launch-${randomUUID()}`,
+    supervisorId = `supervisor-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    launchAttemptId,
+    measuredImage: writerLaunchMeasuredImage(expectedSession),
+    supervisor: {
+      contractVersion: 1,
+      supervisorId,
+    },
+  };
+}
+
 function restoreGenerationCompletion(input, claimed, replayed) {
   const artifactProof = claimed.catalogue.document.artifactProof;
   return {
@@ -1538,6 +1573,61 @@ async function readRestoreGenerationTransactionState(
       "WHERE o.operation_id = $1",
     ].join(" "),
     [operationId],
+  );
+  assert.equal(result.rows.length, 1);
+  return result.rows[0];
+}
+
+async function readRestoreLaunchHandoffTransactionState(
+  client,
+  restoreOperationId,
+  launchAttemptId,
+) {
+  const result = await client.query(
+    [
+      "SELECT s.revision::text AS session_revision,",
+      "s.document AS session_document,",
+      "s.updated_at AS session_updated_at,",
+      "g.state AS generation_state,",
+      "g.document AS generation_document,",
+      "g.committed_at AS generation_committed_at,",
+      "ro.state AS restore_operation_state,",
+      "ro.revision::text AS restore_operation_revision,",
+      "ro.result AS restore_operation_result,",
+      "ro.retired_at AS restore_operation_retired_at,",
+      "rr.state AS restore_reservation_state,",
+      "rr.released_at AS restore_reservation_released_at,",
+      "lo.kind AS launch_operation_kind,",
+      "lo.request AS launch_operation_request,",
+      "lo.result AS launch_operation_result,",
+      "lo.state AS launch_operation_state,",
+      "lo.revision::text AS launch_operation_revision,",
+      "lo.retired_at AS launch_operation_retired_at,",
+      "lr.state AS launch_reservation_state,",
+      "lr.released_at AS launch_reservation_released_at,",
+      "(g.committed_at = ro.updated_at",
+      "AND ro.updated_at = ro.retired_at",
+      "AND ro.updated_at = rr.updated_at",
+      "AND ro.updated_at = rr.released_at",
+      "AND ro.updated_at = lo.created_at",
+      "AND ro.updated_at = lo.updated_at",
+      "AND ro.updated_at = lr.created_at",
+      "AND ro.updated_at = lr.updated_at",
+      "AND ro.updated_at = s.updated_at) AS handoff_times_match",
+      "FROM session_authority.operation_claims ro",
+      "JOIN session_authority.sessions s",
+      "ON s.session_id = ro.session_id",
+      "JOIN session_authority.reservations rr",
+      "ON rr.operation_id = ro.operation_id",
+      "JOIN session_authority.restore_destination_generations g",
+      "ON g.operation_id = ro.operation_id",
+      "LEFT JOIN session_authority.operation_claims lo",
+      "ON lo.operation_id = $2 AND lo.session_id = ro.session_id",
+      "LEFT JOIN session_authority.reservations lr",
+      "ON lr.operation_id = lo.operation_id",
+      "WHERE ro.operation_id = $1",
+    ].join(" "),
+    [restoreOperationId, launchAttemptId],
   );
   assert.equal(result.rows.length, 1);
   return result.rows[0];
@@ -5481,6 +5571,11 @@ test(
           startingFixture.attached.session,
           startingAdmission,
         );
+        assert.equal(startingInput.request.contractVersion, 1);
+        assert.equal(
+          Object.hasOwn(startingInput.request, "launchIntent"),
+          false,
+        );
         assert.deepEqual(
           Reflect.ownKeys(startingInput.request.admission),
           ["checkpoint", "request"],
@@ -6051,6 +6146,408 @@ test(
           },
         );
         assert.equal(guardResult, "guard-reacquired");
+      },
+    );
+
+    await t.test(
+      "restore launch handoff rolls back every authority write and rejects crossed intent",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const launchIntent = restoreGenerationLaunchIntent(
+          fixture.attached.session,
+        );
+        const input = restoreGenerationOperationInputV2(
+          fixture.attached.session,
+          admission,
+          launchIntent,
+        );
+        await authority.reserveOperation(input);
+        const claimed =
+          await authority.claimRestoreDestinationGenerationDispatch({
+            ...structuredClone(input),
+            destinationIsolationProofId:
+              `restore-isolation-proof-${randomUUID()}`,
+            expectedOperationRevision: "0",
+            generationId: `restore-generation-${randomUUID()}`,
+          });
+        const handoffInput = {
+          launch: launchIntent,
+          restore: {
+            ...structuredClone(input),
+            completion: restoreGenerationCompletion(
+              input,
+              claimed,
+              false,
+            ),
+            expectedOperationRevision: "1",
+          },
+        };
+        const observer = await pool.connect();
+        try {
+          const authorizedState =
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            );
+
+          await assert.rejects(
+            authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+              {
+                ...structuredClone(handoffInput),
+                launch: {
+                  ...structuredClone(launchIntent),
+                  launchAttemptId: `writer-launch-${randomUUID()}`,
+                },
+              },
+            ),
+            assertAuthorityCode("invalid_operation_request"),
+          );
+          assert.deepEqual(
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            ),
+            authorizedState,
+          );
+
+          const rollbackAuthority = new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstMatchingQueryResultFailurePool(
+                pool,
+                "restore launch handoff rollback",
+                (text) =>
+                  text.startsWith(
+                    "INSERT INTO session_authority.reservations",
+                  ),
+              ),
+              maxTransactionAttempts: 1,
+            }),
+          });
+          await assert.rejects(
+            rollbackAuthority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+              structuredClone(handoffInput),
+            ),
+            assertTransactionBoundaryLost,
+          );
+          assert.deepEqual(
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            ),
+            authorizedState,
+          );
+          const rolledBack =
+            await readRestoreLaunchHandoffTransactionState(
+              observer,
+              input.operationId,
+              launchIntent.launchAttemptId,
+            );
+          assert.equal(rolledBack.generation_state, "authorized");
+          assert.equal(rolledBack.generation_document, null);
+          assert.equal(rolledBack.restore_operation_state, "starting");
+          assert.equal(rolledBack.restore_reservation_state, "starting");
+          assert.equal(rolledBack.launch_operation_kind, null);
+          assert.equal(rolledBack.launch_operation_request, null);
+          assert.equal(rolledBack.launch_reservation_state, null);
+
+          const handedOff =
+            await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+              structuredClone(handoffInput),
+            );
+          assert.equal(handedOff.status, "prepared");
+          assert.equal(handedOff.restore.finalized, true);
+          assert.equal(handedOff.generation.state, "committed");
+          assert.equal(handedOff.launch.operation.state, "prepared");
+          assert.equal(
+            handedOff.launch.attempt.launchAttemptId,
+            launchIntent.launchAttemptId,
+          );
+          const committed =
+            await readRestoreLaunchHandoffTransactionState(
+              observer,
+              input.operationId,
+              launchIntent.launchAttemptId,
+            );
+          assert.equal(committed.handoff_times_match, true);
+          assert.equal(committed.generation_state, "committed");
+          assert.equal(committed.restore_operation_state, "committed");
+          assert.equal(committed.restore_reservation_state, "released");
+          assert.equal(committed.launch_operation_state, "prepared");
+          assert.equal(committed.launch_reservation_state, "prepared");
+          assert.deepEqual(
+            committed.session_document,
+            structuredClone(handedOff.session.document),
+          );
+        } finally {
+          observer.release();
+        }
+      },
+    );
+
+    await t.test(
+      "restore finalization atomically hands one prepared attempt to the launcher",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const image = integrationPlatformImageFixture();
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+          { imageDigest: image.descriptor.digest },
+        );
+        const imageReservations =
+          new PlatformImageReservationCoordinator();
+        const inspectCodex = async () => ({
+          codexBinaryPath: "/opt/portable-codex/bin/codex",
+          codexBinarySha256: "c".repeat(64),
+          codexVersion:
+            fixture.attached.session.document.manifest.runtime
+              .codexVersion,
+        });
+        const reserved = await imageReservations.reservePlatformImage({
+          configBytes: image.configBytes,
+          descriptor: image.descriptor,
+          inspectCodex,
+          sessionManifest: fixture.attached.session.document.manifest,
+        });
+        const launchAttemptId = `writer-launch-${randomUUID()}`;
+        const supervisorId = `supervisor-${randomUUID()}`;
+        let launchCalls = 0;
+        let launchedRequest = null;
+        const facade = createPostgresLogicalWriterLauncher({
+          authority,
+          imageReservations,
+          operationGuard,
+          stoppedWriterCoordinator:
+            new StoppedWriterCapabilityCoordinator(),
+          supervisor: {
+            contractVersion: 1,
+            launchWriter: async (context) => {
+              launchCalls += 1;
+              launchedRequest = context.attempt.request;
+              return {
+                receiptVersion: 1,
+                evidence: writerLaunchEvidence(
+                  {
+                    operationId: launchAttemptId,
+                    request: context.attempt.request,
+                  },
+                  "started",
+                ),
+                stopWriter: async function stopWriter() {
+                  return STOPPED_WRITER_STOP_CONFIRMED;
+                },
+              };
+            },
+            reconcileWriterLaunch: async () => {
+              throw new Error(
+                "a prepared handoff must not reconcile before launch",
+              );
+            },
+            supervisorId,
+          },
+        });
+        const imageReservation = {
+          configBytes: image.configBytes,
+          descriptor: image.descriptor,
+          inspectCodex,
+          reservation: reserved.reservation,
+        };
+        const launchIntent = await facade.prepareLaunchIntent({
+          expectedSession: fixture.attached.session,
+          imageReservation,
+          launchAttemptId,
+        });
+        assert.equal(launchIntent.launchAttemptId, launchAttemptId);
+        assert.equal(
+          launchIntent.supervisor.supervisorId,
+          supervisorId,
+        );
+
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const input = restoreGenerationOperationInputV2(
+          fixture.attached.session,
+          admission,
+          launchIntent,
+        );
+        await authority.reserveOperation(input);
+        const claimed =
+          await authority.claimRestoreDestinationGenerationDispatch({
+            ...structuredClone(input),
+            destinationIsolationProofId:
+              `restore-isolation-proof-${randomUUID()}`,
+            expectedOperationRevision: "0",
+            generationId: `restore-generation-${randomUUID()}`,
+          });
+        const handoffInput = {
+          launch: launchIntent,
+          restore: {
+            ...structuredClone(input),
+            completion: restoreGenerationCompletion(
+              input,
+              claimed,
+              false,
+            ),
+            expectedOperationRevision: "1",
+          },
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+        await assert.rejects(
+          acknowledgementLossAuthority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+            handoffInput,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+        const handedOff =
+          await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+            handoffInput,
+          );
+
+        assert.equal(handedOff.status, "prepared");
+        assert.equal(handedOff.restore.finalized, false);
+        assert.equal(handedOff.restore.operation.state, "committed");
+        assert.equal(handedOff.generation.state, "committed");
+        assert.equal(handedOff.launch.operation.state, "prepared");
+        assert.equal(
+          handedOff.launch.attempt.launchAttemptId,
+          launchAttemptId,
+        );
+        assert.equal(
+          BigInt(handedOff.launch.operation.expectedSession.revision),
+          BigInt(claimed.session.revision) + 1n,
+        );
+        assert.equal(
+          BigInt(handedOff.session.revision),
+          BigInt(claimed.session.revision) + 2n,
+        );
+        assert.equal(
+          handedOff.session.document.activeOperation.operationId,
+          launchAttemptId,
+        );
+        assert.equal(
+          handedOff.session.document.lastOperation.operationId,
+          input.operationId,
+        );
+        assert.deepEqual(
+          handedOff.launch.attempt.request.measuredImage,
+          launchIntent.measuredImage,
+        );
+        assert.deepEqual(
+          handedOff.launch.attempt.request.supervisor,
+          launchIntent.supervisor,
+        );
+        assert.equal(
+          handedOff.launch.attempt.request.generation.generationId,
+          handedOff.generation.generationId,
+        );
+        assert.equal(
+          handedOff.launch.attempt.request.generation.operationId,
+          handedOff.generation.operationId,
+        );
+
+        const atomicState =
+          await readRestoreLaunchHandoffTransactionState(
+            pool,
+            input.operationId,
+            launchAttemptId,
+          );
+        assert.equal(atomicState.generation_state, "committed");
+        assert.deepEqual(
+          atomicState.generation_document,
+          structuredClone(handedOff.generation.document),
+        );
+        assert.equal(atomicState.restore_operation_state, "committed");
+        assert.equal(atomicState.restore_operation_revision, "2");
+        assert.equal(
+          atomicState.restore_operation_result.outcome,
+          "restore-generation-committed",
+        );
+        assert.equal(atomicState.restore_reservation_state, "released");
+        assert.equal(
+          atomicState.launch_operation_kind,
+          WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+        );
+        assert.equal(atomicState.launch_operation_state, "prepared");
+        assert.equal(atomicState.launch_operation_revision, "0");
+        assert.equal(atomicState.launch_operation_result, null);
+        assert.equal(atomicState.launch_operation_retired_at, null);
+        assert.equal(atomicState.launch_reservation_state, "prepared");
+        assert.equal(atomicState.launch_reservation_released_at, null);
+        assert.equal(atomicState.handoff_times_match, true);
+        assert.equal(
+          atomicState.session_revision,
+          handedOff.session.revision,
+        );
+        assert.deepEqual(
+          atomicState.session_document,
+          structuredClone(handedOff.session.document),
+        );
+        assert.deepEqual(
+          atomicState.launch_operation_request.payload,
+          structuredClone(handedOff.launch.attempt.request),
+        );
+
+        const handoffReplay =
+          await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+            structuredClone(handoffInput),
+          );
+        assert.equal(handoffReplay.status, "prepared");
+        assert.equal(handoffReplay.restore.finalized, false);
+        assert.deepEqual(handoffReplay.generation, handedOff.generation);
+        assert.deepEqual(handoffReplay.launch, handedOff.launch);
+        assert.deepEqual(handoffReplay.session, handedOff.session);
+
+        const started = await facade.runPreparedLaunch({
+          imageReservation,
+          launchAttemptId,
+        });
+        assert.equal(started.status, "started");
+        assert.notEqual(started.writer, null);
+        assert.equal(launchCalls, 1);
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(launchedRequest)),
+          JSON.parse(JSON.stringify(handedOff.launch.attempt.request)),
+        );
+
+        const replayed = await facade.runPreparedLaunch({
+          imageReservation,
+          launchAttemptId,
+        });
+        assert.equal(replayed.status, "started");
+        assert.strictEqual(replayed.writer, started.writer);
+        assert.equal(launchCalls, 1);
+
+        const read = await authority.readWriterLaunchAttempt({
+          operationId: launchAttemptId,
+        });
+        assertOperationReceipt(read, "committed");
+        assert.equal(
+          read.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.session.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
       },
     );
 

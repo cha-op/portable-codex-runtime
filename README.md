@@ -187,6 +187,20 @@ uses stopped-only supervisor reconciliation and never relaunches. An already
 committed started attempt can be adopted only from that exact local record,
 otherwise stop or physical fencing is required.
 
+Restore-generation request version 2 now closes the database crash gap between
+generation finalisation and launch reservation. It binds one exact durable
+launch intent before publication. A single serializable transition commits the
+generation and restore terminal anchor, reserves the matching existing
+`writer-launch-attempt-v1`, and advances the session to that prepared launch.
+The launcher can first prepare the intent from the original opaque image
+reservation and later claim only that pre-reserved attempt. It consumes the
+reservation and invokes the supervisor only after durable `starting`; a
+mismatch leaves the attempt untouched. If the process restarts while the
+attempt is still durably `prepared`, the runtime may mint a fresh opaque
+reservation for the same fixed image and measurement; once the attempt may
+have reached `starting`, recovery never consumes another image capability or
+relaunches.
+
 The authority also provides typed `writer-launch-stop-v1` transitions that
 preserve the original started attempt and clear the current launch only after
 exact `complete-stopped` supervisor proof, plus bounded discovery of prepared
@@ -194,12 +208,12 @@ or active attempts and current launches. The initial facade does not yet route
 the coordinator stop callback through that durable transition or compose
 production capture.
 
-Production restore therefore remains fail-closed. The next serial pull request
-must bind exact typed generation publication to launcher dispatch and
-no-relaunch recovery, compose the durable stop callback and recovery service,
-and only then wire and enable `runRestore()`. Crash-consistent ext4 or
-filesystem-image backend execution also remains later work; neither a database
-lease nor a higher epoch is a physical writer fence.
+Production restore therefore remains fail-closed. Later serial pull requests
+must verify exact typed generation publication, compose durable stop/capture
+callbacks and bounded no-relaunch recovery, and only then wire and enable
+`runRestore()`. Crash-consistent ext4 or filesystem-image backend execution
+also remains later work; neither a database lease nor a higher epoch is a
+physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -348,9 +362,10 @@ conformance tests define the seam, and the PostgreSQL authority now implements
 clean capture, committed reconciliation, and typed destination-generation
 state. The process-local launcher foundation now composes one-use image
 consumption, external launch, exact provisional writer registration, and
-no-relaunch attempt reconciliation. Restore remains fail-closed until the next
-serial slice binds exact generation publication, launcher/recovery, and durable
-stop/capture through `runRestore()`. See
+no-relaunch attempt reconciliation. The atomic handoff additionally binds a
+committed restore generation to an already-prepared durable launch attempt.
+Restore remains fail-closed until later serial slices verify publication and
+compose launcher recovery plus durable stop/capture through `runRestore()`. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

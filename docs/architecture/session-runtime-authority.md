@@ -1086,17 +1086,88 @@ reservation. The object capability prevents an untrusted serialized
 registry availability, publisher signatures, or that a future container driver
 actually launched the reserved bytes.
 
+## Implemented Atomic Restore-to-Launch Handoff
+
+Sequentially calling restore-generation finalisation and then launcher
+reservation leaves a real crash gap: the generation can be committed while no
+active operation names launch work. Restore request version 2 closes that gap
+by adding one exact durable `launchIntent` containing the launch-attempt ID,
+measured-image projection, and supervisor identity. The request is fixed before
+physical publication starts; changing any part of the intent changes the
+durable restore request identity.
+
+`finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt()` performs
+one serializable authority transition. It validates the version 2 intent and
+then:
+
+1. commits the exact authorized destination generation against its validated
+   source catalogue relation;
+2. commits the restore operation and releases its reservation;
+3. advances the canonical session to the restore terminal anchor;
+4. derives the existing `writer-launch-attempt-v1` request from that exact
+   terminal snapshot and committed generation;
+5. inserts the prepared launch operation and reservation; and
+6. advances the session again so its active pointer names that launch attempt.
+
+The transaction exposes neither intermediate session revision. On rollback,
+none of the generation, terminal restore state, or launch reservation becomes
+visible. A lost commit acknowledgement is resolved by exact readback of both
+operations and the generation; replay cannot reserve a different attempt.
+Version 1 restore requests remain readable and independently finalisable, but
+they have no durable launch intent and cannot use the atomic handoff.
+Version 1 recovery candidates also retain their historical three-field shape;
+only version 2 candidates carry `launchIntent`.
+
+Version 2 creation is not yet reachable from production `runRestore()`. Before
+a later release enables that path, every authority and recovery node that can
+observe the same database must first understand version 2, and activation must
+be held behind an explicit fleet-capability gate. A mixed fleet must continue
+creating version 1 work rather than let an older recovery worker fail an entire
+page on an unknown durable request.
+
+The launcher facade adds a split preparation path for this transaction.
+`prepareLaunchIntent()` revalidates the original opaque image reservation and
+returns only its exact durable measured-image and supervisor projection; it
+does not consume the reservation, create database state, or invoke the
+launcher. After the authority transaction commits,
+`runPreparedLaunch()` reads and claims only the named pre-reserved attempt. It
+revalidates the durable request against the supplied opaque reservation before
+the definite claim, consumes the reservation only after durable `starting`,
+and then reuses the same at-most-once launch, registration, finalisation, and
+no-relaunch reconciliation rules as `runLaunch()`.
+
+The opaque reservation is not durable state. If the process restarts while the
+attempt is still authoritatively `prepared`, a trusted image resolver may mint
+a fresh reservation for the same fixed image. The launcher compares its full
+measurement with the durable request before claim. A claim failure whose exact
+readback remains `prepared` leaves the attempt retryable; `starting`,
+`uncertain`, and terminal readback never consume that fresh capability or call
+the launcher again.
+
+A prepared mismatch cannot claim, consume, cancel, or replace the durable
+attempt. A `starting` or `uncertain` attempt only reconciles, and a committed
+attempt uses exact readback. The serialized `launchIntent` is therefore a
+durable correlation and full-measurement recovery binding, not a replacement
+for any image capability or a writer handle.
+
+This slice intentionally does not verify a committed publication, route the
+coordinator's stop callback through PostgreSQL, join stop proof to capture,
+create an operational recovery service, or enable production restore.
+
 ## Remaining Production Restore Composition
 
-The launcher foundation closes the process-local image-consumption, external
-launch, provisional registration, and no-relaunch reconciliation boundary. It
-does not yet compose the complete restore transaction. The next serial pull
-request must:
+The launcher foundation and atomic handoff close the process-local
+image-consumption, external launch, provisional registration, no-relaunch
+reconciliation, and committed-generation-to-prepared-launch crash boundaries.
+They do not yet compose the complete production restore protocol. Later serial
+pull requests must:
 
-- claim one typed destination generation and pass its exact coordinator
-  binding through physical publication before finalising that generation;
-- pass the exact committed generation and original image reservation to the
-  launcher facade, and route active-attempt recovery without another launch;
+- pass one typed destination generation and its exact coordinator binding
+  through physical publication, then verify the committed result before
+  treating it as usable;
+- dispatch the already-reserved launch with the original image reservation, or
+  with a newly minted exact-match reservation while it is still durably
+  `prepared`, and route every active attempt without another launch;
 - compose bounded generation, prepared-launch, active-attempt, and
   current-launch recovery into an operational service;
 - route the coordinator's complete stop through `writer-launch-stop-v1` and

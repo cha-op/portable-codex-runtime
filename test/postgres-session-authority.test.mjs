@@ -8,7 +8,11 @@ import {
 import {
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
+  RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
+  WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  createRestoreDestinationGenerationOperationRequest,
+  createRestoreDestinationGenerationOperationRequestV2,
 } from "../src/postgres-session-authority.mjs";
 import {
   createSessionManifest,
@@ -177,6 +181,131 @@ function legacyDocument(overrides = {}) {
   return value;
 }
 
+function attachedSnapshot() {
+  const lease = {
+    contractVersion: 1,
+    expiresAt: "2026-07-29T13:34:56.789Z",
+    fencingEpoch: "2",
+    holderId: "host-001",
+    leaseId: "lease-001",
+    sessionId: SESSION_ID,
+  };
+  const attachment = {
+    attachmentId: "attachment-001",
+    backendId: "single-attach-test",
+    contractVersion: 1,
+    fencingEpoch: lease.fencingEpoch,
+    holderId: lease.holderId,
+    kind: "directory",
+    leaseId: lease.leaseId,
+    mode: "read-write",
+    operationId: "attachment-operation-001",
+    proofId: "attachment-proof-001",
+    rootPath: "/var/lib/portable-codex/session-001",
+    sessionId: SESSION_ID,
+    storageId: "volume-001",
+  };
+  return {
+    createdAt: NOW,
+    document: document({
+      attachment,
+      lastOperation: {
+        conflictClass: "session-mutation",
+        expectedSessionRevision: "0",
+        kind: WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+        operationId: attachment.operationId,
+        operationRevision: "2",
+        requestSha256: "d".repeat(64),
+        reservationId: "attachment-reservation-001",
+        resultSha256: "e".repeat(64),
+        state: "committed",
+      },
+      lease,
+      lifecycle: "ATTACHED",
+      writerEpoch: lease.fencingEpoch,
+    }),
+    revision: "3",
+    sessionId: SESSION_ID,
+    updatedAt: NOW,
+  };
+}
+
+function restoreGenerationAdmissionFixture(
+  expectedSession = attachedSnapshot(),
+) {
+  const { lease, manifest: sessionManifest, storageRef: sessionStorage } =
+    expectedSession.document;
+  const checkpoint = {
+    artifactId: "artifact-001",
+    backendId: sessionStorage.backendId,
+    checkpointClass: "clean",
+    checkpointId: "checkpoint-001",
+    codexSessionId: sessionManifest.codex.sessionId,
+    codexThreadId: sessionManifest.codex.rootThreadId,
+    contractVersion: 1,
+    createdAt: "2026-07-29T12:00:00.000Z",
+    imageDigest: sessionManifest.runtime.imageDigest,
+    sessionId: expectedSession.sessionId,
+    sourceFencingEpoch: "1",
+    storageId: sessionStorage.storageId,
+  };
+  return {
+    checkpoint,
+    request: {
+      backendId: sessionStorage.backendId,
+      contractVersion: 1,
+      fencingEpoch: lease.fencingEpoch,
+      holderId: lease.holderId,
+      leaseId: lease.leaseId,
+      operation: "restore",
+      operationId: "restore-operation-001",
+      sessionId: expectedSession.sessionId,
+      storageId: sessionStorage.storageId,
+      target: {
+        artifactId: checkpoint.artifactId,
+        checkpointId: checkpoint.checkpointId,
+        kind: "checkpoint",
+      },
+    },
+  };
+}
+
+function writerLaunchIntentFixture(expectedSession = attachedSnapshot()) {
+  const runtime = expectedSession.document.manifest.runtime;
+  const [os, architecture] = runtime.platform.split("/");
+  return {
+    launchAttemptId: "writer-launch-001",
+    measuredImage: {
+      projection: {
+        codexSandbox: runtime.codexSandbox,
+        codexVersion: runtime.codexVersion,
+        platformImage: {
+          architecture,
+          config: {
+            digest: `sha256:${"b".repeat(64)}`,
+            mediaType: "application/vnd.oci.image.config.v1+json",
+            size: 512,
+          },
+          digest: runtime.imageDigest,
+          mediaType: runtime.imageMediaType,
+          os,
+          size: 1024,
+        },
+      },
+      runtimeIdentity: {
+        codexBinaryPath: "/opt/portable-codex/bin/codex",
+        codexBinarySha256: "c".repeat(64),
+        codexVersion: runtime.codexVersion,
+        platformImageDigest: runtime.imageDigest,
+      },
+    },
+    supervisor: {
+      contractVersion: 1,
+      supervisorId: "supervisor-001",
+    },
+  };
+}
+
 function row(overrides = {}) {
   return {
     session_id: SESSION_ID,
@@ -213,6 +342,16 @@ function userQueries(client) {
 function queryTexts(client) {
   return client.queries.map((args) =>
     typeof args[0] === "string" ? args[0] : args[0]?.text,
+  );
+}
+
+function reversePlainData(value) {
+  if (Array.isArray(value)) return value.map(reversePlainData);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .reverse()
+      .map(([key, child]) => [key, reversePlainData(child)]),
   );
 }
 
@@ -684,4 +823,167 @@ test("authority validation uses captured intrinsic decisions", async () => {
     updatedAt: NOW,
   });
   clients[0].assertExhausted();
+});
+
+test("restore generation V2 requests canonically bind one launch intent", () => {
+  const expectedSession = attachedSnapshot();
+  const admission = restoreGenerationAdmissionFixture(expectedSession);
+  const launchIntent = writerLaunchIntentFixture(expectedSession);
+  const legacyRequest =
+    createRestoreDestinationGenerationOperationRequest({
+      admission,
+      expectedSession,
+    });
+
+  const request = createRestoreDestinationGenerationOperationRequestV2({
+    admission,
+    expectedSession,
+    launchIntent,
+  });
+  const reordered =
+    createRestoreDestinationGenerationOperationRequestV2(
+      reversePlainData({ admission, expectedSession, launchIntent }),
+    );
+
+  assert.deepEqual(Reflect.ownKeys(request), [
+    "admission",
+    "contractVersion",
+    "launchIntent",
+    "predeterminedResult",
+  ]);
+  assert.equal(request.contractVersion, 2);
+  assert.equal(JSON.stringify(request), JSON.stringify(reordered));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(request)),
+    {
+      admission,
+      contractVersion: 2,
+      launchIntent,
+      predeterminedResult: JSON.parse(
+        JSON.stringify(legacyRequest.predeterminedResult),
+      ),
+    },
+  );
+  assert.equal(Object.isFrozen(request), true);
+  assert.equal(Object.isFrozen(request.admission), true);
+  assert.equal(Object.isFrozen(request.launchIntent), true);
+  assert.equal(Object.isFrozen(request.launchIntent.measuredImage), true);
+  assert.equal(
+    Object.isFrozen(
+      request.launchIntent.measuredImage.projection.platformImage.config,
+    ),
+    true,
+  );
+
+  launchIntent.supervisor.supervisorId = "mutated-supervisor";
+  admission.request.target.artifactId = "mutated-artifact";
+  assert.equal(
+    request.launchIntent.supervisor.supervisorId,
+    "supervisor-001",
+  );
+  assert.equal(
+    request.admission.request.target.artifactId,
+    "artifact-001",
+  );
+});
+
+test("restore generation request versions reject crossed launch identities before database access", async () => {
+  const expectedSession = attachedSnapshot();
+  const admission = restoreGenerationAdmissionFixture(expectedSession);
+  const launchIntent = writerLaunchIntentFixture(expectedSession);
+  const request = createRestoreDestinationGenerationOperationRequestV2({
+    admission,
+    expectedSession,
+    launchIntent,
+  });
+  const { authority, pool } = authorityWithScripts();
+  const restore = {
+    completion: {
+      materialization: {},
+      replayed: false,
+      result: {},
+    },
+    expectedOperationRevision: "1",
+    expectedSession,
+    kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    operationId: admission.request.operationId,
+    request,
+  };
+
+  assert.throws(
+    () =>
+      createRestoreDestinationGenerationOperationRequestV2({
+        admission,
+        expectedSession,
+        launchIntent: {
+          ...structuredClone(launchIntent),
+          launchAttemptId: admission.request.operationId,
+        },
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
+  assert.throws(
+    () =>
+      createRestoreDestinationGenerationOperationRequestV2({
+        admission,
+        expectedSession,
+        launchIntent: {
+          ...structuredClone(launchIntent),
+          measuredImage: {
+            ...structuredClone(launchIntent.measuredImage),
+            runtimeIdentity: {
+              ...structuredClone(
+                launchIntent.measuredImage.runtimeIdentity,
+              ),
+              platformImageDigest: `sha256:${"d".repeat(64)}`,
+            },
+          },
+        },
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: {
+          ...structuredClone(launchIntent),
+          launchAttemptId: "writer-launch-mismatch",
+        },
+        restore,
+      },
+    ),
+    "invalid_operation_request",
+  );
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGeneration({
+      ...structuredClone(restore),
+    }),
+    "invalid_operation_request",
+  );
+
+  const legacyRequest =
+    createRestoreDestinationGenerationOperationRequest({
+      admission,
+      expectedSession,
+    });
+  assert.equal(legacyRequest.contractVersion, 1);
+  assert.equal(Object.hasOwn(legacyRequest, "launchIntent"), false);
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: launchIntent,
+        restore: {
+          ...structuredClone(restore),
+          request: legacyRequest,
+        },
+      },
+    ),
+    "invalid_operation_request",
+  );
+  assert.equal(pool.connectCalls, 0);
 });

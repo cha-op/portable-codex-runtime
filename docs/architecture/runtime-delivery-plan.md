@@ -134,7 +134,7 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
      settles, drain in-flight work on abort, and leave guard-busy or
      unverifiable operations durably blocked for a later pass.
 
-Restore and launcher authority are now split into five serial pull requests:
+Restore and launcher authority are now split into seven serial pull requests:
 
 1. **Restore-generation schema foundation (complete)**
    - Replace the single hard-coded migration with one ordered,
@@ -171,11 +171,31 @@ Restore and launcher authority are now split into five serial pull requests:
      add typed `writer-launch-stop-v1` authority, and enumerate bounded
      prepared attempts and current launches without enabling production
      restore or claiming production stop/capture composition.
-5. **Production restore composition and enablement**
-   - Bind typed generation claim and publication to the exact committed
-     generation consumed by launcher admission, then wire launcher dispatch,
-     no-relaunch recovery, durable stop callbacks, and bounded recovery
-     services through the production checkpoint adapter.
+5. **Atomic restore-to-launch handoff (complete)**
+   - Add a version 2 restore-generation request that commits to the exact
+     measured image, supervisor, and launch-attempt identity before physical
+     publication begins.
+   - In one serializable transition, commit the authorized generation, retire
+     the restore operation, and reserve the exact existing
+     `writer-launch-attempt-v1` operation. Advance the canonical session first
+     to the restore terminal anchor and then to the prepared launch pointer.
+   - Prepare the process-local image reservation before publication and let
+     the launcher claim only that already-reserved attempt. A crash cannot
+     expose a committed generation without durable launch work.
+6. **Durable stop and recovery composition**
+   - Gate version 2 creation on confirmed fleet-wide authority and recovery
+     compatibility before production can persist the new request shape.
+   - Verify committed restore publication, route exact coordinator stop
+     confirmation through `writer-launch-stop-v1`, retain only the local
+     capability state that can still prove writer identity, and join that stop
+     proof to later capture admission.
+   - Compose bounded generation, prepared-launch, active-attempt, and
+     current-launch recovery without relaunching or reconstructing an opaque
+     image or writer capability from serialized state.
+7. **Production restore adapter enablement**
+   - Wire publication, the atomic handoff, prepared launch, no-relaunch
+     recovery, durable stop, and capture composition through the production
+     checkpoint adapter.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

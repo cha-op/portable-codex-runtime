@@ -1,0 +1,109 @@
+---
+id: 20260804-5a7c2e
+title: Atomic Restore-to-Launch Handoff
+status: completed
+created: 2026-08-04
+updated: 2026-08-04
+branch: wip/restore-launch-handoff
+pr:
+supersedes: []
+superseded_by:
+---
+
+# Atomic Restore-to-Launch Handoff
+
+## Summary
+
+Closed the durable crash gap between committing one restore destination
+generation and reserving its logical writer launch. Restore request version 2
+binds an exact launch intent before publication, one serializable PostgreSQL
+transition commits the generation and reserves that launch attempt, and the
+launcher consumes only the pre-reserved attempt with an exact opaque image
+capability.
+
+## Current State
+
+- `createRestoreDestinationGenerationOperationRequestV2()` records the exact
+  launch-attempt ID, measured-image projection, and supervisor identity in the
+  restore operation request. Existing version 1 requests remain valid but have
+  no launch intent.
+- `finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt()` commits
+  the authorized generation, restore operation, and released reservation;
+  writes the restore terminal session revision; derives the existing
+  `writer-launch-attempt-v1` request from that exact snapshot; reserves it; and
+  writes the prepared-launch session revision in one serializable transaction.
+- Exact replay returns the same generation and launch attempt. Intent changes,
+  revision exhaustion, standalone-finalize gaps, and partial-state conflicts
+  fail closed instead of fabricating a missing launch reservation.
+- Restore-generation recovery candidates expose the exact durable launch
+  intent for version 2 while preserving the historical three-field version 1
+  candidate shape, without treating either form as an opaque image capability.
+- `prepareLaunchIntent()` revalidates but does not consume the original image
+  reservation. `runPreparedLaunch()` reads and claims only the exact existing
+  prepared attempt; it does not reserve another operation.
+- After a restart, a trusted resolver may mint a fresh opaque reservation only
+  while exact authority readback still reports that attempt as `prepared`; its
+  complete measurement must match the durable launch intent before claim.
+- The prepared launcher consumes the image reservation and invokes the
+  supervisor only after definite durable claim. Starting or uncertain state
+  follows no-relaunch reconciliation, committed state follows exact readback,
+  and a prepared mismatch leaves both the durable attempt and process-local
+  capability untouched. A claim failure whose readback remains prepared also
+  leaves the attempt retryable instead of cancelling required launch work.
+
+## Safety Decisions
+
+- The protected property is one-to-one durable continuity from the authorized
+  restore generation to its intended launch attempt. Generation commit and
+  launch reservation therefore share one transaction; two separately atomic
+  calls are insufficient.
+- The first session revision records the committed restore terminal anchor.
+  The launch request is derived from that exact snapshot, and the second
+  revision records its active prepared pointer. Neither intermediate state is
+  externally visible before commit.
+- The serialized launch intent is only correlation and recovery data. It does
+  not recreate the original image reservation, consume it, or authorize a
+  process launch by itself.
+- Version 1 compatibility does not silently upgrade an already committed
+  generation into launch authority. Production composition must use an exact
+  version 2 request before physical publication begins.
+- Version 2 remains dormant until production composition lands. Its rollout
+  must upgrade every authority/recovery node sharing the database before an
+  explicit fleet-capability gate allows any node to create version 2 work;
+  version 1 recovery candidates keep their historical exact shape.
+- No new table is required: the handoff uses the permanent generation,
+  operation, reservation, and session relations already covered by the
+  authority migration chain.
+
+## Next Steps
+
+1. Verify committed restore publication and compose it with the atomic handoff
+   and prepared launcher without treating a published path as launch authority.
+2. Route exact coordinator stop confirmation through
+   `writer-launch-stop-v1`, retain the required local stopped-writer relation,
+   and bind its durable proof to capture admission.
+3. Add bounded generation and launch recovery services, then enable
+   production `runRestore()` only after the complete protocol remains
+   fail-closed across acknowledgement loss and restart.
+4. Implement the later filesystem-image backend, differential export,
+   retention, and cross-host recovery verification.
+
+## Non-Goals
+
+- No production `runRestore()` enablement.
+- No publication verifier or production restore adapter.
+- No complete durable stop/capture composition or operational recovery loop.
+- No concrete Podman or Docker launcher.
+- No filesystem-image backend.
+- No Git Summary implementation.
+
+## Evidence
+
+- `src/postgres-session-authority.mjs`
+- `src/postgres-logical-writer-launcher.mjs`
+- `test/postgres-session-operation-kernel.test.mjs`
+- `test/postgres-logical-writer-launcher.test.mjs`
+- `integration/postgres-session-authority.mjs`
+- `createRestoreDestinationGenerationOperationRequestV2()`
+- `PostgresSessionAuthority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt()`
+- `createPostgresLogicalWriterLauncher()`

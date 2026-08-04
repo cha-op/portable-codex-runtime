@@ -68,6 +68,7 @@ const CHECKPOINT_CATALOGUE_CONTRACT_VERSION = 1;
 const CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION = 2;
 const RESTORE_DESTINATION_MATERIALIZATION_CONTRACT_VERSION = 3;
 const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION = 1;
+const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 = 2;
 const RESTORE_DESTINATION_GENERATION_BINDING_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
@@ -269,6 +270,17 @@ const RESTORE_GENERATION_OPERATION_REQUEST_KEYS = Object.freeze([
   "contractVersion",
   "predeterminedResult",
 ]);
+const RESTORE_GENERATION_OPERATION_REQUEST_V2_KEYS = Object.freeze([
+  "admission",
+  "contractVersion",
+  "launchIntent",
+  "predeterminedResult",
+]);
+const RESTORE_GENERATION_LAUNCH_INTENT_KEYS = Object.freeze([
+  "launchAttemptId",
+  "measuredImage",
+  "supervisor",
+]);
 const RESTORE_GENERATION_ADMISSION_KEYS = Object.freeze([
   "checkpoint",
   "request",
@@ -293,6 +305,10 @@ const RESTORE_GENERATION_FINALIZATION_INPUT_KEYS = Object.freeze([
   "kind",
   "operationId",
   "request",
+]);
+const RESTORE_GENERATION_LAUNCH_HANDOFF_INPUT_KEYS = Object.freeze([
+  "launch",
+  "restore",
 ]);
 const RESTORE_GENERATION_COMPLETION_KEYS = Object.freeze([
   "materialization",
@@ -2790,15 +2806,52 @@ function canonicalRestoreGenerationResult(value, admission, code) {
   return expected;
 }
 
-function restoreGenerationOperationRequest(value, expectedSession, code) {
-  const request = exactPlainObject(
+function canonicalRestoreGenerationLaunchIntent(
+  value,
+  expectedSession,
+  code,
+) {
+  const launchIntent = exactPlainObject(
     value,
-    RESTORE_GENERATION_OPERATION_REQUEST_KEYS,
+    RESTORE_GENERATION_LAUNCH_INTENT_KEYS,
     code,
   );
+  return canonicalJsonObject(
+    {
+      launchAttemptId: canonicalOpaqueId(
+        launchIntent.launchAttemptId,
+        128,
+        code,
+      ),
+      measuredImage: canonicalWriterLaunchMeasuredImage(
+        launchIntent.measuredImage,
+        expectedSession.document.manifest,
+        code,
+      ),
+      supervisor: canonicalWriterLaunchSupervisor(
+        launchIntent.supervisor,
+        code,
+      ),
+    },
+    code,
+  );
+}
+
+function restoreGenerationOperationRequest(value, expectedSession, code) {
+  const contractVersion = ownDataValue(value, "contractVersion", code);
   ensure(
-    request.contractVersion ===
-      RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION,
+    contractVersion ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION ||
+      contractVersion ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2,
+    code,
+  );
+  const request = exactPlainObject(
+    value,
+    contractVersion ===
+      RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION
+      ? RESTORE_GENERATION_OPERATION_REQUEST_KEYS
+      : RESTORE_GENERATION_OPERATION_REQUEST_V2_KEYS,
     code,
   );
   const admission = restoreGenerationAdmission(
@@ -2811,11 +2864,25 @@ function restoreGenerationOperationRequest(value, expectedSession, code) {
     admission,
     code,
   );
+  const launchIntent =
+    contractVersion ===
+    RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2
+      ? canonicalRestoreGenerationLaunchIntent(
+          request.launchIntent,
+          expectedSession,
+          code,
+        )
+      : null;
+  ensure(
+    launchIntent === null ||
+      launchIntent.launchAttemptId !== admission.request.operationId,
+    code,
+  );
   return canonicalJsonObject(
     {
       admission,
-      contractVersion:
-        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION,
+      contractVersion,
+      ...(launchIntent === null ? {} : { launchIntent }),
       predeterminedResult,
     },
     code,
@@ -2842,6 +2909,47 @@ export function createRestoreDestinationGenerationOperationRequest(options) {
       admission,
       contractVersion:
         RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION,
+      predeterminedResult: predeterminedRestoreGenerationResult(
+        admission,
+        "invalid_operation_request",
+      ),
+    },
+    "invalid_operation_request",
+  );
+}
+
+export function createRestoreDestinationGenerationOperationRequestV2(
+  options,
+) {
+  const normalized = exactPlainObject(
+    options,
+    ["admission", "expectedSession", "launchIntent"],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  const admission = restoreGenerationAdmission(
+    normalized.admission,
+    expectedSession,
+    "invalid_operation_request",
+  );
+  const launchIntent = canonicalRestoreGenerationLaunchIntent(
+    normalized.launchIntent,
+    expectedSession,
+    "invalid_operation_request",
+  );
+  ensure(
+    launchIntent.launchAttemptId !== admission.request.operationId,
+    "invalid_operation_request",
+  );
+  return canonicalJsonObject(
+    {
+      admission,
+      contractVersion:
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2,
+      launchIntent,
       predeterminedResult: predeterminedRestoreGenerationResult(
         admission,
         "invalid_operation_request",
@@ -4568,6 +4676,31 @@ function restoreGenerationFinalizationInput(options) {
     completion,
     expectedOperationRevision,
   });
+}
+
+function restoreGenerationLaunchHandoffInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    RESTORE_GENERATION_LAUNCH_HANDOFF_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const restore = restoreGenerationFinalizationInput(normalized.restore);
+  ensure(
+    restore.request.contractVersion ===
+      RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2,
+    "invalid_operation_request",
+  );
+  const launch = canonicalRestoreGenerationLaunchIntent(
+    normalized.launch,
+    restore.expectedSession,
+    "invalid_operation_request",
+  );
+  ensure(
+    canonicalSerialize(launch) ===
+      canonicalSerialize(restore.request.launchIntent),
+    "invalid_operation_request",
+  );
+  return deepFreeze({ launch, restore });
 }
 
 function restoreGenerationReadInput(options) {
@@ -6657,6 +6790,199 @@ function operationReceipt({
   });
 }
 
+function restoreTerminalRevisionForLaunchHandoff(input, operation, code) {
+  return revisionAfter(
+    input.expectedSession.revision,
+    BigIntConstructor(operation.revision) + 1n,
+    code,
+  );
+}
+
+function restoreTerminalSessionForLaunchHandoff(
+  input,
+  operation,
+  reservation,
+) {
+  ensure(
+    operation.state === "committed" &&
+      operation.result?.outcome === "restore-generation-committed",
+    "operation_state_invalid",
+  );
+  const session = expectedSnapshotFromValue(
+    {
+      createdAt: input.expectedSession.createdAt,
+      document: documentWithAuthorityState(
+        input.expectedSession.document,
+        {
+          activeOperation: null,
+          lastOperation: lastPointerFor(operation, reservation),
+        },
+      ),
+      revision: restoreTerminalRevisionForLaunchHandoff(
+        input,
+        operation,
+        "operation_state_invalid",
+      ),
+      sessionId: input.expectedSession.sessionId,
+      updatedAt: operation.updatedAt,
+    },
+    "operation_state_invalid",
+  );
+  validateLastOperationPointer(session, operation, reservation);
+  return session;
+}
+
+function writerLaunchAttemptInputForRestoreHandoff(
+  restoreInput,
+  generation,
+  expectedSession,
+  launch,
+) {
+  const request = createWriterLaunchAttemptOperationRequest({
+    expectedSession,
+    generation,
+    measuredImage: launch.measuredImage,
+    supervisor: launch.supervisor,
+  });
+  const input = writerLaunchAttemptInput({
+    expectedSession,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    operationId: launch.launchAttemptId,
+    request,
+  });
+  ensure(
+    restoreInput.request.contractVersion ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 &&
+      canonicalSerialize(launch) ===
+        canonicalSerialize(restoreInput.request.launchIntent),
+    "operation_state_invalid",
+  );
+  return input;
+}
+
+function restoreLaunchHandoffReceipt({
+  generation,
+  launchInput,
+  launchOperation,
+  launchReservation,
+  restoreCatalogue,
+  restoreFinalized,
+  restoreInput,
+  restoreOperation,
+  restoreReservation,
+  session,
+}) {
+  ensure(
+    generation.state === "committed" &&
+      generation.document !== null &&
+      generation.committedAt === restoreOperation.updatedAt &&
+      restoreOperation.result?.generationId === generation.generationId &&
+      restoreOperation.result?.checkpointId === generation.checkpointId &&
+      restoreOperation.result?.catalogueSha256 ===
+        sha256(canonicalSerialize(restoreCatalogue.document)) &&
+      restoreOperation.result?.generationDocumentSha256 ===
+        sha256(canonicalSerialize(generation.document)) &&
+      launchOperation.createdAt === restoreOperation.updatedAt &&
+      launchReservation.createdAt === restoreOperation.updatedAt,
+    "operation_state_invalid",
+  );
+  validateOperationIdentity(restoreOperation, restoreInput);
+  validateOperationReservation(
+    restoreOperation,
+    restoreReservation,
+    restoreInput,
+  );
+  validateOperationIdentity(launchOperation, launchInput);
+  validateOperationReservation(
+    launchOperation,
+    launchReservation,
+    launchInput,
+  );
+  validateLastOperationPointer(
+    launchInput.expectedSession,
+    restoreOperation,
+    restoreReservation,
+  );
+  if (launchOperation.state === "committed") {
+    validateCommittedOperationHistory(launchOperation, session);
+  } else {
+    validateActivePointer(session, launchOperation, launchReservation);
+  }
+  return deepFreeze({
+    generation,
+    launch: deepFreeze({
+      attempt: writerLaunchAttemptRecord(launchInput, launchOperation),
+      operation: launchOperation,
+      reservation: launchReservation,
+    }),
+    restore: deepFreeze({
+      catalogue: restoreCatalogue,
+      finalized: restoreFinalized,
+      operation: restoreOperation,
+      reservation: restoreReservation,
+    }),
+    session,
+    status: launchOperation.state,
+  });
+}
+
+async function readRestoreLaunchHandoffReplay(
+  transaction,
+  session,
+  input,
+  observed,
+) {
+  const restoreOperation = observed.operation;
+  const restoreReservation = observed.reservation;
+  const relation = observed.generation;
+  ensure(
+    restoreOperation !== null &&
+      restoreReservation !== null &&
+      relation?.generation !== null &&
+      relation?.generation !== undefined &&
+      relation.source !== null &&
+      restoreOperation.state === "committed" &&
+      restoreOperation.result?.outcome === "restore-generation-committed" &&
+      relation.generation.state === "committed",
+    "operation_transition_conflict",
+  );
+  const restoreTerminalSession = restoreTerminalSessionForLaunchHandoff(
+    input.restore,
+    restoreOperation,
+    restoreReservation,
+  );
+  const launchInput = writerLaunchAttemptInputForRestoreHandoff(
+    input.restore,
+    relation.generation,
+    restoreTerminalSession,
+    input.launch,
+  );
+  const launchObserved = await readRequestedOperation(
+    transaction,
+    session,
+    launchInput,
+    true,
+  );
+  ensure(
+    launchObserved.operation !== null &&
+      launchObserved.reservation !== null &&
+      launchObserved.launchAttempt !== null,
+    "operation_transition_conflict",
+  );
+  return restoreLaunchHandoffReceipt({
+    generation: relation.generation,
+    launchInput,
+    launchOperation: launchObserved.operation,
+    launchReservation: launchObserved.reservation,
+    restoreCatalogue: relation.source.catalogue,
+    restoreFinalized: false,
+    restoreInput: input.restore,
+    restoreOperation,
+    restoreReservation,
+    session,
+  });
+}
+
 async function readSessionSnapshot(transaction, sessionId, forUpdate) {
   const rows = rowsFromResult(
     await transaction.query(
@@ -8227,6 +8553,10 @@ export class PostgresSessionAuthority {
           candidates[index] = deepFreeze({
             checkpoint: input.request.admission.checkpoint,
             generationId: observed.generation.generation.generationId,
+            ...(input.request.contractVersion ===
+              RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2
+              ? { launchIntent: input.request.launchIntent }
+              : {}),
             request: durableRequest,
           });
           lastCandidateSessionId = durableRequest.sessionId;
@@ -9234,6 +9564,11 @@ export class PostgresSessionAuthority {
 
   async finalizeRestoreDestinationGeneration(options) {
     const input = restoreGenerationFinalizationInput(options);
+    ensure(
+      input.request.contractVersion ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION,
+      "invalid_operation_request",
+    );
     return runSerializable(this.#store, async (transaction) => {
       const session = await readSessionSnapshot(
         transaction,
@@ -9376,6 +9711,249 @@ export class PostgresSessionAuthority {
         generation,
         operation,
         reservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+    options,
+  ) {
+    const input = restoreGenerationLaunchHandoffInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.restore.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input.restore,
+        true,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.generation?.generation !== null &&
+          observed.generation?.generation !== undefined,
+        "operation_transition_conflict",
+      );
+      const completion = canonicalRestoreGenerationCompletion(
+        input.restore.completion,
+        input.restore,
+        observed.generation.source,
+        observed.generation.generation.binding,
+        "invalid_operation_request",
+      );
+      if (observed.operation.state === "committed") {
+        ensure(
+          observed.operation.result?.outcome ===
+              "restore-generation-committed" &&
+            BigIntConstructor(input.restore.expectedOperationRevision) + 1n ===
+              BigIntConstructor(observed.operation.revision) &&
+            observed.generation.generation.state === "committed" &&
+            observed.generation.generation.document !== null,
+          "operation_transition_conflict",
+        );
+        ensure(
+          canonicalSerialize(observed.generation.generation.document) ===
+            canonicalSerialize(completion.document),
+          "operation_result_conflict",
+        );
+        return readRestoreLaunchHandoffReplay(
+          transaction,
+          session,
+          input,
+          observed,
+        );
+      }
+      ensure(
+        (observed.operation.state === "starting" ||
+          observed.operation.state === "uncertain") &&
+          observed.operation.revision ===
+            input.restore.expectedOperationRevision &&
+          observed.generation.generation.state === "authorized" &&
+          session.document.lifecycle === "ATTACHED" &&
+          session.document.launch === null &&
+          session.document.lease !== null &&
+          session.document.attachment !== null,
+        "operation_transition_conflict",
+      );
+
+      // R+1 commits the generation, R+2 makes the prepared launch active,
+      // and one further revision must remain available before either write.
+      ensure(
+        session.revision ===
+          restoreTerminalRevisionForLaunchHandoff(
+            input.restore,
+            observed.operation,
+            "operation_state_invalid",
+          ),
+        "operation_state_invalid",
+      );
+      revisionAfter(session.revision, 3);
+
+      const generationRows = rowsFromResult(
+        await transaction.query(COMMIT_RESTORE_GENERATION_QUERY.text, [
+          input.restore.operationId,
+          canonicalSerialize(completion.document),
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(generationRows.length === 1, "operation_transition_conflict");
+      const generation = restoreGenerationSnapshotFromRow(
+        generationRows[0],
+        input.restore,
+        observed.generation.source,
+      );
+      const restoreResult = restoreGenerationTerminalResult(
+        input.restore,
+        observed.generation.source,
+        generation,
+      );
+      const serializedRestoreResult = canonicalSerialize(restoreResult);
+      const restorePredecessorState = observed.operation.state;
+      const restoreOperationRows = rowsFromResult(
+        await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+          input.restore.operationId,
+          input.restore.expectedOperationRevision,
+          serializedRestoreResult,
+          transaction.now,
+          restorePredecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        restoreOperationRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const restoreReservationRows = rowsFromResult(
+        await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+          input.restore.operationId,
+          transaction.now,
+          restorePredecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        restoreReservationRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const restoreOperation = operationSnapshotFromRow(
+        restoreOperationRows[0],
+      );
+      const restoreReservation = reservationSnapshotFromRow(
+        restoreReservationRows[0],
+      );
+      validateOperationIdentity(restoreOperation, input.restore);
+      validateOperationReservation(
+        restoreOperation,
+        restoreReservation,
+        input.restore,
+      );
+      ensure(
+        canonicalSerialize(restoreOperation.result) ===
+            serializedRestoreResult &&
+          generation.committedAt === restoreOperation.updatedAt,
+        "operation_result_conflict",
+      );
+
+      const restoreTerminalDocument = documentWithAuthorityState(
+        session.document,
+        {
+          activeOperation: null,
+          lastOperation: lastPointerFor(
+            restoreOperation,
+            restoreReservation,
+          ),
+        },
+      );
+      const restoreTerminalSession = await updateSessionDocument(
+        transaction,
+        session,
+        input.restore,
+        restoreTerminalDocument,
+      );
+      validateLastOperationPointer(
+        restoreTerminalSession,
+        restoreOperation,
+        restoreReservation,
+      );
+
+      const launchInput = writerLaunchAttemptInputForRestoreHandoff(
+        input.restore,
+        generation,
+        restoreTerminalSession,
+        input.launch,
+      );
+      const launchOperationRows = rowsFromResult(
+        await transaction.query(INSERT_OPERATION_QUERY.text, [
+          launchInput.operationId,
+          restoreTerminalSession.sessionId,
+          launchInput.kind,
+          launchInput.serializedEnvelope,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        launchOperationRows.length === 1,
+        "operation_identity_conflict",
+      );
+      const launchOperation = operationSnapshotFromRow(
+        launchOperationRows[0],
+      );
+      validateOperationIdentity(launchOperation, launchInput);
+
+      const launchReservationPayload = reservationPayload(launchInput);
+      const launchReservationRows = rowsFromResult(
+        await transaction.query(INSERT_RESERVATION_QUERY.text, [
+          launchInput.reservationId,
+          launchInput.operationId,
+          restoreTerminalSession.sessionId,
+          launchInput.kind,
+          restoreTerminalSession.revision,
+          canonicalSerialize(launchReservationPayload),
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        launchReservationRows.length === 1,
+        "operation_state_invalid",
+      );
+      const launchReservation = reservationSnapshotFromRow(
+        launchReservationRows[0],
+      );
+      validateOperationReservation(
+        launchOperation,
+        launchReservation,
+        launchInput,
+      );
+
+      const updatedSession = await updateSessionPhase(
+        transaction,
+        restoreTerminalSession,
+        launchInput,
+        activePointerFor(launchInput, "prepared", "0"),
+      );
+      validateActivePointer(
+        updatedSession,
+        launchOperation,
+        launchReservation,
+      );
+      return restoreLaunchHandoffReceipt({
+        generation,
+        launchInput,
+        launchOperation,
+        launchReservation,
+        restoreCatalogue: observed.generation.source.catalogue,
+        restoreFinalized: true,
+        restoreInput: input.restore,
+        restoreOperation,
+        restoreReservation,
         session: updatedSession,
       });
     });

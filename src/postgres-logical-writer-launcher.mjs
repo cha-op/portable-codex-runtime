@@ -5,6 +5,7 @@ import {
   PlatformImageReservationCoordinator,
 } from "./platform-image-reservation.mjs";
 import {
+  RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   createWriterLaunchAttemptOperationRequest,
@@ -13,6 +14,7 @@ import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
   assertSessionAttachment,
+  assertSessionManifest,
   assertStorageMutationRequest,
 } from "./session-storage-contracts.mjs";
 import {
@@ -24,6 +26,7 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const ArrayConstructor = Array;
 const arrayPrototype = Array.prototype;
+const BigIntConstructor = BigInt;
 const createHashIntrinsic = createHash;
 const functionToStringIntrinsic = Function.prototype.toString;
 const hashDigestIntrinsic = Hash.prototype.digest;
@@ -93,6 +96,11 @@ const OPTION_KEYS = objectFreeze([
   "stoppedWriterCoordinator",
   "supervisor",
 ]);
+const PREPARE_INPUT_KEYS = objectFreeze([
+  "expectedSession",
+  "imageReservation",
+  "launchAttemptId",
+]);
 const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
@@ -111,6 +119,10 @@ const AUTHORITY_METHODS = objectFreeze([
 ]);
 const RUN_INPUT_KEYS = objectFreeze([
   "generation",
+  "imageReservation",
+  "launchAttemptId",
+]);
+const PREPARED_RUN_INPUT_KEYS = objectFreeze([
   "imageReservation",
   "launchAttemptId",
 ]);
@@ -1304,6 +1316,15 @@ function normalizeTypedRequest(value, expectedSession, code) {
       attachment.fencingEpoch === lease.fencingEpoch &&
       generation.state === "committed" &&
       generation.sessionId === lease.sessionId &&
+      assertOpaqueId(generation.checkpointId, code) ===
+        generation.checkpointId &&
+      assertOpaqueId(generation.generationId, code) ===
+        generation.generationId &&
+      assertOpaqueId(generation.operationId, code) ===
+        generation.operationId &&
+      assertSessionId(generation.sessionId, code) === generation.sessionId &&
+      typeof generation.claimedAt === "string" &&
+      typeof generation.committedAt === "string" &&
       assertSha256(generation.bindingSha256, code) ===
         generation.bindingSha256 &&
       assertSha256(generation.documentSha256, code) ===
@@ -1327,6 +1348,30 @@ function normalizeTypedRequest(value, expectedSession, code) {
     );
   }
   return snapshotData(value, code);
+}
+
+function normalizeGenerationSnapshotForReference(value, reference, code) {
+  const generation = snapshotData(value, code);
+  exactDataObject(generation, GENERATION_SNAPSHOT_KEYS, code);
+  ensure(
+    generation.binding !== null &&
+      typeof generation.binding === "object" &&
+      generation.document !== null &&
+      typeof generation.document === "object" &&
+      generation.checkpointId === reference.checkpointId &&
+      generation.claimedAt === reference.claimedAt &&
+      generation.committedAt === reference.committedAt &&
+      generation.generationId === reference.generationId &&
+      generation.operationId === reference.operationId &&
+      generation.sessionId === reference.sessionId &&
+      generation.state === "committed" &&
+      canonicalJsonProjectionSha256(generation.binding, code) ===
+        reference.bindingSha256 &&
+      canonicalJsonProjectionSha256(generation.document, code) ===
+        reference.documentSha256,
+    code,
+  );
+  return generation;
 }
 
 function normalizeTerminalEvidence(value, attempt, statuses, code) {
@@ -1635,13 +1680,14 @@ function normalizeClaimReceipt(
   );
   let generation = null;
   if (common.receipt.generation !== null) {
-    exactDataObject(
+    generation = normalizeGenerationSnapshotForReference(
       common.receipt.generation,
-      GENERATION_SNAPSHOT_KEYS,
+      common.normalizedOperation.request.generation,
       code,
     );
-    generation = snapshotData(common.receipt.generation, code);
-    ensure(sameContent(generation, inputGeneration, code), code);
+    if (inputGeneration !== null) {
+      ensure(sameContent(generation, inputGeneration, code), code);
+    }
   }
   if (common.receipt.dispatchGranted) {
     ensure(
@@ -1853,13 +1899,8 @@ function stopOperationId(captureOperationId, launchAttemptId, code) {
   return `writer-stop:${digest}`;
 }
 
-function normalizeRunInput(value, code) {
-  const input = exactDataObject(value, RUN_INPUT_KEYS, code);
-  const image = exactDataObject(
-    input.imageReservation,
-    IMAGE_RESERVATION_KEYS,
-    code,
-  );
+function normalizeImageReservation(value, code) {
+  const image = exactDataObject(value, IMAGE_RESERVATION_KEYS, code);
   ensure(
     typeof image.inspectCodex === "function" &&
       !isProxyValue(image.inspectCodex) &&
@@ -1868,6 +1909,62 @@ function normalizeRunInput(value, code) {
       !isProxyValue(image.reservation),
     code,
   );
+  return exactFrozenRecord({
+    configBytes: image.configBytes,
+    descriptor: image.descriptor,
+    inspectCodex: image.inspectCodex,
+    reservation: image.reservation,
+  });
+}
+
+function ensureMeasuredImageMatchesSession(
+  measuredImage,
+  expectedSession,
+  code,
+) {
+  let manifest;
+  try {
+    manifest = assertSessionManifest(expectedSession.document.manifest);
+  } catch {
+    fail(code);
+  }
+  const projection = measuredImage.projection;
+  const platformImage = projection.platformImage;
+  ensure(
+    manifest.sessionId === expectedSession.sessionId &&
+      projection.codexSandbox === manifest.runtime.codexSandbox &&
+      projection.codexVersion === manifest.runtime.codexVersion &&
+      platformImage.digest === manifest.runtime.imageDigest &&
+      platformImage.mediaType === manifest.runtime.imageMediaType &&
+      `${platformImage.os}/${platformImage.architecture}` ===
+        manifest.runtime.platform,
+    code,
+  );
+}
+
+function normalizePrepareInput(value, code) {
+  const input = exactDataObject(value, PREPARE_INPUT_KEYS, code);
+  const expectedSession = normalizeSession(input.expectedSession, code);
+  ensure(
+    expectedSession.document.lifecycle === "ATTACHED" &&
+      expectedSession.document.activeOperation === null &&
+      expectedSession.document.launch === null &&
+      expectedSession.document.attachment !== null &&
+      expectedSession.document.lease !== null,
+    code,
+  );
+  return exactFrozenRecord({
+    expectedSession,
+    imageReservation: normalizeImageReservation(
+      input.imageReservation,
+      code,
+    ),
+    launchAttemptId: assertOpaqueId(input.launchAttemptId, code),
+  });
+}
+
+function normalizeRunInput(value, code) {
+  const input = exactDataObject(value, RUN_INPUT_KEYS, code);
   const generation = snapshotData(input.generation, code);
   exactDataObject(generation, GENERATION_SNAPSHOT_KEYS, code);
   ensure(
@@ -1878,12 +1975,21 @@ function normalizeRunInput(value, code) {
   );
   return exactFrozenRecord({
     generation,
-    imageReservation: exactFrozenRecord({
-      configBytes: image.configBytes,
-      descriptor: image.descriptor,
-      inspectCodex: image.inspectCodex,
-      reservation: image.reservation,
-    }),
+    imageReservation: normalizeImageReservation(
+      input.imageReservation,
+      code,
+    ),
+    launchAttemptId: assertOpaqueId(input.launchAttemptId, code),
+  });
+}
+
+function normalizePreparedRunInput(value, code) {
+  const input = exactDataObject(value, PREPARED_RUN_INPUT_KEYS, code);
+  return exactFrozenRecord({
+    imageReservation: normalizeImageReservation(
+      input.imageReservation,
+      code,
+    ),
     launchAttemptId: assertOpaqueId(input.launchAttemptId, code),
   });
 }
@@ -2048,6 +2154,98 @@ export function createPostgresLogicalWriterLauncher(...args) {
         outcomeCode,
       ),
       launchAttemptId,
+      outcomeCode,
+    );
+  }
+
+  async function revalidateImageReservation(imageReservation, code) {
+    return normalizeMeasuredImage(
+      await invokeImageCoordinator(
+        imageReservations,
+        imageRevalidateReservationIntrinsic,
+        imageReservation,
+        code,
+      ),
+      code,
+    );
+  }
+
+  function validateFacadeSupervisor(request, code) {
+    ensure(
+      sameContent(
+        request.supervisor,
+        exactFrozenRecord({
+          contractVersion: supervisor.contractVersion,
+          supervisorId: supervisor.supervisorId,
+        }),
+        code,
+      ),
+      code,
+    );
+  }
+
+  function validatePreparedAuthorityRelation(read) {
+    ensure(
+      read.operation.state === "prepared" &&
+        read.operation.revision === "0" &&
+        read.attempt.state === "prepared" &&
+        read.attempt.result === null &&
+        read.launch === null,
+      outcomeCode,
+    );
+    const request = read.attempt.request;
+    const expectedSession = read.operation.expectedSession;
+    const expectedDocument = expectedSession.document;
+    const currentDocument = read.session.document;
+    const expectedLastOperation = exactDataObject(
+      expectedDocument.lastOperation,
+      LAST_OPERATION_KEYS,
+      outcomeCode,
+    );
+    ensure(
+      expectedDocument.lifecycle === "ATTACHED" &&
+        expectedDocument.activeOperation === null &&
+        expectedDocument.launch === null &&
+        expectedDocument.attachment !== null &&
+        expectedDocument.lease !== null &&
+        expectedDocument.writerEpoch === request.fencingEpoch &&
+        expectedLastOperation.kind ===
+          RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+        expectedLastOperation.operationId === request.generation.operationId &&
+        expectedLastOperation.state === "committed" &&
+        request.generation.committedAt === expectedSession.updatedAt &&
+        currentDocument.lifecycle === "ATTACHED" &&
+        currentDocument.launch === null &&
+        currentDocument.writerEpoch === request.fencingEpoch &&
+        sameContent(
+          expectedDocument.attachment,
+          request.attachment,
+          outcomeCode,
+        ) &&
+        sameContent(expectedDocument.lease, request.lease, outcomeCode) &&
+        sameContent(
+          currentDocument.attachment,
+          request.attachment,
+          outcomeCode,
+        ) &&
+        sameContent(currentDocument.lease, request.lease, outcomeCode) &&
+        sameContent(
+          currentDocument.lastOperation,
+          expectedDocument.lastOperation,
+          outcomeCode,
+        ) &&
+        sameContent(
+          currentDocument.manifest,
+          expectedDocument.manifest,
+          outcomeCode,
+        ) &&
+        BigIntConstructor(read.session.revision) ===
+          BigIntConstructor(expectedSession.revision) + 1n,
+      outcomeCode,
+    );
+    ensureMeasuredImageMatchesSession(
+      request.measuredImage,
+      expectedSession,
       outcomeCode,
     );
   }
@@ -2280,6 +2478,70 @@ export function createPostgresLogicalWriterLauncher(...args) {
     }
   }
 
+  async function dispatchGrantedLaunch(
+    claim,
+    imageReservation,
+    probe,
+    uncertaintyState,
+  ) {
+    ensure(claim.dispatchGranted === true, outcomeCode);
+    await assertGuardHeld(probe, outcomeCode);
+    const consumedImage = normalizeMeasuredImage(
+      await invokeImageCoordinator(
+        imageReservations,
+        imageConsumeReservationIntrinsic,
+        imageReservation,
+        outcomeCode,
+      ),
+      outcomeCode,
+    );
+    ensure(
+      sameContent(
+        consumedImage,
+        claim.attempt.request.measuredImage,
+        outcomeCode,
+      ),
+      outcomeCode,
+    );
+    await assertGuardHeld(probe, outcomeCode);
+    const callbackReceipt = normalizeLaunchCallbackReceipt(
+      await invokeSupervisor(
+        supervisor.launchWriter,
+        exactFrozenRecord({
+          contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+          attempt: claim.attempt,
+          authorityNow: claim.authorityNow,
+          consumedImage,
+          generation: claim.generation,
+          operation: claim.operation,
+          reservation: claim.reservation,
+          session: claim.session,
+        }),
+        outcomeCode,
+      ),
+      claim.attempt,
+      outcomeCode,
+    );
+    await assertGuardHeld(probe, outcomeCode);
+
+    if (callbackReceipt.evidence.status !== "started") {
+      return finalizeWithReadback(
+        claim,
+        callbackReceipt.evidence,
+        "finalizeWriterLaunchAttemptStopped",
+        uncertaintyState,
+      );
+    }
+    registerStartedWriter(claim, callbackReceipt);
+    await assertGuardHeld(probe, outcomeCode);
+    return finalizeWithReadback(
+      claim,
+      callbackReceipt.evidence,
+      "finalizeWriterLaunchAttemptStarted",
+      uncertaintyState,
+    );
+  }
+
   async function reconcileWithinGuard(
     launchAttemptId,
     probe,
@@ -2374,6 +2636,74 @@ export function createPostgresLogicalWriterLauncher(...args) {
     );
   }
 
+  async function reconcilePreparedClaimAmbiguity(
+    launchAttemptId,
+    probe,
+    uncertaintyState,
+    expectedRequest,
+  ) {
+    const read = await readAttempt(launchAttemptId);
+    ensure(
+      sameContent(read.attempt.request, expectedRequest, optionCode),
+      optionCode,
+    );
+    if (read.operation.state === "prepared") {
+      validatePreparedAuthorityRelation(read);
+      await assertGuardHeld(probe, admissionCode);
+      fail(admissionCode);
+    }
+    return reconcileWithinGuard(
+      launchAttemptId,
+      probe,
+      uncertaintyState,
+      expectedRequest,
+    );
+  }
+
+  async function prepareLaunchIntentInternal(...prepareArgs) {
+    ensure(prepareArgs.length === 1, optionCode);
+    const input = normalizePrepareInput(prepareArgs[0], optionCode);
+    try {
+      return await invokeGuard(
+        operationGuard,
+        [
+          input.launchAttemptId,
+          async (probeValue) => {
+            const probe = normalizeProbe(probeValue, admissionCode);
+            await assertGuardHeld(probe, admissionCode);
+            const measuredImage = await revalidateImageReservation(
+              input.imageReservation,
+              admissionCode,
+            );
+            await assertGuardHeld(probe, admissionCode);
+            ensureMeasuredImageMatchesSession(
+              measuredImage,
+              input.expectedSession,
+              optionCode,
+            );
+            return exactFrozenRecord({
+              launchAttemptId: input.launchAttemptId,
+              measuredImage,
+              supervisor: exactFrozenRecord({
+                contractVersion: supervisor.contractVersion,
+                supervisorId: supervisor.supervisorId,
+              }),
+            });
+          },
+        ],
+        admissionCode,
+      );
+    } catch (error) {
+      if (
+        isInternalError(error, optionCode) ||
+        isInternalError(error, admissionCode)
+      ) {
+        throw error;
+      }
+      fail(admissionCode);
+    }
+  }
+
   async function runLaunchInternal(...runArgs) {
     ensure(runArgs.length === 1, optionCode);
     const input = normalizeRunInput(runArgs[0], optionCode);
@@ -2398,20 +2728,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
               ),
               admissionCode,
             );
-            let measuredImage;
-            try {
-              measuredImage = normalizeMeasuredImage(
-                await invokeImageCoordinator(
-                  imageReservations,
-                  imageRevalidateReservationIntrinsic,
-                  input.imageReservation,
-                  admissionCode,
-                ),
-                admissionCode,
-              );
-            } catch {
-              fail(admissionCode);
-            }
+            const measuredImage = await revalidateImageReservation(
+              input.imageReservation,
+              admissionCode,
+            );
             let typedRequest;
             try {
               typedRequest = createWriterLaunchAttemptOperationRequest({
@@ -2501,60 +2821,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
             }
             dispatchDefinitelyBegan = true;
             dispatchOperation = claim.operation;
-
-            await assertGuardHeld(probe, outcomeCode);
-            const consumedImage = normalizeMeasuredImage(
-              await invokeImageCoordinator(
-                imageReservations,
-                imageConsumeReservationIntrinsic,
-                input.imageReservation,
-                outcomeCode,
-              ),
-              outcomeCode,
-            );
-            ensure(
-              sameContent(
-                consumedImage,
-                claim.attempt.request.measuredImage,
-                outcomeCode,
-              ),
-              outcomeCode,
-            );
-            await assertGuardHeld(probe, outcomeCode);
-            const callbackReceipt = normalizeLaunchCallbackReceipt(
-              await invokeSupervisor(
-                supervisor.launchWriter,
-                exactFrozenRecord({
-                  contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
-                  attempt: claim.attempt,
-                  authorityNow: claim.authorityNow,
-                  consumedImage,
-                  generation: claim.generation,
-                  operation: claim.operation,
-                  reservation: claim.reservation,
-                  session: claim.session,
-                }),
-                outcomeCode,
-              ),
-              claim.attempt,
-              outcomeCode,
-            );
-            await assertGuardHeld(probe, outcomeCode);
-
-            if (callbackReceipt.evidence.status !== "started") {
-              return finalizeWithReadback(
-                claim,
-                callbackReceipt.evidence,
-                "finalizeWriterLaunchAttemptStopped",
-                uncertaintyState,
-              );
-            }
-            registerStartedWriter(claim, callbackReceipt);
-            await assertGuardHeld(probe, outcomeCode);
-            return finalizeWithReadback(
+            return dispatchGrantedLaunch(
               claim,
-              callbackReceipt.evidence,
-              "finalizeWriterLaunchAttemptStarted",
+              input.imageReservation,
+              probe,
               uncertaintyState,
             );
           },
@@ -2570,6 +2840,110 @@ export function createPostgresLogicalWriterLauncher(...args) {
         throw error;
       }
       if (!durableReservationMayExist) fail(admissionCode);
+      if (dispatchDefinitelyBegan && dispatchOperation !== null) {
+        await bestEffortMarkUncertain(dispatchOperation, uncertaintyState);
+      }
+      fail(outcomeCode);
+    }
+  }
+
+  async function runPreparedLaunchInternal(...runArgs) {
+    ensure(runArgs.length === 1, optionCode);
+    const input = normalizePreparedRunInput(runArgs[0], optionCode);
+    const uncertaintyState = { attempted: false };
+    let dispatchDefinitelyBegan = false;
+    let dispatchOperation = null;
+
+    try {
+      return await invokeGuard(
+        operationGuard,
+        [
+          input.launchAttemptId,
+          async (probeValue) => {
+            const probe = normalizeProbe(probeValue, outcomeCode);
+            const read = await readAttempt(input.launchAttemptId);
+            if (read.operation.state === "committed") {
+              return terminalResultFromRead(read);
+            }
+            validateFacadeSupervisor(read.attempt.request, optionCode);
+            if (
+              read.operation.state === "starting" ||
+              read.operation.state === "uncertain"
+            ) {
+              return reconcileWithinGuard(
+                input.launchAttemptId,
+                probe,
+                uncertaintyState,
+                read.attempt.request,
+              );
+            }
+
+            validatePreparedAuthorityRelation(read);
+            await assertGuardHeld(probe, outcomeCode);
+            const measuredImage = await revalidateImageReservation(
+              input.imageReservation,
+              admissionCode,
+            );
+            await assertGuardHeld(probe, outcomeCode);
+            ensure(
+              sameContent(
+                measuredImage,
+                read.attempt.request.measuredImage,
+                optionCode,
+              ),
+              optionCode,
+            );
+
+            let claim;
+            try {
+              claim = normalizeClaimReceipt(
+                await invokeAsync(
+                  authority,
+                  "claimWriterLaunchAttemptDispatch",
+                  [transitionInput(read.operation)],
+                  outcomeCode,
+                ),
+                input.launchAttemptId,
+                read.attempt.request,
+                null,
+                outcomeCode,
+              );
+            } catch {
+              return reconcilePreparedClaimAmbiguity(
+                input.launchAttemptId,
+                probe,
+                uncertaintyState,
+                read.attempt.request,
+              );
+            }
+            if (!claim.dispatchGranted) {
+              return reconcilePreparedClaimAmbiguity(
+                input.launchAttemptId,
+                probe,
+                uncertaintyState,
+                read.attempt.request,
+              );
+            }
+            dispatchDefinitelyBegan = true;
+            dispatchOperation = claim.operation;
+            return dispatchGrantedLaunch(
+              claim,
+              input.imageReservation,
+              probe,
+              uncertaintyState,
+            );
+          },
+        ],
+        outcomeCode,
+      );
+    } catch (error) {
+      if (
+        isInternalError(error, optionCode) ||
+        isInternalError(error, "logical_writer_handle_unavailable") ||
+        isInternalError(error, admissionCode)
+      ) {
+        throw error;
+      }
       if (dispatchDefinitelyBegan && dispatchOperation !== null) {
         await bestEffortMarkUncertain(dispatchOperation, uncertaintyState);
       }
@@ -2683,21 +3057,31 @@ export function createPostgresLogicalWriterLauncher(...args) {
     }
   }
 
-  const runLaunch = function runLaunch(...runArgs) {
-    return protectPromise(runLaunchInternal(...runArgs));
+  const prepareLaunchIntent = function prepareLaunchIntent(...prepareArgs) {
+    return protectPromise(prepareLaunchIntentInternal(...prepareArgs));
   };
   const reconcileLaunchAttempt = function reconcileLaunchAttempt(
     ...reconcileArgs
   ) {
     return protectPromise(reconcileLaunchAttemptInternal(...reconcileArgs));
   };
-  objectFreeze(runLaunch);
+  const runLaunch = function runLaunch(...runArgs) {
+    return protectPromise(runLaunchInternal(...runArgs));
+  };
+  const runPreparedLaunch = function runPreparedLaunch(...runArgs) {
+    return protectPromise(runPreparedLaunchInternal(...runArgs));
+  };
+  objectFreeze(prepareLaunchIntent);
   objectFreeze(reconcileLaunchAttempt);
   objectFreeze(resolveStoppedWriter);
+  objectFreeze(runLaunch);
+  objectFreeze(runPreparedLaunch);
   return exactFrozenRecord({
+    prepareLaunchIntent,
     reconcileLaunchAttempt,
     resolveStoppedWriter,
     runLaunch,
+    runPreparedLaunch,
   });
 }
 

@@ -16,6 +16,7 @@ import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
+  createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
   PostgresSessionAuthority,
@@ -1936,10 +1937,48 @@ function restoreCurrentWriterFixture({
   };
 }
 
+function restoreCurrentWriterAtRevision(writer, revision) {
+  const targetRevision = BigInt(revision);
+  const writerExpectedRevision = targetRevision - 3n;
+  const anchorExpectedRevision = writerExpectedRevision - 2n;
+  assert.ok(anchorExpectedRevision >= 0n);
+  const expectedSession = structuredClone(writer.options.expectedSession);
+  expectedSession.revision = writerExpectedRevision.toString();
+  expectedSession.document.lastOperation.expectedSessionRevision =
+    anchorExpectedRevision.toString();
+  const options = {
+    ...writer.options,
+    expectedSession,
+  };
+  const session = writerAttachedSessionRow({
+    options,
+    lease: writer.lease,
+    result: writer.result,
+  });
+  return {
+    ...writer,
+    committedOperation: writerCommittedOperationRow({
+      options,
+      lease: writer.lease,
+      result: writer.result,
+    }),
+    expectedSession: snapshotFromSessionRow(session),
+    options,
+    releasedReservation: reservationRow("released", {
+      options,
+      updatedAt: FINAL,
+      releasedAt: FINAL,
+    }),
+    session,
+  };
+}
+
 function restoreGenerationFixture({
   destinationStorageId = "volume-001",
   destinationIsolationProofId = DESTINATION_ISOLATION_PROOF_ID,
+  expectedSessionRevision = null,
   generationId = RESTORE_GENERATION_ID,
+  launchAttemptId = null,
   operationId = RESTORE_OPERATION_ID,
   sessionId = SESSION_ID,
   suffix = sessionId.slice(-3),
@@ -1970,12 +2009,18 @@ function restoreGenerationFixture({
         ? OPERATION_ID
         : `checkpoint-source-writer-${suffix}`,
   });
-  const writer = restoreCurrentWriterFixture({
+  let writer = restoreCurrentWriterFixture({
     checkpoint: source.checkpoint,
     sessionId,
     storageId: destinationStorageId,
     suffix,
   });
+  if (expectedSessionRevision !== null) {
+    writer = restoreCurrentWriterAtRevision(
+      writer,
+      expectedSessionRevision,
+    );
+  }
   const mutationRequest = {
     backendId: writer.expectedSession.document.storageRef.backendId,
     contractVersion: 1,
@@ -1996,10 +2041,28 @@ function restoreGenerationFixture({
     checkpoint: structuredClone(source.checkpoint),
     request: mutationRequest,
   };
-  const request = createRestoreDestinationGenerationOperationRequest({
-    admission,
-    expectedSession: writer.expectedSession,
-  });
+  const launchIntent =
+    launchAttemptId === null
+      ? null
+      : {
+          launchAttemptId,
+          measuredImage: writerLaunchMeasuredImage(writer.expectedSession),
+          supervisor: {
+            contractVersion: 1,
+            supervisorId: SUPERVISOR_ID,
+          },
+        };
+  const request =
+    launchIntent === null
+      ? createRestoreDestinationGenerationOperationRequest({
+          admission,
+          expectedSession: writer.expectedSession,
+        })
+      : createRestoreDestinationGenerationOperationRequestV2({
+          admission,
+          expectedSession: writer.expectedSession,
+          launchIntent,
+        });
   const options = {
     expectedSession: writer.expectedSession,
     kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
@@ -2010,6 +2073,7 @@ function restoreGenerationFixture({
     admission,
     destinationIsolationProofId,
     generationId,
+    launchIntent,
     mutationRequest,
     options,
     request,
@@ -2419,6 +2483,44 @@ function writerLaunchFixture({
   };
 }
 
+function restoreLaunchHandoffFixture({
+  expectedSessionRevision = null,
+  launchOperationId = LAUNCH_ATTEMPT_OPERATION_ID,
+  restoreOperationId = RESTORE_OPERATION_ID,
+} = {}) {
+  const restore = restoreGenerationFixture({
+    expectedSessionRevision,
+    launchAttemptId: launchOperationId,
+    operationId: restoreOperationId,
+  });
+  const expectedSession = snapshotFromSessionRow(
+    restoreGenerationCommittedSessionRow(restore, {
+      operationRevision: "2",
+    }),
+  );
+  const generation = writerLaunchGenerationSnapshot(restore);
+  const request = createWriterLaunchAttemptOperationRequest({
+    expectedSession,
+    generation,
+    measuredImage: restore.launchIntent.measuredImage,
+    supervisor: restore.launchIntent.supervisor,
+  });
+  const options = {
+    expectedSession,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    operationId: launchOperationId,
+    request,
+  };
+  return {
+    generation,
+    measuredImage: restore.launchIntent.measuredImage,
+    options,
+    request,
+    restore,
+    supervisor: restore.launchIntent.supervisor,
+  };
+}
+
 function writerLaunchEvidence(fixture, status = "started", overrides = {}) {
   return {
     contractVersion: 1,
@@ -2530,15 +2632,20 @@ function writerLaunchReservationRow(
   });
 }
 
-function writerLaunchPhaseSessionRow(fixture, state) {
+function writerLaunchPhaseSessionRow(
+  fixture,
+  state,
+  { updatedAt: suppliedUpdatedAt } = {},
+) {
   const operationRevision =
     state === "prepared" ? "0" : state === "starting" ? "1" : "2";
   const updatedAt =
-    state === "prepared"
+    suppliedUpdatedAt ??
+    (state === "prepared"
       ? LAUNCH_PREPARED_NOW
       : state === "starting"
         ? LAUNCH_DISPATCH_NOW
-        : LAUNCH_UNCERTAIN_NOW;
+        : LAUNCH_UNCERTAIN_NOW);
   return sessionRow({
     sessionId: fixture.options.expectedSession.sessionId,
     revision: (
@@ -2557,6 +2664,76 @@ function writerLaunchPhaseSessionRow(fixture, state) {
     createdAt: fixture.options.expectedSession.createdAt,
     updatedAt,
   });
+}
+
+function restoreLaunchHandoffActiveSteps(fixture) {
+  return [
+    rows(
+      writerLaunchPhaseSessionRow(fixture, "prepared", {
+        updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
+    rows(
+      writerLaunchOperationRow(fixture, "prepared", {
+        createdAt: RESTORE_FINALIZE_NOW,
+        updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
+    rows(
+      writerLaunchReservationRow(fixture, "prepared", {
+        createdAt: RESTORE_FINALIZE_NOW,
+        updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
+    rows(
+      restoreGenerationOperationRow(fixture.restore, "committed", {
+        revision: "2",
+      }),
+    ),
+    rows(restoreGenerationReservationRow(fixture.restore, "released")),
+    rows(restoreGenerationRow(fixture.restore, "committed")),
+    ...restoreCheckpointSourceSteps(fixture.restore),
+  ];
+}
+
+function restoreLaunchHandoffWriteSteps(
+  fixture,
+  { finalSession = undefined } = {},
+) {
+  const restore = fixture.restore;
+  return [
+    rows(restoreGenerationRow(restore, "committed")),
+    rows(
+      restoreGenerationOperationRow(restore, "committed", {
+        revision: "2",
+      }),
+    ),
+    rows(restoreGenerationReservationRow(restore, "released")),
+    rows(
+      restoreGenerationCommittedSessionRow(restore, {
+        operationRevision: "2",
+      }),
+    ),
+    rows(
+      writerLaunchOperationRow(fixture, "prepared", {
+        createdAt: RESTORE_FINALIZE_NOW,
+        updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
+    rows(
+      writerLaunchReservationRow(fixture, "prepared", {
+        createdAt: RESTORE_FINALIZE_NOW,
+        updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    ),
+    finalSession === undefined
+      ? rows(
+          writerLaunchPhaseSessionRow(fixture, "prepared", {
+            updatedAt: RESTORE_FINALIZE_NOW,
+          }),
+        )
+      : finalSession,
+  ];
 }
 
 function writerLaunchCommittedSessionRow(
@@ -10067,6 +10244,58 @@ test("restore generation request builder owns the exact canonical admission and 
   }
 });
 
+test("restore generation v2 request durably binds an exact launch intent without an opaque image reservation", () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const replay = createRestoreDestinationGenerationOperationRequestV2({
+    admission: fixture.admission,
+    expectedSession: fixture.options.expectedSession,
+    launchIntent: fixture.launchIntent,
+  });
+
+  assert.equal(replay.contractVersion, 2);
+  assert.deepEqual(replay, fixture.request);
+  assert.deepEqual(replay.launchIntent, canonicalPayload(fixture.launchIntent));
+  assert.deepEqual(Reflect.ownKeys(replay.launchIntent), [
+    "launchAttemptId",
+    "measuredImage",
+    "supervisor",
+  ]);
+  assert.equal("imageReservation" in replay.launchIntent, false);
+  assertDeepFrozen(replay);
+
+  for (const launchIntent of [
+    { ...fixture.launchIntent, imageReservation: "opaque-capability" },
+    {
+      ...fixture.launchIntent,
+      launchAttemptId: fixture.options.operationId,
+    },
+    {
+      ...fixture.launchIntent,
+      measuredImage: {
+        ...fixture.launchIntent.measuredImage,
+        runtimeIdentity: {
+          ...fixture.launchIntent.measuredImage.runtimeIdentity,
+          platformImageDigest: `sha256:${"f".repeat(64)}`,
+        },
+      },
+    },
+  ]) {
+    assert.throws(
+      () =>
+        createRestoreDestinationGenerationOperationRequestV2({
+          admission: fixture.admission,
+          expectedSession: fixture.options.expectedSession,
+          launchIntent,
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+});
+
 test("restore generation claim accepts an exact checkpoint from replacement destination storage", async () => {
   const fixture = restoreGenerationFixture({
     destinationStorageId: "volume-restore-002",
@@ -10443,6 +10672,349 @@ test("restore generation dispatch grants once, starting finalization commits onc
     ],
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation finalization atomically reserves one launch with the real terminal expected session", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const writeSteps = restoreLaunchHandoffWriteSteps(fixture);
+  writeSteps[4] = (args) => {
+    assert.equal(queryText(args), INSERT_OPERATION_QUERY);
+    const envelope = JSON.parse(args[0].values[3]);
+    assert.deepEqual(
+      envelope.expectedSession,
+      snapshotFromSessionRow(
+        restoreGenerationCommittedSessionRow(restore, {
+          operationRevision: "2",
+        }),
+      ),
+    );
+    assert.equal(
+      JSON.stringify(envelope.payload),
+      JSON.stringify(canonicalPayload(fixture.request)),
+    );
+    return rows(
+      writerLaunchOperationRow(fixture, "prepared", {
+        createdAt: RESTORE_FINALIZE_NOW,
+        updatedAt: RESTORE_FINALIZE_NOW,
+      }),
+    );
+  };
+  const { authority, clients } = authorityWithScripts({
+    options: { now: RESTORE_FINALIZE_NOW },
+    steps: [
+      ...restoreGenerationActiveSteps(restore, "starting"),
+      ...writeSteps,
+    ],
+  });
+
+  const receipt =
+    await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    );
+
+  const startingSession = snapshotFromSessionRow(
+    restoreGenerationPhaseSessionRow(restore, "starting"),
+  );
+  const terminalSession = snapshotFromSessionRow(
+    restoreGenerationCommittedSessionRow(restore, {
+      operationRevision: "2",
+    }),
+  );
+  assert.equal(receipt.status, "prepared");
+  assert.equal(receipt.restore.finalized, true);
+  assert.equal(receipt.restore.operation.state, "committed");
+  assert.equal(receipt.launch.operation.state, "prepared");
+  assert.equal(
+    receipt.launch.attempt.launchAttemptId,
+    restore.launchIntent.launchAttemptId,
+  );
+  assert.deepEqual(receipt.launch.attempt.request, fixture.request);
+  assert.deepEqual(receipt.launch.operation.expectedSession, terminalSession);
+  assert.equal(
+    terminalSession.revision,
+    (BigInt(startingSession.revision) + 1n).toString(),
+  );
+  assert.equal(
+    receipt.session.revision,
+    (BigInt(startingSession.revision) + 2n).toString(),
+  );
+  assert.equal(
+    receipt.session.document.activeOperation.operationId,
+    restore.launchIntent.launchAttemptId,
+  );
+  assert.equal(
+    receipt.session.document.lastOperation.operationId,
+    restore.options.operationId,
+  );
+  assert.equal(
+    receipt.launch.attempt.request.generation.bindingSha256,
+    canonicalSha256(receipt.generation.binding),
+  );
+  assert.equal(
+    receipt.launch.attempt.request.generation.documentSha256,
+    canonicalSha256(receipt.generation.document),
+  );
+  assertDeepFrozen(receipt);
+
+  const mutationOrder = authorityQueries(clients[0])
+    .map(queryText)
+    .filter((text) => /^(?:INSERT|UPDATE) /u.test(text));
+  assert.deepEqual(mutationOrder, [
+    COMMIT_RESTORE_GENERATION_QUERY,
+    COMMIT_ACTIVE_OPERATION_QUERY,
+    RELEASE_ACTIVE_RESERVATION_QUERY,
+    UPDATE_SESSION_QUERY,
+    INSERT_OPERATION_QUERY,
+    INSERT_RESERVATION_QUERY,
+    UPDATE_SESSION_QUERY,
+  ]);
+  assert.equal(
+    queryTexts(clients[0]).filter((text) => text === "COMMIT").length,
+    1,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore-to-launch handoff rolls every generation and launch write back together", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const { authority, clients } = authorityWithScripts({
+    options: { now: RESTORE_FINALIZE_NOW },
+    steps: [
+      ...restoreGenerationActiveSteps(restore, "starting"),
+      ...restoreLaunchHandoffWriteSteps(fixture, {
+        finalSession: rows(),
+      }),
+    ],
+  });
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "session_revision_conflict" },
+  );
+
+  const texts = queryTexts(clients[0]);
+  assert.equal(texts.includes(INSERT_OPERATION_QUERY), true);
+  assert.equal(texts.includes(INSERT_RESERVATION_QUERY), true);
+  assert.equal(texts.includes("COMMIT"), false);
+  assert.equal(texts.includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore-to-launch handoff acknowledgement loss replays the same prepared attempt without writes", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const committedSteps = restoreLaunchHandoffActiveSteps(fixture);
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("restore launch handoff acknowledgement lost"),
+        now: RESTORE_FINALIZE_NOW,
+      },
+      steps: [
+        ...restoreGenerationActiveSteps(restore, "starting"),
+        ...restoreLaunchHandoffWriteSteps(fixture),
+      ],
+    },
+    [
+      ...committedSteps,
+      ...committedSteps.slice(1),
+    ],
+  );
+  const input = {
+    launch: restore.launchIntent,
+    restore: {
+      ...restore.options,
+      completion: restore.completion,
+      expectedOperationRevision: "1",
+    },
+  };
+
+  await assert.rejects(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      input,
+    ),
+    assertStoreCommitUncertain,
+  );
+  const replay =
+    await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      input,
+    );
+
+  assert.equal(replay.restore.finalized, false);
+  assert.equal(replay.status, "prepared");
+  assert.equal(
+    replay.launch.operation.operationId,
+    restore.launchIntent.launchAttemptId,
+  );
+  assert.deepEqual(replay.launch.operation.request, fixture.request);
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).at(-1), "ROLLBACK");
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+});
+
+test("restore-to-launch committed replay rejects completion drift without touching the prepared launch", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const conflictingCompletion = {
+    ...restore.completion,
+    materialization: {
+      ...restore.completion.materialization,
+      treeIdentityDigest: "f".repeat(64),
+    },
+    replayed: true,
+  };
+  const { authority, clients } = authorityWithScripts(
+    restoreLaunchHandoffActiveSteps(fixture),
+  );
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: conflictingCompletion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "operation_result_conflict" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore-to-launch handoff never backfills a separately committed generation", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const committedSteps = restoreGenerationCommittedSteps(restore, {
+    operationRevision: "2",
+  });
+  const { authority, clients } = authorityWithScripts([
+    ...committedSteps,
+    ...committedSteps.slice(1),
+    rows(),
+  ]);
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "operation_transition_conflict" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore-to-launch handoff reserves three revisions before its first write", async () => {
+  const fixture = restoreLaunchHandoffFixture({
+    expectedSessionRevision: "9223372036854775803",
+  });
+  const restore = fixture.restore;
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationActiveSteps(restore, "starting"),
+  );
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "session_revision_exhausted" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore-to-launch handoff rejects active session revision drift before its first write", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const driftedSession = restoreGenerationPhaseSessionRow(
+    restore,
+    "starting",
+  );
+  driftedSession.revision = (BigInt(driftedSession.revision) + 1n).toString();
+  const { authority, clients } = authorityWithScripts([
+    rows(driftedSession),
+  ]);
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "session_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
 });
 
 test("restore generation finalization rejects materialization bound to another generation", async () => {
@@ -10931,6 +11503,137 @@ test("restore generation recovery pagination returns exact frozen authorized can
     extendedQuery(LIST_RESTORE_GENERATION_RECOVERY_FIRST_PAGE_QUERY, [2]),
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation v2 recovery returns the exact durable launch intent", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(restoreGenerationOperationRow(fixture, "starting")),
+    ...restoreGenerationActiveSteps(fixture, "starting"),
+  ]);
+
+  const page =
+    await authority.listRestoreDestinationGenerationRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+    });
+
+  assert.deepEqual(page, {
+    candidates: [
+      {
+        checkpoint: fixture.request.admission.checkpoint,
+        generationId: fixture.generationId,
+        launchIntent: canonicalPayload(fixture.launchIntent),
+        request: fixture.request.admission.request,
+      },
+    ],
+    nextAfterSessionId: null,
+  });
+  assertDeepFrozen(page);
+  clients[0].assertExhausted();
+});
+
+test("restore launch intent mismatch and durable tampering fail closed", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const mismatched = {
+    ...fixture.launchIntent,
+    launchAttemptId: "writer-launch-attempt-mismatched",
+  };
+  const noDatabase = authorityWithScripts();
+
+  await assertAuthorityError(
+    noDatabase.authority
+      .finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt({
+        launch: mismatched,
+        restore: {
+          ...fixture.options,
+          completion: fixture.completion,
+          expectedOperationRevision: "1",
+        },
+      }),
+    { code: "invalid_operation_request" },
+  );
+  assert.equal(noDatabase.pool.connectCalls, 0);
+
+  const tamperedOperation = restoreGenerationOperationRow(
+    fixture,
+    "starting",
+  );
+  tamperedOperation.request.payload.launchIntent.supervisor.supervisorId =
+    "supervisor-tampered";
+  const activeSteps = restoreGenerationActiveSteps(fixture, "starting");
+  activeSteps[1] = rows(tamperedOperation);
+  const { authority, clients } = authorityWithScripts([
+    rows(tamperedOperation),
+    ...activeSteps.slice(0, 3),
+  ]);
+
+  await assertAuthorityError(
+    authority.listRestoreDestinationGenerationRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+    }),
+    { code: "operation_state_invalid" },
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("historical restore generation v1 has no launch intent and cannot use atomic handoff", async () => {
+  const fixture = restoreGenerationFixture();
+  const { authority, pool } = authorityWithScripts();
+
+  assert.equal(fixture.request.contractVersion, 1);
+  assert.equal("launchIntent" in fixture.request, false);
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: {
+          launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+          measuredImage: writerLaunchMeasuredImage(
+            fixture.options.expectedSession,
+          ),
+          supervisor: {
+            contractVersion: 1,
+            supervisorId: SUPERVISOR_ID,
+          },
+        },
+        restore: {
+          ...fixture.options,
+          completion: fixture.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "invalid_operation_request" },
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("restore generation v2 cannot bypass atomic handoff through standalone finalization", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const { authority, pool } = authorityWithScripts();
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGeneration({
+      ...fixture.options,
+      completion: fixture.completion,
+      expectedOperationRevision: "1",
+    }),
+    { code: "invalid_operation_request" },
+  );
+  assert.equal(pool.connectCalls, 0);
 });
 
 test("restore generation typed APIs reject non-exact contracts before PostgreSQL", async () => {

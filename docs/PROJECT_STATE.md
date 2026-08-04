@@ -174,13 +174,20 @@
   is never attached to the old receipt. Bounded keyset discovery returns
   prepared or active launch attempts and relationally validated current
   launches without reconstructing process-local authority.
+- Restore-generation request version 2 durably records the exact measured
+  image, supervisor, and launch-attempt identity before publication begins.
+  One serializable authority transition commits the generation, retires the
+  restore operation, creates the exact prepared launch operation and
+  reservation, and advances the canonical session twice. The launcher can
+  prepare the process-local image capability before publication and later
+  claim only that pre-reserved attempt, so a crash cannot leave a newly
+  committed generation without discoverable launch work.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until the next serial pull request binds exact generation publication to the
-  launcher and no-relaunch recovery, routes the coordinator stop through the
-  durable stop transition, adds the recovery service, and wires the complete
-  protocol into `runRestore()`. No published path, generation row, serialized
-  measurement, attempt record, or discovery result is writer-launch authority
-  by itself.
+  until later serial pull requests verify committed generation publication,
+  route coordinator stop through the durable transition, add bounded
+  no-relaunch recovery, and wire the complete protocol into `runRestore()`.
+  No published path, generation row, serialized measurement, attempt record,
+  or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -233,6 +240,8 @@
   `docs/project_journal/2026/08/2026-08-04-durable-launch-attempt-lifecycle-6e2f8b.md`
 - Logical writer launcher foundation:
   `docs/project_journal/2026/08/2026-08-04-logical-writer-launcher-foundation-b6d3e1.md`
+- Atomic restore-to-launch handoff:
+  `docs/project_journal/2026/08/2026-08-04-restore-launch-handoff-5a7c2e.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
