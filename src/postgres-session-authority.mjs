@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, parse, resolve } from "node:path";
+import { isAbsolute, parse, posix as posixPath, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
 import {
   PostgresSerializableStore,
 } from "./postgres-serializable-store.mjs";
+import {
+  MAX_IMAGE_CONFIG_BYTES,
+  MAX_PLATFORM_MANIFEST_BYTES,
+} from "./platform-image-reservation.mjs";
 import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
@@ -21,7 +25,7 @@ import {
   STORAGE_CONTRACT_VERSION,
 } from "./session-storage-contracts.mjs";
 
-export const SESSION_AUTHORITY_DOCUMENT_VERSION = 2;
+export const SESSION_AUTHORITY_DOCUMENT_VERSION = 3;
 export const SESSION_OPERATION_CONFLICT_CLASS = "session-mutation";
 export const WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND =
   "writer-attachment-acquire-v1";
@@ -31,6 +35,8 @@ export const WRITER_FORCE_FENCE_OPERATION_KIND = "writer-force-fence-v1";
 export const CHECKPOINT_CAPTURE_OPERATION_KIND = "checkpoint-capture-v1";
 export const RESTORE_DESTINATION_GENERATION_OPERATION_KIND =
   "restore-destination-generation-v1";
+export const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND =
+  "writer-launch-attempt-v1";
 export const MAX_WRITER_LEASE_DURATION_MILLISECONDS = 86_400_000;
 
 const UUID_PATTERN =
@@ -39,6 +45,7 @@ const REVISION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const PERSISTENT_OBJECT_ID_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const OCI_SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const WRITER_EPOCH_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/u;
 const SENSITIVE_OPERATION_KEY_PATTERN =
   /(?:api[_-]?key|auth(?:json|orization)?|cookie|credential|password|private.?key|secret|token)/iu;
@@ -62,7 +69,11 @@ const RESTORE_DESTINATION_MATERIALIZATION_CONTRACT_VERSION = 3;
 const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_BINDING_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
+const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
+const WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION = 1;
+const WRITER_LAUNCH_POINTER_CONTRACT_VERSION = 1;
 const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
+const PREVIOUS_SESSION_AUTHORITY_DOCUMENT_VERSION = 2;
 const LEGACY_DOCUMENT_KEYS = Object.freeze([
   "activeOperation",
   "attachment",
@@ -322,6 +333,102 @@ const RESTORE_GENERATION_TERMINAL_RESULT_KEYS = Object.freeze([
   "outcome",
   "resultVersion",
 ]);
+const WRITER_LAUNCH_ATTEMPT_OPERATION_REQUEST_KEYS = Object.freeze([
+  "attachment",
+  "contractVersion",
+  "fencingEpoch",
+  "generation",
+  "lease",
+  "measuredImage",
+  "supervisor",
+]);
+const WRITER_LAUNCH_GENERATION_KEYS = Object.freeze([
+  "bindingSha256",
+  "checkpointId",
+  "claimedAt",
+  "committedAt",
+  "documentSha256",
+  "generationId",
+  "operationId",
+  "sessionId",
+  "state",
+]);
+const WRITER_LAUNCH_MEASURED_IMAGE_KEYS = Object.freeze([
+  "projection",
+  "runtimeIdentity",
+]);
+const WRITER_LAUNCH_IMAGE_PROJECTION_KEYS = Object.freeze([
+  "codexSandbox",
+  "codexVersion",
+  "platformImage",
+]);
+const WRITER_LAUNCH_PLATFORM_IMAGE_KEYS = Object.freeze([
+  "architecture",
+  "config",
+  "digest",
+  "mediaType",
+  "os",
+  "size",
+]);
+const WRITER_LAUNCH_IMAGE_CONFIG_KEYS = Object.freeze([
+  "digest",
+  "mediaType",
+  "size",
+]);
+const WRITER_LAUNCH_RUNTIME_IDENTITY_KEYS = Object.freeze([
+  "codexBinaryPath",
+  "codexBinarySha256",
+  "codexVersion",
+  "platformImageDigest",
+]);
+const WRITER_LAUNCH_SUPERVISOR_KEYS = Object.freeze([
+  "contractVersion",
+  "supervisorId",
+]);
+const WRITER_LAUNCH_EVIDENCE_KEYS = Object.freeze([
+  "contractVersion",
+  "launchAttemptId",
+  "processIncarnationId",
+  "proofId",
+  "status",
+  "supervisorId",
+  "writerIncarnationId",
+]);
+const WRITER_LAUNCH_FINALIZATION_INPUT_KEYS = Object.freeze([
+  "evidence",
+  "expectedOperationRevision",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+]);
+const WRITER_LAUNCH_TERMINAL_RESULT_KEYS = Object.freeze([
+  "evidence",
+  "outcome",
+  "resultVersion",
+]);
+const WRITER_LAUNCH_POINTER_KEYS = Object.freeze([
+  "attachmentId",
+  "attachmentSha256",
+  "contractVersion",
+  "fencingEpoch",
+  "generation",
+  "launchAttemptId",
+  "launchResultSha256",
+  "leaseId",
+  "leaseSha256",
+  "measuredImageSha256",
+  "processIncarnationId",
+  "startedAt",
+  "supervisorId",
+  "supervisorProofId",
+  "writerIncarnationId",
+]);
+const WRITER_LAUNCH_READ_KEYS = Object.freeze(["operationId"]);
+const WRITER_LAUNCH_RECOVERY_LIST_KEYS = Object.freeze([
+  "afterSessionId",
+  "limit",
+]);
 const WRITER_ATTACHMENT_REQUEST_KEYS = Object.freeze([
   "contractVersion",
   "holderId",
@@ -401,6 +508,17 @@ const RESTORE_GENERATION_ROW_KEYS = Object.freeze([
   "generation_id",
   "operation_id",
   "session_id",
+  "state",
+]);
+const RESTORE_GENERATION_SNAPSHOT_KEYS = Object.freeze([
+  "binding",
+  "checkpointId",
+  "claimedAt",
+  "committedAt",
+  "document",
+  "generationId",
+  "operationId",
+  "sessionId",
   "state",
 ]);
 const CANCELLATION_RESULT_KEYS = Object.freeze([
@@ -521,6 +639,8 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore destination generation identity is already bound to a different operation",
   restore_generation_not_authorized:
     "Restore destination generation is not actively authorized",
+  writer_launch_attempt_not_authorized:
+    "Writer launch attempt is not actively authorized",
   session_identity_conflict:
     "Session ID is already bound to a different canonical document",
   session_not_found: "Session is not registered",
@@ -573,6 +693,8 @@ const objectSetPrototypeOf = Object.setPrototypeOf;
 const pathIsAbsoluteIntrinsic = isAbsolute;
 const pathParseIntrinsic = parse;
 const pathResolveIntrinsic = resolve;
+const posixPathIsAbsoluteIntrinsic = posixPath.isAbsolute;
+const posixPathNormalizeIntrinsic = posixPath.normalize;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -694,6 +816,31 @@ const LIST_RESTORE_GENERATION_RECOVERY_AFTER_QUERY = Object.freeze({
     `SELECT ${OPERATION_RETURNING_COLUMNS}`,
     "FROM session_authority.operation_claims",
     "WHERE kind = 'restore-destination-generation-v1'",
+    "AND state IN ('starting', 'uncertain')",
+    "AND retired_at IS NULL",
+    "AND session_id > $1::uuid",
+    "ORDER BY session_id ASC",
+    "LIMIT $2::integer",
+  ].join(" "),
+});
+const LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${OPERATION_RETURNING_COLUMNS}`,
+    "FROM session_authority.operation_claims",
+    "WHERE kind = 'writer-launch-attempt-v1'",
+    "AND state IN ('starting', 'uncertain')",
+    "AND retired_at IS NULL",
+    "ORDER BY session_id ASC",
+    "LIMIT $1::integer",
+  ].join(" "),
+});
+const LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${OPERATION_RETURNING_COLUMNS}`,
+    "FROM session_authority.operation_claims",
+    "WHERE kind = 'writer-launch-attempt-v1'",
     "AND state IN ('starting', 'uncertain')",
     "AND retired_at IS NULL",
     "AND session_id > $1::uuid",
@@ -986,6 +1133,10 @@ const READ_RESTORE_GENERATION_BY_ID_QUERY = Object.freeze({
     "FROM session_authority.restore_destination_generations",
     "WHERE generation_id = $1",
   ].join(" "),
+});
+const READ_RESTORE_GENERATION_BY_ID_FOR_UPDATE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: `${READ_RESTORE_GENERATION_BY_ID_QUERY.text} FOR UPDATE`,
 });
 const INSERT_RESTORE_GENERATION_QUERY = Object.freeze({
   queryMode: "extended",
@@ -1591,6 +1742,65 @@ function canonicalLastOperation(value, code) {
   });
 }
 
+function canonicalWriterLaunchPointer(value, sessionId, code) {
+  const launch = exactPlainObject(value, WRITER_LAUNCH_POINTER_KEYS, code);
+  const generation = canonicalWriterLaunchGeneration(
+    launch.generation,
+    { sessionId },
+    code,
+  );
+  const startedAt = canonicalTimestampString(launch.startedAt, code);
+  ensure(
+    launch.contractVersion === WRITER_LAUNCH_POINTER_CONTRACT_VERSION &&
+      launch.fencingEpoch ===
+        canonicalWriterEpoch(launch.fencingEpoch, code, true) &&
+      typeof launch.attachmentSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, launch.attachmentSha256) &&
+      typeof launch.launchResultSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, launch.launchResultSha256) &&
+      typeof launch.leaseSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, launch.leaseSha256) &&
+      typeof launch.measuredImageSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, launch.measuredImageSha256) &&
+      timestampMilliseconds(startedAt) >=
+        timestampMilliseconds(generation.committedAt),
+    code,
+  );
+  return deepFreeze({
+    attachmentId: canonicalOpaqueId(launch.attachmentId, 128, code),
+    attachmentSha256: launch.attachmentSha256,
+    contractVersion: WRITER_LAUNCH_POINTER_CONTRACT_VERSION,
+    fencingEpoch: launch.fencingEpoch,
+    generation,
+    launchAttemptId: canonicalOpaqueId(
+      launch.launchAttemptId,
+      128,
+      code,
+    ),
+    launchResultSha256: launch.launchResultSha256,
+    leaseId: canonicalOpaqueId(launch.leaseId, 128, code),
+    leaseSha256: launch.leaseSha256,
+    measuredImageSha256: launch.measuredImageSha256,
+    processIncarnationId: canonicalOpaqueId(
+      launch.processIncarnationId,
+      128,
+      code,
+    ),
+    startedAt,
+    supervisorId: canonicalOpaqueId(launch.supervisorId, 128, code),
+    supervisorProofId: canonicalOpaqueId(
+      launch.supervisorProofId,
+      128,
+      code,
+    ),
+    writerIncarnationId: canonicalOpaqueId(
+      launch.writerIncarnationId,
+      128,
+      code,
+    ),
+  });
+}
+
 function canonicalDocument(value, code) {
   if (
     value === null ||
@@ -1603,6 +1813,7 @@ function canonicalDocument(value, code) {
   const documentVersion = ownDataValue(value, "documentVersion", code);
   ensure(
     documentVersion === LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION ||
+      documentVersion === PREVIOUS_SESSION_AUTHORITY_DOCUMENT_VERSION ||
       documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION,
     code,
   );
@@ -1616,7 +1827,8 @@ function canonicalDocument(value, code) {
   ensure(
     document.documentVersion === documentVersion &&
       document.recovery === null &&
-      document.launch === null,
+      (documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION ||
+        document.launch === null),
     code,
   );
   const lifecycle = canonicalOpaqueId(document.lifecycle, 32, code);
@@ -1642,6 +1854,14 @@ function canonicalDocument(value, code) {
     fail(code);
   }
   ensure(manifest.sessionId === storageRef.sessionId, code);
+  const launch =
+    document.launch === null
+      ? null
+      : canonicalWriterLaunchPointer(
+          document.launch,
+          manifest.sessionId,
+          code,
+        );
   const activeOperation =
     document.activeOperation === null
       ? null
@@ -1656,11 +1876,12 @@ function canonicalDocument(value, code) {
       lifecycle === "DETACHED" &&
         writerEpoch === "0" &&
         lease === null &&
-        attachment === null,
+        attachment === null &&
+        launch === null,
       code,
     );
   } else if (lifecycle === "DETACHED") {
-    ensure(lease === null && attachment === null, code);
+    ensure(lease === null && attachment === null && launch === null, code);
     ensure(
       activeOperation === null ||
         activeOperation.kind !== WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND ||
@@ -1673,6 +1894,7 @@ function canonicalDocument(value, code) {
         attachment === null &&
         lease.sessionId === manifest.sessionId &&
         lease.fencingEpoch === writerEpoch &&
+        launch === null &&
         activeOperation !== null &&
         activeOperation.kind === WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND &&
         (activeOperation.state === "starting" ||
@@ -1700,6 +1922,7 @@ function canonicalDocument(value, code) {
         attachment !== null &&
         lease.sessionId === manifest.sessionId &&
         lease.fencingEpoch === writerEpoch &&
+        launch === null &&
         activeOperation !== null &&
         activeOperation.kind === WRITER_RELEASE_OPERATION_KIND &&
         (activeOperation.state === "starting" ||
@@ -1770,6 +1993,7 @@ function canonicalDocument(value, code) {
     backendCapabilities,
     documentVersion,
     lastOperation,
+    launch,
     lease,
     lifecycle,
     manifest,
@@ -1813,6 +2037,7 @@ function assembleCanonicalDocument({
   backendCapabilities,
   documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION,
   lastOperation = null,
+  launch = null,
   lease = null,
   lifecycle = "DETACHED",
   manifest,
@@ -1873,6 +2098,16 @@ function assembleCanonicalDocument({
       launch: null,
     });
   }
+  if (documentVersion === PREVIOUS_SESSION_AUTHORITY_DOCUMENT_VERSION) {
+    ensure(launch === null, "session_state_invalid");
+    return deepFreeze({
+      documentVersion: PREVIOUS_SESSION_AUTHORITY_DOCUMENT_VERSION,
+      ...common,
+      lastOperation,
+      recovery: null,
+      launch: null,
+    });
+  }
   ensure(
     documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION,
     "session_state_invalid",
@@ -1882,7 +2117,7 @@ function assembleCanonicalDocument({
     ...common,
     lastOperation,
     recovery: null,
-    launch: null,
+    launch,
   });
 }
 
@@ -1984,9 +2219,9 @@ function timestampMilliseconds(value) {
 }
 
 function documentLastOperation(document) {
-  return document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION
-    ? document.lastOperation
-    : null;
+  return document.documentVersion === LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION
+    ? null
+    : document.lastOperation;
 }
 
 function sameLastOperation(left, right) {
@@ -2019,8 +2254,8 @@ function validateSessionRevisionState(snapshot, code) {
     return;
   }
   ensure(
-    snapshot.document.documentVersion ===
-      SESSION_AUTHORITY_DOCUMENT_VERSION,
+    snapshot.document.documentVersion !==
+      LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION,
     code,
   );
   const expected = BigIntConstructor(active.expectedSessionRevision);
@@ -2263,11 +2498,16 @@ function checkpointCaptureAdmission(value, expectedSession, code) {
   );
   const document = expectedSession.document;
   ensure(
-    document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+    document.documentVersion !== LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION &&
       document.lifecycle === "ATTACHED" &&
       document.activeOperation === null &&
       document.lease !== null &&
       document.attachment !== null &&
+      (document.launch === null ||
+        (processIncarnationId ===
+          document.launch.processIncarnationId &&
+          writerIncarnationId ===
+            document.launch.writerIncarnationId)) &&
       canonicalSerialize(attachment) ===
         canonicalSerialize(document.attachment) &&
       request.operationId ===
@@ -2437,9 +2677,10 @@ function restoreGenerationAdmission(value, expectedSession, code) {
   const request = canonicalRestoreMutationRequest(admission.request, code);
   const document = expectedSession.document;
   ensure(
-    document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+    document.documentVersion !== LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION &&
       document.lifecycle === "ATTACHED" &&
       document.activeOperation === null &&
+      document.launch === null &&
       document.lease !== null &&
       document.attachment !== null &&
       request.operationId ===
@@ -2564,6 +2805,282 @@ export function createRestoreDestinationGenerationOperationRequest(options) {
         "invalid_operation_request",
       ),
     },
+    "invalid_operation_request",
+  );
+}
+
+function canonicalWriterLaunchGeneration(value, expectedSession, code) {
+  const generation = exactPlainObject(
+    value,
+    WRITER_LAUNCH_GENERATION_KEYS,
+    code,
+  );
+  const claimedAt = canonicalTimestampString(generation.claimedAt, code);
+  const committedAt = canonicalTimestampString(
+    generation.committedAt,
+    code,
+  );
+  const sessionId = canonicalSessionId(generation.sessionId, code);
+  ensure(
+    generation.state === "committed" &&
+      sessionId === expectedSession.sessionId &&
+      timestampMilliseconds(committedAt) >=
+        timestampMilliseconds(claimedAt) &&
+      typeof generation.bindingSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, generation.bindingSha256) &&
+      typeof generation.documentSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, generation.documentSha256),
+    code,
+  );
+  return deepFreeze({
+    bindingSha256: generation.bindingSha256,
+    checkpointId: canonicalOpaqueId(generation.checkpointId, 128, code),
+    claimedAt,
+    committedAt,
+    documentSha256: generation.documentSha256,
+    generationId: canonicalOpaqueId(generation.generationId, 128, code),
+    operationId: canonicalOpaqueId(generation.operationId, 128, code),
+    sessionId,
+    state: "committed",
+  });
+}
+
+function writerLaunchGenerationReference(generation, expectedSession, code) {
+  const normalized = exactPlainObject(
+    generation,
+    RESTORE_GENERATION_SNAPSHOT_KEYS,
+    code,
+  );
+  ensure(
+    normalized.state === "committed" &&
+      normalized.document !== null &&
+      normalized.committedAt !== null,
+    code,
+  );
+  return canonicalWriterLaunchGeneration(
+    {
+      bindingSha256: sha256(
+        canonicalSerialize(canonicalJsonObject(normalized.binding, code)),
+      ),
+      checkpointId: normalized.checkpointId,
+      claimedAt: normalized.claimedAt,
+      committedAt: normalized.committedAt,
+      documentSha256: sha256(
+        canonicalSerialize(canonicalJsonObject(normalized.document, code)),
+      ),
+      generationId: normalized.generationId,
+      operationId: normalized.operationId,
+      sessionId: normalized.sessionId,
+      state: normalized.state,
+    },
+    expectedSession,
+    code,
+  );
+}
+
+function canonicalWriterLaunchMeasuredImage(value, manifest, code) {
+  const measuredImage = exactPlainObject(
+    value,
+    WRITER_LAUNCH_MEASURED_IMAGE_KEYS,
+    code,
+  );
+  const projection = exactPlainObject(
+    measuredImage.projection,
+    WRITER_LAUNCH_IMAGE_PROJECTION_KEYS,
+    code,
+  );
+  const platformImage = exactPlainObject(
+    projection.platformImage,
+    WRITER_LAUNCH_PLATFORM_IMAGE_KEYS,
+    code,
+  );
+  const config = exactPlainObject(
+    platformImage.config,
+    WRITER_LAUNCH_IMAGE_CONFIG_KEYS,
+    code,
+  );
+  const runtimeIdentity = exactPlainObject(
+    measuredImage.runtimeIdentity,
+    WRITER_LAUNCH_RUNTIME_IDENTITY_KEYS,
+    code,
+  );
+  assertLosslessString(platformImage.architecture, code);
+  assertLosslessString(platformImage.mediaType, code);
+  assertLosslessString(platformImage.os, code);
+  assertLosslessString(config.mediaType, code);
+  assertLosslessString(runtimeIdentity.codexBinaryPath, code);
+  ensure(
+    platformImage.architecture.length >= 1 &&
+      platformImage.architecture.length <= 64 &&
+      platformImage.os.length >= 1 &&
+      platformImage.os.length <= 64 &&
+      platformImage.mediaType.length >= 1 &&
+      platformImage.mediaType.length <= 256 &&
+      config.mediaType.length >= 1 &&
+      config.mediaType.length <= 256 &&
+      numberIsSafeInteger(platformImage.size) &&
+      platformImage.size > 0 &&
+      platformImage.size <= MAX_PLATFORM_MANIFEST_BYTES &&
+      numberIsSafeInteger(config.size) &&
+      config.size > 0 &&
+      config.size <= MAX_IMAGE_CONFIG_BYTES &&
+      typeof platformImage.digest === "string" &&
+      regexpTest(OCI_SHA256_DIGEST_PATTERN, platformImage.digest) &&
+      typeof config.digest === "string" &&
+      regexpTest(OCI_SHA256_DIGEST_PATTERN, config.digest) &&
+      typeof runtimeIdentity.codexBinarySha256 === "string" &&
+      regexpTest(SHA256_PATTERN, runtimeIdentity.codexBinarySha256) &&
+      runtimeIdentity.codexBinaryPath.length > 1 &&
+      runtimeIdentity.codexBinaryPath.length <= 4_096 &&
+      posixPathIsAbsoluteIntrinsic(runtimeIdentity.codexBinaryPath) &&
+      posixPathNormalizeIntrinsic(runtimeIdentity.codexBinaryPath) ===
+        runtimeIdentity.codexBinaryPath &&
+      projection.codexSandbox === manifest.runtime.codexSandbox &&
+      projection.codexVersion === manifest.runtime.codexVersion &&
+      `${platformImage.os}/${platformImage.architecture}` ===
+        manifest.runtime.platform &&
+      platformImage.digest === manifest.runtime.imageDigest &&
+      platformImage.mediaType === manifest.runtime.imageMediaType &&
+      runtimeIdentity.codexVersion === manifest.runtime.codexVersion &&
+      runtimeIdentity.platformImageDigest === platformImage.digest,
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      projection: {
+        codexSandbox: projection.codexSandbox,
+        codexVersion: projection.codexVersion,
+        platformImage: {
+          architecture: platformImage.architecture,
+          config: {
+            digest: config.digest,
+            mediaType: config.mediaType,
+            size: config.size,
+          },
+          digest: platformImage.digest,
+          mediaType: platformImage.mediaType,
+          os: platformImage.os,
+          size: platformImage.size,
+        },
+      },
+      runtimeIdentity: {
+        codexBinaryPath: runtimeIdentity.codexBinaryPath,
+        codexBinarySha256: runtimeIdentity.codexBinarySha256,
+        codexVersion: runtimeIdentity.codexVersion,
+        platformImageDigest: runtimeIdentity.platformImageDigest,
+      },
+    },
+    code,
+  );
+}
+
+function canonicalWriterLaunchSupervisor(value, code) {
+  const supervisor = exactPlainObject(
+    value,
+    WRITER_LAUNCH_SUPERVISOR_KEYS,
+    code,
+  );
+  ensure(
+    supervisor.contractVersion ===
+      WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION,
+    code,
+  );
+  return deepFreeze({
+    contractVersion: WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION,
+    supervisorId: canonicalOpaqueId(supervisor.supervisorId, 128, code),
+  });
+}
+
+function writerLaunchAttemptOperationRequest(value, expectedSession, code) {
+  const request = exactPlainObject(
+    value,
+    WRITER_LAUNCH_ATTEMPT_OPERATION_REQUEST_KEYS,
+    code,
+  );
+  const document = expectedSession.document;
+  const attachment = canonicalSessionAttachment(request.attachment, code);
+  const lease = canonicalLeaseGrant(request.lease, code);
+  const fencingEpoch = canonicalWriterEpoch(
+    request.fencingEpoch,
+    code,
+    true,
+  );
+  const generation = canonicalWriterLaunchGeneration(
+    request.generation,
+    expectedSession,
+    code,
+  );
+  const measuredImage = canonicalWriterLaunchMeasuredImage(
+    request.measuredImage,
+    document.manifest,
+    code,
+  );
+  const supervisor = canonicalWriterLaunchSupervisor(
+    request.supervisor,
+    code,
+  );
+  ensure(
+    request.contractVersion ===
+        WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION &&
+      (document.documentVersion ===
+        PREVIOUS_SESSION_AUTHORITY_DOCUMENT_VERSION ||
+        document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION) &&
+      document.lifecycle === "ATTACHED" &&
+      document.activeOperation === null &&
+      document.launch === null &&
+      document.attachment !== null &&
+      document.lease !== null &&
+      fencingEpoch === document.writerEpoch &&
+      fencingEpoch === lease.fencingEpoch &&
+      canonicalSerialize(attachment) ===
+        canonicalSerialize(document.attachment) &&
+      canonicalSerialize(lease) === canonicalSerialize(document.lease),
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      attachment,
+      contractVersion: WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION,
+      fencingEpoch,
+      generation,
+      lease,
+      measuredImage,
+      supervisor,
+    },
+    code,
+  );
+}
+
+export function createWriterLaunchAttemptOperationRequest(options) {
+  const normalized = exactPlainObject(
+    options,
+    ["expectedSession", "generation", "measuredImage", "supervisor"],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  const document = expectedSession.document;
+  ensure(
+    document.attachment !== null && document.lease !== null,
+    "invalid_operation_request",
+  );
+  return writerLaunchAttemptOperationRequest(
+    {
+      attachment: document.attachment,
+      contractVersion: WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION,
+      fencingEpoch: document.writerEpoch,
+      generation: writerLaunchGenerationReference(
+        normalized.generation,
+        expectedSession,
+        "invalid_operation_request",
+      ),
+      lease: document.lease,
+      measuredImage: normalized.measuredImage,
+      supervisor: normalized.supervisor,
+    },
+    expectedSession,
     "invalid_operation_request",
   );
 }
@@ -2740,6 +3257,7 @@ function writerReleaseRequest(
   ensure(
     request.contractVersion === WRITER_OPERATION_CONTRACT_VERSION &&
       document.lifecycle === "ATTACHED" &&
+      document.launch === null &&
       document.lease !== null &&
       document.attachment !== null &&
       target.attachmentId === document.attachment.attachmentId,
@@ -2833,6 +3351,12 @@ function validateTypedOperationInput(input) {
     );
     ensure(
       input.operationId === request.admission.request.operationId,
+      "invalid_operation_request",
+    );
+  } else if (input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND) {
+    writerLaunchAttemptOperationRequest(
+      input.request,
+      input.expectedSession,
       "invalid_operation_request",
     );
   }
@@ -3403,6 +3927,147 @@ function restoreGenerationTransitionInput(options) {
     expectedOperationRevision,
     generationId,
   });
+}
+
+function writerLaunchAttemptInput(
+  options,
+  keys = OPERATION_INPUT_KEYS,
+  code = "invalid_operation_request",
+) {
+  const input = canonicalOperationInput(options, keys);
+  ensure(input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND, code);
+  const request = writerLaunchAttemptOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  return deepFreeze({ ...input, request });
+}
+
+function writerLaunchAttemptTransitionInput(options) {
+  const input = writerLaunchAttemptInput(
+    options,
+    OPERATION_TRANSITION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    OPERATION_TRANSITION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(expectedOperationRevision === "0", "invalid_operation_request");
+  return deepFreeze({ ...input, expectedOperationRevision });
+}
+
+function canonicalWriterLaunchEvidence(value, input, statuses, code) {
+  const evidence = exactPlainObject(
+    value,
+    WRITER_LAUNCH_EVIDENCE_KEYS,
+    code,
+  );
+  const status = canonicalOpaqueId(evidence.status, 32, code);
+  ensure(
+    evidence.contractVersion ===
+        WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION &&
+      reflectApply(arrayIncludesIntrinsic, statuses, [status]) &&
+      evidence.launchAttemptId === input.operationId &&
+      evidence.supervisorId === input.request.supervisor.supervisorId,
+    code,
+  );
+  const processIncarnationId =
+    evidence.processIncarnationId === null
+      ? null
+      : canonicalOpaqueId(evidence.processIncarnationId, 128, code);
+  const writerIncarnationId =
+    evidence.writerIncarnationId === null
+      ? null
+      : canonicalOpaqueId(evidence.writerIncarnationId, 128, code);
+  ensure(
+    (status === "not-started" &&
+      processIncarnationId === null &&
+      writerIncarnationId === null) ||
+      ((status === "started" || status === "complete-stopped") &&
+        processIncarnationId !== null &&
+        writerIncarnationId !== null),
+    code,
+  );
+  return deepFreeze({
+    contractVersion: WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION,
+    launchAttemptId: input.operationId,
+    processIncarnationId,
+    proofId: canonicalOpaqueId(evidence.proofId, 128, code),
+    status,
+    supervisorId: input.request.supervisor.supervisorId,
+    writerIncarnationId,
+  });
+}
+
+function writerLaunchAttemptFinalizationInput(options, statuses) {
+  const input = writerLaunchAttemptInput(
+    options,
+    WRITER_LAUNCH_FINALIZATION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_FINALIZATION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(
+    expectedOperationRevision === "1" ||
+      expectedOperationRevision === "2",
+    "invalid_operation_request",
+  );
+  const evidence = canonicalWriterLaunchEvidence(
+    normalized.evidence,
+    input,
+    statuses,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ ...input, evidence, expectedOperationRevision });
+}
+
+function writerLaunchAttemptReadInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_READ_KEYS,
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    operationId: canonicalOpaqueId(
+      normalized.operationId,
+      128,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function writerLaunchAttemptRecoveryListInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_RECOVERY_LIST_KEYS,
+    "invalid_operation_request",
+  );
+  const afterSessionId =
+    normalized.afterSessionId === null
+      ? null
+      : canonicalSessionId(
+          normalized.afterSessionId,
+          "invalid_operation_request",
+        );
+  ensure(
+    numberIsSafeInteger(normalized.limit) &&
+      normalized.limit >= 1 &&
+      normalized.limit <= 100,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ afterSessionId, limit: normalized.limit });
 }
 
 function canonicalCheckpointArtifactProof(value, operationId, code) {
@@ -4567,6 +5232,83 @@ function canonicalWriterBlockedStoredResult(value, input, code) {
   );
 }
 
+function writerLaunchOutcomeForStatus(status, code) {
+  if (status === "started") return "writer-launch-started";
+  if (status === "not-started") return "writer-launch-not-started";
+  if (status === "complete-stopped") {
+    return "writer-launch-complete-stopped";
+  }
+  fail(code);
+}
+
+function canonicalWriterLaunchTerminalResult(value, input, code) {
+  const result = exactPlainObject(
+    value,
+    WRITER_LAUNCH_TERMINAL_RESULT_KEYS,
+    code,
+  );
+  ensure(result.resultVersion === OPERATION_RESULT_VERSION, code);
+  const evidence = canonicalWriterLaunchEvidence(
+    result.evidence,
+    input,
+    ["started", "not-started", "complete-stopped"],
+    code,
+  );
+  const outcome = writerLaunchOutcomeForStatus(evidence.status, code);
+  ensure(result.outcome === outcome, code);
+  return deepFreeze({
+    evidence,
+    outcome,
+    resultVersion: OPERATION_RESULT_VERSION,
+  });
+}
+
+function writerLaunchTerminalResult(input, evidence, code) {
+  return canonicalWriterLaunchTerminalResult(
+    {
+      evidence,
+      outcome: writerLaunchOutcomeForStatus(evidence.status, code),
+      resultVersion: OPERATION_RESULT_VERSION,
+    },
+    input,
+    code,
+  );
+}
+
+function writerLaunchPointerFor(input, result, startedAt, code) {
+  ensure(
+    result.outcome === "writer-launch-started" &&
+      result.evidence.processIncarnationId !== null &&
+      result.evidence.writerIncarnationId !== null,
+    code,
+  );
+  return canonicalWriterLaunchPointer(
+    {
+      attachmentId: input.request.attachment.attachmentId,
+      attachmentSha256: sha256(
+        canonicalSerialize(input.request.attachment),
+      ),
+      contractVersion: WRITER_LAUNCH_POINTER_CONTRACT_VERSION,
+      fencingEpoch: input.request.fencingEpoch,
+      generation: input.request.generation,
+      launchAttemptId: input.operationId,
+      launchResultSha256: sha256(canonicalSerialize(result)),
+      leaseId: input.request.lease.leaseId,
+      leaseSha256: sha256(canonicalSerialize(input.request.lease)),
+      measuredImageSha256: sha256(
+        canonicalSerialize(input.request.measuredImage),
+      ),
+      processIncarnationId: result.evidence.processIncarnationId,
+      startedAt,
+      supervisorId: input.request.supervisor.supervisorId,
+      supervisorProofId: result.evidence.proofId,
+      writerIncarnationId: result.evidence.writerIncarnationId,
+    },
+    input.expectedSession.sessionId,
+    code,
+  );
+}
+
 function canonicalCheckpointCaptureStoredResult(value, input, code) {
   const result = exactPlainObject(
     value,
@@ -4699,6 +5441,18 @@ function canonicalCommittedResult(value, input, revision, code) {
       code,
     );
     return canonicalRestoreGenerationStoredResult(value, input, code);
+  }
+  if (
+    outcome === "writer-launch-started" ||
+    outcome === "writer-launch-not-started" ||
+    outcome === "writer-launch-complete-stopped"
+  ) {
+    ensure(
+      input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+        (revision === "2" || revision === "3"),
+      code,
+    );
+    return canonicalWriterLaunchTerminalResult(value, input, code);
   }
   fail(code);
 }
@@ -5188,6 +5942,16 @@ function restoreGenerationTerminalResult(input, source, generation) {
   });
 }
 
+function writerLaunchAttemptRecord(input, operation) {
+  return deepFreeze({
+    contractVersion: WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION,
+    launchAttemptId: operation.operationId,
+    request: input.request,
+    result: operation.result,
+    state: operation.state,
+  });
+}
+
 function validateOperationIdentity(operation, input) {
   ensure(
     operation.operationId === input.operationId &&
@@ -5198,6 +5962,25 @@ function validateOperationIdentity(operation, input) {
         canonicalSnapshotBytes(input.expectedSession) &&
       canonicalSerialize(operation.request) === canonicalSerialize(input.request),
     "operation_identity_conflict",
+  );
+}
+
+function validateCommittedOperationHistory(operation, session) {
+  ensure(
+    operation.state === "committed" &&
+      operation.sessionId === session.sessionId &&
+      canonicalIdentityBytes(session.document) ===
+        canonicalIdentityBytes(operation.expectedSession.document) &&
+      session.createdAt === operation.expectedSession.createdAt &&
+      BigIntConstructor(session.revision) >=
+        BigIntConstructor(
+          revisionAfter(
+            operation.expectedSession.revision,
+            BigIntConstructor(operation.revision) + 1n,
+            "operation_state_invalid",
+          ),
+        ),
+    "operation_state_invalid",
   );
 }
 
@@ -5268,9 +6051,11 @@ function validateActiveBusinessState(session, operation) {
             "operation_state_invalid",
           ) &&
         canonicalSerialize(session.document.lease) ===
-          canonicalSerialize(expectedDocument.lease) &&
+        canonicalSerialize(expectedDocument.lease) &&
         canonicalSerialize(session.document.attachment) ===
-          canonicalSerialize(expectedDocument.attachment),
+          canonicalSerialize(expectedDocument.attachment) &&
+        canonicalSerialize(session.document.launch) ===
+          canonicalSerialize(expectedDocument.launch),
       "operation_state_invalid",
     );
     return;
@@ -5323,7 +6108,11 @@ function validateTerminalBusinessState(terminalBase, operation) {
         canonicalSerialize(terminalBase.document.lease) ===
           canonicalSerialize(result.lease) &&
         canonicalSerialize(terminalBase.document.attachment) ===
-          canonicalSerialize(result.attachment),
+          canonicalSerialize(result.attachment) &&
+        canonicalSerialize(terminalBase.document.launch) ===
+          canonicalSerialize(
+            operation.expectedSession.document.launch,
+          ),
       "operation_state_invalid",
     );
     return;
@@ -5368,6 +6157,51 @@ function validateTerminalBusinessState(terminalBase, operation) {
     );
     return;
   }
+  if (result.outcome === "writer-launch-started") {
+    const input = writerLaunchAttemptInput(
+      inputForOperation(operation),
+      OPERATION_INPUT_KEYS,
+      "operation_state_invalid",
+    );
+    const expectedLaunch = writerLaunchPointerFor(
+      input,
+      result,
+      operation.updatedAt,
+      "operation_state_invalid",
+    );
+    ensure(
+      terminalBase.document.lifecycle === "ATTACHED" &&
+        canonicalSerialize(
+          canonicalJsonObject(
+            terminalBase.document.lease,
+            "operation_state_invalid",
+          ),
+        ) ===
+          canonicalSerialize(input.request.lease) &&
+        canonicalSerialize(
+          canonicalJsonObject(
+            terminalBase.document.attachment,
+            "operation_state_invalid",
+          ),
+        ) ===
+          canonicalSerialize(input.request.attachment) &&
+        canonicalSerialize(terminalBase.document.launch) ===
+          canonicalSerialize(expectedLaunch),
+      "operation_state_invalid",
+    );
+    return;
+  }
+  if (
+    result.outcome === "writer-launch-not-started" ||
+    result.outcome === "writer-launch-complete-stopped"
+  ) {
+    ensure(
+      canonicalBusinessBytes(terminalBase.document) ===
+        canonicalBusinessBytes(operation.expectedSession.document),
+      "operation_state_invalid",
+    );
+    return;
+  }
   ensure(
     result.outcome === "writer-blocked" &&
       terminalBase.document.lifecycle === "BLOCKED" &&
@@ -5375,7 +6209,9 @@ function validateTerminalBusinessState(terminalBase, operation) {
       canonicalSerialize(terminalBase.document.lease) ===
         canonicalSerialize(result.lease) &&
       canonicalSerialize(terminalBase.document.attachment) ===
-        canonicalSerialize(result.attachment),
+        canonicalSerialize(result.attachment) &&
+      canonicalSerialize(terminalBase.document.launch) ===
+        canonicalSerialize(operation.expectedSession.document.launch),
     "operation_state_invalid",
   );
 }
@@ -5480,6 +6316,7 @@ function documentWithAuthorityState(
     activeOperation = document.activeOperation,
     attachment = document.attachment,
     lastOperation = documentLastOperation(document),
+    launch = document.launch,
     lease = document.lease,
     lifecycle = document.lifecycle,
     writerEpoch = document.writerEpoch,
@@ -5497,7 +6334,7 @@ function documentWithAuthorityState(
     activeOperation,
     lastOperation,
     recovery: document.recovery,
-    launch: document.launch,
+    launch,
   });
 }
 
@@ -5828,6 +6665,119 @@ async function readCommittedCheckpointSource(
   });
 }
 
+async function readCommittedRestoreGenerationForLaunch(
+  transaction,
+  reference,
+  currentSession,
+  forUpdate,
+) {
+  const generationRows = rowsFromResult(
+    await transaction.query(
+      forUpdate
+        ? READ_RESTORE_GENERATION_BY_ID_FOR_UPDATE_QUERY.text
+        : READ_RESTORE_GENERATION_BY_ID_QUERY.text,
+      [reference.generationId],
+    ),
+    "operation_state_invalid",
+  );
+  ensure(generationRows.length === 1, "operation_state_invalid");
+  const identity = restoreGenerationIdentityFromRow(generationRows[0]);
+  ensure(
+    identity.generationId === reference.generationId &&
+      identity.operationId === reference.operationId &&
+      identity.sessionId === reference.sessionId &&
+      identity.checkpointId === reference.checkpointId,
+    "operation_state_invalid",
+  );
+  const operation = await readOperationSnapshot(
+    transaction,
+    identity.operationId,
+    false,
+  );
+  ensure(
+    operation !== null &&
+      operation.kind ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+      operation.state === "committed" &&
+      operation.result?.outcome === "restore-generation-committed" &&
+      operation.result.generationId === identity.generationId &&
+      operation.result.checkpointId === identity.checkpointId,
+    "operation_state_invalid",
+  );
+  validateCommittedOperationHistory(operation, currentSession);
+  const input = restoreGenerationInput(
+    inputForOperation(operation),
+    OPERATION_INPUT_KEYS,
+    "operation_state_invalid",
+  );
+  const source = await readCommittedCheckpointSource(
+    transaction,
+    input.request.admission.checkpoint,
+    currentSession,
+    forUpdate,
+  );
+  const generation = restoreGenerationSnapshotFromRow(
+    generationRows[0],
+    input,
+    source,
+  );
+  const reservation = await readReservationSnapshot(
+    transaction,
+    operation.operationId,
+    false,
+  );
+  ensure(reservation !== null, "operation_state_invalid");
+  validateOperationReservation(operation, reservation, input);
+  ensure(
+    generation.state === "committed" &&
+      generation.document !== null &&
+      generation.committedAt !== null &&
+      generation.committedAt === operation.updatedAt &&
+      timestampMilliseconds(generation.claimedAt) >=
+        timestampMilliseconds(operation.createdAt) &&
+      timestampMilliseconds(generation.claimedAt) <=
+        timestampMilliseconds(operation.updatedAt),
+    "operation_state_invalid",
+  );
+  ensure(
+    operation.result.catalogueSha256 ===
+        sha256(canonicalSerialize(source.catalogue.document)) &&
+      operation.result.generationDocumentSha256 ===
+        sha256(canonicalSerialize(generation.document)),
+    "operation_state_invalid",
+  );
+  const observedReference = writerLaunchGenerationReference(
+    generation,
+    currentSession,
+    "operation_state_invalid",
+  );
+  ensure(
+    observedReference.bindingSha256 === reference.bindingSha256,
+    "operation_state_invalid",
+  );
+  ensure(
+    observedReference.checkpointId === reference.checkpointId,
+    "operation_state_invalid",
+  );
+  ensure(
+    observedReference.claimedAt === reference.claimedAt &&
+      observedReference.committedAt === reference.committedAt,
+    "operation_state_invalid",
+  );
+  ensure(
+    observedReference.documentSha256 === reference.documentSha256,
+    "operation_state_invalid",
+  );
+  ensure(
+    observedReference.generationId === reference.generationId &&
+      observedReference.operationId === reference.operationId &&
+      observedReference.sessionId === reference.sessionId &&
+      observedReference.state === reference.state,
+    "operation_state_invalid",
+  );
+  return deepFreeze({ generation, input, operation, reservation, source });
+}
+
 async function validateRestoreGenerationRelations(
   transaction,
   operation,
@@ -5904,6 +6854,131 @@ async function validateRestoreGenerationRelations(
   return deepFreeze({ generation, input, source });
 }
 
+async function validateWriterLaunchAttemptRelations(
+  transaction,
+  operation,
+  currentSession,
+  forUpdate,
+) {
+  if (operation.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND) {
+    return null;
+  }
+  const input = writerLaunchAttemptInput(
+    inputForOperation(operation),
+    OPERATION_INPUT_KEYS,
+    "operation_state_invalid",
+  );
+  if (
+    operation.state === "prepared" ||
+    (operation.state === "committed" &&
+      operation.result?.outcome === "cancelled-before-dispatch")
+  ) {
+    // Prepared is a cancellable intent, not generation authority. The fresh
+    // claim performs the first locked generation read; later active and
+    // terminal phases continuously revalidate that durable relation.
+    return deepFreeze({ generation: null, input, launch: null });
+  }
+  const generation = await readCommittedRestoreGenerationForLaunch(
+    transaction,
+    input.request.generation,
+    currentSession,
+    forUpdate,
+  );
+  ensure(
+    canonicalSerialize(
+      canonicalJsonObject(
+        generation.generation.binding.attachment,
+        "operation_state_invalid",
+      ),
+    ) ===
+      canonicalSerialize(input.request.attachment),
+    "operation_state_invalid",
+  );
+  let launch = null;
+  if (operation.state === "committed") {
+    ensure(operation.result !== null, "operation_state_invalid");
+    if (operation.result.outcome === "writer-launch-started") {
+      launch = writerLaunchPointerFor(
+        input,
+        operation.result,
+        operation.updatedAt,
+        "operation_state_invalid",
+      );
+    } else {
+      ensure(
+        operation.result.outcome === "writer-launch-not-started" ||
+          operation.result.outcome ===
+            "writer-launch-complete-stopped" ||
+          operation.result.outcome === "cancelled-before-dispatch",
+        "operation_state_invalid",
+      );
+    }
+  }
+  return deepFreeze({ generation, input, launch });
+}
+
+async function validateCurrentWriterLaunchRelation(
+  transaction,
+  session,
+  forUpdate,
+) {
+  const launch = session.document.launch;
+  if (launch === null) return null;
+  const operation = await readOperationSnapshot(
+    transaction,
+    launch.launchAttemptId,
+    false,
+  );
+  ensure(
+    operation !== null &&
+      operation.sessionId === session.sessionId &&
+      operation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+      operation.state === "committed" &&
+      operation.result?.outcome === "writer-launch-started",
+    "operation_state_invalid",
+  );
+  validateCommittedOperationHistory(operation, session);
+  const reservation = await readReservationSnapshot(
+    transaction,
+    operation.operationId,
+    false,
+  );
+  ensure(reservation !== null, "operation_state_invalid");
+  validateOperationReservation(operation, reservation, {
+    reservationId: `reservation-${sha256(operation.operationId)}`,
+  });
+  const relation = await validateWriterLaunchAttemptRelations(
+    transaction,
+    operation,
+    session,
+    forUpdate,
+  );
+  ensure(
+    relation !== null &&
+      relation.launch !== null &&
+      canonicalSerialize(relation.launch) === canonicalSerialize(launch) &&
+      session.document.lease !== null &&
+      session.document.attachment !== null &&
+      session.document.lease.sessionId === operation.sessionId &&
+      session.document.lease.leaseId === relation.input.request.lease.leaseId &&
+      session.document.lease.holderId ===
+        relation.input.request.lease.holderId &&
+      session.document.lease.fencingEpoch ===
+        relation.input.request.lease.fencingEpoch &&
+      timestampMilliseconds(session.document.lease.expiresAt) >=
+        timestampMilliseconds(relation.input.request.lease.expiresAt) &&
+      canonicalSerialize(
+        canonicalJsonObject(
+          session.document.attachment,
+          "operation_state_invalid",
+        ),
+      ) ===
+        canonicalSerialize(relation.input.request.attachment),
+    "operation_state_invalid",
+  );
+  return deepFreeze({ operation, relation, reservation });
+}
+
 async function ensureNoActiveRows(transaction, sessionId) {
   const rows = rowsFromResult(
     await transaction.query(READ_ACTIVE_COUNTS_QUERY.text, [sessionId]),
@@ -5954,9 +7029,16 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       session,
       forUpdate,
     );
+    const launchAttempt = await validateWriterLaunchAttemptRelations(
+      transaction,
+      operation,
+      session,
+      forUpdate,
+    );
     active = deepFreeze({
       checkpoint,
       generation,
+      launchAttempt,
       operation,
       reservation,
     });
@@ -5997,9 +7079,16 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       terminalBase,
       false,
     );
+    const launchAttempt = await validateWriterLaunchAttemptRelations(
+      transaction,
+      operation,
+      terminalBase,
+      false,
+    );
     terminal = deepFreeze({
       checkpoint,
       generation,
+      launchAttempt,
       operation,
       reservation,
     });
@@ -6014,7 +7103,12 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       "operation_state_invalid",
     );
   }
-  return deepFreeze({ active, terminal });
+  const currentLaunch = await validateCurrentWriterLaunchRelation(
+    transaction,
+    session,
+    forUpdate,
+  );
+  return deepFreeze({ active, currentLaunch, terminal });
 }
 
 async function readRequestedOperation(
@@ -6054,6 +7148,7 @@ async function readRequestedOperation(
       active: relations.active,
       checkpoint: null,
       generation: null,
+      launchAttempt: null,
       terminal: relations.terminal,
       operation: null,
       reservation: null,
@@ -6061,19 +7156,7 @@ async function readRequestedOperation(
   }
   validateOperationIdentity(operation, input);
   if (current === null && operation.state === "committed") {
-    const terminalSessionRevision = revisionAfter(
-      operation.expectedSession.revision,
-      BigIntConstructor(operation.revision) + 1n,
-      "operation_state_invalid",
-    );
-    ensure(
-      canonicalIdentityBytes(session.document) ===
-          canonicalIdentityBytes(operation.expectedSession.document) &&
-        session.createdAt === operation.expectedSession.createdAt &&
-        BigIntConstructor(session.revision) >=
-          BigIntConstructor(terminalSessionRevision),
-      "operation_state_invalid",
-    );
+    validateCommittedOperationHistory(operation, session);
   }
   const reservation =
     current === null
@@ -6102,6 +7185,15 @@ async function readRequestedOperation(
           false,
         )
       : current.generation;
+  const launchAttempt =
+    current === null
+      ? await validateWriterLaunchAttemptRelations(
+          transaction,
+          operation,
+          session,
+          false,
+        )
+      : current.launchAttempt;
   if (operation.state !== "committed") {
     validateActivePointer(session, operation, reservation);
   }
@@ -6109,6 +7201,7 @@ async function readRequestedOperation(
     active: relations.active,
     checkpoint,
     generation,
+    launchAttempt,
     terminal: relations.terminal,
     operation,
     reservation,
@@ -6205,6 +7298,158 @@ async function updateSessionDocument(
 
 function runSerializable(store, callback) {
   return reflectApply(runSerializableIntrinsic, store, [callback]);
+}
+
+async function finalizeWriterLaunchAttempt(
+  store,
+  options,
+  acceptedStatuses,
+) {
+  const input = writerLaunchAttemptFinalizationInput(
+    options,
+    acceptedStatuses,
+  );
+  return runSerializable(store, async (transaction) => {
+    const session = await readSessionSnapshot(
+      transaction,
+      input.expectedSession.sessionId,
+      true,
+    );
+    const observed = await readRequestedOperation(
+      transaction,
+      session,
+      input,
+      true,
+    );
+    ensure(
+      observed.operation !== null &&
+        observed.reservation !== null &&
+        observed.launchAttempt !== null,
+      "operation_transition_conflict",
+    );
+    const result = writerLaunchTerminalResult(
+      input,
+      input.evidence,
+      "invalid_operation_request",
+    );
+    if (observed.operation.state === "committed") {
+      ensure(
+        BigIntConstructor(input.expectedOperationRevision) + 1n ===
+          BigIntConstructor(observed.operation.revision),
+        "operation_transition_conflict",
+      );
+      ensure(
+        canonicalSerialize(observed.operation.result) ===
+          canonicalSerialize(result),
+        "operation_result_conflict",
+      );
+      const currentLaunch =
+        session.document.launch?.launchAttemptId === input.operationId
+          ? session.document.launch
+          : null;
+      return operationReceipt({
+        attempt: writerLaunchAttemptRecord(input, observed.operation),
+        finalized: false,
+        launch: currentLaunch,
+        operation: observed.operation,
+        reservation: observed.reservation,
+        session,
+      });
+    }
+    ensure(
+      (observed.operation.state === "starting" ||
+        observed.operation.state === "uncertain") &&
+        observed.operation.revision === input.expectedOperationRevision,
+      "operation_transition_conflict",
+    );
+    ensure(
+      session.document.lifecycle === "ATTACHED" &&
+        session.document.launch === null &&
+        session.document.lease !== null &&
+        session.document.attachment !== null,
+      "operation_transition_conflict",
+    );
+    ensure(
+      canonicalSerialize(
+        canonicalJsonObject(
+          session.document.lease,
+          "operation_transition_conflict",
+        ),
+      ) ===
+        canonicalSerialize(input.request.lease) &&
+        canonicalSerialize(
+          canonicalJsonObject(
+            session.document.attachment,
+            "operation_transition_conflict",
+          ),
+        ) ===
+          canonicalSerialize(input.request.attachment),
+      "operation_transition_conflict",
+    );
+    nextRevision(session.revision);
+    const serializedResult = canonicalSerialize(result);
+    const predecessorState = observed.operation.state;
+    const operationRows = rowsFromResult(
+      await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+        input.operationId,
+        input.expectedOperationRevision,
+        serializedResult,
+        transaction.now,
+        predecessorState,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(operationRows.length === 1, "operation_transition_conflict");
+    const reservationRows = rowsFromResult(
+      await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+        input.operationId,
+        transaction.now,
+        predecessorState,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(
+      reservationRows.length === 1,
+      "operation_transition_conflict",
+    );
+    const operation = operationSnapshotFromRow(operationRows[0]);
+    const reservation = reservationSnapshotFromRow(reservationRows[0]);
+    validateOperationIdentity(operation, input);
+    validateOperationReservation(operation, reservation, input);
+    ensure(
+      canonicalSerialize(operation.result) === serializedResult,
+      "operation_result_conflict",
+    );
+    const launch =
+      result.outcome === "writer-launch-started"
+        ? writerLaunchPointerFor(
+            input,
+            result,
+            operation.updatedAt,
+            "operation_state_invalid",
+          )
+        : null;
+    const nextDocument = documentWithAuthorityState(session.document, {
+      activeOperation: null,
+      lastOperation: lastPointerFor(operation, reservation),
+      launch,
+    });
+    const updatedSession = await updateSessionDocument(
+      transaction,
+      session,
+      input,
+      nextDocument,
+    );
+    validateLastOperationPointer(updatedSession, operation, reservation);
+    return operationReceipt({
+      attempt: writerLaunchAttemptRecord(input, operation),
+      finalized: true,
+      launch,
+      operation,
+      reservation,
+      session: updatedSession,
+    });
+  });
 }
 
 export class PostgresSessionAuthority {
@@ -6507,6 +7752,98 @@ export class PostgresSessionAuthority {
     });
   }
 
+  async listWriterLaunchAttemptRecoveryCandidates(options) {
+    const listInput = writerLaunchAttemptRecoveryListInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const maximumRows = listInput.limit + 1;
+      const afterCursor = listInput.afterSessionId;
+      const query =
+        afterCursor === null
+          ? LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY
+          : LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY;
+      const values =
+        afterCursor === null
+          ? [maximumRows]
+          : [afterCursor, maximumRows];
+      const operationRows = pageRowsFromResult(
+        await transaction.query(query.text, values),
+        maximumRows,
+        "operation_state_invalid",
+      );
+      const candidateCount =
+        operationRows.length > listInput.limit
+          ? listInput.limit
+          : operationRows.length;
+      const candidates = new ArrayConstructor(candidateCount);
+      objectSetPrototypeOf(candidates, null);
+      let previousSessionId = afterCursor;
+      let lastCandidateSessionId = null;
+
+      for (let index = 0; index < operationRows.length; index += 1) {
+        const operation = operationSnapshotFromRow(
+          ownDataValue(
+            operationRows,
+            reflectApply(StringConstructor, undefined, [index]),
+            "operation_state_invalid",
+          ),
+        );
+        ensure(
+          operation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+            (operation.state === "starting" ||
+              operation.state === "uncertain") &&
+            operation.retiredAt === null &&
+            (previousSessionId === null ||
+              operation.sessionId > previousSessionId),
+          "operation_state_invalid",
+        );
+        const input = writerLaunchAttemptInput(
+          inputForOperation(operation),
+          OPERATION_INPUT_KEYS,
+          "operation_state_invalid",
+        );
+        const session = await readSessionSnapshot(
+          transaction,
+          operation.sessionId,
+          false,
+        );
+        const observed = await readRequestedOperation(
+          transaction,
+          session,
+          input,
+          false,
+        );
+        ensure(
+          observed.active !== null &&
+            observed.active.operation.operationId === operation.operationId &&
+            observed.operation !== null &&
+            observed.reservation !== null &&
+            observed.launchAttempt !== null &&
+            (observed.operation.state === "starting" ||
+              observed.operation.state === "uncertain") &&
+            canonicalSerialize(observed.operation) ===
+              canonicalSerialize(operation),
+          "operation_state_invalid",
+        );
+        if (index < candidateCount) {
+          candidates[index] = deepFreeze({
+            launchAttemptId: input.operationId,
+            request: input.request,
+          });
+          lastCandidateSessionId = operation.sessionId;
+        }
+        previousSessionId = operation.sessionId;
+      }
+      objectSetPrototypeOf(candidates, arrayPrototype);
+      return deepFreeze({
+        candidates,
+        nextAfterSessionId:
+          operationRows.length > listInput.limit
+            ? lastCandidateSessionId
+            : null,
+      });
+    });
+  }
+
   async reserveOperation(options) {
     const input = canonicalOperationInput(options);
     ensure(
@@ -6672,7 +8009,8 @@ export class PostgresSessionAuthority {
         input.kind !== WRITER_RELEASE_OPERATION_KIND &&
         input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND &&
         input.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND &&
-        input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+        input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+        input.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
       "invalid_operation_request",
     );
     return runSerializable(this.#store, async (transaction) => {
@@ -7532,6 +8870,194 @@ export class PostgresSessionAuthority {
     });
   }
 
+  async claimWriterLaunchAttemptDispatch(options) {
+    const input = writerLaunchAttemptTransitionInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.launchAttempt !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state !== "prepared") {
+        return operationReceipt({
+          attempt: writerLaunchAttemptRecord(input, observed.operation),
+          dispatchGranted: false,
+          generation:
+            observed.launchAttempt.generation?.generation ?? null,
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+        });
+      }
+      ensure(
+        observed.operation.revision === input.expectedOperationRevision &&
+          session.document.lifecycle === "ATTACHED" &&
+          session.document.launch === null &&
+          session.document.lease !== null &&
+          session.document.attachment !== null &&
+          canonicalSerialize(
+            canonicalJsonObject(
+              session.document.lease,
+              "operation_transition_conflict",
+            ),
+          ) ===
+            canonicalSerialize(input.request.lease) &&
+          canonicalSerialize(
+            canonicalJsonObject(
+              session.document.attachment,
+              "operation_transition_conflict",
+            ),
+          ) ===
+            canonicalSerialize(input.request.attachment) &&
+          observed.launchAttempt.generation === null,
+        "operation_transition_conflict",
+      );
+      revisionAfter(session.revision, 3);
+      const generation = await readCommittedRestoreGenerationForLaunch(
+        transaction,
+        input.request.generation,
+        session,
+        true,
+      );
+      ensure(
+        canonicalSerialize(
+          canonicalJsonObject(
+            generation.generation.binding.attachment,
+            "operation_transition_conflict",
+          ),
+        ) === canonicalSerialize(input.request.attachment),
+        "operation_transition_conflict",
+      );
+      // Read the non-transactional authority clock only after every
+      // generation relation lock has been acquired. Otherwise a wait on the
+      // generation row could cross lease expiry after an earlier successful
+      // time check and still grant dispatch.
+      const authorityNow = await readAuthorityClock(transaction);
+      ensure(
+        timestampMilliseconds(authorityNow) >=
+          timestampMilliseconds(transaction.now),
+        "session_state_invalid",
+      );
+      ensure(
+        timestampMilliseconds(session.document.lease.expiresAt) >
+          timestampMilliseconds(authorityNow),
+        "writer_lease_expired",
+      );
+      const operationRows = rowsFromResult(
+        await transaction.query(START_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(START_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        reservationRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(reservationRows[0]);
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      const updatedSession = await updateSessionPhase(
+        transaction,
+        session,
+        input,
+        activePointerFor(input, "starting", "1"),
+      );
+      validateActivePointer(updatedSession, operation, reservation);
+      return operationReceipt({
+        attempt: writerLaunchAttemptRecord(input, operation),
+        authorityNow,
+        dispatchGranted: true,
+        generation: generation.generation,
+        operation,
+        reservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async finalizeWriterLaunchAttemptStarted(options) {
+    return finalizeWriterLaunchAttempt(this.#store, options, ["started"]);
+  }
+
+  async finalizeWriterLaunchAttemptStopped(options) {
+    return finalizeWriterLaunchAttempt(this.#store, options, [
+      "not-started",
+      "complete-stopped",
+    ]);
+  }
+
+  async readWriterLaunchAttempt(options) {
+    const readInput = writerLaunchAttemptReadInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const operation = await readOperationSnapshot(
+        transaction,
+        readInput.operationId,
+        false,
+      );
+      ensure(
+        operation !== null &&
+          operation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+        "writer_launch_attempt_not_authorized",
+      );
+      const input = writerLaunchAttemptInput(
+        inputForOperation(operation),
+        OPERATION_INPUT_KEYS,
+        "operation_state_invalid",
+      );
+      const session = await readSessionSnapshot(
+        transaction,
+        operation.sessionId,
+        false,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        false,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.launchAttempt !== null,
+        "writer_launch_attempt_not_authorized",
+      );
+      const launch =
+        session.document.launch?.launchAttemptId === input.operationId
+          ? session.document.launch
+          : null;
+      return operationReceipt({
+        attempt: writerLaunchAttemptRecord(input, observed.operation),
+        launch,
+        operation: observed.operation,
+        reservation: observed.reservation,
+        session,
+      });
+    });
+  }
+
   async claimWriterAttachmentDispatch(options) {
     const input = operationInputWithExpectedRevision(options, "0");
     writerAttachmentRequest(input);
@@ -8181,6 +9707,7 @@ export class PostgresSessionAuthority {
           activeOperation: null,
           attachment: null,
           lastOperation: lastPointerFor(operation, reservation),
+          launch: null,
           lease: null,
           lifecycle: "DETACHED",
         },
@@ -8424,6 +9951,7 @@ export class PostgresSessionAuthority {
           activeOperation: null,
           attachment: null,
           lastOperation: lastPointerFor(operation, reservation),
+          launch: null,
           lease: null,
           lifecycle: "DETACHED",
           writerEpoch: result.writerEpoch,
@@ -8616,7 +10144,8 @@ export class PostgresSessionAuthority {
           input.kind === WRITER_RELEASE_OPERATION_KIND ||
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND ||
           input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND ||
-          input.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND
+          input.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND ||
+          input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND
           ? 2
           : 1,
       );

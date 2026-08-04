@@ -20,7 +20,9 @@ The implemented authority provides:
   reconciliation;
 - production clean-checkpoint capture admission, durable attempt claims, and
   exact checkpoint-catalogue finalization; and
-- committed-only, source-free capture reconciliation.
+- committed-only, source-free capture reconciliation; and
+- typed durable writer-launch attempt reservation, single dispatch, exact
+  started/stopped finalization, readback, and bounded recovery.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
@@ -34,8 +36,10 @@ reservation, capture-attempt, tombstone, and catalogue tables. The migration
 chain also installs the permanent relational identities and constraints needed
 by restore destination generations, while the typed authority claims and
 finalises one exact detached destination generation against a committed source
-checkpoint. Subsequent authority slices will implement durable launch attempts
-and logical launcher composition.
+checkpoint. The launch-attempt slice binds that committed generation to an
+exact current session, measured image, and trusted supervisor outcome without
+calling a launcher. The subsequent authority slice will compose the original
+one-use image capability, external launcher, and exact writer registration.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -49,7 +53,9 @@ finalization. Release and force-fence use the same reserve, typed-dispatch,
 external-provider, and typed-finalization order. The current
 stopped-directory backend declares `fencing: "manual"` and therefore cannot
 successfully finalize an automatic force-fence proof or use lease expiration
-or a higher database epoch alone for host takeover.
+or a higher database epoch alone for host takeover. The durable launch-attempt
+methods likewise execute no launcher or supervisor callback. They accept only
+bounded canonical request data and exact evidence returned by a trusted caller.
 
 ## Protected Properties
 
@@ -75,8 +81,12 @@ restore-generation transitions protect historical identity, same-session
 linkage, single dispatch, exact finalisation, replay, and bounded recovery. A
 generation row authorises restore publication only after the typed claim
 commits; even a committed generation does not authorise a writer launch.
-Durable launch-attempt and launcher transitions remain later slices. Physical
-exclusion evidence must be supplied by a capable storage backend or supervisor.
+The launch-attempt transition reuses the operation and reservation rows to
+protect one durable blocker and binds a started writer through a version 3
+session pointer to its immutable launch operation. That durable pointer and its
+serialized IDs still do not authorize process creation. Physical exclusion
+evidence must be supplied by a capable storage backend or supervisor, and
+logical launcher composition remains a later slice.
 
 ## Implemented Canonical Session Registry
 
@@ -84,7 +94,7 @@ exclusion evidence must be supplied by a capable storage backend or supervisor.
 document:
 
 ```text
-documentVersion = 2
+documentVersion = 3
 manifest
 storageRef
 backendCapabilities
@@ -110,14 +120,16 @@ complete canonical identity:
   `session_identity_conflict` and never overwrites the row; and
 - database `transaction_timestamp()` supplies both initial timestamps.
 
-Version 2 adds a bounded `lastOperation` terminal anchor. A canonical version 1
-document remains readable with its exact original shape and serialization so
-operation requests already bound to that snapshot retain the same digest.
-Version 1 is accepted only as an inactive revision-zero snapshot. The first
-state-changing session write upgrades it to version 2 before an active pointer
-is stored; any active version 1 document is an impossible downgrade and fails
-closed. Readback never rewrites a stored document merely to normalize its
-version.
+Version 2 adds a bounded `lastOperation` terminal anchor. Version 3 adds the
+canonical current-launch pointer. A canonical version 1 or version 2 document
+remains readable with its exact original shape and serialization so operation
+requests already bound to that snapshot retain the same digest. Version 1 is
+accepted only as an inactive revision-zero snapshot. Version 2 remains valid
+for every previously supported inactive and active operation state, but its
+`launch` field must be null. The first state-changing session write upgrades a
+version 1 or version 2 document to version 3; readback and exact replay never
+rewrite a stored document merely to normalize its version. Unknown future
+versions fail closed.
 The previously merged version 1 registry exposed no session-state mutation
 method, so its supported persisted state was revision zero; progressed version
 1 operation states existed only in intermediate commits of this unmerged
@@ -126,13 +138,17 @@ operation-kernel workstream and are not a migration input.
 `readSession()` validates the complete relational and JSON document shape,
 immutable identity bindings, current mutable state, revision, timestamps, and
 any active operation/reservation linkage before returning a deep-frozen
-snapshot. For a progressed version 2 session, it also resolves the
+snapshot. For a progressed version 2 or version 3 session, it also resolves the
 `lastOperation` primary keys and proves that they name a matching committed
 operation and released reservation, including request and result digests,
 revisions, and terminal timestamps. Missing sessions return
 `session_not_found`; malformed or inconsistent stored state returns
 `session_state_invalid` or `operation_state_invalid`. Readback never repairs or
-normalizes stored authority state implicitly.
+normalizes stored authority state implicitly. When version 3 carries a current
+launch pointer, readback also follows its launch-attempt operation ID
+independently of `lastOperation` and proves the exact generation, attachment,
+stable lease tuple, image measurement, process and writer incarnations, and
+supervisor evidence.
 
 ## Implemented Operation and Reservation Kernel
 
@@ -684,10 +700,12 @@ Lease expiry closes subsequent mutation, renewal, and launch admission. It does
 not change the physical attachment state, move the lifecycle to `FENCING`, or
 prove a fence. Exact attachment finalization still persists matching physical
 evidence after expiry, and exact-owner cleanup for the unchanged tuple and
-target may detach after expiry. Once a newer epoch has been allocated, the old
-tuple is stale even for cleanup. Moving from `BLOCKED` to `FENCING` always
-requires a separately reserved force-fence operation and a definite typed
-dispatch commit.
+target may detach after expiry only when no current launch is recorded. A
+non-null launch requires exact supervisor-stopped evidence or a successful
+physical force fence before storage release can proceed. Once a newer epoch
+has been allocated, the old tuple is stale even for cleanup. Moving from
+`BLOCKED` to `FENCING` always requires a separately reserved force-fence
+operation and a definite typed dispatch commit.
 
 ## Schema for Durable Claims and Reservations
 
@@ -705,7 +723,10 @@ identities rather than session-volume data:
 - checkpoint catalogue entries are finalized only from the exact active
   capture attempt; and
 - restore destination generation IDs remain independent permanent identities,
-  each bound to one exact operation, session, and same-session checkpoint.
+  each bound to one exact operation, session, and same-session checkpoint; and
+- each writer launch attempt reuses its globally unique operation ID and
+  permanent request/result row instead of duplicating phase state in another
+  relation.
 
 The PostgreSQL schema intentionally stores state-machine documents as `jsonb`
 while keeping identities, revisions, timestamps, and uniqueness constraints in
@@ -789,10 +810,9 @@ Bounded recovery enumerates only retained `starting` or `uncertain`
 restore-generation operations whose exact authorised generation and source
 catalogue still validate. The generation relation has no deletion or
 retirement path. These transitions neither invoke publication inside a
-database transaction nor change the canonical session document version.
-Production restore remains disabled until a later durable launch-attempt and
-logical launcher composition consume the committed generation without
-weakening the no-second-writer boundary.
+database transaction nor require launch-specific DDL. Production restore
+remains disabled until logical launcher composition consumes the committed
+generation without weakening the no-second-writer boundary.
 
 The current capture-oriented stopped-directory backend still constructs its
 legacy restore journal binding from only checkpoint, isolation-proof, and
@@ -800,6 +820,82 @@ reservation context. Production composition must instead pass the exact
 claimed generation binding as the publisher's coordinator binding before it
 can produce a materialisation accepted by generation document v2. Restore
 remains fail-closed until that composition exists.
+
+## Implemented Durable Launch-Attempt Lifecycle
+
+`writer-launch-attempt-v1` reuses the migration version 2 operation and
+reservation schema. The operation ID is also the launch-attempt ID; no
+migration version 3 or launch-specific relation is required. The permanent
+operation request binds:
+
+- one exact committed restore-generation identity plus hashes of its binding
+  and finalized document;
+- the complete current attachment and lease snapshot, including the stable
+  lease ID, holder, and fencing epoch;
+- the bounded platform-image projection and measured Codex runtime identity;
+  and
+- one trusted supervisor identity.
+
+`createWriterLaunchAttemptOperationRequest` accepts the complete committed
+restore-generation snapshot returned by the typed authority: `binding`,
+`checkpointId`, `claimedAt`, `committedAt`, `document`, `generationId`,
+`operationId`, `sessionId`, and `state`. The builder validates that snapshot
+against the expected session and derives the compact generation reference
+stored in the durable request. Callers must not pass that compact reference
+back as the builder input.
+
+The serialized generation reference, image measurement, supervisor ID, proof
+ID, process incarnation ID, and writer incarnation ID are correlation values.
+They neither replace the committed generation relation nor authenticate
+authority. In particular, the measured-image record is not the opaque one-use
+reservation issued by `PlatformImageReservationCoordinator`.
+
+Reservation writes `prepared` before any dispatch is possible. Typed claim
+then locks the session, operation, reservation, and named restore generation,
+revalidates the complete committed generation relation and its committed
+operation's immutable session identity, creation timestamp, terminal revision
+floor, and claim-time bounds, and only then reads the database clock to check
+the exact current attachment and unexpired lease before advancing to
+`starting`. A generation-row lock wait therefore cannot reuse a pre-wait lease
+observation after expiry. Only that definite commit returns
+`dispatchGranted: true`.
+`starting` and `uncertain` both retain the active operation and reservation, so
+neither acknowledgement loss nor process restart opens a second launch.
+Bounded recovery lists only those two phases in stable `session_id` keyset
+order and revalidates their durable relation without consulting a launcher.
+
+Typed finalization accepts only exact evidence for the same attempt and
+supervisor:
+
+- `started` binds non-null process and writer incarnation IDs and stores a
+  canonical current-launch pointer;
+- `not-started` requires both incarnation IDs to be null; and
+- `complete-stopped` binds both incarnation IDs and proves that the complete
+  old container, cgroup, or VM writer boundary has joined.
+
+PID disappearance, an exit code, Codex `ShutdownComplete`, lease expiry,
+storage detach, or a copied `"stopped": true` field is not
+`complete-stopped` evidence. Exact finalization from `starting` or `uncertain`
+atomically commits the operation result, releases the reservation, clears the
+active pointer, and advances `lastOperation`. Replays accept only the same
+canonical evidence and never grant dispatch again.
+
+Canonical session document version 3 stores the current started-launch pointer
+separately from `lastOperation`. Later lease renewal or checkpoint capture may
+replace the terminal anchor, so strict readback follows the pointer's operation
+ID and reconstructs its immutable request/result. It rechecks the operation's
+session identity, creation timestamp, terminal revision floor, generation,
+attachment, stable lease tuple, non-regressing lease expiry, image hashes,
+process and writer incarnations, and supervisor proof. A second launch requires
+`launch = null`. Writer release also requires `launch = null`; storage detach
+alone does not prove the process stopped. Force-fence `starting`, `uncertain`,
+and unresolved `BLOCKED` states retain the launch pointer, while a successful
+exact physical fence clears it. Checkpoint capture preserves the pointer and,
+when present, must name the same process and writer incarnations.
+
+This slice deliberately does not consume an image reservation, invoke a
+launcher or supervisor, register a writer capability, or enable production
+restore.
 
 ## Platform Image Reservation
 
@@ -864,34 +960,39 @@ actually launched the reserved bytes.
 
 ## Required Logical Launcher Admission
 
-Launcher admission atomically re-reads:
+The remaining launcher composition must atomically re-read:
 
 - the immutable session manifest and storage reference;
 - the current unexpired lease and fencing epoch;
 - the exact writable attachment;
-- the absence of another active authority reservation;
+- the exact durable launch-attempt admission and absence of another active
+  authority reservation;
 - checkpoint/recovery state required by the selected recovery class; and
 - the consumed exact-image reservation.
 
-It then commits a durable launch attempt before invoking a launcher callback.
-`prepared`, `starting`, and `uncertain` attempts all block a second writer.
-Success records the returned process and writer incarnation bindings; failure
-is launchable again only when the supervisor has proved the complete old writer
-boundary stopped and the authority has finalized that proof.
+The durable attempt already commits `prepared` before dispatch and advances to
+`starting` before a caller may invoke a launcher. `prepared`, `starting`, and
+`uncertain` attempts all block a second writer. The remaining composition must
+consume the original opaque image reservation exactly once, invoke the
+launcher, and return exact supervisor evidence to the implemented started or
+stopped finalizer. Failure is launchable again only when the supervisor has
+proved the complete old writer boundary stopped and the authority has finalized
+that proof.
 
 The later logical-launcher slice will introduce this launcher callback seam. A
 concrete Podman/Docker adapter must hold directory identity through the bind,
 enforce rootless execution, fix the Codex CLI/config surface, and register the
 exact writer with `StoppedWriterCapabilityCoordinator`.
 
-The authority now exposes typed restore-generation claim, finalisation, exact
-read, replay, and bounded recovery transitions. Those transitions can name one
-detached destination as a canonical generation and commit its exact restore
-result, but they deliberately do not launch a writer. Until a durable launch
-attempt feeds that committed generation into the same logical launcher
-admission transaction, the production checkpoint adapter rejects restore. A
-database table row, published directory, restore journal record, checkpoint
-descriptor, catalogue entry, or committed generation alone is never
+The authority now exposes typed restore-generation and durable launch-attempt
+claim, finalisation, exact read, replay, and bounded recovery transitions.
+Those transitions can bind one detached destination generation to an exact
+measured runtime and trusted supervisor result, but they deliberately do not
+launch or register a writer. Until logical composition consumes the one-use
+image capability, invokes the external launcher, and registers the exact
+writer, the production checkpoint adapter rejects restore. A database row,
+published directory, restore journal record, checkpoint descriptor, catalogue
+entry, committed generation, or serialized launch attempt alone is never
 writable-launch authority.
 
 ## Operational Boundary
@@ -939,8 +1040,9 @@ Registry unit tests cover validation, exact replay, identity conflict, strict
 readback, and immutable snapshots. Operation-kernel unit tests cover
 incremental canonical-request byte and structure bounds, exact claim replay,
 dispatch-grant single use, retained uncertainty, safe pre-dispatch
-cancellation, cancellation acknowledgement loss, version 1 exact request
-compatibility and upgrade-on-write, active-document downgrade rejection,
+cancellation, cancellation acknowledgement loss, version 1 and version 2 exact
+request compatibility and version 3 upgrade-on-write, active-document
+downgrade rejection,
 post-import global/prototype mutation, pre-database U+0000 rejection,
 terminal-anchor relational corruption, and revision CAS. Writer-acquisition
 unit tests cover bounded DB-clock leases, deterministic typed dispatch, the
@@ -971,7 +1073,13 @@ loss, restart replay, committed-only source-free reconciliation, claim
 revalidation after verification, and relational corruption. Restore-generation
 tests cover exact claim and finalisation replay, replacement-storage admission,
 transaction rollback, acknowledgement loss, bounded recovery, and relational
-corruption. Later authority slices must add durable launch-attempt and logical
-launcher transition tests.
+corruption. Launch-attempt tests cover exact committed-generation and
+measured-image binding, single dispatch, retained `starting` and `uncertain`
+blockers, started/not-started/complete-stopped evidence, exact replay,
+acknowledgement loss, current-launch relational readback after terminal-anchor
+replacement, lease renewal, second-launch rejection, release and checkpoint
+interaction, successful-fence clearing, bounded recovery, and corruption.
+Later authority slices must add logical launcher callback, one-use image
+consumption, and exact writer-registration tests.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.
