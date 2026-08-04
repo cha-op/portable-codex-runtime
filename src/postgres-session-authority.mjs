@@ -6926,6 +6926,77 @@ function restoreLaunchHandoffReceipt({
   });
 }
 
+function isPreparedAtomicRestoreLaunchHandoff(session, observed) {
+  const active = observed.active;
+  if (
+    active === null ||
+    active.operation.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND ||
+    active.operation.state !== "prepared"
+  ) {
+    return false;
+  }
+  const terminal = observed.terminal;
+  const restoreRelation = terminal?.generation;
+  if (
+    restoreRelation?.input.request.contractVersion !==
+    RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2
+  ) {
+    return false;
+  }
+  ensure(
+    active.operation.operationId === observed.operation?.operationId &&
+      active.reservation.reservationId ===
+        observed.reservation?.reservationId &&
+      active.launchAttempt !== null &&
+      terminal !== null &&
+      terminal.operation.state === "committed" &&
+      restoreRelation.generation !== null &&
+      restoreRelation.source !== null,
+    "operation_state_invalid",
+  );
+
+  const restoreTerminalSession = restoreTerminalSessionForLaunchHandoff(
+    restoreRelation.input,
+    terminal.operation,
+    terminal.reservation,
+  );
+  const launchInput = writerLaunchAttemptInputForRestoreHandoff(
+    restoreRelation.input,
+    restoreRelation.generation,
+    restoreTerminalSession,
+    restoreRelation.input.request.launchIntent,
+  );
+  ensure(
+    canonicalSerialize(active.launchAttempt.input) ===
+        canonicalSerialize(launchInput) &&
+      active.operation.createdAt === terminal.operation.updatedAt &&
+      active.operation.updatedAt === terminal.operation.updatedAt &&
+      active.reservation.createdAt === terminal.operation.updatedAt &&
+      active.reservation.updatedAt === terminal.operation.updatedAt,
+    "operation_state_invalid",
+  );
+
+  // Standalone restore finalization accepts only V1, so a committed V2
+  // terminal relation identifies the atomic producer. The reconstructed input
+  // binds its launch intent, committed generation, measured image, and
+  // supervisor; the shared durable timestamps corroborate that producer but
+  // are not the provenance root. Receipt validation additionally proves both
+  // durable identities and the active/terminal session relation.
+  restoreLaunchHandoffReceipt({
+    generation: restoreRelation.generation,
+    launchInput,
+    launchOperation: active.operation,
+    launchReservation: active.reservation,
+    restoreCatalogue: restoreRelation.source.catalogue,
+    restoreFinalized: false,
+    restoreInput: restoreRelation.input,
+    restoreOperation: terminal.operation,
+    restoreReservation: terminal.reservation,
+    session,
+  });
+  return true;
+}
+
 async function readRestoreLaunchHandoffReplay(
   transaction,
   session,
@@ -6966,7 +7037,12 @@ async function readRestoreLaunchHandoffReplay(
   ensure(
     launchObserved.operation !== null &&
       launchObserved.reservation !== null &&
-      launchObserved.launchAttempt !== null,
+      launchObserved.launchAttempt !== null &&
+      !(
+        launchObserved.operation.state === "committed" &&
+        launchObserved.operation.result?.outcome ===
+          "cancelled-before-dispatch"
+      ),
     "operation_transition_conflict",
   );
   return restoreLaunchHandoffReceipt({
@@ -9459,7 +9535,17 @@ export class PostgresSessionAuthority {
           session.document.attachment !== null,
         "operation_transition_conflict",
       );
-      revisionAfter(session.revision, 3);
+      // V1 needs the restore claim, optional uncertain, and terminal writes.
+      // V2 needs the restore claim, optional restore uncertain, two handoff
+      // writes, and the launch claim, optional uncertain, and terminal writes:
+      // seven in total. Prove that budget before publishing restore authority.
+      revisionAfter(
+        session.revision,
+        input.request.contractVersion ===
+          RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2
+          ? 7
+          : 3,
+      );
       const authorityNow = await readAuthorityClock(transaction);
       ensure(
         timestampMilliseconds(authorityNow) >=
@@ -11475,6 +11561,10 @@ export class PostgresSessionAuthority {
       ensure(
         observed.operation.state === "prepared" &&
           observed.operation.revision === input.expectedOperationRevision,
+        "operation_transition_conflict",
+      );
+      ensure(
+        !isPreparedAtomicRestoreLaunchHandoff(session, observed),
         "operation_transition_conflict",
       );
       nextRevision(session.revision);

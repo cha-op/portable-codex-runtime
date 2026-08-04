@@ -1113,6 +1113,11 @@ The transaction exposes neither intermediate session revision. On rollback,
 none of the generation, terminal restore state, or launch reservation becomes
 visible. A lost commit acknowledgement is resolved by exact readback of both
 operations and the generation; replay cannot reserve a different attempt.
+Before restore dispatch can authorize physical publication, a version 2
+request proves a seven-revision budget for restore claim, optional restore
+uncertainty, both handoff writes, and the launch claim, uncertainty, and
+terminal transition. Version 1 keeps its independent three-revision restore
+budget.
 Before the first write, the fresh handoff also proves that the session revision
 can advance five times: twice for the handoff and three more for launch claim,
 uncertainty, and terminal completion. It therefore cannot commit a prepared
@@ -1162,6 +1167,14 @@ attempt. A `starting` or `uncertain` attempt only reconciles, and a committed
 attempt uses exact readback. The serialized `launchIntent` is therefore a
 durable correlation and full-measurement recovery binding, not a replacement
 for any image capability or a writer handle.
+
+The authority reconstructs the exact version 2 handoff from the terminal
+restore request, committed generation, launch intent, and same-transaction
+operation and reservation timestamps before accepting prepared cancellation.
+An exact atomic handoff is not cancellable; a generic reconciliation attempt
+without the matching image capability remains uncertain and leaves it
+prepared for `runPreparedLaunch()`. Standalone version 1 launch reservations
+retain their existing cancellation behavior.
 
 This slice intentionally does not verify a committed publication, route the
 coordinator's stop callback through PostgreSQL, join stop proof to capture,

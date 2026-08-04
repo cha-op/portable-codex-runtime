@@ -616,6 +616,9 @@ class MemoryLaunchAuthority {
     this.calls.cancel += 1;
     this.events.push("authority.cancel");
     assert.equal(this.state, "prepared");
+    if (this.behaviour.cancelPreparedHandoffConflict) {
+      throw new Error("prepared handoff cancellation conflict");
+    }
     this.state = "committed";
     this.terminalRevision = "1";
     this.result = {
@@ -986,6 +989,7 @@ function seedPreparedLaunchHandoff(
   };
   const expectedSession = preparedLaunchExpectedSession(value, generation);
   value.authority.beginNextAttempt({ expectedSession, generation });
+  value.authority.behaviour.cancelPreparedHandoffConflict = true;
   const request = createWriterLaunchAttemptOperationRequest({
     expectedSession,
     generation,
@@ -1435,10 +1439,13 @@ test("rejects a non-matching opaque image before claim, consumption, or cancella
   assert.equal(Object.isFrozen(stillIssued), true);
   assert.equal(value.inspectionCount, 3);
 
-  const cancelled = await value.facade.reconcileLaunchAttempt({
-    launchAttemptId: LAUNCH_ATTEMPT_ID,
-  });
-  assert.equal(cancelled.status, "cancelled-before-dispatch");
+  await assert.rejects(
+    value.facade.reconcileLaunchAttempt({
+      launchAttemptId: LAUNCH_ATTEMPT_ID,
+    }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.state, "prepared");
   assert.equal(value.authority.calls.cancel, 1);
   assert.equal(value.launchCalls, 0);
 });
@@ -2681,6 +2688,36 @@ test("prepared recovery cancels without image consumption or supervisor calls", 
   assert.equal(value.inspectionCount, 1);
   assert.equal(value.launchCalls, 0);
   assert.equal(value.reconcileCalls, 0);
+});
+
+test("prepared handoff recovery preserves the attempt for capability-bearing launch", async () => {
+  const value = await fixture();
+  seedPreparedLaunchHandoff(value);
+  const preparedReceipt = clone(value.authority.receipt());
+
+  await assert.rejects(
+    value.facade.reconcileLaunchAttempt({
+      launchAttemptId: LAUNCH_ATTEMPT_ID,
+    }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+
+  assert.equal(value.authority.state, "prepared");
+  assert.deepEqual(value.authority.receipt(), preparedReceipt);
+  assert.equal(value.authority.calls.cancel, 1);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
+  assert.equal(value.inspectionCount, 1);
+
+  const result = await value.facade.runPreparedLaunch(preparedRunInput(value));
+  assert.equal(result.status, "started");
+  assert.equal(result.writer !== null, true);
+  assert.equal(value.authority.calls.cancel, 1);
+  assert.equal(value.authority.calls.claim, 1);
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.launchCalls, 1);
 });
 
 for (const state of ["starting", "uncertain"]) {

@@ -70,6 +70,15 @@ capability.
   two revisions for the atomic handoff and three for the prepared attempt's
   claim, uncertainty, and terminal lifecycle. An attempt that cannot complete
   that lifecycle is rejected before any generation or session mutation.
+- Before version 2 restore dispatch authorizes physical publication, it
+  reserves the complete seven-revision worst case: restore claim and
+  uncertainty, both handoff writes, then launch claim, uncertainty, and
+  terminal completion. Version 1 keeps its three-revision restore boundary.
+- Prepared cancellation reconstructs the exact version 2 handoff provenance
+  from the terminal restore request, committed generation, launch intent, and
+  same-transaction operation records. A matching atomic handoff cannot be
+  retired by generic reconciliation; version 1 prepared work remains
+  cancellable.
 - The serialized launch intent is only correlation and recovery data. It does
   not recreate the original image reservation, consume it, or authorize a
   process launch by itself.

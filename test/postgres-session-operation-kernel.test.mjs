@@ -2488,6 +2488,7 @@ function restoreLaunchHandoffFixture({
   expectedSessionRevision = null,
   launchOperationId = LAUNCH_ATTEMPT_OPERATION_ID,
   restoreOperationId = RESTORE_OPERATION_ID,
+  restoreOperationRevision = "2",
 } = {}) {
   const restore = restoreGenerationFixture({
     expectedSessionRevision,
@@ -2496,7 +2497,7 @@ function restoreLaunchHandoffFixture({
   });
   const expectedSession = snapshotFromSessionRow(
     restoreGenerationCommittedSessionRow(restore, {
-      operationRevision: "2",
+      operationRevision: restoreOperationRevision,
     }),
   );
   const generation = writerLaunchGenerationSnapshot(restore);
@@ -2668,6 +2669,8 @@ function writerLaunchPhaseSessionRow(
 }
 
 function restoreLaunchHandoffActiveSteps(fixture) {
+  const restoreOperationRevision =
+    fixture.options.expectedSession.document.lastOperation.operationRevision;
   return [
     rows(
       writerLaunchPhaseSessionRow(fixture, "prepared", {
@@ -2688,7 +2691,7 @@ function restoreLaunchHandoffActiveSteps(fixture) {
     ),
     rows(
       restoreGenerationOperationRow(fixture.restore, "committed", {
-        revision: "2",
+        revision: restoreOperationRevision,
       }),
     ),
     rows(restoreGenerationReservationRow(fixture.restore, "released")),
@@ -2702,17 +2705,19 @@ function restoreLaunchHandoffWriteSteps(
   { finalSession = undefined } = {},
 ) {
   const restore = fixture.restore;
+  const restoreOperationRevision =
+    fixture.options.expectedSession.document.lastOperation.operationRevision;
   return [
     rows(restoreGenerationRow(restore, "committed")),
     rows(
       restoreGenerationOperationRow(restore, "committed", {
-        revision: "2",
+        revision: restoreOperationRevision,
       }),
     ),
     rows(restoreGenerationReservationRow(restore, "released")),
     rows(
       restoreGenerationCommittedSessionRow(restore, {
-        operationRevision: "2",
+        operationRevision: restoreOperationRevision,
       }),
     ),
     rows(
@@ -2783,12 +2788,14 @@ function writerLaunchBaseSessionRow(fixture) {
 }
 
 function writerLaunchBaseSteps(fixture) {
+  const restoreOperationRevision =
+    fixture.options.expectedSession.document.lastOperation.operationRevision;
   return [
     rows(writerLaunchBaseSessionRow(fixture)),
     rows({ operation_count: 0, reservation_count: 0 }),
     rows(
       restoreGenerationOperationRow(fixture.restore, "committed", {
-        revision: "2",
+        revision: restoreOperationRevision,
       }),
     ),
     rows(restoreGenerationReservationRow(fixture.restore, "released")),
@@ -2798,11 +2805,13 @@ function writerLaunchBaseSteps(fixture) {
 }
 
 function writerLaunchGenerationReferenceSteps(fixture) {
+  const restoreOperationRevision =
+    fixture.options.expectedSession.document.lastOperation.operationRevision;
   return [
     rows(restoreGenerationRow(fixture.restore, "committed")),
     rows(
       restoreGenerationOperationRow(fixture.restore, "committed", {
-        revision: "2",
+        revision: restoreOperationRevision,
       }),
     ),
     ...restoreCheckpointSourceSteps(fixture.restore),
@@ -2815,6 +2824,8 @@ function writerLaunchActiveSteps(
   state,
   { createdAt = LAUNCH_PREPARED_NOW } = {},
 ) {
+  const restoreOperationRevision =
+    fixture.options.expectedSession.document.lastOperation.operationRevision;
   const steps = [
     rows(writerLaunchPhaseSessionRow(fixture, state)),
     rows(writerLaunchOperationRow(fixture, state, { createdAt })),
@@ -2826,7 +2837,7 @@ function writerLaunchActiveSteps(
   steps.push(
     rows(
       restoreGenerationOperationRow(fixture.restore, "committed", {
-        revision: "2",
+        revision: restoreOperationRevision,
       }),
     ),
     rows(restoreGenerationReservationRow(fixture.restore, "released")),
@@ -8653,7 +8664,7 @@ test("writer launch claim rejects forged committed generation history and claime
   }
 });
 
-test("writer launch prepared intent remains readable and cancellable with a stale generation while claim fails before mutation", async () => {
+test("V1 writer launch prepared intent remains readable and cancellable with a stale generation while claim fails before mutation", async () => {
   const base = writerLaunchFixture();
   const fabricatedGeneration = {
     ...base.generation,
@@ -8759,6 +8770,7 @@ test("writer launch prepared intent remains readable and cancellable with a stal
   });
 
   assert.equal(reserved.acquired, true);
+  assert.equal(fixture.restore.request.contractVersion, 1);
   assert.equal(read.attempt.state, "prepared");
   assert.equal(read.launch, null);
   assert.equal(cancelled.cancelled, true);
@@ -10881,6 +10893,67 @@ test("restore-to-launch handoff acknowledgement loss replays the same prepared a
   clients[1].assertExhausted();
 });
 
+test("restore-to-launch prepared atomic handoff cannot be cancelled", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const reason = "caller-abandoned-before-launch-dispatch";
+  const { authority, clients } = authorityWithScripts(
+    restoreLaunchHandoffActiveSteps(fixture),
+  );
+
+  await assertAuthorityError(
+    authority.cancelPreparedOperation({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+      reason,
+    }),
+    { code: "operation_transition_conflict" },
+  );
+
+  assert.equal(fixture.restore.request.contractVersion, 2);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore-to-launch V2 candidate with non-atomic timestamps fails closed before cancellation", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const committedSteps = restoreLaunchHandoffActiveSteps(fixture);
+  const { authority, clients } = authorityWithScripts([
+    rows(
+      writerLaunchPhaseSessionRow(fixture, "prepared", {
+        updatedAt: LAUNCH_PREPARED_NOW,
+      }),
+    ),
+    rows(writerLaunchOperationRow(fixture, "prepared")),
+    rows(writerLaunchReservationRow(fixture, "prepared")),
+    ...committedSteps.slice(3),
+  ]);
+
+  await assertAuthorityError(
+    authority.cancelPreparedOperation({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+      reason: "caller-abandoned-before-launch-dispatch",
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(fixture.restore.request.contractVersion, 2);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
 test("restore-to-launch committed replay rejects completion drift without touching the prepared launch", async () => {
   const fixture = restoreLaunchHandoffFixture();
   const restore = fixture.restore;
@@ -10919,6 +10992,73 @@ test("restore-to-launch committed replay rejects completion drift without touchi
   clients[0].assertExhausted();
 });
 
+test("restore-to-launch replay rejects a historical cancelled prepared launch", async () => {
+  const fixture = restoreLaunchHandoffFixture();
+  const restore = fixture.restore;
+  const cancellation = cancellationResult(
+    "caller-abandoned-before-launch-dispatch",
+  );
+  const cancelledOperation = writerLaunchOperationRow(
+    fixture,
+    "committed",
+    {
+      createdAt: RESTORE_FINALIZE_NOW,
+      result: cancellation,
+      revision: "1",
+    },
+  );
+  const cancelledReservation = writerLaunchReservationRow(
+    fixture,
+    "released",
+    { createdAt: RESTORE_FINALIZE_NOW },
+  );
+  const cancelledSession = writerLaunchCommittedSessionRow(fixture, {
+    operationRevision: "1",
+    result: cancellation,
+  });
+  const terminalLaunchSteps = [
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(cancelledOperation),
+    rows(cancelledReservation),
+  ];
+  const { authority, clients } = authorityWithScripts([
+    rows(cancelledSession),
+    ...terminalLaunchSteps,
+    rows(
+      restoreGenerationOperationRow(restore, "committed", {
+        revision: "2",
+      }),
+    ),
+    rows(restoreGenerationReservationRow(restore, "released")),
+    rows(restoreGenerationRow(restore, "committed")),
+    ...restoreCheckpointSourceSteps(restore),
+    ...terminalLaunchSteps,
+  ]);
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+      {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: "1",
+        },
+      },
+    ),
+    { code: "operation_transition_conflict" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
 test("restore-to-launch handoff never backfills a separately committed generation", async () => {
   const fixture = restoreLaunchHandoffFixture();
   const restore = fixture.restore;
@@ -10945,6 +11085,477 @@ test("restore-to-launch handoff never backfills a separately committed generatio
     { code: "operation_transition_conflict" },
   );
 
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore generation V1 claim keeps the exact three-revision boundary", async (t) => {
+  await t.test("bigint max-3 reaches terminal through uncertainty", async () => {
+    const preparedRevision = MAX_POSTGRES_BIGINT - 3n;
+    const fixture = restoreGenerationFixture({
+      expectedSessionRevision: (preparedRevision - 1n).toString(),
+    });
+    const startingOperation = restoreGenerationOperationRow(
+      fixture,
+      "starting",
+    );
+    const startingReservation = restoreGenerationReservationRow(
+      fixture,
+      "starting",
+    );
+    const startingSession = restoreGenerationPhaseSessionRow(
+      fixture,
+      "starting",
+    );
+    const uncertainOperation = restoreGenerationOperationRow(
+      fixture,
+      "uncertain",
+    );
+    const uncertainReservation = restoreGenerationReservationRow(
+      fixture,
+      "uncertain",
+    );
+    const uncertainSession = restoreGenerationPhaseSessionRow(
+      fixture,
+      "uncertain",
+    );
+    const committedOperation = restoreGenerationOperationRow(
+      fixture,
+      "committed",
+    );
+    const committedReservation = restoreGenerationReservationRow(
+      fixture,
+      "released",
+    );
+    const committedSession = restoreGenerationCommittedSessionRow(fixture);
+    const { authority, clients } = authorityWithScripts(
+      {
+        options: {
+          authorityNow: RESTORE_AUTHORITY_NOW,
+          now: RESTORE_DISPATCH_NOW,
+        },
+        steps: [
+          ...restoreGenerationActiveSteps(fixture, "prepared"),
+          ...restoreCheckpointSourceSteps(fixture),
+          rows(restoreGenerationRow(fixture)),
+          rows(startingOperation),
+          rows(startingReservation),
+          rows(startingSession),
+        ],
+      },
+      {
+        options: { now: RESTORE_UNCERTAIN_NOW },
+        steps: [
+          ...restoreGenerationActiveSteps(fixture, "starting"),
+          rows(uncertainOperation),
+          rows(uncertainReservation),
+          rows(uncertainSession),
+        ],
+      },
+      {
+        options: { now: RESTORE_FINALIZE_NOW },
+        steps: [
+          ...restoreGenerationActiveSteps(fixture, "uncertain"),
+          rows(restoreGenerationRow(fixture, "committed")),
+          rows(committedOperation),
+          rows(committedReservation),
+          rows(committedSession),
+        ],
+      },
+    );
+
+    const claimed =
+      await authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: fixture.generationId,
+      });
+    const uncertain = await authority.markOperationUncertain({
+      ...fixture.options,
+      expectedOperationRevision: "1",
+    });
+    const finalized = await authority.finalizeRestoreDestinationGeneration({
+      ...fixture.options,
+      completion: fixture.completion,
+      expectedOperationRevision: "2",
+    });
+
+    assert.equal(fixture.request.contractVersion, 1);
+    assert.equal(
+      restoreGenerationPhaseSessionRow(fixture, "prepared").revision,
+      preparedRevision.toString(),
+    );
+    assert.equal(claimed.dispatchGranted, true);
+    assert.equal(
+      claimed.session.revision,
+      (preparedRevision + 1n).toString(),
+    );
+    assert.equal(uncertain.changed, true);
+    assert.equal(
+      uncertain.session.revision,
+      (preparedRevision + 2n).toString(),
+    );
+    assert.equal(finalized.finalized, true);
+    assert.equal(
+      finalized.session.revision,
+      MAX_POSTGRES_BIGINT.toString(),
+    );
+    for (const client of clients) client.assertExhausted();
+  });
+
+  await t.test("bigint max-2 rejects before authority publication", async () => {
+    const preparedRevision = MAX_POSTGRES_BIGINT - 2n;
+    const fixture = restoreGenerationFixture({
+      expectedSessionRevision: (preparedRevision - 1n).toString(),
+    });
+    const { authority, clients } = authorityWithScripts(
+      restoreGenerationActiveSteps(fixture, "prepared"),
+    );
+
+    await assertAuthorityError(
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: fixture.generationId,
+      }),
+      { code: "session_revision_exhausted" },
+    );
+
+    assert.equal(fixture.request.contractVersion, 1);
+    assert.equal(
+      restoreGenerationPhaseSessionRow(fixture, "prepared").revision,
+      preparedRevision.toString(),
+    );
+    assert.equal(
+      queryTexts(clients[0]).includes(READ_AUTHORITY_CLOCK_QUERY),
+      false,
+    );
+    assert.equal(
+      authorityQueries(clients[0]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[0].assertExhausted();
+  });
+});
+
+test("restore generation V2 claim rejects bigint max-6 before external publication", async () => {
+  const preparedRevision = MAX_POSTGRES_BIGINT - 6n;
+  const fixture = restoreLaunchHandoffFixture({
+    expectedSessionRevision: (preparedRevision - 1n).toString(),
+  });
+  const restore = fixture.restore;
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationActiveSteps(restore, "prepared"),
+  );
+
+  await assertAuthorityError(
+    authority.claimRestoreDestinationGenerationDispatch({
+      ...restore.options,
+      destinationIsolationProofId: restore.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: restore.generationId,
+    }),
+    { code: "session_revision_exhausted" },
+  );
+
+  assert.equal(restore.request.contractVersion, 2);
+  assert.equal(
+    restoreGenerationPhaseSessionRow(restore, "prepared").revision,
+    preparedRevision.toString(),
+  );
+  assert.equal(
+    queryTexts(clients[0]).includes(READ_AUTHORITY_CLOCK_QUERY),
+    false,
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore generation V2 claim at bigint max-7 covers both handoff routes", async (t) => {
+  const routes = [
+    {
+      name: "starting handoff",
+      restoreOperationRevision: "2",
+      restoreUncertain: false,
+    },
+    {
+      name: "restore-uncertain handoff",
+      restoreOperationRevision: "3",
+      restoreUncertain: true,
+    },
+  ];
+
+  for (const route of routes) {
+    await t.test(route.name, async () => {
+      const preparedRevision = MAX_POSTGRES_BIGINT - 7n;
+      const fixture = restoreLaunchHandoffFixture({
+        expectedSessionRevision: (preparedRevision - 1n).toString(),
+        restoreOperationRevision: route.restoreOperationRevision,
+      });
+      const restore = fixture.restore;
+      const restoreStartingOperation = restoreGenerationOperationRow(
+        restore,
+        "starting",
+      );
+      const restoreStartingReservation = restoreGenerationReservationRow(
+        restore,
+        "starting",
+      );
+      const restoreStartingSession = restoreGenerationPhaseSessionRow(
+        restore,
+        "starting",
+      );
+      const restoreUncertainOperation = restoreGenerationOperationRow(
+        restore,
+        "uncertain",
+      );
+      const restoreUncertainReservation = restoreGenerationReservationRow(
+        restore,
+        "uncertain",
+      );
+      const restoreUncertainSession = restoreGenerationPhaseSessionRow(
+        restore,
+        "uncertain",
+      );
+      const launchStartingOperation = writerLaunchOperationRow(
+        fixture,
+        "starting",
+        { createdAt: RESTORE_FINALIZE_NOW },
+      );
+      const launchStartingReservation = writerLaunchReservationRow(
+        fixture,
+        "starting",
+        { createdAt: RESTORE_FINALIZE_NOW },
+      );
+      const launchStartingSession = writerLaunchPhaseSessionRow(
+        fixture,
+        "starting",
+      );
+      const launchUncertainOperation = writerLaunchOperationRow(
+        fixture,
+        "uncertain",
+        { createdAt: RESTORE_FINALIZE_NOW },
+      );
+      const launchUncertainReservation = writerLaunchReservationRow(
+        fixture,
+        "uncertain",
+        { createdAt: RESTORE_FINALIZE_NOW },
+      );
+      const launchUncertainSession = writerLaunchPhaseSessionRow(
+        fixture,
+        "uncertain",
+      );
+      const evidence = writerLaunchEvidence(fixture);
+      const result = writerLaunchResult(fixture);
+      const launchCommittedOperation = writerLaunchOperationRow(
+        fixture,
+        "committed",
+        {
+          createdAt: RESTORE_FINALIZE_NOW,
+          result,
+          revision: "3",
+        },
+      );
+      const launchCommittedReservation = writerLaunchReservationRow(
+        fixture,
+        "released",
+        { createdAt: RESTORE_FINALIZE_NOW },
+      );
+      const launchCommittedSession = writerLaunchCommittedSessionRow(
+        fixture,
+        { operationRevision: "3", result },
+      );
+      const scripts = [
+        {
+          options: {
+            authorityNow: RESTORE_AUTHORITY_NOW,
+            now: RESTORE_DISPATCH_NOW,
+          },
+          steps: [
+            ...restoreGenerationActiveSteps(restore, "prepared"),
+            ...restoreCheckpointSourceSteps(restore),
+            rows(restoreGenerationRow(restore)),
+            rows(restoreStartingOperation),
+            rows(restoreStartingReservation),
+            rows(restoreStartingSession),
+          ],
+        },
+        ...(route.restoreUncertain
+          ? [
+              {
+                options: { now: RESTORE_UNCERTAIN_NOW },
+                steps: [
+                  ...restoreGenerationActiveSteps(restore, "starting"),
+                  rows(restoreUncertainOperation),
+                  rows(restoreUncertainReservation),
+                  rows(restoreUncertainSession),
+                ],
+              },
+            ]
+          : []),
+        {
+          options: { now: RESTORE_FINALIZE_NOW },
+          steps: [
+            ...restoreGenerationActiveSteps(
+              restore,
+              route.restoreUncertain ? "uncertain" : "starting",
+            ),
+            ...restoreLaunchHandoffWriteSteps(fixture),
+          ],
+        },
+        {
+          options: {
+            authorityNow: LAUNCH_DISPATCH_NOW,
+            now: LAUNCH_DISPATCH_NOW,
+          },
+          steps: [
+            ...restoreLaunchHandoffActiveSteps(fixture),
+            ...writerLaunchGenerationReferenceSteps(fixture),
+            rows(launchStartingOperation),
+            rows(launchStartingReservation),
+            rows(launchStartingSession),
+          ],
+        },
+        {
+          options: { now: LAUNCH_UNCERTAIN_NOW },
+          steps: [
+            ...writerLaunchActiveSteps(fixture, "starting", {
+              createdAt: RESTORE_FINALIZE_NOW,
+            }),
+            rows(launchUncertainOperation),
+            rows(launchUncertainReservation),
+            rows(launchUncertainSession),
+          ],
+        },
+        {
+          options: { now: LAUNCH_FINALIZE_NOW },
+          steps: [
+            ...writerLaunchActiveSteps(fixture, "uncertain", {
+              createdAt: RESTORE_FINALIZE_NOW,
+            }),
+            rows(launchCommittedOperation),
+            rows(launchCommittedReservation),
+            rows(launchCommittedSession),
+          ],
+        },
+      ];
+      const { authority, clients } = authorityWithScripts(...scripts);
+
+      const restoreClaimed =
+        await authority.claimRestoreDestinationGenerationDispatch({
+          ...restore.options,
+          destinationIsolationProofId:
+            restore.destinationIsolationProofId,
+          expectedOperationRevision: "0",
+          generationId: restore.generationId,
+        });
+      const restoreUncertain = route.restoreUncertain
+        ? await authority.markOperationUncertain({
+            ...restore.options,
+            expectedOperationRevision: "1",
+          })
+        : null;
+      const handoff =
+        await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+          {
+            launch: restore.launchIntent,
+            restore: {
+              ...restore.options,
+              completion: restore.completion,
+              expectedOperationRevision: route.restoreUncertain ? "2" : "1",
+            },
+          },
+        );
+      const launchClaimed = await authority.claimWriterLaunchAttemptDispatch({
+        ...fixture.options,
+        expectedOperationRevision: "0",
+      });
+      const launchUncertain = await authority.markOperationUncertain({
+        ...fixture.options,
+        expectedOperationRevision: "1",
+      });
+      const launchFinalized =
+        await authority.finalizeWriterLaunchAttemptStarted({
+          ...fixture.options,
+          evidence,
+          expectedOperationRevision: "2",
+        });
+
+      assert.equal(restore.request.contractVersion, 2);
+      assert.equal(
+        restoreGenerationPhaseSessionRow(restore, "prepared").revision,
+        preparedRevision.toString(),
+      );
+      assert.equal(restoreClaimed.dispatchGranted, true);
+      assert.equal(
+        restoreClaimed.session.revision,
+        (preparedRevision + 1n).toString(),
+      );
+      if (route.restoreUncertain) {
+        assert.equal(restoreUncertain.changed, true);
+        assert.equal(
+          restoreUncertain.session.revision,
+          (preparedRevision + 2n).toString(),
+        );
+      }
+      assert.equal(handoff.restore.finalized, true);
+      assert.equal(launchClaimed.dispatchGranted, true);
+      assert.equal(launchUncertain.changed, true);
+      assert.equal(launchFinalized.finalized, true);
+      assert.equal(launchFinalized.attempt.state, "committed");
+      assert.equal(
+        launchFinalized.session.revision,
+        (
+          preparedRevision + (route.restoreUncertain ? 7n : 6n)
+        ).toString(),
+      );
+      for (const client of clients) client.assertExhausted();
+    });
+  }
+});
+
+test("restore generation V2 committed replay remains available at bigint max", async () => {
+  const fixture = restoreGenerationFixture({
+    expectedSessionRevision: (MAX_POSTGRES_BIGINT - 3n).toString(),
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationCommittedSteps(fixture, {
+      operationRevision: "2",
+    }),
+  );
+
+  const replay =
+    await authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    });
+
+  assert.equal(fixture.request.contractVersion, 2);
+  assert.equal(replay.dispatchGranted, false);
+  assert.equal(replay.operation.state, "committed");
+  assert.equal(replay.generation.state, "committed");
+  assert.equal(replay.session.revision, MAX_POSTGRES_BIGINT.toString());
+  assert.equal(
+    queryTexts(clients[0]).includes(READ_AUTHORITY_CLOCK_QUERY),
+    false,
+  );
   assert.equal(
     authorityQueries(clients[0]).some((args) =>
       /^(?:INSERT|UPDATE) /u.test(queryText(args)),
