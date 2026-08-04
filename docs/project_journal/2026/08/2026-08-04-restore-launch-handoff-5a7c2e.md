@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-04
 updated: 2026-08-04
 branch: wip/restore-launch-handoff
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/26
 supersedes: []
 superseded_by:
 ---
