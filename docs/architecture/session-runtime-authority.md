@@ -8,7 +8,8 @@ The implemented authority provides:
 - database-authoritative transaction time;
 - bounded, provenance-aware serialization and deadlock retry;
 - an ordered, checksum-bound authority migration chain;
-- a permanent relational foundation for restore destination generations;
+- permanent relational and typed state-machine authority for restore
+  destination generations;
 - real-PostgreSQL migration and concurrency tests;
 - bounded OCI/Docker runnable-image inspection plus a one-use reservation
   capability;
@@ -30,10 +31,11 @@ lease, attachment, detach, and force-fence records in
 `ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, and `DETACHED`.
 The checkpoint slice binds stopped-writer clean capture to the operation,
 reservation, capture-attempt, tombstone, and catalogue tables. The migration
-chain now also installs the permanent relational identities and constraints
-needed by restore destination generations. It does not yet claim or finalize a
-generation. Subsequent authority slices will implement those typed
-transitions, durable launch attempts, and logical launcher composition.
+chain also installs the permanent relational identities and constraints needed
+by restore destination generations, while the typed authority claims and
+finalises one exact detached destination generation against a committed source
+checkpoint. Subsequent authority slices will implement durable launch attempts
+and logical launcher composition.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -68,12 +70,13 @@ operation kernel and typed writer lifecycle methods use the executor and
 schema to order reservation, lease allocation, attachment finalization,
 renewal, release, force-fence epoch advancement, and blocked reconciliation.
 The capture authority uses the same ordering boundary for exact attempt
-admission and catalogue finalization. The generation relation protects
-historical identity and cross-session linkage, but no generation row is
-authorizing until the later typed authority creates and finalizes it.
-Restore-destination and launcher transitions remain later slices. Physical
-exclusion evidence must be supplied by a capable storage backend or
-supervisor.
+admission and catalogue finalisation. The generation relation and typed
+restore-generation transitions protect historical identity, same-session
+linkage, single dispatch, exact finalisation, replay, and bounded recovery. A
+generation row authorises restore publication only after the typed claim
+commits; even a committed generation does not authorise a writer launch.
+Durable launch-attempt and launcher transitions remain later slices. Physical
+exclusion evidence must be supplied by a capable storage backend or supervisor.
 
 ## Implemented Canonical Session Registry
 
@@ -223,7 +226,8 @@ typed writer methods described below verify their own completion evidence and
 atomically combine the business-state update with operation finalization.
 Checkpoint catalogue finalization preserves that rule: it never calls a
 generic finalizer first and writes the catalogue in a second transaction.
-Future restore-destination and launch methods must preserve the same boundary.
+Typed restore-destination claim and finalisation preserve the same boundary.
+Future durable launch-attempt and launcher methods must preserve it as well.
 
 ## Implemented Writer Lease and Attachment Acquisition
 
@@ -482,9 +486,10 @@ The production checkpoint slice is deliberately capture-only. It reuses the
 version 1 authority schema without DDL and composes the existing session-wide
 operation/reservation kernel with `capture_attempt_claims`,
 `capture_attempt_tombstones`, and `checkpoint_catalogue`. Restore is not
-admitted by this slice: it fails closed until a later authority can name one
-canonical detached destination generation and bind its finalized state to
-logical launcher admission.
+admitted through this capture API. The separate typed restore-generation
+authority can name and finalise one canonical detached destination generation,
+but production restore still fails closed until durable logical launcher
+admission consumes that committed generation.
 
 Normal capture begins from the exact canonical `ATTACHED` session snapshot.
 Before publication, the authority uses database time to prove that the lease
@@ -735,12 +740,66 @@ session's permanent operation claim and checkpoint catalogue entry.
 `committed` rows must have both. The authority exposes no deletion or
 retirement API for these rows in this foundation.
 
-These constraints are necessary but not sufficient authority. This slice has
-no API that inserts or updates a generation row, does not change the canonical
-session document, and does not enable restore. The next typed slice must lock
-and validate the exact operation, session, catalogue, generation, destination
-isolation, and restore fence in one serializable transition before any
-publication callback can run.
+These constraints are necessary but not sufficient authority. The typed
+restore-generation layer now retains the backend's exact
+`{checkpoint, request}` admission unchanged inside an operation payload that
+also binds the contract version and predetermined result. The permanent
+operation envelope separately retains the complete expected session snapshot,
+including its lease, attachment, storage reference, revision, and terminal
+anchor.
+
+The `prepared -> starting` transition locks and revalidates the session,
+operation, reservation, source checkpoint catalogue, and generation relation
+in one serializable transaction. It requires an `ATTACHED` canonical session,
+an unexpired database-clock lease, an exact destination storage and fence, a
+clean committed source checkpoint, and a restore epoch strictly newer than the
+source epoch. The source checkpoint and destination request name the same
+backend and session but do not infer one another's storage identity.
+
+Fresh `generationId` and `destinationIsolationProofId` values enter only at
+this typed claim boundary. The generation binding retains those identities,
+the exact destination attachment and request, the full source checkpoint,
+capture-operation and attempt identities, and the checkpoint catalogue hash.
+`destinationState: "detached"` describes the isolated physical restore target;
+it does not change the canonical session lifecycle from `ATTACHED`. The proof
+ID is a durable correlation value rather than a self-authenticating
+capability, so later composition must obtain it from the trusted destination
+authority.
+
+Only a definitely committed claim returns `dispatchGranted: true`. A replay
+of `starting`, `uncertain`, or committed state returns the retained generation
+without authorising another publication. Exact finalisation may begin from
+`starting` or `uncertain` and atomically changes the generation to `committed`,
+retires the operation, releases the reservation, and advances the session
+terminal anchor. The committed document binds the source artefact proof, the
+`restore-destination` materialisation, and the predetermined restore result.
+Restore generation document v2 requires materialisation contract v3, which
+carries a domain-separated SHA-256 of the exact coordinator generation
+binding retained by the publication journal. Finalisation recomputes that
+digest from the locked generation before any write, so a materialisation from
+another operation, generation, isolation proof, reservation, or destination
+attachment cannot be spliced into the current predetermined result.
+Finalisation replay accepts only the same canonical document. The filesystem
+publication and stopped-directory backend may read-only replay a historical
+restore materialisation contract v2 after an upgrade, but this typed authority
+deliberately rejects that physical compatibility result because it lacks the
+coordinator-binding digest.
+
+Bounded recovery enumerates only retained `starting` or `uncertain`
+restore-generation operations whose exact authorised generation and source
+catalogue still validate. The generation relation has no deletion or
+retirement path. These transitions neither invoke publication inside a
+database transaction nor change the canonical session document version.
+Production restore remains disabled until a later durable launch-attempt and
+logical launcher composition consume the committed generation without
+weakening the no-second-writer boundary.
+
+The current capture-oriented stopped-directory backend still constructs its
+legacy restore journal binding from only checkpoint, isolation-proof, and
+reservation context. Production composition must instead pass the exact
+claimed generation binding as the publisher's coordinator binding before it
+can produce a materialisation accepted by generation document v2. Restore
+remains fail-closed until that composition exists.
 
 ## Platform Image Reservation
 
@@ -825,13 +884,15 @@ concrete Podman/Docker adapter must hold directory identity through the bind,
 enforce rootless execution, fix the Codex CLI/config surface, and register the
 exact writer with `StoppedWriterCapabilityCoordinator`.
 
-The schema can now retain restore destination generations, but it exposes no
-typed claim or finalization transition. Until the authority can name one
-detached destination as a canonical generation, finalize its exact restore
-result, and feed that generation into the same launcher admission transaction,
-the production checkpoint adapter rejects restore. A database table row,
-published directory, restore journal record, checkpoint descriptor, or
-catalogue entry alone is never writable-launch authority.
+The authority now exposes typed restore-generation claim, finalisation, exact
+read, replay, and bounded recovery transitions. Those transitions can name one
+detached destination as a canonical generation and commit its exact restore
+result, but they deliberately do not launch a writer. Until a durable launch
+attempt feeds that committed generation into the same logical launcher
+admission transaction, the production checkpoint adapter rejects restore. A
+database table row, published directory, restore journal record, checkpoint
+descriptor, catalogue entry, or committed generation alone is never
+writable-launch authority.
 
 ## Operational Boundary
 
@@ -905,9 +966,12 @@ exercises exact dispatch/finalization replay, uncertain-to-blocked recovery,
 and retained advanced epochs. Checkpoint-authority validation must cover exact
 fresh admission, global attempt and operation conflicts, tombstone rejection,
 single dispatch, publication outside the transaction, advisory-guard
-serialization, atomic catalogue and terminal finalization, acknowledgement
+serialization, atomic catalogue and terminal finalisation, acknowledgement
 loss, restart replay, committed-only source-free reconciliation, claim
-revalidation after verification, and relational corruption. Later authority
-slices must add restore-generation transition and launch transition tests.
+revalidation after verification, and relational corruption. Restore-generation
+tests cover exact claim and finalisation replay, replacement-storage admission,
+transaction rollback, acknowledgement loss, bounded recovery, and relational
+corruption. Later authority slices must add durable launch-attempt and logical
+launcher transition tests.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

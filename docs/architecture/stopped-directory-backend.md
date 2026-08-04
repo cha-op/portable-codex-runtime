@@ -180,10 +180,11 @@ committed publication whose catalogue finalization acknowledgement was lost.
 Transport-only `replayed` is not durable attempt authority; the canonical
 catalogue stores the verified artefact proof and materialisation separately.
 
-This repository defines and tests that seam. PostgreSQL session lease and
-checkpoint-catalogue authority are now implemented. A production
-crash-consistent physical backend plus canonical restore-destination and
-launcher-admission authority remain separate work.
+This repository defines and tests that seam. PostgreSQL session lease,
+checkpoint-catalogue, and typed restore-generation authority are now
+implemented. Production composition of the crash-consistent physical backend
+with the exact claimed generation binding, plus launcher admission, remains
+separate work.
 
 ## Capture Transaction
 
@@ -335,10 +336,19 @@ so an upgraded backend can still replay an exact committed restore started by
 the previous adapter version.
 
 The frozen restore completion contains `materialization`, `replayed`, and
-`result`. The authority must durably finalize launcher-visible destination
-state and return that same completion object before the backend reports
-success. A published path or journal record alone is not writable-launch
-authority.
+`result`. A fresh restore materialisation is contract v3 and carries the
+publication journal's digest of this adapter's exact v1 coordinator binding.
+For upgrade recovery, a completion with `replayed: true` may instead retain an
+exact historical contract v2 materialisation without that digest; the backend
+rejects the same v2 shape on a non-replayed outcome. This read-only physical
+replay does not make the legacy result admissible to a typed generation
+authority. The adapter's v1 coordinator projection is sufficient only for
+legacy adapter replay; it is not the complete typed generation binding required
+by PostgreSQL generation document v2. A later production composition must pass
+the exact claimed generation binding to the publisher. The authority must
+durably finalize launcher-visible destination state and return that same
+completion object before the backend reports success. A published path or
+journal record alone is not writable-launch authority.
 
 ## Callback and Uncertainty Contract
 

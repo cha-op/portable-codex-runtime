@@ -144,7 +144,7 @@ Restore and launcher authority are now split into four serial pull requests:
      generation and operation identities, cross-session-safe foreign keys, and
      fail-closed authorized/committed row shapes.
    - Do not claim, finalize, or authorize a generation in this slice.
-2. **Typed restore-generation authority**
+2. **Typed restore-generation authority (complete)**
    - Claim one canonical destination generation from an exact committed
      checkpoint, bind the restore fence and isolated destination, and finalize
      the predetermined restore result through typed PostgreSQL transitions.

@@ -15,6 +15,7 @@ import { acquireAdvisoryLock } from "./advisory-lock.mjs";
 import {
   FilesystemOperationJournal,
   OperationJournalError,
+  operationJournalBindingSha256,
   snapshotOperationJournalBinding,
 } from "./filesystem-operation-journal.mjs";
 import {
@@ -42,6 +43,7 @@ const reflectApply = Reflect.apply;
 export const STOPPED_DIRECTORY_ARTIFACT_VERSION = 1;
 
 const PUBLICATION_CONTRACT_VERSION = 2;
+const RESTORE_MATERIALIZATION_CONTRACT_VERSION = 3;
 const ARTIFACT_FORMAT = "portable-codex-stopped-directory";
 const LOCAL_DURABILITY_PROFILE = "local-fsync-rename";
 const PUBLICATION_CANDIDATE_PREFIX = ".publication-";
@@ -1052,20 +1054,50 @@ async function readArtifactManifest(path, expectedCheckpoint, expectedProof) {
 
 function validateMaterialization(
   value,
-  { artifactProof, committed = false, kind, operationId, finalName },
+  {
+    allowLegacyRestore = false,
+    artifactProof,
+    committed = false,
+    coordinatorBindingSha256,
+    kind,
+    operationId,
+    finalName,
+  },
 ) {
   const code = committed ? "published_state_invalid" : "publication_integrity_failed";
   const commitState = committed ? "committed" : "not-committed";
+  const restoreDestination = kind === "restore-destination";
+  const materialization = ownEnumerableObject(value, code);
+  // Restore contract v2 is a read-only upgrade path for durable journal
+  // replays. New materializations remain v3 and carry the coordinator digest.
+  const legacyRestore =
+    restoreDestination &&
+    allowLegacyRestore === true &&
+    materialization.contractVersion === PUBLICATION_CONTRACT_VERSION;
+  const expectedContractVersion = legacyRestore
+    ? PUBLICATION_CONTRACT_VERSION
+    : restoreDestination
+      ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
+      : PUBLICATION_CONTRACT_VERSION;
   const keys = [
     "contractVersion",
     "artifactManifestDigest",
+    ...(restoreDestination && !legacyRestore
+      ? ["coordinatorBindingSha256"]
+      : []),
     "modeledDigest",
     "publicationId",
     "publicationKind",
     "stagedRoot",
     "treeIdentityDigest",
   ];
-  const materialization = exactOptions(value, keys, keys, code);
+  const materializationKeys = Object.keys(materialization);
+  ensure(
+    materializationKeys.every((key) => keys.includes(key)) &&
+      keys.every((key) => Object.hasOwn(materialization, key)),
+    code,
+    commitState,
+  );
   const stagedRoot = exactOptions(
     materialization.stagedRoot,
     ["filesystemId", "objectIdentityScheme", "objectId"],
@@ -1073,7 +1105,7 @@ function validateMaterialization(
     code,
   );
   ensure(
-    materialization.contractVersion === PUBLICATION_CONTRACT_VERSION &&
+    materialization.contractVersion === expectedContractVersion &&
       materialization.publicationKind === kind &&
       materialization.publicationId === publicationId(operationId, finalName) &&
       typeof materialization.modeledDigest === "string" &&
@@ -1082,8 +1114,13 @@ function validateMaterialization(
       DIGEST_PATTERN.test(materialization.artifactManifestDigest) &&
       typeof materialization.treeIdentityDigest === "string" &&
       DIGEST_PATTERN.test(materialization.treeIdentityDigest) &&
-      (kind !== "restore-destination" ||
+      (!restoreDestination ||
         (artifactProof !== null &&
+          (legacyRestore ||
+            (typeof materialization.coordinatorBindingSha256 === "string" &&
+              DIGEST_PATTERN.test(materialization.coordinatorBindingSha256) &&
+              materialization.coordinatorBindingSha256 ===
+                coordinatorBindingSha256)) &&
           materialization.artifactManifestDigest ===
             artifactProof.artifactManifestDigest &&
           materialization.modeledDigest === artifactProof.modeledDigest)) &&
@@ -1105,6 +1142,7 @@ function validateMaterialization(
 
 function materializationFor({
   artifactManifestDigest,
+  coordinatorBindingSha256,
   filesystem,
   finalName,
   kind,
@@ -1113,9 +1151,13 @@ function materializationFor({
   operationId,
   treeIdentityDigest,
 }) {
+  const restoreDestination = kind === "restore-destination";
   return Object.freeze({
-    contractVersion: PUBLICATION_CONTRACT_VERSION,
+    contractVersion: restoreDestination
+      ? RESTORE_MATERIALIZATION_CONTRACT_VERSION
+      : PUBLICATION_CONTRACT_VERSION,
     artifactManifestDigest,
+    ...(restoreDestination ? { coordinatorBindingSha256 } : {}),
     modeledDigest,
     publicationId: publicationId(operationId, finalName),
     publicationKind: kind,
@@ -1274,10 +1316,10 @@ function normalizeJournalError(
   return createPublicationError("publication_io_failed", commitState);
 }
 
-function frozenOutcome(outcome) {
+function frozenOutcome(outcome, replayed = outcome.replayed) {
   return Object.freeze({
     materialization: outcome.record.materialization,
-    replayed: outcome.replayed,
+    replayed: replayed === true,
     result: outcome.record.result,
   });
 }
@@ -2674,6 +2716,10 @@ export class StoppedDirectoryPublication {
         request,
         result,
       });
+      const coordinatorBindingSha256 =
+        options.kind === "restore-destination"
+          ? operationJournalBindingSha256(journalInput.binding.coordinator)
+          : null;
       const runJournalObservableOperation = async (operation) => {
         const previousPublicationMayHaveOccurred = publicationMayHaveOccurred;
         publicationMayHaveOccurred = true;
@@ -2790,8 +2836,10 @@ export class StoppedDirectoryPublication {
       if (state === "committed") {
         commitState = "committed";
         const materialization = validateMaterialization(prepared.record.materialization, {
+          allowLegacyRestore: prepared.replayed === true,
           artifactProof,
           committed: true,
+          coordinatorBindingSha256,
           finalName,
           kind: options.kind,
           operationId,
@@ -2815,6 +2863,7 @@ export class StoppedDirectoryPublication {
           const created = await this.#materializeCandidate({
             candidatePath,
             checkpoint: prepared.record.result.checkpoint,
+            coordinatorBindingSha256,
             finalName,
             journalAuthority,
             journalIdentity,
@@ -2889,7 +2938,9 @@ export class StoppedDirectoryPublication {
         const materialization = validateMaterialization(
           materialized.record.materialization,
           {
+            allowLegacyRestore: prepared.replayed === true,
             artifactProof,
+            coordinatorBindingSha256,
             finalName,
             kind: options.kind,
             operationId,
@@ -3117,7 +3168,15 @@ export class StoppedDirectoryPublication {
           checkpoint: committed.record.result.checkpoint,
           materialization,
         });
-        successfulOutcome = frozenOutcome(committed);
+        // `replayed` reports whether this invocation reused durable operation
+        // state. A later transition may be fresh even though an earlier phase
+        // was replayed, so retain every authoritative journal replay signal.
+        successfulOutcome = frozenOutcome(
+          committed,
+          prepared.replayed === true ||
+            materialized.replayed === true ||
+            committed.replayed === true,
+        );
       }
     } catch (error) {
       const journalError = normalizeJournalError(error, {
@@ -3186,6 +3245,7 @@ export class StoppedDirectoryPublication {
     artifactProof,
     candidatePath,
     checkpoint,
+    coordinatorBindingSha256,
     finalName,
     journalAuthority,
     journalIdentity,
@@ -3489,6 +3549,7 @@ export class StoppedDirectoryPublication {
     }
     const materialization = materializationFor({
       artifactManifestDigest,
+      coordinatorBindingSha256,
       filesystem: targetFilesystem,
       finalName,
       kind,

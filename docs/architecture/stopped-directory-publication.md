@@ -186,6 +186,25 @@ before its first asynchronous publication-root lookup or queue wait. Caller
 mutation after invocation therefore cannot change the later durable journal
 record.
 
+Checkpoint materialisations remain contract v2. New restore materialisations
+use contract v3, which additionally retains a domain-separated SHA-256 of that
+exact snapshotted coordinator binding. A materialised or committed journal
+replay may retain a historical restore contract v2 materialisation so an
+upgrade can finish an operation written by the previous publication contract.
+That compatibility path is read-only, requires the journal operation to be a
+replay, validates the exact v2 shape and physical publication evidence, and
+never emits v2 for a fresh materialisation. Fresh publication and every v3
+replay recompute and compare the coordinator-binding digest before returning
+the record. The publication outcome's `replayed` flag is invocation-scoped: it
+is true when any exact durable journal phase was reused, even if a later phase
+was freshly advanced during the same call. Individual journal transition
+envelopes retain their transition-local replay semantics. The publication
+layer authenticates equality with the supplied
+binding; it does not decide whether a higher-layer restore binding is complete.
+A generation authority must therefore supply its exact claimed generation
+binding rather than a reduced backend-local projection, and must reject the
+legacy v2 replay result when its own document contract requires the v3 digest.
+
 The source and destination trees reject nested mount points. A backend that
 permits the declared source root itself to be a mounted volume must distinguish
 that approved root mount from mounts below it and must pin the applicable mount

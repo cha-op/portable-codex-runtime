@@ -6,15 +6,20 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  operationJournalBindingSha256,
+} from "../src/filesystem-operation-journal.mjs";
+import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
 import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
+  createRestoreDestinationGenerationOperationRequest,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
+  RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
@@ -40,6 +45,9 @@ const THIRD_CAPTURE_ATTEMPT_ID =
   "019f2100-0000-7000-8000-000000000006";
 const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "checkpoint-artifact-001";
+const RESTORE_OPERATION_ID = "restore-generation-operation-001";
+const RESTORE_GENERATION_ID = "restore-generation-001";
+const DESTINATION_ISOLATION_PROOF_ID = "destination-isolation-proof-001";
 const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const STOP_OPERATION_ID = "stop-operation-001";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
@@ -64,6 +72,12 @@ const CAPTURE_DISPATCH_NOW = "2026-07-29T12:35:02.000Z";
 const CAPTURE_AUTHORITY_NOW = "2026-07-29T12:35:02.500Z";
 const CAPTURE_UNCERTAIN_NOW = "2026-07-29T12:35:03.000Z";
 const CAPTURE_FINALIZE_NOW = "2026-07-29T12:35:04.000Z";
+const RESTORE_PREPARED_NOW = "2026-07-29T12:35:10.000Z";
+const RESTORE_DISPATCH_NOW = "2026-07-29T12:35:11.000Z";
+const RESTORE_AUTHORITY_NOW = "2026-07-29T12:35:11.500Z";
+const RESTORE_UNCERTAIN_NOW = "2026-07-29T12:35:12.000Z";
+const RESTORE_FINALIZE_NOW = "2026-07-29T12:35:13.000Z";
+const RESTORE_CANCEL_NOW = "2026-07-29T12:35:14.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
@@ -121,6 +135,25 @@ const LIST_CHECKPOINT_CAPTURE_RECOVERY_AFTER_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.operation_claims",
   "WHERE kind = 'checkpoint-capture-v1'",
+  "AND state IN ('starting', 'uncertain')",
+  "AND retired_at IS NULL",
+  "AND session_id > $1::uuid",
+  "ORDER BY session_id ASC",
+  "LIMIT $2::integer",
+].join(" ");
+const LIST_RESTORE_GENERATION_RECOVERY_FIRST_PAGE_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.operation_claims",
+  "WHERE kind = 'restore-destination-generation-v1'",
+  "AND state IN ('starting', 'uncertain')",
+  "AND retired_at IS NULL",
+  "ORDER BY session_id ASC",
+  "LIMIT $1::integer",
+].join(" ");
+const LIST_RESTORE_GENERATION_RECOVERY_AFTER_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.operation_claims",
+  "WHERE kind = 'restore-destination-generation-v1'",
   "AND state IN ('starting', 'uncertain')",
   "AND retired_at IS NULL",
   "AND session_id > $1::uuid",
@@ -261,6 +294,17 @@ const CHECKPOINT_CATALOGUE_COLUMNS = [
   "document",
   "committed_at",
 ].join(", ");
+const RESTORE_GENERATION_COLUMNS = [
+  "generation_id",
+  "operation_id",
+  "session_id",
+  "checkpoint_id",
+  "state",
+  "binding",
+  "document",
+  "claimed_at",
+  "committed_at",
+].join(", ");
 const READ_CAPTURE_ATTEMPT_QUERY = [
   `SELECT ${CAPTURE_ATTEMPT_COLUMNS}`,
   "FROM session_authority.capture_attempt_claims",
@@ -299,6 +343,31 @@ const INSERT_CHECKPOINT_CATALOGUE_QUERY = [
   "VALUES ($1, $2::uuid, $3::uuid, $4::jsonb, $5)",
   "ON CONFLICT DO NOTHING",
   `RETURNING ${CHECKPOINT_CATALOGUE_COLUMNS}`,
+].join(" ");
+const READ_RESTORE_GENERATION_BY_OPERATION_QUERY = [
+  `SELECT ${RESTORE_GENERATION_COLUMNS}`,
+  "FROM session_authority.restore_destination_generations",
+  "WHERE operation_id = $1",
+].join(" ");
+const READ_RESTORE_GENERATION_BY_ID_QUERY = [
+  `SELECT ${RESTORE_GENERATION_COLUMNS}`,
+  "FROM session_authority.restore_destination_generations",
+  "WHERE generation_id = $1",
+].join(" ");
+const INSERT_RESTORE_GENERATION_QUERY = [
+  "INSERT INTO session_authority.restore_destination_generations",
+  "(generation_id, operation_id, session_id, checkpoint_id, state,",
+  "binding, document, claimed_at, committed_at)",
+  "VALUES ($1, $2, $3::uuid, $4, 'authorized', $5::jsonb, NULL, $6, NULL)",
+  "ON CONFLICT DO NOTHING",
+  `RETURNING ${RESTORE_GENERATION_COLUMNS}`,
+].join(" ");
+const COMMIT_RESTORE_GENERATION_QUERY = [
+  "UPDATE session_authority.restore_destination_generations",
+  "SET state = 'committed', document = $2::jsonb, committed_at = $3",
+  "WHERE operation_id = $1 AND state = 'authorized'",
+  "AND document IS NULL AND committed_at IS NULL",
+  `RETURNING ${RESTORE_GENERATION_COLUMNS}`,
 ].join(" ");
 const TRANSACTION_INFRASTRUCTURE_QUERIES = new Set([
   "DISCARD ALL",
@@ -1702,6 +1771,479 @@ function checkpointCaptureAttemptRecord(
     result: fixture.request.predeterminedResult,
     state,
   };
+}
+
+function restoreCurrentWriterFixture({
+  checkpoint,
+  sessionId,
+  storageId = "volume-001",
+  suffix,
+}) {
+  const previousOptions = reserveOptions({
+    expectedSession: sessionSnapshot({
+      sessionId,
+      sessionDocument: document(sessionId, {
+        storageRef: storageRef(sessionId, storageId),
+      }),
+    }),
+    operationId: `restore-anchor-previous-${suffix}`,
+    request: operationRequest({ checkpointId: `restore-anchor-${suffix}` }),
+  });
+  const previousResult = cancellationResult(`restore-anchor-${suffix}`);
+  const anchorExpectedSession = sessionSnapshot({
+    sessionId,
+    revision: "2",
+    sessionDocument: document(sessionId, {
+      storageRef: storageRef(sessionId, storageId),
+      writerEpoch: checkpoint.sourceFencingEpoch,
+      lastOperation: terminalPointer({
+        options: previousOptions,
+        operationRevision: "1",
+        result: previousResult,
+      }),
+    }),
+  });
+  const anchorOptions = reserveOptions({
+    expectedSession: anchorExpectedSession,
+    operationId: `restore-anchor-current-${suffix}`,
+    request: operationRequest({
+      checkpointId: `restore-anchor-current-${suffix}`,
+    }),
+  });
+  const anchorResult = cancellationResult(
+    `restore-anchor-current-${suffix}`,
+  );
+  const expectedSession = sessionSnapshot({
+    sessionId,
+    revision: "4",
+    sessionDocument: document(sessionId, {
+      storageRef: storageRef(sessionId, storageId),
+      writerEpoch: checkpoint.sourceFencingEpoch,
+      lastOperation: terminalPointer({
+        options: anchorOptions,
+        operationRevision: "1",
+        result: anchorResult,
+      }),
+    }),
+  });
+  const options = writerAcquireOptions({
+    expectedSession,
+    operationId: `restore-writer-${suffix}`,
+  });
+  const lease = writerLease(options);
+  const result = writerAttachmentResult(options, lease, {
+    mutationResult: writerMutationResult(options, lease, {
+      proofId: `restore-writer-proof-${suffix}`,
+      rootPath: `/var/lib/portable-codex/restore-${suffix}`,
+    }),
+    attachment: writerAttachment(options, lease, {
+      proofId: `restore-writer-proof-${suffix}`,
+      rootPath: `/var/lib/portable-codex/restore-${suffix}`,
+    }),
+  });
+  const session = writerAttachedSessionRow({ options, lease, result });
+  return {
+    committedOperation: writerCommittedOperationRow({
+      options,
+      lease,
+      result,
+    }),
+    expectedSession: snapshotFromSessionRow(session),
+    lease,
+    options,
+    releasedReservation: reservationRow("released", {
+      options,
+      updatedAt: FINAL,
+      releasedAt: FINAL,
+    }),
+    result,
+    session,
+  };
+}
+
+function restoreGenerationFixture({
+  destinationStorageId = "volume-001",
+  destinationIsolationProofId = DESTINATION_ISOLATION_PROOF_ID,
+  generationId = RESTORE_GENERATION_ID,
+  operationId = RESTORE_OPERATION_ID,
+  sessionId = SESSION_ID,
+  suffix = sessionId.slice(-3),
+} = {}) {
+  const captureAttemptId =
+    sessionId === SESSION_ID
+      ? CAPTURE_ATTEMPT_ID
+      : sessionId === OTHER_SESSION_ID
+        ? OTHER_CAPTURE_ATTEMPT_ID
+        : THIRD_CAPTURE_ATTEMPT_ID;
+  const source = checkpointCaptureFixture({
+    artifactId:
+      sessionId === SESSION_ID ? ARTIFACT_ID : `checkpoint-artifact-${suffix}`,
+    captureAttemptId,
+    checkpointId:
+      sessionId === SESSION_ID ? CHECKPOINT_ID : `checkpoint-${suffix}`,
+    operationId:
+      sessionId === SESSION_ID
+        ? CAPTURE_OPERATION_ID
+        : `checkpoint-source-capture-${suffix}`,
+    processIncarnationId: `restore-source-process-${suffix}`,
+    publicationId: `restore-source-publication-${suffix}`,
+    sessionId,
+    stopOperationId: `restore-source-stop-${suffix}`,
+    writerIncarnationId: `restore-source-writer-incarnation-${suffix}`,
+    writerOperationId:
+      sessionId === SESSION_ID
+        ? OPERATION_ID
+        : `checkpoint-source-writer-${suffix}`,
+  });
+  const writer = restoreCurrentWriterFixture({
+    checkpoint: source.checkpoint,
+    sessionId,
+    storageId: destinationStorageId,
+    suffix,
+  });
+  const mutationRequest = {
+    backendId: writer.expectedSession.document.storageRef.backendId,
+    contractVersion: 1,
+    fencingEpoch: writer.lease.fencingEpoch,
+    holderId: writer.lease.holderId,
+    leaseId: writer.lease.leaseId,
+    operation: "restore",
+    operationId,
+    sessionId,
+    storageId: writer.expectedSession.document.storageRef.storageId,
+    target: {
+      artifactId: source.checkpoint.artifactId,
+      checkpointId: source.checkpoint.checkpointId,
+      kind: "checkpoint",
+    },
+  };
+  const admission = {
+    checkpoint: structuredClone(source.checkpoint),
+    request: mutationRequest,
+  };
+  const request = createRestoreDestinationGenerationOperationRequest({
+    admission,
+    expectedSession: writer.expectedSession,
+  });
+  const options = {
+    expectedSession: writer.expectedSession,
+    kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    operationId,
+    request,
+  };
+  const fixture = {
+    admission,
+    destinationIsolationProofId,
+    generationId,
+    mutationRequest,
+    options,
+    request,
+    source,
+    writer,
+  };
+  const completion = {
+    materialization: {
+      artifactManifestDigest:
+        source.completion.artifactProof.artifactManifestDigest,
+      coordinatorBindingSha256:
+        operationJournalBindingSha256(restoreGenerationBinding(fixture)),
+      contractVersion: 3,
+      modeledDigest: source.completion.artifactProof.modeledDigest,
+      publicationId: `restore-destination-publication-${suffix}`,
+      publicationKind: "restore-destination",
+      stagedRoot: {
+        filesystemId: `restore-filesystem-${suffix}`,
+        objectIdentityScheme: "test-object-id-v1",
+        objectId: `restore-object-${suffix}`,
+      },
+      treeIdentityDigest: "e".repeat(64),
+    },
+    replayed: false,
+    result: request.predeterminedResult,
+  };
+  return { ...fixture, completion };
+}
+
+function restoreGenerationBinding(fixture) {
+  return {
+    attachment: structuredClone(
+      fixture.options.expectedSession.document.attachment,
+    ),
+    captureAttemptId: fixture.source.request.admission.captureAttemptId,
+    captureOperationId: fixture.source.options.operationId,
+    catalogueSha256: sha256(
+      JSON.stringify(checkpointCatalogueDocument(fixture.source)),
+    ),
+    checkpoint: structuredClone(fixture.source.checkpoint),
+    contractVersion: 1,
+    destinationIsolationProofId: fixture.destinationIsolationProofId,
+    destinationState: "detached",
+    generationId: fixture.generationId,
+    request: structuredClone(fixture.mutationRequest),
+    reservationId: operationBinding(fixture.options).reservationId,
+  };
+}
+
+function restoreGenerationDocument(fixture, completion = fixture.completion) {
+  return {
+    artifactProof: structuredClone(fixture.source.completion.artifactProof),
+    contractVersion: 2,
+    materialization: structuredClone(completion.materialization),
+    result: structuredClone(completion.result),
+  };
+}
+
+function restoreGenerationRow(
+  fixture,
+  state = "authorized",
+  overrides = {},
+) {
+  return {
+    generation_id: fixture.generationId,
+    operation_id: fixture.options.operationId,
+    session_id: fixture.options.expectedSession.sessionId,
+    checkpoint_id: fixture.source.checkpoint.checkpointId,
+    state,
+    binding: restoreGenerationBinding(fixture),
+    document:
+      state === "committed" ? restoreGenerationDocument(fixture) : null,
+    claimed_at: new Date(RESTORE_DISPATCH_NOW),
+    committed_at:
+      state === "committed" ? new Date(RESTORE_FINALIZE_NOW) : null,
+    ...overrides,
+  };
+}
+
+function restoreGenerationTerminalResult(fixture, completion = fixture.completion) {
+  return {
+    catalogueSha256: sha256(
+      JSON.stringify(checkpointCatalogueDocument(fixture.source)),
+    ),
+    checkpointId: fixture.source.checkpoint.checkpointId,
+    generationDocumentSha256: sha256(
+      JSON.stringify(restoreGenerationDocument(fixture, completion)),
+    ),
+    generationId: fixture.generationId,
+    outcome: "restore-generation-committed",
+    resultVersion: 1,
+  };
+}
+
+function restoreGenerationOperationRow(
+  fixture,
+  state,
+  {
+    completion = fixture.completion,
+    revision =
+      state === "prepared"
+        ? "0"
+        : state === "starting"
+          ? "1"
+          : state === "uncertain"
+            ? "2"
+            : "3",
+    updatedAt =
+      state === "prepared"
+        ? RESTORE_PREPARED_NOW
+        : state === "starting"
+          ? RESTORE_DISPATCH_NOW
+          : state === "uncertain"
+            ? RESTORE_UNCERTAIN_NOW
+            : RESTORE_FINALIZE_NOW,
+    result =
+      state === "committed"
+        ? restoreGenerationTerminalResult(fixture, completion)
+        : null,
+  } = {},
+) {
+  return operationRow(state, {
+    options: fixture.options,
+    revision,
+    createdAt: RESTORE_PREPARED_NOW,
+    updatedAt,
+    result,
+    retiredAt: state === "committed" ? updatedAt : null,
+  });
+}
+
+function restoreGenerationReservationRow(
+  fixture,
+  state,
+  {
+    updatedAt =
+      state === "prepared"
+        ? RESTORE_PREPARED_NOW
+        : state === "starting"
+          ? RESTORE_DISPATCH_NOW
+          : state === "uncertain"
+            ? RESTORE_UNCERTAIN_NOW
+            : RESTORE_FINALIZE_NOW,
+  } = {},
+) {
+  return reservationRow(state, {
+    options: fixture.options,
+    createdAt: RESTORE_PREPARED_NOW,
+    updatedAt,
+    releasedAt: state === "released" ? updatedAt : null,
+  });
+}
+
+function restoreGenerationPhaseSessionRow(fixture, state) {
+  const operationRevision =
+    state === "prepared" ? "0" : state === "starting" ? "1" : "2";
+  const updatedAt =
+    state === "prepared"
+      ? RESTORE_PREPARED_NOW
+      : state === "starting"
+        ? RESTORE_DISPATCH_NOW
+        : RESTORE_UNCERTAIN_NOW;
+  return sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(fixture.options.expectedSession.sessionId, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: activeOperation(state, {
+        options: fixture.options,
+        operationRevision,
+      }),
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function restoreGenerationCommittedSessionRow(
+  fixture,
+  { completion = fixture.completion, operationRevision = "3" } = {},
+) {
+  const result = restoreGenerationTerminalResult(fixture, completion);
+  return sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(fixture.options.expectedSession.sessionId, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options: fixture.options,
+        operationRevision,
+        result,
+      }),
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt: RESTORE_FINALIZE_NOW,
+  });
+}
+
+function restoreCheckpointSourceSteps(fixture) {
+  return [
+    rows(checkpointCatalogueRow(fixture.source)),
+    rows(checkpointCaptureAttemptRow(fixture.source)),
+    rows(checkpointCaptureOperationRow(fixture.source, "committed")),
+    rows(checkpointCaptureReservationRow(fixture.source, "released")),
+    rows(checkpointCaptureAttemptRow(fixture.source)),
+    rows(),
+    rows(checkpointCatalogueRow(fixture.source)),
+  ];
+}
+
+function restoreGenerationActiveSteps(
+  fixture,
+  state,
+  { generation = undefined } = {},
+) {
+  const durableGeneration =
+    generation === undefined
+      ? state === "prepared"
+        ? null
+        : restoreGenerationRow(fixture)
+      : generation;
+  const steps = [
+    rows(restoreGenerationPhaseSessionRow(fixture, state)),
+    rows(restoreGenerationOperationRow(fixture, state)),
+    rows(restoreGenerationReservationRow(fixture, state)),
+    durableGeneration === null ? rows() : rows(durableGeneration),
+  ];
+  if (state !== "prepared") {
+    steps.push(...restoreCheckpointSourceSteps(fixture));
+  }
+  steps.push(
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+  );
+  return steps;
+}
+
+function restoreGenerationCommittedSteps(
+  fixture,
+  { completion = fixture.completion, operationRevision = "3" } = {},
+) {
+  return [
+    rows(
+      restoreGenerationCommittedSessionRow(fixture, {
+        completion,
+        operationRevision,
+      }),
+    ),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(
+      restoreGenerationOperationRow(fixture, "committed", {
+        completion,
+        revision: operationRevision,
+      }),
+    ),
+    rows(restoreGenerationReservationRow(fixture, "released")),
+    rows(restoreGenerationRow(fixture, "committed", {
+      document: restoreGenerationDocument(fixture, completion),
+    })),
+    ...restoreCheckpointSourceSteps(fixture),
+  ];
+}
+
+function restoreGenerationCancelledFixture(fixture) {
+  const reason = "caller-abandoned-before-restore-dispatch";
+  const result = cancellationResult(reason);
+  const operation = restoreGenerationOperationRow(fixture, "committed", {
+    revision: "1",
+    updatedAt: RESTORE_CANCEL_NOW,
+    result,
+  });
+  const reservation = restoreGenerationReservationRow(fixture, "released", {
+    updatedAt: RESTORE_CANCEL_NOW,
+  });
+  const session = sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (BigInt(fixture.options.expectedSession.revision) + 2n).toString(),
+    sessionDocument: document(fixture.options.expectedSession.sessionId, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options: fixture.options,
+        operationRevision: "1",
+        result,
+      }),
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt: RESTORE_CANCEL_NOW,
+  });
+  return { operation, reason, reservation, result, session };
+}
+
+function restoreGenerationCancelledSteps(fixture, cancelled) {
+  return [
+    rows(cancelled.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(cancelled.operation),
+    rows(cancelled.reservation),
+    rows(),
+  ];
 }
 
 function checkpointCaptureActiveSteps(fixture, state) {
@@ -4672,6 +5214,7 @@ test("all typed operation kinds and generic dispatch bypasses reject invalid inp
   const acquire = writerAcquireOptions();
   const fixture = writerAcquiredFixture();
   const capture = checkpointCaptureFixture();
+  const restore = restoreGenerationFixture();
   const release = writerReleaseOptions(fixture);
   const fence = writerForceFenceOptions(fixture);
   const fenceEpoch = (
@@ -4713,6 +5256,11 @@ test("all typed operation kinds and generic dispatch bypasses reject invalid inp
     () =>
       authority.claimOperationDispatch({
         ...capture.options,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.claimOperationDispatch({
+        ...restore.options,
         expectedOperationRevision: "0",
       }),
     () =>
@@ -6544,6 +7092,977 @@ test("uncertain force-fence accepts one exact proof and rejects a different repl
     false,
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation request builder owns the exact canonical admission and predetermined result", () => {
+  const fixture = restoreGenerationFixture();
+  const replay = createRestoreDestinationGenerationOperationRequest({
+    admission: fixture.admission,
+    expectedSession: fixture.options.expectedSession,
+  });
+
+  assert.equal(
+    RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    "restore-destination-generation-v1",
+  );
+  assert.deepEqual(replay, fixture.request);
+  assert.deepEqual(Reflect.ownKeys(replay.admission), [
+    "checkpoint",
+    "request",
+  ]);
+  assert.equal(
+    replay.predeterminedResult.mutation.proofId,
+    `proof-restore-${sha256(
+      `restore-destination-proof:${RESTORE_OPERATION_ID}`,
+    )}`,
+  );
+  assert.deepEqual(
+    replay.predeterminedResult.checkpoint,
+    canonicalPayload(fixture.source.checkpoint),
+  );
+  assertDeepFrozen(replay);
+
+  for (const admission of [
+    { ...fixture.admission, extra: true },
+    {
+      ...fixture.admission,
+      request: {
+        ...fixture.mutationRequest,
+        fencingEpoch: fixture.source.checkpoint.sourceFencingEpoch,
+      },
+    },
+    {
+      ...fixture.admission,
+      checkpoint: {
+        ...fixture.source.checkpoint,
+        checkpointClass: "crash-prefix",
+      },
+    },
+  ]) {
+    assert.throws(
+      () =>
+        createRestoreDestinationGenerationOperationRequest({
+          admission,
+          expectedSession: fixture.options.expectedSession,
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+});
+
+test("restore generation claim accepts an exact checkpoint from replacement destination storage", async () => {
+  const fixture = restoreGenerationFixture({
+    destinationStorageId: "volume-restore-002",
+  });
+  const startingOperation = restoreGenerationOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = restoreGenerationReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: RESTORE_AUTHORITY_NOW,
+      now: RESTORE_DISPATCH_NOW,
+    },
+    steps: [
+      ...restoreGenerationActiveSteps(fixture, "prepared"),
+      ...restoreCheckpointSourceSteps(fixture),
+      rows(restoreGenerationRow(fixture)),
+      rows(startingOperation),
+      rows(startingReservation),
+      rows(startingSession),
+    ],
+  });
+
+  const claimed =
+    await authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    });
+
+  assert.notEqual(
+    fixture.source.checkpoint.storageId,
+    fixture.options.expectedSession.document.storageRef.storageId,
+  );
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(
+    claimed.generation.binding.checkpoint.storageId,
+    fixture.source.checkpoint.storageId,
+  );
+  assert.equal(
+    claimed.generation.binding.request.storageId,
+    fixture.options.expectedSession.document.storageRef.storageId,
+  );
+  assert.deepEqual(
+    claimed.generation.binding,
+    canonicalPayload(restoreGenerationBinding(fixture)),
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore generation claim rejects non-storage source identity drift before mutation", async (t) => {
+  const cases = [
+    {
+      name: "session incarnation",
+      mutate(sourceSession) {
+        sourceSession.createdAt = "2026-07-29T12:34:56.790Z";
+      },
+    },
+    {
+      name: "immutable manifest",
+      mutate(sourceSession) {
+        sourceSession.document.manifest.codex.historyMode = "legacy";
+      },
+    },
+    {
+      name: "backend capabilities",
+      mutate(sourceSession) {
+        sourceSession.document.backendCapabilities.fencing = "manual";
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const fixture = restoreGenerationFixture({
+        destinationStorageId: "volume-restore-002",
+      });
+      scenario.mutate(fixture.source.options.expectedSession);
+      const sourceSteps = restoreCheckpointSourceSteps(fixture);
+      const { authority, clients } = authorityWithScripts({
+        options: {
+          authorityNow: RESTORE_AUTHORITY_NOW,
+          now: RESTORE_DISPATCH_NOW,
+        },
+        steps: [
+          ...restoreGenerationActiveSteps(fixture, "prepared"),
+          ...sourceSteps.slice(0, 3),
+        ],
+      });
+
+      await assertAuthorityError(
+        authority.claimRestoreDestinationGenerationDispatch({
+          ...fixture.options,
+          destinationIsolationProofId:
+            fixture.destinationIsolationProofId,
+          expectedOperationRevision: "0",
+          generationId: fixture.generationId,
+        }),
+        { code: "operation_state_invalid" },
+      );
+
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+      clients[0].assertExhausted();
+    });
+  }
+});
+
+test("restore generation dispatch grants once, starting finalization commits once, and exact reads replay", async () => {
+  const fixture = restoreGenerationFixture();
+  const preparedOperation = restoreGenerationOperationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedReservation = restoreGenerationReservationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "prepared",
+  );
+  const startingOperation = restoreGenerationOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = restoreGenerationReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const committedOperation = restoreGenerationOperationRow(
+    fixture,
+    "committed",
+    { revision: "2" },
+  );
+  const committedReservation = restoreGenerationReservationRow(
+    fixture,
+    "released",
+  );
+  const committedSession = restoreGenerationCommittedSessionRow(fixture, {
+    operationRevision: "2",
+  });
+  const conflictingCompletion = {
+    ...fixture.completion,
+    materialization: {
+      ...fixture.completion.materialization,
+      treeIdentityDigest: "f".repeat(64),
+    },
+    replayed: true,
+  };
+  let insertedBinding;
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: RESTORE_PREPARED_NOW },
+      steps: [
+        rows(fixture.writer.session),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(fixture.writer.committedOperation),
+        rows(fixture.writer.releasedReservation),
+        rows(),
+        rows(preparedOperation),
+        rows(preparedReservation),
+        rows(preparedSession),
+      ],
+    },
+    {
+      options: {
+        authorityNow: RESTORE_AUTHORITY_NOW,
+        now: RESTORE_DISPATCH_NOW,
+      },
+      steps: [
+        ...restoreGenerationActiveSteps(fixture, "prepared"),
+        ...restoreCheckpointSourceSteps(fixture),
+        (args) => {
+          assert.equal(queryText(args), INSERT_RESTORE_GENERATION_QUERY);
+          insertedBinding = JSON.parse(args[0].values[4]);
+          return rows(
+            restoreGenerationRow(fixture, "authorized", {
+              binding: insertedBinding,
+            }),
+          );
+        },
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    restoreGenerationActiveSteps(fixture, "starting"),
+    {
+      options: { now: RESTORE_FINALIZE_NOW },
+      steps: [
+        ...restoreGenerationActiveSteps(fixture, "starting"),
+        rows(restoreGenerationRow(fixture, "committed")),
+        rows(committedOperation),
+        rows(committedReservation),
+        rows(committedSession),
+      ],
+    },
+    restoreGenerationCommittedSteps(fixture, { operationRevision: "2" }),
+    restoreGenerationCommittedSteps(fixture, { operationRevision: "2" }),
+    [
+      rows(restoreGenerationRow(fixture, "committed")),
+      rows(committedOperation),
+      ...restoreGenerationCommittedSteps(fixture, {
+        operationRevision: "2",
+      }),
+    ],
+  );
+
+  const reserved = await authority.reserveOperation(fixture.options);
+  const claimed =
+    await authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    });
+  const claimReplay =
+    await authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    });
+  const finalized = await authority.finalizeRestoreDestinationGeneration({
+    ...fixture.options,
+    completion: fixture.completion,
+    expectedOperationRevision: "1",
+  });
+  const replayed = await authority.finalizeRestoreDestinationGeneration({
+    ...fixture.options,
+    completion: { ...fixture.completion, replayed: true },
+    expectedOperationRevision: "1",
+  });
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGeneration({
+      ...fixture.options,
+      completion: conflictingCompletion,
+      expectedOperationRevision: "1",
+    }),
+    { code: "operation_result_conflict" },
+  );
+  const read = await authority.readRestoreDestinationGeneration({
+    checkpoint: fixture.source.checkpoint,
+    generationId: fixture.generationId,
+    request: fixture.mutationRequest,
+  });
+
+  assert.equal(reserved.acquired, true);
+  assert.equal(reserved.operation.state, "prepared");
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(claimed.authorityNow, RESTORE_AUTHORITY_NOW);
+  assert.equal(claimed.generation.state, "authorized");
+  assert.deepEqual(insertedBinding, restoreGenerationBinding(fixture));
+  assert.equal(
+    claimed.generation.binding.destinationIsolationProofId,
+    fixture.destinationIsolationProofId,
+  );
+  assert.equal(claimReplay.dispatchGranted, false);
+  assert.deepEqual(claimReplay.generation, claimed.generation);
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.operation.revision, "2");
+  assert.equal(finalized.generation.state, "committed");
+  assert.equal(replayed.finalized, false);
+  assert.deepEqual(replayed.generation, finalized.generation);
+  assert.equal(read.status, "committed");
+  assert.deepEqual(read.generation, finalized.generation);
+  assertDeepFrozen(finalized);
+  assertDeepFrozen(read);
+
+  const claimTexts = authorityQueries(clients[1]).map(queryText);
+  const readGenerationForUpdateQuery =
+    `${READ_RESTORE_GENERATION_BY_OPERATION_QUERY} FOR UPDATE`;
+  assert.equal(
+    claimTexts.includes(readGenerationForUpdateQuery),
+    true,
+  );
+  assert.ok(
+    claimTexts.indexOf(INSERT_RESTORE_GENERATION_QUERY) <
+      claimTexts.indexOf(START_OPERATION_QUERY),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[1]).filter((args) =>
+      [readGenerationForUpdateQuery, INSERT_RESTORE_GENERATION_QUERY]
+        .includes(queryText(args)),
+    ),
+    [
+      extendedQuery(readGenerationForUpdateQuery, [
+        fixture.options.operationId,
+      ]),
+      extendedQuery(INSERT_RESTORE_GENERATION_QUERY, [
+        fixture.generationId,
+        fixture.options.operationId,
+        fixture.options.expectedSession.sessionId,
+        fixture.source.checkpoint.checkpointId,
+        JSON.stringify(canonicalPayload(restoreGenerationBinding(fixture))),
+        RESTORE_DISPATCH_NOW,
+      ]),
+    ],
+  );
+  assert.deepEqual(
+    authorityQueries(clients[2]).filter(
+      (args) => queryText(args) === readGenerationForUpdateQuery,
+    ),
+    [
+      extendedQuery(readGenerationForUpdateQuery, [
+        fixture.options.operationId,
+      ]),
+    ],
+  );
+  const finalizeTexts = authorityQueries(clients[3]).map(queryText);
+  assert.ok(
+    finalizeTexts.indexOf(COMMIT_RESTORE_GENERATION_QUERY) <
+      finalizeTexts.indexOf(COMMIT_ACTIVE_OPERATION_QUERY),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[3]).filter((args) =>
+      [readGenerationForUpdateQuery, COMMIT_RESTORE_GENERATION_QUERY]
+        .includes(queryText(args)),
+    ),
+    [
+      extendedQuery(readGenerationForUpdateQuery, [
+        fixture.options.operationId,
+      ]),
+      extendedQuery(COMMIT_RESTORE_GENERATION_QUERY, [
+        fixture.options.operationId,
+        JSON.stringify(restoreGenerationDocument(fixture)),
+        RESTORE_FINALIZE_NOW,
+      ]),
+    ],
+  );
+  assert.equal(
+    authorityQueries(clients[2]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.deepEqual(
+    authorityQueries(clients[6]).map(queryText).slice(0, 2),
+    [READ_RESTORE_GENERATION_BY_ID_QUERY, READ_OPERATION_QUERY],
+  );
+  assert.deepEqual(
+    authorityQueries(clients[6]).filter((args) =>
+      [
+        READ_RESTORE_GENERATION_BY_ID_QUERY,
+        READ_RESTORE_GENERATION_BY_OPERATION_QUERY,
+      ].includes(queryText(args)),
+    ),
+    [
+      extendedQuery(READ_RESTORE_GENERATION_BY_ID_QUERY, [
+        fixture.generationId,
+      ]),
+      extendedQuery(READ_RESTORE_GENERATION_BY_OPERATION_QUERY, [
+        fixture.options.operationId,
+      ]),
+    ],
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation finalization rejects materialization bound to another generation", async () => {
+  const fixture = restoreGenerationFixture();
+  const foreign = restoreGenerationFixture({
+    destinationIsolationProofId: "destination-isolation-proof-foreign",
+    generationId: "restore-generation-foreign",
+    operationId: "restore-generation-operation-foreign",
+  });
+  const completion = {
+    ...fixture.completion,
+    materialization: structuredClone(foreign.completion.materialization),
+  };
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationActiveSteps(fixture, "starting"),
+  );
+
+  await assertAuthorityError(
+    authority.finalizeRestoreDestinationGeneration({
+      ...fixture.options,
+      completion,
+      expectedOperationRevision: "1",
+    }),
+    { code: "invalid_operation_request" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore generation binding validation ignores poisoned JSON and hash intrinsics", async () => {
+  const fixture = restoreGenerationFixture();
+  const foreign = restoreGenerationFixture({
+    destinationIsolationProofId: "destination-isolation-proof-poisoned",
+    generationId: "restore-generation-poisoned",
+    operationId: "restore-generation-operation-poisoned",
+  });
+  const completion = {
+    ...fixture.completion,
+    materialization: {
+      ...foreign.completion.materialization,
+      coordinatorBindingSha256: "0".repeat(64),
+    },
+  };
+  const { authority, clients } = authorityWithScripts(
+    restoreGenerationActiveSteps(fixture, "starting"),
+  );
+  const hashPrototype = Object.getPrototypeOf(createHash("sha256"));
+  const stringifyDescriptor = Object.getOwnPropertyDescriptor(
+    JSON,
+    "stringify",
+  );
+  const updateDescriptor = Object.getOwnPropertyDescriptor(
+    hashPrototype,
+    "update",
+  );
+  const digestDescriptor = Object.getOwnPropertyDescriptor(
+    hashPrototype,
+    "digest",
+  );
+  let poisonedStringifyCalls = 0;
+  let poisonedUpdateCalls = 0;
+  let poisonedDigestCalls = 0;
+
+  try {
+    Object.defineProperty(JSON, "stringify", {
+      ...stringifyDescriptor,
+      value() {
+        poisonedStringifyCalls += 1;
+        return "{}";
+      },
+    });
+    Object.defineProperty(hashPrototype, "update", {
+      ...updateDescriptor,
+      value() {
+        poisonedUpdateCalls += 1;
+        return this;
+      },
+    });
+    Object.defineProperty(hashPrototype, "digest", {
+      ...digestDescriptor,
+      value() {
+        poisonedDigestCalls += 1;
+        return "0".repeat(64);
+      },
+    });
+
+    await assertAuthorityError(
+      authority.finalizeRestoreDestinationGeneration({
+        ...fixture.options,
+        completion,
+        expectedOperationRevision: "1",
+      }),
+      { code: "invalid_operation_request" },
+    );
+  } finally {
+    Object.defineProperty(JSON, "stringify", stringifyDescriptor);
+    Object.defineProperty(hashPrototype, "update", updateDescriptor);
+    Object.defineProperty(hashPrototype, "digest", digestDescriptor);
+  }
+
+  assert.equal(poisonedStringifyCalls, 0);
+  assert.equal(poisonedUpdateCalls, 0);
+  assert.equal(poisonedDigestCalls, 0);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore generation committed read rejects a tampered materialization binding digest", async () => {
+  const fixture = restoreGenerationFixture();
+  const completion = {
+    ...fixture.completion,
+    materialization: {
+      ...fixture.completion.materialization,
+      coordinatorBindingSha256: "f".repeat(64),
+    },
+  };
+  const { authority, clients } = authorityWithScripts([
+    rows(
+      restoreGenerationRow(fixture, "committed", {
+        document: restoreGenerationDocument(fixture, completion),
+      }),
+    ),
+    rows(
+      restoreGenerationOperationRow(fixture, "committed", {
+        completion,
+        revision: "2",
+      }),
+    ),
+    ...restoreGenerationCommittedSteps(fixture, {
+      completion,
+      operationRevision: "2",
+    }),
+  ]);
+
+  await assertAuthorityError(
+    authority.readRestoreDestinationGeneration({
+      checkpoint: fixture.source.checkpoint,
+      generationId: fixture.generationId,
+      request: fixture.mutationRequest,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore generation starting and committed replays reject mismatched generation identity without mutation", async () => {
+  const fixture = restoreGenerationFixture();
+  const cases = [
+    {
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      generationId: "restore-generation-conflict",
+      state: "starting",
+    },
+    {
+      destinationIsolationProofId: "destination-isolation-proof-conflict",
+      generationId: fixture.generationId,
+      state: "starting",
+    },
+    {
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      generationId: "restore-generation-conflict",
+      state: "committed",
+    },
+    {
+      destinationIsolationProofId: "destination-isolation-proof-conflict",
+      generationId: fixture.generationId,
+      state: "committed",
+    },
+  ];
+  const { authority, clients } = authorityWithScripts(
+    ...cases.map(({ state }) =>
+      state === "starting"
+        ? restoreGenerationActiveSteps(fixture, state)
+        : restoreGenerationCommittedSteps(fixture),
+    ),
+  );
+
+  for (const identity of cases) {
+    await assertAuthorityError(
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId:
+          identity.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: identity.generationId,
+      }),
+      { code: "restore_generation_identity_conflict" },
+    );
+  }
+
+  for (const client of clients) {
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    assert.equal(queryTexts(client).includes("ROLLBACK"), true);
+    client.assertExhausted();
+  }
+});
+
+test("restore generation uncertain finalization accepts the exact authorized generation", async () => {
+  const fixture = restoreGenerationFixture();
+  const committedOperation = restoreGenerationOperationRow(
+    fixture,
+    "committed",
+  );
+  const committedReservation = restoreGenerationReservationRow(
+    fixture,
+    "released",
+  );
+  const committedSession = restoreGenerationCommittedSessionRow(fixture);
+  const { authority, clients } = authorityWithScripts({
+    options: { now: RESTORE_FINALIZE_NOW },
+    steps: [
+      ...restoreGenerationActiveSteps(fixture, "uncertain"),
+      rows(restoreGenerationRow(fixture, "committed")),
+      rows(committedOperation),
+      rows(committedReservation),
+      rows(committedSession),
+    ],
+  });
+
+  const finalized = await authority.finalizeRestoreDestinationGeneration({
+    ...fixture.options,
+    completion: fixture.completion,
+    expectedOperationRevision: "2",
+  });
+
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.operation.state, "committed");
+  assert.equal(finalized.operation.revision, "3");
+  assert.equal(finalized.generation.state, "committed");
+  clients[0].assertExhausted();
+});
+
+test("restore generation prepared cancellation never creates or later authorizes a generation", async () => {
+  const fixture = restoreGenerationFixture();
+  const cancelled = restoreGenerationCancelledFixture(fixture);
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: RESTORE_CANCEL_NOW },
+      steps: [
+        ...restoreGenerationActiveSteps(fixture, "prepared"),
+        rows(cancelled.operation),
+        rows(cancelled.reservation),
+        rows(cancelled.session),
+      ],
+    },
+    restoreGenerationCancelledSteps(fixture, cancelled),
+  );
+
+  const receipt = await authority.cancelPreparedOperation({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+    reason: cancelled.reason,
+  });
+  await assertAuthorityError(
+    authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    }),
+    { code: "restore_generation_not_authorized" },
+  );
+
+  assert.equal(receipt.cancelled, true);
+  assert.equal(receipt.operation.result.outcome, "cancelled-before-dispatch");
+  for (const client of clients) {
+    assert.equal(
+      authorityQueries(client).some(
+        (args) => queryText(args) === INSERT_RESTORE_GENERATION_QUERY,
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
+test("restore generation with an absent catalogue source remains readable and cancellable while prepared", async () => {
+  const fixture = restoreGenerationFixture();
+  const preparedOperation = restoreGenerationOperationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedReservation = restoreGenerationReservationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "prepared",
+  );
+  const cancelled = restoreGenerationCancelledFixture(fixture);
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: RESTORE_PREPARED_NOW },
+      steps: [
+        rows(fixture.writer.session),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(fixture.writer.committedOperation),
+        rows(fixture.writer.releasedReservation),
+        rows(),
+        rows(preparedOperation),
+        rows(preparedReservation),
+        rows(preparedSession),
+      ],
+    },
+    restoreGenerationActiveSteps(fixture, "prepared"),
+    {
+      options: { now: RESTORE_CANCEL_NOW },
+      steps: [
+        ...restoreGenerationActiveSteps(fixture, "prepared"),
+        rows(cancelled.operation),
+        rows(cancelled.reservation),
+        rows(cancelled.session),
+      ],
+    },
+  );
+
+  const reserved = await authority.reserveOperation(fixture.options);
+  const reconciled = await authority.reconcileOperation(fixture.options);
+  const receipt = await authority.cancelPreparedOperation({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+    reason: cancelled.reason,
+  });
+
+  assert.equal(reserved.acquired, true);
+  assert.equal(reconciled.status, "prepared");
+  assert.equal(reconciled.operation.operationId, fixture.options.operationId);
+  assert.equal(receipt.cancelled, true);
+  assert.equal(receipt.operation.result.outcome, "cancelled-before-dispatch");
+  assert.equal(
+    clients.flatMap(authorityQueries).some((args) =>
+      queryText(args).startsWith(READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY),
+    ),
+    false,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation relation corruption fails closed before phase mutation", async () => {
+  const fixture = restoreGenerationFixture();
+  const corruptGeneration = restoreGenerationRow(fixture, "authorized", {
+    binding: {
+      ...restoreGenerationBinding(fixture),
+      captureOperationId: "substituted-capture-operation",
+    },
+  });
+  const steps = restoreGenerationActiveSteps(fixture, "starting", {
+    generation: corruptGeneration,
+  }).slice(0, -2);
+  const { authority, clients } = authorityWithScripts(steps);
+
+  await assertAuthorityError(
+    authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    }),
+    { code: "operation_state_invalid" },
+  );
+
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  clients[0].assertExhausted();
+});
+
+test("restore generation recovery pagination returns exact frozen authorized candidates", async () => {
+  const second = restoreGenerationFixture({
+    destinationIsolationProofId: "destination-isolation-proof-002",
+    generationId: "restore-generation-002",
+    operationId: "restore-generation-operation-002",
+    sessionId: OTHER_SESSION_ID,
+  });
+  const third = restoreGenerationFixture({
+    destinationIsolationProofId: "destination-isolation-proof-003",
+    generationId: "restore-generation-003",
+    operationId: "restore-generation-operation-003",
+    sessionId: THIRD_SESSION_ID,
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      rows(
+        restoreGenerationOperationRow(second, "starting"),
+        restoreGenerationOperationRow(third, "uncertain"),
+      ),
+      ...restoreGenerationActiveSteps(second, "starting"),
+      ...restoreGenerationActiveSteps(third, "uncertain"),
+    ],
+    [
+      rows(restoreGenerationOperationRow(third, "uncertain")),
+      ...restoreGenerationActiveSteps(third, "uncertain"),
+    ],
+    [rows()],
+  );
+
+  const firstPage =
+    await authority.listRestoreDestinationGenerationRecoveryCandidates({
+      afterSessionId: SESSION_ID,
+      limit: 1,
+    });
+  const secondPage =
+    await authority.listRestoreDestinationGenerationRecoveryCandidates({
+      afterSessionId: firstPage.nextAfterSessionId,
+      limit: 1,
+    });
+  const emptyFirstPage =
+    await authority.listRestoreDestinationGenerationRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+    });
+
+  assert.deepEqual(firstPage, {
+    candidates: [
+      {
+        checkpoint: second.request.admission.checkpoint,
+        generationId: second.generationId,
+        request: second.request.admission.request,
+      },
+    ],
+    nextAfterSessionId: OTHER_SESSION_ID,
+  });
+  assert.deepEqual(secondPage, {
+    candidates: [
+      {
+        checkpoint: third.request.admission.checkpoint,
+        generationId: third.generationId,
+        request: third.request.admission.request,
+      },
+    ],
+    nextAfterSessionId: null,
+  });
+  assert.deepEqual(emptyFirstPage, {
+    candidates: [],
+    nextAfterSessionId: null,
+  });
+  assertDeepFrozen(firstPage);
+  assertDeepFrozen(secondPage);
+  assert.deepEqual(
+    authorityQueries(clients[0])[0],
+    extendedQuery(LIST_RESTORE_GENERATION_RECOVERY_AFTER_QUERY, [
+      SESSION_ID,
+      2,
+    ]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[1])[0],
+    extendedQuery(LIST_RESTORE_GENERATION_RECOVERY_AFTER_QUERY, [
+      OTHER_SESSION_ID,
+      2,
+    ]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[2])[0],
+    extendedQuery(LIST_RESTORE_GENERATION_RECOVERY_FIRST_PAGE_QUERY, [2]),
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation typed APIs reject non-exact contracts before PostgreSQL", async () => {
+  const fixture = restoreGenerationFixture();
+  const { authority, pool } = authorityWithScripts();
+  const cases = [
+    () =>
+      authority.listRestoreDestinationGenerationRecoveryCandidates({
+        afterSessionId: null,
+        limit: 1,
+        extra: true,
+      }),
+    () =>
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: fixture.generationId,
+        extra: true,
+      }),
+    () =>
+      authority.finalizeRestoreDestinationGeneration({
+        ...fixture.options,
+        completion: { ...fixture.completion, extra: true },
+        expectedOperationRevision: "1",
+      }),
+    () =>
+      authority.readRestoreDestinationGeneration({
+        checkpoint: fixture.source.checkpoint,
+        generationId: fixture.generationId,
+        request: fixture.mutationRequest,
+        extra: true,
+      }),
+  ];
+
+  for (const invoke of cases) {
+    await assertAuthorityError(invoke(), {
+      code: "invalid_operation_request",
+    });
+  }
+  assert.equal(pool.connectCalls, 0);
 });
 
 test("checkpoint capture request builder owns the exact predetermined proof", () => {

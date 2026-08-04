@@ -6,6 +6,9 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  operationJournalBindingSha256,
+} from "../src/filesystem-operation-journal.mjs";
+import {
   PostgresCheckpointMutationAuthorityError,
   createPostgresCheckpointMutationAuthority,
 } from "../src/postgres-checkpoint-mutation-authority.mjs";
@@ -19,12 +22,14 @@ import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
+  RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
   WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
+  createRestoreDestinationGenerationOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -766,6 +771,43 @@ function commitAcknowledgementLossAfterQueryPool(
   });
 }
 
+function firstMatchingQueryResultFailurePool(pool, label, matches) {
+  let failed = false;
+
+  return Object.freeze({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        connection: client.connection,
+        async query(...args) {
+          const input = args[0];
+          const text =
+            typeof input === "string" ? input : input?.text;
+          const result = await Reflect.apply(
+            client.query,
+            client,
+            args,
+          );
+          if (
+            !failed &&
+            typeof text === "string" &&
+            matches(text)
+          ) {
+            failed = true;
+            throw new Error(
+              `synthetic ${label} failure after query result`,
+            );
+          }
+          return result;
+        },
+        release(...args) {
+          return Reflect.apply(client.release, client, args);
+        },
+      };
+    },
+  });
+}
+
 function assertIdentityConflict(error) {
   assert.ok(error instanceof PostgresSessionAuthorityError);
   assert.equal(error.name, "PostgresSessionAuthorityError");
@@ -792,6 +834,15 @@ function assertCommitOutcomeUncertain(error) {
     error.code,
     "transaction_commit_outcome_uncertain",
   );
+  assert.equal(error.commitState, "uncertain");
+  assert.equal(error.retryable, false);
+  assert.equal("cause" in error, false);
+  return true;
+}
+
+function assertTransactionBoundaryLost(error) {
+  assert.ok(error instanceof PostgresSerializableStoreError);
+  assert.equal(error.code, "transaction_boundary_lost");
   assert.equal(error.commitState, "uncertain");
   assert.equal(error.retryable, false);
   assert.equal("cause" in error, false);
@@ -902,6 +953,20 @@ async function attachWriter(authority, registered, options) {
     ...structuredClone(input),
     expectedOperationRevision: "1",
     ...attachmentEvidence(starting.mutationRequest),
+  });
+}
+
+async function releaseWriter(authority, attached) {
+  const input = writerReleaseInput(attached.session);
+  await authority.reserveOperation(input);
+  const starting = await authority.claimWriterReleaseDispatch({
+    ...structuredClone(input),
+    expectedOperationRevision: "0",
+  });
+  return authority.finalizeWriterRelease({
+    ...structuredClone(input),
+    expectedOperationRevision: "1",
+    mutationResult: detachEvidence(starting.mutationRequest),
   });
 }
 
@@ -1043,6 +1108,147 @@ function checkpointOperationInput(expectedSession, admission) {
       expectedSession,
     }),
   };
+}
+
+function restoreGenerationAdmission(
+  attached,
+  checkpoint,
+  {
+    operationId = `restore-operation-${randomUUID()}`,
+  } = {},
+) {
+  const { lease, storageRef } = attached.session.document;
+  return {
+    checkpoint,
+    request: {
+      backendId: storageRef.backendId,
+      contractVersion: 1,
+      fencingEpoch: lease.fencingEpoch,
+      holderId: lease.holderId,
+      leaseId: lease.leaseId,
+      operation: "restore",
+      operationId,
+      sessionId: attached.session.sessionId,
+      storageId: storageRef.storageId,
+      target: {
+        artifactId: checkpoint.artifactId,
+        checkpointId: checkpoint.checkpointId,
+        kind: "checkpoint",
+      },
+    },
+  };
+}
+
+function restoreGenerationOperationInput(expectedSession, admission) {
+  return {
+    expectedSession,
+    kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    operationId: admission.request.operationId,
+    request: createRestoreDestinationGenerationOperationRequest({
+      admission,
+      expectedSession,
+    }),
+  };
+}
+
+function restoreGenerationCompletion(input, claimed, replayed) {
+  const artifactProof = claimed.catalogue.document.artifactProof;
+  return {
+    materialization: {
+      artifactManifestDigest: artifactProof.artifactManifestDigest,
+      contractVersion: 3,
+      coordinatorBindingSha256: operationJournalBindingSha256(
+        claimed.generation.binding,
+      ),
+      modeledDigest: artifactProof.modeledDigest,
+      publicationId: `restore-publication-${input.operationId}`,
+      publicationKind: "restore-destination",
+      stagedRoot: {
+        filesystemId: "integration-restore-filesystem",
+        objectIdentityScheme: "integration-restore-object-v1",
+        objectId: `restore-object-${input.operationId}`,
+      },
+      treeIdentityDigest: "e".repeat(64),
+    },
+    replayed,
+    result: input.request.predeterminedResult,
+  };
+}
+
+async function prepareRestoreGenerationFixture(
+  authority,
+  checkpointAuthority,
+  sessionId,
+) {
+  const registered = await authority.registerSession(
+    registrationInput(sessionId),
+  );
+  const sourceAttachment = await attachWriter(authority, registered, {
+    leaseDurationMilliseconds: 300_000,
+  });
+  const captureAdmission = checkpointCaptureAdmission(sourceAttachment);
+  const captureCompletion = await checkpointAuthority.runCapture(
+    captureAdmission,
+    async (context) => checkpointCompletion(context, false),
+  );
+  const captureTerminal = await authority.reconcileOperation(
+    checkpointOperationInput(
+      sourceAttachment.session,
+      captureAdmission,
+    ),
+  );
+  assertOperationReceipt(captureTerminal, "committed");
+  const released = await releaseWriter(authority, captureTerminal);
+  const attached = await attachWriter(authority, released.session, {
+    leaseDurationMilliseconds: 300_000,
+  });
+  assert.equal(
+    BigInt(attached.session.document.lease.fencingEpoch) >
+      BigInt(captureAdmission.checkpoint.sourceFencingEpoch),
+    true,
+  );
+  return {
+    attached,
+    captureCompletion,
+    checkpoint: captureAdmission.checkpoint,
+  };
+}
+
+async function readRestoreGenerationTransactionState(
+  client,
+  operationId,
+) {
+  const result = await client.query(
+    [
+      "SELECT s.revision::text AS session_revision,",
+      "s.document AS session_document,",
+      "s.updated_at AS session_updated_at,",
+      "o.state AS operation_state,",
+      "o.revision::text AS operation_revision,",
+      "o.result AS operation_result,",
+      "o.updated_at AS operation_updated_at,",
+      "o.retired_at AS operation_retired_at,",
+      "r.state AS reservation_state,",
+      "r.updated_at AS reservation_updated_at,",
+      "r.released_at AS reservation_released_at,",
+      "g.generation_id, g.state AS generation_state,",
+      "g.binding AS generation_binding,",
+      "g.document AS generation_document,",
+      "g.claimed_at AS generation_claimed_at,",
+      "g.committed_at AS generation_committed_at",
+      "FROM session_authority.operation_claims o",
+      "JOIN session_authority.sessions s",
+      "ON s.session_id = o.session_id",
+      "JOIN session_authority.reservations r",
+      "ON r.operation_id = o.operation_id",
+      "LEFT JOIN session_authority.restore_destination_generations g",
+      "ON g.operation_id = o.operation_id",
+      "WHERE o.operation_id = $1",
+    ].join(" "),
+    [operationId],
+  );
+  assert.equal(result.rows.length, 1);
+  return result.rows[0];
 }
 
 function integrationArtifactPaths({ checkpoint }) {
@@ -1681,6 +1887,13 @@ test(
     t.after(async () => {
       try {
         if (sessionIds.length > 0) {
+          await pool.query(
+            [
+              "DELETE FROM session_authority.restore_destination_generations",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
           await pool.query(
             [
               "DELETE FROM session_authority.checkpoint_catalogue",
@@ -4795,6 +5008,515 @@ test(
         assertOperationReceipt(terminal, "committed");
         assert.equal(terminal.operation.revision, "2");
         assert.deepEqual(terminal.operation, committed.operation);
+      },
+    );
+
+    await t.test(
+      "restore destination generation mutations roll back with their operation state",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const input = restoreGenerationOperationInput(
+          fixture.attached.session,
+          admission,
+        );
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        const generationId = `restore-generation-${randomUUID()}`;
+        const claimInput = {
+          ...structuredClone(input),
+          destinationIsolationProofId:
+            `restore-isolation-proof-${randomUUID()}`,
+          expectedOperationRevision: "0",
+          generationId,
+        };
+
+        const observer = await pool.connect();
+        try {
+          const preparedState =
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            );
+          assert.equal(preparedState.generation_id, null);
+          assert.equal(preparedState.operation_state, "prepared");
+          assert.equal(preparedState.operation_revision, "0");
+          assert.equal(preparedState.operation_result, null);
+          assert.equal(preparedState.operation_retired_at, null);
+          assert.equal(preparedState.reservation_state, "prepared");
+          assert.equal(preparedState.reservation_released_at, null);
+          assert.equal(
+            preparedState.session_revision,
+            reserved.session.revision,
+          );
+          assert.deepEqual(
+            preparedState.session_document,
+            reserved.session.document,
+          );
+
+          const claimRollbackAuthority =
+            new PostgresSessionAuthority({
+              store: new PostgresSerializableStore({
+                dedicatedPool: firstMatchingQueryResultFailurePool(
+                  pool,
+                  "restore generation claim rollback",
+                  (text) =>
+                    text.startsWith(
+                      "UPDATE session_authority.sessions",
+                    ),
+                ),
+                maxTransactionAttempts: 1,
+              }),
+            });
+          await assert.rejects(
+            claimRollbackAuthority
+              .claimRestoreDestinationGenerationDispatch(claimInput),
+            assertTransactionBoundaryLost,
+          );
+          assert.deepEqual(
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            ),
+            preparedState,
+          );
+
+          const claimed =
+            await authority.claimRestoreDestinationGenerationDispatch(
+              structuredClone(claimInput),
+            );
+          assertOperationReceipt(claimed, "starting");
+          assert.equal(claimed.dispatchGranted, true);
+          const authorizedState =
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            );
+          assert.equal(authorizedState.generation_id, generationId);
+          assert.equal(
+            authorizedState.generation_state,
+            "authorized",
+          );
+          assert.deepEqual(
+            authorizedState.generation_binding,
+            structuredClone(claimed.generation.binding),
+          );
+          assert.equal(authorizedState.generation_document, null);
+          assert.equal(authorizedState.generation_committed_at, null);
+          assert.equal(authorizedState.operation_state, "starting");
+          assert.equal(authorizedState.operation_revision, "1");
+          assert.equal(authorizedState.operation_result, null);
+          assert.equal(authorizedState.operation_retired_at, null);
+          assert.equal(authorizedState.reservation_state, "starting");
+          assert.equal(authorizedState.reservation_released_at, null);
+          assert.equal(
+            authorizedState.session_revision,
+            claimed.session.revision,
+          );
+          assert.deepEqual(
+            authorizedState.session_document,
+            claimed.session.document,
+          );
+
+          const completion = restoreGenerationCompletion(
+            input,
+            claimed,
+            false,
+          );
+          const finalization = {
+            ...structuredClone(input),
+            completion,
+            expectedOperationRevision: "1",
+          };
+          const finalizeRollbackAuthority =
+            new PostgresSessionAuthority({
+              store: new PostgresSerializableStore({
+                dedicatedPool: firstMatchingQueryResultFailurePool(
+                  pool,
+                  "restore generation finalize rollback",
+                  (text) =>
+                    text.startsWith(
+                      "UPDATE session_authority.sessions",
+                    ),
+                ),
+                maxTransactionAttempts: 1,
+              }),
+            });
+          await assert.rejects(
+            finalizeRollbackAuthority
+              .finalizeRestoreDestinationGeneration(finalization),
+            assertTransactionBoundaryLost,
+          );
+          assert.deepEqual(
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            ),
+            authorizedState,
+          );
+        } finally {
+          observer.release();
+        }
+      },
+    );
+
+    await t.test(
+      "restore destination generations preserve typed authority across replay and acknowledgement loss",
+      async () => {
+        const startingSessionId = randomUUID();
+        const uncertainSessionId = randomUUID();
+        sessionIds.push(startingSessionId, uncertainSessionId);
+        const startingFixture =
+          await prepareRestoreGenerationFixture(
+            authority,
+            checkpointAuthority,
+            startingSessionId,
+          );
+        const startingAdmission = restoreGenerationAdmission(
+          startingFixture.attached,
+          startingFixture.checkpoint,
+        );
+        const startingInput = restoreGenerationOperationInput(
+          startingFixture.attached.session,
+          startingAdmission,
+        );
+        assert.deepEqual(
+          Reflect.ownKeys(startingInput.request.admission),
+          ["checkpoint", "request"],
+        );
+        assert.deepEqual(
+          structuredClone(startingInput.request.admission),
+          startingAdmission,
+        );
+
+        const startingReserved =
+          await authority.reserveOperation(startingInput);
+        assertOperationReceipt(startingReserved, "prepared");
+        const startingGenerationId =
+          `restore-generation-${randomUUID()}`;
+        const startingIsolationProofId =
+          `restore-isolation-proof-${randomUUID()}`;
+        const startingClaimInput = {
+          ...structuredClone(startingInput),
+          destinationIsolationProofId: startingIsolationProofId,
+          expectedOperationRevision: "0",
+          generationId: startingGenerationId,
+        };
+        const startingClaim =
+          await authority.claimRestoreDestinationGenerationDispatch(
+            startingClaimInput,
+          );
+        assertOperationReceipt(startingClaim, "starting");
+        assert.equal(startingClaim.dispatchGranted, true);
+        assert.equal(startingClaim.generation.state, "authorized");
+        assert.equal(
+          startingClaim.generation.generationId,
+          startingGenerationId,
+        );
+        assert.equal(
+          startingClaim.generation.binding.destinationIsolationProofId,
+          startingIsolationProofId,
+        );
+        assert.equal(startingClaim.generation.document, null);
+
+        const authorizedRow = await pool.query(
+          [
+            "SELECT g.generation_id, g.operation_id,",
+            "g.session_id::text AS session_id, g.checkpoint_id,",
+            "g.state, g.binding->>'destinationIsolationProofId'",
+            "AS destination_isolation_proof_id,",
+            "g.document, g.committed_at,",
+            "o.state AS operation_state,",
+            "o.revision::text AS operation_revision,",
+            "r.state AS reservation_state",
+            "FROM session_authority.restore_destination_generations g",
+            "JOIN session_authority.operation_claims o",
+            "ON o.operation_id = g.operation_id",
+            "JOIN session_authority.reservations r",
+            "ON r.operation_id = g.operation_id",
+            "WHERE g.generation_id = $1",
+          ].join(" "),
+          [startingGenerationId],
+        );
+        assert.deepEqual(authorizedRow.rows, [
+          {
+            checkpoint_id: startingFixture.checkpoint.checkpointId,
+            committed_at: null,
+            destination_isolation_proof_id:
+              startingIsolationProofId,
+            document: null,
+            generation_id: startingGenerationId,
+            operation_id: startingInput.operationId,
+            operation_revision: "1",
+            operation_state: "starting",
+            reservation_state: "starting",
+            session_id: startingSessionId,
+            state: "authorized",
+          },
+        ]);
+
+        const startingCompletion = restoreGenerationCompletion(
+          startingInput,
+          startingClaim,
+          false,
+        );
+        const startingFinalization = {
+          ...structuredClone(startingInput),
+          completion: startingCompletion,
+          expectedOperationRevision: "1",
+        };
+        const startingFinalized =
+          await authority.finalizeRestoreDestinationGeneration(
+            startingFinalization,
+          );
+        assertOperationReceipt(startingFinalized, "committed");
+        assert.equal(startingFinalized.finalized, true);
+        assert.equal(startingFinalized.operation.revision, "2");
+        assert.equal(
+          startingFinalized.operation.result.outcome,
+          "restore-generation-committed",
+        );
+        assert.equal(startingFinalized.generation.state, "committed");
+        assert.deepEqual(
+          startingFinalized.generation.document.result,
+          startingInput.request.predeterminedResult,
+        );
+
+        const startingReadInput = {
+          checkpoint: structuredClone(startingAdmission.checkpoint),
+          generationId: startingGenerationId,
+          request: structuredClone(startingAdmission.request),
+        };
+        const startingRead =
+          await authority.readRestoreDestinationGeneration(
+            startingReadInput,
+          );
+        assertOperationReceipt(startingRead, "committed");
+        assert.equal(startingRead.status, "committed");
+        assert.deepEqual(
+          startingRead.generation,
+          startingFinalized.generation,
+        );
+
+        const startingClaimReplay =
+          await authority.claimRestoreDestinationGenerationDispatch(
+            structuredClone(startingClaimInput),
+          );
+        assertOperationReceipt(startingClaimReplay, "committed");
+        assert.equal(startingClaimReplay.dispatchGranted, false);
+        assert.deepEqual(
+          startingClaimReplay.generation,
+          startingFinalized.generation,
+        );
+        const startingFinalizeReplay =
+          await authority.finalizeRestoreDestinationGeneration(
+            structuredClone(startingFinalization),
+          );
+        assertOperationReceipt(startingFinalizeReplay, "committed");
+        assert.equal(startingFinalizeReplay.finalized, false);
+        assert.deepEqual(
+          startingFinalizeReplay.generation,
+          startingFinalized.generation,
+        );
+        assert.deepEqual(
+          await authority.readRestoreDestinationGeneration(
+            structuredClone(startingReadInput),
+          ),
+          startingRead,
+        );
+
+        const wrongCheckpoint = {
+          ...structuredClone(startingAdmission.checkpoint),
+          artifactId: `wrong-artifact-${randomUUID()}`,
+          checkpointId: `wrong-checkpoint-${randomUUID()}`,
+        };
+        const wrongRequest = {
+          ...structuredClone(startingAdmission.request),
+          target: {
+            artifactId: wrongCheckpoint.artifactId,
+            checkpointId: wrongCheckpoint.checkpointId,
+            kind: "checkpoint",
+          },
+        };
+        await assert.rejects(
+          authority.readRestoreDestinationGeneration({
+            checkpoint: wrongCheckpoint,
+            generationId: startingGenerationId,
+            request: wrongRequest,
+          }),
+          assertAuthorityCode("restore_generation_not_authorized"),
+        );
+
+        const collisionAdmission = restoreGenerationAdmission(
+          { session: startingFinalized.session },
+          startingFixture.checkpoint,
+        );
+        const collisionInput = restoreGenerationOperationInput(
+          startingFinalized.session,
+          collisionAdmission,
+        );
+        await authority.reserveOperation(collisionInput);
+        await assert.rejects(
+          authority.claimRestoreDestinationGenerationDispatch({
+            ...structuredClone(collisionInput),
+            destinationIsolationProofId:
+              `restore-isolation-proof-${randomUUID()}`,
+            expectedOperationRevision: "0",
+            generationId: startingGenerationId,
+          }),
+          assertAuthorityCode("restore_generation_identity_conflict"),
+        );
+        const collisionPrepared =
+          await authority.reconcileOperation(collisionInput);
+        assertOperationReceipt(collisionPrepared, "prepared");
+
+        const uncertainFixture =
+          await prepareRestoreGenerationFixture(
+            authority,
+            checkpointAuthority,
+            uncertainSessionId,
+          );
+        const uncertainAdmission = restoreGenerationAdmission(
+          uncertainFixture.attached,
+          uncertainFixture.checkpoint,
+        );
+        const uncertainInput = restoreGenerationOperationInput(
+          uncertainFixture.attached.session,
+          uncertainAdmission,
+        );
+        await authority.reserveOperation(uncertainInput);
+        const uncertainGenerationId =
+          `restore-generation-${randomUUID()}`;
+        const uncertainClaimInput = {
+          ...structuredClone(uncertainInput),
+          destinationIsolationProofId:
+            `restore-isolation-proof-${randomUUID()}`,
+          expectedOperationRevision: "0",
+          generationId: uncertainGenerationId,
+        };
+        const claimLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: commitAcknowledgementLossAfterQueryPool(
+              pool,
+              "restore generation claim",
+              (text) =>
+                text.startsWith(
+                  "INSERT INTO session_authority.restore_destination_generations",
+                ),
+            ),
+            maxTransactionAttempts: 2,
+          }),
+        });
+        await assert.rejects(
+          claimLossAuthority.claimRestoreDestinationGenerationDispatch(
+            uncertainClaimInput,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+        const claimLossReconciled =
+          await authority.reconcileOperation(uncertainInput);
+        assertOperationReceipt(claimLossReconciled, "starting");
+        const claimReplay =
+          await authority.claimRestoreDestinationGenerationDispatch(
+            structuredClone(uncertainClaimInput),
+          );
+        assertOperationReceipt(claimReplay, "starting");
+        assert.equal(claimReplay.dispatchGranted, false);
+        assert.equal(claimReplay.generation.state, "authorized");
+        assert.equal(
+          claimReplay.generation.generationId,
+          uncertainGenerationId,
+        );
+        const authorizedRead =
+          await authority.readRestoreDestinationGeneration({
+            checkpoint: uncertainAdmission.checkpoint,
+            generationId: uncertainGenerationId,
+            request: uncertainAdmission.request,
+          });
+        assert.equal(authorizedRead.status, "authorized");
+        assert.equal(authorizedRead.operation.state, "starting");
+        assert.equal(authorizedRead.reservation.state, "starting");
+        assert.deepEqual(
+          authorizedRead.generation,
+          claimReplay.generation,
+        );
+        assert.equal(Object.isFrozen(authorizedRead), true);
+
+        const markedUncertain = await authority.markOperationUncertain({
+          ...structuredClone(uncertainInput),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(markedUncertain, "uncertain");
+        const uncertainCompletion = restoreGenerationCompletion(
+          uncertainInput,
+          claimReplay,
+          false,
+        );
+        const uncertainFinalization = {
+          ...structuredClone(uncertainInput),
+          completion: uncertainCompletion,
+          expectedOperationRevision: "2",
+        };
+        const finalizeLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: commitAcknowledgementLossAfterQueryPool(
+              pool,
+              "restore generation finalize",
+              (text) =>
+                text.startsWith(
+                  "UPDATE session_authority.restore_destination_generations",
+                ),
+            ),
+            maxTransactionAttempts: 2,
+          }),
+        });
+        await assert.rejects(
+          finalizeLossAuthority.finalizeRestoreDestinationGeneration(
+            uncertainFinalization,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const uncertainReadInput = {
+          checkpoint: uncertainAdmission.checkpoint,
+          generationId: uncertainGenerationId,
+          request: uncertainAdmission.request,
+        };
+        const finalizeLossRead =
+          await authority.readRestoreDestinationGeneration(
+            uncertainReadInput,
+          );
+        assertOperationReceipt(finalizeLossRead, "committed");
+        assert.equal(finalizeLossRead.status, "committed");
+        assert.equal(
+          finalizeLossRead.operation.result.outcome,
+          "restore-generation-committed",
+        );
+        const finalizeLossReplay =
+          await authority.finalizeRestoreDestinationGeneration(
+            structuredClone(uncertainFinalization),
+          );
+        assertOperationReceipt(finalizeLossReplay, "committed");
+        assert.equal(finalizeLossReplay.finalized, false);
+        assert.deepEqual(
+          finalizeLossReplay.generation,
+          finalizeLossRead.generation,
+        );
+        assert.deepEqual(
+          await authority.readRestoreDestinationGeneration(
+            structuredClone(uncertainReadInput),
+          ),
+          finalizeLossRead,
+        );
       },
     );
   },
