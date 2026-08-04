@@ -174,12 +174,32 @@ operations replace `lastOperation`. No launch-specific table is required, and
 the serialized generation, measurement, process, writer, and proof identifiers
 are correlation values rather than launch capabilities.
 
-Production restore therefore remains fail-closed. The later logical-launcher
-slice must consume the original one-use image reservation, invoke the external
-launcher, and register the exact writer incarnation against the durable
-attempt. Crash-consistent ext4 or filesystem-image backend execution also
-remains later work; neither a database lease nor a higher epoch is a physical
-writer fence.
+A hardened PostgreSQL logical-writer-launcher facade now composes the next
+same-process boundary. It revalidates the original image reservation, reserves
+the exact attempt and advances it durably to `starting`, consumes that one-use
+capability, and compares its measured result before invoking one external
+launch callback. A started writer is registered provisionally with the
+stopped-writer coordinator before durable started finalisation and becomes
+resolvable only after exact readback. Prepared recovery cancels without launch.
+For `starting` or `uncertain`, an exact same-process provisional record first
+retries started finalisation with its original evidence; otherwise recovery
+uses stopped-only supervisor reconciliation and never relaunches. An already
+committed started attempt can be adopted only from that exact local record,
+otherwise stop or physical fencing is required.
+
+The authority also provides typed `writer-launch-stop-v1` transitions that
+preserve the original started attempt and clear the current launch only after
+exact `complete-stopped` supervisor proof, plus bounded discovery of prepared
+or active attempts and current launches. The initial facade does not yet route
+the coordinator stop callback through that durable transition or compose
+production capture.
+
+Production restore therefore remains fail-closed. The next serial pull request
+must bind exact typed generation publication to launcher dispatch and
+no-relaunch recovery, compose the durable stop callback and recovery service,
+and only then wire and enable `runRestore()`. Crash-consistent ext4 or
+filesystem-image backend execution also remains later work; neither a database
+lease nor a higher epoch is a physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -326,9 +346,11 @@ filesystem development and conformance backend, not an NFS, live-volume, or
 automatic failover implementation. The durable authority interface and
 conformance tests define the seam, and the PostgreSQL authority now implements
 clean capture, committed reconciliation, and typed destination-generation
-state. Restore remains fail-closed until the durable launch attempt is composed
-with one-use image-capability consumption, external launch, and exact writer
-registration. See
+state. The process-local launcher foundation now composes one-use image
+consumption, external launch, exact provisional writer registration, and
+no-relaunch attempt reconciliation. Restore remains fail-closed until the next
+serial slice binds exact generation publication, launcher/recovery, and durable
+stop/capture through `runRestore()`. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

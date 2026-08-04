@@ -54,10 +54,15 @@
 - [done] Implement the durable launch-attempt lifecycle around exact
   generation, lease, attachment, fencing, measured-image, process, writer, and
   supervisor bindings without invoking a launcher inside that slice.
-- [pending] Compose logical launcher admission from the typed generation,
-  one-use measured-image capability, durable launch attempt, external launcher,
-  and exact writer registration; enable production restore only after the
-  complete composition is fail-closed under ambiguous outcomes.
+- [done] Add the logical-writer-launcher foundation: consume the original
+  one-use measured-image capability only after durable `starting`, invoke an
+  external launcher once, register a provisional writer before started
+  finalisation, reconcile active attempts without relaunch, and add typed
+  launch-stop authority plus bounded prepared/active/current-launch discovery.
+- [pending] In the next serial pull request, wire the exact typed generation
+  binding through restore publication, launcher and no-relaunch recovery;
+  compose the durable stop callback and recovery service; and only then enable
+  `runRestore()` under fail-closed ambiguous outcomes.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

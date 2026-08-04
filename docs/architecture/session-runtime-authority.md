@@ -19,10 +19,15 @@ The implemented authority provides:
   finalization, exact lease renewal, exact-owner release, and force-fence
   reconciliation;
 - production clean-checkpoint capture admission, durable attempt claims, and
-  exact checkpoint-catalogue finalization; and
-- committed-only, source-free capture reconciliation; and
+  exact checkpoint-catalogue finalization;
+- committed-only, source-free capture reconciliation;
 - typed durable writer-launch attempt reservation, single dispatch, exact
-  started/stopped finalization, readback, and bounded recovery.
+  started/stopped finalization, readback, and bounded recovery;
+- a hardened process-local logical-writer-launcher facade with exact image
+  consumption, external launch, provisional writer registration, and
+  no-relaunch reconciliation; and
+- typed launch-stop authority plus bounded prepared/active/current-launch
+  discovery.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
@@ -38,18 +43,24 @@ by restore destination generations, while the typed authority claims and
 finalises one exact detached destination generation against a committed source
 checkpoint. The launch-attempt slice binds that committed generation to an
 exact current session, measured image, and trusted supervisor outcome without
-calling a launcher. The subsequent authority slice will compose the original
-one-use image capability, external launcher, and exact writer registration.
+calling a launcher. The logical-launcher foundation now composes the original
+one-use image capability, external launch callback, and exact same-process
+writer registration. Typed stop state preserves that original launch until
+exact complete-stopped proof. Production generation publication,
+launcher/recovery, durable stop/capture, and `runRestore()` integration remain
+the next serial slice.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
 authorize a launcher. Typed `claimWriterAttachmentDispatch()` allocates the
 logical writer tuple only after the generic reservation is durable, but it
-still does not execute a provider callback. The authority does not mount
-storage, launch a container, resolve a registry tag, verify an image publisher,
-stop a writer, or prove a physical fence. A caller invokes the exact provider
-request outside the transaction and returns its exact evidence for typed
-finalization. Release and force-fence use the same reserve, typed-dispatch,
+still does not execute a provider callback. The PostgreSQL authority does not
+mount storage, launch a container, resolve a registry tag, verify an image
+publisher, stop a writer, or prove a physical fence. A caller invokes the exact
+provider request outside the transaction and returns its exact evidence for
+typed finalization. The logical-launcher facade invokes only its explicitly
+supplied external callbacks; it is not a concrete Podman/Docker adapter.
+Release and force-fence use the same reserve, typed-dispatch,
 external-provider, and typed-finalization order. The current
 stopped-directory backend declares `fencing: "manual"` and therefore cannot
 successfully finalize an automatic force-fence proof or use lease expiration
@@ -84,9 +95,11 @@ commits; even a committed generation does not authorise a writer launch.
 The launch-attempt transition reuses the operation and reservation rows to
 protect one durable blocker and binds a started writer through a version 3
 session pointer to its immutable launch operation. That durable pointer and its
-serialized IDs still do not authorize process creation. Physical exclusion
-evidence must be supplied by a capable storage backend or supervisor, and
-logical launcher composition remains a later slice.
+serialized IDs still do not authorize process creation. The process-local
+launcher facade consumes the exact opaque image reservation and registers the
+exact returned writer; neither step supplies physical exclusion evidence.
+That evidence must come from a capable storage backend or supervisor, and full
+production restore/stop composition remains a later slice.
 
 ## Implemented Canonical Session Registry
 
@@ -811,8 +824,9 @@ restore-generation operations whose exact authorised generation and source
 catalogue still validate. The generation relation has no deletion or
 retirement path. These transitions neither invoke publication inside a
 database transaction nor require launch-specific DDL. Production restore
-remains disabled until logical launcher composition consumes the committed
-generation without weakening the no-second-writer boundary.
+remains disabled until exact publication finalisation is wired to the
+implemented launcher and recovery facade without weakening the
+no-second-writer boundary.
 
 The current capture-oriented stopped-directory backend still constructs its
 legacy restore journal binding from only checkpoint, isolation-proof, and
@@ -893,9 +907,112 @@ and unresolved `BLOCKED` states retain the launch pointer, while a successful
 exact physical fence clears it. Checkpoint capture preserves the pointer and,
 when present, must name the same process and writer incarnations.
 
-This slice deliberately does not consume an image reservation, invoke a
-launcher or supervisor, register a writer capability, or enable production
-restore.
+The durable launch-attempt lifecycle slice deliberately did not consume an
+image reservation, invoke a launcher or supervisor, register a writer
+capability, or enable production restore. The following foundation composes
+the process-local launch boundary without enabling restore.
+
+## Implemented Logical Writer Launcher Foundation
+
+`createPostgresLogicalWriterLauncher()` composes the process-local image and
+stopped-writer coordinators with the PostgreSQL launch-attempt authority and
+the external `launchWriter` and `reconcileWriterLaunch` callbacks. It returns
+the exact frozen `runLaunch`, `reconcileLaunchAttempt`, and
+`resolveStoppedWriter` facade. The facade owns callback ordering and local
+object capabilities; it does not turn their serialized projections into
+authority.
+
+The facade accepts exact own-data shapes under bounded traversal budgets,
+rejects proxies, accessors, inherited fields, unsafe thenables, and non-native
+callback promises, and snapshots collaborator methods and relevant intrinsics.
+Its per-attempt operation guard revalidates its held probe immediately around
+image consumption and supervisor callbacks. Public operations retain protected
+Promise chains and expose only the fixed,
+non-retryable `invalid_logical_writer_launch_request`,
+`logical_writer_handle_unavailable`, and
+`logical_writer_launch_outcome_uncertain` error codes without collaborator
+details.
+
+The supervisor contract is version 1. `launchWriter` must return exact
+`{ receiptVersion: 1, evidence, stopWriter }`: a `started` result requires one
+trusted asynchronous `stopWriter`, while `not-started` or `complete-stopped`
+requires `stopWriter: null`. `reconcileWriterLaunch` returns exact
+`{ receiptVersion: 1, evidence }` and accepts only `not-started` or
+`complete-stopped`; recovery cannot report a newly adopted started writer.
+
+A new launch follows this order:
+
+1. strictly read the current canonical session and revalidate the original
+   opaque image reservation without consuming it;
+2. build and reserve the exact durable launch attempt, then obtain the one
+   definite `prepared -> starting` dispatch claim;
+3. consume that same reservation exactly once and compare every retained image
+   and runtime-measurement field with the durable request;
+4. invoke the external launch callback at most once; and
+5. for a started result, register the exact process and writer incarnations
+   with the designated `StoppedWriterCapabilityCoordinator` before started
+   finalisation, retain that handle as provisional, and expose it only after
+   exact authority readback succeeds.
+
+No external launch callback runs before durable `starting`. If image
+consumption, launch, registration, finalisation, or acknowledgement becomes
+ambiguous after that boundary, the durable attempt remains a blocker. A
+`not-started` or already `complete-stopped` supervisor result uses the typed
+stopped finaliser and never registers a writer.
+
+Recovery is deliberately not another launch path. A still-`prepared` attempt
+is cancelled without consuming an image or invoking either launch path. When
+the same facade instance retains an exact provisional writer record for a
+`starting` or `uncertain` attempt, recovery first retries started finalisation
+with the original supervisor evidence and exposes the same handle only after
+exact committed readback. Without that record, `starting` is moved toward
+durable uncertainty on a best-effort basis and the active attempt consults only
+the trusted stopped-only supervisor reconciliation callback. Neither branch
+relaunches. A committed started attempt is usable only when the facade still
+retains its exact local record. A restart cannot deserialize that handle, so
+readback fails with `logical_writer_handle_unavailable` and requires stop or
+physical fencing. A committed not-started or completely stopped attempt
+returns no writer.
+
+`resolveStoppedWriter()` authenticates only a ready local record whose complete
+attachment tuple matches the capture request. It also binds the checkpoint's
+Codex session, root thread, and image digest to the launch manifest and pins the
+first normalized attachment/checkpoint/request tuple against later resolver
+calls. This is the local bridge needed by later capture composition. Its
+registered stop wrapper checks the exact coordinator binding, calls the launch
+receipt's local supervisor callback, and requires
+`STOPPED_WRITER_STOP_CONFIRMED`; it does not yet claim or finalise the durable
+PostgreSQL stop transition.
+
+This foundation also keeps one later receipt shape deliberately closed. After
+a separate durable stop operation clears the current launch, the immutable
+historical launch attempt still says `started` while
+`readWriterLaunchAttempt()` can return `launch: null`. The facade rejects that
+combination instead of treating serialized history as a local handle or as a
+complete stop receipt. The next durable stop-composition slice must add an
+explicit joined receipt before this historical state can be consumed.
+
+The PostgreSQL authority separately adds typed `writer-launch-stop-v1` state.
+`createWriterLaunchStopOperationRequest()` accepts only a version 3 `ATTACHED`
+session with no other active operation and embeds its complete current-launch
+pointer. `claimWriterLaunchStopDispatch()` grants the typed
+`prepared -> starting` transition once; it deliberately does not make lease
+validity a stop gate, and `starting` or `uncertain` retains the launch.
+`finalizeWriterLaunchStopped()` accepts only the complete seven-field
+supervisor evidence for the original launch with `status: "complete-stopped"`.
+It leaves the original started operation unchanged while atomically releasing
+the stop reservation, clearing the current launch, and advancing
+`lastOperation`. The authority does not call a supervisor automatically.
+
+`listWriterLaunchAttemptRecoveryCandidates()` now returns bounded keyset pages
+of `prepared`, `starting`, and `uncertain` attempts with each candidate's exact
+state. `listCurrentWriterLaunchRecoveryCandidates()` instead scans a bounded
+keyset page of session rows and returns only relationally validated current
+launches. Its cursor advances by the last scanned session, so a page can
+contain fewer candidates, including none, while still carrying a continuation
+cursor. Discovery records are recovery inputs only: they cannot consume an
+image, invoke a launcher, reconstruct a writer handle, or prove a stopped
+boundary.
 
 ## Platform Image Reservation
 
@@ -958,42 +1075,34 @@ reservation. The object capability prevents an untrusted serialized
 registry availability, publisher signatures, or that a future container driver
 actually launched the reserved bytes.
 
-## Required Logical Launcher Admission
+## Remaining Production Restore Composition
 
-The remaining launcher composition must atomically re-read:
+The launcher foundation closes the process-local image-consumption, external
+launch, provisional registration, and no-relaunch reconciliation boundary. It
+does not yet compose the complete restore transaction. The next serial pull
+request must:
 
-- the immutable session manifest and storage reference;
-- the current unexpired lease and fencing epoch;
-- the exact writable attachment;
-- the exact durable launch-attempt admission and absence of another active
-  authority reservation;
-- checkpoint/recovery state required by the selected recovery class; and
-- the consumed exact-image reservation.
+- claim one typed destination generation and pass its exact coordinator
+  binding through physical publication before finalising that generation;
+- pass the exact committed generation and original image reservation to the
+  launcher facade, and route active-attempt recovery without another launch;
+- compose bounded generation, prepared-launch, active-attempt, and
+  current-launch recovery into an operational service;
+- route the coordinator's complete stop through `writer-launch-stop-v1` and
+  persist the exact supervisor proof before treating the writer as stopped or
+  admitting capture; and
+- wire the whole protocol into `runRestore()` only after every uncertain
+  publication, launch, registration, stop, and finalisation boundary remains
+  fail-closed.
 
-The durable attempt already commits `prepared` before dispatch and advances to
-`starting` before a caller may invoke a launcher. `prepared`, `starting`, and
-`uncertain` attempts all block a second writer. The remaining composition must
-consume the original opaque image reservation exactly once, invoke the
-launcher, and return exact supervisor evidence to the implemented started or
-stopped finalizer. Failure is launchable again only when the supervisor has
-proved the complete old writer boundary stopped and the authority has finalized
-that proof.
-
-The later logical-launcher slice will introduce this launcher callback seam. A
-concrete Podman/Docker adapter must hold directory identity through the bind,
-enforce rootless execution, fix the Codex CLI/config surface, and register the
-exact writer with `StoppedWriterCapabilityCoordinator`.
-
-The authority now exposes typed restore-generation and durable launch-attempt
-claim, finalisation, exact read, replay, and bounded recovery transitions.
-Those transitions can bind one detached destination generation to an exact
-measured runtime and trusted supervisor result, but they deliberately do not
-launch or register a writer. Until logical composition consumes the one-use
-image capability, invokes the external launcher, and registers the exact
-writer, the production checkpoint adapter rejects restore. A database row,
-published directory, restore journal record, checkpoint descriptor, catalogue
-entry, committed generation, or serialized launch attempt alone is never
-writable-launch authority.
+Until that integration lands, the production checkpoint adapter rejects
+restore and the launcher resolver is not production stop/capture composition.
+A database row, published directory, restore journal record, checkpoint
+descriptor, catalogue entry, committed generation, serialized measurement,
+discovery result, or durable attempt alone is never writable-launch authority.
+A later concrete Podman/Docker adapter must also hold directory identity
+through the bind, enforce rootless execution, and fix the Codex CLI/config
+surface.
 
 ## Operational Boundary
 
@@ -1079,7 +1188,12 @@ blockers, started/not-started/complete-stopped evidence, exact replay,
 acknowledgement loss, current-launch relational readback after terminal-anchor
 replacement, lease renewal, second-launch rejection, release and checkpoint
 interaction, successful-fence clearing, bounded recovery, and corruption.
-Later authority slices must add logical launcher callback, one-use image
-consumption, and exact writer-registration tests.
+Logical-launcher foundation validation must cover exact reservation
+revalidation and one-use consumption, no callback before durable `starting`,
+single external launch, register-before-finalise ordering, no-relaunch
+reconciliation, provisional-handle loss, typed complete-stop finalisation, and
+bounded discovery. The next integration slice must add whole-protocol
+generation publication, launcher/recovery, durable stop/capture, and
+`runRestore()` failure-injection coverage.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

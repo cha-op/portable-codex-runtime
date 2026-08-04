@@ -17,6 +17,7 @@ import {
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
   createWriterLaunchAttemptOperationRequest,
+  createWriterLaunchStopOperationRequest,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
@@ -27,6 +28,7 @@ import {
   WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_STOP_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
 } from "../src/postgres-session-authority.mjs";
 import {
@@ -96,6 +98,10 @@ const LAUNCH_FENCE_FINALIZE_NOW = "2026-07-29T12:35:34.000Z";
 const LAUNCH_CHECKPOINT_PREPARED_NOW = "2026-07-29T12:35:40.000Z";
 const LAUNCH_CHECKPOINT_DISPATCH_NOW = "2026-07-29T12:35:41.000Z";
 const LAUNCH_CHECKPOINT_FINALIZE_NOW = "2026-07-29T12:35:42.000Z";
+const LAUNCH_STOP_PREPARED_NOW = "2026-07-29T12:36:00.000Z";
+const LAUNCH_STOP_DISPATCH_NOW = "2026-07-29T12:36:01.000Z";
+const LAUNCH_STOP_UNCERTAIN_NOW = "2026-07-29T12:36:02.000Z";
+const LAUNCH_STOP_FINALIZE_NOW = "2026-07-29T12:36:03.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
@@ -109,6 +115,19 @@ const READ_SESSION_QUERY = [
   `SELECT ${SESSION_COLUMNS}`,
   "FROM session_authority.sessions",
   "WHERE session_id = $1::uuid",
+].join(" ");
+const LIST_CURRENT_WRITER_LAUNCH_FIRST_PAGE_QUERY = [
+  `SELECT ${SESSION_COLUMNS}`,
+  "FROM session_authority.sessions",
+  "ORDER BY session_id ASC",
+  "LIMIT $1::integer",
+].join(" ");
+const LIST_CURRENT_WRITER_LAUNCH_AFTER_QUERY = [
+  `SELECT ${SESSION_COLUMNS}`,
+  "FROM session_authority.sessions",
+  "WHERE session_id > $1::uuid",
+  "ORDER BY session_id ASC",
+  "LIMIT $2::integer",
 ].join(" ");
 const OPERATION_COLUMNS = [
   "operation_id",
@@ -182,7 +201,7 @@ const LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.operation_claims",
   "WHERE kind = 'writer-launch-attempt-v1'",
-  "AND state IN ('starting', 'uncertain')",
+  "AND state IN ('prepared', 'starting', 'uncertain')",
   "AND retired_at IS NULL",
   "ORDER BY session_id ASC",
   "LIMIT $1::integer",
@@ -191,7 +210,7 @@ const LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.operation_claims",
   "WHERE kind = 'writer-launch-attempt-v1'",
-  "AND state IN ('starting', 'uncertain')",
+  "AND state IN ('prepared', 'starting', 'uncertain')",
   "AND retired_at IS NULL",
   "AND session_id > $1::uuid",
   "ORDER BY session_id ASC",
@@ -2691,6 +2710,187 @@ function writerLaunchCommittedRelationSteps(
       writerLaunchReservationRow(fixture, "released", { updatedAt }),
     ),
     ...writerLaunchGenerationReferenceSteps(fixture),
+  ];
+}
+
+function writerLaunchStopFixture({
+  launch = writerLaunchFixture(),
+  stopOperationId = STOP_OPERATION_ID,
+} = {}) {
+  const launchResult = writerLaunchResult(launch);
+  const expectedSession = snapshotFromSessionRow(
+    writerLaunchCommittedSessionRow(launch, { result: launchResult }),
+  );
+  const request = createWriterLaunchStopOperationRequest({
+    expectedSession,
+  });
+  const options = {
+    expectedSession,
+    kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+    operationId: stopOperationId,
+    request,
+  };
+  const evidence = {
+    contractVersion: 1,
+    launchAttemptId: request.launch.launchAttemptId,
+    processIncarnationId: request.launch.processIncarnationId,
+    proofId: "supervisor-stop-proof-001",
+    status: "complete-stopped",
+    supervisorId: request.launch.supervisorId,
+    writerIncarnationId: request.launch.writerIncarnationId,
+  };
+  const result = {
+    evidence,
+    outcome: "writer-launch-stopped",
+    resultVersion: 1,
+  };
+  return { evidence, launch, launchResult, options, request, result };
+}
+
+function writerLaunchStopOperationRow(
+  fixture,
+  state,
+  {
+    result = state === "committed" ? fixture.result : null,
+    revision =
+      state === "prepared"
+        ? "0"
+        : state === "starting"
+          ? "1"
+          : state === "uncertain"
+            ? "2"
+            : "2",
+    updatedAt =
+      state === "prepared"
+        ? LAUNCH_STOP_PREPARED_NOW
+        : state === "starting"
+          ? LAUNCH_STOP_DISPATCH_NOW
+          : state === "uncertain"
+            ? LAUNCH_STOP_UNCERTAIN_NOW
+            : LAUNCH_STOP_FINALIZE_NOW,
+  } = {},
+) {
+  return operationRow(state, {
+    options: fixture.options,
+    revision,
+    createdAt: LAUNCH_STOP_PREPARED_NOW,
+    updatedAt,
+    result,
+    retiredAt: state === "committed" ? updatedAt : null,
+  });
+}
+
+function writerLaunchStopReservationRow(
+  fixture,
+  state,
+  {
+    updatedAt =
+      state === "prepared"
+        ? LAUNCH_STOP_PREPARED_NOW
+        : state === "starting"
+          ? LAUNCH_STOP_DISPATCH_NOW
+          : state === "uncertain"
+            ? LAUNCH_STOP_UNCERTAIN_NOW
+            : LAUNCH_STOP_FINALIZE_NOW,
+  } = {},
+) {
+  return reservationRow(state, {
+    options: fixture.options,
+    createdAt: LAUNCH_STOP_PREPARED_NOW,
+    updatedAt,
+    releasedAt: state === "released" ? updatedAt : null,
+  });
+}
+
+function writerLaunchStopPhaseSessionRow(fixture, state) {
+  const operationRevision =
+    state === "prepared" ? "0" : state === "starting" ? "1" : "2";
+  const updatedAt =
+    state === "prepared"
+      ? LAUNCH_STOP_PREPARED_NOW
+      : state === "starting"
+        ? LAUNCH_STOP_DISPATCH_NOW
+        : LAUNCH_STOP_UNCERTAIN_NOW;
+  return sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(fixture.options.expectedSession.sessionId, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: activeOperation(state, {
+        options: fixture.options,
+        operationRevision,
+      }),
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerLaunchStopCommittedSessionRow(
+  fixture,
+  { operationRevision = "2", updatedAt = LAUNCH_STOP_FINALIZE_NOW } = {},
+) {
+  return sessionRow({
+    sessionId: fixture.options.expectedSession.sessionId,
+    revision: (
+      BigInt(fixture.options.expectedSession.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(fixture.options.expectedSession.sessionId, {
+      ...structuredClone(fixture.options.expectedSession.document),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options: fixture.options,
+        operationRevision,
+        result: fixture.result,
+      }),
+      launch: null,
+    }),
+    createdAt: fixture.options.expectedSession.createdAt,
+    updatedAt,
+  });
+}
+
+function writerLaunchStopActiveSteps(fixture, state) {
+  return [
+    rows(writerLaunchStopPhaseSessionRow(fixture, state)),
+    rows(writerLaunchStopOperationRow(fixture, state)),
+    rows(writerLaunchStopReservationRow(fixture, state)),
+    ...writerLaunchCommittedRelationSteps(fixture.launch, {
+      result: fixture.launchResult,
+    }),
+    ...writerLaunchCommittedRelationSteps(fixture.launch, {
+      result: fixture.launchResult,
+    }),
+    ...writerLaunchCommittedRelationSteps(fixture.launch, {
+      result: fixture.launchResult,
+    }),
+  ];
+}
+
+function writerLaunchStopCommittedSteps(
+  fixture,
+  { operationRevision = "2" } = {},
+) {
+  return [
+    rows(
+      writerLaunchStopCommittedSessionRow(fixture, { operationRevision }),
+    ),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(
+      writerLaunchStopOperationRow(fixture, "committed", {
+        revision: operationRevision,
+      }),
+    ),
+    rows(writerLaunchStopReservationRow(fixture, "released")),
+    ...writerLaunchCommittedRelationSteps(fixture.launch, {
+      result: fixture.launchResult,
+    }),
   ];
 }
 
@@ -9187,7 +9387,240 @@ test("writer release rejects a current launch before PostgreSQL", async () => {
   assert.equal(pool.connectCalls, 0);
 });
 
-test("writer launch recovery enumeration returns only validated starting and uncertain attempts with keyset pagination", async () => {
+test("writer launch stop request owns the exact current launch pointer", async () => {
+  const fixture = writerLaunchStopFixture();
+  const replay = createWriterLaunchStopOperationRequest({
+    expectedSession: fixture.options.expectedSession,
+  });
+  assert.deepEqual(replay, canonicalPayload({
+    contractVersion: 1,
+    launch: fixture.options.expectedSession.document.launch,
+  }));
+  assertDeepFrozen(replay);
+
+  for (const mutate of [
+    (expectedSession) => {
+      expectedSession.document.launch = null;
+    },
+    (expectedSession) => {
+      expectedSession.document.lifecycle = "BLOCKED";
+    },
+    (expectedSession) => {
+      expectedSession.document.activeOperation = activeOperation(
+        "prepared",
+        { options: reserveOptions({ expectedSession }) },
+      );
+    },
+  ]) {
+    const expectedSession = structuredClone(fixture.options.expectedSession);
+    mutate(expectedSession);
+    assert.throws(
+      () => createWriterLaunchStopOperationRequest({ expectedSession }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+});
+
+test("writer launch stop claim, finalize, and exact replay clear only the current launch", async () => {
+  const fixture = writerLaunchStopFixture();
+  const startingOperation = writerLaunchStopOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = writerLaunchStopReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = writerLaunchStopPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const committedOperation = writerLaunchStopOperationRow(
+    fixture,
+    "committed",
+  );
+  const releasedReservation = writerLaunchStopReservationRow(
+    fixture,
+    "released",
+  );
+  const committedSession = writerLaunchStopCommittedSessionRow(fixture);
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: LAUNCH_STOP_DISPATCH_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "prepared"),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    {
+      options: { now: LAUNCH_STOP_FINALIZE_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "starting"),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(committedSession),
+      ],
+    },
+    writerLaunchStopCommittedSteps(fixture),
+  );
+
+  const claimed = await authority.claimWriterLaunchStopDispatch({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+  });
+  const finalized = await authority.finalizeWriterLaunchStopped({
+    ...fixture.options,
+    evidence: fixture.evidence,
+    expectedOperationRevision: "1",
+  });
+  const replayed = await authority.finalizeWriterLaunchStopped({
+    ...fixture.options,
+    evidence: fixture.evidence,
+    expectedOperationRevision: "1",
+  });
+
+  assert.equal(claimed.dispatchGranted, true);
+  assert.deepEqual(canonicalPayload(claimed.launch), fixture.request.launch);
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.launch, null);
+  assert.equal(finalized.session.document.launch, null);
+  assert.equal(
+    finalized.session.document.lastOperation.operationId,
+    fixture.options.operationId,
+  );
+  assert.deepEqual(finalized.operation.result, fixture.result);
+  assert.equal(replayed.finalized, false);
+  assert.equal(replayed.launch, null);
+  assert.deepEqual(replayed.operation.result, fixture.result);
+  for (const client of clients) {
+    assert.equal(
+      authorityQueries(client).some(
+        (args) =>
+          /^(?:UPDATE) /u.test(queryText(args)) &&
+          args[0]?.values?.[0] === fixture.launch.options.operationId,
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
+test("writer launch stop rejects tuple and replay proof mismatches without clearing launch", async (t) => {
+  const fixture = writerLaunchStopFixture();
+  for (const [field, value] of [
+    ["launchAttemptId", "writer-launch-attempt-mismatch"],
+    ["supervisorId", "supervisor-mismatch"],
+    ["processIncarnationId", "process-incarnation-mismatch"],
+    ["writerIncarnationId", "writer-incarnation-mismatch"],
+  ]) {
+    await t.test(field, async () => {
+      const { authority, pool } = authorityWithScripts();
+      await assertAuthorityError(
+        authority.finalizeWriterLaunchStopped({
+          ...fixture.options,
+          evidence: { ...fixture.evidence, [field]: value },
+          expectedOperationRevision: "1",
+        }),
+        { code: "invalid_operation_request" },
+      );
+      assert.equal(pool.connectCalls, 0);
+    });
+  }
+
+  await t.test("proof replay", async () => {
+    const { authority, clients } = authorityWithScripts(
+      writerLaunchStopCommittedSteps(fixture),
+    );
+    await assertAuthorityError(
+      authority.finalizeWriterLaunchStopped({
+        ...fixture.options,
+        evidence: {
+          ...fixture.evidence,
+          proofId: "supervisor-stop-proof-mismatch",
+        },
+        expectedOperationRevision: "1",
+      }),
+      { code: "operation_result_conflict" },
+    );
+    assert.equal(
+      authorityQueries(clients[0]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[0].assertExhausted();
+  });
+});
+
+test("writer launch stop fails closed when the original started result drifts", async () => {
+  const fixture = writerLaunchStopFixture();
+  const corruptedResult = writerLaunchResult(fixture.launch, "started", {
+    evidence: writerLaunchEvidence(fixture.launch, "started", {
+      proofId: "different-original-start-proof",
+    }),
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(writerLaunchStopPhaseSessionRow(fixture, "starting")),
+    rows(writerLaunchStopOperationRow(fixture, "starting")),
+    rows(writerLaunchStopReservationRow(fixture, "starting")),
+    ...writerLaunchCommittedRelationSteps(fixture.launch, {
+      result: corruptedResult,
+    }),
+  ]);
+
+  await assertAuthorityError(
+    authority.finalizeWriterLaunchStopped({
+      ...fixture.options,
+      evidence: fixture.evidence,
+      expectedOperationRevision: "1",
+    }),
+    { code: "operation_state_invalid" },
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer launch stop readback rejects a forged historical lease relation", async () => {
+  const fixture = writerLaunchStopFixture();
+  const expectedSession = structuredClone(fixture.options.expectedSession);
+  expectedSession.document.lease.expiresAt = "2026-01-01T00:00:00.000Z";
+  const request = createWriterLaunchStopOperationRequest({ expectedSession });
+  const forged = {
+    ...fixture,
+    options: {
+      ...fixture.options,
+      expectedSession,
+      request,
+    },
+    request,
+  };
+  const { authority, clients } = authorityWithScripts(
+    writerLaunchStopCommittedSteps(forged),
+  );
+
+  await assertAuthorityError(
+    authority.readSession({ sessionId: expectedSession.sessionId }),
+    { code: "operation_state_invalid" },
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer launch recovery enumeration returns validated active attempts with state and keyset pagination", async () => {
   const second = writerLaunchFixture({
     destinationIsolationProofId: "destination-isolation-proof-002",
     generationId: "restore-generation-002",
@@ -9233,6 +9666,7 @@ test("writer launch recovery enumeration returns only validated starting and unc
       {
         launchAttemptId: second.options.operationId,
         request: second.request,
+        state: "starting",
       },
     ],
     nextAfterSessionId: OTHER_SESSION_ID,
@@ -9242,6 +9676,7 @@ test("writer launch recovery enumeration returns only validated starting and unc
       {
         launchAttemptId: third.options.operationId,
         request: third.request,
+        state: "uncertain",
       },
     ],
     nextAfterSessionId: null,
@@ -9263,6 +9698,130 @@ test("writer launch recovery enumeration returns only validated starting and unc
     ]),
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("writer launch recovery enumeration includes exact prepared intents", async () => {
+  const fixture = writerLaunchFixture();
+  const { authority, clients } = authorityWithScripts([
+    rows(writerLaunchOperationRow(fixture, "prepared")),
+    ...writerLaunchActiveSteps(fixture, "prepared"),
+  ]);
+
+  const page = await authority.listWriterLaunchAttemptRecoveryCandidates({
+    afterSessionId: null,
+    limit: 1,
+  });
+
+  assert.deepEqual(page, {
+    candidates: [
+      {
+        launchAttemptId: fixture.options.operationId,
+        request: fixture.request,
+        state: "prepared",
+      },
+    ],
+    nextAfterSessionId: null,
+  });
+  assert.deepEqual(
+    authorityQueries(clients[0])[0],
+    extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY, [2]),
+  );
+  assertDeepFrozen(page);
+  clients[0].assertExhausted();
+});
+
+test("current writer launch recovery uses sparse bounded session pages", async () => {
+  const launch = writerLaunchFixture({
+    destinationIsolationProofId: "destination-isolation-proof-current-page",
+    generationId: "restore-generation-current-page",
+    launchOperationId: "writer-launch-attempt-current-page",
+    restoreOperationId: "restore-generation-operation-current-page",
+    sessionId: OTHER_SESSION_ID,
+  });
+  const launchResult = writerLaunchResult(launch);
+  const detached = sessionRow({ sessionId: SESSION_ID });
+  const launched = writerLaunchCommittedSessionRow(launch, {
+    result: launchResult,
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      rows(detached, launched),
+      rows({ operation_count: 0, reservation_count: 0 }),
+    ],
+    [
+      rows(launched),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      ...writerLaunchCommittedRelationSteps(launch, {
+        result: launchResult,
+      }),
+      ...writerLaunchCommittedRelationSteps(launch, {
+        result: launchResult,
+      }),
+    ],
+  );
+
+  const sparse = await authority.listCurrentWriterLaunchRecoveryCandidates({
+    afterSessionId: null,
+    limit: 1,
+  });
+  const current = await authority.listCurrentWriterLaunchRecoveryCandidates({
+    afterSessionId: sparse.nextAfterSessionId,
+    limit: 1,
+  });
+
+  assert.deepEqual(sparse, {
+    candidates: [],
+    nextAfterSessionId: SESSION_ID,
+  });
+  assert.deepEqual(current, {
+    candidates: [
+      {
+        launch: launched.document.launch,
+        launchAttemptId: launch.options.operationId,
+        request: launch.request,
+      },
+    ],
+    nextAfterSessionId: null,
+  });
+  assert.deepEqual(
+    authorityQueries(clients[0])[0],
+    extendedQuery(LIST_CURRENT_WRITER_LAUNCH_FIRST_PAGE_QUERY, [2]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[1])[0],
+    extendedQuery(LIST_CURRENT_WRITER_LAUNCH_AFTER_QUERY, [SESSION_ID, 2]),
+  );
+  assertDeepFrozen(sparse);
+  assertDeepFrozen(current);
+  for (const client of clients) client.assertExhausted();
+});
+
+test("current writer launch recovery fails closed on corrupt launch history", async () => {
+  const launch = writerLaunchFixture();
+  const launchResult = writerLaunchResult(launch);
+  const launched = writerLaunchCommittedSessionRow(launch, {
+    result: launchResult,
+  });
+  const corruptedOperation = writerLaunchOperationRow(
+    launch,
+    "committed",
+    { result: launchResult, revision: "2" },
+  );
+  corruptedOperation.request.expectedSession.revision = launched.revision;
+  const { authority, clients } = authorityWithScripts([
+    rows(launched),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(corruptedOperation),
+  ]);
+
+  await assertAuthorityError(
+    authority.listCurrentWriterLaunchRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+    }),
+    { code: "operation_state_invalid" },
+  );
+  clients[0].assertExhausted();
 });
 
 test("restore generation request builder owns the exact canonical admission and predetermined result", () => {
