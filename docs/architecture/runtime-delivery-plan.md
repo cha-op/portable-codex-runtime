@@ -191,6 +191,18 @@ Restore and launcher authority are now split into seven serial pull requests:
    - Prepare the process-local image reservation before publication and let
      the launcher claim only that already-reserved attempt. A crash cannot
      expose a committed generation without durable launch work.
+   - Close expiry retirement over the same serialized launch boundary. After
+     locking the session and active operation/reservation rows and proving the
+     committed, immutable version 2 terminal restore, generation, and
+     materialized registry provenance, permit only exact reason
+     `launch-dispatch-not-started` when `expiresAt <= authorityNow`. Persist
+     that sampled authority time on the operation, released reservation, and
+     terminal session while retaining the registry claim permanently.
+     Dispatch claim keeps the complementary `expiresAt > authorityNow`
+     boundary; wrong reasons and pre-expiry cancellation reject.
+   - Treat an expired cancellation as a valid terminal successor when the
+     original atomic handoff API replays. Preserve ordinary version 1
+     cancellation and replay behavior unchanged.
    - Preserve version 1 behavior, but fail the schema upgrade closed if an old
      version 2 restore operation has progressed beyond `prepared`: only an
      undispatched request can safely receive the missing pre-publication

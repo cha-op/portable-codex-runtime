@@ -10,6 +10,7 @@ import {
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
@@ -304,6 +305,7 @@ class MemoryLaunchAuthority {
       reserve: 0,
     };
     this.lastClaimInput = null;
+    this.lastCancelInput = null;
     this.readReceiptMutation = null;
     this.beforeFinalize = null;
   }
@@ -324,6 +326,7 @@ class MemoryLaunchAuthority {
     this.behaviour = Object.create(null);
     this.claimReceiptMutation = null;
     this.lastClaimInput = null;
+    this.lastCancelInput = null;
     this.readReceiptMutation = null;
     this.beforeFinalize = null;
   }
@@ -341,7 +344,7 @@ class MemoryLaunchAuthority {
         this.result = {
           resultVersion: 1,
           outcome: "cancelled-before-dispatch",
-          reason: "launch-dispatch-not-started",
+          reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
         };
         this.terminalRevision = "1";
       } else {
@@ -612,10 +615,15 @@ class MemoryLaunchAuthority {
     };
   }
 
-  async cancelPreparedOperation() {
+  async cancelPreparedOperation(options) {
     this.calls.cancel += 1;
     this.events.push("authority.cancel");
     assert.equal(this.state, "prepared");
+    this.lastCancelInput = clone(options);
+    assert.equal(
+      options.reason,
+      WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+    );
     if (this.behaviour.cancelPreparedHandoffConflict) {
       throw new Error("prepared handoff cancellation conflict");
     }
@@ -624,7 +632,7 @@ class MemoryLaunchAuthority {
     this.result = {
       resultVersion: 1,
       outcome: "cancelled-before-dispatch",
-      reason: "launch-dispatch-not-started",
+      reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
     };
     const operation = this.operation();
     const reservation = this.reservation(operation);
@@ -2718,6 +2726,27 @@ test("prepared handoff recovery preserves the attempt for capability-bearing lau
   assert.equal(value.authority.calls.claim, 1);
   assert.equal(value.authority.calls.reserve, 0);
   assert.equal(value.launchCalls, 1);
+});
+
+test("authority-confirmed expired prepared handoff recovery cancels without dispatch", async () => {
+  const value = await fixture();
+  seedPreparedLaunchHandoff(value);
+  value.authority.behaviour.cancelPreparedHandoffConflict = false;
+
+  const result = await value.facade.reconcileLaunchAttempt({
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+  });
+
+  assert.equal(result.status, "cancelled-before-dispatch");
+  assert.equal(result.writer, null);
+  assert.equal(
+    value.authority.lastCancelInput.reason,
+    WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  );
+  assert.equal(value.authority.calls.cancel, 1);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
 });
 
 for (const state of ["starting", "uncertain"]) {

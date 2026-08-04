@@ -38,6 +38,8 @@ export const RESTORE_DESTINATION_GENERATION_OPERATION_KIND =
 export const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND =
   "writer-launch-attempt-v1";
 export const WRITER_LAUNCH_STOP_OPERATION_KIND = "writer-launch-stop-v1";
+export const WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON =
+  "launch-dispatch-not-started";
 export const MAX_WRITER_LEASE_DURATION_MILLISECONDS = 86_400_000;
 
 const UUID_PATTERN =
@@ -7214,17 +7216,25 @@ async function readRestoreLaunchHandoffReplay(
     launchInput,
     true,
   );
+  const cancelledAfterLeaseExpiry =
+    launchObserved.operation?.state === "committed" &&
+    launchObserved.operation.result?.outcome ===
+      "cancelled-before-dispatch";
   ensure(
     launchObserved.operation !== null &&
       launchObserved.reservation !== null &&
-      launchObserved.launchAttempt !== null &&
-      !(
-        launchObserved.operation.state === "committed" &&
-        launchObserved.operation.result?.outcome ===
-          "cancelled-before-dispatch"
-      ),
+      launchObserved.launchAttempt !== null,
     "operation_transition_conflict",
   );
+  if (cancelledAfterLeaseExpiry) {
+    ensure(
+      launchObserved.operation.result.reason ===
+          WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON &&
+        timestampMilliseconds(launchObserved.operation.updatedAt) >=
+          timestampMilliseconds(launchInput.request.lease.expiresAt),
+      "operation_transition_conflict",
+    );
+  }
   ensure(
     launchIdClaim.claimedAt === relation.generation.claimedAt &&
       launchIdClaim.materializedAt === launchObserved.operation.createdAt &&
@@ -8262,6 +8272,7 @@ async function updateSessionPhase(
   input,
   activeOperation,
   lastOperation = documentLastOperation(session.document),
+  updatedAt = transaction.now,
 ) {
   const nextDocument = documentWithActiveOperation(
     session.document,
@@ -8273,6 +8284,7 @@ async function updateSessionPhase(
     session,
     input,
     nextDocument,
+    updatedAt,
   );
 }
 
@@ -8281,6 +8293,7 @@ async function updateSessionDocument(
   session,
   input,
   document,
+  updatedAt = transaction.now,
 ) {
   const nextDocument = canonicalDocument(
     document,
@@ -8291,14 +8304,14 @@ async function updateSessionDocument(
       session.sessionId,
       session.revision,
       canonicalSerialize(nextDocument),
-      transaction.now,
+      updatedAt,
     ]),
   );
   ensure(rows.length === 1, "session_revision_conflict");
   const updated = snapshotFromRow(rows[0], session.sessionId);
   ensure(
     updated.revision === nextRevision(session.revision) &&
-      updated.updatedAt === transaction.now &&
+      updated.updatedAt === updatedAt &&
       canonicalSerialize(updated.document) ===
         canonicalSerialize(nextDocument) &&
       canonicalIdentityBytes(updated.document) ===
@@ -11885,17 +11898,41 @@ export class PostgresSessionAuthority {
           observed.operation.revision === input.expectedOperationRevision,
         "operation_transition_conflict",
       );
-      ensure(
-        !isAtomicRestoreLaunchHandoff(session, observed),
-        "operation_transition_conflict",
-      );
+      const atomicRestoreLaunchHandoff =
+        isAtomicRestoreLaunchHandoff(session, observed);
+      let mutationTimestamp = transaction.now;
+      if (atomicRestoreLaunchHandoff) {
+        ensure(
+          input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+            input.reason ===
+              WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+          "operation_transition_conflict",
+        );
+        // The session and active launch rows are locked, and the immutable
+        // terminal restore/generation/ID-claim provenance has been fully
+        // revalidated, before sampling the non-transactional clock. Claim and
+        // expiry cancellation therefore form complementary boundaries around
+        // the same bound lease without a dispatch-versus-cancel race.
+        const authorityNow = await readAuthorityClock(transaction);
+        ensure(
+          timestampMilliseconds(authorityNow) >=
+            timestampMilliseconds(transaction.now),
+          "session_state_invalid",
+        );
+        ensure(
+          timestampMilliseconds(input.request.lease.expiresAt) <=
+            timestampMilliseconds(authorityNow),
+          "operation_transition_conflict",
+        );
+        mutationTimestamp = authorityNow;
+      }
       nextRevision(session.revision);
       const operationRows = rowsFromResult(
         await transaction.query(CANCEL_OPERATION_QUERY.text, [
           input.operationId,
           input.expectedOperationRevision,
           input.serializedResult,
-          transaction.now,
+          mutationTimestamp,
         ]),
         "operation_state_invalid",
       );
@@ -11903,7 +11940,7 @@ export class PostgresSessionAuthority {
       const reservationRows = rowsFromResult(
         await transaction.query(RELEASE_RESERVATION_QUERY.text, [
           input.operationId,
-          transaction.now,
+          mutationTimestamp,
         ]),
         "operation_state_invalid",
       );
@@ -11923,6 +11960,7 @@ export class PostgresSessionAuthority {
         input,
         null,
         lastPointerFor(operation, reservation),
+        mutationTimestamp,
       );
       validateLastOperationPointer(
         updatedSession,

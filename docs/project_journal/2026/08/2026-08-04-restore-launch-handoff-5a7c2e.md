@@ -63,6 +63,11 @@ capability.
   timestamps, and an authority clock still inside the bound lease. Hostile
   lifecycle, co-mutated session, or clock data falls back to durable readback
   without image consumption or supervisor launch.
+- Recovery requests prepared cancellation with the exact reason
+  `launch-dispatch-not-started`. A version 2 atomic handoff remains prepared
+  before lease expiry; only fully proven handoff provenance at or after expiry
+  can commit cancellation. Wrong reasons and pre-expiry attempts reject, while
+  standalone version 1 launch cancellation remains unchanged.
 
 ## Safety Decisions
 
@@ -84,11 +89,19 @@ capability.
   reserves the complete seven-revision worst case: restore claim and
   uncertainty, both handoff writes, then launch claim, uncertainty, and
   terminal completion. Version 1 keeps its three-revision restore boundary.
-- Prepared cancellation reconstructs the exact version 2 handoff provenance
-  from the terminal restore request, committed generation, launch intent, and
-  same-transaction operation records. A matching atomic handoff cannot be
-  retired by generic reconciliation; version 1 prepared work remains
-  cancellable.
+- Prepared cancellation locks the session and active launch operation and
+  reservation while reconstructing the exact version 2 handoff from the
+  committed, immutable terminal restore, generation, launch intent, and
+  materialized permanent registry provenance. It then samples the authority
+  clock: launch claim requires `expiresAt > authorityNow`, and cancellation is
+  its complement at `expiresAt <= authorityNow` with the exact reason
+  `launch-dispatch-not-started`.
+- A successful expired cancellation uses the sampled `authorityNow` as the
+  durable operation, released-reservation, and terminal-session timestamp.
+  The registry claim remains permanent, and replay through the original atomic
+  handoff API returns this cancellation as the valid successor instead of
+  reserving or fabricating another launch attempt. Wrong reasons and
+  pre-expiry cancellation reject; version 1 keeps its ordinary behavior.
 - The serialized launch intent is only correlation and recovery data. It does
   not recreate the original image reservation, consume it, or authorize a
   process launch by itself.

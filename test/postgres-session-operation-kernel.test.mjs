@@ -29,6 +29,7 @@ import {
   WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
 } from "../src/postgres-session-authority.mjs";
@@ -2949,6 +2950,35 @@ function writerLaunchCommittedSessionRow(
   });
 }
 
+function writerLaunchCancelledFixture(
+  fixture,
+  {
+    createdAt = LAUNCH_PREPARED_NOW,
+    reason = "caller-abandoned-before-launch-dispatch",
+    updatedAt = LAUNCH_FINALIZE_NOW,
+  } = {},
+) {
+  const result = cancellationResult(reason);
+  return {
+    operation: writerLaunchOperationRow(fixture, "committed", {
+      createdAt,
+      result,
+      revision: "1",
+      updatedAt,
+    }),
+    reservation: writerLaunchReservationRow(fixture, "released", {
+      createdAt,
+      updatedAt,
+    }),
+    result,
+    session: writerLaunchCommittedSessionRow(fixture, {
+      operationRevision: "1",
+      result,
+      updatedAt,
+    }),
+  };
+}
+
 function writerLaunchBaseSessionRow(fixture) {
   const expected = fixture.options.expectedSession;
   return sessionRow({
@@ -3792,6 +3822,32 @@ function authorityQueries(client) {
 
 function queryTexts(client) {
   return client.queries.map(queryText);
+}
+
+function assertAtomicHandoffValidatedBeforeAuthorityClock(client) {
+  const texts = queryTexts(client);
+  const authorityClockIndex = texts.indexOf(READ_AUTHORITY_CLOCK_QUERY);
+  const launchIdClaimIndex = Math.max(
+    texts.lastIndexOf(READ_OPERATION_ID_CLAIM_QUERY),
+    texts.lastIndexOf(READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY),
+  );
+  const requiredLockIndexes = [
+    `${READ_SESSION_QUERY} FOR UPDATE`,
+    `${READ_OPERATION_QUERY} FOR UPDATE`,
+    `${READ_RESERVATION_QUERY} FOR UPDATE`,
+  ].map((text) => texts.indexOf(text));
+  const lastForUpdateIndex = texts.reduce(
+    (lastIndex, text, index) =>
+      text.includes("FOR UPDATE") ? index : lastIndex,
+    -1,
+  );
+
+  assert.ok(authorityClockIndex >= 0);
+  assert.ok(launchIdClaimIndex >= 0);
+  assert.equal(requiredLockIndexes.every((index) => index >= 0), true);
+  assert.ok(authorityClockIndex > launchIdClaimIndex);
+  assert.ok(authorityClockIndex > lastForUpdateIndex);
+  return { authorityClockIndex, texts };
 }
 
 function assertDeepFrozen(value) {
@@ -11265,34 +11321,238 @@ test("restore-to-launch handoff acknowledgement loss replays the same prepared a
   clients[1].assertExhausted();
 });
 
-test("restore-to-launch prepared atomic handoff cannot be cancelled", async () => {
-  const fixture = restoreLaunchHandoffFixture();
-  const reason = "caller-abandoned-before-launch-dispatch";
-  const { authority, clients } = authorityWithScripts(
-    restoreLaunchHandoffActiveSteps(fixture, {
-      launchIdClaim: restoreLaunchIdClaimRow(fixture, {
-        materializedAt: RESTORE_FINALIZE_NOW,
-      }),
-    }),
-  );
-
-  await assertAuthorityError(
-    authority.cancelPreparedOperation({
-      ...fixture.options,
-      expectedOperationRevision: "0",
-      reason,
-    }),
-    { code: "operation_transition_conflict" },
-  );
-
-  assert.equal(fixture.restore.request.contractVersion, 2);
+test("restore-to-launch prepared cancellation requires exact launcher non-dispatch evidence after expiry", async (t) => {
   assert.equal(
-    authorityQueries(clients[0]).some((args) =>
-      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
-    ),
+    WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+    "launch-dispatch-not-started",
+  );
+
+  await t.test("wrong reason", async () => {
+    const fixture = restoreLaunchHandoffFixture();
+    const expiresAt = fixture.request.lease.expiresAt;
+    const transactionNow = new Date(
+      Date.parse(expiresAt) - 1,
+    ).toISOString();
+    const { authority, clients } = authorityWithScripts({
+      options: { authorityNow: expiresAt, now: transactionNow },
+      steps: restoreLaunchHandoffActiveSteps(fixture),
+    });
+
+    await assertAuthorityError(
+      authority.cancelPreparedOperation({
+        ...fixture.options,
+        expectedOperationRevision: "0",
+        reason: "caller-abandoned-before-launch-dispatch",
+      }),
+      { code: "operation_transition_conflict" },
+    );
+
+    assert.equal(fixture.restore.request.contractVersion, 2);
+    assert.equal(
+      queryTexts(clients[0]).includes(READ_AUTHORITY_CLOCK_QUERY),
+      false,
+    );
+    assert.equal(
+      authorityQueries(clients[0]).some((args) =>
+        /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+    clients[0].assertExhausted();
+  });
+
+  await t.test("before lease expiry", async () => {
+    const fixture = restoreLaunchHandoffFixture();
+    const expiresAt = fixture.request.lease.expiresAt;
+    const authorityNow = new Date(
+      Date.parse(expiresAt) - 1,
+    ).toISOString();
+    const { authority, clients } = authorityWithScripts({
+      options: { authorityNow, now: authorityNow },
+      steps: restoreLaunchHandoffActiveSteps(fixture),
+    });
+
+    await assertAuthorityError(
+      authority.cancelPreparedOperation({
+        ...fixture.options,
+        expectedOperationRevision: "0",
+        reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+      }),
+      { code: "operation_transition_conflict" },
+    );
+
+    const { texts } =
+      assertAtomicHandoffValidatedBeforeAuthorityClock(clients[0]);
+    assert.equal(
+      authorityQueries(clients[0]).some((args) =>
+        /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    assert.equal(texts.includes("ROLLBACK"), true);
+    clients[0].assertExhausted();
+  });
+});
+
+test("expired restore-to-launch handoff cancellation commits at and after the lease boundary", async (t) => {
+  for (const offsetMilliseconds of [0, 1]) {
+    await t.test(
+      offsetMilliseconds === 0 ? "at expiry" : "after expiry",
+      async () => {
+        const fixture = restoreLaunchHandoffFixture();
+        const expiresAt = fixture.request.lease.expiresAt;
+        const transactionNow = new Date(
+          Date.parse(expiresAt) - 1,
+        ).toISOString();
+        const authorityNow = new Date(
+          Date.parse(expiresAt) + offsetMilliseconds,
+        ).toISOString();
+        assert.ok(Date.parse(transactionNow) < Date.parse(expiresAt));
+        assert.ok(Date.parse(expiresAt) <= Date.parse(authorityNow));
+        const cancelled = writerLaunchCancelledFixture(fixture, {
+          createdAt: RESTORE_FINALIZE_NOW,
+          reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+          updatedAt: authorityNow,
+        });
+        const { authority, clients } = authorityWithScripts({
+          options: { authorityNow, now: transactionNow },
+          steps: [
+            ...restoreLaunchHandoffActiveSteps(fixture),
+            rows(cancelled.operation),
+            rows(cancelled.reservation),
+            rows(cancelled.session),
+          ],
+        });
+
+        const receipt = await authority.cancelPreparedOperation({
+          ...fixture.options,
+          expectedOperationRevision: "0",
+          reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+        });
+
+        assert.deepEqual(receipt, {
+          cancelled: true,
+          operation: operationView(cancelled.operation),
+          reservation: reservationView(cancelled.reservation),
+          session: snapshotFromSessionRow(cancelled.session),
+          status: "committed",
+        });
+        assert.equal(
+          receipt.operation.result.outcome,
+          "cancelled-before-dispatch",
+        );
+        assert.equal(
+          receipt.operation.result.reason,
+          "launch-dispatch-not-started",
+        );
+        assert.equal(Object.hasOwn(receipt, "authorityNow"), false);
+        assert.equal(receipt.reservation.state, "released");
+        assert.equal(receipt.session.document.activeOperation, null);
+        assert.equal(
+          receipt.session.document.lastOperation.operationId,
+          fixture.options.operationId,
+        );
+        assertDeepFrozen(receipt);
+
+        const { authorityClockIndex, texts } =
+          assertAtomicHandoffValidatedBeforeAuthorityClock(clients[0]);
+        const firstMutationIndex = texts.findIndex((text) =>
+          /^(?:INSERT|UPDATE|DELETE) /u.test(text),
+        );
+        assert.ok(firstMutationIndex > authorityClockIndex);
+        assert.equal(
+          authorityQueries(clients[0]).some((args) =>
+            /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)) &&
+            queryText(args).includes(
+              "session_authority.operation_id_registry",
+            ),
+          ),
+          false,
+        );
+        assert.deepEqual(
+          authorityQueries(clients[0]).filter((args) =>
+            /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
+          ),
+          [
+            extendedQuery(CANCEL_OPERATION_QUERY, [
+              fixture.options.operationId,
+              "0",
+              JSON.stringify(cancelled.result),
+              authorityNow,
+            ]),
+            extendedQuery(RELEASE_RESERVATION_QUERY, [
+              fixture.options.operationId,
+              authorityNow,
+            ]),
+            extendedQuery(UPDATE_SESSION_QUERY, [
+              fixture.options.expectedSession.sessionId,
+              (
+                BigInt(fixture.options.expectedSession.revision) + 1n
+              ).toString(),
+              JSON.stringify(cancelled.session.document),
+              authorityNow,
+            ]),
+          ],
+        );
+        clients[0].assertExhausted();
+      },
+    );
+  }
+});
+
+test("V1 writer launch prepared cancellation keeps the ordinary query shape", async () => {
+  const fixture = writerLaunchFixture();
+  const reason = "caller-abandoned-before-launch-dispatch";
+  const cancelled = writerLaunchCancelledFixture(fixture, { reason });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: LAUNCH_FINALIZE_NOW },
+    steps: [
+      ...writerLaunchActiveSteps(fixture, "prepared"),
+      rows(cancelled.operation),
+      rows(cancelled.reservation),
+      rows(cancelled.session),
+    ],
+  });
+
+  const receipt = await authority.cancelPreparedOperation({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+    reason,
+  });
+
+  assert.equal(fixture.restore.request.contractVersion, 1);
+  assert.equal(receipt.cancelled, true);
+  assert.equal(Object.hasOwn(receipt, "authorityNow"), false);
+  assert.equal(
+    queryTexts(clients[0]).includes(READ_AUTHORITY_CLOCK_QUERY),
     false,
   );
-  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  assert.deepEqual(
+    authorityQueries(clients[0]).filter((args) =>
+      /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
+    ),
+    [
+      extendedQuery(CANCEL_OPERATION_QUERY, [
+        fixture.options.operationId,
+        "0",
+        JSON.stringify(cancelled.result),
+        LAUNCH_FINALIZE_NOW,
+      ]),
+      extendedQuery(RELEASE_RESERVATION_QUERY, [
+        fixture.options.operationId,
+        LAUNCH_FINALIZE_NOW,
+      ]),
+      extendedQuery(UPDATE_SESSION_QUERY, [
+        fixture.options.expectedSession.sessionId,
+        (
+          BigInt(fixture.options.expectedSession.revision) + 1n
+        ).toString(),
+        JSON.stringify(cancelled.session.document),
+        LAUNCH_FINALIZE_NOW,
+      ]),
+    ],
+  );
   clients[0].assertExhausted();
 });
 
@@ -11372,37 +11632,21 @@ test("restore-to-launch committed replay rejects completion drift without touchi
   clients[0].assertExhausted();
 });
 
-test("restore-to-launch replay rejects a historical cancelled prepared launch", async () => {
+test("restore-to-launch replay returns its historically cancelled prepared successor", async () => {
   const fixture = restoreLaunchHandoffFixture();
   const restore = fixture.restore;
-  const cancellation = cancellationResult(
-    "caller-abandoned-before-launch-dispatch",
-  );
-  const cancelledOperation = writerLaunchOperationRow(
-    fixture,
-    "committed",
-    {
-      createdAt: RESTORE_FINALIZE_NOW,
-      result: cancellation,
-      revision: "1",
-    },
-  );
-  const cancelledReservation = writerLaunchReservationRow(
-    fixture,
-    "released",
-    { createdAt: RESTORE_FINALIZE_NOW },
-  );
-  const cancelledSession = writerLaunchCommittedSessionRow(fixture, {
-    operationRevision: "1",
-    result: cancellation,
+  const cancelled = writerLaunchCancelledFixture(fixture, {
+    createdAt: RESTORE_FINALIZE_NOW,
+    reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+    updatedAt: fixture.request.lease.expiresAt,
   });
   const terminalLaunchSteps = [
     rows({ operation_count: 0, reservation_count: 0 }),
-    rows(cancelledOperation),
-    rows(cancelledReservation),
+    rows(cancelled.operation),
+    rows(cancelled.reservation),
   ];
   const { authority, clients } = authorityWithScripts([
-    rows(cancelledSession),
+    rows(cancelled.session),
     ...terminalLaunchSteps,
     rows(
       restoreGenerationOperationRow(restore, "committed", {
@@ -11420,8 +11664,8 @@ test("restore-to-launch replay rejects a historical cancelled prepared launch", 
     ...terminalLaunchSteps,
   ]);
 
-  await assertAuthorityError(
-    authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+  const replay =
+    await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
       {
         launch: restore.launchIntent,
         restore: {
@@ -11430,17 +11674,31 @@ test("restore-to-launch replay rejects a historical cancelled prepared launch", 
           expectedOperationRevision: "1",
         },
       },
-    ),
-    { code: "operation_transition_conflict" },
-  );
+    );
 
+  assert.equal(replay.status, "committed");
+  assert.equal(replay.restore.finalized, false);
+  assert.deepEqual(replay.launch.operation, operationView(cancelled.operation));
+  assert.deepEqual(
+    replay.launch.reservation,
+    reservationView(cancelled.reservation),
+  );
+  assert.deepEqual(replay.session, snapshotFromSessionRow(cancelled.session));
+  assert.equal(
+    replay.launch.operation.result.reason,
+    "launch-dispatch-not-started",
+  );
+  assertDeepFrozen(replay);
   assert.equal(
     authorityQueries(clients[0]).some((args) =>
-      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
     ),
     false,
   );
-  assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+  assert.equal(
+    queryTexts(clients[0]).includes(READ_AUTHORITY_CLOCK_QUERY),
+    false,
+  );
   clients[0].assertExhausted();
 });
 

@@ -8,6 +8,7 @@ import {
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   createWriterLaunchAttemptOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
@@ -2672,7 +2673,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
             exactFrozenRecord({
               ...operationInput(read.operation),
               expectedOperationRevision: "0",
-              reason: "launch-dispatch-not-started",
+              reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
             }),
           ],
           outcomeCode,

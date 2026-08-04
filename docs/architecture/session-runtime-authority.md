@@ -1031,9 +1031,12 @@ ambiguous after that boundary, the durable attempt remains a blocker. A
 `not-started` or already `complete-stopped` supervisor result uses the typed
 stopped finaliser and never registers a writer.
 
-Recovery is deliberately not another launch path. A still-`prepared` attempt
-is cancelled without consuming an image or invoking either launch path. When
-the same facade instance retains an exact provisional writer record for a
+Recovery is deliberately not another launch path. A still-`prepared`
+standalone version 1 attempt is cancelled without consuming an image or
+invoking either launch path. A proven version 2 atomic restore-to-launch
+attempt instead remains prepared before lease expiry and can be retired only
+through the closed expired-handoff cancellation protocol described below.
+When the same facade instance retains an exact provisional writer record for a
 `starting` or `uncertain` attempt, recovery first retries started finalisation
 with the original supervisor evidence and exposes the same handle only after
 exact committed readback. Without that record, `starting` is moved toward
@@ -1042,8 +1045,8 @@ the trusted stopped-only supervisor reconciliation callback. Neither branch
 relaunches. A committed started attempt is usable only when the facade still
 retains its exact local record. A restart cannot deserialize that handle, so
 readback fails with `logical_writer_handle_unavailable` and requires stop or
-physical fencing. A committed not-started or completely stopped attempt
-returns no writer.
+physical fencing. A committed not-started, completely stopped, or validly
+cancelled attempt returns no writer.
 
 `resolveStoppedWriter()` authenticates only a ready local record whose complete
 attachment tuple matches the capture request. It also binds the checkpoint's
@@ -1249,14 +1252,35 @@ attempt uses exact readback. The serialized `launchIntent` is therefore a
 durable correlation and full-measurement recovery binding, not a replacement
 for any image capability or a writer handle.
 
-The authority reconstructs the exact version 2 handoff from the terminal
-restore request, committed generation, launch intent, permanent registry
-claim, and same-transaction operation and reservation timestamps before
-accepting prepared cancellation.
-An exact atomic handoff is not cancellable; a generic reconciliation attempt
-without the matching image capability remains uncertain and leaves it
-prepared for `runPreparedLaunch()`. Standalone version 1 launch reservations
-retain their existing cancellation behavior.
+The authority admits one closed prepared-cancellation path for an atomic
+handoff. It first locks the canonical session and active launch operation and
+reservation, then reconstructs the exact version 2 provenance from the
+terminal restore request, committed generation, launch intent, permanently
+materialized registry claim, and same-transaction timestamps. The terminal
+restore, generation, and registry provenance is committed and immutable while
+the active rows remain locked.
+
+Only that fully proven `writer-launch-attempt-v1` provenance may use the path,
+and only with the exact reason `launch-dispatch-not-started`. After provenance
+validation, the authority samples `authorityNow` and permits cancellation only
+when `expiresAt <= authorityNow`; a wrong reason or a pre-expiry sample rejects
+with `operation_transition_conflict` without a terminal mutation. The sampled
+`authorityNow` becomes the durable operation, released-reservation, and
+session terminal timestamp. The materialized registry claim is not changed or
+released, so the launch-attempt ID remains permanently unavailable for reuse.
+
+Dispatch claim and expiry cancellation are complementary while holding the
+same active-row serialization boundary: claim requires
+`expiresAt > authorityNow`, whereas cancellation requires
+`expiresAt <= authorityNow`, with equality belonging only to cancellation.
+Before expiry, reconciliation without the matching image capability leaves the
+attempt prepared for `runPreparedLaunch()`; at or after expiry, recovery may
+retire it without consuming an image or invoking the supervisor. Exact replay
+of `finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt()`
+accepts that reason-bound, expiry-timestamped cancellation as the valid
+successor of the original handoff and returns the same terminal launch state.
+Standalone version 1 launch reservations retain their ordinary cancellation
+reason, clock, timestamp, and replay behavior unchanged.
 
 This slice intentionally does not verify a committed publication, route the
 coordinator's stop callback through PostgreSQL, join stop proof to capture,
