@@ -5,7 +5,7 @@ import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 2;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 3;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
@@ -96,6 +96,13 @@ const MIGRATION_SOURCES = objectFreeze([
       import.meta.url,
     ),
     version: 2,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/003-operation-id-registry.sql",
+      import.meta.url,
+    ),
+    version: 3,
   }),
 ]);
 

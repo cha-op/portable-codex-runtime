@@ -59,10 +59,14 @@
   external launcher once, register a provisional writer before started
   finalisation, reconcile active attempts without relaunch, and add typed
   launch-stop authority plus bounded prepared/active/current-launch discovery.
-- [pending] In the next serial pull request, wire the exact typed generation
-  binding through restore publication, launcher and no-relaunch recovery;
-  compose the durable stop callback and recovery service; and only then enable
-  `runRestore()` under fail-closed ambiguous outcomes.
+- [done] Eliminate the generation-to-launch crash gap with a version 2 restore
+  request that durably binds one launch intent, one serializable transaction
+  that commits the generation and reserves that exact launch attempt, and a
+  launcher path that consumes only the already-reserved attempt.
+- [pending] After a fleet-wide version 2 capability gate, compose committed
+  restore publication, durable stop/capture callbacks, and bounded no-relaunch
+  recovery services; only then enable `runRestore()` under fail-closed
+  ambiguous outcomes.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

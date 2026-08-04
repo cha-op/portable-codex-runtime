@@ -134,7 +134,7 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
      settles, drain in-flight work on abort, and leave guard-busy or
      unverifiable operations durably blocked for a later pass.
 
-Restore and launcher authority are now split into five serial pull requests:
+Restore and launcher authority are now split into seven serial pull requests:
 
 1. **Restore-generation schema foundation (complete)**
    - Replace the single hard-coded migration with one ordered,
@@ -158,7 +158,7 @@ Restore and launcher authority are now split into five serial pull requests:
      epoch, image measurement, process incarnation, and writer incarnation
      without invoking a launcher in this slice.
    - Reuse the permanent operation and reservation rows with the operation ID
-     as the launch-attempt ID; no migration version 3 is required.
+     as the launch-attempt ID; launch phase state needs no separate relation.
    - Upgrade canonical session documents to version 3 on the next real write
      so a started launch remains linked to its immutable operation after
      `lastOperation` advances.
@@ -171,11 +171,56 @@ Restore and launcher authority are now split into five serial pull requests:
      add typed `writer-launch-stop-v1` authority, and enumerate bounded
      prepared attempts and current launches without enabling production
      restore or claiming production stop/capture composition.
-5. **Production restore composition and enablement**
-   - Bind typed generation claim and publication to the exact committed
-     generation consumed by launcher admission, then wire launcher dispatch,
-     no-relaunch recovery, durable stop callbacks, and bounded recovery
-     services through the production checkpoint adapter.
+5. **Atomic restore-to-launch handoff (complete)**
+   - Add a version 2 restore-generation request that commits to the exact
+     measured image, supervisor, and launch-attempt identity before physical
+     publication begins.
+   - Add migration version 3's permanent global operation-ID registry. Direct
+     operations materialize their claim immediately; version 2 restore
+     dispatch durably claims the exact launch-attempt ID before authorizing
+     publication, so no other session or operation can steal it in the crash
+     gap. Drain in-flight legacy writes by locking the session table before the
+     operation table, matching runtime lock order, and retain a database
+     trigger that blocks old binaries from advancing V2 work without the exact
+     claim while still allowing strict cancellation before dispatch.
+   - In one serializable transition, commit the authorized generation, retire
+     the restore operation, materialize its exact registry claim as the
+     `writer-launch-attempt-v1` operation, and reserve that operation. Advance
+     the canonical session first to the restore terminal anchor and then to
+     the prepared launch pointer.
+   - Prepare the process-local image reservation before publication and let
+     the launcher claim only that already-reserved attempt. A crash cannot
+     expose a committed generation without durable launch work.
+   - Close expiry retirement over the same serialized launch boundary. After
+     locking the session and active operation/reservation rows and proving the
+     committed, immutable version 2 terminal restore, generation, and
+     materialized registry provenance, permit only exact reason
+     `launch-dispatch-not-started` when `expiresAt <= authorityNow`. Persist
+     that sampled authority time on the operation, released reservation, and
+     terminal session while retaining the registry claim permanently.
+     Dispatch claim keeps the complementary `expiresAt > authorityNow`
+     boundary; wrong reasons and pre-expiry cancellation reject.
+   - Treat an expired cancellation as a valid terminal successor when the
+     original atomic handoff API replays. Preserve ordinary version 1
+     cancellation and replay behavior unchanged.
+   - Preserve version 1 behavior, but fail the schema upgrade closed if an old
+     version 2 restore operation has progressed beyond `prepared`: only an
+     undispatched request can safely receive the missing pre-publication
+     registry claim.
+6. **Durable stop and recovery composition**
+   - Gate version 2 creation on confirmed fleet-wide authority and recovery
+     compatibility before production can persist the new request shape.
+   - Verify committed restore publication, route exact coordinator stop
+     confirmation through `writer-launch-stop-v1`, retain only the local
+     capability state that can still prove writer identity, and join that stop
+     proof to later capture admission.
+   - Compose bounded generation, prepared-launch, active-attempt, and
+     current-launch recovery without relaunching or reconstructing an opaque
+     image or writer capability from serialized state.
+7. **Production restore adapter enablement**
+   - Wire publication, the atomic handoff, prepared launch, no-relaunch
+     recovery, durable stop, and capture composition through the production
+     checkpoint adapter.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

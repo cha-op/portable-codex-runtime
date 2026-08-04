@@ -38,6 +38,7 @@ import {
   WRITER_RELEASE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
+  createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
 } from "../src/postgres-session-authority.mjs";
@@ -76,6 +77,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
     ),
     version: 2,
   }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/003-operation-id-registry.sql",
+      import.meta.url,
+    ),
+    version: 3,
+  }),
 ]);
 
 if (!databaseConfigured) {
@@ -110,8 +118,12 @@ async function readMigrationLedger(pool) {
   return result.rows;
 }
 
-async function installVersionOneAuthority(pool, migration) {
-  assert.equal(migration.version, 1);
+async function installAuthorityMigrations(pool, migrations) {
+  assert.notEqual(migrations.length, 0);
+  assert.deepEqual(
+    migrations.map(({ version }) => version),
+    migrations.map((_, index) => index + 1),
+  );
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -126,21 +138,456 @@ async function installVersionOneAuthority(pool, migration) {
         ")",
       ].join(" "),
     );
-    await client.query(migration.sql);
-    await client.query(
-      [
-        "INSERT INTO session_authority.schema_migrations",
-        "(version, checksum, applied_at)",
-        "VALUES ($1, $2, pg_catalog.transaction_timestamp())",
-      ].join(" "),
-      [migration.version, migration.checksum],
-    );
+    for (const migration of migrations) {
+      await client.query(migration.sql);
+      await client.query(
+        [
+          "INSERT INTO session_authority.schema_migrations",
+          "(version, checksum, applied_at)",
+          "VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+        ].join(" "),
+        [migration.version, migration.checksum],
+      );
+    }
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function installVersionOneAuthority(pool, migration) {
+  assert.equal(migration.version, 1);
+  return installAuthorityMigrations(pool, [migration]);
+}
+
+async function insertDirectOperationIdClaim(
+  queryable,
+  { claimedAt, operationId, sessionId },
+) {
+  await queryable.query(
+    [
+      "INSERT INTO session_authority.operation_id_registry",
+      "(operation_id, session_id, claim_type, claimant_operation_id,",
+      "binding, claimed_at, materialized_at)",
+      "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, $3)",
+    ].join(" "),
+    [operationId, sessionId, claimedAt],
+  );
+}
+
+async function waitForMigrationOperationTableLock(queryable) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await queryable.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
+    const result = await queryable.query(
+      [
+        "SELECT count(*)::integer AS value",
+        "FROM pg_catalog.pg_stat_activity",
+        "WHERE datname = pg_catalog.current_database()",
+        "AND wait_event_type = 'Lock'",
+        "AND position(",
+        "'LOCK TABLE session_authority.operation_claims IN ACCESS EXCLUSIVE MODE'",
+        "IN query) > 0",
+      ].join(" "),
+    );
+    if (result.rows[0]?.value >= 1) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail("operation ID registry migration did not wait for old writers");
+}
+
+async function waitForMigrationSessionTableLock(queryable) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await queryable.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
+    const result = await queryable.query(
+      [
+        "SELECT count(*)::integer AS value",
+        "FROM pg_catalog.pg_locks AS locks",
+        "JOIN pg_catalog.pg_class AS relation",
+        "ON relation.oid = locks.relation",
+        "JOIN pg_catalog.pg_namespace AS namespace",
+        "ON namespace.oid = relation.relnamespace",
+        "JOIN pg_catalog.pg_stat_activity AS activity",
+        "ON activity.pid = locks.pid",
+        "WHERE locks.locktype = 'relation'",
+        "AND locks.mode = 'ExclusiveLock'",
+        "AND locks.granted = false",
+        "AND namespace.nspname = 'session_authority'",
+        "AND relation.relname = 'sessions'",
+        "AND activity.datname = pg_catalog.current_database()",
+        "AND position(",
+        "'LOCK TABLE session_authority.sessions IN EXCLUSIVE MODE'",
+        "IN activity.query) > 0",
+      ].join(" "),
+    );
+    if (result.rows[0]?.value >= 1) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(
+    "operation ID registry migration did not wait for session writers",
+  );
+}
+
+async function assertLegacyRestoreV2MigrationGate(
+  pool,
+  store,
+  trackedMigrations,
+) {
+  await pool.query("DROP SCHEMA IF EXISTS session_authority CASCADE");
+  await installAuthorityMigrations(pool, trackedMigrations.slice(0, 2));
+
+  const blockedOperationId = `legacy-starting-restore-v2-${randomUUID()}`;
+  const sessionId = randomUUID();
+  const timestamp = await pool.query(
+    "SELECT pg_catalog.transaction_timestamp() AS value",
+  );
+  const now = timestamp.rows[0].value;
+  await pool.query(
+    [
+      "INSERT INTO session_authority.sessions",
+      "(session_id, document, created_at, updated_at)",
+      "VALUES ($1, $2::jsonb, $3, $3)",
+    ].join(" "),
+    [sessionId, EMPTY_JSON_OBJECT, now],
+  );
+  const inserted = await pool.query(
+    [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+      "VALUES ($1, $2, 'restore-destination-generation-v1',",
+      "$3::jsonb, 'prepared', $4, $4)",
+      "RETURNING created_at",
+    ].join(" "),
+    [
+      blockedOperationId,
+      sessionId,
+      JSON.stringify({ payload: { contractVersion: 2 } }),
+      now,
+    ],
+  );
+  assert.equal(inserted.rows.length, 1);
+
+  const oldWriter = await pool.connect();
+  let oldWriterTransactionOpen = false;
+  try {
+    await oldWriter.query("BEGIN");
+    oldWriterTransactionOpen = true;
+    await oldWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', updated_at = $2",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [blockedOperationId, now],
+    );
+    const migrationOutcome = store.migrate().then(
+      (value) => ({ error: null, value }),
+      (error) => ({ error, value: null }),
+    );
+    // The integration pool intentionally has only two connections: this old
+    // writer and the blocked migrator. Observe the wait through the writer's
+    // existing connection so the probe itself cannot deadlock in the pool
+    // queue before releasing the table lock.
+    await waitForMigrationOperationTableLock(oldWriter);
+    await oldWriter.query("COMMIT");
+    oldWriterTransactionOpen = false;
+    const outcome = await migrationOutcome;
+    assert.equal(outcome.value, null);
+    assert.ok(outcome.error instanceof PostgresSerializableStoreError);
+    assert.equal(outcome.error.code, "migration_failed");
+    assert.equal(outcome.error.commitState, "not-committed");
+  } finally {
+    if (oldWriterTransactionOpen) await oldWriter.query("ROLLBACK");
+    oldWriter.release();
+  }
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 2).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  const absentRegistry = await pool.query(
+    "SELECT pg_catalog.to_regclass('session_authority.operation_id_registry') AS value",
+  );
+  assert.equal(absentRegistry.rows[0].value, null);
+
+  await pool.query(
+    "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+    [blockedOperationId],
+  );
+  const operationId = `legacy-prepared-restore-v2-${randomUUID()}`;
+  await pool.query(
+    [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+      "VALUES ($1, $2, 'restore-destination-generation-v1',",
+      "$3::jsonb, 'prepared', $4, $4)",
+    ].join(" "),
+    [
+      operationId,
+      sessionId,
+      JSON.stringify({ payload: { contractVersion: 2 } }),
+      now,
+    ],
+  );
+  const sessionWriter = await pool.connect();
+  let sessionWriterTransactionOpen = false;
+  let migrationOutcome;
+  try {
+    // Enter the runtime's session-first lock order before the migration. The
+    // writer must still be able to touch its operation before releasing the
+    // session row, proving that the migration has not inverted that order.
+    await sessionWriter.query("BEGIN");
+    sessionWriterTransactionOpen = true;
+    const lockedSession = await sessionWriter.query(
+      [
+        "SELECT session_id",
+        "FROM session_authority.sessions",
+        "WHERE session_id = $1",
+        "FOR UPDATE",
+      ].join(" "),
+      [sessionId],
+    );
+    assert.equal(lockedSession.rows.length, 1);
+    migrationOutcome = store.migrate().then(
+      (value) => ({ error: null, value }),
+      (error) => ({ error, value: null }),
+    );
+    await waitForMigrationSessionTableLock(sessionWriter);
+    const touchedOperation = await sessionWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET updated_at = updated_at",
+        "WHERE operation_id = $1",
+        "RETURNING operation_id, state",
+      ].join(" "),
+      [operationId],
+    );
+    assert.deepEqual(touchedOperation.rows, [
+      { operation_id: operationId, state: "prepared" },
+    ]);
+    await sessionWriter.query("COMMIT");
+    sessionWriterTransactionOpen = false;
+  } finally {
+    if (sessionWriterTransactionOpen) {
+      await sessionWriter.query("ROLLBACK");
+    }
+    sessionWriter.release();
+  }
+  const upgradeOutcome = await migrationOutcome;
+  assert.equal(upgradeOutcome.error, null);
+  const upgraded = upgradeOutcome.value;
+  assert.deepEqual(upgraded, {
+    applied: true,
+    checksum: trackedMigrations[2].checksum,
+    version: 3,
+  });
+  const registry = await pool.query(
+    [
+      "SELECT operation_id, session_id, claim_type, claimant_operation_id,",
+      "binding, claimed_at, materialized_at",
+      "FROM session_authority.operation_id_registry",
+      "WHERE operation_id = $1",
+    ].join(" "),
+    [operationId],
+  );
+  assert.equal(registry.rows.length, 1);
+  assert.equal(registry.rows[0].operation_id, operationId);
+  assert.equal(registry.rows[0].session_id, sessionId);
+  assert.equal(registry.rows[0].claim_type, "direct-operation");
+  assert.equal(registry.rows[0].claimant_operation_id, null);
+  assert.equal(registry.rows[0].binding, null);
+  assert.equal(
+    registry.rows[0].materialized_at.getTime(),
+    registry.rows[0].claimed_at.getTime(),
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', updated_at = $2",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [operationId, now],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "operation_claims_restore_v2_launch_id_claim",
+      );
+      return true;
+    },
+  );
+  const cancelled = await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'committed',",
+      "result = $2::jsonb, revision = revision + 1,",
+      "updated_at = $3, retired_at = $3",
+      "WHERE operation_id = $1 AND state = 'prepared'",
+      "RETURNING state, result, revision, retired_at",
+    ].join(" "),
+    [
+      operationId,
+      JSON.stringify({
+        outcome: "cancelled-before-dispatch",
+        reason: "integration-upgrade-cancellation",
+        resultVersion: 1,
+      }),
+      now,
+    ],
+  );
+  assert.equal(cancelled.rows.length, 1);
+  assert.equal(cancelled.rows[0].state, "committed");
+  assert.equal(cancelled.rows[0].result.outcome, "cancelled-before-dispatch");
+  assert.equal(cancelled.rows[0].revision, "1");
+  assert.equal(cancelled.rows[0].retired_at.getTime(), now.getTime());
+
+  await pool.query(
+    "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+    [operationId],
+  );
+  await pool.query(
+    "DELETE FROM session_authority.operation_id_registry WHERE operation_id = $1",
+    [operationId],
+  );
+  await pool.query(
+    "DELETE FROM session_authority.sessions WHERE session_id = $1",
+    [sessionId],
+  );
+}
+
+async function waitForBackendLockWait(observer, backendPid) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await observer.query(
+      [
+        "SELECT wait_event_type",
+        "FROM pg_catalog.pg_stat_activity",
+        "WHERE pid = $1",
+      ].join(" "),
+      [backendPid],
+    );
+    if (result.rows[0]?.wait_event_type === "Lock") return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail("concurrent operation ID claimant did not wait on the registry");
+}
+
+async function assertOperationIdRegistryConcurrency(pool) {
+  const firstClient = await pool.connect();
+  const secondClient = await pool.connect();
+  const firstSessionId = randomUUID();
+  const secondSessionId = randomUUID();
+  const invalidOperationId = `invalid-direct-operation-${randomUUID()}`;
+  const operationId = `concurrent-operation-${randomUUID()}`;
+  let firstTransactionOpen = false;
+  let secondTransactionOpen = false;
+  try {
+    const now = new Date();
+    await firstClient.query(
+      [
+        "INSERT INTO session_authority.sessions",
+        "(session_id, document, created_at, updated_at)",
+        "VALUES ($1, $3::jsonb, $4, $4), ($2, $3::jsonb, $4, $4)",
+      ].join(" "),
+      [firstSessionId, secondSessionId, EMPTY_JSON_OBJECT, now],
+    );
+    await assert.rejects(
+      firstClient.query(
+        [
+          "INSERT INTO session_authority.operation_id_registry",
+          "(operation_id, session_id, claim_type, claimant_operation_id,",
+          "binding, claimed_at, materialized_at)",
+          "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, NULL)",
+        ].join(" "),
+        [invalidOperationId, firstSessionId, now],
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "operation_id_registry_claim_shape",
+        );
+        return true;
+      },
+    );
+
+    await firstClient.query("BEGIN");
+    firstTransactionOpen = true;
+    await insertDirectOperationIdClaim(firstClient, {
+      claimedAt: now,
+      operationId,
+      sessionId: firstSessionId,
+    });
+    await firstClient.query(
+      [
+        "INSERT INTO session_authority.operation_claims",
+        "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+        "VALUES ($1, $2, 'integration', $3::jsonb, 'active', $4, $4)",
+      ].join(" "),
+      [operationId, firstSessionId, EMPTY_JSON_OBJECT, now],
+    );
+
+    await secondClient.query("BEGIN");
+    secondTransactionOpen = true;
+    await secondClient.query("SET LOCAL lock_timeout = '5s'");
+    const backend = await secondClient.query(
+      "SELECT pg_catalog.pg_backend_pid() AS value",
+    );
+    const competingInsert = secondClient.query(
+      [
+        "INSERT INTO session_authority.operation_id_registry",
+        "(operation_id, session_id, claim_type, claimant_operation_id,",
+        "binding, claimed_at, materialized_at)",
+        "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, $3)",
+        "ON CONFLICT (operation_id) DO NOTHING",
+        "RETURNING operation_id",
+      ].join(" "),
+      [operationId, secondSessionId, now],
+    );
+    await waitForBackendLockWait(firstClient, backend.rows[0].value);
+    await firstClient.query("COMMIT");
+    firstTransactionOpen = false;
+    assert.deepEqual((await competingInsert).rows, []);
+    await secondClient.query("COMMIT");
+    secondTransactionOpen = false;
+
+    const existingConflict = await firstClient.query(
+      [
+        "INSERT INTO session_authority.operation_id_registry",
+        "(operation_id, session_id, claim_type, claimant_operation_id,",
+        "binding, claimed_at, materialized_at)",
+        "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, $3)",
+        "ON CONFLICT (operation_id) DO NOTHING",
+        "RETURNING operation_id",
+      ].join(" "),
+      [operationId, secondSessionId, now],
+    );
+    assert.deepEqual(existingConflict.rows, []);
+  } finally {
+    if (secondTransactionOpen) await secondClient.query("ROLLBACK");
+    if (firstTransactionOpen) await firstClient.query("ROLLBACK");
+    secondClient.release();
+    firstClient.release();
+    await pool.query(
+      "DELETE FROM session_authority.operation_claims WHERE operation_id = $1",
+      [operationId],
+    );
+    await pool.query(
+      [
+        "DELETE FROM session_authority.operation_id_registry",
+        "WHERE operation_id IN ($1, $2)",
+      ].join(" "),
+      [operationId, invalidOperationId],
+    );
+    await pool.query(
+      "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2)",
+      [firstSessionId, secondSessionId],
+    );
   }
 }
 
@@ -170,6 +617,11 @@ async function assertRestoreGenerationConstraints(pool) {
         ].join(" "),
         [fixture.sessionId, EMPTY_JSON_OBJECT, now],
       );
+      await insertDirectOperationIdClaim(client, {
+        claimedAt: now,
+        operationId: fixture.captureOperationId,
+        sessionId: fixture.sessionId,
+      });
       await client.query(
         [
           "INSERT INTO session_authority.operation_claims",
@@ -203,6 +655,11 @@ async function assertRestoreGenerationConstraints(pool) {
           now,
         ],
       );
+      await insertDirectOperationIdClaim(client, {
+        claimedAt: now,
+        operationId: fixture.restoreOperationId,
+        sessionId: fixture.sessionId,
+      });
       await client.query(
         [
           "INSERT INTO session_authority.checkpoint_catalogue",
@@ -1241,6 +1698,40 @@ function restoreGenerationOperationInput(expectedSession, admission) {
   };
 }
 
+function restoreGenerationOperationInputV2(
+  expectedSession,
+  admission,
+  launchIntent,
+) {
+  return {
+    expectedSession,
+    kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    operationId: admission.request.operationId,
+    request: createRestoreDestinationGenerationOperationRequestV2({
+      admission,
+      expectedSession,
+      launchIntent,
+    }),
+  };
+}
+
+function restoreGenerationLaunchIntent(
+  expectedSession,
+  {
+    launchAttemptId = `writer-launch-${randomUUID()}`,
+    supervisorId = `supervisor-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    launchAttemptId,
+    measuredImage: writerLaunchMeasuredImage(expectedSession),
+    supervisor: {
+      contractVersion: 1,
+      supervisorId,
+    },
+  };
+}
+
 function restoreGenerationCompletion(input, claimed, replayed) {
   const artifactProof = claimed.catalogue.document.artifactProof;
   return {
@@ -1543,6 +2034,61 @@ async function readRestoreGenerationTransactionState(
   return result.rows[0];
 }
 
+async function readRestoreLaunchHandoffTransactionState(
+  client,
+  restoreOperationId,
+  launchAttemptId,
+) {
+  const result = await client.query(
+    [
+      "SELECT s.revision::text AS session_revision,",
+      "s.document AS session_document,",
+      "s.updated_at AS session_updated_at,",
+      "g.state AS generation_state,",
+      "g.document AS generation_document,",
+      "g.committed_at AS generation_committed_at,",
+      "ro.state AS restore_operation_state,",
+      "ro.revision::text AS restore_operation_revision,",
+      "ro.result AS restore_operation_result,",
+      "ro.retired_at AS restore_operation_retired_at,",
+      "rr.state AS restore_reservation_state,",
+      "rr.released_at AS restore_reservation_released_at,",
+      "lo.kind AS launch_operation_kind,",
+      "lo.request AS launch_operation_request,",
+      "lo.result AS launch_operation_result,",
+      "lo.state AS launch_operation_state,",
+      "lo.revision::text AS launch_operation_revision,",
+      "lo.retired_at AS launch_operation_retired_at,",
+      "lr.state AS launch_reservation_state,",
+      "lr.released_at AS launch_reservation_released_at,",
+      "(g.committed_at = ro.updated_at",
+      "AND ro.updated_at = ro.retired_at",
+      "AND ro.updated_at = rr.updated_at",
+      "AND ro.updated_at = rr.released_at",
+      "AND ro.updated_at = lo.created_at",
+      "AND ro.updated_at = lo.updated_at",
+      "AND ro.updated_at = lr.created_at",
+      "AND ro.updated_at = lr.updated_at",
+      "AND ro.updated_at = s.updated_at) AS handoff_times_match",
+      "FROM session_authority.operation_claims ro",
+      "JOIN session_authority.sessions s",
+      "ON s.session_id = ro.session_id",
+      "JOIN session_authority.reservations rr",
+      "ON rr.operation_id = ro.operation_id",
+      "JOIN session_authority.restore_destination_generations g",
+      "ON g.operation_id = ro.operation_id",
+      "LEFT JOIN session_authority.operation_claims lo",
+      "ON lo.operation_id = $2 AND lo.session_id = ro.session_id",
+      "LEFT JOIN session_authority.reservations lr",
+      "ON lr.operation_id = lo.operation_id",
+      "WHERE ro.operation_id = $1",
+    ].join(" "),
+    [restoreOperationId, launchAttemptId],
+  );
+  assert.equal(result.rows.length, 1);
+  return result.rows[0];
+}
+
 function integrationArtifactPaths({ checkpoint }) {
   return {
     artifactDirectory:
@@ -1703,10 +2249,11 @@ test(
     });
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 2);
+    const latestMigration = trackedMigrations.at(-1);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 3);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2],
+      [1, 2, 3],
     );
 
     await pool.query(
@@ -1715,8 +2262,8 @@ test(
     const freshMigration = await store.migrate();
     assert.deepEqual(freshMigration, {
       applied: true,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -1728,8 +2275,8 @@ test(
     const freshNoOpMigration = await store.migrate();
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -1743,8 +2290,8 @@ test(
     const upgradeMigration = await store.migrate();
     assert.deepEqual(upgradeMigration, {
       applied: true,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -1755,9 +2302,15 @@ test(
     );
     assert.deepEqual(await store.migrate(), {
       applied: false,
-      checksum: trackedMigrations[1].checksum,
-      version: 2,
+      checksum: latestMigration.checksum,
+      version: 3,
     });
+    await assertLegacyRestoreV2MigrationGate(
+      pool,
+      store,
+      trackedMigrations,
+    );
+    await assertOperationIdRegistryConcurrency(pool);
     await assertRestoreGenerationConstraints(pool);
 
     const baselineWorkMem = await resetStore.runSerializable(
@@ -2063,6 +2616,11 @@ test(
           `integration-operation-${randomUUID()}`,
           `integration-operation-${randomUUID()}`,
         ]) {
+          await insertDirectOperationIdClaim(transaction, {
+            claimedAt: transaction.now,
+            operationId,
+            sessionId: activeOperationSessionId,
+          });
           await transaction.query(
             [
               "INSERT INTO session_authority.operation_claims",
@@ -2100,6 +2658,11 @@ test(
         );
         const retiredOperationId = `integration-operation-${randomUUID()}`;
         const activeOperationId = `integration-operation-${randomUUID()}`;
+        await insertDirectOperationIdClaim(transaction, {
+          claimedAt: transaction.now,
+          operationId: retiredOperationId,
+          sessionId: activeReservationSessionId,
+        });
         await transaction.query(
           [
             "INSERT INTO session_authority.operation_claims",
@@ -2113,6 +2676,11 @@ test(
             transaction.now,
           ],
         );
+        await insertDirectOperationIdClaim(transaction, {
+          claimedAt: transaction.now,
+          operationId: activeOperationId,
+          sessionId: activeReservationSessionId,
+        });
         await transaction.query(
           [
             "INSERT INTO session_authority.operation_claims",
@@ -2217,6 +2785,33 @@ test(
           await pool.query(
             [
               "DELETE FROM session_authority.operation_claims",
+              "WHERE operation_id IN (",
+              "SELECT operation_id",
+              "FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+              "AND claim_type = 'restore-launch-intent-v2'",
+              ")",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+              "AND claim_type = 'restore-launch-intent-v2'",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
             [sessionIds],
@@ -5481,6 +6076,11 @@ test(
           startingFixture.attached.session,
           startingAdmission,
         );
+        assert.equal(startingInput.request.contractVersion, 1);
+        assert.equal(
+          Object.hasOwn(startingInput.request, "launchIntent"),
+          false,
+        );
         assert.deepEqual(
           Reflect.ownKeys(startingInput.request.admission),
           ["checkpoint", "request"],
@@ -6055,6 +6655,408 @@ test(
     );
 
     await t.test(
+      "restore launch handoff rolls back every authority write and rejects crossed intent",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const launchIntent = restoreGenerationLaunchIntent(
+          fixture.attached.session,
+        );
+        const input = restoreGenerationOperationInputV2(
+          fixture.attached.session,
+          admission,
+          launchIntent,
+        );
+        await authority.reserveOperation(input);
+        const claimed =
+          await authority.claimRestoreDestinationGenerationDispatch({
+            ...structuredClone(input),
+            destinationIsolationProofId:
+              `restore-isolation-proof-${randomUUID()}`,
+            expectedOperationRevision: "0",
+            generationId: `restore-generation-${randomUUID()}`,
+          });
+        const handoffInput = {
+          launch: launchIntent,
+          restore: {
+            ...structuredClone(input),
+            completion: restoreGenerationCompletion(
+              input,
+              claimed,
+              false,
+            ),
+            expectedOperationRevision: "1",
+          },
+        };
+        const observer = await pool.connect();
+        try {
+          const authorizedState =
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            );
+
+          await assert.rejects(
+            authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+              {
+                ...structuredClone(handoffInput),
+                launch: {
+                  ...structuredClone(launchIntent),
+                  launchAttemptId: `writer-launch-${randomUUID()}`,
+                },
+              },
+            ),
+            assertAuthorityCode("invalid_operation_request"),
+          );
+          assert.deepEqual(
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            ),
+            authorizedState,
+          );
+
+          const rollbackAuthority = new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstMatchingQueryResultFailurePool(
+                pool,
+                "restore launch handoff rollback",
+                (text) =>
+                  text.startsWith(
+                    "INSERT INTO session_authority.reservations",
+                  ),
+              ),
+              maxTransactionAttempts: 1,
+            }),
+          });
+          await assert.rejects(
+            rollbackAuthority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+              structuredClone(handoffInput),
+            ),
+            assertTransactionBoundaryLost,
+          );
+          assert.deepEqual(
+            await readRestoreGenerationTransactionState(
+              observer,
+              input.operationId,
+            ),
+            authorizedState,
+          );
+          const rolledBack =
+            await readRestoreLaunchHandoffTransactionState(
+              observer,
+              input.operationId,
+              launchIntent.launchAttemptId,
+            );
+          assert.equal(rolledBack.generation_state, "authorized");
+          assert.equal(rolledBack.generation_document, null);
+          assert.equal(rolledBack.restore_operation_state, "starting");
+          assert.equal(rolledBack.restore_reservation_state, "starting");
+          assert.equal(rolledBack.launch_operation_kind, null);
+          assert.equal(rolledBack.launch_operation_request, null);
+          assert.equal(rolledBack.launch_reservation_state, null);
+
+          const handedOff =
+            await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+              structuredClone(handoffInput),
+            );
+          assert.equal(handedOff.status, "prepared");
+          assert.equal(handedOff.restore.finalized, true);
+          assert.equal(handedOff.generation.state, "committed");
+          assert.equal(handedOff.launch.operation.state, "prepared");
+          assert.equal(
+            handedOff.launch.attempt.launchAttemptId,
+            launchIntent.launchAttemptId,
+          );
+          const committed =
+            await readRestoreLaunchHandoffTransactionState(
+              observer,
+              input.operationId,
+              launchIntent.launchAttemptId,
+            );
+          assert.equal(committed.handoff_times_match, true);
+          assert.equal(committed.generation_state, "committed");
+          assert.equal(committed.restore_operation_state, "committed");
+          assert.equal(committed.restore_reservation_state, "released");
+          assert.equal(committed.launch_operation_state, "prepared");
+          assert.equal(committed.launch_reservation_state, "prepared");
+          assert.deepEqual(
+            committed.session_document,
+            structuredClone(handedOff.session.document),
+          );
+        } finally {
+          observer.release();
+        }
+      },
+    );
+
+    await t.test(
+      "restore finalization atomically hands one prepared attempt to the launcher",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const image = integrationPlatformImageFixture();
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+          { imageDigest: image.descriptor.digest },
+        );
+        const imageReservations =
+          new PlatformImageReservationCoordinator();
+        const inspectCodex = async () => ({
+          codexBinaryPath: "/opt/portable-codex/bin/codex",
+          codexBinarySha256: "c".repeat(64),
+          codexVersion:
+            fixture.attached.session.document.manifest.runtime
+              .codexVersion,
+        });
+        const reserved = await imageReservations.reservePlatformImage({
+          configBytes: image.configBytes,
+          descriptor: image.descriptor,
+          inspectCodex,
+          sessionManifest: fixture.attached.session.document.manifest,
+        });
+        const launchAttemptId = `writer-launch-${randomUUID()}`;
+        const supervisorId = `supervisor-${randomUUID()}`;
+        let launchCalls = 0;
+        let launchedRequest = null;
+        const facade = createPostgresLogicalWriterLauncher({
+          authority,
+          imageReservations,
+          operationGuard,
+          stoppedWriterCoordinator:
+            new StoppedWriterCapabilityCoordinator(),
+          supervisor: {
+            contractVersion: 1,
+            launchWriter: async (context) => {
+              launchCalls += 1;
+              launchedRequest = context.attempt.request;
+              return {
+                receiptVersion: 1,
+                evidence: writerLaunchEvidence(
+                  {
+                    operationId: launchAttemptId,
+                    request: context.attempt.request,
+                  },
+                  "started",
+                ),
+                stopWriter: async function stopWriter() {
+                  return STOPPED_WRITER_STOP_CONFIRMED;
+                },
+              };
+            },
+            reconcileWriterLaunch: async () => {
+              throw new Error(
+                "a prepared handoff must not reconcile before launch",
+              );
+            },
+            supervisorId,
+          },
+        });
+        const imageReservation = {
+          configBytes: image.configBytes,
+          descriptor: image.descriptor,
+          inspectCodex,
+          reservation: reserved.reservation,
+        };
+        const launchIntent = await facade.prepareLaunchIntent({
+          expectedSession: fixture.attached.session,
+          imageReservation,
+          launchAttemptId,
+        });
+        assert.equal(launchIntent.launchAttemptId, launchAttemptId);
+        assert.equal(
+          launchIntent.supervisor.supervisorId,
+          supervisorId,
+        );
+
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const input = restoreGenerationOperationInputV2(
+          fixture.attached.session,
+          admission,
+          launchIntent,
+        );
+        await authority.reserveOperation(input);
+        const claimed =
+          await authority.claimRestoreDestinationGenerationDispatch({
+            ...structuredClone(input),
+            destinationIsolationProofId:
+              `restore-isolation-proof-${randomUUID()}`,
+            expectedOperationRevision: "0",
+            generationId: `restore-generation-${randomUUID()}`,
+          });
+        const handoffInput = {
+          launch: launchIntent,
+          restore: {
+            ...structuredClone(input),
+            completion: restoreGenerationCompletion(
+              input,
+              claimed,
+              false,
+            ),
+            expectedOperationRevision: "1",
+          },
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+        await assert.rejects(
+          acknowledgementLossAuthority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+            handoffInput,
+          ),
+          assertCommitOutcomeUncertain,
+        );
+        const handedOff =
+          await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+            handoffInput,
+          );
+
+        assert.equal(handedOff.status, "prepared");
+        assert.equal(handedOff.restore.finalized, false);
+        assert.equal(handedOff.restore.operation.state, "committed");
+        assert.equal(handedOff.generation.state, "committed");
+        assert.equal(handedOff.launch.operation.state, "prepared");
+        assert.equal(
+          handedOff.launch.attempt.launchAttemptId,
+          launchAttemptId,
+        );
+        assert.equal(
+          BigInt(handedOff.launch.operation.expectedSession.revision),
+          BigInt(claimed.session.revision) + 1n,
+        );
+        assert.equal(
+          BigInt(handedOff.session.revision),
+          BigInt(claimed.session.revision) + 2n,
+        );
+        assert.equal(
+          handedOff.session.document.activeOperation.operationId,
+          launchAttemptId,
+        );
+        assert.equal(
+          handedOff.session.document.lastOperation.operationId,
+          input.operationId,
+        );
+        assert.deepEqual(
+          handedOff.launch.attempt.request.measuredImage,
+          launchIntent.measuredImage,
+        );
+        assert.deepEqual(
+          handedOff.launch.attempt.request.supervisor,
+          launchIntent.supervisor,
+        );
+        assert.equal(
+          handedOff.launch.attempt.request.generation.generationId,
+          handedOff.generation.generationId,
+        );
+        assert.equal(
+          handedOff.launch.attempt.request.generation.operationId,
+          handedOff.generation.operationId,
+        );
+
+        const atomicState =
+          await readRestoreLaunchHandoffTransactionState(
+            pool,
+            input.operationId,
+            launchAttemptId,
+          );
+        assert.equal(atomicState.generation_state, "committed");
+        assert.deepEqual(
+          atomicState.generation_document,
+          structuredClone(handedOff.generation.document),
+        );
+        assert.equal(atomicState.restore_operation_state, "committed");
+        assert.equal(atomicState.restore_operation_revision, "2");
+        assert.equal(
+          atomicState.restore_operation_result.outcome,
+          "restore-generation-committed",
+        );
+        assert.equal(atomicState.restore_reservation_state, "released");
+        assert.equal(
+          atomicState.launch_operation_kind,
+          WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+        );
+        assert.equal(atomicState.launch_operation_state, "prepared");
+        assert.equal(atomicState.launch_operation_revision, "0");
+        assert.equal(atomicState.launch_operation_result, null);
+        assert.equal(atomicState.launch_operation_retired_at, null);
+        assert.equal(atomicState.launch_reservation_state, "prepared");
+        assert.equal(atomicState.launch_reservation_released_at, null);
+        assert.equal(atomicState.handoff_times_match, true);
+        assert.equal(
+          atomicState.session_revision,
+          handedOff.session.revision,
+        );
+        assert.deepEqual(
+          atomicState.session_document,
+          structuredClone(handedOff.session.document),
+        );
+        assert.deepEqual(
+          atomicState.launch_operation_request.payload,
+          structuredClone(handedOff.launch.attempt.request),
+        );
+
+        const handoffReplay =
+          await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
+            structuredClone(handoffInput),
+          );
+        assert.equal(handoffReplay.status, "prepared");
+        assert.equal(handoffReplay.restore.finalized, false);
+        assert.deepEqual(handoffReplay.generation, handedOff.generation);
+        assert.deepEqual(handoffReplay.launch, handedOff.launch);
+        assert.deepEqual(handoffReplay.session, handedOff.session);
+
+        const started = await facade.runPreparedLaunch({
+          imageReservation,
+          launchAttemptId,
+        });
+        assert.equal(started.status, "started");
+        assert.notEqual(started.writer, null);
+        assert.equal(launchCalls, 1);
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(launchedRequest)),
+          JSON.parse(JSON.stringify(handedOff.launch.attempt.request)),
+        );
+
+        const replayed = await facade.runPreparedLaunch({
+          imageReservation,
+          launchAttemptId,
+        });
+        assert.equal(replayed.status, "started");
+        assert.strictEqual(replayed.writer, started.writer);
+        assert.equal(launchCalls, 1);
+
+        const read = await authority.readWriterLaunchAttempt({
+          operationId: launchAttemptId,
+        });
+        assertOperationReceipt(read, "committed");
+        assert.equal(
+          read.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(read.session.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
+        );
+      },
+    );
+
+    await t.test(
       "writer launch binds a committed restore, upgrades v2 history, and replays one started attempt",
       async () => {
         const sessionId = randomUUID();
@@ -6096,7 +7098,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2],
+          [1, 2, 3],
         );
 
         const input = writerLaunchAttemptInput(
