@@ -392,6 +392,8 @@ const ERROR_MESSAGES = objectFreeze({
     "Logical writer launch request is invalid",
   logical_writer_handle_unavailable:
     "The original writer handle is unavailable; stop or fence is required",
+  logical_writer_launch_admission_unavailable:
+    "Logical writer launch admission is temporarily unavailable",
   logical_writer_launch_outcome_uncertain:
     "Logical writer launch outcome is uncertain",
 });
@@ -541,7 +543,7 @@ export class PostgresLogicalWriterLauncherError extends Error {
     });
     objectDefineProperty(this, "retryable", {
       enumerable: true,
-      value: false,
+      value: code === "logical_writer_launch_admission_unavailable",
     });
     objectDefineProperty(this, "stack", {
       enumerable: false,
@@ -1964,6 +1966,7 @@ function evidenceMatchesRecord(evidence, record, code) {
  */
 export function createPostgresLogicalWriterLauncher(...args) {
   const optionCode = "invalid_logical_writer_launch_request";
+  const admissionCode = "logical_writer_launch_admission_unavailable";
   const outcomeCode = "logical_writer_launch_outcome_uncertain";
   ensure(args.length === 1, optionCode);
   const options = exactDataObject(args[0], OPTION_KEYS, optionCode);
@@ -2377,6 +2380,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
     const uncertaintyState = { attempted: false };
     let dispatchDefinitelyBegan = false;
     let dispatchOperation = null;
+    let durableReservationMayExist = false;
 
     try {
       return await invokeGuard(
@@ -2390,9 +2394,9 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 authority,
                 "readSession",
                 [exactFrozenRecord({ sessionId: input.generation.sessionId })],
-                outcomeCode,
+                admissionCode,
               ),
-              outcomeCode,
+              admissionCode,
             );
             let measuredImage;
             try {
@@ -2401,12 +2405,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   imageReservations,
                   imageRevalidateReservationIntrinsic,
                   input.imageReservation,
-                  outcomeCode,
+                  admissionCode,
                 ),
-                outcomeCode,
+                admissionCode,
               );
             } catch {
-              fail(outcomeCode);
+              fail(admissionCode);
             }
             let typedRequest;
             try {
@@ -2430,6 +2434,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
             });
 
             let reserve;
+            durableReservationMayExist = true;
             try {
               reserve = normalizeReserveReceipt(
                 await invokeAsync(
@@ -2559,10 +2564,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
     } catch (error) {
       if (
         isInternalError(error, optionCode) ||
-        isInternalError(error, "logical_writer_handle_unavailable")
+        isInternalError(error, "logical_writer_handle_unavailable") ||
+        isInternalError(error, admissionCode)
       ) {
         throw error;
       }
+      if (!durableReservationMayExist) fail(admissionCode);
       if (dispatchDefinitelyBegan && dispatchOperation !== null) {
         await bestEffortMarkUncertain(dispatchOperation, uncertaintyState);
       }

@@ -927,11 +927,12 @@ rejects proxies, accessors, inherited fields, unsafe thenables, and non-native
 callback promises, and snapshots collaborator methods and relevant intrinsics.
 Its per-attempt operation guard revalidates its held probe immediately around
 image consumption and supervisor callbacks. Public operations retain protected
-Promise chains and expose only the fixed,
-non-retryable `invalid_logical_writer_launch_request`,
-`logical_writer_handle_unavailable`, and
-`logical_writer_launch_outcome_uncertain` error codes without collaborator
-details.
+Promise chains and expose only four fixed error codes without collaborator
+details. `logical_writer_launch_admission_unavailable` is retryable only when
+the initial session read, image revalidation, or operation-guard admission
+fails before `reserveOperation` can create durable state. The remaining
+`invalid_logical_writer_launch_request`, `logical_writer_handle_unavailable`,
+and `logical_writer_launch_outcome_uncertain` codes are non-retryable.
 
 The supervisor contract is version 1. `launchWriter` must return exact
 `{ receiptVersion: 1, evidence, stopWriter }`: a `started` result requires one
@@ -954,6 +955,15 @@ A new launch follows this order:
    finalisation, retain that handle as provisional, and expose it only after
    exact authority readback succeeds.
 
+An admission failure before the first durable reservation call is explicitly
+retryable because this invocation cannot itself have created an attempt. A
+prior replay or concurrent holder may already own the same attempt, so retry
+must preserve the same `launchAttemptId`; the next reservation call and its
+readback or reconciliation path resolve that durable state. An image-inspection
+failure revokes that opaque image reservation, so retrying that case also
+requires a freshly prepared reservation. Once durable reservation invocation
+begins, acknowledgement loss follows the durable readback and reconciliation
+path rather than this pre-dispatch classification.
 No external launch callback runs before durable `starting`. If image
 consumption, launch, registration, finalisation, or acknowledgement becomes
 ambiguous after that boundary, the durable attempt remains a blocker. A

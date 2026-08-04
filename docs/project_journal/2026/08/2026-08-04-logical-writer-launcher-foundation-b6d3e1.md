@@ -75,6 +75,12 @@ production restore remains fail-closed.
 - A reservation-consumption or callback ambiguity after durable `starting`
   leaves the launch attempt blocked for reconciliation; it never permits a
   second launch.
+- A session-read, image-revalidation, or guard-admission failure before the
+  first durable reservation call returns a retryable admission error. It does
+  not claim that this invocation created a durable launch outcome. Retry keeps
+  the same launch-attempt ID so a prior replay or concurrent holder is resolved
+  by the next reservation/readback path; a failed image inspection additionally
+  requires a fresh opaque reservation.
 - Register-before-finalise prevents a database acknowledgement loss from
   turning a possibly running writer into an untracked same-process writer.
   Recovery does not synthesize or deserialize a replacement handle.

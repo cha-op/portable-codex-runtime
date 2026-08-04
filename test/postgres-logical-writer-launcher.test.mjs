@@ -486,6 +486,9 @@ class MemoryLaunchAuthority {
 
   async readSession() {
     this.events.push("authority.read-session");
+    if (this.behaviour.readSessionThrows) {
+      throw new Error("session read unavailable");
+    }
     return clone(this.expectedSession);
   }
 
@@ -700,11 +703,11 @@ function captureRequest() {
   };
 }
 
-function assertLauncherError(code) {
+function assertLauncherError(code, retryable = false) {
   return (error) => {
     assert.ok(error instanceof PostgresLogicalWriterLauncherError);
     assert.equal(error.code, code);
-    assert.equal(error.retryable, false);
+    assert.equal(error.retryable, retryable);
     assert.equal(Object.isFrozen(error), true);
     assert.equal(Object.hasOwn(error, "cause"), false);
     return true;
@@ -1418,6 +1421,59 @@ test("claim acknowledgement loss reconciles without consuming or launching", asy
   ]);
 });
 
+test("session-read admission failure is retryable before durable reservation", async () => {
+  const value = await fixture();
+  value.authority.behaviour.readSessionThrows = true;
+
+  await assert.rejects(
+    value.facade.runLaunch(runInput(value)),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(value.inspectionCount, 1);
+  assert.equal(value.authority.state, "absent");
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
+  assert.equal(value.authority.calls.markUncertain, 0);
+});
+
+test("image revalidation admission failure permits a fresh-reservation retry", async () => {
+  const value = await fixture();
+  value.failInspectionAt(2);
+
+  await assert.rejects(
+    value.facade.runLaunch(runInput(value)),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(value.inspectionCount, 2);
+  assert.equal(value.authority.state, "absent");
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
+  assert.equal(value.authority.calls.markUncertain, 0);
+
+  value.failInspectionAt(null);
+  const fresh = await value.imageReservations.reservePlatformImage({
+    configBytes: value.imageReservation.configBytes,
+    descriptor: value.imageReservation.descriptor,
+    inspectCodex: value.imageReservation.inspectCodex,
+    sessionManifest: value.image.manifest,
+  });
+  const result = await value.facade.runLaunch(
+    runInput(value, {
+      imageReservation: {
+        ...value.imageReservation,
+        reservation: fresh.reservation,
+      },
+    }),
+  );
+  assert.equal(result.status, "started");
+  assert.equal(value.authority.calls.reserve, 1);
+  assert.equal(value.launchCalls, 1);
+});
+
 test("claim acknowledgement loss plus failed read stays closed", async () => {
   const value = await fixture();
   value.authority.behaviour.claimThrowAfterCommit = true;
@@ -1444,6 +1500,25 @@ test("reserve acknowledgement loss cancels the still-prepared attempt", async ()
   assert.equal(value.launchCalls, 0);
   assert.equal(value.authority.calls.claim, 0);
   assert.equal(value.authority.calls.cancel, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+});
+
+test("reserve acknowledgement loss plus failed read stays non-retryable", async () => {
+  const value = await fixture();
+  value.authority.behaviour.reserveThrowAfterCommit = true;
+  value.authority.behaviour.readThrows = true;
+
+  await assert.rejects(
+    value.facade.runLaunch(runInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.inspectionCount, 2);
+  assert.equal(value.authority.state, "prepared");
+  assert.equal(value.authority.calls.reserve, 1);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.authority.calls.read, 1);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
   assert.equal(value.authority.calls.markUncertain, 0);
 });
 
