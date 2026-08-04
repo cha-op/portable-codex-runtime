@@ -639,11 +639,15 @@ class MemoryOperationGuard {
     this.events = events;
     this.calls = 0;
     this.assertions = 0;
+    this.failBeforeCallback = false;
   }
 
   async runExclusive(operationId, callback) {
     this.calls += 1;
     this.events.push(`guard.enter:${operationId}`);
+    if (this.failBeforeCallback) {
+      throw new Error("operation guard unavailable");
+    }
     const result = await callback(
       Object.freeze({
         assertHeld: async () => {
@@ -1436,6 +1440,29 @@ test("session-read admission failure is retryable before durable reservation", a
   assert.equal(value.launchCalls, 0);
   assert.equal(value.reconcileCalls, 0);
   assert.equal(value.authority.calls.markUncertain, 0);
+});
+
+test("guard admission failure permits an exact same-attempt retry", async () => {
+  const value = await fixture();
+  value.operationGuard.failBeforeCallback = true;
+
+  await assert.rejects(
+    value.facade.runLaunch(runInput(value)),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(value.inspectionCount, 1);
+  assert.equal(value.authority.state, "absent");
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
+  assert.equal(value.authority.calls.markUncertain, 0);
+
+  value.operationGuard.failBeforeCallback = false;
+  const result = await value.facade.runLaunch(runInput(value));
+  assert.equal(result.status, "started");
+  assert.equal(value.authority.calls.reserve, 1);
+  assert.equal(value.launchCalls, 1);
 });
 
 test("image revalidation admission failure permits a fresh-reservation retry", async () => {

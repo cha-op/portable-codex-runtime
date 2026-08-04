@@ -964,6 +964,7 @@ failure revokes that opaque image reservation, so retrying that case also
 requires a freshly prepared reservation. Once durable reservation invocation
 begins, acknowledgement loss follows the durable readback and reconciliation
 path rather than this pre-dispatch classification.
+
 No external launch callback runs before durable `starting`. If image
 consumption, launch, registration, finalisation, or acknowledgement becomes
 ambiguous after that boundary, the durable attempt remains a blocker. A
