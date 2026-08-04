@@ -50,6 +50,11 @@ capability.
   and a prepared mismatch leaves both the durable attempt and process-local
   capability untouched. A claim failure whose readback remains prepared also
   leaves the attempt retryable instead of cancelling required launch work.
+- A granted claim receipt must preserve the previously read expected-session
+  content, exact active-pointer revision transition, operation/reservation
+  timestamps, and an authority clock still inside the bound lease. Hostile
+  lifecycle, co-mutated session, or clock data falls back to durable readback
+  without image consumption or supervisor launch.
 
 ## Safety Decisions
 

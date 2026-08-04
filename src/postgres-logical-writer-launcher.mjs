@@ -28,6 +28,9 @@ const ArrayConstructor = Array;
 const arrayPrototype = Array.prototype;
 const BigIntConstructor = BigInt;
 const createHashIntrinsic = createHash;
+const dateParseIntrinsic = Date.parse;
+const dateToISOStringIntrinsic = Date.prototype.toISOString;
+const DateConstructor = Date;
 const functionToStringIntrinsic = Function.prototype.toString;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
@@ -1246,6 +1249,69 @@ function validateSessionPointer(
   return false;
 }
 
+function canonicalTimestampMilliseconds(value, code) {
+  ensure(typeof value === "string", code);
+  const milliseconds = reflectApply(dateParseIntrinsic, DateConstructor, [
+    value,
+  ]);
+  ensure(numberIsFinite(milliseconds), code);
+  const normalized = new DateConstructor(milliseconds);
+  ensure(
+    reflectApply(dateToISOStringIntrinsic, normalized, []) === value,
+    code,
+  );
+  return milliseconds;
+}
+
+function validateActiveSessionRelation(
+  session,
+  operation,
+  reservation,
+  code,
+) {
+  ensure(operation.state !== "committed", code);
+  const expectedSession = operation.expectedSession;
+  const expectedDocument = exactDataObject(
+    expectedSession.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+  );
+  const currentDocument = exactDataObject(
+    session.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+  );
+  // Protect session content stability rather than object identity. An active
+  // transition may only upgrade the document version, replace its active
+  // pointer, advance the revision, and move the operation-owned timestamp.
+  const stableDocument = exactFrozenRecord({
+    activeOperation: currentDocument.activeOperation,
+    attachment: expectedDocument.attachment,
+    backendCapabilities: expectedDocument.backendCapabilities,
+    documentVersion: 3,
+    lastOperation: expectedDocument.lastOperation,
+    launch: expectedDocument.launch,
+    lease: expectedDocument.lease,
+    lifecycle: expectedDocument.lifecycle,
+    manifest: expectedDocument.manifest,
+    recovery: expectedDocument.recovery,
+    storageRef: expectedDocument.storageRef,
+    writerEpoch: expectedDocument.writerEpoch,
+  });
+  ensure(
+    session.createdAt === expectedSession.createdAt &&
+      session.updatedAt === operation.updatedAt &&
+      BigIntConstructor(session.revision) ===
+        BigIntConstructor(expectedSession.revision) +
+          BigIntConstructor(operation.revision) +
+          1n &&
+      reservation.createdAt === operation.createdAt &&
+      reservation.updatedAt === operation.updatedAt &&
+      sameContent(currentDocument, stableDocument, code),
+    code,
+  );
+}
+
 function normalizeMeasuredImage(value, code) {
   const measured = exactDataObject(value, MEASURED_IMAGE_KEYS, code);
   const projection = exactDataObject(
@@ -1618,6 +1684,9 @@ function normalizeReceiptCommon(
     normalizedOperation.terminal.resultSha256,
     code,
   );
+  if (operation.state !== "committed") {
+    validateActiveSessionRelation(session, operation, reservation, code);
+  }
   return {
     normalizedOperation,
     operation,
@@ -1628,7 +1697,13 @@ function normalizeReceiptCommon(
   };
 }
 
-function normalizeReserveReceipt(value, launchAttemptId, typedRequest, code) {
+function normalizeReserveReceipt(
+  value,
+  launchAttemptId,
+  typedRequest,
+  expectedSession,
+  code,
+) {
   const common = normalizeReceiptCommon(
     value,
     RESERVE_RECEIPT_KEYS,
@@ -1636,7 +1711,15 @@ function normalizeReserveReceipt(value, launchAttemptId, typedRequest, code) {
     typedRequest,
     code,
   );
-  ensure(typeof common.receipt.acquired === "boolean", code);
+  ensure(
+    typeof common.receipt.acquired === "boolean" &&
+      sameContent(
+        common.operation.expectedSession,
+        expectedSession,
+        code,
+      ),
+    code,
+  );
   if (common.receipt.acquired) {
     ensure(common.operation.state === "prepared", code);
   }
@@ -1654,6 +1737,7 @@ function normalizeClaimReceipt(
   launchAttemptId,
   typedRequest,
   inputGeneration,
+  expectedSession,
   code,
 ) {
   const shape = exactDataObjectVariant(
@@ -1671,7 +1755,15 @@ function normalizeClaimReceipt(
     typedRequest,
     code,
   );
-  ensure(typeof common.receipt.dispatchGranted === "boolean", code);
+  ensure(
+    typeof common.receipt.dispatchGranted === "boolean" &&
+      sameContent(
+        common.operation.expectedSession,
+        expectedSession,
+        code,
+      ),
+    code,
+  );
   const attempt = normalizeAttempt(
     common.receipt.attempt,
     common.operation,
@@ -1690,11 +1782,24 @@ function normalizeClaimReceipt(
     }
   }
   if (common.receipt.dispatchGranted) {
+    const authorityNow = canonicalTimestampMilliseconds(
+      common.receipt.authorityNow,
+      code,
+    );
+    const operationUpdatedAt = canonicalTimestampMilliseconds(
+      common.operation.updatedAt,
+      code,
+    );
+    const leaseExpiresAt = canonicalTimestampMilliseconds(
+      common.normalizedOperation.request.lease.expiresAt,
+      code,
+    );
     ensure(
       objectHasOwn(common.receipt, "authorityNow") &&
         common.operation.state === "starting" &&
         generation !== null &&
-        typeof common.receipt.authorityNow === "string",
+        authorityNow >= operationUpdatedAt &&
+        authorityNow < leaseExpiresAt,
       code,
     );
   } else {
@@ -2765,6 +2870,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 ),
                 input.launchAttemptId,
                 typedRequest,
+                expectedSession,
                 outcomeCode,
               );
             } catch {
@@ -2801,6 +2907,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 input.launchAttemptId,
                 typedRequest,
                 input.generation,
+                expectedSession,
                 outcomeCode,
               );
             } catch {
@@ -2906,6 +3013,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 input.launchAttemptId,
                 read.attempt.request,
                 null,
+                read.operation.expectedSession,
                 outcomeCode,
               );
             } catch {

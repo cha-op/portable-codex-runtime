@@ -917,10 +917,10 @@ the process-local launch boundary without enabling restore.
 `createPostgresLogicalWriterLauncher()` composes the process-local image and
 stopped-writer coordinators with the PostgreSQL launch-attempt authority and
 the external `launchWriter` and `reconcileWriterLaunch` callbacks. It returns
-the exact frozen `runLaunch`, `reconcileLaunchAttempt`, and
-`resolveStoppedWriter` facade. The facade owns callback ordering and local
-object capabilities; it does not turn their serialized projections into
-authority.
+the exact frozen `prepareLaunchIntent`, `runLaunch`, `runPreparedLaunch`,
+`reconcileLaunchAttempt`, and `resolveStoppedWriter` facade. The facade owns
+callback ordering and local object capabilities; it does not turn their
+serialized projections into authority.
 
 The facade accepts exact own-data shapes under bounded traversal budgets,
 rejects proxies, accessors, inherited fields, unsafe thenables, and non-native
@@ -1135,6 +1135,15 @@ revalidates the durable request against the supplied opaque reservation before
 the definite claim, consumes the reservation only after durable `starting`,
 and then reuses the same at-most-once launch, registration, finalisation, and
 no-relaunch reconciliation rules as `runLaunch()`.
+
+A granted claim receipt must preserve the previously read expected-session
+content. Its active session may differ only by the version-3 authority-state
+projection, the exact starting pointer, the prescribed revision advance, and
+the operation timestamp; the operation and reservation timestamps must also
+agree. The canonical authority clock must be no earlier than that operation
+timestamp and still precede the bound lease expiry. A malformed or co-mutated
+receipt therefore falls back to durable readback without consuming the image
+capability or invoking the supervisor.
 
 The opaque reservation is not durable state. If the process restarts while the
 attempt is still authoritatively `prepared`, a trusted image resolver may mint

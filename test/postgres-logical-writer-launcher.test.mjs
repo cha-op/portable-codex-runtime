@@ -1629,6 +1629,57 @@ test("hostile prepared-claim receipt uses durable readback without consuming or 
   assert.equal(value.inspectionCount, 3);
 });
 
+for (const [name, mutateClaimReceipt] of [
+  [
+    "changed current lifecycle",
+    (receipt) => {
+      receipt.session.document.lifecycle = "RELEASING";
+    },
+  ],
+  [
+    "co-mutated expected and current session content",
+    (receipt) => {
+      receipt.operation.expectedSession.document.backendCapabilities.fencing =
+        "automatic";
+      receipt.session.document.backendCapabilities.fencing = "automatic";
+    },
+  ],
+  [
+    "authority clock at lease expiry",
+    (receipt) => {
+      receipt.authorityNow = receipt.operation.request.lease.expiresAt;
+    },
+  ],
+]) {
+  test(`hostile prepared claim with ${name} never consumes or launches`, async () => {
+    const value = await fixture({ reconcileStatus: "not-started" });
+    seedPreparedLaunchHandoff(value);
+    value.authority.claimReceiptMutation = (receipt) => {
+      mutateClaimReceipt(receipt);
+      return receipt;
+    };
+
+    const result = await value.facade.runPreparedLaunch(
+      preparedRunInput(value),
+    );
+    assert.equal(result.status, "not-started");
+    assert.equal(result.writer, null);
+    assert.equal(value.authority.calls.reserve, 0);
+    assert.equal(value.authority.calls.claim, 1);
+    assert.equal(value.authority.calls.cancel, 0);
+    assert.equal(value.authority.calls.markUncertain, 1);
+    assert.equal(value.authority.calls.finalizeStopped, 1);
+    assert.equal(value.launchCalls, 0);
+    assert.equal(value.reconcileCalls, 1);
+    assert.equal(value.inspectionCount, 2);
+
+    await value.imageReservations.revalidateReservation(
+      value.imageReservation,
+    );
+    assert.equal(value.inspectionCount, 3);
+  });
+}
+
 for (const state of ["starting", "uncertain"]) {
   test(`prepared launcher reconciles durable ${state} without relaunch or image use`, async () => {
     const value = await fixture({ reconcileStatus: "complete-stopped" });
