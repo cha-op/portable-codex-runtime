@@ -53,6 +53,7 @@ CREATE TABLE session_authority.operation_id_registry (
         claim_type = 'direct-operation'
         AND claimant_operation_id IS NULL
         AND binding IS NULL
+        AND materialized_at IS NOT NULL
         AND materialized_at = claimed_at
       )
       OR

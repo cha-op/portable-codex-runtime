@@ -482,6 +482,7 @@ async function assertOperationIdRegistryConcurrency(pool) {
   const secondClient = await pool.connect();
   const firstSessionId = randomUUID();
   const secondSessionId = randomUUID();
+  const invalidOperationId = `invalid-direct-operation-${randomUUID()}`;
   const operationId = `concurrent-operation-${randomUUID()}`;
   let firstTransactionOpen = false;
   let secondTransactionOpen = false;
@@ -503,7 +504,7 @@ async function assertOperationIdRegistryConcurrency(pool) {
           "binding, claimed_at, materialized_at)",
           "VALUES ($1, $2, 'direct-operation', NULL, NULL, $3, NULL)",
         ].join(" "),
-        [`invalid-direct-operation-${randomUUID()}`, firstSessionId, now],
+        [invalidOperationId, firstSessionId, now],
       ),
       (error) => {
         assert.equal(error.code, "23514");
@@ -577,8 +578,11 @@ async function assertOperationIdRegistryConcurrency(pool) {
       [operationId],
     );
     await pool.query(
-      "DELETE FROM session_authority.operation_id_registry WHERE operation_id = $1",
-      [operationId],
+      [
+        "DELETE FROM session_authority.operation_id_registry",
+        "WHERE operation_id IN ($1, $2)",
+      ].join(" "),
+      [operationId, invalidOperationId],
     );
     await pool.query(
       "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2)",
