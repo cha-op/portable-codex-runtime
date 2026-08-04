@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-04
 updated: 2026-08-04
 branch: wip/restore-generation-authority
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/23
 supersedes: []
 superseded_by:
 ---
@@ -31,6 +31,9 @@ enabling production restore or launcher admission.
 - The claim checks the database clock, exact current destination lease and
   storage reference, a strictly newer restore fence, and the complete source
   checkpoint relation.
+- Source checkpoint provenance retains its exact source storage, while the
+  current destination may use a replacement storage ID under the same session,
+  backend, manifest, capabilities, and session incarnation.
 - Fresh generation and destination-isolation proof identities are supplied
   only at the typed claim boundary and become immutable members of the
   generation binding.

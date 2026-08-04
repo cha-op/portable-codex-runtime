@@ -1770,9 +1770,19 @@ function checkpointCaptureAttemptRecord(
   };
 }
 
-function restoreCurrentWriterFixture({ checkpoint, sessionId, suffix }) {
+function restoreCurrentWriterFixture({
+  checkpoint,
+  sessionId,
+  storageId = "volume-001",
+  suffix,
+}) {
   const previousOptions = reserveOptions({
-    expectedSession: sessionSnapshot({ sessionId }),
+    expectedSession: sessionSnapshot({
+      sessionId,
+      sessionDocument: document(sessionId, {
+        storageRef: storageRef(sessionId, storageId),
+      }),
+    }),
     operationId: `restore-anchor-previous-${suffix}`,
     request: operationRequest({ checkpointId: `restore-anchor-${suffix}` }),
   });
@@ -1781,6 +1791,7 @@ function restoreCurrentWriterFixture({ checkpoint, sessionId, suffix }) {
     sessionId,
     revision: "2",
     sessionDocument: document(sessionId, {
+      storageRef: storageRef(sessionId, storageId),
       writerEpoch: checkpoint.sourceFencingEpoch,
       lastOperation: terminalPointer({
         options: previousOptions,
@@ -1803,6 +1814,7 @@ function restoreCurrentWriterFixture({ checkpoint, sessionId, suffix }) {
     sessionId,
     revision: "4",
     sessionDocument: document(sessionId, {
+      storageRef: storageRef(sessionId, storageId),
       writerEpoch: checkpoint.sourceFencingEpoch,
       lastOperation: terminalPointer({
         options: anchorOptions,
@@ -1847,6 +1859,7 @@ function restoreCurrentWriterFixture({ checkpoint, sessionId, suffix }) {
 }
 
 function restoreGenerationFixture({
+  destinationStorageId = "volume-001",
   destinationIsolationProofId = DESTINATION_ISOLATION_PROOF_ID,
   generationId = RESTORE_GENERATION_ID,
   operationId = RESTORE_OPERATION_ID,
@@ -1882,6 +1895,7 @@ function restoreGenerationFixture({
   const writer = restoreCurrentWriterFixture({
     checkpoint: source.checkpoint,
     sessionId,
+    storageId: destinationStorageId,
     suffix,
   });
   const mutationRequest = {
@@ -7130,6 +7144,128 @@ test("restore generation request builder owns the exact canonical admission and 
         error instanceof PostgresSessionAuthorityError &&
         error.code === "invalid_operation_request",
     );
+  }
+});
+
+test("restore generation claim accepts an exact checkpoint from replacement destination storage", async () => {
+  const fixture = restoreGenerationFixture({
+    destinationStorageId: "volume-restore-002",
+  });
+  const startingOperation = restoreGenerationOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = restoreGenerationReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: RESTORE_AUTHORITY_NOW,
+      now: RESTORE_DISPATCH_NOW,
+    },
+    steps: [
+      ...restoreGenerationActiveSteps(fixture, "prepared"),
+      ...restoreCheckpointSourceSteps(fixture),
+      rows(restoreGenerationRow(fixture)),
+      rows(startingOperation),
+      rows(startingReservation),
+      rows(startingSession),
+    ],
+  });
+
+  const claimed =
+    await authority.claimRestoreDestinationGenerationDispatch({
+      ...fixture.options,
+      destinationIsolationProofId: fixture.destinationIsolationProofId,
+      expectedOperationRevision: "0",
+      generationId: fixture.generationId,
+    });
+
+  assert.notEqual(
+    fixture.source.checkpoint.storageId,
+    fixture.options.expectedSession.document.storageRef.storageId,
+  );
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(
+    claimed.generation.binding.checkpoint.storageId,
+    fixture.source.checkpoint.storageId,
+  );
+  assert.equal(
+    claimed.generation.binding.request.storageId,
+    fixture.options.expectedSession.document.storageRef.storageId,
+  );
+  assert.deepEqual(
+    claimed.generation.binding,
+    canonicalPayload(restoreGenerationBinding(fixture)),
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore generation claim rejects non-storage source identity drift before mutation", async (t) => {
+  const cases = [
+    {
+      name: "session incarnation",
+      mutate(sourceSession) {
+        sourceSession.createdAt = "2026-07-29T12:34:56.790Z";
+      },
+    },
+    {
+      name: "immutable manifest",
+      mutate(sourceSession) {
+        sourceSession.document.manifest.codex.historyMode = "legacy";
+      },
+    },
+    {
+      name: "backend capabilities",
+      mutate(sourceSession) {
+        sourceSession.document.backendCapabilities.fencing = "manual";
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const fixture = restoreGenerationFixture({
+        destinationStorageId: "volume-restore-002",
+      });
+      scenario.mutate(fixture.source.options.expectedSession);
+      const sourceSteps = restoreCheckpointSourceSteps(fixture);
+      const { authority, clients } = authorityWithScripts({
+        options: {
+          authorityNow: RESTORE_AUTHORITY_NOW,
+          now: RESTORE_DISPATCH_NOW,
+        },
+        steps: [
+          ...restoreGenerationActiveSteps(fixture, "prepared"),
+          ...sourceSteps.slice(0, 3),
+        ],
+      });
+
+      await assertAuthorityError(
+        authority.claimRestoreDestinationGenerationDispatch({
+          ...fixture.options,
+          destinationIsolationProofId:
+            fixture.destinationIsolationProofId,
+          expectedOperationRevision: "0",
+          generationId: fixture.generationId,
+        }),
+        { code: "operation_state_invalid" },
+      );
+
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+      clients[0].assertExhausted();
+    });
   }
 });
 

@@ -2147,6 +2147,18 @@ function canonicalIdentityBytes(document) {
   });
 }
 
+function canonicalRestoreIdentityBytes(document) {
+  return canonicalSerialize({
+    manifest: document.manifest,
+    storageRef: {
+      contractVersion: document.storageRef.contractVersion,
+      backendId: document.storageRef.backendId,
+      sessionId: document.storageRef.sessionId,
+    },
+    backendCapabilities: document.backendCapabilities,
+  });
+}
+
 function canonicalBusinessBytes(document) {
   return canonicalSerialize({
     lifecycle: document.lifecycle,
@@ -5710,11 +5722,16 @@ async function readCommittedCheckpointSource(
     OPERATION_INPUT_KEYS,
     "operation_state_invalid",
   );
+  const sourceCheckpoint = input.request.admission.checkpoint;
+  const sourceStorageRef = operation.expectedSession.document.storageRef;
   ensure(
-    canonicalSerialize(input.request.admission.checkpoint) ===
+    canonicalSerialize(sourceCheckpoint) ===
         canonicalSerialize(checkpoint) &&
-      canonicalIdentityBytes(operation.expectedSession.document) ===
-        canonicalIdentityBytes(currentSession.document) &&
+      sourceStorageRef.sessionId === sourceCheckpoint.sessionId &&
+      sourceStorageRef.backendId === sourceCheckpoint.backendId &&
+      sourceStorageRef.storageId === sourceCheckpoint.storageId &&
+      canonicalRestoreIdentityBytes(operation.expectedSession.document) ===
+        canonicalRestoreIdentityBytes(currentSession.document) &&
       operation.expectedSession.createdAt === currentSession.createdAt &&
       BigIntConstructor(currentSession.revision) >=
         BigIntConstructor(

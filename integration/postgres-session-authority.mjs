@@ -1192,7 +1192,7 @@ async function prepareRestoreGenerationFixture(
   );
   assertOperationReceipt(captureTerminal, "committed");
   const released = await releaseWriter(authority, captureTerminal);
-  const attached = await attachWriter(authority, released, {
+  const attached = await attachWriter(authority, released.session, {
     leaseDurationMilliseconds: 300_000,
   });
   assert.equal(
