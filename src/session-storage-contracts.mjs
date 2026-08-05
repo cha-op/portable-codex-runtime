@@ -24,6 +24,7 @@ export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
 export const STORAGE_CONTRACT_VERSION = 1;
 export const CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION = 1;
+export const RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION = 1;
 export const SESSION_WORKER_ROOT = "/session";
 export const SESSION_WORKER_LAYOUT = deepFreeze({
   codexHome: "/session/codex-home",
@@ -1021,7 +1022,7 @@ export function assertSessionAttachmentMatches(options) {
 
 export function assertStorageBackend(value) {
   ensure(
-    value !== null && typeof value === "object" && !Array.isArray(value),
+    value !== null && typeof value === "object" && !arrayIsArray(value),
     "invalid_storage_backend",
     "storage backend must be an object",
   );
@@ -1087,6 +1088,39 @@ export function assertCheckpointCaptureReconciliationBackend(value) {
       typeof backend.reconcileCheckpointCapture === "function",
     "invalid_storage_backend",
     "storage backend does not support checkpoint capture reconciliation",
+  );
+  return backend;
+}
+
+/**
+ * Optional provider extension for attaching one already-published restore
+ * destination. The base storage contract remains version 1 and does not
+ * require this operation.
+ */
+export function assertRestoreAttachmentActivationBackend(value) {
+  ensure(
+    !isProxyValue(value),
+    "invalid_storage_backend",
+    "storage backend must not be a proxy",
+  );
+  const backend = assertStorageBackend(value);
+  const version = plainDataDescriptor(
+    backend,
+    "restoreAttachmentActivationContractVersion",
+    "invalid_storage_backend",
+    "restore attachment activation backend",
+  ).value;
+  const prepare = plainDataDescriptor(
+    backend,
+    "prepareRestoreAttachment",
+    "invalid_storage_backend",
+    "restore attachment activation backend",
+  ).value;
+  ensure(
+    version === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION &&
+      typeof prepare === "function",
+    "invalid_storage_backend",
+    "storage backend does not support restore attachment activation",
   );
   return backend;
 }
@@ -1349,8 +1383,10 @@ export function assertStorageMutationRequest(value) {
   assertOpaqueId(value.operationId, "invalid_storage_mutation", "mutation operation ID");
   parseFencingEpochForRecord(value.fencingEpoch, "invalid_storage_mutation");
   ensure(
-    ["attach", "checkpoint", "destroy", "detach", "restore"].includes(
-      value.operation,
+    reflectApply(
+      arrayIncludesIntrinsic,
+      ["attach", "checkpoint", "destroy", "detach", "restore"],
+      [value.operation],
     ),
     "invalid_storage_mutation",
     "storage mutation operation is unsupported",
@@ -1467,27 +1503,247 @@ export function assertStorageMutationResult(value, options) {
     "storage mutation result status is unsupported",
   );
   const targetMatches =
-    Object.keys(expected.target).length === Object.keys(actualRequest.target).length &&
-    Object.keys(expected.target).every(
-      (targetKey) => expected.target[targetKey] === actualRequest.target[targetKey],
-    );
+    expected.target.kind === actualRequest.target.kind &&
+    (expected.operation === "attach" || expected.operation === "detach"
+      ? expected.target.attachmentId === actualRequest.target.attachmentId
+      : expected.operation === "destroy"
+        ? expected.target.storageId === actualRequest.target.storageId
+        : expected.target.artifactId === actualRequest.target.artifactId &&
+          expected.target.checkpointId === actualRequest.target.checkpointId);
   ensure(
-    ["backendId", "contractVersion", "operation", "operationId", "sessionId", "storageId"].every(
-      (key) => expected[key] === actualRequest[key],
-    ) && targetMatches,
+    expected.backendId === actualRequest.backendId &&
+      expected.contractVersion === actualRequest.contractVersion &&
+      expected.operation === actualRequest.operation &&
+      expected.operationId === actualRequest.operationId &&
+      expected.sessionId === actualRequest.sessionId &&
+      expected.storageId === actualRequest.storageId &&
+      targetMatches,
     "invalid_storage_mutation",
     "storage mutation result does not match its request",
   );
   ensure(
-    ["fencingEpoch", "holderId", "leaseId"].every(
-      (key) => expected[key] === actualRequest[key],
-    ),
+    expected.fencingEpoch === actualRequest.fencingEpoch &&
+      expected.holderId === actualRequest.holderId &&
+      expected.leaseId === actualRequest.leaseId,
     "stale_fence",
     "storage mutation result fence does not match its request",
   );
   return deepFreeze(
     defensiveClone(value, "invalid_storage_mutation", "storage mutation result"),
   );
+}
+
+function isSha256Hex(value) {
+  if (typeof value !== "string" || value.length !== 64) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!isLowerHex(stringCharCodeAt(value, index))) return false;
+  }
+  return true;
+}
+
+function assertPersistentObjectId(value, code, label) {
+  ensure(
+    typeof value === "string" &&
+      value.length >= 1 &&
+      value.length <= 256 &&
+      isAsciiAlphaNumeric(stringCharCodeAt(value, 0)),
+    code,
+    `${label} must be a bounded persistent object identifier`,
+  );
+  for (let index = 1; index < value.length; index += 1) {
+    const character = stringCharCodeAt(value, index);
+    ensure(
+      isAsciiAlphaNumeric(character) ||
+        character === 45 ||
+        character === 46 ||
+        character === 58 ||
+        character === 95,
+      code,
+      `${label} must be a bounded persistent object identifier`,
+    );
+  }
+}
+
+function assertRestoreAttachmentPublication(value) {
+  const code = "invalid_restore_attachment_activation";
+  assertExactObject(
+    value,
+    [
+      "artifactManifestDigest",
+      "coordinatorBindingSha256",
+      "modeledDigest",
+      "publicationId",
+      "publicationKind",
+      "root",
+      "treeIdentityDigest",
+    ],
+    code,
+    "restore attachment publication",
+  );
+  assertExactObject(
+    value.root,
+    ["filesystemId", "objectIdentityScheme", "objectId", "rootPath"],
+    code,
+    "restore attachment publication root",
+  );
+  ensure(
+    isSha256Hex(value.artifactManifestDigest) &&
+      isSha256Hex(value.coordinatorBindingSha256) &&
+      isSha256Hex(value.modeledDigest) &&
+      isSha256Hex(value.treeIdentityDigest),
+    code,
+    "restore attachment publication digests must be lowercase sha256 values",
+  );
+  assertOpaqueId(value.publicationId, code, "restore attachment publication ID");
+  ensure(
+    value.publicationKind === "restore-destination",
+    code,
+    "restore attachment publication kind is unsupported",
+  );
+  assertOpaqueId(value.root.filesystemId, code, "restore attachment filesystem ID");
+  assertOpaqueId(
+    value.root.objectIdentityScheme,
+    code,
+    "restore attachment object identity scheme",
+  );
+  assertPersistentObjectId(
+    value.root.objectId,
+    code,
+    "restore attachment object ID",
+  );
+  assertAttachmentRootPath(
+    value.root.rootPath,
+    code,
+    "restore attachment publication root",
+  );
+  return deepFreeze(
+    defensiveClone(value, code, "restore attachment publication"),
+  );
+}
+
+function restoreAttachmentPublicationsMatch(expected, actual) {
+  return (
+    expected.artifactManifestDigest === actual.artifactManifestDigest &&
+    expected.coordinatorBindingSha256 === actual.coordinatorBindingSha256 &&
+    expected.modeledDigest === actual.modeledDigest &&
+    expected.publicationId === actual.publicationId &&
+    expected.publicationKind === actual.publicationKind &&
+    expected.treeIdentityDigest === actual.treeIdentityDigest &&
+    expected.root.filesystemId === actual.root.filesystemId &&
+    expected.root.objectIdentityScheme === actual.root.objectIdentityScheme &&
+    expected.root.objectId === actual.root.objectId &&
+    expected.root.rootPath === actual.root.rootPath
+  );
+}
+
+export function assertRestoreAttachmentActivationRequest(value) {
+  const code = "invalid_restore_attachment_activation";
+  assertExactObject(
+    value,
+    ["contractVersion", "lease", "manifest", "mutationRequest", "publication", "storageRef"],
+    code,
+    "restore attachment activation request",
+  );
+  ensure(
+    value.contractVersion === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    code,
+    "restore attachment activation contract version is unsupported",
+  );
+  const writerLease = assertLeaseGrant(value.lease);
+  const sessionManifest = assertSessionManifest(value.manifest);
+  const mutation = assertStorageMutationRequest(value.mutationRequest);
+  const publication = assertRestoreAttachmentPublication(value.publication);
+  const storage = assertSessionStorageRef(value.storageRef);
+  ensure(
+    mutation.operation === "attach",
+    code,
+    "restore attachment activation requires an attach mutation",
+  );
+  ensure(
+    sessionManifest.sessionId === writerLease.sessionId &&
+      storage.sessionId === sessionManifest.sessionId &&
+      mutation.sessionId === sessionManifest.sessionId &&
+      mutation.backendId === storage.backendId &&
+      mutation.storageId === storage.storageId,
+    code,
+    "restore attachment activation request does not match canonical session storage",
+  );
+  ensure(
+    mutation.leaseId === writerLease.leaseId &&
+      mutation.holderId === writerLease.holderId &&
+      mutation.fencingEpoch === writerLease.fencingEpoch,
+    "stale_fence",
+    "restore attachment activation request fence is stale",
+  );
+  return deepFreeze({
+    contractVersion: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    lease: writerLease,
+    manifest: sessionManifest,
+    mutationRequest: mutation,
+    publication,
+    storageRef: storage,
+  });
+}
+
+export function assertRestoreAttachmentActivationResult(value, options) {
+  const code = "invalid_restore_attachment_activation";
+  const { request } = assertOptionsObject(
+    options,
+    ["request"],
+    ["request"],
+    code,
+    "restore attachment activation result options",
+  );
+  assertExactObject(
+    value,
+    ["attachment", "contractVersion", "mutationResult", "publication"],
+    code,
+    "restore attachment activation result",
+  );
+  ensure(
+    value.contractVersion === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    code,
+    "restore attachment activation contract version is unsupported",
+  );
+  const expected = assertRestoreAttachmentActivationRequest(request);
+  const publication = assertRestoreAttachmentPublication(value.publication);
+  ensure(
+    restoreAttachmentPublicationsMatch(expected.publication, publication),
+    code,
+    "restore attachment activation result does not echo its publication",
+  );
+  const mutationResult = assertStorageMutationResult(value.mutationResult, {
+    request: expected.mutationRequest,
+  });
+  const matched = assertSessionAttachmentMatches({
+    attachment: value.attachment,
+    lease: expected.lease,
+    manifest: expected.manifest,
+    storageRef: expected.storageRef,
+  });
+  ensure(
+    matched.attachment.operationId === expected.mutationRequest.operationId &&
+      matched.attachment.operationId === mutationResult.operationId &&
+      matched.attachment.attachmentId ===
+        expected.mutationRequest.target.attachmentId &&
+      matched.attachment.attachmentId === mutationResult.target.attachmentId &&
+      matched.attachment.proofId === mutationResult.proofId,
+    code,
+    "restore attachment does not match its attach request and result",
+  );
+  // Persistent object identity is established by the exact publication echo
+  // above. Path equality only correlates that object with the prepared mount.
+  ensure(
+    matched.attachment.rootPath === publication.root.rootPath,
+    code,
+    "restore attachment path does not match the published destination",
+  );
+  return deepFreeze({
+    attachment: matched.attachment,
+    contractVersion: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    mutationResult,
+    publication,
+  });
 }
 
 /**

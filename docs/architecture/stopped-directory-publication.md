@@ -28,17 +28,20 @@ snapshot-core composition. This layer must not accept an arbitrary object or
 callback as proof that a writer stopped, that a restore destination is
 detached, or that a fence is current.
 
-The publication object exposes three checkpoint entry points with different
-authority contracts. `publishCheckpointArtifact()` is the replay-capable
-physical primitive reserved for explicit trusted repair workflows.
+The publication object exposes checkpoint and restore entry points with
+different authority contracts. `publishCheckpointArtifact()` is the
+replay-capable physical primitive reserved for explicit trusted repair
+workflows.
 `publishFreshCheckpointArtifact()` atomically requires the journal operation
 to begin at `absent` and is the only checkpoint entry point used by the normal
 stopped-directory capture backend. `verifyCommittedCheckpointArtifact()` is a
 source-free, transition-free verifier used by automatic capture
 reconciliation; it accepts only the exact already committed journal record and
-final artefact. Restore keeps its replay-capable entry point because it copies
-from an already trusted immutable checkpoint into a currently fenced, detached
-destination.
+final artefact. Restore keeps its replay-capable publication entry point because
+it copies from an already trusted immutable checkpoint into a currently fenced,
+detached destination. `verifyCommittedRestoreDestination()` is a separate
+committed-only, source-free verifier for later detached activation recovery; it
+never re-enters that copy/publication state machine.
 
 ## Publication Objects
 
@@ -318,7 +321,7 @@ invocation returns `replayed: false`, but that output flag is not the freshness
 proof; the proof is the journal's atomic absent-to-prepared transition inside
 the current publication call.
 
-## Committed-Only Capture Reconciliation
+## Committed-Only Reconciliation
 
 `verifyCommittedCheckpointArtifact()` is intentionally not a mode of the
 ordered publication state machine. Its exact input contains the artefact path,
@@ -340,14 +343,41 @@ the exact bundle shape, manifest, payload, modeled digest, tree-identity digest,
 mode, ACL, mount, and capture-operation checks. Success returns only the frozen
 recorded result and materialisation with `replayed: true`.
 
+`verifyCommittedRestoreDestination()` applies the same committed-journal and
+namespace discipline to a detached restore destination. Its exact input is the
+trusted `artifactProof`, coordinator binding, operation ID, request,
+predetermined result, destination path, and destination-owned root. It accepts
+no artefact path or artefact-owned root, so a missing, replaced, or inaccessible
+source bundle cannot make verification read or reconstruct source state.
+
+For restore, the protected properties are the committed operation bytes, the
+destination object generation, the identity of every modeled tree entry, the
+modeled content digest, the journal-recorded filesystem profile, and the fixed
+access-policy contract. The pathname only locates the candidate authority:
+success additionally requires the journal-recorded destination root profile,
+final persistent object identity, complete tree-identity digest, modeled
+digest, root mode, ACL and trusted ancestor policy, and mount topology. The
+verifier matches the recorded `artifactProof` and v3 coordinator-binding digest
+exactly. Historical committed
+restore materialisation v2 remains a read-only compatibility case; verification
+does not create new v2 state or broaden publication admission.
+
+Unlike committed capture reconciliation, committed restore verification issues
+no filesystem or directory durability sync. It reads and pins the existing
+journal and detached destination under the existing publication lock, and it
+does not change journal bytes, phase, or mtime. Success returns the frozen exact
+recorded result and materialisation with `replayed: true`.
+
 The verifier calls the read-only `journal.describeAuthority()` and
 `journal.read()` methods. It never calls `prepare()`, `prepareFresh()`,
 `markMaterialized()`, or `commit()`, and it never creates, copies, renames,
-deletes, or repairs an artefact. `absent`, `prepared`, and `materialized`
-therefore remain non-success states even when their retained bytes appear
-complete. Automatic reconciliation cannot turn partial evidence into authority;
-a distinct operator repair design would need separate policy, provenance, and
-audit controls.
+deletes, or repairs an artefact or restore destination. `absent`, `prepared`,
+and `materialized` therefore remain non-success states even when their retained
+bytes appear complete. Automatic reconciliation cannot turn partial evidence
+into authority; a distinct operator repair design would need separate policy,
+provenance, and audit controls. A final object observed before a committed
+journal record is outcome-uncertain and is never adopted; a candidate-only
+materialised object requires recovery without claiming a commit.
 
 The source-leaf and destination-root filesystem profiles and persistent object
 identities are re-read after every callback and at every materialisation,

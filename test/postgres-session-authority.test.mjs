@@ -8,9 +8,12 @@ import {
 import {
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
+  RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  WRITER_RELEASE_OPERATION_KIND,
+  createRestoreAttachmentActivationOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
   createRestoreDestinationGenerationOperationRequestV2,
 } from "../src/postgres-session-authority.mjs";
@@ -302,6 +305,58 @@ function writerLaunchIntentFixture(expectedSession = attachedSnapshot()) {
     supervisor: {
       contractVersion: 1,
       supervisorId: "supervisor-001",
+    },
+  };
+}
+
+function detachedRestoreActivationFixture() {
+  const expectedSession = {
+    createdAt: NOW,
+    document: document({
+      lastOperation: {
+        conflictClass: "session-mutation",
+        expectedSessionRevision: "10",
+        kind: WRITER_RELEASE_OPERATION_KIND,
+        operationId: "writer-release-001",
+        operationRevision: "2",
+        requestSha256: "f".repeat(64),
+        reservationId: "writer-release-reservation-001",
+        resultSha256: "1".repeat(64),
+        state: "committed",
+      },
+      writerEpoch: "2",
+    }),
+    revision: "13",
+    sessionId: SESSION_ID,
+    updatedAt: "2026-07-29T12:35:00.000Z",
+  };
+  const generation = {
+    binding: {
+      attachment: attachedSnapshot().document.attachment,
+      marker: "exact-generation-binding",
+    },
+    checkpointId: "checkpoint-001",
+    claimedAt: "2026-07-29T12:34:57.000Z",
+    committedAt: "2026-07-29T12:34:58.000Z",
+    document: {
+      marker: "exact-generation-document",
+    },
+    generationId: "restore-generation-001",
+    operationId: "restore-generation-operation-001",
+    sessionId: SESSION_ID,
+    state: "committed",
+  };
+  return {
+    destinationRootPath: "/var/lib/portable-codex/restores/session-001",
+    expectedSession,
+    generation,
+    holderId: "host-restore-002",
+    launchIntent: writerLaunchIntentFixture(expectedSession),
+    leaseDurationMilliseconds: 60_000,
+    predecessor: {
+      attachmentId: "attachment-001",
+      detachOperationId: "writer-release-001",
+      stopOperationId: "writer-launch-stop-001",
     },
   };
 }
@@ -984,6 +1039,133 @@ test("restore generation request versions reject crossed launch identities befor
       },
     ),
     "invalid_operation_request",
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("restore attachment activation requests bind one detached predecessor, generation, and launch", () => {
+  const fixture = detachedRestoreActivationFixture();
+  const request = createRestoreAttachmentActivationOperationRequest(fixture);
+  const reordered = createRestoreAttachmentActivationOperationRequest(
+    reversePlainData(fixture),
+  );
+
+  assert.equal(request.contractVersion, 1);
+  assert.equal(JSON.stringify(request), JSON.stringify(reordered));
+  assert.deepEqual(Reflect.ownKeys(request), [
+    "contractVersion",
+    "destinationRootPath",
+    "generation",
+    "holderId",
+    "launchIntent",
+    "leaseDurationMilliseconds",
+    "predecessor",
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(request.predecessor)),
+    fixture.predecessor,
+  );
+  assert.equal(request.generation.generationId, fixture.generation.generationId);
+  assert.equal(request.generation.sessionId, fixture.expectedSession.sessionId);
+  assert.equal(request.launchIntent.launchAttemptId, "writer-launch-001");
+  assert.equal(Object.isFrozen(request), true);
+  assert.equal(Object.isFrozen(request.generation), true);
+  assert.equal(Object.isFrozen(request.launchIntent.measuredImage), true);
+  assert.equal(Object.isFrozen(request.predecessor), true);
+
+  fixture.predecessor.attachmentId = "mutated-attachment";
+  fixture.generation.document.marker = "mutated-generation";
+  fixture.launchIntent.supervisor.supervisorId = "mutated-supervisor";
+  assert.equal(request.predecessor.attachmentId, "attachment-001");
+  assert.equal(request.launchIntent.supervisor.supervisorId, "supervisor-001");
+});
+
+test("restore attachment activation rejects non-detached and ambiguous predecessor authority before PostgreSQL", async () => {
+  const fixture = detachedRestoreActivationFixture();
+  const invalidFixtures = [
+    {
+      ...fixture,
+      expectedSession: attachedSnapshot(),
+      launchIntent: writerLaunchIntentFixture(attachedSnapshot()),
+    },
+    {
+      ...fixture,
+      destinationRootPath: "/var/lib/portable-codex/restores/../escape",
+    },
+    {
+      ...fixture,
+      predecessor: {
+        ...fixture.predecessor,
+        detachOperationId: "writer-release-other",
+      },
+    },
+    {
+      ...fixture,
+      expectedSession: {
+        ...fixture.expectedSession,
+        document: {
+          ...fixture.expectedSession.document,
+          lastOperation: {
+            ...fixture.expectedSession.document.lastOperation,
+            kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+          },
+        },
+      },
+    },
+  ];
+  for (const candidate of invalidFixtures) {
+    assert.throws(
+      () => createRestoreAttachmentActivationOperationRequest(candidate),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+
+  const request = createRestoreAttachmentActivationOperationRequest(fixture);
+  const { authority, pool } = authorityWithScripts();
+  await assertAuthorityError(
+    authority.reserveOperation({
+      expectedSession: fixture.expectedSession,
+      kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+      operationId: fixture.launchIntent.launchAttemptId,
+      request,
+    }),
+    "invalid_operation_request",
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("restore attachment activation rejects epoch exhaustion explicitly", async () => {
+  const fixture = detachedRestoreActivationFixture();
+  const request = createRestoreAttachmentActivationOperationRequest(fixture);
+  const expectedSession = {
+    ...fixture.expectedSession,
+    document: {
+      ...fixture.expectedSession.document,
+      writerEpoch: "18446744073709551615",
+    },
+  };
+  assert.throws(
+    () =>
+      createRestoreAttachmentActivationOperationRequest({
+        ...fixture,
+        expectedSession,
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
+
+  const { authority, pool } = authorityWithScripts();
+  await assertAuthorityError(
+    authority.reserveOperation({
+      expectedSession,
+      kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+      operationId: "restore-activation-epoch-exhausted",
+      request,
+    }),
+    "writer_epoch_exhausted",
   );
   assert.equal(pool.connectCalls, 0);
 });

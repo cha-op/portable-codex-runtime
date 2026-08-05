@@ -222,7 +222,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      exact `starting` or authority-proven `uncertain` without repeating physical
      stop. Ambiguous stop, finalisation, capture, or retirement stays
      fail-closed.
-7. **Detached restore activation and recovery composition**
+7. **Detached restore activation and recovery composition (complete)**
    - Keep the absent restore-publication destination independent from the
      current active attachment. After exact committed publication, obtain
      provider-backed attachment evidence for that object and atomically
@@ -233,10 +233,20 @@ Restore and launcher authority are now split into eight serial pull requests:
      attachment authority or filesystem object identity.
    - Verify committed restore publication against the detached destination
      and activated attachment before any prepared launch can proceed.
-   - Compose bounded generation, prepared-launch, active-attempt, and
-     current-launch recovery without relaunching or reconstructing an opaque
-     image or writer capability from serialized state.
-8. **Production restore adapter enablement**
+   - Add source-free committed-only destination verification and the optional
+     version 1 provider activation extension. Bind physical object identity,
+     content digest, access policy, attach mutation, and proof echoes without
+     treating path equality as attachment authority.
+   - Claim and finalize `restore-attachment-activation-v1` through serializable
+     authority transitions. The final transition installs the exact canonical
+     attachment and materializes its predetermined prepared launch atomically;
+     acknowledgement loss replays the same durable result.
+   - Compose four independently cursor-bounded lanes for retained generation,
+     attachment activation, prepared or active launch attempt, and current
+     launch inventory. The service is sequential and no-relaunch: it never
+     republishes, reserves or consumes an image, invokes a launcher, or
+     reconstructs an opaque writer capability.
+8. **Production restore adapter enablement (pending)**
    - Wire publication, the atomic handoff, prepared launch, no-relaunch
      recovery, durable stop, and capture composition through the production
      checkpoint adapter.

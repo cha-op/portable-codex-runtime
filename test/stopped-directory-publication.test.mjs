@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   access,
   chmod,
+  cp,
   link,
   lstat,
   mkdir,
@@ -365,6 +366,23 @@ function restoreOptions(fixture, overrides = {}) {
     artifactDirectory: fixture.artifactDirectory,
     destinationOwnedRoot: fixture.destinationOwnedRoot,
     destinationDirectory: fixture.destinationDirectory,
+    ...overrides,
+  };
+}
+
+function committedRestoreVerificationOptions(
+  fixture,
+  published,
+  overrides = {},
+) {
+  return {
+    artifactProof: published.artifactProof,
+    binding: published.binding,
+    destinationDirectory: fixture.destinationDirectory,
+    destinationOwnedRoot: fixture.destinationOwnedRoot,
+    operationId: published.operationId,
+    request: published.request,
+    result: published.result,
     ...overrides,
   };
 }
@@ -1800,6 +1818,447 @@ test("restore publication publishes a raw isolated payload and preserves its art
     expectedBindingSha256,
   );
   assert.deepEqual(result.materialization, journalRecord.materialization);
+});
+
+test("committed restore verification is source-free and leaves durable state untouched", async (t) => {
+  const guard = { armed: false, calls: [] };
+  let rejectSourceInspection = false;
+  let fixture;
+  const sourcePathWasInspected = (path) =>
+    rejectSourceInspection &&
+    [fixture.sourceOwnedRoot, fixture.artifactOwnedRoot].some(
+      (root) => path === root || path.startsWith(`${root}/`),
+    );
+  fixture = await createFixture(t, {
+    JournalClass: armableJournalClass(guard),
+    inspectFilesystem: async (path) => {
+      if (sourcePathWasInspected(path)) {
+        throw new Error("committed restore verifier inspected a source root");
+      }
+      return {
+        durability: "local-fsync-rename",
+        type: "test-local",
+      };
+    },
+    inspectPersistentObjectIdentity: async (path) => {
+      if (sourcePathWasInspected(path)) {
+        throw new Error("committed restore verifier inspected a source object");
+      }
+      return inspectTestPersistentObjectIdentity(path);
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  const published =
+    await fixture.publication.publishRestoreDestination(options);
+  const recordPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(RESTORE_OPERATION_ID),
+  );
+  const journalBytesBefore = await readFile(recordPath);
+  const journalStatBefore = await lstat(recordPath, { bigint: true });
+  const journalBefore = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  const destinationBefore = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+  await rm(fixture.artifactOwnedRoot, { force: true, recursive: true });
+  rejectSourceInspection = true;
+  guard.armed = true;
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination({
+      ...committedRestoreVerificationOptions(fixture, options),
+      artifactDirectory: fixture.artifactDirectory,
+    }),
+    (error) =>
+      assertPublicationError(
+        error,
+        "invalid_publication_request",
+        "not-committed",
+      ),
+  );
+
+  const verified =
+    await fixture.publication.verifyCommittedRestoreDestination(
+      committedRestoreVerificationOptions(fixture, options),
+    );
+
+  assert.deepEqual(verified.result, published.result);
+  assert.deepEqual(verified.materialization, published.materialization);
+  assert.equal(verified.replayed, true);
+  assert.equal(Object.isFrozen(verified), true);
+  assert.equal(Object.isFrozen(verified.materialization), true);
+  assert.equal(Object.isFrozen(verified.result), true);
+  assert.deepEqual(guard.calls, []);
+  assert.deepEqual(
+    await fixture.journal.read({ operationId: RESTORE_OPERATION_ID }),
+    journalBefore,
+  );
+  assert.deepEqual(await readFile(recordPath), journalBytesBefore);
+  const journalStatAfter = await lstat(recordPath, { bigint: true });
+  assert.equal(journalStatAfter.dev, journalStatBefore.dev);
+  assert.equal(journalStatAfter.ino, journalStatBefore.ino);
+  assert.equal(journalStatAfter.size, journalStatBefore.size);
+  assert.equal(journalStatAfter.mtimeNs, journalStatBefore.mtimeNs);
+  const destinationAfter = await lstat(fixture.destinationDirectory, {
+    bigint: true,
+  });
+  assert.equal(destinationAfter.dev, destinationBefore.dev);
+  assert.equal(destinationAfter.ino, destinationBefore.ino);
+});
+
+test("committed restore verification classifies non-committed physical phases without mutation", async (t) => {
+  for (const phase of ["absent", "prepared", "candidate-only", "final-only"]) {
+    await t.test(phase, async (t) => {
+      const guard = { armed: false, calls: [] };
+      let seedFaultEnabled = false;
+      const faults =
+        phase === "prepared"
+          ? {
+              async afterJournalPrepared() {
+                if (seedFaultEnabled) throw new Error("retain prepared restore");
+              },
+            }
+          : phase === "candidate-only"
+            ? {
+                async afterMaterialized() {
+                  if (seedFaultEnabled) {
+                    throw new Error("retain candidate-only restore");
+                  }
+                },
+              }
+            : phase === "final-only"
+              ? {
+                  async afterRename() {
+                    if (seedFaultEnabled) {
+                      throw new Error("retain final-only restore");
+                    }
+                  },
+                }
+              : {};
+      const fixture = await createFixture(t, {
+        JournalClass: armableJournalClass(guard),
+        faults,
+      });
+      await publishFixtureArtifact(fixture);
+      const options = restoreOptions(fixture);
+      if (phase !== "absent") {
+        seedFaultEnabled = true;
+        await assert.rejects(
+          fixture.publication.publishRestoreDestination(options),
+          (error) => assertPublicationError(error),
+        );
+      }
+      const candidate = candidatePath(
+        fixture.destinationOwnedRoot,
+        RESTORE_OPERATION_ID,
+        fixture.destinationDirectory,
+      );
+      const recordPath = join(
+        fixture.journalDirectory,
+        operationJournalRecordFilename(RESTORE_OPERATION_ID),
+      );
+      const recordExistsBefore = await pathExists(recordPath);
+      const recordBytesBefore = recordExistsBefore
+        ? await readFile(recordPath)
+        : null;
+      const recordStatBefore = recordExistsBefore
+        ? await lstat(recordPath, { bigint: true })
+        : null;
+      const journalDirectoryStatBefore = await lstat(
+        fixture.journalDirectory,
+        { bigint: true },
+      );
+      const journalBefore = await fixture.journal.read({
+        operationId: RESTORE_OPERATION_ID,
+      });
+      const candidateBefore = await pathExists(candidate);
+      const finalBefore = await pathExists(fixture.destinationDirectory);
+      guard.armed = true;
+      await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+      await rm(fixture.artifactOwnedRoot, { force: true, recursive: true });
+
+      await assert.rejects(
+        fixture.publication.verifyCommittedRestoreDestination(
+          committedRestoreVerificationOptions(fixture, options),
+        ),
+        (error) =>
+          phase === "final-only"
+            ? assertPublicationError(
+                error,
+                "publication_outcome_uncertain",
+                "uncertain",
+              )
+            : assertPublicationError(
+                error,
+                "publication_recovery_required",
+                "not-committed",
+              ),
+      );
+
+      assert.deepEqual(guard.calls, []);
+      assert.deepEqual(
+        await fixture.journal.read({ operationId: RESTORE_OPERATION_ID }),
+        journalBefore,
+      );
+      assert.equal(await pathExists(recordPath), recordExistsBefore);
+      if (recordExistsBefore) {
+        assert.deepEqual(await readFile(recordPath), recordBytesBefore);
+        const recordStatAfter = await lstat(recordPath, { bigint: true });
+        assert.equal(recordStatAfter.dev, recordStatBefore.dev);
+        assert.equal(recordStatAfter.ino, recordStatBefore.ino);
+        assert.equal(recordStatAfter.size, recordStatBefore.size);
+        assert.equal(recordStatAfter.mtimeNs, recordStatBefore.mtimeNs);
+      }
+      const journalDirectoryStatAfter = await lstat(
+        fixture.journalDirectory,
+        { bigint: true },
+      );
+      assert.equal(
+        journalDirectoryStatAfter.mtimeNs,
+        journalDirectoryStatBefore.mtimeNs,
+      );
+      assert.equal(await pathExists(candidate), candidateBefore);
+      assert.equal(await pathExists(fixture.destinationDirectory), finalBefore);
+    });
+  }
+});
+
+test("committed restore verification accepts only the existing v2 replay compatibility", async (t) => {
+  const fixture = await createFixture(t);
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  await fixture.publication.publishRestoreDestination(options);
+  const legacyMaterialization =
+    await rewriteRestoreMaterializationAsV2(fixture);
+  await rm(fixture.sourceOwnedRoot, { force: true, recursive: true });
+  await rm(fixture.artifactOwnedRoot, { force: true, recursive: true });
+
+  const verified =
+    await fixture.publication.verifyCommittedRestoreDestination(
+      committedRestoreVerificationOptions(fixture, options),
+    );
+
+  assert.equal(verified.replayed, true);
+  assert.deepEqual(verified.materialization, legacyMaterialization);
+  assert.equal(verified.materialization.contractVersion, 2);
+  assert.equal(
+    Object.hasOwn(verified.materialization, "coordinatorBindingSha256"),
+    false,
+  );
+});
+
+test("committed restore verification rejects caller conflicts and materialization tampering", async (t) => {
+  const fixture = await createFixture(t);
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  await fixture.publication.publishRestoreDestination(options);
+  const verification = committedRestoreVerificationOptions(fixture, options);
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination({
+      ...verification,
+      binding: { ...options.binding, storageId: "volume-other" },
+    }),
+    (error) =>
+      assertPublicationError(error, "publication_conflict", "committed"),
+  );
+
+  const conflictingRequest = {
+    ...options.request,
+    holderId: "host-other",
+  };
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination({
+      ...verification,
+      request: conflictingRequest,
+      result: fixedResult(conflictingRequest),
+    }),
+    (error) =>
+      assertPublicationError(error, "publication_conflict", "committed"),
+  );
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination({
+      ...verification,
+      result: {
+        ...options.result,
+        mutation: {
+          ...options.result.mutation,
+          proofId: "proof-restore-other",
+        },
+      },
+    }),
+    (error) =>
+      assertPublicationError(error, "publication_conflict", "committed"),
+  );
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination({
+      ...verification,
+      artifactProof: {
+        ...options.artifactProof,
+        modeledDigest: "f".repeat(64),
+      },
+    }),
+    (error) =>
+      assertPublicationError(error, "publication_conflict", "committed"),
+  );
+
+  const recordPath = join(
+    fixture.journalDirectory,
+    operationJournalRecordFilename(RESTORE_OPERATION_ID),
+  );
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  record.materialization.coordinatorBindingSha256 = "0".repeat(64);
+  await writeFile(recordPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  const tamperedBytes = await readFile(recordPath);
+  const tamperedStat = await lstat(recordPath, { bigint: true });
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(verification),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+
+  assert.deepEqual(await readFile(recordPath), tamperedBytes);
+  const afterVerification = await lstat(recordPath, { bigint: true });
+  assert.equal(afterVerification.mtimeNs, tamperedStat.mtimeNs);
+});
+
+test("committed restore verification binds content and every physical object identity", async (t) => {
+  await t.test("content mutation", async (t) => {
+    const fixture = await createFixture(t);
+    await publishFixtureArtifact(fixture);
+    const options = restoreOptions(fixture);
+    await fixture.publication.publishRestoreDestination(options);
+    await writeFile(
+      join(fixture.destinationDirectory, "workspace", "README.md"),
+      "tampered\n",
+      { mode: 0o640 },
+    );
+
+    await assert.rejects(
+      fixture.publication.verifyCommittedRestoreDestination(
+        committedRestoreVerificationOptions(fixture, options),
+      ),
+      (error) =>
+        assertPublicationError(error, "published_state_invalid", "committed"),
+    );
+  });
+
+  await t.test("same-content child replacement", async (t) => {
+    const fixture = await createFixture(t);
+    await publishFixtureArtifact(fixture);
+    const options = restoreOptions(fixture);
+    await fixture.publication.publishRestoreDestination(options);
+    const readme = join(
+      fixture.destinationDirectory,
+      "workspace",
+      "README.md",
+    );
+    const replacement = join(
+      fixture.destinationDirectory,
+      "workspace",
+      "README.md.replacement",
+    );
+    await writeFile(replacement, "portable\n", { mode: 0o640 });
+    await rename(replacement, readme);
+
+    await assert.rejects(
+      fixture.publication.verifyCommittedRestoreDestination(
+        committedRestoreVerificationOptions(fixture, options),
+      ),
+      (error) =>
+        assertPublicationError(error, "published_state_invalid", "committed"),
+    );
+  });
+
+  await t.test("same-content root replacement", async (t) => {
+    const fixture = await createFixture(t);
+    await publishFixtureArtifact(fixture);
+    const options = restoreOptions(fixture);
+    await fixture.publication.publishRestoreDestination(options);
+    const replacement = join(
+      fixture.destinationOwnedRoot,
+      "restored-session-replacement",
+    );
+    await cp(fixture.destinationDirectory, replacement, {
+      preserveTimestamps: true,
+      recursive: true,
+    });
+    await rm(fixture.destinationDirectory, { force: true, recursive: true });
+    await rename(replacement, fixture.destinationDirectory);
+
+    await assert.rejects(
+      fixture.publication.verifyCommittedRestoreDestination(
+        committedRestoreVerificationOptions(fixture, options),
+      ),
+      (error) =>
+        assertPublicationError(error, "published_state_invalid", "committed"),
+    );
+  });
+});
+
+test("committed restore verification fails closed on profile, ACL, and identity inspection", async (t) => {
+  let rejectDestinationIdentity = false;
+  let destinationAclUnsafe = false;
+  let destinationFilesystemChanged = false;
+  let canonicalDestinationDirectory;
+  let canonicalDestinationOwnedRoot;
+  let fixture;
+  fixture = await createFixture(t, {
+    inspectFilesystem: async (path) => ({
+      durability: "local-fsync-rename",
+      type:
+        destinationFilesystemChanged && path === canonicalDestinationOwnedRoot
+          ? "test-local-replaced"
+          : "test-local",
+    }),
+    inspectOwnedRootAcl: async (path) =>
+      destinationAclUnsafe && path === canonicalDestinationDirectory,
+    inspectPersistentObjectIdentity: async (path) => {
+      if (
+        rejectDestinationIdentity &&
+        path === canonicalDestinationDirectory
+      ) {
+        throw new Error("destination object identity is unreadable");
+      }
+      return inspectTestPersistentObjectIdentity(path);
+    },
+  });
+  canonicalDestinationOwnedRoot = await realpath(fixture.destinationOwnedRoot);
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  await fixture.publication.publishRestoreDestination(options);
+  canonicalDestinationDirectory = await realpath(fixture.destinationDirectory);
+  const verification = committedRestoreVerificationOptions(fixture, options);
+
+  destinationFilesystemChanged = true;
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(verification),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  destinationFilesystemChanged = false;
+
+  destinationAclUnsafe = true;
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(verification),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  destinationAclUnsafe = false;
+
+  rejectDestinationIdentity = true;
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(verification),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
 });
 
 test("upgrade replays a historical committed restore materialization v2", async (t) => {

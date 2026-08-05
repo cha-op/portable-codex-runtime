@@ -10,10 +10,12 @@ import { types as utilTypes } from "node:util";
 
 import {
   CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
   assertCanonicalFenceMatch,
   assertCheckpointDescriptor,
   assertLeaseGrant,
+  assertRestoreAttachmentActivationBackend,
   assertSessionAttachment,
   assertSessionStorageRef,
   assertStorageBackend,
@@ -1492,6 +1494,26 @@ export class StoppedDirectoryBackend {
         assertTrustedFunction(lifecycleBackend[method]),
       );
     }
+    const hasRestoreActivationVersion = objectHasOwn(
+      lifecycleBackend,
+      "restoreAttachmentActivationContractVersion",
+    );
+    const hasRestoreActivationMethod = objectHasOwn(
+      lifecycleBackend,
+      "prepareRestoreAttachment",
+    );
+    ensureInvalid(
+      hasRestoreActivationVersion === hasRestoreActivationMethod,
+    );
+    const supportsRestoreActivation = hasRestoreActivationVersion;
+    if (supportsRestoreActivation) {
+      runContractValidator(() =>
+        assertRestoreAttachmentActivationBackend(lifecycleBackend),
+      );
+      lifecycleMethods.prepareRestoreAttachment = runContractValidator(() =>
+        assertTrustedFunction(lifecycleBackend.prepareRestoreAttachment),
+      );
+    }
 
     this.#authority = authority;
     this.#coordinator = options.coordinator;
@@ -1522,6 +1544,23 @@ export class StoppedDirectoryBackend {
       enumerable: true,
       value: CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
     });
+    if (supportsRestoreActivation) {
+      const prepareRestoreAttachment = (...methodArgs) =>
+        this.#delegateLifecycle("prepareRestoreAttachment", methodArgs);
+      objectFreeze(prepareRestoreAttachment);
+      objectDefineProperty(this, "prepareRestoreAttachment", {
+        enumerable: true,
+        value: prepareRestoreAttachment,
+      });
+      objectDefineProperty(
+        this,
+        "restoreAttachmentActivationContractVersion",
+        {
+          enumerable: true,
+          value: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+        },
+      );
+    }
     objectFreeze(this);
   }
 

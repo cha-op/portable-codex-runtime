@@ -1406,19 +1406,60 @@ export class StoppedDirectoryPublication {
       fail("invalid_publication_request");
     }
     const verification = {
+      artifactProof: null,
       expected,
       finalDirectory: normalized.artifactDirectory,
+      kind: "checkpoint-artifact",
       operationId: snapshot.operationId,
       targetOwnedRoot: normalized.artifactOwnedRoot,
     };
     const queueKey = await publicationQueueKey(verification.targetOwnedRoot);
     return runPublicationQueued(queueKey, () =>
-      this.#verifyCommittedCheckpointArtifact(verification),
+      this.#verifyCommittedPublication(verification),
     );
   }
 
-  async #verifyCommittedCheckpointArtifact(options) {
+  async verifyCommittedRestoreDestination(options) {
+    const normalized = exactOptions(options, [
+      "artifactProof",
+      "binding",
+      "destinationDirectory",
+      "destinationOwnedRoot",
+      "operationId",
+      "request",
+      "result",
+    ]);
+    const snapshot = snapshotPublicationQueueInput(
+      "restore-destination",
+      normalized,
+    );
+    let expected;
+    try {
+      expected = snapshotOperationJournalBinding({
+        binding: snapshot.binding,
+        request: snapshot.request,
+        result: snapshot.result,
+      });
+    } catch {
+      fail("invalid_publication_request");
+    }
+    const verification = {
+      artifactProof: snapshot.artifactProof,
+      expected,
+      finalDirectory: normalized.destinationDirectory,
+      kind: "restore-destination",
+      operationId: snapshot.operationId,
+      targetOwnedRoot: normalized.destinationOwnedRoot,
+    };
+    const queueKey = await publicationQueueKey(verification.targetOwnedRoot);
+    return runPublicationQueued(queueKey, () =>
+      this.#verifyCommittedPublication(verification),
+    );
+  }
+
+  async #verifyCommittedPublication(options) {
     const operationId = options.operationId;
+    const restoreDestination = options.kind === "restore-destination";
     let targetAuthority;
     let lock;
     let pinnedPublication;
@@ -1580,6 +1621,9 @@ export class StoppedDirectoryPublication {
         if (state === "prepared" && finalPresent) {
           fail("publication_outcome_uncertain", "uncertain");
         }
+        if (restoreDestination && state === "absent" && finalPresent) {
+          fail("publication_outcome_uncertain", "uncertain");
+        }
         fail("publication_recovery_required", "not-committed");
       }
 
@@ -1592,6 +1636,7 @@ export class StoppedDirectoryPublication {
       let recordedJournal;
       let recordedJournalFilesystem;
       let recordedJournalRoot;
+      let recordedSourceArtifactProof;
       try {
         recordedBinding = exactOptions(record.binding, [
           "coordinator",
@@ -1642,13 +1687,19 @@ export class StoppedDirectoryPublication {
           recordedSource.rootFilesystem,
         );
         const recordedSourceRoot = parseFileIdentityRecord(recordedSource.root);
+        recordedSourceArtifactProof =
+          recordedSource.artifactProof === null
+            ? null
+            : normalizeArtifactProof(recordedSource.artifactProof);
         ensure(
           recordedPublication.contractVersion ===
               PUBLICATION_CONTRACT_VERSION &&
-            recordedPublication.publicationKind === "checkpoint-artifact" &&
+            recordedPublication.publicationKind === options.kind &&
             recordedDestination.name === finalName &&
             recordedDestination.candidateName === candidateName &&
-            recordedSource.artifactProof === null &&
+            (restoreDestination
+              ? recordedSourceArtifactProof !== null
+              : recordedSourceArtifactProof === null) &&
             assertDirectName(recordedSource.name) === recordedSource.name &&
             recordedSourceDirectoryIdentity.filesystemId ===
               recordedSourceFilesystem.filesystemId &&
@@ -1669,6 +1720,11 @@ export class StoppedDirectoryPublication {
           recordedBinding.coordinator,
           options.expected.binding,
         ) &&
+          (!restoreDestination ||
+            sameCanonicalValue(
+              recordedSourceArtifactProof,
+              options.artifactProof,
+            )) &&
           sameCanonicalValue(record.request, options.expected.request) &&
           sameCanonicalValue(record.result, options.expected.result),
         "publication_conflict",
@@ -1775,10 +1831,14 @@ export class StoppedDirectoryPublication {
         "committed",
       );
       const materialization = validateMaterialization(record.materialization, {
-        artifactProof: null,
+        allowLegacyRestore: restoreDestination,
+        artifactProof: options.artifactProof,
         committed: true,
+        coordinatorBindingSha256: restoreDestination
+          ? operationJournalBindingSha256(options.expected.binding)
+          : undefined,
         finalName,
-        kind: "checkpoint-artifact",
+        kind: options.kind,
         operationId,
       });
       pinnedPublication = await openPinnedDirectory(
@@ -1805,20 +1865,24 @@ export class StoppedDirectoryPublication {
         "published_state_invalid",
         "committed",
       );
-      await syncStoppedTree(finalPath, {
-        listMountPoints: this.#listMountPoints,
-      });
-      await targetAuthority.assertCurrent();
-      await targetAuthority.handle.sync();
+      if (!restoreDestination) {
+        await syncStoppedTree(finalPath, {
+          listMountPoints: this.#listMountPoints,
+        });
+        await targetAuthority.assertCurrent();
+        await targetAuthority.handle.sync();
+      }
       await this.#verifyPublishedTree({
-        artifactProof: Object.freeze({
-          artifactManifestDigest: materialization.artifactManifestDigest,
-          captureOperationId: operationId,
-          modeledDigest: materialization.modeledDigest,
-        }),
+        artifactProof: restoreDestination
+          ? options.artifactProof
+          : Object.freeze({
+              artifactManifestDigest: materialization.artifactManifestDigest,
+              captureOperationId: operationId,
+              modeledDigest: materialization.modeledDigest,
+            }),
         checkpoint: record.result.checkpoint,
         committed: true,
-        kind: "checkpoint-artifact",
+        kind: options.kind,
         materialization,
         observedObjectIdentities,
         path: finalPath,

@@ -214,18 +214,24 @@
   prepare the process-local image capability before publication and later
   claim only that pre-reserved attempt, so a crash cannot leave a newly
   committed generation without discoverable launch work.
-- The attempted standalone restore publication-to-launch facade was reverted
-  after review proved that it conflated an existing active
-  `attachment.rootPath` with the absent detached pathname required by atomic
-  restore publication. Production restore remains fail-closed. A later slice
-  must publish to an independent detached destination, obtain provider-backed
-  attachment evidence for the committed object, and atomically replace the
-  canonical session/launch attachment only after the old attachment is
-  stopped, fenced, and detached.
+- Detached restore activation and recovery composition now verifies only an
+  exact committed destination without re-reading a capture source or advancing
+  publication state. The optional version 1 provider extension binds that
+  published object and materialization digest to new attachment evidence.
+  Typed `restore-attachment-activation-v1` authority then serializably installs
+  the exact attachment and materializes its predeclared prepared launch as one
+  atomic canonical transition after the predecessor is stopped, fenced, and
+  detached.
+- A bounded restore recovery coordinator and service now cover retained
+  destination generations, attachment activations, prepared or active launch
+  attempts, and current-launch inventory through four independent keyset
+  cursors. Recovery is source-free and no-relaunch: it never republishes,
+  reserves or consumes an image, invokes a launcher, or reconstructs an opaque
+  writer capability. Current-launch handling is inventory only.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until later serial pull requests verify committed generation publication,
-  activate a provider-proven detached destination, add bounded no-relaunch
-  recovery, and wire the complete protocol into `runRestore()`.
+  until a separate production-adapter slice passes its fleet capability gate
+  and wires committed publication, detached activation, prepared launch, and
+  no-relaunch recovery into `runRestore()`.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -284,6 +290,8 @@
   `docs/project_journal/2026/08/2026-08-04-restore-launch-handoff-5a7c2e.md`
 - Restore publication attachment-contract correction:
   `docs/project_journal/2026/08/2026-08-05-restore-publication-attachment-contract-4c7a91.md`
+- Detached restore activation and recovery composition:
+  `docs/project_journal/2026/08/2026-08-05-detached-restore-activation-3f91c2.md`
 - Durable stop-to-clean-capture composition:
   `docs/project_journal/2026/08/2026-08-05-durable-stop-capture-composition-7e3a91.md`
 - External-auth probe workstream:
@@ -298,8 +306,7 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  authority until the old attachment is durably stopped/fenced/detached, an
-  independently published destination receives provider-backed attachment
-  evidence, the authority atomically activates that attachment for the launch
-  request, and launcher/no-relaunch recovery is verified as one fail-closed
-  protocol.
+  adapter. The detached-destination activation and bounded no-relaunch
+  recovery protocol now exist, but production still requires an explicit fleet
+  capability gate, adapter composition, and end-to-end fail-closed validation
+  before `runRestore()` may be enabled.
