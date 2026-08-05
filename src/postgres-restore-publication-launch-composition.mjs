@@ -112,6 +112,12 @@ const PREPARATION_KEYS = objectFreeze([
   "imageReservation",
   "launchAttemptId",
 ]);
+const IMAGE_RESERVATION_KEYS = objectFreeze([
+  "configBytes",
+  "descriptor",
+  "inspectCodex",
+  "reservation",
+]);
 const SESSION_KEYS = objectFreeze([
   "createdAt",
   "document",
@@ -121,6 +127,19 @@ const SESSION_KEYS = objectFreeze([
 ]);
 const SESSION_DOCUMENT_KEYS = objectFreeze([
   "activeOperation",
+  "attachment",
+  "backendCapabilities",
+  "documentVersion",
+  "lastOperation",
+  "launch",
+  "lease",
+  "lifecycle",
+  "manifest",
+  "recovery",
+  "storageRef",
+  "writerEpoch",
+]);
+const ACTIVE_SESSION_STABLE_DOCUMENT_KEYS = objectFreeze([
   "attachment",
   "backendCapabilities",
   "documentVersion",
@@ -892,6 +911,24 @@ function directPathPlan(directoryValue, ownedRootValue, code) {
   return exactFrozenRecord({ directory, ownedRoot });
 }
 
+function normalizeImageReservation(value, code) {
+  const image = exactObject(value, IMAGE_RESERVATION_KEYS, code);
+  ensure(
+    typeof image.inspectCodex === "function" &&
+      !isProxyValue(image.inspectCodex) &&
+      image.reservation !== null &&
+      typeof image.reservation === "object" &&
+      !isProxyValue(image.reservation),
+    code,
+  );
+  return exactFrozenRecord({
+    configBytes: image.configBytes,
+    descriptor: image.descriptor,
+    inspectCodex: image.inspectCodex,
+    reservation: image.reservation,
+  });
+}
+
 function normalizePreparation(value, admission, code) {
   const input = exactObject(value, PREPARATION_KEYS, code);
   const destinationIsolationProofId = assertOpaqueId(
@@ -900,13 +937,11 @@ function normalizePreparation(value, admission, code) {
   );
   const generationId = assertOpaqueId(input.generationId, code);
   const launchAttemptId = assertOpaqueId(input.launchAttemptId, code);
-  ensure(
-    launchAttemptId !== admission.request.operationId &&
-      input.imageReservation !== null &&
-      typeof input.imageReservation === "object" &&
-      !isProxyValue(input.imageReservation),
+  const imageReservation = normalizeImageReservation(
+    input.imageReservation,
     code,
   );
+  ensure(launchAttemptId !== admission.request.operationId, code);
   const artifact = directPathPlan(
     input.artifactDirectory,
     input.artifactOwnedRoot,
@@ -929,7 +964,7 @@ function normalizePreparation(value, admission, code) {
     destination,
     destinationIsolationProofId,
     generationId,
-    imageReservation: input.imageReservation,
+    imageReservation,
     launchAttemptId,
   });
 }
@@ -1042,19 +1077,12 @@ function validateActiveSession(
     code,
     true,
   );
-  for (const key of [
-    "attachment",
-    "backendCapabilities",
-    "documentVersion",
-    "lastOperation",
-    "launch",
-    "lease",
-    "lifecycle",
-    "manifest",
-    "recovery",
-    "storageRef",
-    "writerEpoch",
-  ]) {
+  for (
+    let index = 0;
+    index < ACTIVE_SESSION_STABLE_DOCUMENT_KEYS.length;
+    index += 1
+  ) {
+    const key = ACTIVE_SESSION_STABLE_DOCUMENT_KEYS[index];
     ensure(sameData(document[key], expectedDocument[key], code), code);
   }
   canonicalData(sessionValue, code);

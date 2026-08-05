@@ -59,10 +59,13 @@ unavailable.
   bound back to both durable operations and reservations, the generation and
   catalogue, the exact launch request, and the canonical session relation.
   After handoff confirmation, the guard is released and
-  `runPreparedLaunch()` receives the original opaque reservation and exact
-  pre-reserved launch-attempt ID; it does not reserve another operation. Its
-  `started` result is accepted only when the full terminal
-  operation/reservation/session/evidence relation validates.
+  `runPreparedLaunch()` receives the original opaque reservation through the
+  same frozen shallow wrapper snapshot used to prepare the launch, plus the
+  exact pre-reserved launch-attempt ID; it does not reserve another operation.
+  Its `started` result is accepted only when the full terminal
+  operation/reservation/session/evidence relation validates and the durable
+  revision is exactly 2 after prepared/starting, exactly 3 after uncertain, or
+  unchanged for committed replay.
 - A failure before definite publication dispatch may cancel only the prepared
   restore. A failure after dispatch but before confirmed handoff leaves or
   marks durable uncertainty. A launch failure after handoff remains owned by
@@ -96,6 +99,10 @@ unavailable.
   from a reduced journal projection. Legacy version 1 compatibility is
   read-only and committed-only, so it cannot fabricate the coordinator digest
   required by a fresh typed version 2 generation.
+- The mutable preparation result is never retained as the image capability
+  wrapper. Its four own data fields are sampled once into a frozen wrapper,
+  preserving the opaque inner reservation identity while preventing a later
+  outer-property swap between launch preparation and execution.
 - The standalone facade does not provide durable complete-stop proof, capture
   admission, bounded operational recovery, a concrete container driver, or
   production adapter enablement.

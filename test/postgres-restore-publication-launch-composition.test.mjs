@@ -644,6 +644,8 @@ function materialization(binding, overrides = {}) {
 
 class MemoryAuthority {
   constructor(events, options = {}) {
+    this.afterReserveReceiptCreated =
+      options.afterReserveReceiptCreated ?? null;
     this.events = events;
     this.artifactProof = options.artifactProof ?? artifactProof();
     this.claimAcknowledgementLoss = options.claimAcknowledgementLoss === true;
@@ -661,6 +663,7 @@ class MemoryAuthority {
     this.handoffReceipt = null;
     this.phase = "absent";
     this.reserveAcquired = options.reserveAcquired !== false;
+    this.reserveReceiptMutation = options.reserveReceiptMutation ?? null;
   }
 
   async readSession() {
@@ -677,7 +680,7 @@ class MemoryAuthority {
     this.input = input;
     const reservedOperation = operation(input, "prepared", "0", NOW);
     const reservedReservation = reservation(reservedOperation, "prepared");
-    this.prepared = deepFreeze({
+    const prepared = {
       acquired: this.reserveAcquired,
       operation: reservedOperation,
       reservation: reservedReservation,
@@ -688,8 +691,16 @@ class MemoryAuthority {
         "4",
       ),
       status: "prepared",
-    });
+    };
+    this.prepared = deepFreeze(
+      this.reserveReceiptMutation === null
+        ? prepared
+        : this.reserveReceiptMutation(clone(prepared)),
+    );
     this.phase = "prepared";
+    if (this.afterReserveReceiptCreated !== null) {
+      this.afterReserveReceiptCreated(this.prepared);
+    }
     return this.prepared;
   }
 
@@ -965,18 +976,45 @@ class MemoryAuthority {
 
 class MemoryLauncher {
   constructor(events, imageReservation, authority, options = {}) {
+    this.afterPrepareLaunchIntent = options.afterPrepareLaunchIntent ?? null;
     this.events = events;
     this.imageReservation = imageReservation;
     this.authority = authority;
     this.resultMutation = options.launchResultMutation ?? null;
     this.launchCalls = 0;
+    this.prepareImageReservation = null;
+    this.prepareOpaqueReservation = null;
     this.runCalls = 0;
+    this.runImageReservation = null;
+    this.runOpaqueReservation = null;
     this.started = false;
   }
 
   prepareLaunchIntent(input) {
     this.events.push("launcher.prepare");
-    assert.strictEqual(input.imageReservation, this.imageReservation);
+    assert.notStrictEqual(input.imageReservation, this.imageReservation);
+    assert.equal(Object.isFrozen(input.imageReservation), true);
+    assert.strictEqual(
+      input.imageReservation.configBytes,
+      this.imageReservation.configBytes,
+    );
+    assert.strictEqual(
+      input.imageReservation.descriptor,
+      this.imageReservation.descriptor,
+    );
+    assert.strictEqual(
+      input.imageReservation.inspectCodex,
+      this.imageReservation.inspectCodex,
+    );
+    assert.strictEqual(
+      input.imageReservation.reservation,
+      this.imageReservation.reservation,
+    );
+    this.prepareImageReservation = input.imageReservation;
+    this.prepareOpaqueReservation = input.imageReservation.reservation;
+    if (this.afterPrepareLaunchIntent !== null) {
+      this.afterPrepareLaunchIntent(input);
+    }
     return Promise.resolve(launchIntent());
   }
 
@@ -987,7 +1025,16 @@ class MemoryLauncher {
       this.launchCalls += 1;
       this.started = true;
     }
-    assert.strictEqual(input.imageReservation, this.imageReservation);
+    assert.strictEqual(
+      input.imageReservation,
+      this.prepareImageReservation,
+    );
+    this.runImageReservation = input.imageReservation;
+    this.runOpaqueReservation = input.imageReservation.reservation;
+    assert.strictEqual(
+      this.runOpaqueReservation,
+      this.prepareOpaqueReservation,
+    );
     const prepared = this.authority.handoffReceipt.launch.operation;
     const launchEvidence = deepFreeze({
       contractVersion: 1,
@@ -1123,7 +1170,14 @@ class MemoryGuard {
 async function fixture(t, options = {}) {
   const events = [];
   const publicationFixture = await createPublicationFixture(t);
-  const imageReservation = Object.freeze(Object.create(null));
+  const imageReservation =
+    options.imageReservation ??
+    Object.freeze({
+      configBytes: Object.freeze(Object.create(null)),
+      descriptor: Object.freeze(Object.create(null)),
+      inspectCodex() {},
+      reservation: Object.freeze(Object.create(null)),
+    });
   const authority = new MemoryAuthority(events, {
     ...options,
     artifactProof: publicationFixture.artifactProof,
@@ -1219,6 +1273,7 @@ async function fixture(t, options = {}) {
       return publicationCalls;
     },
     guard,
+    imageReservation,
     launcher,
     publication: publicationFixture,
     publish,
@@ -1298,6 +1353,46 @@ test("committed restore publication hands off atomically before prepared launch"
     "guard.exit",
     "launcher.run",
   ]);
+});
+
+test("preparation snapshots one image reservation capability across prepare and run", async (t) => {
+  const reservationA = Object.freeze(Object.create(null));
+  const reservationB = Object.freeze(Object.create(null));
+  const imageReservation = {
+    configBytes: Object.freeze(Object.create(null)),
+    descriptor: Object.freeze(Object.create(null)),
+    inspectCodex() {},
+    reservation: reservationA,
+  };
+  const value = await fixture(t, {
+    afterPrepareLaunchIntent() {
+      imageReservation.reservation = reservationB;
+    },
+    imageReservation,
+  });
+
+  await value.composer.runRestore(admission(), value.publish);
+
+  assert.strictEqual(imageReservation.reservation, reservationB);
+  assert.notStrictEqual(
+    value.launcher.prepareImageReservation,
+    imageReservation,
+  );
+  assert.equal(
+    Object.isFrozen(value.launcher.prepareImageReservation),
+    true,
+  );
+  assert.strictEqual(
+    value.launcher.prepareOpaqueReservation,
+    reservationA,
+  );
+  assert.strictEqual(
+    value.launcher.runImageReservation,
+    value.launcher.prepareImageReservation,
+  );
+  assert.strictEqual(value.launcher.runOpaqueReservation, reservationA);
+  assert.equal(value.authority.handoffCalls, 1);
+  assert.equal(value.launcher.launchCalls, 1);
 });
 
 test("stopped-directory backend composes real publication through atomic handoff and prepared launch", async (t) => {
@@ -1436,6 +1531,53 @@ test("an observed reserve replay is never cancelled as invocation-owned", async 
   assert.equal(value.events.includes("authority.cancel"), false);
   assert.equal(value.publicationCalls, 0);
   assert.equal(value.launcher.launchCalls, 0);
+});
+
+test("active session relation rejects stable-field forgery with a poisoned Array iterator", async (t) => {
+  const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    Symbol.iterator,
+  );
+  const value = await fixture(t, {
+    afterReserveReceiptCreated() {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        ...iteratorDescriptor,
+        value: function* emptyArrayIterator() {},
+      });
+    },
+    reserveReceiptMutation(receipt) {
+      receipt.session.document.writerEpoch = "999";
+      return receipt;
+    },
+  });
+  let observedError = null;
+
+  try {
+    try {
+      await value.composer.runRestore(admission(), value.publish);
+    } catch (error) {
+      observedError = error;
+    }
+  } finally {
+    Object.defineProperty(
+      Array.prototype,
+      Symbol.iterator,
+      iteratorDescriptor,
+    );
+  }
+
+  assert.ok(
+    observedError instanceof PostgresRestorePublicationLaunchCompositionError,
+  );
+  assert.equal(
+    observedError.code,
+    "postgres_restore_publication_launch_composition_outcome_uncertain",
+  );
+  assert.equal(value.authority.phase, "prepared");
+  assert.equal(value.events.includes("authority.claim"), false);
+  assert.equal(value.publicationCalls, 0);
+  assert.equal(value.authority.handoffCalls, 0);
+  assert.equal(value.launcher.runCalls, 0);
 });
 
 test("a forged handoff session relation is rejected before launch", async (t) => {

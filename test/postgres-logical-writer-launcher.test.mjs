@@ -251,35 +251,60 @@ function terminalPointer(operation, reservation) {
   };
 }
 
-function preparedReceiptForStartedResult(result) {
+function handoffReceiptForStartedResult(result, state = "prepared") {
+  const revision =
+    state === "prepared" ? "0" : state === "starting" ? "1" : "2";
+  const updatedAt =
+    state === "prepared"
+      ? result.operation.createdAt
+      : state === "starting"
+        ? STARTING_TIME
+        : UNCERTAIN_TIME;
   const operation = clone(result.operation);
   operation.result = null;
   operation.retiredAt = null;
-  operation.revision = "0";
-  operation.state = "prepared";
-  operation.updatedAt = operation.createdAt;
+  operation.revision = revision;
+  operation.state = state;
+  operation.updatedAt = updatedAt;
   const reservation = clone(result.reservation);
   reservation.releasedAt = null;
-  reservation.state = "prepared";
-  reservation.updatedAt = reservation.createdAt;
+  reservation.state = state;
+  reservation.updatedAt = updatedAt;
   const session = clone(operation.expectedSession);
   session.document.activeOperation = activePointer(operation, reservation);
   session.document.launch = null;
-  session.revision = (BigInt(operation.expectedSession.revision) + 1n).toString();
-  session.updatedAt = operation.createdAt;
+  session.revision = (
+    BigInt(operation.expectedSession.revision) +
+    BigInt(revision) +
+    1n
+  ).toString();
+  session.updatedAt = updatedAt;
   return {
     attempt: {
       contractVersion: 1,
       launchAttemptId: operation.operationId,
       request: clone(operation.request),
       result: null,
-      state: "prepared",
+      state,
     },
     operation,
     reservation,
     session,
-    status: "prepared",
+    status: state,
   };
+}
+
+function startedResultAtRevision(result, revision) {
+  const terminal = clone(result);
+  terminal.writer = result.writer;
+  terminal.operation.revision = revision;
+  terminal.session.document.lastOperation.operationRevision = revision;
+  terminal.session.revision = (
+    BigInt(terminal.operation.expectedSession.revision) +
+    BigInt(revision) +
+    1n
+  ).toString();
+  return terminal;
 }
 
 function evidence(attemptId, status, overrides = {}) {
@@ -1238,7 +1263,7 @@ test("started-result validation binds the full durable launch relation", async (
   const result = await value.facade.runLaunch(runInput(value));
 
   const validated = assertLogicalWriterLaunchStartedResult({
-    handoff: preparedReceiptForStartedResult(result),
+    handoff: handoffReceiptForStartedResult(result),
     result,
   });
 
@@ -1265,11 +1290,49 @@ test("started-result validation binds the full durable launch relation", async (
   assert.throws(
     () =>
       assertLogicalWriterLaunchStartedResult({
-        handoff: preparedReceiptForStartedResult(result),
+        handoff: handoffReceiptForStartedResult(result),
         result: forged,
       }),
     assertLauncherError("logical_writer_launch_outcome_uncertain"),
   );
+});
+
+test("started-result validation enforces exact handoff revision transitions", async () => {
+  const value = await fixture();
+  const revisionTwoResult = await value.facade.runLaunch(runInput(value));
+
+  for (const state of ["prepared", "starting"]) {
+    const validated = assertLogicalWriterLaunchStartedResult({
+      handoff: handoffReceiptForStartedResult(revisionTwoResult, state),
+      result: revisionTwoResult,
+    });
+    assert.equal(validated.operation.revision, "2");
+  }
+
+  assert.throws(
+    () =>
+      assertLogicalWriterLaunchStartedResult({
+        handoff: handoffReceiptForStartedResult(
+          revisionTwoResult,
+          "uncertain",
+        ),
+        result: revisionTwoResult,
+      }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+
+  const revisionThreeResult = startedResultAtRevision(
+    revisionTwoResult,
+    "3",
+  );
+  const validated = assertLogicalWriterLaunchStartedResult({
+    handoff: handoffReceiptForStartedResult(
+      revisionThreeResult,
+      "uncertain",
+    ),
+    result: revisionThreeResult,
+  });
+  assert.equal(validated.operation.revision, "3");
 });
 
 test("prepares one exact durable launch seed without consuming or reserving", async () => {

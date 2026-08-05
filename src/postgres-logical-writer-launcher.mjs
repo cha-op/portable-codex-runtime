@@ -2048,8 +2048,17 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
     launchAttemptId,
     code,
   );
+  // Prepared handoff must claim revision 1 before finalizing revision 2.
+  // Starting and uncertain handoffs each finalize exactly one revision later.
+  const expectedCommittedRevision =
+    handoff.operation.state === "uncertain"
+      ? "3"
+      : handoff.operation.state === "committed"
+        ? handoff.operation.revision
+        : "2";
   ensure(
     receipt.status === "started" &&
+      receipt.operation.revision === expectedCommittedRevision &&
       receipt.operation.operationId === handoff.operation.operationId &&
       receipt.operation.sessionId === handoff.operation.sessionId &&
       receipt.operation.kind === handoff.operation.kind &&
