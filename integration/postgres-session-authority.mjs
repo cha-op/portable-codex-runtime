@@ -7750,13 +7750,25 @@ test(
         );
         const consecutive = consecutiveFreshSessionIds(
           existingRows.rows.map(({ session_id: sessionId }) => sessionId),
-          2,
+          3,
         );
-        const [detachedSessionId, launchedSessionId] =
-          consecutive.sessionIds;
-        sessionIds.push(detachedSessionId, launchedSessionId);
+        const [
+          detachedSessionId,
+          launchedSessionId,
+          lookaheadSessionId,
+        ] = consecutive.sessionIds;
+        sessionIds.push(
+          detachedSessionId,
+          launchedSessionId,
+          lookaheadSessionId,
+        );
         await authority.registerSession(
           registrationInput(detachedSessionId),
+        );
+        // Keep the limit+1 lookahead independent from intentionally corrupt
+        // rows retained by other fail-closed integration cases.
+        await authority.registerSession(
+          registrationInput(lookaheadSessionId),
         );
         const fixture = await prepareCommittedRestoreGenerationFixture(
           authority,
@@ -7802,6 +7814,10 @@ test(
             limit: 1,
           });
         assert.equal(currentPage.candidates.length, 1);
+        assert.equal(
+          currentPage.nextAfterSessionId,
+          launchedSessionId,
+        );
         assert.deepEqual(currentPage.candidates[0], {
           launch: launched.launch,
           launchAttemptId: launchInput.operationId,
