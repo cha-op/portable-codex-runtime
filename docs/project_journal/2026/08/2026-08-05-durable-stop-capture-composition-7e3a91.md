@@ -31,10 +31,16 @@ detached-destination activation, and bounded restart recovery remain closed.
   frozen `{capability, evidence, resolution, stop}`.
 - The launcher retains the first exact stop operation input. Later calls use
   `reconcileOperation()` and proceed only from `prepared`, or from `starting`
-  with the same record's true-grant or thrown-acknowledgement witness while it
-  still proves the coordinator and physical stop have not begun. An explicit
-  non-grant never creates that witness. It never repeats claim for known
-  `starting` state or synthesizes operation timestamps from a session.
+  only after the same record received the exact true-grant receipt while it
+  still proves the coordinator and physical stop have not begun. A thrown claim
+  or explicit non-grant never creates that witness because the durable state
+  cannot distinguish acknowledgement loss from a foreign claimant. It never
+  repeats claim for known `starting` state or synthesizes operation timestamps
+  from a session.
+- Stop preflight accepts a current lease only when its contract, session,
+  lease, holder, and fencing-epoch identity remains exact and its canonical
+  expiration has not moved backwards. This preserves stop/capture across
+  ordinary renewal without treating expiration extension as a new writer.
 - The composition independently derives the same stop ID from its prepared
   tuple before it accepts any receipt. A valid receipt for a different request
   or checkpoint is rejected before capture.
@@ -57,10 +63,10 @@ detached-destination activation, and bounded restart recovery remain closed.
 
 Only a complete canonical `{attachment, checkpoint, request}` tuple bound to
 the current launch attempt may name the stop that authorizes its capture. The
-launcher must definitely claim the durable stop before invoking physical stop
-once, then validate the typed result, released reservation, direct terminal
-session successor, cleared launch, and exact complete-stop evidence before a
-capability can be issued.
+launcher must receive the exact durable stop grant before invoking physical
+stop once, then validate the typed result, released reservation, direct
+terminal session successor, cleared launch, and exact complete-stop evidence
+before a capability can be issued.
 
 Stop, finalization, capability, capture, or retirement ambiguity retains the
 durable and process-local blockers. It cannot repeat physical stop, replace the
@@ -100,9 +106,10 @@ recovery or a cross-process or cross-host fence.
 - The five focused stopped-writer coordinator, launcher, snapshot-core,
   composition, and operation-kernel test files passed with exit 0 and no
   failures. They include direct same-session cross-backend/storage registration
-  exclusion, concurrent capability consumption, exact prepared/starting stop
-  replay, and rejection of `starting` without the retained record's claim
-  witness.
+  exclusion, concurrent capability consumption, renewed-lease stop admission,
+  exact prepared stop replay, rejection of claim-acknowledgement ambiguity and
+  foreign `starting`, and ordinary launch-reconciliation rejection after a
+  joined durable stop.
 - `test/stopped-directory-backend.test.mjs` passed with 91 dot-reporter test
   markers and no failures.
 - The complete unit suite passed with exit 0 when it skipped only

@@ -215,9 +215,10 @@ Restore and launcher authority are now split into eight serial pull requests:
      `writer-launch-stop-v1`, and validate the committed operation,
      reservation, session, and complete-stop proof before issuing one opaque
      capability. Retain the local writer identity until capture succeeds;
-     reconcile only the exact same-process `prepared` or locally claimed
-     `starting` pre-dispatch state, and block same-session successor launch in
-     the canonical local coordinator until retirement. Ambiguous stop,
+     reconcile only the exact same-process `prepared` or explicitly granted
+     `starting` pre-dispatch state, accept lease-expiration extension only for
+     the same stable writer-fence identity, and block same-session successor
+     launch in the canonical local coordinator until retirement. Ambiguous stop,
      finalisation, capture, or retirement stays fail-closed.
 7. **Detached restore activation and recovery composition**
    - Keep the absent restore-publication destination independent from the

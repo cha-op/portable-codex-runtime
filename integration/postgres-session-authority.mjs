@@ -22,6 +22,7 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
+  PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
@@ -1403,6 +1404,17 @@ function assertCheckpointAuthorityCode(code) {
       error.name,
       "PostgresCheckpointMutationAuthorityError",
     );
+    assert.equal(error.code, code);
+    assert.equal(error.retryable, false);
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  };
+}
+
+function assertLauncherCode(code) {
+  return (error) => {
+    assert.ok(error instanceof PostgresLogicalWriterLauncherError);
+    assert.equal(error.name, "PostgresLogicalWriterLauncherError");
     assert.equal(error.code, code);
     assert.equal(error.retryable, false);
     assert.equal(Object.hasOwn(error, "cause"), false);
@@ -6527,7 +6539,7 @@ test(
     );
 
     await t.test(
-      "logical writer launcher commits one started writer and reconciles its original handle",
+      "logical writer launcher stops a renewed writer and keeps launch readback closed",
       async () => {
         const sessionId = randomUUID();
         sessionIds.push(sessionId);
@@ -6559,6 +6571,7 @@ test(
         const launchAttemptId = `writer-launch-${randomUUID()}`;
         const supervisorId = `supervisor-${randomUUID()}`;
         let launchCalls = 0;
+        let stopCalls = 0;
         const launchWriter = async (context) => {
           launchCalls += 1;
           assert.equal(
@@ -6575,6 +6588,7 @@ test(
               "started",
             ),
             stopWriter: async function stopWriter() {
+              stopCalls += 1;
               return STOPPED_WRITER_STOP_CONFIRMED;
             },
           };
@@ -6651,6 +6665,62 @@ test(
           },
         );
         assert.equal(guardResult, "guard-reacquired");
+
+        const renewalInput = writerLeaseRenewalInput(current);
+        const renewed = await authority.renewWriterLease(renewalInput);
+        assertOperationReceipt(renewed, "committed");
+        assert.equal(renewed.renewed, true);
+        assert.equal(
+          renewed.session.document.lease.expiresAt >
+            started.attempt.request.lease.expiresAt,
+          true,
+        );
+        assert.deepEqual(
+          renewed.session.document.launch,
+          started.launch,
+        );
+
+        const capture = checkpointCaptureAdmission(
+          { session: renewed.session },
+          {
+            processIncarnationId: started.evidence.processIncarnationId,
+            writerIncarnationId: started.evidence.writerIncarnationId,
+          },
+        );
+        const stopped = await facade.stopWriterForCapture({
+          attachment: capture.attachment,
+          checkpoint: capture.checkpoint,
+          request: capture.request,
+        });
+        assert.equal(stopped.stop.status, "committed");
+        assert.equal(stopped.evidence.status, "complete-stopped");
+        assert.equal(stopCalls, 1);
+        assert.deepEqual(
+          stopped.stop.operation.expectedSession.document.lease,
+          renewed.session.document.lease,
+        );
+        assert.deepEqual(
+          stopped.resolution.canonicalLeaseAtRegistration,
+          started.attempt.request.lease,
+        );
+
+        const historical = await authority.readWriterLaunchAttempt({
+          operationId: launchAttemptId,
+        });
+        assertOperationReceipt(historical, "committed");
+        assert.equal(
+          historical.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.equal(historical.launch, null);
+        assert.equal(historical.session.document.launch, null);
+
+        await assert.rejects(
+          facade.reconcileLaunchAttempt({ launchAttemptId }),
+          assertLauncherCode("logical_writer_launch_outcome_uncertain"),
+        );
+        assert.equal(launchCalls, 1);
+        assert.equal(stopCalls, 1);
       },
     );
 

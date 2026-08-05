@@ -2940,7 +2940,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       request: claim.attempt.request,
       state: "registering",
       stopBaseInput: null,
-      stopClaimDispatchWitnessFor: null,
+      stopClaimGrantAcknowledgedFor: null,
       stopEvidence: null,
       stopReceipt: null,
       stopWriter: callbackReceipt.stopWriter,
@@ -3645,11 +3645,25 @@ export function createPostgresLogicalWriterLauncher(...args) {
 
   function validateCurrentStopSession(session, record, code) {
     let manifest;
+    let currentLease;
+    let registeredLease;
     try {
       manifest = assertSessionManifest(session.document.manifest);
+      currentLease = assertLeaseGrant(session.document.lease);
+      registeredLease = assertLeaseGrant(record.canonicalLease);
     } catch {
       fail(code);
     }
+    ensure(
+      currentLease.contractVersion === registeredLease.contractVersion &&
+        currentLease.sessionId === registeredLease.sessionId &&
+        currentLease.leaseId === registeredLease.leaseId &&
+        currentLease.holderId === registeredLease.holderId &&
+        currentLease.fencingEpoch === registeredLease.fencingEpoch &&
+        canonicalTimestampMilliseconds(currentLease.expiresAt, code) >=
+          canonicalTimestampMilliseconds(registeredLease.expiresAt, code),
+      code,
+    );
     ensure(
       record.launch !== null &&
         session.sessionId === record.attachment.sessionId &&
@@ -3657,7 +3671,6 @@ export function createPostgresLogicalWriterLauncher(...args) {
         session.document.activeOperation === null &&
         session.document.writerEpoch === record.canonicalLease.fencingEpoch &&
         sameContent(session.document.attachment, record.attachment, code) &&
-        sameContent(session.document.lease, record.canonicalLease, code) &&
         sameContent(session.document.launch, record.launch, code) &&
         manifest.codex.sessionId === record.codexSessionId &&
         manifest.codex.rootThreadId === record.codexThreadId &&
@@ -3789,11 +3802,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
               }
             }
 
-            let hasClaimDispatchWitness =
-              record.stopClaimDispatchWitnessFor === stopOperation;
+            let hasAcknowledgedClaimGrant =
+              record.stopClaimGrantAcknowledgedFor === stopOperation;
             if (phase.status === "prepared") {
-              record.stopClaimDispatchWitnessFor = null;
-              hasClaimDispatchWitness = false;
+              record.stopClaimGrantAcknowledgedFor = null;
+              hasAcknowledgedClaimGrant = false;
               let claimValue;
               let claimInvocationFailed = false;
               try {
@@ -3810,13 +3823,9 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 );
               } catch {
                 claimInvocationFailed = true;
-                record.stopClaimDispatchWitnessFor = stopOperation;
-                hasClaimDispatchWitness = true;
+                record.stopClaimGrantAcknowledgedFor = null;
+                hasAcknowledgedClaimGrant = false;
                 phase = await reconcileStopOperation(baseInput);
-                if (phase.status !== "starting") {
-                  record.stopClaimDispatchWitnessFor = null;
-                  hasClaimDispatchWitness = false;
-                }
               }
               if (!claimInvocationFailed) {
                 phase = normalizeStopClaimReceipt(
@@ -3824,20 +3833,19 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   baseInput,
                   outcomeCode,
                 );
-                ensure(
-                  phase.dispatchGranted === true &&
-                    phase.status === "starting",
-                  outcomeCode,
-                );
-                record.stopClaimDispatchWitnessFor = stopOperation;
-                hasClaimDispatchWitness = true;
+                if (phase.dispatchGranted) {
+                  record.stopClaimGrantAcknowledgedFor = stopOperation;
+                  hasAcknowledgedClaimGrant = true;
+                }
               }
             }
-            ensure(
+            const physicalStopAuthorized =
               phase.status === "starting" &&
-                record.stopClaimDispatchWitnessFor === stopOperation,
-              outcomeCode,
-            );
+              record.stopClaimGrantAcknowledgedFor === stopOperation;
+            if (!physicalStopAuthorized && phase.status !== "prepared") {
+              record.state = "lost";
+            }
+            ensure(physicalStopAuthorized, outcomeCode);
 
             await assertGuardHeld(probe, outcomeCode);
             ensure(record.state === "ready", outcomeCode);
@@ -3861,7 +3869,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 record.pendingStop = null;
                 record.state = "lost";
               }
-              if (hasClaimDispatchWitness) {
+              if (hasAcknowledgedClaimGrant) {
                 await bestEffortMarkStopUncertain(
                   baseInput,
                   uncertaintyState,

@@ -1075,10 +1075,18 @@ composition confirms exact capture completion. The launcher caches the first
 frozen stop operation input. A retry reads that exact operation through
 `reconcileOperation()`: `prepared` may repeat claim, while `starting` may enter
 the first physical stop only when the retained record proves this facade
-received the exact claim grant or lost that exact claim acknowledgement and
-has not entered the coordinator. An explicit non-grant never creates this
-witness.
+received and validated the exact `dispatchGranted: true` claim receipt and has
+not entered the coordinator. An invocation error or explicit non-grant never
+creates this witness: without a durable claimant token, local acknowledgement
+loss is indistinguishable from a foreign claimant winning before readback.
 `uncertain`, `committed`, foreign, and cold-start state remain closed.
+
+The stop preflight compares the current lease's stable contract, session,
+lease, holder, and fencing-epoch identity with the lease registered for the
+local writer. It accepts only a canonical `expiresAt` at or after the
+registration value, so ordinary lease renewal does not invalidate the local
+stop handle while expiry rollback or fence replacement remains closed. Lease
+expiry itself is deliberately not a stop gate.
 
 The immutable historical launch attempt still says `started` after the stop
 operation clears the current launch. Only the facade's joined receipt bridges

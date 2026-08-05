@@ -173,8 +173,11 @@
   coordinator, any retained writer blocks physical successor launch for that
   session across backend and storage slots until explicit retirement. Exact
   stop retries reuse the original frozen operation input and reconcile durable
-  `prepared` or locally granted/acknowledgement-lost `starting` state without
-  repeating claim or physical stop. An explicit non-grant remains closed.
+  `prepared` or explicitly granted `starting` state without repeating claim or
+  physical stop. Claim acknowledgement loss and an explicit non-grant remain
+  closed because the durable operation does not identify its claimant. A lease
+  renewal may extend expiration while the stable registered writer-fence tuple
+  remains exact; expiry rollback or identity drift rejects before stop reserve.
 - Typed `writer-launch-stop-v1` authority preserves the original started
   attempt and clears the current-launch relation only for exact
   `complete-stopped` evidence from the bound supervisor. Historical stop or

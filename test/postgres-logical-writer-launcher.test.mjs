@@ -360,6 +360,7 @@ class MemoryLaunchAuthority {
     this.lastOperationOverride = undefined;
     this.sessionRevisionOverride = undefined;
     this.sessionUpdatedAtOverride = undefined;
+    this.currentLeaseOverride = undefined;
     this.behaviour = Object.create(null);
     this.claimReceiptMutation = null;
     this.calls = {
@@ -398,6 +399,7 @@ class MemoryLaunchAuthority {
     this.lastOperationOverride = undefined;
     this.sessionRevisionOverride = undefined;
     this.sessionUpdatedAtOverride = undefined;
+    this.currentLeaseOverride = undefined;
     this.behaviour = Object.create(null);
     this.claimReceiptMutation = null;
     this.lastClaimInput = null;
@@ -528,6 +530,9 @@ class MemoryLaunchAuthority {
 
   session(operation = this.operation(), reservation = this.reservation(operation)) {
     const document = clone(this.expectedSession.document);
+    if (this.currentLeaseOverride !== undefined) {
+      document.lease = clone(this.currentLeaseOverride);
+    }
     document.documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION;
     if (operation.state === "committed") {
       document.activeOperation =
@@ -747,6 +752,12 @@ class MemoryLaunchAuthority {
       throw new Error("stop reconcile unavailable");
     }
     assert.equal(input.kind, WRITER_LAUNCH_STOP_OPERATION_KIND);
+    if (
+      this.behaviour.stopForeignClaimBeforeReconcile &&
+      this.stopState === "prepared"
+    ) {
+      this.stopState = "starting";
+    }
     if (this.stopState === "absent") {
       return {
         operation: null,
@@ -890,6 +901,10 @@ class MemoryLaunchAuthority {
     if (this.behaviour.readThrows) throw new Error("read unavailable");
     if (this.state === "absent") throw new Error("attempt absent");
     const receipt = this.receipt();
+    if (this.stopState === "committed") {
+      receipt.launch = null;
+      receipt.session = this.stopSession();
+    }
     return this.readReceiptMutation === null
       ? receipt
       : this.readReceiptMutation(clone(receipt));
@@ -1637,7 +1652,66 @@ test("stop finalization acknowledgement loss replays without a second physical s
   assert.equal(value.authority.stopState, "committed");
 });
 
-test("same-process stop claim acknowledgement loss proves starting before physical stop", async () => {
+test("a renewed lease preserves the registered writer identity for stop", async () => {
+  const value = await fixture();
+  const started = await value.facade.runLaunch(runInput(value));
+  const renewedLease = lease({
+    expiresAt: "2027-08-04T12:05:00.000Z",
+  });
+  value.authority.currentLeaseOverride = renewedLease;
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.deepEqual(
+    stopped.stop.operation.expectedSession.document.lease,
+    renewedLease,
+  );
+  assert.deepEqual(
+    stopped.resolution.canonicalLeaseAtRegistration,
+    started.attempt.request.lease,
+  );
+  assert.equal(
+    stopped.resolution.canonicalLeaseAtRegistration.expiresAt,
+    "2027-08-04T12:00:00.000Z",
+  );
+});
+
+for (const [name, currentLease] of [
+  [
+    "expiration rollback",
+    lease({ expiresAt: "2027-08-04T11:59:59.000Z" }),
+  ],
+  [
+    "session change",
+    lease({ sessionId: "019f3d80-0000-7000-8000-000000000099" }),
+  ],
+  ["lease change", lease({ leaseId: "lease-002" })],
+  ["holder change", lease({ holderId: "host-002" })],
+  ["fencing epoch change", lease({ fencingEpoch: "12" })],
+]) {
+  test(`stop rejects current lease ${name} before durable reserve`, async () => {
+    const value = await fixture();
+    await value.facade.runLaunch(runInput(value));
+    const reservesBeforeStop = value.authority.calls.reserve;
+    value.authority.currentLeaseOverride = currentLease;
+
+    await assert.rejects(
+      value.facade.stopWriterForCapture(resolverInput(value)),
+      assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    );
+
+    assert.equal(value.authority.calls.reserve, reservesBeforeStop);
+    assert.equal(value.authority.calls.stopClaim, 0);
+    assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+    assert.equal(value.supervisorStopCalls, 0);
+  });
+}
+
+test("stop claim acknowledgement loss remains closed before physical stop", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
   const readsBeforeStop = value.events.filter(
@@ -1645,12 +1719,13 @@ test("same-process stop claim acknowledgement loss proves starting before physic
   ).length;
   value.authority.behaviour.stopClaimThrowAfterCommit = true;
 
-  const stopped = await value.facade.stopWriterForCapture(
-    resolverInput(value),
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
   );
 
-  assert.equal(stopped.stop.finalized, true);
-  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.stopState, "starting");
+  assert.equal(value.supervisorStopCalls, 0);
   assert.equal(value.authority.calls.stopClaim, 1);
   assert.equal(
     value.events.filter((entry) => entry === "authority.read-session").length -
@@ -1659,6 +1734,15 @@ test("same-process stop claim acknowledgement loss proves starting before physic
   );
   assert.equal(value.authority.calls.stopReconcile, 1);
   assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.supervisorStopCalls, 0);
 });
 
 test("a pre-commit stop claim failure clears its witness before retry", async () => {
@@ -1710,6 +1794,32 @@ test("a rejected stop claim witness cannot authorize a foreign starting state", 
   assert.equal(value.supervisorStopCalls, 0);
 });
 
+test("a pre-commit stop claim failure cannot adopt foreign starting during readback", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopClaimThrowBeforeCommit = true;
+  value.authority.behaviour.stopForeignClaimBeforeReconcile = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "starting");
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+  assert.equal(value.supervisorStopCalls, 0);
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.supervisorStopCalls, 0);
+});
+
 test("a lost stop claim race never authorizes physical stop", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
@@ -1726,7 +1836,7 @@ test("a lost stop claim race never authorizes physical stop", async () => {
 
   await assert.rejects(
     value.facade.stopWriterForCapture(resolverInput(value)),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    assertLauncherError("invalid_logical_writer_launch_request"),
   );
   assert.equal(value.authority.calls.stopClaim, 1);
   assert.equal(value.authority.calls.markUncertain, 0);
@@ -1755,7 +1865,7 @@ test("exact stop replay resumes a retained prepared operation before physical st
   assert.equal(value.supervisorStopCalls, 1);
 });
 
-test("exact stop replay resumes acknowledged starting only before physical stop", async () => {
+test("exact stop replay cannot adopt an unacknowledged starting claim", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
   value.authority.behaviour.stopClaimThrowAfterCommit = true;
@@ -1768,11 +1878,14 @@ test("exact stop replay resumes acknowledged starting only before physical stop"
   assert.equal(value.authority.stopState, "starting");
   assert.equal(value.supervisorStopCalls, 0);
 
-  const stopped = await value.facade.stopWriterForCapture(resolverInput(value));
-  assert.equal(stopped.stop.status, "committed");
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
   assert.equal(value.authority.calls.stopClaim, 1);
   assert.equal(value.authority.calls.stopReconcile, 2);
-  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+  assert.equal(value.supervisorStopCalls, 0);
 });
 
 test("a starting stop without this record's claim witness never dispatches physical stop", async () => {
@@ -2466,6 +2579,28 @@ test("does not infer stopped from historical started state with no current launc
   assert.equal(value.launchCalls, 0);
   assert.equal(value.reconcileCalls, 0);
   assert.equal(value.inspectionCount, 1);
+});
+
+test("ordinary launch reconciliation remains closed after a joined durable stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(stopped.evidence.status, "complete-stopped");
+  assert.equal(value.supervisorStopCalls, 1);
+
+  await assert.rejects(
+    value.facade.reconcileLaunchAttempt({
+      launchAttemptId: LAUNCH_ATTEMPT_ID,
+    }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.calls.read, 1);
+  assert.equal(value.reconcileCalls, 0);
+  assert.equal(value.supervisorStopCalls, 1);
 });
 
 test("serializes concurrent prepared claims on the launch-attempt guard key", async () => {
