@@ -584,6 +584,13 @@ export class StoppedWriterCapabilityCoordinator {
     );
     parseFencingEpoch(writerFence.fencingEpoch);
     ensure(!this.#disposed, "writer_state_conflict");
+    // Direct registration is part of launch admission. Enforce the same
+    // session-wide exclusion here so callers cannot bypass the preflight by
+    // choosing a different backend or storage slot.
+    ensure(
+      (mapGet(this.#activeWritersBySession, attachment.sessionId) ?? 0) === 0,
+      "writer_state_conflict",
+    );
     const existing = findSlot(this.#slots, attachment);
     if (existing?.lastFencingEpoch !== undefined) {
       let comparison;

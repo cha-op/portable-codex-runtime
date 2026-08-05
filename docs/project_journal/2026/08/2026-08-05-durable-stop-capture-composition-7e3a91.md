@@ -43,7 +43,8 @@ detached-destination activation, and bounded restart recovery remain closed.
   still classified as retirement uncertainty.
 - The canonical same-process stopped-writer coordinator retains a per-session
   launch-exclusion count across running, stopped, issued, consuming, consumed,
-  revoked, and uncertain records. Sharing that exact coordinator blocks
+  revoked, and uncertain records. Both launch preflight and direct writer
+  registration enforce that count, so sharing the exact coordinator blocks
   successor launch across backend and storage slots until retirement.
 - Public envelope validators reject ordinary and revoked proxies with their
   fixed contract error classification before array introspection or dispatch.
@@ -97,9 +98,10 @@ recovery or a cross-process or cross-host fence.
   coordinator, authority, launcher, snapshot core, and new composition modules.
 - The five focused stopped-writer coordinator, launcher, snapshot-core,
   composition, and operation-kernel test files passed with exit 0 and no
-  failures. They include same-session cross-backend/storage launch exclusion,
-  concurrent capability consumption, exact prepared/starting stop replay, and
-  rejection of `starting` without the retained record's claim witness.
+  failures. They include direct same-session cross-backend/storage registration
+  exclusion, concurrent capability consumption, exact prepared/starting stop
+  replay, and rejection of `starting` without the retained record's claim
+  witness.
 - `test/stopped-directory-backend.test.mjs` passed with 91 dot-reporter test
   markers and no failures.
 - The complete unit suite passed with exit 0 when it skipped only

@@ -1821,7 +1821,7 @@ test("dispose releases a high-churn finite issuer scope", async () => {
   );
 });
 
-test("slot identity is session, backend, and storage rather than attachment ID", () => {
+test("direct registration enforces session exclusion across slot keys", () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
   const first = coordinator.registerWriter(registerOptions());
   assertOpaqueHandle(first);
@@ -1844,21 +1844,44 @@ test("slot identity is session, backend, and storage rather than attachment ID",
   );
 
   const otherStorageLease = lease({ leaseId: "lease-other-storage" });
-  const otherStorage = coordinator.registerWriter(
-    registerOptions({
-      attachment: attachment(otherStorageLease, {
-        attachmentId: "attachment-other-storage",
-        operationId: "operation-attach-other-storage",
-        proofId: "proof-attachment-other-storage",
-        rootPath: "/var/lib/portable-codex/other-storage",
-        storageId: "volume-002",
-      }),
-      canonicalLease: otherStorageLease,
-      processIncarnationId: "process-incarnation-other-storage",
-      writerIncarnationId: "writer-incarnation-other-storage",
-    }),
+  syncCapabilityError(
+    () =>
+      coordinator.registerWriter(
+        registerOptions({
+          attachment: attachment(otherStorageLease, {
+            attachmentId: "attachment-other-storage",
+            operationId: "operation-attach-other-storage",
+            proofId: "proof-attachment-other-storage",
+            rootPath: "/var/lib/portable-codex/other-storage",
+            storageId: "volume-002",
+          }),
+          canonicalLease: otherStorageLease,
+          processIncarnationId: "process-incarnation-other-storage",
+          writerIncarnationId: "writer-incarnation-other-storage",
+        }),
+      ),
+    "writer_state_conflict",
   );
-  assertOpaqueHandle(otherStorage);
+
+  const otherBackendLease = lease({ leaseId: "lease-other-backend" });
+  syncCapabilityError(
+    () =>
+      coordinator.registerWriter(
+        registerOptions({
+          attachment: attachment(otherBackendLease, {
+            attachmentId: "attachment-other-backend",
+            backendId: "other-backend",
+            operationId: "operation-attach-other-backend",
+            proofId: "proof-attachment-other-backend",
+            rootPath: "/var/lib/portable-codex/other-backend",
+          }),
+          canonicalLease: otherBackendLease,
+          processIncarnationId: "process-incarnation-other-backend",
+          writerIncarnationId: "writer-incarnation-other-backend",
+        }),
+      ),
+    "writer_state_conflict",
+  );
 });
 
 test("slot lookup is immune to inherited toJSON poisoning", async (t) => {
