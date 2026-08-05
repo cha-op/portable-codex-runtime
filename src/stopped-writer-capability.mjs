@@ -18,6 +18,7 @@ const BigIntConstructor = BigInt;
 const DateConstructor = Date;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
+const mapDeleteIntrinsic = Map.prototype.delete;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const MapConstructor = Map;
@@ -65,6 +66,10 @@ function arrayIncludes(value, candidate) {
 
 function mapGet(value, key) {
   return callIntrinsic(mapGetIntrinsic, value, [key]);
+}
+
+function mapDelete(value, key) {
+  return callIntrinsic(mapDeleteIntrinsic, value, [key]);
 }
 
 function mapSet(value, key, entry) {
@@ -503,6 +508,10 @@ function frozenCallbackBinding(record) {
 export class StoppedWriterCapabilityCoordinator {
   #activeWriters = 0;
 
+  // This count protects same-process session launch exclusion. Slot identity
+  // remains session/backend/storage for direct registration and fence history.
+  #activeWritersBySession = new MapConstructor();
+
   #capabilities = new WeakMapConstructor();
 
   #disposed = false;
@@ -514,6 +523,41 @@ export class StoppedWriterCapabilityCoordinator {
   constructor(...args) {
     ensure(args.length === 0, "invalid_stopped_writer_request");
     objectFreeze(this);
+  }
+
+  assertWriterLaunchAvailable(options) {
+    ensure(!this.#disposed, "writer_state_conflict");
+    const {
+      attachment: attachmentValue,
+      canonicalLease,
+    } = assertExactOptions(options, ["attachment", "canonicalLease"]);
+    const { attachment, writerFence } = normalizeBinding(
+      attachmentValue,
+      canonicalLease,
+    );
+    parseFencingEpoch(writerFence.fencingEpoch);
+    ensure(!this.#disposed, "writer_state_conflict");
+    // A retained writer is the access-policy signal. Capability state changes
+    // do not release exclusion; only retireWriter decrements this count.
+    ensure(
+      (mapGet(this.#activeWritersBySession, attachment.sessionId) ?? 0) === 0,
+      "writer_state_conflict",
+    );
+    const slot = findSlot(this.#slots, attachment);
+    if (slot === undefined) return;
+    ensure(slot.current === null, "writer_state_conflict");
+    if (slot.lastFencingEpoch !== undefined) {
+      let comparison;
+      try {
+        comparison = compareFencingEpochs(
+          writerFence.fencingEpoch,
+          slot.lastFencingEpoch,
+        );
+      } catch {
+        fail("invalid_stopped_writer_request");
+      }
+      ensure(comparison > 0, "writer_state_conflict");
+    }
   }
 
   registerWriter(options) {
@@ -540,10 +584,14 @@ export class StoppedWriterCapabilityCoordinator {
     );
     parseFencingEpoch(writerFence.fencingEpoch);
     ensure(!this.#disposed, "writer_state_conflict");
+    // Direct registration is part of launch admission. Enforce the same
+    // session-wide exclusion here so callers cannot bypass the preflight by
+    // choosing a different backend or storage slot.
+    ensure(
+      (mapGet(this.#activeWritersBySession, attachment.sessionId) ?? 0) === 0,
+      "writer_state_conflict",
+    );
     const existing = findSlot(this.#slots, attachment);
-    if (existing?.current !== null && existing?.current !== undefined) {
-      fail("writer_state_conflict");
-    }
     if (existing?.lastFencingEpoch !== undefined) {
       let comparison;
       try {
@@ -580,6 +628,11 @@ export class StoppedWriterCapabilityCoordinator {
     weakMapSet(this.#writers, writer, record);
     slot.current = record;
     this.#activeWriters += 1;
+    mapSet(
+      this.#activeWritersBySession,
+      attachment.sessionId,
+      (mapGet(this.#activeWritersBySession, attachment.sessionId) ?? 0) + 1,
+    );
     return writer;
   }
 
@@ -793,10 +846,30 @@ export class StoppedWriterCapabilityCoordinator {
     );
     const { slot } = record;
     ensure(slot?.current === record, "writer_state_conflict");
+    const activeForSession = mapGet(
+      this.#activeWritersBySession,
+      record.attachment.sessionId,
+    );
+    ensure(
+      typeof activeForSession === "number" && activeForSession > 0,
+      "writer_state_conflict",
+    );
     record.state = "retired";
     slot.current = null;
     slot.lastFencingEpoch = record.writerFence.fencingEpoch;
     this.#activeWriters -= 1;
+    if (activeForSession === 1) {
+      ensure(
+        mapDelete(this.#activeWritersBySession, record.attachment.sessionId),
+        "writer_state_conflict",
+      );
+    } else {
+      mapSet(
+        this.#activeWritersBySession,
+        record.attachment.sessionId,
+        activeForSession - 1,
+      );
+    }
   }
 
   dispose(...args) {
@@ -804,6 +877,7 @@ export class StoppedWriterCapabilityCoordinator {
     ensure(args.length === 0, "invalid_stopped_writer_request");
     ensure(this.#activeWriters === 0, "writer_state_conflict");
     this.#disposed = true;
+    this.#activeWritersBySession = new MapConstructor();
     this.#capabilities = new WeakMapConstructor();
     this.#slots = new MapConstructor();
     this.#writers = new WeakMapConstructor();

@@ -16,10 +16,31 @@ import {
   compareFencingEpochs,
 } from "./session-storage-contracts.mjs";
 
+// Map membership, one-use state, and the captured backend function are the
+// dispatch authority. A stop collaborator must not replace those identities by
+// mutating shared intrinsics after preparation.
+const arrayEveryIntrinsic = Array.prototype.every;
+const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayIsArray = Array.isArray;
+const objectCreate = Object.create;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const objectIsFrozen = Object.isFrozen;
+const objectKeys = Object.keys;
+const objectPrototype = Object.prototype;
+const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
+const { isProxy: isProxyValue } = utilTypes;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapHasIntrinsic = WeakMap.prototype.has;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+
 // Each API dispatches at most once per invocation. The backend owns durable
 // operationId replay and must atomically recheck its authoritative writer fence.
 
-const CORE_ERROR_MESSAGES = Object.freeze({
+const CORE_ERROR_MESSAGES = objectFreeze({
   checkpoint_outcome_uncertain: "Checkpoint capture outcome is uncertain",
   checkpoint_reconciliation_outcome_uncertain:
     "Checkpoint capture reconciliation outcome is uncertain",
@@ -27,16 +48,36 @@ const CORE_ERROR_MESSAGES = Object.freeze({
   unsupported_checkpoint_class: "Checkpoint class is not supported by the clean snapshot core",
 });
 
+function weakMapGet(value, key) {
+  return reflectApply(weakMapGetIntrinsic, value, [key]);
+}
+
+function weakMapHas(value, key) {
+  return reflectApply(weakMapHasIntrinsic, value, [key]);
+}
+
+function weakMapSet(value, key, entry) {
+  reflectApply(weakMapSetIntrinsic, value, [key, entry]);
+}
+
+function arrayEvery(value, callback) {
+  return reflectApply(arrayEveryIntrinsic, value, [callback]);
+}
+
+function arrayIncludes(value, candidate) {
+  return reflectApply(arrayIncludesIntrinsic, value, [candidate]);
+}
+
 export class SessionSnapshotCoreError extends Error {
   constructor(code) {
-    if (!Object.hasOwn(CORE_ERROR_MESSAGES, code)) {
+    if (!objectHasOwn(CORE_ERROR_MESSAGES, code)) {
       throw new TypeError("unsupported session snapshot core error code");
     }
     super(CORE_ERROR_MESSAGES[code]);
     this.name = "SessionSnapshotCoreError";
     this.code = code;
     this.retryable = false;
-    Object.freeze(this);
+    objectFreeze(this);
   }
 }
 
@@ -50,10 +91,10 @@ function ensureContract(condition, code, message) {
 
 function assertExactOptions(value, keys, label) {
   if (
-    utilTypes.isProxy(value) ||
+    isProxyValue(value) ||
     value === null ||
     typeof value !== "object" ||
-    Array.isArray(value)
+    arrayIsArray(value)
   ) {
     failContract("invalid_checkpoint", `${label} must be a plain object`);
   }
@@ -61,33 +102,37 @@ function assertExactOptions(value, keys, label) {
   let prototype;
   let actual;
   try {
-    prototype = Object.getPrototypeOf(value);
-    actual = Reflect.ownKeys(value);
+    prototype = objectGetPrototypeOf(value);
+    actual = reflectOwnKeys(value);
   } catch {
     failContract("invalid_checkpoint", `${label} must be a plain object`);
   }
   ensureContract(
-    [Object.prototype, null].includes(prototype),
+    arrayIncludes([objectPrototype, null], prototype),
     "invalid_checkpoint",
     `${label} must be a plain object`,
   );
   ensureContract(
     actual.length === keys.length &&
-      actual.every((key) => typeof key === "string" && keys.includes(key)),
+      arrayEvery(
+        actual,
+        (key) => typeof key === "string" && arrayIncludes(keys, key),
+      ),
     "invalid_checkpoint",
     `${label} contains unexpected or missing fields`,
   );
 
-  const normalized = Object.create(null);
-  for (const key of actual) {
+  const normalized = objectCreate(null);
+  for (let index = 0; index < actual.length; index += 1) {
+    const key = actual[index];
     let descriptor;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(value, key);
+      descriptor = objectGetOwnPropertyDescriptor(value, key);
     } catch {
       failContract("invalid_checkpoint", `${label} fields must be plain data properties`);
     }
     ensureContract(
-      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
       "invalid_checkpoint",
       `${label} fields must be enumerable plain data properties`,
     );
@@ -170,8 +215,8 @@ function assertStoppedWriterEvidence(value) {
   ensureContract(
     value !== null &&
       typeof value === "object" &&
-      !utilTypes.isProxy(value) &&
-      !Array.isArray(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
     "invalid_checkpoint",
     "stopped writer evidence must be an opaque non-proxy object handle",
   );
@@ -222,7 +267,8 @@ function assertBackendCheckpointResult(
     storageRef === undefined ? { manifest } : { manifest, storageRef };
   const checkpoint = assertCheckpointDescriptor(envelope.checkpoint, checkpointOptions);
   ensureContract(
-    Object.keys(expectedCheckpoint).every(
+    arrayEvery(
+      objectKeys(expectedCheckpoint),
       (key) => checkpoint[key] === expectedCheckpoint[key],
     ),
     "invalid_checkpoint",
@@ -233,14 +279,19 @@ function assertBackendCheckpointResult(
 }
 
 function frozenResult(checkpoint, mutation) {
-  return Object.freeze({ checkpoint, mutation });
+  return objectFreeze({ checkpoint, mutation });
 }
 
+const preparedCleanCheckpointCaptures = new WeakMap();
+
 /**
- * Structural orchestration only. The backend must atomically recheck the
- * canonical writer fence while capturing the checkpoint.
+ * Validates and canonicalizes one deterministic clean-checkpoint capture
+ * before any stopped-writer capability is requested. The returned tuple is a
+ * same-process token: capturePreparedCleanCheckpoint accepts only an object
+ * produced by this helper, so a caller cannot substitute a different tuple
+ * between writer stop and backend dispatch.
  */
-export async function captureCleanCheckpoint(options) {
+export function prepareCleanCheckpointCapture(options) {
   const {
     attachment,
     backend,
@@ -250,7 +301,6 @@ export async function captureCleanCheckpoint(options) {
     manifest,
     now,
     request,
-    stoppedWriterEvidence,
     storageRef,
   } = assertExactOptions(
     options,
@@ -263,14 +313,12 @@ export async function captureCleanCheckpoint(options) {
       "manifest",
       "now",
       "request",
-      "stoppedWriterEvidence",
       "storageRef",
     ],
-    "checkpoint capture options",
+    "checkpoint capture preparation options",
   );
 
   const cleanClass = assertCleanCheckpointClass(checkpointClass);
-  const writerEvidence = assertStoppedWriterEvidence(stoppedWriterEvidence);
   const storageBackend = checkedBackend(backend);
   const matched = validateContract(
     () =>
@@ -321,25 +369,133 @@ export async function captureCleanCheckpoint(options) {
   );
 
   const capture = checkedBackendMethod(storageBackend, "captureCheckpoint");
+  const prepared = objectFreeze({
+    attachment: matched.attachment,
+    backend: storageBackend,
+    checkpoint,
+    manifest: matched.manifest,
+    request: mutationRequest,
+    storageRef: matched.storageRef,
+  });
+  weakMapSet(preparedCleanCheckpointCaptures, prepared, {
+    capture,
+    state: "prepared",
+  });
+  return prepared;
+}
+
+/**
+ * Dispatches one previously prepared clean capture with the exact canonical
+ * tuple that was presented to the stopped-writer authority.
+ */
+export async function capturePreparedCleanCheckpoint(options) {
+  const { preparedCapture, stoppedWriterEvidence } = assertExactOptions(
+    options,
+    ["preparedCapture", "stoppedWriterEvidence"],
+    "prepared checkpoint capture options",
+  );
+  const writerEvidence = assertStoppedWriterEvidence(stoppedWriterEvidence);
+  ensureContract(
+    preparedCapture !== null &&
+      typeof preparedCapture === "object" &&
+      !isProxyValue(preparedCapture) &&
+      !arrayIsArray(preparedCapture) &&
+      objectIsFrozen(preparedCapture) &&
+      weakMapHas(preparedCleanCheckpointCaptures, preparedCapture),
+    "invalid_checkpoint",
+    "prepared checkpoint capture is invalid",
+  );
+  const preparedState = weakMapGet(
+    preparedCleanCheckpointCaptures,
+    preparedCapture,
+  );
+  ensureContract(
+    preparedState.state === "prepared",
+    "invalid_checkpoint",
+    "prepared checkpoint capture was already dispatched",
+  );
+  // One token authorizes one dispatch attempt. Transition synchronously before
+  // invoking the backend so rejection or acknowledgement loss cannot reopen it.
+  preparedState.state = "dispatched";
+  const { capture } = preparedState;
+  const {
+    attachment,
+    backend,
+    checkpoint,
+    manifest,
+    request,
+    storageRef,
+  } = preparedCapture;
+
   try {
-    const result = await capture.call(
-      storageBackend,
-      Object.freeze({
-        attachment: matched.attachment,
+    const result = await reflectApply(capture, backend, [
+      objectFreeze({
+        attachment,
         checkpoint,
-        request: mutationRequest,
+        request,
         stoppedWriterEvidence: writerEvidence,
       }),
-    );
+    ]);
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: checkpoint,
-      manifest: matched.manifest,
-      request: mutationRequest,
-      storageRef: matched.storageRef,
+      manifest,
+      request,
+      storageRef,
     });
   } catch {
     throw new SessionSnapshotCoreError("checkpoint_outcome_uncertain");
   }
+}
+
+/**
+ * Structural orchestration only. The backend must atomically recheck the
+ * canonical writer fence while capturing the checkpoint.
+ */
+export async function captureCleanCheckpoint(options) {
+  const {
+    attachment,
+    backend,
+    canonicalLease,
+    checkpointClass,
+    createdAt,
+    manifest,
+    now,
+    request,
+    stoppedWriterEvidence,
+    storageRef,
+  } = assertExactOptions(
+    options,
+    [
+      "attachment",
+      "backend",
+      "canonicalLease",
+      "checkpointClass",
+      "createdAt",
+      "manifest",
+      "now",
+      "request",
+      "stoppedWriterEvidence",
+      "storageRef",
+    ],
+    "checkpoint capture options",
+  );
+
+  const writerEvidence = assertStoppedWriterEvidence(stoppedWriterEvidence);
+  const preparedCapture = prepareCleanCheckpointCapture({
+    attachment,
+    backend,
+    canonicalLease,
+    checkpointClass,
+    createdAt,
+    manifest,
+    now,
+    request,
+    storageRef,
+  });
+  return capturePreparedCleanCheckpoint({
+    preparedCapture,
+    stoppedWriterEvidence: writerEvidence,
+  });
 }
 
 /**
@@ -402,10 +558,9 @@ export async function reconcileCleanCheckpointCapture(options) {
     "reconcileCheckpointCapture",
   );
   try {
-    const result = await reconcile.call(
-      storageBackend,
-      Object.freeze({ checkpoint: descriptor, request: mutationRequest }),
-    );
+    const result = await reflectApply(reconcile, storageBackend, [
+      objectFreeze({ checkpoint: descriptor, request: mutationRequest }),
+    ]);
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: descriptor,
       manifest: sessionManifest,
@@ -480,10 +635,9 @@ export async function restoreCleanCheckpoint(options) {
 
   const restore = checkedBackendMethod(storageBackend, "restoreCheckpoint");
   try {
-    const result = await restore.call(
-      storageBackend,
-      Object.freeze({ checkpoint: descriptor, request: mutationRequest }),
-    );
+    const result = await reflectApply(restore, storageBackend, [
+      objectFreeze({ checkpoint: descriptor, request: mutationRequest }),
+    ]);
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: descriptor,
       manifest: sessionManifest,

@@ -19,6 +19,7 @@ import {
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
+  assertCommittedWriterLaunchStopTransitionProof,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
@@ -59,6 +60,8 @@ const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const SUPERVISOR_ID = "supervisor-001";
 const SUPERVISOR_PROOF_ID = "supervisor-proof-001";
 const STOP_OPERATION_ID = "stop-operation-001";
+const STOP_CLAIM_TOKEN = "019f2100-0000-7000-8000-000000000007";
+const OTHER_STOP_CLAIM_TOKEN = "019f2100-0000-7000-8000-000000000008";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
 const MAX_POSTGRES_BIGINT = 9_223_372_036_854_775_807n;
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -738,6 +741,12 @@ function reserveOptions(overrides = {}) {
 
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function writerLaunchStopClaimSha256(claimToken) {
+  return sha256(
+    `portable-codex-runtime:writer-launch-stop-claim:v1\0${claimToken}`,
+  );
 }
 
 function canonicalPayload(value) {
@@ -3156,6 +3165,8 @@ function writerLaunchCommittedRelationSteps(
 }
 
 function writerLaunchStopFixture({
+  claimToken = STOP_CLAIM_TOKEN,
+  contractVersion = 2,
   launch = writerLaunchFixture(),
   stopOperationId = STOP_OPERATION_ID,
 } = {}) {
@@ -3163,9 +3174,11 @@ function writerLaunchStopFixture({
   const expectedSession = snapshotFromSessionRow(
     writerLaunchCommittedSessionRow(launch, { result: launchResult }),
   );
-  const request = createWriterLaunchStopOperationRequest({
-    expectedSession,
-  });
+  const request = createWriterLaunchStopOperationRequest(
+    contractVersion === 1
+      ? { expectedSession }
+      : { claimToken, expectedSession },
+  );
   const options = {
     expectedSession,
     kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
@@ -3186,7 +3199,15 @@ function writerLaunchStopFixture({
     outcome: "writer-launch-stopped",
     resultVersion: 1,
   };
-  return { evidence, launch, launchResult, options, request, result };
+  return {
+    claimToken: contractVersion === 1 ? null : claimToken,
+    evidence,
+    launch,
+    launchResult,
+    options,
+    request,
+    result,
+  };
 }
 
 function writerLaunchStopOperationRow(
@@ -9906,14 +9927,44 @@ test("writer release rejects a current launch before PostgreSQL", async () => {
 
 test("writer launch stop request owns the exact current launch pointer", async () => {
   const fixture = writerLaunchStopFixture();
+  const legacy = createWriterLaunchStopOperationRequest({
+    expectedSession: fixture.options.expectedSession,
+  });
   const replay = createWriterLaunchStopOperationRequest({
+    claimToken: fixture.claimToken,
     expectedSession: fixture.options.expectedSession,
   });
   assert.deepEqual(replay, canonicalPayload({
+    contractVersion: 2,
+    dispatchClaimSha256: writerLaunchStopClaimSha256(fixture.claimToken),
+    launch: fixture.options.expectedSession.document.launch,
+  }));
+  assert.deepEqual(legacy, canonicalPayload({
     contractVersion: 1,
     launch: fixture.options.expectedSession.document.launch,
   }));
+  assert.equal(JSON.stringify(replay).includes(fixture.claimToken), false);
+  assertDeepFrozen(legacy);
   assertDeepFrozen(replay);
+
+  for (const options of [
+    {
+      claimToken: fixture.claimToken,
+      expectedSession: fixture.options.expectedSession,
+      extra: true,
+    },
+    {
+      claimToken: "not-a-uuid",
+      expectedSession: fixture.options.expectedSession,
+    },
+  ]) {
+    assert.throws(
+      () => createWriterLaunchStopOperationRequest(options),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
 
   for (const mutate of [
     (expectedSession) => {
@@ -9932,12 +9983,338 @@ test("writer launch stop request owns the exact current launch pointer", async (
     const expectedSession = structuredClone(fixture.options.expectedSession);
     mutate(expectedSession);
     assert.throws(
-      () => createWriterLaunchStopOperationRequest({ expectedSession }),
+      () =>
+        createWriterLaunchStopOperationRequest({
+          claimToken: fixture.claimToken,
+          expectedSession,
+        }),
       (error) =>
         error instanceof PostgresSessionAuthorityError &&
         error.code === "invalid_operation_request",
     );
   }
+});
+
+test("writer launch stop reconcile distinguishes exact and superseded absent preconditions", async () => {
+  const fixture = writerLaunchStopFixture();
+  const renewalOptions = renewOptions(fixture.options.expectedSession);
+  const renewal = renewalResult(
+    renewalOptions,
+    LAUNCH_RENEW_AUTHORITY_NOW,
+  );
+  const renewalOperation = operationRow("committed", {
+    options: renewalOptions,
+    revision: "0",
+    createdAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    updatedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    retiredAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    result: renewal,
+  });
+  const renewalReservation = reservationRow("released", {
+    options: renewalOptions,
+    createdAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    updatedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    releasedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+  });
+  const renewedSession = renewedSessionRow({
+    options: renewalOptions,
+    result: renewal,
+    updatedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      ...writerLaunchCommittedSteps(fixture.launch, {
+        result: fixture.launchResult,
+      }),
+      rows(),
+      rows(),
+    ],
+    [
+      rows(renewedSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(renewalOperation),
+      rows(renewalReservation),
+      ...writerLaunchCommittedRelationSteps(fixture.launch, {
+        result: fixture.launchResult,
+      }),
+      rows(),
+      rows(),
+    ],
+  );
+
+  const exact = await authority.reconcileWriterLaunchStopOperation(
+    { ...fixture.options, claimToken: fixture.claimToken },
+  );
+  const superseded = await authority.reconcileWriterLaunchStopOperation(
+    { ...fixture.options, claimToken: fixture.claimToken },
+  );
+  await assertAuthorityError(
+    authority.reconcileWriterLaunchStopOperation({
+      ...fixture.options,
+      claimToken: fixture.claimToken,
+      extra: true,
+    }),
+    { code: "invalid_operation_request" },
+  );
+
+  assert.equal(exact.status, "absent");
+  assert.equal(exact.claimTokenMatched, false);
+  assert.equal(exact.expectedSessionMatched, true);
+  assert.deepEqual(exact.session, fixture.options.expectedSession);
+  assert.equal(superseded.status, "absent");
+  assert.equal(superseded.claimTokenMatched, false);
+  assert.equal(superseded.expectedSessionMatched, false);
+  assert.deepEqual(
+    superseded.session,
+    snapshotFromSessionRow(renewedSession),
+  );
+  assertDeepFrozen(exact);
+  assertDeepFrozen(superseded);
+  for (const client of clients) {
+    assert.deepEqual(
+      authorityQueries(client)[0],
+      extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [
+        fixture.options.expectedSession.sessionId,
+      ]),
+    );
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
+test("writer launch stop claim-token inputs are exact outer authority inputs", async () => {
+  const fixture = writerLaunchStopFixture();
+  const legacy = writerLaunchStopFixture({ contractVersion: 1 });
+  const { authority, pool } = authorityWithScripts();
+  const baseClaim = {
+    ...fixture.options,
+    expectedOperationRevision: "0",
+  };
+
+  for (const reconcile of [
+    fixture.options,
+    { ...fixture.options, claimToken: fixture.claimToken, extra: true },
+    { ...fixture.options, claimToken: "not-a-uuid" },
+    { ...legacy.options, claimToken: STOP_CLAIM_TOKEN },
+  ]) {
+    await assertAuthorityError(
+      authority.reconcileWriterLaunchStopOperation(reconcile),
+      { code: "invalid_operation_request" },
+    );
+  }
+  for (const claim of [
+    baseClaim,
+    { ...baseClaim, claimToken: fixture.claimToken, extra: true },
+    { ...baseClaim, claimToken: "not-a-uuid" },
+    {
+      ...legacy.options,
+      claimToken: STOP_CLAIM_TOKEN,
+      expectedOperationRevision: "0",
+    },
+  ]) {
+    await assertAuthorityError(
+      authority.claimWriterLaunchStopDispatch(claim),
+      { code: "invalid_operation_request" },
+    );
+  }
+  for (const request of [
+    {
+      ...legacy.request,
+      dispatchClaimSha256: writerLaunchStopClaimSha256(STOP_CLAIM_TOKEN),
+    },
+    {
+      contractVersion: 2,
+      launch: fixture.request.launch,
+    },
+    {
+      contractVersion: 2,
+      dispatchClaimSha256: "g".repeat(64),
+      launch: fixture.request.launch,
+    },
+  ]) {
+    await assertAuthorityError(
+      authority.reserveOperation({ ...fixture.options, request }),
+      { code: "invalid_operation_request" },
+    );
+  }
+
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer launch stop claim grants only the exact persisted claim digest", async () => {
+  const fixture = writerLaunchStopFixture();
+  const { authority, clients } = authorityWithScripts(
+    writerLaunchStopActiveSteps(fixture, "starting"),
+    writerLaunchStopActiveSteps(fixture, "prepared"),
+    writerLaunchStopActiveSteps(fixture, "starting"),
+  );
+
+  const sameTokenReplay = await authority.claimWriterLaunchStopDispatch({
+    ...fixture.options,
+    claimToken: fixture.claimToken,
+    expectedOperationRevision: "0",
+  });
+  const wrongTokenPrepared = await authority.claimWriterLaunchStopDispatch({
+    ...fixture.options,
+    claimToken: OTHER_STOP_CLAIM_TOKEN,
+    expectedOperationRevision: "0",
+  });
+  const wrongTokenReconcile =
+    await authority.reconcileWriterLaunchStopOperation({
+      ...fixture.options,
+      claimToken: OTHER_STOP_CLAIM_TOKEN,
+    });
+
+  assert.equal(sameTokenReplay.status, "starting");
+  assert.equal(sameTokenReplay.claimTokenMatched, true);
+  assert.equal(sameTokenReplay.dispatchGranted, false);
+  assert.equal(wrongTokenPrepared.status, "prepared");
+  assert.equal(wrongTokenPrepared.claimTokenMatched, false);
+  assert.equal(wrongTokenPrepared.dispatchGranted, false);
+  assert.equal(wrongTokenReconcile.status, "starting");
+  assert.equal(wrongTokenReconcile.claimTokenMatched, false);
+  assertDeepFrozen(sameTokenReplay);
+  assertDeepFrozen(wrongTokenPrepared);
+  assertDeepFrozen(wrongTokenReconcile);
+  for (const client of clients) {
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
+test("writer launch stop v1 durable lifecycle preserves legacy inputs and receipts", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 1 });
+  const startingOperation = writerLaunchStopOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = writerLaunchStopReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = writerLaunchStopPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const committedOperation = writerLaunchStopOperationRow(
+    fixture,
+    "committed",
+  );
+  const releasedReservation = writerLaunchStopReservationRow(
+    fixture,
+    "released",
+  );
+  const committedSession = writerLaunchStopCommittedSessionRow(fixture);
+  const { authority, clients } = authorityWithScripts(
+    writerLaunchStopActiveSteps(fixture, "prepared"),
+    writerLaunchStopActiveSteps(fixture, "prepared"),
+    {
+      options: { now: LAUNCH_STOP_DISPATCH_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "prepared"),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    writerLaunchStopActiveSteps(fixture, "starting"),
+    writerLaunchStopActiveSteps(fixture, "starting"),
+    writerLaunchStopActiveSteps(fixture, "starting"),
+    {
+      options: { now: LAUNCH_STOP_FINALIZE_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "starting"),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(committedSession),
+      ],
+    },
+    writerLaunchStopCommittedSteps(fixture),
+    writerLaunchStopCommittedSteps(fixture),
+    [
+      ...writerLaunchCommittedSteps(fixture.launch, {
+        result: fixture.launchResult,
+      }),
+      rows(),
+      rows(),
+    ],
+  );
+
+  const preparedRead = await authority.readSession({
+    sessionId: fixture.options.expectedSession.sessionId,
+  });
+  const preparedReconcile =
+    await authority.reconcileWriterLaunchStopOperation(fixture.options);
+  const claimed = await authority.claimWriterLaunchStopDispatch({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+  });
+  const startingRead = await authority.readSession({
+    sessionId: fixture.options.expectedSession.sessionId,
+  });
+  const startingReconcile =
+    await authority.reconcileWriterLaunchStopOperation(fixture.options);
+  const startingClaimReplay =
+    await authority.claimWriterLaunchStopDispatch({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+    });
+  const finalized = await authority.finalizeWriterLaunchStopped({
+    ...fixture.options,
+    evidence: fixture.evidence,
+    expectedOperationRevision: "1",
+  });
+  const committedRead = await authority.readSession({
+    sessionId: fixture.options.expectedSession.sessionId,
+  });
+  const committedReconcile =
+    await authority.reconcileWriterLaunchStopOperation(fixture.options);
+  const absentReconcile =
+    await authority.reconcileWriterLaunchStopOperation(fixture.options);
+
+  assert.equal(fixture.request.contractVersion, 1);
+  assert.equal(Object.hasOwn(fixture.request, "dispatchClaimSha256"), false);
+  assert.equal(preparedRead.document.activeOperation.state, "prepared");
+  assert.equal(preparedReconcile.status, "prepared");
+  assert.equal(Object.hasOwn(preparedReconcile, "claimTokenMatched"), false);
+  assert.equal(claimed.status, "starting");
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(Object.hasOwn(claimed, "claimTokenMatched"), false);
+  assert.equal(claimed.stop.contractVersion, 1);
+  assert.equal(startingRead.document.activeOperation.state, "starting");
+  assert.equal(startingReconcile.status, "starting");
+  assert.equal(Object.hasOwn(startingReconcile, "claimTokenMatched"), false);
+  assert.equal(startingClaimReplay.dispatchGranted, false);
+  assert.equal(
+    Object.hasOwn(startingClaimReplay, "claimTokenMatched"),
+    false,
+  );
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.stop.contractVersion, 1);
+  assert.equal(committedRead.document.launch, null);
+  assert.equal(committedReconcile.status, "committed");
+  assert.equal(Object.hasOwn(committedReconcile, "claimTokenMatched"), false);
+  assert.equal(absentReconcile.status, "absent");
+  assert.equal(Object.hasOwn(absentReconcile, "claimTokenMatched"), false);
+  const proof = assertCommittedWriterLaunchStopTransitionProof({
+    after: finalized.session,
+    before: fixture.options.expectedSession,
+    operation: finalized.operation,
+    reservation: finalized.reservation,
+  });
+  assert.equal(proof.operation.request.contractVersion, 1);
+  assertDeepFrozen(proof);
+  for (const client of clients) client.assertExhausted();
 });
 
 test("writer launch stop claim, finalize, and exact replay clear only the current launch", async () => {
@@ -9987,6 +10364,7 @@ test("writer launch stop claim, finalize, and exact replay clear only the curren
 
   const claimed = await authority.claimWriterLaunchStopDispatch({
     ...fixture.options,
+    claimToken: fixture.claimToken,
     expectedOperationRevision: "0",
   });
   const finalized = await authority.finalizeWriterLaunchStopped({
@@ -10000,9 +10378,12 @@ test("writer launch stop claim, finalize, and exact replay clear only the curren
     expectedOperationRevision: "1",
   });
 
+  assert.equal(claimed.claimTokenMatched, true);
   assert.equal(claimed.dispatchGranted, true);
+  assert.equal(claimed.stop.contractVersion, 2);
   assert.deepEqual(canonicalPayload(claimed.launch), fixture.request.launch);
   assert.equal(finalized.finalized, true);
+  assert.equal(finalized.stop.contractVersion, 2);
   assert.equal(finalized.launch, null);
   assert.equal(finalized.session.document.launch, null);
   assert.equal(
@@ -10010,6 +10391,53 @@ test("writer launch stop claim, finalize, and exact replay clear only the curren
     fixture.options.operationId,
   );
   assert.deepEqual(finalized.operation.result, fixture.result);
+  const proof = {
+    after: finalized.session,
+    before: fixture.options.expectedSession,
+    operation: finalized.operation,
+    reservation: finalized.reservation,
+  };
+  const validatedProof = assertCommittedWriterLaunchStopTransitionProof(proof);
+  assertDeepFrozen(validatedProof);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(validatedProof)),
+    JSON.parse(JSON.stringify(proof)),
+  );
+
+  for (const mutate of [
+    (candidate) => {
+      candidate.after.revision = (
+        BigInt(candidate.after.revision) + 1n
+      ).toString();
+    },
+    (candidate) => {
+      candidate.after.document.documentVersion = 2;
+    },
+    (candidate) => {
+      candidate.after.document.launch = structuredClone(
+        candidate.before.document.launch,
+      );
+    },
+    (candidate) => {
+      candidate.after.document.lastOperation.resultSha256 = "f".repeat(64);
+    },
+    (candidate) => {
+      candidate.operation.request.launch.writerIncarnationId =
+        "writer-incarnation-tampered";
+    },
+    (candidate) => {
+      candidate.reservation.operationId = "writer-stop-operation-tampered";
+    },
+  ]) {
+    const candidate = structuredClone(proof);
+    mutate(candidate);
+    assert.throws(
+      () => assertCommittedWriterLaunchStopTransitionProof(candidate),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "operation_state_invalid",
+    );
+  }
   assert.equal(replayed.finalized, false);
   assert.equal(replayed.launch, null);
   assert.deepEqual(replayed.operation.result, fixture.result);
@@ -10024,6 +10452,51 @@ test("writer launch stop claim, finalize, and exact replay clear only the curren
     );
     client.assertExhausted();
   }
+});
+
+test("writer launch stop claim acknowledgement loss reconciles the exact claimant", async () => {
+  const fixture = writerLaunchStopFixture();
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("writer stop claim acknowledgement lost"),
+        now: LAUNCH_STOP_DISPATCH_NOW,
+      },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "prepared"),
+        rows(writerLaunchStopOperationRow(fixture, "starting")),
+        rows(writerLaunchStopReservationRow(fixture, "starting")),
+        rows(writerLaunchStopPhaseSessionRow(fixture, "starting")),
+      ],
+    },
+    writerLaunchStopActiveSteps(fixture, "starting"),
+  );
+  const claim = {
+    ...fixture.options,
+    claimToken: fixture.claimToken,
+    expectedOperationRevision: "0",
+  };
+
+  await assert.rejects(
+    authority.claimWriterLaunchStopDispatch(claim),
+    assertStoreCommitUncertain,
+  );
+  const reconciled = await authority.reconcileWriterLaunchStopOperation({
+    ...fixture.options,
+    claimToken: fixture.claimToken,
+  });
+
+  assert.equal(reconciled.status, "starting");
+  assert.equal(reconciled.claimTokenMatched, true);
+  assertDeepFrozen(reconciled);
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
 });
 
 test("lost-ack writer launch stop replays do not expose a successor launch", async () => {
@@ -10077,6 +10550,7 @@ test("lost-ack writer launch stop replays do not expose a successor launch", asy
   };
   const claim = {
     ...stopped.options,
+    claimToken: stopped.claimToken,
     expectedOperationRevision: "0",
   };
   const finalizeLoss = authorityWithScripts(
@@ -10164,7 +10638,20 @@ test("lost-ack writer launch stop replays do not expose a successor launch", asy
   assert.equal(finalized.finalized, false);
   assert.equal(finalized.launch, null);
   assert.deepEqual(finalized.session.document.launch, successorPointer);
+  assert.throws(
+    () =>
+      assertCommittedWriterLaunchStopTransitionProof({
+        after: finalized.session,
+        before: stopped.options.expectedSession,
+        operation: finalized.operation,
+        reservation: finalized.reservation,
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
   assert.equal(claimed.dispatchGranted, false);
+  assert.equal(claimed.claimTokenMatched, true);
   assert.equal(claimed.launch, null);
   assert.deepEqual(claimed.session.document.launch, successorPointer);
   const clients = [...finalizeLoss.clients, ...claimLoss.clients];
@@ -10263,7 +10750,10 @@ test("writer launch stop readback rejects a forged historical lease relation", a
   const fixture = writerLaunchStopFixture();
   const expectedSession = structuredClone(fixture.options.expectedSession);
   expectedSession.document.lease.expiresAt = "2026-01-01T00:00:00.000Z";
-  const request = createWriterLaunchStopOperationRequest({ expectedSession });
+  const request = createWriterLaunchStopOperationRequest({
+    claimToken: fixture.claimToken,
+    expectedSession,
+  });
   const forged = {
     ...fixture,
     options: {

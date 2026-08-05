@@ -279,6 +279,74 @@ test("stops one exact writer and returns a one-use opaque capability", async () 
   assert.equal(stopCalls, 1);
 });
 
+test("launch admission remains closed through capability consumption until retirement", async () => {
+  const coordinator = new StoppedWriterCapabilityCoordinator();
+  const writerLease = lease();
+  const mounted = attachment(writerLease);
+  const admission = {
+    attachment: mounted,
+    canonicalLease: writerLease,
+  };
+  assert.equal(coordinator.assertWriterLaunchAvailable(admission), undefined);
+
+  const writer = coordinator.registerWriter(
+    registerOptions({ attachment: mounted, canonicalLease: writerLease }),
+  );
+  syncCapabilityError(
+    () => coordinator.assertWriterLaunchAvailable(admission),
+    "writer_state_conflict",
+  );
+
+  const capability = await coordinator.stopAndIssueCapability(
+    stopOptions(writer),
+  );
+  syncCapabilityError(
+    () => coordinator.assertWriterLaunchAvailable(admission),
+    "writer_state_conflict",
+  );
+
+  const snapshotStarted = deferred();
+  const finishSnapshot = deferred();
+  const consuming = coordinator.consumeCapability(
+    consumeOptions(writer, capability, {
+      runSnapshot: async () => {
+        snapshotStarted.resolve();
+        await finishSnapshot.promise;
+        return "captured";
+      },
+    }),
+  );
+  await snapshotStarted.promise;
+  syncCapabilityError(
+    () => coordinator.assertWriterLaunchAvailable(admission),
+    "writer_state_conflict",
+  );
+  finishSnapshot.resolve();
+  assert.equal(await consuming, "captured");
+  syncCapabilityError(
+    () => coordinator.assertWriterLaunchAvailable(admission),
+    "writer_state_conflict",
+  );
+
+  coordinator.retireWriter(writerOptions(writer));
+  syncCapabilityError(
+    () => coordinator.assertWriterLaunchAvailable(admission),
+    "writer_state_conflict",
+  );
+  const newerLease = lease({
+    fencingEpoch: "9007199254740994",
+    holderId: "host-002",
+    leaseId: "lease-002",
+  });
+  assert.equal(
+    coordinator.assertWriterLaunchAvailable({
+      attachment: attachment(newerLease, { attachmentId: "attachment-002" }),
+      canonicalLease: newerLease,
+    }),
+    undefined,
+  );
+});
+
 test("lease renewal may change only expiresAt without invalidating the binding", async () => {
   const originalLease = lease();
   const mounted = attachment(originalLease);
@@ -1753,7 +1821,7 @@ test("dispose releases a high-churn finite issuer scope", async () => {
   );
 });
 
-test("slot identity is session, backend, and storage rather than attachment ID", () => {
+test("direct registration enforces session exclusion across slot keys", () => {
   const coordinator = new StoppedWriterCapabilityCoordinator();
   const first = coordinator.registerWriter(registerOptions());
   assertOpaqueHandle(first);
@@ -1776,21 +1844,44 @@ test("slot identity is session, backend, and storage rather than attachment ID",
   );
 
   const otherStorageLease = lease({ leaseId: "lease-other-storage" });
-  const otherStorage = coordinator.registerWriter(
-    registerOptions({
-      attachment: attachment(otherStorageLease, {
-        attachmentId: "attachment-other-storage",
-        operationId: "operation-attach-other-storage",
-        proofId: "proof-attachment-other-storage",
-        rootPath: "/var/lib/portable-codex/other-storage",
-        storageId: "volume-002",
-      }),
-      canonicalLease: otherStorageLease,
-      processIncarnationId: "process-incarnation-other-storage",
-      writerIncarnationId: "writer-incarnation-other-storage",
-    }),
+  syncCapabilityError(
+    () =>
+      coordinator.registerWriter(
+        registerOptions({
+          attachment: attachment(otherStorageLease, {
+            attachmentId: "attachment-other-storage",
+            operationId: "operation-attach-other-storage",
+            proofId: "proof-attachment-other-storage",
+            rootPath: "/var/lib/portable-codex/other-storage",
+            storageId: "volume-002",
+          }),
+          canonicalLease: otherStorageLease,
+          processIncarnationId: "process-incarnation-other-storage",
+          writerIncarnationId: "writer-incarnation-other-storage",
+        }),
+      ),
+    "writer_state_conflict",
   );
-  assertOpaqueHandle(otherStorage);
+
+  const otherBackendLease = lease({ leaseId: "lease-other-backend" });
+  syncCapabilityError(
+    () =>
+      coordinator.registerWriter(
+        registerOptions({
+          attachment: attachment(otherBackendLease, {
+            attachmentId: "attachment-other-backend",
+            backendId: "other-backend",
+            operationId: "operation-attach-other-backend",
+            proofId: "proof-attachment-other-backend",
+            rootPath: "/var/lib/portable-codex/other-backend",
+          }),
+          canonicalLease: otherBackendLease,
+          processIncarnationId: "process-incarnation-other-backend",
+          writerIncarnationId: "writer-incarnation-other-backend",
+        }),
+      ),
+    "writer_state_conflict",
+  );
 });
 
 test("slot lookup is immune to inherited toJSON poisoning", async (t) => {

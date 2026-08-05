@@ -1,0 +1,164 @@
+---
+id: 20260805-7e3a91
+title: Durable Stop-to-Clean-Capture Composition
+status: completed
+created: 2026-08-05
+updated: 2026-08-05
+branch: wip/durable-stop-capture-composition
+pr: https://github.com/cha-op/portable-codex-runtime/pull/29
+supersedes: []
+superseded_by:
+---
+
+# Durable Stop-to-Clean-Capture Composition
+
+## Summary
+
+Added the same-process boundary joining one prepared clean-capture tuple, one
+physical writer stop, the exact committed `writer-launch-stop-v1` transition,
+one opaque stopped-writer capability, and one capture dispatch. Local writer
+identity is retired only after confirmed capture success. Production restore,
+detached-destination activation, and bounded restart recovery remain closed.
+
+## Current State
+
+- The snapshot core separates deterministic preparation from one-use dispatch,
+  preserving exact attachment, checkpoint, and mutation-request object
+  identity across stop and backend capture.
+- The launcher derives its stop operation ID from the complete canonical
+  capture tuple plus launch-attempt ID, persists and finalizes the durable stop,
+  validates a stop-specific committed transition proof, and returns exact
+  frozen `{capability, evidence, resolution, stop}`.
+- The launcher freezes each stop operation input before reserve. The dedicated
+  `reconcileWriterLaunchStopOperation()` path locks the canonical session,
+  resolves an exact existing operation before absence, and distinguishes an
+  exact absent precondition from a strictly newer same-incarnation snapshot.
+  Only the latter may refresh the input after the complete stop relation and
+  lease expiration are revalidated against both registration and the prior
+  input. This recovers a renewal between read and reserve without discarding an
+  ambiguously committed operation. Later calls proceed only from `prepared`,
+  or from `starting` only after the same record attempted the claim and the
+  authority proves that the durable operation matches its retained raw
+  dispatch claimant token. Request contract version 2 persists only the
+  token's domain-separated SHA-256 digest; claim and reconciliation carry the
+  raw token outside the stored operation. Exact legacy version 1 requests
+  retain their original edge-only claim and terminal recovery paths. V2
+  recovers a committed claim whose
+  acknowledgement was lost without adopting a pre-commit failure, foreign
+  token, explicit mismatch, or never-attempted `starting` state. It never
+  repeats claim for known owned `starting` state or synthesizes operation
+  timestamps from a session.
+- Stop preflight accepts a current lease only when its contract, session,
+  lease, holder, and fencing-epoch identity remains exact and its canonical
+  expiration has not moved backwards. This preserves stop/capture across
+  ordinary renewal without treating expiration extension as a new writer.
+- After the one physical stop returns exact confirmation, finalization starts
+  from revision 1, reconciles the exact durable stop after a failed attempt,
+  and selects revision 2 only for a validated `uncertain` phase. Exact terminal
+  replay recovers acknowledgement loss without invoking physical stop again.
+- The composition independently derives the same stop ID from its prepared
+  tuple before it accepts any receipt. It accepts the exact legacy version 1
+  request shape and the claim-bound version 2 shape emitted by the current
+  launcher, validates the version 2 dispatch-claim digest without recovering
+  the raw token, and binds the two durable request copies before capture. A
+  valid receipt for a different request or checkpoint is rejected before
+  capture.
+- `retireStoppedWriter(resolution)` accepts only the retained exact writer
+  resolution and releases launcher indexes only after capture. A mistakenly
+  returned native Promise is rejection-observed without awaiting it and is
+  still classified as retirement uncertainty.
+- The canonical same-process stopped-writer coordinator retains a per-session
+  launch-exclusion count across running, stopped, issued, consuming, consumed,
+  revoked, and uncertain records. Both launch preflight and direct writer
+  registration enforce that count, so sharing the exact coordinator blocks
+  successor launch across backend and storage slots until retirement.
+- Public envelope validators reject ordinary and revoked proxies with their
+  fixed contract error classification before array introspection or dispatch.
+- The retained migration-version-3 operation-ID registry and restore schema
+  remain documented after the restore-composition revert; this work does not
+  reinstate the reverted restore facade or callback contract.
+
+## Protected Property
+
+Only a complete canonical `{attachment, checkpoint, request}` tuple bound to
+the current launch attempt may name the stop that authorizes its capture. The
+launcher must receive the exact durable stop grant before invoking physical
+stop once, then validate the typed result, released reservation, direct
+terminal session successor, cleared launch, and exact complete-stop evidence
+before a capability can be issued.
+
+Stop, finalization, capability, capture, or retirement ambiguity retains the
+durable and process-local blockers. It cannot repeat physical stop, replace the
+capability, reconstruct a writer handle, or release the retained identity.
+The protected access policy also forbids a physical successor launch for the
+same session while that retained identity remains. This is same-process
+composition inside one canonical coordinator authority domain, not restart
+recovery or a cross-process or cross-host fence.
+
+## Next Steps
+
+1. Publish restore into an independent detached destination, verify its
+   committed object identity, obtain provider-backed attachment evidence, and
+   atomically activate that attachment only after the old writer is stopped,
+   fenced, and detached.
+2. Compose bounded generation, prepared-launch, active-attempt, and
+   current-launch recovery without relaunching or reconstructing opaque image
+   or writer capabilities.
+3. Wire the complete protocol into production `runRestore()` only after all
+   ambiguous boundaries remain fail-closed.
+4. Implement the later filesystem-image backend, differential export,
+   retention, and cross-host recovery verification.
+
+## Non-Goals
+
+- No reinstatement of the reverted restore publication facade.
+- No detached-destination attachment activation.
+- No bounded restart recovery service.
+- No production `runRestore()` enablement.
+- No concrete Podman/Docker launcher or filesystem-image backend.
+- No Git Summary implementation.
+
+## Validation
+
+- On Node.js `v24.18.0`, `node --check` passed for the stopped-writer
+  coordinator, authority, launcher, snapshot core, and new composition modules.
+- The five focused stopped-writer coordinator, launcher, snapshot-core,
+  composition, and operation-kernel test files passed 543/543. They include
+  direct same-session cross-backend/storage registration exclusion, concurrent
+  capability consumption, renewed-lease stop admission, a lease renewal
+  between stop read and reserve, locked absent-precondition classification,
+  refreshed-reserve acknowledgement loss, expiry rollback rejection, exact
+  prepared and uncertain-finalization stop replay, rejection of
+  claim-acknowledgement ambiguity and foreign `starting`, and ordinary launch
+  reconciliation rejection after a joined durable stop.
+- After the version 2 receipt compatibility fix, the composition suite passed
+  14/14 and the launcher suite passed 107/107. The latter drives one real
+  launcher stop through composition, capability-backed capture, and retirement
+  without a database, and proves physical stop, durable finalization, capture,
+  and retirement each occur exactly once.
+- The PostgreSQL integration gate now drives the real interleaving from the
+  launcher's first stop-session read through a committed lease renewal, stale
+  reserve rejection, locked absence proof, refreshed reserve, uncertain stop,
+  and exact finalization. It remains part of the required PR CI matrix.
+- `test/stopped-directory-backend.test.mjs` passed with 91 dot-reporter test
+  markers and no failures.
+- The complete unit suite passed again with exit 0 on Node.js `v24.18.0` with
+  Codex removed from `PATH`; it skipped only
+  `chatgptAuthTokens refreshes after 401 without writing auth.json`.
+- That exact unskipped live-auth test failed with the host-wide
+  `EMFILE: too many open files, watch` condition in both this worktree and the
+  unmodified `cfe96a7` baseline, so it is retained as an environmental
+  limitation rather than reported as passing.
+
+## Evidence
+
+- `src/postgres-durable-stop-capture-composition.mjs`
+- `src/postgres-logical-writer-launcher.mjs`
+- `src/postgres-session-authority.mjs`
+- `src/session-snapshot-core.mjs`
+- `src/stopped-writer-capability.mjs`
+- `test/postgres-durable-stop-capture-composition.test.mjs`
+- `test/postgres-logical-writer-launcher.test.mjs`
+- `test/postgres-session-operation-kernel.test.mjs`
+- `test/session-snapshot-core.test.mjs`
+- `test/stopped-writer-capability.test.mjs`

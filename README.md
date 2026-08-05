@@ -204,9 +204,18 @@ relaunches.
 The authority also provides typed `writer-launch-stop-v1` transitions that
 preserve the original started attempt and clear the current launch only after
 exact `complete-stopped` supervisor proof, plus bounded discovery of prepared
-or active attempts and current launches. The initial facade does not yet route
-the coordinator stop callback through that durable transition or compose
-production capture.
+or active attempts and current launches. Stop request contract version 2 adds
+a persisted claimant digest; a local raw-token plus attempted-claim witness
+recovers a committed stop claim whose acknowledgement was lost without
+authorizing foreign or never-attempted `starting` state. Exact legacy request
+version 1 remains readable and finalizable with its original edge-only claim
+semantics. The launcher now routes one
+same-process coordinator stop through that durable transition and composes one
+clean capture. Its locked stop reconciliation preserves an ambiguously
+committed operation identity while allowing a strictly newer, validated lease
+snapshot to replace a pre-reserve input only after the authority proves the
+operation absent. Restart recovery and production restore remain separate,
+still-closed boundaries.
 
 Production restore therefore remains fail-closed. Later serial pull requests
 must verify exact typed generation publication, compose durable stop/capture

@@ -63,17 +63,21 @@
   request that durably binds one launch intent, one serializable transaction
   that commits the generation and reserves that exact launch attempt, and a
   launcher path that consumes only the already-reserved attempt.
-- [pending] Compose the durable writer-stop and capture boundary, retaining the
-  exact supervisor and stopped-writer authority needed before any restore can
-  replace the current attachment.
+- [done] Compose one same-process durable writer stop with one clean capture:
+  bind the complete prepared capture tuple to the exact
+  `writer-launch-stop-v1` identity, validate its committed transition before
+  issuing the one-use capability, reconcile same-process pre-dispatch stop
+  replay, block same-session successor launch through capture, and retire local
+  writer identity only after confirmed capture success.
 - [pending] Model a restore destination independently from the current active
   attachment. After committed absent-destination publication, obtain
   provider-backed attachment evidence and atomically bind the canonical
   session plus prepared launch request to that new attachment; never infer
   activation from pathname equality.
 - [pending] After a fleet-wide version 2 capability gate, compose committed
-  restore publication and bounded no-relaunch recovery services; only then
-  enable `runRestore()` under fail-closed ambiguous outcomes.
+  restore publication, detached-destination activation, and bounded
+  no-relaunch recovery services; only then enable `runRestore()` under
+  fail-closed ambiguous outcomes.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

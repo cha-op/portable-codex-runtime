@@ -22,6 +22,7 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
+  PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
@@ -1410,6 +1411,17 @@ function assertCheckpointAuthorityCode(code) {
   };
 }
 
+function assertLauncherCode(code) {
+  return (error) => {
+    assert.ok(error instanceof PostgresLogicalWriterLauncherError);
+    assert.equal(error.name, "PostgresLogicalWriterLauncherError");
+    assert.equal(error.code, code);
+    assert.equal(error.retryable, false);
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  };
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -1832,11 +1844,18 @@ function writerLaunchStopInput(
   expectedSession,
   { operationId = `writer-launch-stop-${randomUUID()}` } = {},
 ) {
+  const claimToken = randomUUID();
   return {
-    expectedSession,
-    kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
-    operationId,
-    request: createWriterLaunchStopOperationRequest({ expectedSession }),
+    claimToken,
+    input: {
+      expectedSession,
+      kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+      operationId,
+      request: createWriterLaunchStopOperationRequest({
+        claimToken,
+        expectedSession,
+      }),
+    },
   };
 }
 
@@ -6527,7 +6546,7 @@ test(
     );
 
     await t.test(
-      "logical writer launcher commits one started writer and reconciles its original handle",
+      "logical writer launcher recovers renewal and stop-claim acknowledgement loss before finalization",
       async () => {
         const sessionId = randomUUID();
         sessionIds.push(sessionId);
@@ -6559,6 +6578,78 @@ test(
         const launchAttemptId = `writer-launch-${randomUUID()}`;
         const supervisorId = `supervisor-${randomUUID()}`;
         let launchCalls = 0;
+        let stopCalls = 0;
+        let renewedDuringStopReserve = null;
+        let stopReadSession = null;
+        let stopRenewalArmed = false;
+        let stopReserveAttempts = 0;
+        let stopClaimAcknowledgementLosses = 0;
+        let stopUncertaintyInput = null;
+        const stopClaimLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+          }),
+        });
+        const launcherAuthority = {
+          async cancelPreparedOperation(options) {
+            return authority.cancelPreparedOperation(options);
+          },
+          async claimWriterLaunchAttemptDispatch(options) {
+            return authority.claimWriterLaunchAttemptDispatch(options);
+          },
+          async claimWriterLaunchStopDispatch(options) {
+            if (stopClaimAcknowledgementLosses === 0) {
+              stopClaimAcknowledgementLosses += 1;
+              return stopClaimLossAuthority.claimWriterLaunchStopDispatch(
+                options,
+              );
+            }
+            return authority.claimWriterLaunchStopDispatch(options);
+          },
+          async finalizeWriterLaunchAttemptStarted(options) {
+            return authority.finalizeWriterLaunchAttemptStarted(options);
+          },
+          async finalizeWriterLaunchAttemptStopped(options) {
+            return authority.finalizeWriterLaunchAttemptStopped(options);
+          },
+          async finalizeWriterLaunchStopped(options) {
+            return authority.finalizeWriterLaunchStopped(options);
+          },
+          async markOperationUncertain(options) {
+            return authority.markOperationUncertain(options);
+          },
+          async readSession(options) {
+            const session = await authority.readSession(options);
+            if (stopRenewalArmed) {
+              stopReadSession = structuredClone(session);
+            }
+            return session;
+          },
+          async readWriterLaunchAttempt(options) {
+            return authority.readWriterLaunchAttempt(options);
+          },
+          async reconcileWriterLaunchStopOperation(options) {
+            return authority.reconcileWriterLaunchStopOperation(options);
+          },
+          async reserveOperation(options) {
+            if (options.kind === WRITER_LAUNCH_STOP_OPERATION_KIND) {
+              stopReserveAttempts += 1;
+              if (stopRenewalArmed) {
+                stopRenewalArmed = false;
+                assert.notEqual(stopReadSession, null);
+                renewedDuringStopReserve = await authority.renewWriterLease(
+                  writerLeaseRenewalInput(stopReadSession),
+                );
+                assertOperationReceipt(
+                  renewedDuringStopReserve,
+                  "committed",
+                );
+              }
+              stopUncertaintyInput = structuredClone(options);
+            }
+            return authority.reserveOperation(options);
+          },
+        };
         const launchWriter = async (context) => {
           launchCalls += 1;
           assert.equal(
@@ -6575,6 +6666,13 @@ test(
               "started",
             ),
             stopWriter: async function stopWriter() {
+              stopCalls += 1;
+              assert.notEqual(stopUncertaintyInput, null);
+              const uncertain = await authority.markOperationUncertain({
+                ...stopUncertaintyInput,
+                expectedOperationRevision: "1",
+              });
+              assertOperationReceipt(uncertain, "uncertain");
               return STOPPED_WRITER_STOP_CONFIRMED;
             },
           };
@@ -6583,7 +6681,7 @@ test(
           throw new Error("committed launches must not reach the supervisor");
         };
         const facade = createPostgresLogicalWriterLauncher({
-          authority,
+          authority: launcherAuthority,
           imageReservations,
           operationGuard,
           stoppedWriterCoordinator:
@@ -6651,6 +6749,57 @@ test(
           },
         );
         assert.equal(guardResult, "guard-reacquired");
+
+        const capture = checkpointCaptureAdmission(
+          { session: current },
+          {
+            processIncarnationId: started.evidence.processIncarnationId,
+            writerIncarnationId: started.evidence.writerIncarnationId,
+          },
+        );
+        const captureInput = {
+          attachment: capture.attachment,
+          checkpoint: capture.checkpoint,
+          request: capture.request,
+        };
+        stopRenewalArmed = true;
+        const stopped = await facade.stopWriterForCapture(captureInput);
+        assert.notEqual(renewedDuringStopReserve, null);
+        assert.equal(renewedDuringStopReserve.renewed, true);
+        assert.equal(stopReserveAttempts, 2);
+        assert.equal(stopClaimAcknowledgementLosses, 1);
+        assert.equal(stopped.stop.status, "committed");
+        assert.equal(stopped.stop.operation.revision, "3");
+        assert.equal(stopped.evidence.status, "complete-stopped");
+        assert.equal(stopCalls, 1);
+        assert.deepEqual(
+          stopped.stop.operation.expectedSession.document.lease,
+          renewedDuringStopReserve.session.document.lease,
+        );
+        assert.deepEqual(
+          stopped.resolution.canonicalLeaseAtRegistration,
+          started.attempt.request.lease,
+        );
+
+        const historical = await authority.readWriterLaunchAttempt({
+          operationId: launchAttemptId,
+        });
+        assertOperationReceipt(historical, "committed", {
+          currentTerminal: false,
+        });
+        assert.equal(
+          historical.operation.result.outcome,
+          "writer-launch-started",
+        );
+        assert.equal(historical.launch, null);
+        assert.equal(historical.session.document.launch, null);
+
+        await assert.rejects(
+          facade.reconcileLaunchAttempt({ launchAttemptId }),
+          assertLauncherCode("logical_writer_launch_outcome_uncertain"),
+        );
+        assert.equal(launchCalls, 1);
+        assert.equal(stopCalls, 1);
       },
     );
 
@@ -7621,13 +7770,25 @@ test(
         );
         const consecutive = consecutiveFreshSessionIds(
           existingRows.rows.map(({ session_id: sessionId }) => sessionId),
-          2,
+          3,
         );
-        const [detachedSessionId, launchedSessionId] =
-          consecutive.sessionIds;
-        sessionIds.push(detachedSessionId, launchedSessionId);
+        const [
+          detachedSessionId,
+          launchedSessionId,
+          lookaheadSessionId,
+        ] = consecutive.sessionIds;
+        sessionIds.push(
+          detachedSessionId,
+          launchedSessionId,
+          lookaheadSessionId,
+        );
         await authority.registerSession(
           registrationInput(detachedSessionId),
+        );
+        // Keep the limit+1 lookahead independent from intentionally corrupt
+        // rows retained by other fail-closed integration cases.
+        await authority.registerSession(
+          registrationInput(lookaheadSessionId),
         );
         const fixture = await prepareCommittedRestoreGenerationFixture(
           authority,
@@ -7673,6 +7834,10 @@ test(
             limit: 1,
           });
         assert.equal(currentPage.candidates.length, 1);
+        assert.equal(
+          currentPage.nextAfterSessionId,
+          launchedSessionId,
+        );
         assert.deepEqual(currentPage.candidates[0], {
           launch: launched.launch,
           launchAttemptId: launchInput.operationId,
@@ -7688,7 +7853,10 @@ test(
           [launchInput.operationId],
         );
         assert.equal(originalBefore.rows.length, 1);
-        const stopInput = writerLaunchStopInput(launched.session);
+        const {
+          claimToken: stopClaimToken,
+          input: stopInput,
+        } = writerLaunchStopInput(launched.session);
         const prepared = await authority.reserveOperation(stopInput);
         assertOperationReceipt(prepared, "prepared");
 
@@ -7698,6 +7866,7 @@ test(
         );
         const claimInput = {
           ...structuredClone(stopInput),
+          claimToken: stopClaimToken,
           expectedOperationRevision: "0",
         };
         const claimLossAuthority = new PostgresSessionAuthority({
@@ -7715,7 +7884,24 @@ test(
           );
         assertOperationReceipt(claimReplay, "starting");
         assert.equal(claimReplay.dispatchGranted, false);
+        assert.equal(claimReplay.claimTokenMatched, true);
         assert.deepEqual(claimReplay.session.document.launch, launched.launch);
+        const wrongTokenReplay =
+          await authority.claimWriterLaunchStopDispatch({
+            ...structuredClone(stopInput),
+            claimToken: randomUUID(),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(wrongTokenReplay, "starting");
+        assert.equal(wrongTokenReplay.dispatchGranted, false);
+        assert.equal(wrongTokenReplay.claimTokenMatched, false);
+        const reconciledClaim =
+          await authority.reconcileWriterLaunchStopOperation({
+            ...structuredClone(stopInput),
+            claimToken: stopClaimToken,
+          });
+        assertOperationReceipt(reconciledClaim, "starting");
+        assert.equal(reconciledClaim.claimTokenMatched, true);
 
         const uncertain = await authority.markOperationUncertain({
           ...structuredClone(stopInput),
