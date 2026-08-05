@@ -57,8 +57,12 @@ detached-destination activation, and bounded restart recovery remain closed.
   and selects revision 2 only for a validated `uncertain` phase. Exact terminal
   replay recovers acknowledgement loss without invoking physical stop again.
 - The composition independently derives the same stop ID from its prepared
-  tuple before it accepts any receipt. A valid receipt for a different request
-  or checkpoint is rejected before capture.
+  tuple before it accepts any receipt. It accepts the exact legacy version 1
+  request shape and the claim-bound version 2 shape emitted by the current
+  launcher, validates the version 2 dispatch-claim digest without recovering
+  the raw token, and binds the two durable request copies before capture. A
+  valid receipt for a different request or checkpoint is rejected before
+  capture.
 - `retireStoppedWriter(resolution)` accepts only the retained exact writer
   resolution and releases launcher indexes only after capture. A mistakenly
   returned native Promise is rejection-observed without awaiting it and is
@@ -127,13 +131,19 @@ recovery or a cross-process or cross-host fence.
   prepared and uncertain-finalization stop replay, rejection of
   claim-acknowledgement ambiguity and foreign `starting`, and ordinary launch
   reconciliation rejection after a joined durable stop.
+- After the version 2 receipt compatibility fix, the composition suite passed
+  14/14 and the launcher suite passed 107/107. The latter drives one real
+  launcher stop through composition, capability-backed capture, and retirement
+  without a database, and proves physical stop, durable finalization, capture,
+  and retirement each occur exactly once.
 - The PostgreSQL integration gate now drives the real interleaving from the
   launcher's first stop-session read through a committed lease renewal, stale
   reserve rejection, locked absence proof, refreshed reserve, uncertain stop,
   and exact finalization. It remains part of the required PR CI matrix.
 - `test/stopped-directory-backend.test.mjs` passed with 91 dot-reporter test
   markers and no failures.
-- The complete unit suite passed with exit 0 when it skipped only
+- The complete unit suite passed again with exit 0 on Node.js `v24.18.0` with
+  Codex removed from `PATH`; it skipped only
   `chatgptAuthTokens refreshes after 401 without writing auth.json`.
 - That exact unskipped live-auth test failed with the host-wide
   `EMFILE: too many open files, watch` condition in both this worktree and the

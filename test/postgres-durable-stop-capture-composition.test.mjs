@@ -19,6 +19,7 @@ const LAUNCH_ATTEMPT_ID = "launch-attempt-001";
 const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
 const SUPERVISOR_ID = "supervisor-001";
+const STOP_DISPATCH_CLAIM_SHA256 = "d".repeat(64);
 
 function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
@@ -162,7 +163,25 @@ function opaqueHandle() {
   return Object.freeze(Object.create(null));
 }
 
-function stoppedCaptureResult(capture) {
+function writerLaunchStopRequest(contractVersion) {
+  const request = { contractVersion };
+  if (contractVersion === 2) {
+    request.dispatchClaimSha256 = STOP_DISPATCH_CLAIM_SHA256;
+  }
+  request.launch = {
+    attachmentId: "attachment-001",
+    contractVersion: 1,
+    fencingEpoch: "11",
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+    leaseId: "lease-001",
+    processIncarnationId: PROCESS_INCARNATION_ID,
+    supervisorId: SUPERVISOR_ID,
+    writerIncarnationId: WRITER_INCARNATION_ID,
+  };
+  return request;
+}
+
+function stoppedCaptureResult(capture, { stopRequestVersion = 2 } = {}) {
   const stopOperationId = derivePostgresLogicalWriterStopOperationId({
     ...capture,
     launchAttemptId: LAUNCH_ATTEMPT_ID,
@@ -198,19 +217,7 @@ function stoppedCaptureResult(capture) {
     },
     operation: {
       operationId: stopOperationId,
-      request: {
-        contractVersion: 1,
-        launch: {
-          attachmentId: "attachment-001",
-          contractVersion: 1,
-          fencingEpoch: "11",
-          launchAttemptId: LAUNCH_ATTEMPT_ID,
-          leaseId: "lease-001",
-          processIncarnationId: PROCESS_INCARNATION_ID,
-          supervisorId: SUPERVISOR_ID,
-          writerIncarnationId: WRITER_INCARNATION_ID,
-        },
-      },
+      request: writerLaunchStopRequest(stopRequestVersion),
       result: terminal,
       sessionId: SESSION_ID,
       state: "committed",
@@ -223,21 +230,9 @@ function stoppedCaptureResult(capture) {
     finalized: true,
     launch: null,
     stop: {
-      contractVersion: 1,
+      contractVersion: stopRequestVersion,
       launchAttemptId: LAUNCH_ATTEMPT_ID,
-      request: {
-        contractVersion: 1,
-        launch: {
-          attachmentId: "attachment-001",
-          contractVersion: 1,
-          fencingEpoch: "11",
-          launchAttemptId: LAUNCH_ATTEMPT_ID,
-          leaseId: "lease-001",
-          processIncarnationId: PROCESS_INCARNATION_ID,
-          supervisorId: SUPERVISOR_ID,
-          writerIncarnationId: WRITER_INCARNATION_ID,
-        },
-      },
+      request: writerLaunchStopRequest(stopRequestVersion),
       result: terminal,
       state: "committed",
       stopOperationId,
@@ -246,12 +241,12 @@ function stoppedCaptureResult(capture) {
   return deepFreeze({ capability, evidence, resolution, stop });
 }
 
-function createLauncher({ retire, stop } = {}) {
+function createLauncher({ retire, stop, stopRequestVersion = 2 } = {}) {
   const calls = { retire: [], stop: [] };
   const fixture = { calls, defaultStopped: null, launcher: null };
   const stopWriterForCapture = async function (input) {
     calls.stop.push(input);
-    const defaultStopped = stoppedCaptureResult(input);
+    const defaultStopped = stoppedCaptureResult(input, { stopRequestVersion });
     fixture.defaultStopped = defaultStopped;
     if (stop) return stop(input, defaultStopped);
     return defaultStopped;
@@ -275,6 +270,32 @@ function assertCompositionError(code) {
     error instanceof PostgresDurableStopCaptureCompositionError &&
     error.code === code &&
     error.retryable === false;
+}
+
+async function assertStopReceiptRejected(
+  mutate,
+  { stopRequestVersion = 2 } = {},
+) {
+  const { backend, calls: backendCalls } = createBackend();
+  const launcherFixture = createLauncher({
+    stop(_input, result) {
+      return deepFreeze(mutate(result));
+    },
+    stopRequestVersion,
+  });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(launcherFixture.calls.stop.length, 1);
+  assert.equal(backendCalls.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
 }
 
 test("durable stop composition dispatches one exact tuple and retires after capture", async () => {
@@ -306,6 +327,24 @@ test("durable stop composition dispatches one exact tuple and retires after capt
         "checkpoint",
         "request",
       ]);
+      assert.equal(result.stop.stop.contractVersion, 2);
+      assert.deepEqual(Object.keys(result.stop.stop.request).sort(), [
+        "contractVersion",
+        "dispatchClaimSha256",
+        "launch",
+      ]);
+      assert.deepEqual(
+        Object.keys(result.stop.operation.request).sort(),
+        Object.keys(result.stop.stop.request).sort(),
+      );
+      assert.notStrictEqual(
+        result.stop.operation.request,
+        result.stop.stop.request,
+      );
+      assert.match(
+        result.stop.stop.request.dispatchClaimSha256,
+        /^[0-9a-f]{64}$/u,
+      );
       return result;
     },
     retire(input) {
@@ -329,6 +368,25 @@ test("durable stop composition dispatches one exact tuple and retires after capt
     checkpoint: stopInput.checkpoint,
     mutation: mutationResult(stopInput.request),
   });
+});
+
+test("durable stop composition retains v1 receipt compatibility", async () => {
+  const { backend, calls: backendCalls } = createBackend();
+  const launcherFixture = createLauncher({ stopRequestVersion: 1 });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await composition.runCapture(captureOptions(backend));
+
+  assert.equal(launcherFixture.defaultStopped.stop.stop.contractVersion, 1);
+  assert.deepEqual(
+    Object.keys(launcherFixture.defaultStopped.stop.stop.request).sort(),
+    ["contractVersion", "launch"],
+  );
+  assert.equal(launcherFixture.calls.stop.length, 1);
+  assert.equal(backendCalls.length, 1);
+  assert.equal(launcherFixture.calls.retire.length, 1);
 });
 
 test("durable stop composition rejects caller-supplied stopped-writer evidence", async () => {
@@ -462,7 +520,10 @@ test("unsupported durable stop receipt versions fail before capture", async () =
         ...result,
         stop: {
           ...result.stop,
-          contractVersion: 2,
+          stop: {
+            ...result.stop.stop,
+            contractVersion: 3,
+          },
         },
       });
     },
@@ -479,6 +540,126 @@ test("unsupported durable stop receipt versions fail before capture", async () =
   );
   assert.equal(backendCalls.length, 0);
   assert.equal(launcherFixture.calls.retire.length, 0);
+});
+
+test("malformed v2 durable stop requests fail before capture", async () => {
+  const scenarios = [
+    {
+      name: "missing digest",
+      mutate(result) {
+        return {
+          ...result,
+          stop: {
+            ...result.stop,
+            operation: {
+              ...result.stop.operation,
+              request: {
+                contractVersion: 2,
+                launch: result.stop.operation.request.launch,
+              },
+            },
+            stop: {
+              ...result.stop.stop,
+              request: {
+                contractVersion: 2,
+                launch: result.stop.stop.request.launch,
+              },
+            },
+          },
+        };
+      },
+    },
+    {
+      name: "invalid digest",
+      mutate(result) {
+        const request = {
+          ...result.stop.stop.request,
+          dispatchClaimSha256: "D".repeat(64),
+        };
+        const operationRequest = {
+          ...result.stop.operation.request,
+          dispatchClaimSha256: "D".repeat(64),
+        };
+        return {
+          ...result,
+          stop: {
+            ...result.stop,
+            operation: {
+              ...result.stop.operation,
+              request: operationRequest,
+            },
+            stop: {
+              ...result.stop.stop,
+              request,
+            },
+          },
+        };
+      },
+    },
+    {
+      name: "contradictory digest",
+      mutate(result) {
+        return {
+          ...result,
+          stop: {
+            ...result.stop,
+            operation: {
+              ...result.stop.operation,
+              request: {
+                ...result.stop.operation.request,
+                dispatchClaimSha256: "e".repeat(64),
+              },
+            },
+          },
+        };
+      },
+    },
+    {
+      name: "outer version mismatch",
+      mutate(result) {
+        return {
+          ...result,
+          stop: {
+            ...result.stop,
+            stop: {
+              ...result.stop.stop,
+              contractVersion: 1,
+            },
+          },
+        };
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await assertStopReceiptRejected(scenario.mutate);
+  }
+});
+
+test("v1 durable stop requests reject v2-only digest fields", async () => {
+  await assertStopReceiptRejected(
+    (result) => ({
+      ...result,
+      stop: {
+        ...result.stop,
+        operation: {
+          ...result.stop.operation,
+          request: {
+            ...result.stop.operation.request,
+            dispatchClaimSha256: STOP_DISPATCH_CLAIM_SHA256,
+          },
+        },
+        stop: {
+          ...result.stop.stop,
+          request: {
+            ...result.stop.stop.request,
+            dispatchClaimSha256: STOP_DISPATCH_CLAIM_SHA256,
+          },
+        },
+      },
+    }),
+    { stopRequestVersion: 1 },
+  );
 });
 
 test("contradictory nested durable stop identity fails before capture", async () => {

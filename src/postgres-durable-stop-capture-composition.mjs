@@ -12,6 +12,7 @@ const PromiseConstructor = Promise;
 const promiseSpeciesSymbol = Symbol.species;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApply = Reflect.apply;
+const regexpExecIntrinsic = RegExp.prototype.exec;
 const {
   isGeneratorObject: isGeneratorObjectValue,
   isPromise: isPromiseValue,
@@ -72,7 +73,13 @@ const STOP_TERMINAL_RESULT_KEYS = Object.freeze([
   "outcome",
   "resultVersion",
 ]);
-const STOP_REQUEST_KEYS = Object.freeze(["contractVersion", "launch"]);
+const STOP_REQUEST_V1_KEYS = Object.freeze(["contractVersion", "launch"]);
+const STOP_REQUEST_V2_KEYS = Object.freeze([
+  "contractVersion",
+  "dispatchClaimSha256",
+  "launch",
+]);
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const CAPTURE_OPTION_KEYS = Object.freeze([
   "attachment",
   "backend",
@@ -106,6 +113,10 @@ function fail(code) {
 
 function ensure(condition, code) {
   if (!condition) fail(code);
+}
+
+function regexpTest(pattern, value) {
+  return reflectApply(regexpExecIntrinsic, pattern, [value]) !== null;
 }
 
 function exactDataObject(value, keys, code, { frozen = false } = {}) {
@@ -398,6 +409,40 @@ function normalizeResolution(value, preparedCapture, code) {
   return resolution;
 }
 
+function normalizeStopRequest(value, code) {
+  const record = frozenRecord(value, code);
+  let contractVersionDescriptor;
+  try {
+    contractVersionDescriptor = Object.getOwnPropertyDescriptor(
+      record,
+      "contractVersion",
+    );
+  } catch {
+    fail(code);
+  }
+  ensure(
+    contractVersionDescriptor?.enumerable === true &&
+      Object.hasOwn(contractVersionDescriptor, "value"),
+    code,
+  );
+  const contractVersion = contractVersionDescriptor.value;
+  ensure(contractVersion === 1 || contractVersion === 2, code);
+  const request = exactDataObject(
+    record,
+    contractVersion === 1 ? STOP_REQUEST_V1_KEYS : STOP_REQUEST_V2_KEYS,
+    code,
+    { frozen: true },
+  );
+  if (contractVersion === 2) {
+    ensure(
+      typeof request.dispatchClaimSha256 === "string" &&
+        regexpTest(SHA256_PATTERN, request.dispatchClaimSha256),
+      code,
+    );
+  }
+  return request;
+}
+
 function normalizeStopReceipt(value, evidence, resolution, preparedCapture, code) {
   const receipt = exactDataObject(value, STOP_RECEIPT_KEYS, code, {
     frozen: true,
@@ -444,8 +489,7 @@ function normalizeStopReceipt(value, evidence, resolution, preparedCapture, code
     frozen: true,
   });
   ensure(
-    stop.contractVersion === 1 &&
-      stop.state === "committed" &&
+    stop.state === "committed" &&
       stop.stopOperationId === resolution.stopOperationId &&
       stop.launchAttemptId === evidence.launchAttemptId,
     code,
@@ -476,15 +520,8 @@ function normalizeStopReceipt(value, evidence, resolution, preparedCapture, code
       sameEvidence(operationEvidence, evidence),
     code,
   );
-  const request = exactDataObject(stop.request, STOP_REQUEST_KEYS, code, {
-    frozen: true,
-  });
-  const operationRequest = exactDataObject(
-    operation.request,
-    STOP_REQUEST_KEYS,
-    code,
-    { frozen: true },
-  );
+  const request = normalizeStopRequest(stop.request, code);
+  const operationRequest = normalizeStopRequest(operation.request, code);
   const launch = frozenDataProjection(
     request.launch,
     [
@@ -514,7 +551,7 @@ function normalizeStopReceipt(value, evidence, resolution, preparedCapture, code
     code,
   );
   ensure(
-    request.contractVersion === 1 &&
+    stop.contractVersion === request.contractVersion &&
       operationRequest.contractVersion === request.contractVersion &&
       sameFrozenData(stop.request, operation.request) &&
       sameLaunchIdentity(operationLaunch, launch) &&

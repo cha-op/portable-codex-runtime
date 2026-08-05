@@ -23,6 +23,9 @@ import {
   derivePostgresLogicalWriterStopOperationId,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
+  createPostgresDurableStopCaptureComposition,
+} from "../src/postgres-durable-stop-capture-composition.mjs";
+import {
   createSessionManifest,
   serializeSessionManifest,
 } from "../src/session-storage-contracts.mjs";
@@ -2923,6 +2926,115 @@ test("retirement requires the exact stopped resolution and releases both indexes
     () => value.facade.resolveStoppedWriter(resolverInput(value)),
     assertLauncherError("invalid_logical_writer_launch_request"),
   );
+});
+
+test("real logical writer launcher composes one v2 stop, capture, and retirement", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const captureTuple = resolverInput(value);
+
+  let stoppedResult = null;
+  let retireCalls = 0;
+  const stopWriterForCapture = async function (input) {
+    stoppedResult = await value.facade.stopWriterForCapture(input);
+    return stoppedResult;
+  };
+  const retireStoppedWriter = function (input) {
+    retireCalls += 1;
+    return value.facade.retireStoppedWriter(input);
+  };
+  Object.freeze(stopWriterForCapture);
+  Object.freeze(retireStoppedWriter);
+  const launcher = Object.freeze({
+    retireStoppedWriter,
+    stopWriterForCapture,
+  });
+
+  const captureCalls = [];
+  const operation = async () => undefined;
+  const backend = {
+    contractVersion: 1,
+    backendId: BACKEND_ID,
+    capabilities: backendCapabilities(),
+    async captureCheckpoint(input) {
+      captureCalls.push(input);
+      const resolution = value.facade.resolveStoppedWriter({
+        attachment: input.attachment,
+        checkpoint: input.checkpoint,
+        request: input.request,
+      });
+      return value.stoppedWriterCoordinator.consumeCapability({
+        attachment: input.attachment,
+        canonicalLease: resolution.canonicalLeaseAtRegistration,
+        capability: input.stoppedWriterEvidence,
+        processIncarnationId: resolution.processIncarnationId,
+        runSnapshot: async () => ({
+          checkpoint: input.checkpoint,
+          mutation: {
+            ...input.request,
+            proofId: "proof-checkpoint-capture-001",
+            status: "checkpoint-created",
+          },
+        }),
+        stopOperationId: resolution.stopOperationId,
+        writer: resolution.writer,
+        writerIncarnationId: resolution.writerIncarnationId,
+      });
+    },
+    destroySession: operation,
+    detachAttachment: operation,
+    forceFence: operation,
+    prepareWritableAttachment: operation,
+    provisionSession: operation,
+    restoreCheckpoint: operation,
+  };
+
+  const composition = createPostgresDurableStopCaptureComposition({ launcher });
+  const result = await composition.runCapture({
+    attachment: captureTuple.attachment,
+    backend,
+    canonicalLease: lease(),
+    checkpointClass: captureTuple.checkpoint.checkpointClass,
+    createdAt: captureTuple.checkpoint.createdAt,
+    manifest: value.image.manifest,
+    now: Date.parse(BASE_TIME),
+    request: captureTuple.request,
+    storageRef: storageRef(),
+  });
+
+  assert.equal(stoppedResult.stop.stop.contractVersion, 2);
+  for (const request of [
+    stoppedResult.stop.stop.request,
+    stoppedResult.stop.operation.request,
+  ]) {
+    assert.equal(request.contractVersion, 2);
+    assert.match(request.dispatchClaimSha256, /^[0-9a-f]{64}$/u);
+  }
+  assert.deepEqual(
+    stoppedResult.stop.operation.request,
+    stoppedResult.stop.stop.request,
+  );
+  assert.equal(captureCalls.length, 1);
+  assert.strictEqual(
+    captureCalls[0].stoppedWriterEvidence,
+    stoppedResult.capability,
+  );
+  assert.equal(retireCalls, 1);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 1);
+  assert.deepEqual(result, {
+    checkpoint: captureTuple.checkpoint,
+    mutation: {
+      ...captureTuple.request,
+      proofId: "proof-checkpoint-capture-001",
+      status: "checkpoint-created",
+    },
+  });
+  assert.throws(
+    () => value.facade.resolveStoppedWriter(captureTuple),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.stoppedWriterCoordinator.dispose(), undefined);
 });
 
 test("keeps a failed stop fail-closed for successor launch registration", async () => {
