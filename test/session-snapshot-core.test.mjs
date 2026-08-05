@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   SessionSnapshotCoreError,
   captureCleanCheckpoint,
+  capturePreparedCleanCheckpoint,
+  prepareCleanCheckpointCapture,
   reconcileCleanCheckpointCapture,
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
@@ -295,6 +297,86 @@ test("clean checkpoint capture dispatches exact frozen portable data", async () 
   ]) {
     assert.equal(serialized.includes(forbidden), false);
   }
+});
+
+test("prepared clean capture reuses the exact canonical tuple and descriptor", async () => {
+  const { backend, calls } = createBackend();
+  const options = captureOptions(backend);
+  const { stoppedWriterEvidence, ...preparationOptions } = options;
+  const preparedCapture = prepareCleanCheckpointCapture(preparationOptions);
+
+  assert(Object.isFrozen(preparedCapture));
+  assert.deepEqual(Object.keys(preparedCapture).sort(), [
+    "attachment",
+    "backend",
+    "checkpoint",
+    "manifest",
+    "request",
+    "storageRef",
+  ]);
+  assert.strictEqual(preparedCapture.backend, backend);
+  assert.deepEqual(
+    preparedCapture.checkpoint,
+    checkpoint({ sourceFencingEpoch: "11" }),
+  );
+
+  const preparedResult = await capturePreparedCleanCheckpoint({
+    preparedCapture,
+    stoppedWriterEvidence,
+  });
+  assert.equal(calls.capture.length, 1);
+  assert.strictEqual(calls.capture[0].attachment, preparedCapture.attachment);
+  assert.strictEqual(calls.capture[0].checkpoint, preparedCapture.checkpoint);
+  assert.strictEqual(calls.capture[0].request, preparedCapture.request);
+  assert.strictEqual(
+    calls.capture[0].stoppedWriterEvidence,
+    stoppedWriterEvidence,
+  );
+
+  await assert.rejects(
+    () =>
+      capturePreparedCleanCheckpoint({
+        preparedCapture,
+        stoppedWriterEvidence,
+      }),
+    assertContractCode("invalid_checkpoint"),
+  );
+  assert.equal(calls.capture.length, 1);
+
+  const ordinaryResult = await captureCleanCheckpoint(options);
+  assert.equal(calls.capture.length, 2);
+  assert.deepEqual(calls.capture[1].checkpoint, preparedCapture.checkpoint);
+  assert.deepEqual(ordinaryResult.checkpoint, preparedResult.checkpoint);
+  assert.deepEqual(ordinaryResult.mutation, preparedResult.mutation);
+});
+
+test("a failed prepared capture token cannot dispatch a second time", async () => {
+  const { backend, calls } = createBackend({
+    capture() {
+      throw new Error("capture acknowledgement lost");
+    },
+  });
+  const options = captureOptions(backend);
+  const { stoppedWriterEvidence, ...preparationOptions } = options;
+  const preparedCapture = prepareCleanCheckpointCapture(preparationOptions);
+
+  await assert.rejects(
+    () =>
+      capturePreparedCleanCheckpoint({
+        preparedCapture,
+        stoppedWriterEvidence,
+      }),
+    assertCoreCode("checkpoint_outcome_uncertain"),
+  );
+  await assert.rejects(
+    () =>
+      capturePreparedCleanCheckpoint({
+        preparedCapture,
+        stoppedWriterEvidence,
+      }),
+    assertContractCode("invalid_checkpoint"),
+  );
+  assert.equal(calls.capture.length, 1);
 });
 
 test("clean checkpoint core passes an exact one-use stopped-writer capability to the backend", async () => {

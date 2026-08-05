@@ -207,13 +207,18 @@ Restore and launcher authority are now split into eight serial pull requests:
      version 2 restore operation has progressed beyond `prepared`: only an
      undispatched request can safely receive the missing pre-publication
      registry claim.
-6. **Durable stop and capture composition**
+6. **Durable stop and capture composition (complete)**
    - Gate version 2 creation on confirmed fleet-wide authority and recovery
      compatibility before production can persist the new request shape.
-   - Route exact coordinator stop confirmation through
-     `writer-launch-stop-v1`, retain only the local capability state that can
-     still prove writer identity, and join that stop proof to later capture
-     admission.
+   - Prepare one exact clean-capture tuple, derive the stop operation from the
+     complete tuple and current launch attempt, route one physical stop through
+     `writer-launch-stop-v1`, and validate the committed operation,
+     reservation, session, and complete-stop proof before issuing one opaque
+     capability. Retain the local writer identity until capture succeeds;
+     reconcile only the exact same-process `prepared` or locally claimed
+     `starting` pre-dispatch state, and block same-session successor launch in
+     the canonical local coordinator until retirement. Ambiguous stop,
+     finalisation, capture, or retirement stays fail-closed.
 7. **Detached restore activation and recovery composition**
    - Keep the absent restore-publication destination independent from the
      current active attachment. After exact committed publication, obtain

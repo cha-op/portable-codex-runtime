@@ -236,11 +236,16 @@ function frozenResult(checkpoint, mutation) {
   return Object.freeze({ checkpoint, mutation });
 }
 
+const preparedCleanCheckpointCaptures = new WeakMap();
+
 /**
- * Structural orchestration only. The backend must atomically recheck the
- * canonical writer fence while capturing the checkpoint.
+ * Validates and canonicalizes one deterministic clean-checkpoint capture
+ * before any stopped-writer capability is requested. The returned tuple is a
+ * same-process token: capturePreparedCleanCheckpoint accepts only an object
+ * produced by this helper, so a caller cannot substitute a different tuple
+ * between writer stop and backend dispatch.
  */
-export async function captureCleanCheckpoint(options) {
+export function prepareCleanCheckpointCapture(options) {
   const {
     attachment,
     backend,
@@ -250,7 +255,6 @@ export async function captureCleanCheckpoint(options) {
     manifest,
     now,
     request,
-    stoppedWriterEvidence,
     storageRef,
   } = assertExactOptions(
     options,
@@ -263,14 +267,12 @@ export async function captureCleanCheckpoint(options) {
       "manifest",
       "now",
       "request",
-      "stoppedWriterEvidence",
       "storageRef",
     ],
-    "checkpoint capture options",
+    "checkpoint capture preparation options",
   );
 
   const cleanClass = assertCleanCheckpointClass(checkpointClass);
-  const writerEvidence = assertStoppedWriterEvidence(stoppedWriterEvidence);
   const storageBackend = checkedBackend(backend);
   const matched = validateContract(
     () =>
@@ -321,25 +323,131 @@ export async function captureCleanCheckpoint(options) {
   );
 
   const capture = checkedBackendMethod(storageBackend, "captureCheckpoint");
+  const prepared = Object.freeze({
+    attachment: matched.attachment,
+    backend: storageBackend,
+    checkpoint,
+    manifest: matched.manifest,
+    request: mutationRequest,
+    storageRef: matched.storageRef,
+  });
+  preparedCleanCheckpointCaptures.set(prepared, {
+    capture,
+    state: "prepared",
+  });
+  return prepared;
+}
+
+/**
+ * Dispatches one previously prepared clean capture with the exact canonical
+ * tuple that was presented to the stopped-writer authority.
+ */
+export async function capturePreparedCleanCheckpoint(options) {
+  const { preparedCapture, stoppedWriterEvidence } = assertExactOptions(
+    options,
+    ["preparedCapture", "stoppedWriterEvidence"],
+    "prepared checkpoint capture options",
+  );
+  const writerEvidence = assertStoppedWriterEvidence(stoppedWriterEvidence);
+  ensureContract(
+    preparedCapture !== null &&
+      typeof preparedCapture === "object" &&
+      !utilTypes.isProxy(preparedCapture) &&
+      !Array.isArray(preparedCapture) &&
+      Object.isFrozen(preparedCapture) &&
+      preparedCleanCheckpointCaptures.has(preparedCapture),
+    "invalid_checkpoint",
+    "prepared checkpoint capture is invalid",
+  );
+  const preparedState = preparedCleanCheckpointCaptures.get(preparedCapture);
+  ensureContract(
+    preparedState.state === "prepared",
+    "invalid_checkpoint",
+    "prepared checkpoint capture was already dispatched",
+  );
+  // One token authorizes one dispatch attempt. Transition synchronously before
+  // invoking the backend so rejection or acknowledgement loss cannot reopen it.
+  preparedState.state = "dispatched";
+  const { capture } = preparedState;
+  const {
+    attachment,
+    backend,
+    checkpoint,
+    manifest,
+    request,
+    storageRef,
+  } = preparedCapture;
+
   try {
     const result = await capture.call(
-      storageBackend,
+      backend,
       Object.freeze({
-        attachment: matched.attachment,
+        attachment,
         checkpoint,
-        request: mutationRequest,
+        request,
         stoppedWriterEvidence: writerEvidence,
       }),
     );
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: checkpoint,
-      manifest: matched.manifest,
-      request: mutationRequest,
-      storageRef: matched.storageRef,
+      manifest,
+      request,
+      storageRef,
     });
   } catch {
     throw new SessionSnapshotCoreError("checkpoint_outcome_uncertain");
   }
+}
+
+/**
+ * Structural orchestration only. The backend must atomically recheck the
+ * canonical writer fence while capturing the checkpoint.
+ */
+export async function captureCleanCheckpoint(options) {
+  const {
+    attachment,
+    backend,
+    canonicalLease,
+    checkpointClass,
+    createdAt,
+    manifest,
+    now,
+    request,
+    stoppedWriterEvidence,
+    storageRef,
+  } = assertExactOptions(
+    options,
+    [
+      "attachment",
+      "backend",
+      "canonicalLease",
+      "checkpointClass",
+      "createdAt",
+      "manifest",
+      "now",
+      "request",
+      "stoppedWriterEvidence",
+      "storageRef",
+    ],
+    "checkpoint capture options",
+  );
+
+  const writerEvidence = assertStoppedWriterEvidence(stoppedWriterEvidence);
+  const preparedCapture = prepareCleanCheckpointCapture({
+    attachment,
+    backend,
+    canonicalLease,
+    checkpointClass,
+    createdAt,
+    manifest,
+    now,
+    request,
+    storageRef,
+  });
+  return capturePreparedCleanCheckpoint({
+    preparedCapture,
+    stoppedWriterEvidence: writerEvidence,
+  });
 }
 
 /**

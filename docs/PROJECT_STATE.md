@@ -164,10 +164,17 @@
   finalised receipt requires a complete `lastOperation` anchor; historical
   readback may instead coexist with a later active operation or retain a later
   committed anchor while the digest-bound current launch pointer still binds
-  the original attempt. Exact local stop confirmation
-  releases the facade's strong attempt and attachment indexes; an uncertain
-  stop retains the record fail-closed instead of treating a possibly running
-  writer as reclaimable.
+  the original attempt. The facade routes a capture-bound physical stop
+  through the durable stop transition and retains its strong attempt,
+  attachment, and writer indexes until the exact clean capture succeeds. An
+  uncertain stop, finalisation, capture, or retirement retains the record
+  fail-closed instead of treating a possibly running or incompletely captured
+  writer as reclaimable. Within one canonical same-process stopped-writer
+  coordinator, any retained writer blocks physical successor launch for that
+  session across backend and storage slots until explicit retirement. Exact
+  stop retries reuse the original frozen operation input and reconcile durable
+  `prepared` or locally claimed `starting` state without repeating claim or
+  physical stop.
 - Typed `writer-launch-stop-v1` authority preserves the original started
   attempt and clears the current-launch relation only for exact
   `complete-stopped` evidence from the bound supervisor. Historical stop or
@@ -176,6 +183,13 @@
   is never attached to the old receipt. Bounded keyset discovery returns
   prepared or active launch attempts and relationally validated current
   launches without reconstructing process-local authority.
+- A same-process durable stop-to-clean-capture composition now prepares the
+  exact capture admission before stopping, derives the stop identity from the
+  complete attachment/checkpoint/request tuple and launch attempt, and permits
+  one opaque capability only after the supervisor's physical stop and complete
+  committed transition validate. Capture success retires the retained local
+  identity; ambiguity never reissues the capability, repeats physical stop, or
+  reconstructs a handle.
 - Restore-generation request version 2 durably records the exact measured
   image, supervisor, and launch-attempt identity before publication begins.
   One serializable authority transition commits the generation, retires the
@@ -194,8 +208,8 @@
   stopped, fenced, and detached.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   until later serial pull requests verify committed generation publication,
-  route coordinator stop through the durable transition, add bounded
-  no-relaunch recovery, and wire the complete protocol into `runRestore()`.
+  activate a provider-proven detached destination, add bounded no-relaunch
+  recovery, and wire the complete protocol into `runRestore()`.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -254,6 +268,8 @@
   `docs/project_journal/2026/08/2026-08-04-restore-launch-handoff-5a7c2e.md`
 - Restore publication attachment-contract correction:
   `docs/project_journal/2026/08/2026-08-05-restore-publication-attachment-contract-4c7a91.md`
+- Durable stop-to-clean-capture composition:
+  `docs/project_journal/2026/08/2026-08-05-durable-stop-capture-composition-7e3a91.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 

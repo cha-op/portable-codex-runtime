@@ -9,7 +9,10 @@ import {
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  WRITER_LAUNCH_STOP_OPERATION_KIND,
+  assertCommittedWriterLaunchStopTransitionProof,
   createWriterLaunchAttemptOperationRequest,
+  createWriterLaunchStopOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
   assertCheckpointDescriptor,
@@ -65,9 +68,19 @@ const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
+const stoppedAssertWriterLaunchAvailableIntrinsic =
+  StoppedWriterCapabilityCoordinator.prototype.assertWriterLaunchAvailable;
 const stoppedRegisterWriterIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.registerWriter;
+const stoppedRetireWriterIntrinsic =
+  StoppedWriterCapabilityCoordinator.prototype.retireWriter;
+const stoppedStopAndIssueCapabilityIntrinsic =
+  StoppedWriterCapabilityCoordinator.prototype.stopAndIssueCapability;
 const TypeErrorConstructor = TypeError;
+const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakMapConstructor = WeakMap;
 const WeakSetConstructor = WeakSet;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
@@ -114,11 +127,14 @@ const SUPERVISOR_KEYS = objectFreeze([
 const AUTHORITY_METHODS = objectFreeze([
   "cancelPreparedOperation",
   "claimWriterLaunchAttemptDispatch",
+  "claimWriterLaunchStopDispatch",
   "finalizeWriterLaunchAttemptStarted",
   "finalizeWriterLaunchAttemptStopped",
+  "finalizeWriterLaunchStopped",
   "markOperationUncertain",
   "readSession",
   "readWriterLaunchAttempt",
+  "reconcileOperation",
   "reserveOperation",
 ]);
 const RUN_INPUT_KEYS = objectFreeze([
@@ -141,6 +157,19 @@ const RESOLVER_INPUT_KEYS = objectFreeze([
   "attachment",
   "checkpoint",
   "request",
+]);
+const STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
+  "attachment",
+  "checkpoint",
+  "launchAttemptId",
+  "request",
+]);
+const STOP_RESOLUTION_KEYS = objectFreeze([
+  "canonicalLeaseAtRegistration",
+  "processIncarnationId",
+  "stopOperationId",
+  "writer",
+  "writerIncarnationId",
 ]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 const SESSION_KEYS = objectFreeze([
@@ -332,6 +361,45 @@ const CLAIM_NOT_GRANTED_RECEIPT_KEYS = objectFreeze([
   "session",
   "status",
 ]);
+const STOP_RESERVE_RECEIPT_KEYS = objectFreeze([
+  "acquired",
+  "operation",
+  "reservation",
+  "session",
+  "status",
+]);
+const STOP_RECONCILE_RECEIPT_KEYS = objectFreeze([
+  "operation",
+  "reservation",
+  "session",
+  "status",
+]);
+const STOP_CLAIM_RECEIPT_KEYS = objectFreeze([
+  "dispatchGranted",
+  "launch",
+  "operation",
+  "reservation",
+  "session",
+  "status",
+  "stop",
+]);
+const STOP_FINALIZE_RECEIPT_KEYS = objectFreeze([
+  "finalized",
+  "launch",
+  "operation",
+  "reservation",
+  "session",
+  "status",
+  "stop",
+]);
+const STOP_RECORD_KEYS = objectFreeze([
+  "contractVersion",
+  "launchAttemptId",
+  "request",
+  "result",
+  "state",
+  "stopOperationId",
+]);
 const READ_RECEIPT_KEYS = objectFreeze([
   "attempt",
   "launch",
@@ -447,6 +515,18 @@ function mapHas(map, key) {
 
 function mapSet(map, key, value) {
   callIntrinsic(mapSetIntrinsic, map, [key, value]);
+}
+
+function weakMapGet(map, key) {
+  return callIntrinsic(weakMapGetIntrinsic, map, [key]);
+}
+
+function weakMapSet(map, key, value) {
+  callIntrinsic(weakMapSetIntrinsic, map, [key, value]);
+}
+
+function weakMapDelete(map, key) {
+  return callIntrinsic(weakMapDeleteIntrinsic, map, [key]);
 }
 
 function weakSetAdd(set, value) {
@@ -596,8 +676,8 @@ function exactDataObjectVariant(value, keySets, code) {
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !arrayIsArray(value) &&
-      !isProxyValue(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
     code,
   );
   let prototype;
@@ -1141,6 +1221,34 @@ async function invokeImageCoordinator(coordinator, method, options, code) {
   );
   try {
     return await pending;
+  } catch {
+    fail(code);
+  }
+}
+
+async function invokeStoppedCoordinator(
+  coordinator,
+  method,
+  options,
+  code,
+) {
+  let pending;
+  try {
+    pending = callIntrinsic(method, coordinator, [options]);
+  } catch {
+    fail(code);
+  }
+  ensure(isSafeNativePromise(pending), code);
+  try {
+    return await pending;
+  } catch {
+    fail(code);
+  }
+}
+
+function invokeStoppedCoordinatorSync(coordinator, method, options, code) {
+  try {
+    return callIntrinsic(method, coordinator, [options]);
   } catch {
     fail(code);
   }
@@ -1927,6 +2035,239 @@ function normalizeCancelReceipt(value, launchAttemptId, expectedRequest, code) {
   );
 }
 
+function normalizeStopPhaseOperation(value, baseInput, states, code) {
+  const normalized = exactDataObject(value, OPERATION_KEYS, code);
+  const expectedSession = normalizeSession(normalized.expectedSession, code);
+  const operation = snapshotData(value, code);
+  ensure(
+    operation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      operation.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+      operation.operationId === baseInput.operationId &&
+      operation.sessionId === baseInput.expectedSession.sessionId &&
+      sameContent(expectedSession, baseInput.expectedSession, code) &&
+      sameContent(operation.request, baseInput.request, code) &&
+      assertSha256(operation.requestSha256, code) ===
+        operation.requestSha256 &&
+      arrayIncludes(states, operation.state) &&
+      operation.result === null &&
+      operation.retiredAt === null,
+    code,
+  );
+  const expectedRevision = {
+    prepared: "0",
+    starting: "1",
+    uncertain: "2",
+  }[operation.state];
+  ensure(operation.revision === expectedRevision, code);
+  return operation;
+}
+
+function normalizeStopRecord(value, operation, baseInput, code) {
+  const stop = exactDataObject(value, STOP_RECORD_KEYS, code);
+  ensure(
+    stop.contractVersion === LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION &&
+      stop.launchAttemptId === baseInput.request.launch.launchAttemptId &&
+      stop.stopOperationId === baseInput.operationId &&
+      stop.state === operation.state &&
+      sameContent(stop.request, baseInput.request, code) &&
+      sameContent(stop.result, operation.result, code),
+    code,
+  );
+  return snapshotData(value, code);
+}
+
+function normalizeStopReserveReceipt(value, baseInput, code) {
+  const receipt = exactDataObject(value, STOP_RESERVE_RECEIPT_KEYS, code);
+  ensure(typeof receipt.acquired === "boolean", code);
+  const operation = normalizeStopPhaseOperation(
+    receipt.operation,
+    baseInput,
+    ["prepared", "starting"],
+    code,
+  );
+  const reservation = normalizeReservation(
+    receipt.reservation,
+    operation,
+    code,
+  );
+  const session = normalizeSession(receipt.session, code);
+  ensure(
+    receipt.status === operation.state &&
+      session.sessionId === operation.sessionId &&
+      (!receipt.acquired || operation.state === "prepared") &&
+      sameContent(session.document.launch, baseInput.request.launch, code),
+    code,
+  );
+  validateSessionPointer(session, operation, reservation, null, code);
+  validateActiveSessionRelation(session, operation, reservation, code);
+  return exactFrozenRecord({
+    acquired: receipt.acquired,
+    operation,
+    reservation,
+    session,
+    status: operation.state,
+  });
+}
+
+function normalizeStopReconcileReceipt(value, baseInput, code) {
+  const receipt = exactDataObject(
+    value,
+    STOP_RECONCILE_RECEIPT_KEYS,
+    code,
+  );
+  const session = normalizeSession(receipt.session, code);
+  if (receipt.operation === null || receipt.reservation === null) {
+    ensure(
+      receipt.operation === null &&
+        receipt.reservation === null &&
+        receipt.status === "absent" &&
+        sameContent(session, baseInput.expectedSession, code),
+      code,
+    );
+    return exactFrozenRecord({
+      operation: null,
+      reservation: null,
+      session,
+      status: "absent",
+    });
+  }
+  const operation = normalizeStopPhaseOperation(
+    receipt.operation,
+    baseInput,
+    ["prepared", "starting"],
+    code,
+  );
+  const reservation = normalizeReservation(
+    receipt.reservation,
+    operation,
+    code,
+  );
+  ensure(
+    receipt.status === operation.state &&
+      session.sessionId === operation.sessionId &&
+      sameContent(session.document.launch, baseInput.request.launch, code),
+    code,
+  );
+  validateSessionPointer(session, operation, reservation, null, code);
+  validateActiveSessionRelation(session, operation, reservation, code);
+  return exactFrozenRecord({
+    operation,
+    reservation,
+    session,
+    status: operation.state,
+  });
+}
+
+function normalizeStopClaimReceipt(value, baseInput, code) {
+  const receipt = exactDataObject(value, STOP_CLAIM_RECEIPT_KEYS, code);
+  ensure(typeof receipt.dispatchGranted === "boolean", code);
+  const operation = normalizeStopPhaseOperation(
+    receipt.operation,
+    baseInput,
+    ["prepared", "starting", "uncertain"],
+    code,
+  );
+  const reservation = normalizeReservation(
+    receipt.reservation,
+    operation,
+    code,
+  );
+  const session = normalizeSession(receipt.session, code);
+  const launch = snapshotData(receipt.launch, code);
+  ensure(
+    receipt.status === operation.state &&
+      session.sessionId === operation.sessionId &&
+      sameContent(launch, baseInput.request.launch, code) &&
+      sameContent(session.document.launch, launch, code) &&
+      (receipt.dispatchGranted
+        ? operation.state === "starting"
+        : operation.state === "prepared" ||
+          operation.state === "starting" ||
+          operation.state === "uncertain"),
+    code,
+  );
+  validateSessionPointer(session, operation, reservation, null, code);
+  validateActiveSessionRelation(session, operation, reservation, code);
+  const stop = normalizeStopRecord(
+    receipt.stop,
+    operation,
+    baseInput,
+    code,
+  );
+  return exactFrozenRecord({
+    dispatchGranted: receipt.dispatchGranted,
+    launch,
+    operation,
+    reservation,
+    session,
+    status: operation.state,
+    stop,
+  });
+}
+
+function normalizeStopFinalizationReceipt(
+  value,
+  baseInput,
+  expectedEvidence,
+  code,
+) {
+  const receipt = exactDataObject(
+    value,
+    STOP_FINALIZE_RECEIPT_KEYS,
+    code,
+  );
+  ensure(
+    typeof receipt.finalized === "boolean" &&
+      receipt.launch === null &&
+      receipt.status === "committed",
+    code,
+  );
+  let transition;
+  try {
+    transition = assertCommittedWriterLaunchStopTransitionProof({
+      after: receipt.session,
+      before: baseInput.expectedSession,
+      operation: receipt.operation,
+      reservation: receipt.reservation,
+    });
+  } catch {
+    fail(code);
+  }
+  const operation = transition.operation;
+  ensure(
+    operation.operationId === baseInput.operationId &&
+      sameContent(operation.expectedSession, baseInput.expectedSession, code) &&
+      sameContent(operation.request, baseInput.request, code),
+    code,
+  );
+  const result = exactDataObject(
+    operation.result,
+    TERMINAL_RESULT_KEYS,
+    code,
+  );
+  ensure(
+    result.resultVersion === 1 &&
+      result.outcome === "writer-launch-stopped" &&
+      sameContent(result.evidence, expectedEvidence, code),
+    code,
+  );
+  const stop = normalizeStopRecord(
+    receipt.stop,
+    operation,
+    baseInput,
+    code,
+  );
+  return exactFrozenRecord({
+    finalized: receipt.finalized,
+    launch: null,
+    operation,
+    reservation: transition.reservation,
+    session: transition.after,
+    status: "committed",
+    stop,
+  });
+}
+
 function operationInput(operation) {
   return exactFrozenRecord({
     expectedSession: operation.expectedSession,
@@ -1991,18 +2332,60 @@ function canonicalJsonProjectionSha256(value, code) {
   );
 }
 
-function stopOperationId(captureOperationId, launchAttemptId, code) {
+function stopOperationId(capture, launchAttemptId, code) {
+  let serializedCapture;
+  try {
+    serializedCapture = reflectApply(jsonStringifyIntrinsic, JsonObject, [
+      canonicalJsonDataTree(snapshotData(capture, code)),
+    ]);
+  } catch (error) {
+    if (isInternalError(error)) throw error;
+    fail(code);
+  }
+  ensure(typeof serializedCapture === "string", code);
   const digest = sha256Parts(
     [
-      "portable-codex-runtime:writer-stop:v1",
-      "\0",
-      captureOperationId,
+      "portable-codex-runtime:writer-stop-capture:v2",
       "\0",
       launchAttemptId,
+      "\0",
+      serializedCapture,
     ],
     code,
   );
   return `writer-stop:${digest}`;
+}
+
+/**
+ * Derives the durable writer-stop operation identity from the complete
+ * canonical capture tuple and the launch attempt it will retire.
+ */
+export function derivePostgresLogicalWriterStopOperationId(...args) {
+  const code = "invalid_logical_writer_launch_request";
+  ensure(args.length === 1, code);
+  try {
+    const input = exactDataObject(
+      args[0],
+      STOP_OPERATION_ID_INPUT_KEYS,
+      code,
+    );
+    const capture = normalizeCaptureTuple(
+      exactFrozenRecord({
+        attachment: input.attachment,
+        checkpoint: input.checkpoint,
+        request: input.request,
+      }),
+      code,
+    );
+    return stopOperationId(
+      capture,
+      assertOpaqueId(input.launchAttemptId, code),
+      code,
+    );
+  } catch (error) {
+    if (isInternalError(error, code)) throw error;
+    fail(code);
+  }
 }
 
 function normalizeImageReservation(value, code) {
@@ -2149,8 +2532,8 @@ function assertOpaqueWriterHandle(value, code) {
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !arrayIsArray(value) &&
       !isProxyValue(value) &&
+      !arrayIsArray(value) &&
       objectGetPrototypeOf(value) === null &&
       reflectOwnKeys(value).length === 0 &&
       objectIsFrozen(value),
@@ -2170,11 +2553,43 @@ function evidenceMatchesRecord(evidence, record, code) {
   );
 }
 
+function normalizeCaptureTuple(value, code) {
+  const input = exactDataObject(value, RESOLVER_INPUT_KEYS, code);
+  let attachment;
+  let checkpoint;
+  let request;
+  try {
+    attachment = assertSessionAttachment(input.attachment);
+    checkpoint = assertCheckpointDescriptor(input.checkpoint);
+    request = assertStorageMutationRequest(input.request);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    request.operation === "checkpoint" &&
+      attachment.sessionId === checkpoint.sessionId &&
+      attachment.sessionId === request.sessionId &&
+      attachment.backendId === checkpoint.backendId &&
+      attachment.backendId === request.backendId &&
+      attachment.storageId === checkpoint.storageId &&
+      attachment.storageId === request.storageId &&
+      attachment.leaseId === request.leaseId &&
+      attachment.holderId === request.holderId &&
+      attachment.fencingEpoch === request.fencingEpoch &&
+      attachment.fencingEpoch === checkpoint.sourceFencingEpoch &&
+      checkpoint.checkpointClass === "clean" &&
+      request.target.kind === "checkpoint" &&
+      request.target.checkpointId === checkpoint.checkpointId &&
+      request.target.artifactId === checkpoint.artifactId,
+    code,
+  );
+  return exactFrozenRecord({ attachment, checkpoint, request });
+}
+
 /**
- * Composes durable launch admission with one-use image and in-process writer
- * capabilities. The registered stop callback deliberately remains a local
- * supervisor seam: production restore must stay disabled until a durable,
- * typed stop transition owns this boundary.
+ * Composes durable launch/stop admission with one-use image and in-process
+ * writer capabilities. Production restore remains disabled until the wider
+ * bounded-recovery protocol composes this primitive with capture publication.
  */
 export function createPostgresLogicalWriterLauncher(...args) {
   const optionCode = "invalid_logical_writer_launch_request";
@@ -2229,6 +2644,16 @@ export function createPostgresLogicalWriterLauncher(...args) {
   const stoppedWriterCoordinator = options.stoppedWriterCoordinator;
   const recordsByAttempt = new MapConstructor();
   const recordsByAttachmentId = new MapConstructor();
+  const recordsByWriter = new WeakMapConstructor();
+
+  function assertWriterLaunchAvailable(attachment, canonicalLease, code) {
+    invokeStoppedCoordinatorSync(
+      stoppedWriterCoordinator,
+      stoppedAssertWriterLaunchAvailableIntrinsic,
+      exactFrozenRecord({ attachment, canonicalLease }),
+      code,
+    );
+  }
 
   function releaseStoppedRecord(record) {
     ensure(
@@ -2248,7 +2673,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
       recordsByAttachmentId,
       record.attachment.attachmentId,
     );
-    ensure(attemptDeleted && attachmentDeleted, outcomeCode);
+    const writerDeleted = weakMapDelete(recordsByWriter, record.writer);
+    ensure(attemptDeleted && attachmentDeleted && writerDeleted, outcomeCode);
   }
 
   async function readAttempt(launchAttemptId) {
@@ -2387,6 +2813,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
       fail("logical_writer_handle_unavailable");
     }
     assertOpaqueWriterHandle(record.writer, outcomeCode);
+    ensure(read.launch !== null, outcomeCode);
+    if (record.launch === null) {
+      record.launch = read.launch;
+    } else {
+      ensure(sameContent(record.launch, read.launch, outcomeCode), outcomeCode);
+    }
     if (record.state === "provisional") record.state = "ready";
     return record.writer;
   }
@@ -2501,10 +2933,16 @@ export function createPostgresLogicalWriterLauncher(...args) {
       evidence,
       imageDigest:
         claim.attempt.request.measuredImage.projection.platformImage.digest,
+      launch: null,
       launchAttemptId: claim.attempt.launchAttemptId,
+      pendingStop: null,
       processIncarnationId: evidence.processIncarnationId,
       request: claim.attempt.request,
       state: "registering",
+      stopBaseInput: null,
+      stopClaimAttemptedFor: null,
+      stopEvidence: null,
+      stopReceipt: null,
       stopWriter: callbackReceipt.stopWriter,
       supervisorId: evidence.supervisorId,
       writer: null,
@@ -2524,7 +2962,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
         outcomeCode,
       );
       ensure(
-        record.state === "ready" &&
+        record.state === "stop-dispatch" &&
+          record.pendingStop !== null &&
           record.authorizedStopOperationId !== null &&
           binding.stopOperationId === record.authorizedStopOperationId &&
           binding.processIncarnationId === record.processIncarnationId &&
@@ -2539,16 +2978,56 @@ export function createPostgresLogicalWriterLauncher(...args) {
       );
       record.state = "stopping";
       try {
+        await assertGuardHeld(record.pendingStop.probe, outcomeCode);
         const stopped = await invokeSupervisor(
           record.stopWriter,
           snapshotData(bindingValue, outcomeCode),
           outcomeCode,
         );
         ensure(stopped === STOPPED_WRITER_STOP_CONFIRMED, outcomeCode);
+        await assertGuardHeld(record.pendingStop.probe, outcomeCode);
+        const stopEvidence = exactFrozenRecord({
+          contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+          launchAttemptId: record.launchAttemptId,
+          processIncarnationId: record.processIncarnationId,
+          proofId: binding.stopOperationId,
+          status: "complete-stopped",
+          supervisorId: record.supervisorId,
+          writerIncarnationId: record.writerIncarnationId,
+        });
+        const finalizationInput = exactFrozenRecord({
+          ...record.pendingStop.baseInput,
+          evidence: stopEvidence,
+          expectedOperationRevision: "1",
+        });
+        let stopReceipt = null;
+        for (let attempt = 0; attempt < 2 && stopReceipt === null; attempt += 1) {
+          try {
+            stopReceipt = normalizeStopFinalizationReceipt(
+              await invokeAsync(
+                authority,
+                "finalizeWriterLaunchStopped",
+                [finalizationInput],
+                outcomeCode,
+              ),
+              record.pendingStop.baseInput,
+              stopEvidence,
+              outcomeCode,
+            );
+          } catch {
+            // One exact replay distinguishes acknowledgement loss from an
+            // unresolved durable stop outcome without repeating physical stop.
+          }
+        }
+        ensure(stopReceipt !== null, outcomeCode);
+        await assertGuardHeld(record.pendingStop.probe, outcomeCode);
+        record.stopEvidence = stopEvidence;
+        record.stopReceipt = stopReceipt;
+        record.pendingStop = null;
         record.state = "stopped";
-        releaseStoppedRecord(record);
         return STOPPED_WRITER_STOP_CONFIRMED;
       } catch {
+        record.pendingStop = null;
         record.state = "lost";
         fail(outcomeCode);
       }
@@ -2576,6 +3055,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
         record.attachment.attachmentId,
         record,
       );
+      weakMapSet(recordsByWriter, record.writer, record);
       return record;
     } catch (error) {
       record.state = "lost";
@@ -2592,6 +3072,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
   ) {
     ensure(claim.dispatchGranted === true, outcomeCode);
     await assertGuardHeld(probe, outcomeCode);
+    assertWriterLaunchAvailable(
+      claim.attempt.request.attachment,
+      claim.attempt.request.lease,
+      outcomeCode,
+    );
     const consumedImage = normalizeMeasuredImage(
       await invokeImageCoordinator(
         imageReservations,
@@ -2610,6 +3095,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
       outcomeCode,
     );
     await assertGuardHeld(probe, outcomeCode);
+    assertWriterLaunchAvailable(
+      claim.attempt.request.attachment,
+      claim.attempt.request.lease,
+      outcomeCode,
+    );
     const callbackReceipt = normalizeLaunchCallbackReceipt(
       await invokeSupervisor(
         supervisor.launchWriter,
@@ -2859,6 +3349,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
               request: typedRequest,
             });
 
+            assertWriterLaunchAvailable(
+              typedRequest.attachment,
+              typedRequest.lease,
+              admissionCode,
+            );
+
             let reserve;
             durableReservationMayExist = true;
             try {
@@ -2890,6 +3386,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 typedRequest,
               );
             }
+
+            assertWriterLaunchAvailable(
+              typedRequest.attachment,
+              typedRequest.lease,
+              outcomeCode,
+            );
 
             let claim;
             try {
@@ -2987,6 +3489,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
             }
 
             validatePreparedAuthorityRelation(read);
+            assertWriterLaunchAvailable(
+              read.attempt.request.attachment,
+              read.attempt.request.lease,
+              admissionCode,
+            );
             await assertGuardHeld(probe, outcomeCode);
             const measuredImage = await revalidateImageReservation(
               input.imageReservation,
@@ -3000,6 +3507,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 optionCode,
               ),
               optionCode,
+            );
+
+            assertWriterLaunchAvailable(
+              read.attempt.request.attachment,
+              read.attempt.request.lease,
+              outcomeCode,
             );
 
             let claim;
@@ -3086,84 +3599,348 @@ export function createPostgresLogicalWriterLauncher(...args) {
     }
   }
 
+  function captureRecord(capture, states, code) {
+    const record = mapGet(
+      recordsByAttachmentId,
+      capture.attachment.attachmentId,
+    );
+    ensure(
+      record !== undefined &&
+        arrayIncludes(states, record.state) &&
+        sameContent(capture.attachment, record.attachment, code) &&
+        capture.checkpoint.codexSessionId === record.codexSessionId &&
+        capture.checkpoint.codexThreadId === record.codexThreadId &&
+        capture.checkpoint.imageDigest === record.imageDigest,
+      code,
+    );
+    ensure(
+      record.authorizedCapture === null ||
+        sameContent(record.authorizedCapture, capture, code),
+      code,
+    );
+    const derivedStopOperationId = stopOperationId(
+      capture,
+      record.launchAttemptId,
+      code,
+    );
+    ensure(
+      record.authorizedStopOperationId === null ||
+        record.authorizedStopOperationId === derivedStopOperationId,
+      code,
+    );
+    record.authorizedCapture = capture;
+    record.authorizedStopOperationId = derivedStopOperationId;
+    return record;
+  }
+
+  function resolutionForRecord(record) {
+    return exactFrozenRecord({
+      canonicalLeaseAtRegistration: record.canonicalLease,
+      processIncarnationId: record.processIncarnationId,
+      stopOperationId: record.authorizedStopOperationId,
+      writer: record.writer,
+      writerIncarnationId: record.writerIncarnationId,
+    });
+  }
+
+  function validateCurrentStopSession(session, record, code) {
+    let manifest;
+    try {
+      manifest = assertSessionManifest(session.document.manifest);
+    } catch {
+      fail(code);
+    }
+    ensure(
+      record.launch !== null &&
+        session.sessionId === record.attachment.sessionId &&
+        session.document.lifecycle === "ATTACHED" &&
+        session.document.activeOperation === null &&
+        session.document.writerEpoch === record.canonicalLease.fencingEpoch &&
+        sameContent(session.document.attachment, record.attachment, code) &&
+        sameContent(session.document.lease, record.canonicalLease, code) &&
+        sameContent(session.document.launch, record.launch, code) &&
+        manifest.codex.sessionId === record.codexSessionId &&
+        manifest.codex.rootThreadId === record.codexThreadId &&
+        manifest.runtime.imageDigest === record.imageDigest,
+      code,
+    );
+  }
+
+  async function reconcileStopOperation(baseInput) {
+    return normalizeStopReconcileReceipt(
+      await invokeAsync(
+        authority,
+        "reconcileOperation",
+        [baseInput],
+        outcomeCode,
+      ),
+      baseInput,
+      outcomeCode,
+    );
+  }
+
+  async function reserveStopOperation(baseInput) {
+    return normalizeStopReserveReceipt(
+      await invokeAsync(
+        authority,
+        "reserveOperation",
+        [baseInput],
+        outcomeCode,
+      ),
+      baseInput,
+      outcomeCode,
+    );
+  }
+
+  async function bestEffortMarkStopUncertain(baseInput, state) {
+    if (state.attempted) return;
+    state.attempted = true;
+    try {
+      await invokeAsync(
+        authority,
+        "markOperationUncertain",
+        [
+          exactFrozenRecord({
+            ...baseInput,
+            expectedOperationRevision: "1",
+          }),
+        ],
+        outcomeCode,
+      );
+    } catch {
+      // The unresolved durable stop operation remains the recovery authority.
+    }
+  }
+
+  async function stopWriterForCaptureInternal(...stopArgs) {
+    ensure(stopArgs.length === 1, optionCode);
+    const capture = normalizeCaptureTuple(stopArgs[0], optionCode);
+    const initialRecord = captureRecord(capture, ["ready"], optionCode);
+    const stopOperation = initialRecord.authorizedStopOperationId;
+    const uncertaintyState = { attempted: false };
+    try {
+      return await invokeGuard(
+        operationGuard,
+        [
+          stopOperation,
+          async (probeValue) => {
+            const probe = normalizeProbe(probeValue, outcomeCode);
+            const record = captureRecord(capture, ["ready"], optionCode);
+            ensure(record === initialRecord, optionCode);
+            await assertGuardHeld(probe, outcomeCode);
+            let baseInput = record.stopBaseInput;
+            const retainedBaseInput = baseInput !== null;
+            if (baseInput === null) {
+              const expectedSession = normalizeSession(
+                await invokeAsync(
+                  authority,
+                  "readSession",
+                  [
+                    exactFrozenRecord({
+                      sessionId: capture.attachment.sessionId,
+                    }),
+                  ],
+                  outcomeCode,
+                ),
+                outcomeCode,
+              );
+              validateCurrentStopSession(expectedSession, record, outcomeCode);
+              let typedRequest;
+              try {
+                typedRequest = createWriterLaunchStopOperationRequest({
+                  expectedSession,
+                });
+              } catch {
+                fail(optionCode);
+              }
+              baseInput = exactFrozenRecord({
+                expectedSession,
+                kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+                operationId: stopOperation,
+                request: typedRequest,
+              });
+              record.stopBaseInput = baseInput;
+            }
+            ensure(
+              baseInput.operationId === stopOperation &&
+                sameContent(
+                  baseInput.request.launch,
+                  record.launch,
+                  outcomeCode,
+                ),
+              outcomeCode,
+            );
+
+            let phase;
+            if (retainedBaseInput) {
+              phase = await reconcileStopOperation(baseInput);
+            } else {
+              try {
+                phase = await reserveStopOperation(baseInput);
+              } catch {
+                phase = await reconcileStopOperation(baseInput);
+              }
+            }
+            if (phase.status === "absent") {
+              try {
+                phase = await reserveStopOperation(baseInput);
+              } catch {
+                phase = await reconcileStopOperation(baseInput);
+              }
+            }
+
+            let claimAttempted =
+              record.stopClaimAttemptedFor === stopOperation;
+            if (phase.status === "prepared") {
+              record.stopClaimAttemptedFor = stopOperation;
+              claimAttempted = true;
+              try {
+                phase = normalizeStopClaimReceipt(
+                  await invokeAsync(
+                    authority,
+                    "claimWriterLaunchStopDispatch",
+                    [
+                      exactFrozenRecord({
+                        ...baseInput,
+                        expectedOperationRevision: "0",
+                      }),
+                    ],
+                    outcomeCode,
+                  ),
+                  baseInput,
+                  outcomeCode,
+                );
+                ensure(phase.status === "starting", outcomeCode);
+              } catch {
+                phase = await reconcileStopOperation(baseInput);
+              }
+            }
+            ensure(
+              phase.status === "starting" &&
+                record.stopClaimAttemptedFor === stopOperation,
+              outcomeCode,
+            );
+
+            await assertGuardHeld(probe, outcomeCode);
+            ensure(record.state === "ready", outcomeCode);
+            record.pendingStop = exactFrozenRecord({ baseInput, probe });
+            record.state = "stop-dispatch";
+            let capability;
+            try {
+              capability = await invokeStoppedCoordinator(
+                stoppedWriterCoordinator,
+                stoppedStopAndIssueCapabilityIntrinsic,
+                exactFrozenRecord({
+                  processIncarnationId: record.processIncarnationId,
+                  stopOperationId: stopOperation,
+                  writer: record.writer,
+                  writerIncarnationId: record.writerIncarnationId,
+                }),
+                outcomeCode,
+              );
+            } catch {
+              if (record.state === "stop-dispatch") {
+                record.pendingStop = null;
+                record.state = "lost";
+              }
+              if (claimAttempted) {
+                await bestEffortMarkStopUncertain(
+                  baseInput,
+                  uncertaintyState,
+                );
+              }
+              fail(outcomeCode);
+            }
+            assertOpaqueWriterHandle(capability, outcomeCode);
+            ensure(
+              record.state === "stopped" &&
+                record.stopEvidence !== null &&
+                record.stopReceipt !== null,
+              outcomeCode,
+            );
+            return exactFrozenRecord({
+              capability,
+              evidence: record.stopEvidence,
+              resolution: resolutionForRecord(record),
+              stop: record.stopReceipt,
+            });
+          },
+        ],
+        outcomeCode,
+      );
+    } catch (error) {
+      if (isInternalError(error, optionCode)) throw error;
+      fail(outcomeCode);
+    }
+  }
+
   function resolveStoppedWriter(...resolverArgs) {
     ensure(resolverArgs.length === 1, optionCode);
     try {
+      const capture = normalizeCaptureTuple(resolverArgs[0], optionCode);
+      return resolutionForRecord(
+        captureRecord(capture, ["ready", "stopped"], optionCode),
+      );
+    } catch (error) {
+      if (isInternalError(error, optionCode)) throw error;
+      fail(optionCode);
+    }
+  }
+
+  function retireStoppedWriter(...retireArgs) {
+    ensure(retireArgs.length === 1, optionCode);
+    let resolution;
+    try {
       const input = exactDataObject(
-        resolverArgs[0],
-        RESOLVER_INPUT_KEYS,
+        retireArgs[0],
+        STOP_RESOLUTION_KEYS,
         optionCode,
       );
-      let attachment;
-      let checkpoint;
-      let request;
-      try {
-        attachment = assertSessionAttachment(input.attachment);
-        checkpoint = assertCheckpointDescriptor(input.checkpoint);
-        request = assertStorageMutationRequest(input.request);
-      } catch {
-        fail(optionCode);
-      }
-      ensure(
-        request.operation === "checkpoint" &&
-          attachment.sessionId === checkpoint.sessionId &&
-          attachment.sessionId === request.sessionId &&
-          attachment.backendId === checkpoint.backendId &&
-          attachment.backendId === request.backendId &&
-          attachment.storageId === checkpoint.storageId &&
-          attachment.storageId === request.storageId &&
-          attachment.leaseId === request.leaseId &&
-          attachment.holderId === request.holderId &&
-          attachment.fencingEpoch === request.fencingEpoch &&
-          attachment.fencingEpoch === checkpoint.sourceFencingEpoch &&
-          checkpoint.checkpointClass === "clean" &&
-          request.target.kind === "checkpoint" &&
-          request.target.checkpointId === checkpoint.checkpointId &&
-          request.target.artifactId === checkpoint.artifactId,
-        optionCode,
-      );
-      const record = mapGet(
-        recordsByAttachmentId,
-        attachment.attachmentId,
-      );
-      ensure(
-        record !== undefined &&
-          record.state === "ready" &&
-          sameContent(attachment, record.attachment, optionCode) &&
-          checkpoint.codexSessionId === record.codexSessionId &&
-          checkpoint.codexThreadId === record.codexThreadId &&
-          checkpoint.imageDigest === record.imageDigest,
-        optionCode,
-      );
-      const capture = exactFrozenRecord({ attachment, checkpoint, request });
-      ensure(
-        record.authorizedCapture === null ||
-          sameContent(record.authorizedCapture, capture, optionCode),
-        optionCode,
-      );
-      const derivedStopOperationId = stopOperationId(
-        assertOpaqueId(request.operationId, optionCode),
-        record.launchAttemptId,
-        optionCode,
-      );
-      ensure(
-        record.authorizedStopOperationId === null ||
-          record.authorizedStopOperationId === derivedStopOperationId,
-        optionCode,
-      );
-      record.authorizedCapture = capture;
-      record.authorizedStopOperationId = derivedStopOperationId;
-      return exactFrozenRecord({
-        canonicalLeaseAtRegistration: record.canonicalLease,
-        processIncarnationId: record.processIncarnationId,
-        stopOperationId: derivedStopOperationId,
-        writer: record.writer,
-        writerIncarnationId: record.writerIncarnationId,
+      resolution = exactFrozenRecord({
+        canonicalLeaseAtRegistration: assertLeaseGrant(
+          input.canonicalLeaseAtRegistration,
+        ),
+        processIncarnationId: assertOpaqueId(
+          input.processIncarnationId,
+          optionCode,
+        ),
+        stopOperationId: assertOpaqueId(input.stopOperationId, optionCode),
+        writer: assertOpaqueWriterHandle(input.writer, optionCode),
+        writerIncarnationId: assertOpaqueId(
+          input.writerIncarnationId,
+          optionCode,
+        ),
       });
     } catch (error) {
       if (isInternalError(error, optionCode)) throw error;
       fail(optionCode);
     }
+    const record = weakMapGet(recordsByWriter, resolution.writer);
+    ensure(
+      record !== undefined &&
+        record.state === "stopped" &&
+        record.stopReceipt !== null &&
+        resolution.processIncarnationId === record.processIncarnationId &&
+        resolution.writerIncarnationId === record.writerIncarnationId &&
+        resolution.stopOperationId === record.authorizedStopOperationId &&
+        sameContent(
+          resolution.canonicalLeaseAtRegistration,
+          record.canonicalLease,
+          optionCode,
+        ),
+      optionCode,
+    );
+    invokeStoppedCoordinatorSync(
+      stoppedWriterCoordinator,
+      stoppedRetireWriterIntrinsic,
+      exactFrozenRecord({
+        processIncarnationId: record.processIncarnationId,
+        writer: record.writer,
+        writerIncarnationId: record.writerIncarnationId,
+      }),
+      outcomeCode,
+    );
+    releaseStoppedRecord(record);
   }
 
   const prepareLaunchIntent = function prepareLaunchIntent(...prepareArgs) {
@@ -3180,17 +3957,24 @@ export function createPostgresLogicalWriterLauncher(...args) {
   const runPreparedLaunch = function runPreparedLaunch(...runArgs) {
     return protectPromise(runPreparedLaunchInternal(...runArgs));
   };
+  const stopWriterForCapture = function stopWriterForCapture(...stopArgs) {
+    return protectPromise(stopWriterForCaptureInternal(...stopArgs));
+  };
   objectFreeze(prepareLaunchIntent);
   objectFreeze(reconcileLaunchAttempt);
+  objectFreeze(retireStoppedWriter);
   objectFreeze(resolveStoppedWriter);
   objectFreeze(runLaunch);
   objectFreeze(runPreparedLaunch);
+  objectFreeze(stopWriterForCapture);
   return exactFrozenRecord({
     prepareLaunchIntent,
     reconcileLaunchAttempt,
+    retireStoppedWriter,
     resolveStoppedWriter,
     runLaunch,
     runPreparedLaunch,
+    stopWriterForCapture,
   });
 }
 

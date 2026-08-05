@@ -19,6 +19,7 @@ import {
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
+  assertCommittedWriterLaunchStopTransitionProof,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
@@ -10010,6 +10011,53 @@ test("writer launch stop claim, finalize, and exact replay clear only the curren
     fixture.options.operationId,
   );
   assert.deepEqual(finalized.operation.result, fixture.result);
+  const proof = {
+    after: finalized.session,
+    before: fixture.options.expectedSession,
+    operation: finalized.operation,
+    reservation: finalized.reservation,
+  };
+  const validatedProof = assertCommittedWriterLaunchStopTransitionProof(proof);
+  assertDeepFrozen(validatedProof);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(validatedProof)),
+    JSON.parse(JSON.stringify(proof)),
+  );
+
+  for (const mutate of [
+    (candidate) => {
+      candidate.after.revision = (
+        BigInt(candidate.after.revision) + 1n
+      ).toString();
+    },
+    (candidate) => {
+      candidate.after.document.documentVersion = 2;
+    },
+    (candidate) => {
+      candidate.after.document.launch = structuredClone(
+        candidate.before.document.launch,
+      );
+    },
+    (candidate) => {
+      candidate.after.document.lastOperation.resultSha256 = "f".repeat(64);
+    },
+    (candidate) => {
+      candidate.operation.request.launch.writerIncarnationId =
+        "writer-incarnation-tampered";
+    },
+    (candidate) => {
+      candidate.reservation.operationId = "writer-stop-operation-tampered";
+    },
+  ]) {
+    const candidate = structuredClone(proof);
+    mutate(candidate);
+    assert.throws(
+      () => assertCommittedWriterLaunchStopTransitionProof(candidate),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "operation_state_invalid",
+    );
+  }
   assert.equal(replayed.finalized, false);
   assert.equal(replayed.launch, null);
   assert.deepEqual(replayed.operation.result, fixture.result);
@@ -10164,6 +10212,18 @@ test("lost-ack writer launch stop replays do not expose a successor launch", asy
   assert.equal(finalized.finalized, false);
   assert.equal(finalized.launch, null);
   assert.deepEqual(finalized.session.document.launch, successorPointer);
+  assert.throws(
+    () =>
+      assertCommittedWriterLaunchStopTransitionProof({
+        after: finalized.session,
+        before: stopped.options.expectedSession,
+        operation: finalized.operation,
+        reservation: finalized.reservation,
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
   assert.equal(claimed.dispatchGranted, false);
   assert.equal(claimed.launch, null);
   assert.deepEqual(claimed.session.document.launch, successorPointer);

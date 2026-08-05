@@ -356,6 +356,41 @@ const RESTORE_GENERATION_TERMINAL_RESULT_KEYS = Object.freeze([
   "outcome",
   "resultVersion",
 ]);
+const COMMITTED_WRITER_LAUNCH_STOP_PROOF_KEYS = Object.freeze([
+  "after",
+  "before",
+  "operation",
+  "reservation",
+]);
+const COMMITTED_WRITER_LAUNCH_STOP_OPERATION_KEYS = Object.freeze([
+  "conflictClass",
+  "createdAt",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+  "requestSha256",
+  "result",
+  "retiredAt",
+  "revision",
+  "sessionId",
+  "state",
+  "updatedAt",
+]);
+const COMMITTED_WRITER_LAUNCH_STOP_RESERVATION_KEYS = Object.freeze([
+  "conflictClass",
+  "createdAt",
+  "expectedSessionRevision",
+  "expiresAt",
+  "kind",
+  "operationId",
+  "releasedAt",
+  "requestSha256",
+  "reservationId",
+  "sessionId",
+  "state",
+  "updatedAt",
+]);
 const WRITER_LAUNCH_ATTEMPT_OPERATION_REQUEST_KEYS = Object.freeze([
   "attachment",
   "contractVersion",
@@ -6873,6 +6908,158 @@ function validateLastOperationPointer(
   validateTerminalBusinessState(terminalBase, operation);
   validateOperationReservation(operation, reservation, {
     reservationId: last.reservationId,
+  });
+}
+
+function canonicalCommittedWriterLaunchStopOperation(value, code) {
+  const normalized = exactPlainObject(
+    value,
+    COMMITTED_WRITER_LAUNCH_STOP_OPERATION_KEYS,
+    code,
+  );
+  let input;
+  try {
+    input = canonicalOperationInput({
+      expectedSession: normalized.expectedSession,
+      kind: normalized.kind,
+      operationId: normalized.operationId,
+      request: normalized.request,
+    });
+  } catch {
+    fail(code);
+  }
+  const revision = canonicalRevisionForCode(normalized.revision, code);
+  const createdAt = canonicalTimestampString(normalized.createdAt, code);
+  const updatedAt = canonicalTimestampString(normalized.updatedAt, code);
+  const retiredAt = canonicalTimestampString(normalized.retiredAt, code);
+  ensure(
+    input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+      normalized.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      normalized.sessionId === input.expectedSession.sessionId &&
+      normalized.state === "committed" &&
+      normalized.requestSha256 === input.requestSha256 &&
+      retiredAt === updatedAt &&
+      timestampMilliseconds(updatedAt) >= timestampMilliseconds(createdAt),
+    code,
+  );
+  const result = canonicalCommittedResult(
+    normalized.result,
+    input,
+    revision,
+    code,
+  );
+  ensure(
+    result.outcome === "writer-launch-stopped" &&
+      canonicalSerialize(normalized.result) === canonicalSerialize(result),
+    code,
+  );
+  const operation = deepFreeze({
+    operationId: input.operationId,
+    sessionId: input.expectedSession.sessionId,
+    kind: input.kind,
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSession: input.expectedSession,
+    request: input.request,
+    requestSha256: input.requestSha256,
+    state: "committed",
+    revision,
+    result,
+    createdAt,
+    updatedAt,
+    retiredAt,
+  });
+  validateOperationIdentity(operation, input);
+  return deepFreeze({ input, operation });
+}
+
+function canonicalCommittedWriterLaunchStopReservation(value, code) {
+  const reservation = exactPlainObject(
+    value,
+    COMMITTED_WRITER_LAUNCH_STOP_RESERVATION_KEYS,
+    code,
+  );
+  const createdAt = canonicalTimestampString(reservation.createdAt, code);
+  const updatedAt = canonicalTimestampString(reservation.updatedAt, code);
+  const releasedAt = canonicalTimestampString(reservation.releasedAt, code);
+  ensure(
+    reservation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      reservation.state === "released" &&
+      reservation.expiresAt === null &&
+      typeof reservation.requestSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, reservation.requestSha256) &&
+      releasedAt === updatedAt &&
+      timestampMilliseconds(updatedAt) >= timestampMilliseconds(createdAt),
+    code,
+  );
+  return deepFreeze({
+    reservationId: canonicalOpaqueId(
+      reservation.reservationId,
+      128,
+      code,
+    ),
+    operationId: canonicalOpaqueId(reservation.operationId, 128, code),
+    sessionId: canonicalSessionId(reservation.sessionId, code),
+    kind: canonicalOpaqueId(reservation.kind, 64, code),
+    expectedSessionRevision: canonicalRevisionForCode(
+      reservation.expectedSessionRevision,
+      code,
+    ),
+    state: "released",
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    requestSha256: reservation.requestSha256,
+    createdAt,
+    updatedAt,
+    expiresAt: null,
+    releasedAt,
+  });
+}
+
+/**
+ * Validates one committed writer-launch stop transition, including the exact
+ * typed request/result relation and released reservation linkage.
+ */
+export function assertCommittedWriterLaunchStopTransitionProof(...args) {
+  const code = "operation_state_invalid";
+  ensure(args.length === 1, code);
+  const proof = exactPlainObject(
+    args[0],
+    COMMITTED_WRITER_LAUNCH_STOP_PROOF_KEYS,
+    code,
+  );
+  const before = expectedSnapshotFromValue(proof.before, code);
+  const after = expectedSnapshotFromValue(proof.after, code);
+  const normalizedOperation = canonicalCommittedWriterLaunchStopOperation(
+    proof.operation,
+    code,
+  );
+  const operation = normalizedOperation.operation;
+  const reservation = canonicalCommittedWriterLaunchStopReservation(
+    proof.reservation,
+    code,
+  );
+  ensure(
+    canonicalSnapshotBytes(operation.expectedSession) ===
+        canonicalSnapshotBytes(before) &&
+      after.sessionId === before.sessionId &&
+      after.document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+      after.document.activeOperation === null &&
+      BigIntConstructor(after.revision) ===
+        BigIntConstructor(before.revision) +
+          BigIntConstructor(operation.revision) +
+          1n,
+    code,
+  );
+  validateOperationReservation(
+    operation,
+    reservation,
+    normalizedOperation.input,
+  );
+  validateLastOperationPointer(after, operation, reservation);
+  return deepFreeze({
+    after,
+    before,
+    operation,
+    reservation,
   });
 }
 

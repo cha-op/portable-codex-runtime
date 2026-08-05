@@ -11,12 +11,16 @@ import {
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  WRITER_LAUNCH_STOP_OPERATION_KIND,
+  assertCommittedWriterLaunchStopTransitionProof,
   createWriterLaunchAttemptOperationRequest,
+  createWriterLaunchStopOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
+  derivePostgresLogicalWriterStopOperationId,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   createSessionManifest,
@@ -54,6 +58,10 @@ const PREPARED_TIME = "2026-08-04T12:00:01.000Z";
 const STARTING_TIME = "2026-08-04T12:00:02.000Z";
 const UNCERTAIN_TIME = "2026-08-04T12:00:03.000Z";
 const COMMITTED_TIME = "2026-08-04T12:00:04.000Z";
+const STOP_PREPARED_TIME = "2026-08-04T12:00:05.000Z";
+const STOP_STARTING_TIME = "2026-08-04T12:00:06.000Z";
+const STOP_UNCERTAIN_TIME = "2026-08-04T12:00:07.000Z";
+const STOP_COMMITTED_TIME = "2026-08-04T12:00:08.000Z";
 const jsonStringify = JSON.stringify;
 
 function digest(bytes) {
@@ -66,6 +74,10 @@ function jsonBytes(value) {
 
 function jsonSha256(value) {
   return createHash("sha256").update(jsonStringify(value)).digest("hex");
+}
+
+function textSha256(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function imageFixture() {
@@ -230,6 +242,61 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function canonicalAuthorityOperationPointer(value, terminal) {
+  if (value === null) return null;
+  const pointer = {
+    conflictClass: value.conflictClass,
+    expectedSessionRevision: value.expectedSessionRevision,
+    kind: value.kind,
+    operationId: value.operationId,
+    operationRevision: value.operationRevision,
+    requestSha256: value.requestSha256,
+    reservationId: value.reservationId,
+  };
+  if (terminal) pointer.resultSha256 = value.resultSha256;
+  pointer.state = value.state;
+  return pointer;
+}
+
+function canonicalAuthoritySession(value) {
+  const document = value.document;
+  return {
+    sessionId: value.sessionId,
+    revision: value.revision,
+    document: {
+      documentVersion: document.documentVersion,
+      manifest: clone(document.manifest),
+      storageRef: clone(document.storageRef),
+      backendCapabilities: clone(document.backendCapabilities),
+      lifecycle: document.lifecycle,
+      writerEpoch: document.writerEpoch,
+      lease: clone(document.lease),
+      attachment: clone(document.attachment),
+      activeOperation: canonicalAuthorityOperationPointer(
+        document.activeOperation,
+        false,
+      ),
+      lastOperation: canonicalAuthorityOperationPointer(
+        document.lastOperation,
+        true,
+      ),
+      recovery: null,
+      launch: clone(document.launch),
+    },
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function operationRequestSha256(expectedSession, request) {
+  return jsonSha256({
+    requestVersion: 1,
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSession: canonicalAuthoritySession(expectedSession),
+    payload: request,
+  });
+}
+
 function activePointer(operation, reservation) {
   return {
     conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
@@ -300,14 +367,22 @@ class MemoryLaunchAuthority {
       claim: 0,
       finalizeStarted: 0,
       finalizeStopped: 0,
+      finalizeWriterStopped: 0,
       markUncertain: 0,
       read: 0,
       reserve: 0,
+      stopClaim: 0,
+      stopReconcile: 0,
     };
     this.lastClaimInput = null;
     this.lastCancelInput = null;
     this.readReceiptMutation = null;
     this.beforeFinalize = null;
+    this.stopBaseInput = null;
+    this.stopState = "absent";
+    this.stopResult = null;
+    this.stopTerminalRevision = null;
+    this.stopFinalizationMutation = null;
   }
 
   beginNextAttempt({ expectedSession, generation }) {
@@ -329,6 +404,11 @@ class MemoryLaunchAuthority {
     this.lastCancelInput = null;
     this.readReceiptMutation = null;
     this.beforeFinalize = null;
+    this.stopBaseInput = null;
+    this.stopState = "absent";
+    this.stopResult = null;
+    this.stopTerminalRevision = null;
+    this.stopFinalizationMutation = null;
   }
 
   seed(request, state, launchEvidence = null) {
@@ -494,17 +574,146 @@ class MemoryLaunchAuthority {
     };
   }
 
+  stopOperation() {
+    assert.notEqual(this.stopBaseInput, null);
+    const revision =
+      this.stopState === "prepared"
+        ? "0"
+        : this.stopState === "starting"
+          ? "1"
+          : this.stopState === "uncertain"
+            ? "2"
+            : this.stopTerminalRevision;
+    const updatedAt =
+      this.stopState === "prepared"
+        ? STOP_PREPARED_TIME
+        : this.stopState === "starting"
+          ? STOP_STARTING_TIME
+          : this.stopState === "uncertain"
+            ? STOP_UNCERTAIN_TIME
+            : STOP_COMMITTED_TIME;
+    return {
+      operationId: this.stopBaseInput.operationId,
+      sessionId: this.stopBaseInput.expectedSession.sessionId,
+      kind: this.stopBaseInput.kind,
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      expectedSession: clone(this.stopBaseInput.expectedSession),
+      request: clone(this.stopBaseInput.request),
+      requestSha256: operationRequestSha256(
+        this.stopBaseInput.expectedSession,
+        this.stopBaseInput.request,
+      ),
+      state: this.stopState,
+      revision,
+      result: clone(this.stopResult),
+      createdAt: STOP_PREPARED_TIME,
+      updatedAt,
+      retiredAt: this.stopState === "committed" ? updatedAt : null,
+    };
+  }
+
+  stopReservation(operation = this.stopOperation()) {
+    return {
+      reservationId: `reservation-${textSha256(operation.operationId)}`,
+      operationId: operation.operationId,
+      sessionId: operation.sessionId,
+      kind: operation.kind,
+      expectedSessionRevision: operation.expectedSession.revision,
+      state:
+        operation.state === "committed" ? "released" : operation.state,
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      requestSha256: operation.requestSha256,
+      createdAt: STOP_PREPARED_TIME,
+      updatedAt: operation.updatedAt,
+      expiresAt: null,
+      releasedAt:
+        operation.state === "committed" ? operation.updatedAt : null,
+    };
+  }
+
+  stopRecord(operation = this.stopOperation()) {
+    return {
+      contractVersion: 1,
+      launchAttemptId: this.stopBaseInput.request.launch.launchAttemptId,
+      request: clone(this.stopBaseInput.request),
+      result: clone(operation.result),
+      state: operation.state,
+      stopOperationId: operation.operationId,
+    };
+  }
+
+  stopSession(
+    operation = this.stopOperation(),
+    reservation = this.stopReservation(operation),
+  ) {
+    const session = clone(this.stopBaseInput.expectedSession);
+    session.document.documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION;
+    if (operation.state === "committed") {
+      session.document.activeOperation = null;
+      session.document.lastOperation = terminalPointer(operation, reservation);
+      session.document.launch = null;
+    } else {
+      session.document.activeOperation = activePointer(operation, reservation);
+    }
+    session.revision = (
+      BigInt(this.stopBaseInput.expectedSession.revision) +
+      BigInt(operation.revision) +
+      1n
+    ).toString();
+    session.updatedAt = operation.updatedAt;
+    return session;
+  }
+
   async readSession() {
     this.events.push("authority.read-session");
     if (this.behaviour.readSessionThrows) {
       throw new Error("session read unavailable");
     }
+    if (this.stopState !== "absent") return this.stopSession();
+    if (this.state === "committed") return this.receipt().session;
     return clone(this.expectedSession);
   }
 
   async reserveOperation(input) {
     this.calls.reserve += 1;
     this.events.push("authority.reserve");
+    if (input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND) {
+      if (this.stopState === "absent") {
+        const expectedSession = canonicalAuthoritySession(
+          input.expectedSession,
+        );
+        this.stopBaseInput = {
+          expectedSession,
+          kind: input.kind,
+          operationId: input.operationId,
+          request: createWriterLaunchStopOperationRequest({
+            expectedSession,
+          }),
+        };
+        this.stopState = "prepared";
+        if (this.behaviour.stopReserveThrowAfterCommit) {
+          throw new Error("lost stop reserve acknowledgement");
+        }
+        const operation = this.stopOperation();
+        const reservation = this.stopReservation(operation);
+        return {
+          acquired: true,
+          operation,
+          reservation,
+          session: this.stopSession(operation, reservation),
+          status: "prepared",
+        };
+      }
+      const operation = this.stopOperation();
+      const reservation = this.stopReservation(operation);
+      return {
+        acquired: false,
+        operation,
+        reservation,
+        session: this.stopSession(operation, reservation),
+        status: operation.state,
+      };
+    }
     if (this.state === "absent") {
       this.baseInput = clone(input);
       this.state = "prepared";
@@ -526,6 +735,36 @@ class MemoryLaunchAuthority {
       operation,
       reservation,
       session: this.session(operation, reservation),
+      status: operation.state,
+    };
+  }
+
+  async reconcileOperation(input) {
+    this.calls.stopReconcile += 1;
+    this.events.push("authority.reconcile-stop");
+    if (this.behaviour.stopReconcileThrowsOnce) {
+      this.behaviour.stopReconcileThrowsOnce = false;
+      throw new Error("stop reconcile unavailable");
+    }
+    assert.equal(input.kind, WRITER_LAUNCH_STOP_OPERATION_KIND);
+    if (this.stopState === "absent") {
+      return {
+        operation: null,
+        reservation: null,
+        session: canonicalAuthoritySession(input.expectedSession),
+        status: "absent",
+      };
+    }
+    assert.deepEqual(
+      JSON.parse(jsonStringify(input)),
+      JSON.parse(jsonStringify(this.stopBaseInput)),
+    );
+    const operation = this.stopOperation();
+    const reservation = this.stopReservation(operation);
+    return {
+      operation,
+      reservation,
+      session: this.stopSession(operation, reservation),
       status: operation.state,
     };
   }
@@ -586,6 +825,51 @@ class MemoryLaunchAuthority {
       : this.claimReceiptMutation(clone(claimReceipt));
   }
 
+  async claimWriterLaunchStopDispatch(input) {
+    this.calls.stopClaim += 1;
+    this.events.push("authority.claim-stop");
+    assert.deepEqual(
+      JSON.parse(jsonStringify(input)),
+      JSON.parse(
+        jsonStringify({
+          ...this.stopBaseInput,
+          expectedOperationRevision: "0",
+        }),
+      ),
+    );
+    if (this.stopState !== "prepared") {
+      const operation = this.stopOperation();
+      const reservation = this.stopReservation(operation);
+      return {
+        dispatchGranted: false,
+        launch: clone(this.stopBaseInput.request.launch),
+        operation,
+        reservation,
+        session: this.stopSession(operation, reservation),
+        status: operation.state,
+        stop: this.stopRecord(operation),
+      };
+    }
+    if (this.behaviour.stopClaimThrowBeforeCommit) {
+      throw new Error("stop claim unavailable before commit");
+    }
+    this.stopState = "starting";
+    if (this.behaviour.stopClaimThrowAfterCommit) {
+      throw new Error("lost stop claim acknowledgement");
+    }
+    const operation = this.stopOperation();
+    const reservation = this.stopReservation(operation);
+    return {
+      dispatchGranted: true,
+      launch: clone(this.stopBaseInput.request.launch),
+      operation,
+      reservation,
+      session: this.stopSession(operation, reservation),
+      status: "starting",
+      stop: this.stopRecord(operation),
+    };
+  }
+
   async readWriterLaunchAttempt() {
     this.calls.read += 1;
     this.events.push("authority.read-attempt");
@@ -597,9 +881,24 @@ class MemoryLaunchAuthority {
       : this.readReceiptMutation(clone(receipt));
   }
 
-  async markOperationUncertain() {
+  async markOperationUncertain(input) {
     this.calls.markUncertain += 1;
     this.events.push("authority.mark-uncertain");
+    if (input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND) {
+      if (this.stopState === "starting") this.stopState = "uncertain";
+      if (this.behaviour.markThrowsAfterCommit) {
+        throw new Error("lost uncertain ack");
+      }
+      const operation = this.stopOperation();
+      const reservation = this.stopReservation(operation);
+      return {
+        changed: true,
+        operation,
+        reservation,
+        session: this.stopSession(operation, reservation),
+        status: operation.state,
+      };
+    }
     if (this.state === "starting") this.state = "uncertain";
     if (this.behaviour.markThrowsAfterCommit) {
       throw new Error("lost uncertain ack");
@@ -689,6 +988,69 @@ class MemoryLaunchAuthority {
     this.calls.finalizeStopped += 1;
     return this.#finalize(input.evidence, "stopped");
   }
+
+  async finalizeWriterLaunchStopped(input) {
+    this.calls.finalizeWriterStopped += 1;
+    this.events.push("authority.finalize-writer-stopped");
+    assert.deepEqual(
+      JSON.parse(jsonStringify(input)),
+      JSON.parse(
+        jsonStringify({
+          ...this.stopBaseInput,
+          evidence: input.evidence,
+          expectedOperationRevision: "1",
+        }),
+      ),
+    );
+    if (this.stopState === "committed") {
+      const operation = this.stopOperation();
+      const reservation = this.stopReservation(operation);
+      const replay = {
+        finalized: false,
+        launch: null,
+        operation,
+        reservation,
+        session: this.stopSession(operation, reservation),
+        status: "committed",
+        stop: this.stopRecord(operation),
+      };
+      return this.stopFinalizationMutation === null
+        ? replay
+        : this.stopFinalizationMutation(clone(replay));
+    }
+    assert.ok(
+      this.stopState === "starting" || this.stopState === "uncertain",
+    );
+    if (this.behaviour.stopFinalizeThrowBeforeCommit) {
+      throw new Error("stop finalization unavailable before commit");
+    }
+    const predecessor = this.stopState;
+    this.stopState = "committed";
+    this.stopTerminalRevision = predecessor === "starting" ? "2" : "3";
+    this.stopResult = {
+      evidence: clone(input.evidence),
+      outcome: "writer-launch-stopped",
+      resultVersion: 1,
+    };
+    if (this.behaviour.stopFinalizeThrowAfterCommit) {
+      this.behaviour.stopFinalizeThrowAfterCommit = false;
+      throw new Error("lost stop finalization acknowledgement");
+    }
+    const operation = this.stopOperation();
+    const reservation = this.stopReservation(operation);
+    const receipt = {
+      finalized: true,
+      launch: null,
+      operation,
+      reservation,
+      session: this.stopSession(operation, reservation),
+      status: "committed",
+      stop: this.stopRecord(operation),
+    };
+    return this.stopFinalizationMutation === null
+      ? receipt
+      : this.stopFinalizationMutation(clone(receipt));
+  }
 }
 
 class MemoryOperationGuard {
@@ -733,10 +1095,28 @@ class MemoryOperationGuard {
 }
 
 let hostileRegisterWriterCalls = 0;
+let hostileLaunchAdmissionCalls = 0;
+let hostileRetireWriterCalls = 0;
+let hostileStopWriterCalls = 0;
 
 class HostileStoppedWriterCoordinator extends StoppedWriterCapabilityCoordinator {
+  assertWriterLaunchAvailable() {
+    hostileLaunchAdmissionCalls += 1;
+    throw new Error("subclass override must not run");
+  }
+
   registerWriter() {
     hostileRegisterWriterCalls += 1;
+    throw new Error("subclass override must not run");
+  }
+
+  retireWriter() {
+    hostileRetireWriterCalls += 1;
+    throw new Error("subclass override must not run");
+  }
+
+  async stopAndIssueCapability() {
+    hostileStopWriterCalls += 1;
     throw new Error("subclass override must not run");
   }
 }
@@ -1017,7 +1397,11 @@ function resolverInput(value, overrides = {}) {
   };
 }
 
-async function prepareLaunchCycle(value, index) {
+async function prepareLaunchCycle(
+  value,
+  index,
+  { attachmentOverrides = {} } = {},
+) {
   const ordinal = String(index + 1).padStart(3, "0");
   const launchAttemptId = `writer-launch-attempt-${ordinal}`;
   const writerLease = lease({
@@ -1027,6 +1411,7 @@ async function prepareLaunchCycle(value, index) {
   const mounted = attachment(writerLease, {
     operationId: `operation-attach-${ordinal}`,
     proofId: `proof-attachment-${ordinal}`,
+    ...attachmentOverrides,
   });
   const generation = generationSnapshot({
     generationId: `restore-generation-${ordinal}`,
@@ -1051,6 +1436,11 @@ async function prepareLaunchCycle(value, index) {
           state: "committed",
         },
         lease: writerLease,
+        storageRef: {
+          ...storageRef(),
+          backendId: mounted.backendId,
+          storageId: mounted.storageId,
+        },
         writerEpoch: writerLease.fencingEpoch,
       }),
       revision: String(revision),
@@ -1103,8 +1493,10 @@ test("exports one exact frozen facade and starts/registers before durable finali
     "prepareLaunchIntent",
     "reconcileLaunchAttempt",
     "resolveStoppedWriter",
+    "retireStoppedWriter",
     "runLaunch",
     "runPreparedLaunch",
+    "stopWriterForCapture",
   ]);
   assert.equal(Object.getPrototypeOf(value.facade), null);
   assert.equal(Object.isFrozen(value.facade), true);
@@ -1187,18 +1579,178 @@ test("exports one exact frozen facade and starts/registers before durable finali
   assert.equal(repeated.stopOperationId, resolved.stopOperationId);
   assert.strictEqual(repeated.writer, result.writer);
 
-  const capability = await value.stoppedWriterCoordinator.stopAndIssueCapability({
-    processIncarnationId: resolved.processIncarnationId,
-    stopOperationId: resolved.stopOperationId,
-    writer: resolved.writer,
-    writerIncarnationId: resolved.writerIncarnationId,
-  });
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
   assert.equal(value.supervisorStopCalls, 1);
-  assert.equal(Object.isFrozen(capability), true);
+  assert.equal(Object.isFrozen(stopped.capability), true);
+  assert.equal(Object.isFrozen(stopped), true);
+  assert.deepEqual(Reflect.ownKeys(stopped), [
+    "capability",
+    "evidence",
+    "resolution",
+    "stop",
+  ]);
+  assert.deepEqual(stopped.resolution, resolved);
+  assert.equal(stopped.evidence.status, "complete-stopped");
+  assert.equal(stopped.evidence.proofId, resolved.stopOperationId);
+  assert.equal(stopped.stop.status, "committed");
+  assertCommittedWriterLaunchStopTransitionProof({
+    after: stopped.stop.session,
+    before: stopped.stop.operation.expectedSession,
+    operation: stopped.stop.operation,
+    reservation: stopped.stop.reservation,
+  });
+  assert.deepEqual(
+    value.facade.resolveStoppedWriter(resolverInput(value)),
+    resolved,
+  );
+});
+
+test("stop finalization acknowledgement loss replays without a second physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopFinalizeThrowAfterCommit = true;
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.finalized, false);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 2);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.authority.stopState, "committed");
+});
+
+test("same-process stop claim acknowledgement loss proves starting before physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const readsBeforeStop = value.events.filter(
+    (entry) => entry === "authority.read-session",
+  ).length;
+  value.authority.behaviour.stopClaimThrowAfterCommit = true;
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.finalized, true);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(
+    value.events.filter((entry) => entry === "authority.read-session").length -
+      readsBeforeStop,
+    1,
+  );
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+});
+
+test("exact stop replay resumes a retained prepared operation before physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopReserveThrowAfterCommit = true;
+  value.authority.behaviour.stopReconcileThrowsOnce = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "prepared");
+  assert.equal(value.supervisorStopCalls, 0);
+  assert.equal(value.authority.calls.stopClaim, 0);
+
+  const stopped = await value.facade.stopWriterForCapture(resolverInput(value));
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.authority.calls.reserve, 2);
+  assert.equal(value.authority.calls.stopReconcile, 2);
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.supervisorStopCalls, 1);
+});
+
+test("exact stop replay resumes acknowledged starting only before physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopClaimThrowAfterCommit = true;
+  value.authority.behaviour.stopReconcileThrowsOnce = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "starting");
+  assert.equal(value.supervisorStopCalls, 0);
+
+  const stopped = await value.facade.stopWriterForCapture(resolverInput(value));
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 2);
+  assert.equal(value.supervisorStopCalls, 1);
+});
+
+test("a starting stop without this record's claim witness never dispatches physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopReserveThrowAfterCommit = true;
+  value.authority.behaviour.stopReconcileThrowsOnce = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "prepared");
+  value.authority.stopState = "starting";
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.calls.stopClaim, 0);
+  assert.equal(value.supervisorStopCalls, 0);
+});
+
+test("malformed committed stop proof never yields a capability", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.stopFinalizationMutation = (receipt) => {
+    receipt.session.document.lastOperation.resultSha256 = "d".repeat(64);
+    return receipt;
+  };
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 2);
+  assert.equal(value.authority.calls.markUncertain, 1);
   assert.throws(
     () => value.facade.resolveStoppedWriter(resolverInput(value)),
     assertLauncherError("invalid_logical_writer_launch_request"),
   );
+});
+
+test("concurrent same-tuple stop calls issue one capability and stop once", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const capture = resolverInput(value);
+
+  const outcomes = await Promise.allSettled([
+    value.facade.stopWriterForCapture(capture),
+    value.facade.stopWriterForCapture(capture),
+  ]);
+  const fulfilled = outcomes.filter((outcome) => outcome.status === "fulfilled");
+  const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
+
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assertLauncherError("invalid_logical_writer_launch_request")(
+    rejected[0].reason,
+  );
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 1);
 });
 
 test("prepares one exact durable launch seed without consuming or reserving", async () => {
@@ -1884,42 +2436,74 @@ test("releases stopped launch indexes across repeated writer lifecycles", async 
       cycle.writerLease.fencingEpoch,
     );
 
-    const resolved = value.facade.resolveStoppedWriter(
+    const stopped = await value.facade.stopWriterForCapture(
       cycleResolverInput(value, cycle),
     );
-    const capability =
-      await value.stoppedWriterCoordinator.stopAndIssueCapability({
-        processIncarnationId: resolved.processIncarnationId,
-        stopOperationId: resolved.stopOperationId,
-        writer: resolved.writer,
-        writerIncarnationId: resolved.writerIncarnationId,
-      });
-
-    await assert.rejects(
-      value.facade.reconcileLaunchAttempt({
-        launchAttemptId: cycle.launchAttemptId,
-      }),
-      assertLauncherError("logical_writer_handle_unavailable"),
-    );
+    const resolved = stopped.resolution;
     await value.stoppedWriterCoordinator.consumeCapability({
       attachment: cycle.mounted,
       canonicalLease: cycle.writerLease,
-      capability,
+      capability: stopped.capability,
       processIncarnationId: resolved.processIncarnationId,
       runSnapshot: async () => `captured-${cycle.ordinal}`,
       stopOperationId: resolved.stopOperationId,
       writer: resolved.writer,
       writerIncarnationId: resolved.writerIncarnationId,
     });
-    value.stoppedWriterCoordinator.retireWriter({
-      processIncarnationId: resolved.processIncarnationId,
-      writer: resolved.writer,
-      writerIncarnationId: resolved.writerIncarnationId,
-    });
+    value.facade.retireStoppedWriter(resolved);
   }
 
   assert.equal(value.launchCalls, cycleCount);
   assert.equal(value.supervisorStopCalls, cycleCount);
+});
+
+test("retirement requires the exact stopped resolution and releases both indexes", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+  const resolution = stopped.resolution;
+
+  for (const candidate of [
+    {
+      ...resolution,
+      processIncarnationId: "process-incarnation-mismatch",
+    },
+    {
+      ...resolution,
+      stopOperationId: `writer-stop:${"f".repeat(64)}`,
+    },
+    {
+      ...resolution,
+      writer: Object.freeze(Object.create(null)),
+    },
+    {
+      ...resolution,
+      writerIncarnationId: "writer-incarnation-mismatch",
+    },
+  ]) {
+    assert.throws(
+      () => value.facade.retireStoppedWriter(candidate),
+      assertLauncherError("invalid_logical_writer_launch_request"),
+    );
+  }
+
+  await value.stoppedWriterCoordinator.consumeCapability({
+    attachment: attachment(),
+    canonicalLease: lease(),
+    capability: stopped.capability,
+    processIncarnationId: resolution.processIncarnationId,
+    runSnapshot: async () => "captured",
+    stopOperationId: resolution.stopOperationId,
+    writer: resolution.writer,
+    writerIncarnationId: resolution.writerIncarnationId,
+  });
+  assert.equal(value.facade.retireStoppedWriter(resolution), undefined);
+  assert.throws(
+    () => value.facade.resolveStoppedWriter(resolverInput(value)),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
 });
 
 test("keeps a failed stop fail-closed for successor launch registration", async () => {
@@ -1933,22 +2517,13 @@ test("keeps a failed stop fail-closed for successor launch registration", async 
     }),
   );
   assert.equal(started.status, "started");
-  const resolved = value.facade.resolveStoppedWriter(
-    cycleResolverInput(value, first),
-  );
-
   await assert.rejects(
-    value.stoppedWriterCoordinator.stopAndIssueCapability({
-      processIncarnationId: resolved.processIncarnationId,
-      stopOperationId: resolved.stopOperationId,
-      writer: resolved.writer,
-      writerIncarnationId: resolved.writerIncarnationId,
-    }),
-    (error) =>
-      error instanceof StoppedWriterCapabilityError &&
-      error.code === "writer_stop_outcome_uncertain",
+    value.facade.stopWriterForCapture(cycleResolverInput(value, first)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
   );
   assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.stopState, "uncertain");
+  assert.equal(value.authority.calls.markUncertain, 1);
   assert.throws(
     () => value.facade.resolveStoppedWriter(cycleResolverInput(value, first)),
     assertLauncherError("invalid_logical_writer_launch_request"),
@@ -1963,12 +2538,174 @@ test("keeps a failed stop fail-closed for successor launch registration", async 
         launchAttemptId: successor.launchAttemptId,
       }),
     ),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
   );
-  assert.equal(value.launchCalls, 2);
-  assert.equal(value.authority.state, "uncertain");
+  assert.equal(value.launchCalls, 1);
+  assert.equal(value.authority.state, "absent");
   assert.equal(value.authority.calls.finalizeStarted, 1);
   assert.equal(value.authority.calls.markUncertain, 1);
+});
+
+test("shared launch exclusion spans concurrent capture through explicit retirement", async () => {
+  const stoppedWriterCoordinator = new StoppedWriterCapabilityCoordinator();
+  const first = await fixture({ stoppedWriterCoordinator });
+  await first.facade.runLaunch(runInput(first));
+  const stopped = await first.facade.stopWriterForCapture(resolverInput(first));
+
+  const successor = await fixture({ stoppedWriterCoordinator });
+  const next = await prepareLaunchCycle(successor, 1, {
+    attachmentOverrides: {
+      attachmentId: "attachment-alternate-storage",
+      backendId: "alternate-backend",
+      operationId: "operation-attach-alternate-storage",
+      proofId: "proof-attachment-alternate-storage",
+      rootPath: "/var/lib/portable-codex/alternate-storage",
+      storageId: "volume-alternate",
+    },
+  });
+  const nextInput = runInput(successor, {
+    generation: next.generation,
+    imageReservation: next.imageReservation,
+    launchAttemptId: next.launchAttemptId,
+  });
+  await assert.rejects(
+    successor.facade.runLaunch(nextInput),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(successor.authority.calls.reserve, 0);
+  assert.equal(successor.authority.calls.claim, 0);
+  assert.equal(successor.launchCalls, 0);
+
+  let captureStarted;
+  const captureStartedPromise = new Promise((resolve) => {
+    captureStarted = resolve;
+  });
+  let finishCapture;
+  const finishCapturePromise = new Promise((resolve) => {
+    finishCapture = resolve;
+  });
+  const resolution = stopped.resolution;
+  const consuming = stoppedWriterCoordinator.consumeCapability({
+    attachment: attachment(),
+    canonicalLease: lease(),
+    capability: stopped.capability,
+    processIncarnationId: resolution.processIncarnationId,
+    runSnapshot: async () => {
+      captureStarted();
+      await finishCapturePromise;
+      return "captured";
+    },
+    stopOperationId: resolution.stopOperationId,
+    writer: resolution.writer,
+    writerIncarnationId: resolution.writerIncarnationId,
+  });
+  await captureStartedPromise;
+  await assert.rejects(
+    successor.facade.runLaunch(nextInput),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(successor.authority.calls.reserve, 0);
+  assert.equal(successor.launchCalls, 0);
+
+  finishCapture();
+  assert.equal(await consuming, "captured");
+  await assert.rejects(
+    successor.facade.runLaunch(nextInput),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(successor.authority.calls.reserve, 0);
+  assert.equal(successor.launchCalls, 0);
+
+  first.facade.retireStoppedWriter(resolution);
+  const launched = await successor.facade.runLaunch(nextInput);
+  assert.equal(launched.status, "started");
+  assert.equal(successor.authority.calls.reserve, 1);
+  assert.equal(successor.authority.calls.claim, 1);
+  assert.equal(successor.launchCalls, 1);
+});
+
+test("shared session exclusion blocks prepared launch on another storage domain", async () => {
+  const stoppedWriterCoordinator = new StoppedWriterCapabilityCoordinator();
+  const blockerLease = lease();
+  stoppedWriterCoordinator.registerWriter({
+    attachment: attachment(blockerLease, {
+      attachmentId: "attachment-blocker",
+      backendId: "blocker-backend",
+      operationId: "operation-attach-blocker",
+      proofId: "proof-attachment-blocker",
+      rootPath: "/var/lib/portable-codex/blocker",
+      storageId: "volume-blocker",
+    }),
+    canonicalLease: blockerLease,
+    processIncarnationId: "process-incarnation-blocker",
+    stopWriter: async () => STOPPED_WRITER_STOP_CONFIRMED,
+    writerIncarnationId: "writer-incarnation-blocker",
+  });
+  const value = await fixture({ stoppedWriterCoordinator });
+  seedPreparedLaunchHandoff(value);
+  const inspectionsBefore = value.inspectionCount;
+
+  await assert.rejects(
+    value.facade.runPreparedLaunch(preparedRunInput(value)),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.inspectionCount, inspectionsBefore);
+});
+
+test("stop operation identity binds every canonical capture tuple member", async () => {
+  const value = await fixture();
+  const capture = resolverInput(value);
+  const base = derivePostgresLogicalWriterStopOperationId({
+    ...capture,
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+  });
+  const changedCheckpoint = derivePostgresLogicalWriterStopOperationId({
+    ...capture,
+    checkpoint: {
+      ...capture.checkpoint,
+      createdAt: "2026-08-04T11:00:01.000Z",
+    },
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+  });
+  const changedRequest = derivePostgresLogicalWriterStopOperationId({
+    ...capture,
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+    request: {
+      ...capture.request,
+      operationId: "checkpoint-capture-operation-002",
+    },
+  });
+
+  assert.match(base, /^writer-stop:[0-9a-f]{64}$/u);
+  assert.notEqual(changedCheckpoint, base);
+  assert.notEqual(changedRequest, base);
+  assert.notEqual(changedCheckpoint, changedRequest);
+
+  const revoked = Proxy.revocable(
+    { ...capture, launchAttemptId: LAUNCH_ATTEMPT_ID },
+    {},
+  );
+  revoked.revoke();
+  assert.throws(
+    () => derivePostgresLogicalWriterStopOperationId(revoked.proxy),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+});
+
+test("stop request rejects a revoked envelope before physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const revoked = Proxy.revocable(resolverInput(value), {});
+  revoked.revoke();
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(revoked.proxy),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.supervisorStopCalls, 0);
+  assert.equal(value.authority.calls.stopClaim, 0);
 });
 
 test("resolver binds the complete attachment and one deterministic capture operation", async () => {
@@ -2028,11 +2765,13 @@ test("resolver binds the complete attachment and one deterministic capture opera
 
 test("uses the captured base registration intrinsic instead of a subclass override", async () => {
   hostileRegisterWriterCalls = 0;
+  hostileLaunchAdmissionCalls = 0;
   const stoppedWriterCoordinator = new HostileStoppedWriterCoordinator();
   const value = await fixture({ stoppedWriterCoordinator });
 
   const result = await value.facade.runLaunch(runInput(value));
   assert.equal(result.status, "started");
+  assert.equal(hostileLaunchAdmissionCalls, 0);
   assert.equal(hostileRegisterWriterCalls, 0);
   const resolved = value.facade.resolveStoppedWriter(resolverInput(value));
   assert.strictEqual(resolved.writer, result.writer);
@@ -2119,7 +2858,7 @@ test("keeps launch behavior stable after selected mutable intrinsics are poisone
   assert.equal(result.status, "started");
 });
 
-test("registration conflict after launch marks uncertainty without finalization", async () => {
+test("preexisting writer blocks before durable reservation or physical launch", async () => {
   const value = await fixture({ reconcileStatus: "complete-stopped" });
   value.stoppedWriterCoordinator.registerWriter({
     attachment: attachment(),
@@ -2131,22 +2870,19 @@ test("registration conflict after launch marks uncertainty without finalization"
 
   await assert.rejects(
     value.facade.runLaunch(runInput(value)),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
   );
-  assert.equal(value.launchCalls, 1);
-  assert.equal(value.authority.state, "uncertain");
-  assert.equal(value.authority.calls.markUncertain, 1);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.authority.state, "absent");
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.authority.calls.claim, 0);
+  assert.equal(value.authority.calls.markUncertain, 0);
   assert.equal(value.authority.calls.finalizeStarted, 0);
   assert.equal(value.authority.calls.finalizeStopped, 0);
   assert.throws(
     () => value.facade.resolveStoppedWriter(resolverInput(value)),
     assertLauncherError("invalid_logical_writer_launch_request"),
   );
-  const recovered = await value.facade.reconcileLaunchAttempt({
-    launchAttemptId: LAUNCH_ATTEMPT_ID,
-  });
-  assert.equal(recovered.status, "complete-stopped");
-  assert.equal(recovered.writer, null);
 });
 
 test("runLaunch rejects an operation-ID replay with a different durable request", async () => {
