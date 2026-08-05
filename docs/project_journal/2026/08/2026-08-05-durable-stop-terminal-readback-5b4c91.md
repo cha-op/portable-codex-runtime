@@ -54,8 +54,9 @@ uncertain and cannot issue a capability.
 ## Validation
 
 - Node.js `v24.18.0` syntax checks passed for the launcher and its test file.
-- The launcher test file passed 114/114, including persistent acknowledgement
-  loss, persistent malformed output, and six fail-closed relation-drift cases.
+- The launcher test file passed 115/115, including persistent acknowledgement
+  loss, persistent malformed output, a genuinely non-committed terminal
+  readback, and six fail-closed relation-drift cases.
 - The launcher plus durable stop/capture composition tests passed together.
 - The complete Node test suite passed with exit 0 while Codex was excluded
   from `PATH`; the app-server auth file separately reported 42 passed and 2

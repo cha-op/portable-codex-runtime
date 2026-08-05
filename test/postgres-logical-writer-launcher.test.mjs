@@ -2163,6 +2163,27 @@ test("persistent malformed stop finalization uses exact terminal readback", asyn
   );
 });
 
+test("fresh non-committed stop readback fails closed after finalization exhaustion", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopFinalizeThrowBeforeCommit = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 3);
+  assert.equal(value.authority.calls.stopReconcile, 4);
+  assert.equal(value.authority.calls.markUncertain, 1);
+  assert.equal(value.authority.stopState, "uncertain");
+  assert.throws(
+    () => value.facade.resolveStoppedWriter(resolverInput(value)),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+});
+
 const committedStopReadbackDriftCases = [
   ["request", (receipt) => {
     receipt.operation.request.launch.supervisorId = "foreign-supervisor";
