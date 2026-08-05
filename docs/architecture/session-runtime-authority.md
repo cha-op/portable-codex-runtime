@@ -1293,21 +1293,27 @@ create an operational recovery service, or enable production restore.
 
 The launcher foundation and atomic handoff close the process-local
 image-consumption, external launch, provisional registration, no-relaunch
-reconciliation, and committed-generation-to-prepared-launch crash boundaries.
-They do not yet compose the complete production restore protocol. Later serial
-pull requests must:
+reconciliation, and logical generation-to-launch reservation boundaries for
+an already authoritative attachment. They do not prove that a newly published
+restore destination is that attachment, and they do not yet compose the
+complete production restore protocol. Later serial pull requests must:
 
+- route the current writer's complete stop through `writer-launch-stop-v1`,
+  retain the exact supervisor proof, and physically fence and detach the old
+  attachment before any restored attachment can become launch authority;
 - pass one typed destination generation and its exact coordinator binding
-  through physical publication, then verify the committed result before
-  treating it as usable;
+  through physical publication to an independent detached, absent final
+  pathname, then verify the committed object before treating it as usable;
+- obtain provider-backed attachment evidence for that exact committed object
+  and atomically replace the canonical session and prepared launch attachment.
+  Pathname equality is correlation only and cannot prove attachment authority
+  or filesystem object identity;
 - dispatch the already-reserved launch with the original image reservation, or
   with a newly minted exact-match reservation while it is still durably
   `prepared`, and route every active attempt without another launch;
 - compose bounded generation, prepared-launch, active-attempt, and
   current-launch recovery into an operational service;
-- route the coordinator's complete stop through `writer-launch-stop-v1` and
-  persist the exact supervisor proof before treating the writer as stopped or
-  admitting capture; and
+- join the durable stop proof to later capture admission; and
 - wire the whole protocol into `runRestore()` only after every uncertain
   publication, launch, registration, stop, and finalisation boundary remains
   fail-closed.
