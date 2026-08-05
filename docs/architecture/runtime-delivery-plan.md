@@ -207,36 +207,24 @@ Restore and launcher authority are now split into eight serial pull requests:
      version 2 restore operation has progressed beyond `prepared`: only an
      undispatched request can safely receive the missing pre-publication
      registry claim.
-6. **Restore publication-to-launch composition (complete)**
-   - Default fresh version 2 authority creation to disabled and enable it only
-     through an explicit startup option after fleet compatibility is
-     confirmed. Apply that gate only to absent operation creation so existing
-     replay, finalisation, and recovery remain available.
-   - Add a separately gated, production-neutral facade that first reads exact
-     durable restore state, applies its invocation-time fleet gate only to an
-     absent operation, and prepares the filesystem and launch intent outside
-     the PostgreSQL operation guard. Hold that guard across typed re-read,
-     claim, one physical publication callback, independent committed-state
-     verification, and atomic handoff, then release it before invoking
-     `runPreparedLaunch()` on the already-reserved attempt. Revalidate the
-     complete handoff receipt, re-prove guard ownership before an
-     acknowledgement-loss retry, and validate the complete durable started
-     result rather than accepting an attempt ID projection.
-   - Negotiate restore callback contract v3 to pass the authority's full
-     generation binding unchanged through the stopped-directory backend and
-     publication journal, with an explicit fresh-or-replay versus
-     committed-only mode. Retain callback contract v2 only for committed
-     read-only replay through its internally derived four-field version 1
-     binding; it cannot authorize fresh publication or replace typed
-     generation identity.
-   - Keep `createPostgresCheckpointMutationAuthority().runRestore()`
-     fail-closed. The standalone facade proves composition order but is not
-     production enablement.
-7. **Durable stop and recovery composition**
+6. **Durable stop and capture composition**
+   - Gate version 2 creation on confirmed fleet-wide authority and recovery
+     compatibility before production can persist the new request shape.
    - Route exact coordinator stop confirmation through
-     `writer-launch-stop-v1`, retain only the local
-     capability state that can still prove writer identity, and join that stop
-     proof to later capture admission.
+     `writer-launch-stop-v1`, retain only the local capability state that can
+     still prove writer identity, and join that stop proof to later capture
+     admission.
+7. **Detached restore activation and recovery composition**
+   - Keep the absent restore-publication destination independent from the
+     current active attachment. After exact committed publication, obtain
+     provider-backed attachment evidence for that object and atomically
+     replace the canonical session attachment while materializing the exact
+     prepared launch request.
+   - Require the old attachment to be stopped, fenced, and detached before
+     activation. Pathname equality is correlation only and never proves
+     attachment authority or filesystem object identity.
+   - Verify committed restore publication against the detached destination
+     and activated attachment before any prepared launch can proceed.
    - Compose bounded generation, prepared-launch, active-attempt, and
      current-launch recovery without relaunching or reconstructing an opaque
      image or writer capability from serialized state.

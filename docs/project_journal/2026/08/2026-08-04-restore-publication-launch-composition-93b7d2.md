@@ -1,18 +1,23 @@
 ---
 id: 20260804-93b7d2
 title: Restore Publication-to-Launch Composition
-status: completed
+status: superseded
 created: 2026-08-04
 updated: 2026-08-05
 branch: wip/restore-publication-launch-composition
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/27
 supersedes: []
-superseded_by:
+superseded_by: 20260805-4c7a91
 ---
 
 # Restore Publication-to-Launch Composition
 
 ## Summary
+
+> [!IMPORTANT]
+> This workstream was reverted after review proved that it equated an existing
+> active attachment root with the absent final pathname required by restore
+> publication. See the superseding attachment-contract correction journal.
 
 Added a production-neutral composition facade (a standalone implementation not
 wired into the production checkpoint adapter) for the ordered restore path:
