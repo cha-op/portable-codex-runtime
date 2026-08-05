@@ -28,6 +28,9 @@ exercise a legal storage state.
 
 - Preserve PR #26's durable atomic generation-to-prepared-launch handoff and
   logical launcher foundations.
+- Preserve the current-state description of PR #26's migration version 3
+  operation-ID registry; the facade revert does not remove that retained
+  schema or its dispatch trigger.
 - Remove PR #27's facade and callback-contract changes instead of leaving a
   large fresh path unreachable or retaining synthetic authorization tests.
 - Keep production restore unavailable; no enabled production path regressed.

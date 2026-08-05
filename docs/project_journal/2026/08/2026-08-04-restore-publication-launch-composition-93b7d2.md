@@ -18,6 +18,8 @@ superseded_by: 20260805-4c7a91
 > This workstream was reverted after review proved that it equated an existing
 > active attachment root with the absent final pathname required by restore
 > publication. See the superseding attachment-contract correction journal.
+> The remaining present-tense prose is preserved as a historical record of the
+> PR #27 tree at merge commit `65559ea`; it does not describe the current tree.
 
 Added a production-neutral composition facade (a standalone implementation not
 wired into the production checkpoint adapter) for the ordered restore path:
@@ -28,7 +30,7 @@ generation binding unchanged through the stopped-directory backend and
 publication journal, while production `runRestore()` remains intentionally
 unavailable.
 
-## Current State
+## Historical State at `65559ea`
 
 - `PostgresSessionAuthority` accepts
   `restoreLaunchV2FleetCompatible: true` only as an explicit startup decision.
@@ -120,7 +122,7 @@ unavailable.
   still fails with `postgres_checkpoint_restore_unavailable` without invoking
   its publication callback.
 
-## Safety Decisions
+## Historical Safety Decisions at `65559ea`
 
 - The protected property is an unbroken one-to-one chain from the fresh
   version 2 restore operation, through its authority-owned generation binding
@@ -179,7 +181,7 @@ unavailable.
   admission, bounded operational recovery, a concrete container driver, or
   production adapter enablement.
 
-## Next Steps
+## Historical Next Steps at `65559ea`
 
 1. Route exact coordinator stop confirmation through
    `writer-launch-stop-v1`, retain only same-process capability state that can
@@ -194,7 +196,7 @@ unavailable.
 4. Implement the later filesystem-image backend, differential export,
    retention, and cross-host recovery verification.
 
-## Non-Goals
+## Historical Non-Goals at `65559ea`
 
 - No production `runRestore()` enablement.
 - No durable stop-to-capture composition.
@@ -203,7 +205,7 @@ unavailable.
 - No filesystem-image backend.
 - No Git Summary implementation.
 
-## Evidence
+## Historical Evidence at `65559ea`
 
 - `src/postgres-restore-publication-launch-composition.mjs`
 - `src/postgres-session-authority.mjs`

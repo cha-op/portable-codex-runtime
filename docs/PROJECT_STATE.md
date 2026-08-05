@@ -126,16 +126,18 @@
   version 2 adds a permanent `restore_destination_generations` relation with
   independent generation and operation identities, same-session operation and
   checkpoint foreign keys, and exact authorized/committed row-shape
-  constraints.
+  constraints. Migration version 3 adds the permanent global operation-ID
+  registry, backfills direct operations, and requires a version 2 restore to
+  claim its launch-attempt ID before publication dispatch.
 - Typed restore-generation authority now reserves the exact
   `{checkpoint, request}` admission, claims one generation and
   destination-isolation proof under the database-clock lease and restore
   fence, and atomically finalises the committed generation with its operation,
   reservation, and session terminal anchor. Claim replay never grants a second
   dispatch; exact finalisation replay and bounded `starting`/`uncertain`
-  recovery remain available on the migration version 2 schema.
-- Typed durable writer-launch attempts now reuse the permanent operation and
-  reservation rows without migration version 3. One operation ID is also the
+  recovery remain available through the ordered migration chain.
+- Typed durable writer-launch attempts reuse the permanent operation and
+  reservation lifecycle rows. One globally registered operation ID is also the
   launch-attempt ID and binds a committed destination generation, exact
   attachment, stable lease and fence tuple, bounded measured-image projection,
   and trusted supervisor identity. Definite claim revalidates the generation's
