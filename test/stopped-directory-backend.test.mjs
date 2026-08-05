@@ -726,7 +726,9 @@ function createMutationAuthority(fixture, options = {}) {
         attachmentId: "attachment-restore-001",
         operationId: "operation-attach-restore-001",
         proofId: "proof-attachment-restore-001",
-        rootPath: fixture.destinationDirectory,
+        rootPath:
+          options.restoreGenerationBindingRootPath ??
+          fixture.destinationDirectory,
         storageId: RESTORE_STORAGE_ID,
       }),
       captureAttemptId: CAPTURE_ATTEMPT_ID,
@@ -2189,6 +2191,37 @@ test("adapter v3 rejects an explicit reduced restore generation binding", async 
     null,
   );
   assert.equal(await pathExists(fixture.destinationDirectory), false);
+});
+
+test("adapter v3 rejects a binding attachment root that differs from the restore destination", async (t) => {
+  const fixture = await createFixture(t, {
+    restoreGenerationBindingRootPath:
+      "/var/lib/portable-codex/restore/other-session",
+  });
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+  const publicationEventsBeforeRestore = fixture.observation.events.filter(
+    (event) => event.startsWith("publication:"),
+  );
+
+  await assert.rejects(
+    restoreCleanCheckpoint(restoreCoreOptions(fixture)),
+    (error) =>
+      error instanceof SessionSnapshotCoreError &&
+      error.code === "restore_outcome_uncertain",
+  );
+
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+  assert.deepEqual(
+    fixture.observation.events.filter((event) =>
+      event.startsWith("publication:"),
+    ),
+    publicationEventsBeforeRestore,
+  );
 });
 
 test("adapter v3 cannot downgrade to the legacy null generation binding", async (t) => {

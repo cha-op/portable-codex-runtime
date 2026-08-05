@@ -1975,6 +1975,18 @@ export function createPostgresRestorePublicationLaunchComposition(...args) {
         admission,
         outcomeCode,
       );
+      // Protected property: publication and writer launch must use the exact
+      // canonical directory named by the session attachment. Preparation and
+      // the initial attachment are already canonical absolute host paths, and
+      // normalizeGenerationBinding later binds the claim attachment exactly to
+      // this expected session attachment. This establishes the transitive
+      // destination -> initial attachment -> claim attachment identity chain
+      // before launch preparation or any durable operation begins.
+      ensure(
+        preparation.destination.directory ===
+          initial.session.document.attachment.rootPath,
+        outcomeCode,
+      );
       // Once the restore handoff is committed, its canonical request is the
       // durable launch-intent authority. Revalidating the one-use image
       // capability here would reject a legitimate replay after the writer

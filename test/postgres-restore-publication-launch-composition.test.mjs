@@ -320,7 +320,9 @@ function lease() {
   };
 }
 
-function attachment() {
+function attachment(
+  rootPath = "/var/lib/portable-codex/restore/session-001",
+) {
   const currentLease = lease();
   return {
     attachmentId: "attachment-restore-001",
@@ -333,7 +335,7 @@ function attachment() {
     mode: "read-write",
     operationId: "attachment-operation-001",
     proofId: "attachment-proof-001",
-    rootPath: "/var/lib/portable-codex/restore/session-001",
+    rootPath,
     sessionId: SESSION_ID,
     storageId: "volume-restore-001",
   };
@@ -341,12 +343,13 @@ function attachment() {
 
 function expectedSession(
   documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION,
+  attachmentRootPath = "/var/lib/portable-codex/restore/session-001",
 ) {
   return deepFreeze({
     createdAt: "2026-08-04T11:00:00.000Z",
     document: {
       activeOperation: null,
-      attachment: attachment(),
+      attachment: attachment(attachmentRootPath),
       backendCapabilities: {
         atomicPointInTimeCheckpoint: true,
         exclusiveWriterAttachment: true,
@@ -703,6 +706,7 @@ class MemoryAuthority {
       options.claimFailureBeforeDispatch === true;
     this.expectedSession = expectedSession(
       options.expectedDocumentVersion ?? SESSION_AUTHORITY_DOCUMENT_VERSION,
+      options.attachmentRootPath,
     );
     this.handoffFailures = options.handoffFailures ?? 0;
     this.handoffReceiptMutation = options.handoffReceiptMutation ?? null;
@@ -1358,6 +1362,8 @@ async function fixture(t, options = {}) {
   const authority = new MemoryAuthority(events, {
     ...options,
     artifactProof: publicationFixture.artifactProof,
+    attachmentRootPath:
+      options.attachmentRootPath ?? publicationFixture.destinationDirectory,
   });
   const launcher =
     options.launcherFactory?.({ authority, events, imageReservation }) ??
@@ -1527,6 +1533,30 @@ test("committed restore publication hands off atomically before prepared launch"
     "guard.exit",
     "launcher.run",
   ]);
+});
+
+test("attachment destination mismatch blocks publication and writer launch", async (t) => {
+  const value = await fixture(t, {
+    attachmentRootPath: "/var/lib/portable-codex/restore/other-session",
+  });
+
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(value.publicationCalls, 0);
+  assert.equal(value.authority.handoffCalls, 0);
+  assert.equal(value.launcher.runCalls, 0);
+  assert.equal(value.authority.phase, "absent");
+  assert.equal(value.events.includes("launcher.prepare"), false);
+  assert.equal(value.events.includes("guard.enter"), false);
+  assert.equal(value.events.includes("authority.reserve"), false);
+  assert.equal(value.events.includes("authority.claim"), false);
+  assert.equal(value.events.includes("publication.commit"), false);
+  assert.equal(value.events.includes("launcher.run"), false);
 });
 
 test("v2 expected session upgrades authority receipts to v3 without rewriting the operation input", async (t) => {

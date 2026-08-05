@@ -1231,6 +1231,10 @@ function restoreJournalBinding(context, request) {
     assertSessionAttachment(binding.attachment),
   );
   assertRobustAttachment(bindingAttachment, failUncertain);
+  // Protected property: the restore journal binding and publication plan must
+  // identify the exact same canonical attachment directory. Both paths have
+  // already passed their canonical absolute-path validators, so exact equality
+  // is the only relevant identity signal; filesystem metadata is not involved.
   ensureUncertain(
     binding.contractVersion === RESTORE_JOURNAL_BINDING_CONTRACT_VERSION &&
       binding.destinationState === "detached" &&
@@ -1247,6 +1251,7 @@ function restoreJournalBinding(context, request) {
       regexpTest(OPAQUE_ID_PATTERN, binding.generationId) &&
       sameFlatRecord(binding.checkpoint, request.checkpoint) &&
       sameMutationRequest(binding.request, request.request) &&
+      bindingAttachment.rootPath === context.destination.directory &&
       bindingAttachment.sessionId === request.request.sessionId &&
       bindingAttachment.backendId === request.request.backendId &&
       bindingAttachment.storageId === request.request.storageId &&

@@ -3,7 +3,7 @@ id: 20260804-93b7d2
 title: Restore Publication-to-Launch Composition
 status: completed
 created: 2026-08-04
-updated: 2026-08-04
+updated: 2026-08-05
 branch: wip/restore-publication-launch-composition
 pr:
 supersedes: []
@@ -55,7 +55,13 @@ unavailable.
 - Physical publication receives the authority-returned full generation
   binding plus the exact artefact, lease, storage, destination, path, and
   predetermined-result context. Its coordinator-binding digest must match the
-  same generation binding before handoff.
+  same generation binding before handoff. Before launch preparation or any
+  durable reserve/claim, the composition requires the prepared canonical
+  destination to equal the expected session attachment root; the authority
+  receipt later binds the claim attachment exactly to that expected
+  attachment. The stopped-directory backend independently enforces the same
+  canonical root equality for every version 3 journal binding before
+  publication.
 - Restore callback contract version 3 requires and validates that full
   generation binding plus an explicit publication mode, then passes the same
   frozen object unchanged to the publication journal. A legacy version 2
@@ -96,8 +102,11 @@ unavailable.
   after binding the target filesystem/root identity and probing candidate and
   final paths under the publication lock. A retained `materialized` candidate
   with an absent final path is proven `not-committed`; a final-only state after
-  rename remains `uncertain`. Verification performs no journal transition or
-  path mutation.
+  rename remains `uncertain`. The locked verifier may first construct an
+  internal `not-committed` error, but the outer publication boundary preserves
+  `publicationMayHaveOccurred` and reclassifies it as `uncertain` whenever the
+  final path was visible or absence was not proved. Verification performs no
+  journal transition or path mutation.
 - A failure before definite publication dispatch may cancel only the prepared
   restore. A failure after dispatch but before confirmed handoff leaves or
   marks durable uncertainty. A launch failure after handoff remains owned by
@@ -131,6 +140,12 @@ unavailable.
   from a reduced journal projection. Legacy version 1 compatibility is
   read-only and committed-only, so it cannot fabricate the coordinator digest
   required by a fresh typed version 2 generation.
+- Publication destination identity is the exact canonical path shared by the
+  prepared destination, expected session attachment, authority-validated claim
+  attachment, and backend journal binding. Both endpoints pass canonical
+  absolute-path validation before equality is checked; unrelated filesystem
+  timestamps, link counts, and inode metadata are not identity evidence for
+  this property.
 - The mutable preparation result is never retained as the image capability
   wrapper. Its four own data fields are sampled once into a frozen wrapper,
   preserving the opaque inner reservation identity while preventing a later
