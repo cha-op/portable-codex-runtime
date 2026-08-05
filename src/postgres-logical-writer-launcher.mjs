@@ -2326,6 +2326,90 @@ function normalizeStopFinalizationReceipt(
   });
 }
 
+function normalizeCommittedStopReadbackReceipt(
+  value,
+  baseInput,
+  claimToken,
+  expectedEvidence,
+  code,
+) {
+  const requestContractVersion = baseInput.request.contractVersion;
+  ensure(
+    requestContractVersion === WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+    code,
+  );
+  const receipt = exactDataObject(
+    value,
+    STOP_RECONCILE_RECEIPT_KEYS,
+    code,
+  );
+  ensure(
+    receipt.status === "committed" &&
+      typeof claimToken === "string" &&
+      regexpTest(UUID_PATTERN, claimToken) &&
+      receipt.claimTokenMatched === true &&
+      stopClaimTokenMatchesRequest(claimToken, baseInput.request, code),
+    code,
+  );
+
+  let transition;
+  try {
+    transition = assertCommittedWriterLaunchStopTransitionProof({
+      after: receipt.session,
+      before: baseInput.expectedSession,
+      operation: receipt.operation,
+      reservation: receipt.reservation,
+    });
+  } catch {
+    fail(code);
+  }
+  const operation = transition.operation;
+  ensure(
+    operation.operationId === baseInput.operationId &&
+      sameContent(operation.expectedSession, baseInput.expectedSession, code) &&
+      sameContent(operation.request, baseInput.request, code),
+    code,
+  );
+  const result = exactDataObject(
+    operation.result,
+    TERMINAL_RESULT_KEYS,
+    code,
+  );
+  const evidence = exactDataObject(result.evidence, EVIDENCE_KEYS, code);
+  ensure(
+    result.resultVersion === 1 &&
+      result.outcome === "writer-launch-stopped" &&
+      evidence.contractVersion === LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION &&
+      evidence.status === "complete-stopped" &&
+      evidence.launchAttemptId === baseInput.request.launch.launchAttemptId &&
+      evidence.processIncarnationId ===
+        baseInput.request.launch.processIncarnationId &&
+      evidence.supervisorId === baseInput.request.launch.supervisorId &&
+      evidence.writerIncarnationId ===
+        baseInput.request.launch.writerIncarnationId &&
+      evidence.proofId === baseInput.operationId &&
+      sameContent(evidence, expectedEvidence, code),
+    code,
+  );
+  const stop = exactFrozenRecord({
+    contractVersion: requestContractVersion,
+    launchAttemptId: baseInput.request.launch.launchAttemptId,
+    request: operation.request,
+    result: operation.result,
+    state: "committed",
+    stopOperationId: operation.operationId,
+  });
+  return exactFrozenRecord({
+    finalized: false,
+    launch: null,
+    operation,
+    reservation: transition.reservation,
+    session: transition.after,
+    status: "committed",
+    stop,
+  });
+}
+
 function operationInput(operation) {
   return exactFrozenRecord({
     expectedSession: operation.expectedSession,
@@ -3083,52 +3167,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
           supervisorId: record.supervisorId,
           writerIncarnationId: record.writerIncarnationId,
         });
-        let stopReceipt = null;
-        let expectedOperationRevision = "1";
-        for (
-          let attempt = 0;
-          attempt < STOP_FINALIZATION_MAX_ATTEMPTS && stopReceipt === null;
-          attempt += 1
-        ) {
-          const finalizationInput = exactFrozenRecord({
-            ...record.pendingStop.baseInput,
-            evidence: stopEvidence,
-            expectedOperationRevision,
-          });
-          try {
-            stopReceipt = normalizeStopFinalizationReceipt(
-              await invokeAsync(
-                authority,
-                "finalizeWriterLaunchStopped",
-                [finalizationInput],
-                outcomeCode,
-              ),
-              record.pendingStop.baseInput,
-              stopEvidence,
-              outcomeCode,
-            );
-          } catch {
-            try {
-              const phase = await reconcileStopOperation(
-                record.pendingStop.baseInput,
-                record.stopClaimToken,
-              );
-              ensure(
-                phase.claimTokenMatched === true &&
-                  (phase.status === "starting" ||
-                    phase.status === "uncertain"),
-                outcomeCode,
-              );
-              expectedOperationRevision =
-                phase.status === "uncertain" ? "2" : "1";
-            } catch {
-              // A committed readback intentionally fails the active-phase
-              // normalizer. Retrying the same predecessor revision then uses
-              // the authority's exact terminal replay without repeating stop.
-            }
-          }
-        }
-        ensure(stopReceipt !== null, outcomeCode);
+        const stopReceipt = await finalizeStopWithReadback(
+          record.pendingStop.baseInput,
+          record.stopClaimToken,
+          stopEvidence,
+        );
         await assertGuardHeld(record.pendingStop.probe, outcomeCode);
         record.stopEvidence = stopEvidence;
         record.stopReceipt = stopReceipt;
@@ -3800,13 +3843,88 @@ export function createPostgresLogicalWriterLauncher(...args) {
 
   async function reconcileStopOperation(baseInput, claimToken) {
     return normalizeStopReconcileReceipt(
-      await invokeAsync(
-        authority,
-        "reconcileWriterLaunchStopOperation",
-        [exactFrozenRecord({ ...baseInput, claimToken })],
-        outcomeCode,
-      ),
+      await readStopOperationReceipt(baseInput, claimToken),
       baseInput,
+      outcomeCode,
+    );
+  }
+
+  async function readStopOperationReceipt(baseInput, claimToken) {
+    return invokeAsync(
+      authority,
+      "reconcileWriterLaunchStopOperation",
+      [exactFrozenRecord({ ...baseInput, claimToken })],
+      outcomeCode,
+    );
+  }
+
+  async function finalizeStopWithReadback(
+    baseInput,
+    claimToken,
+    evidence,
+  ) {
+    let expectedOperationRevision = "1";
+    for (
+      let attempt = 0;
+      attempt < STOP_FINALIZATION_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      const finalizationInput = exactFrozenRecord({
+        ...baseInput,
+        evidence,
+        expectedOperationRevision,
+      });
+      try {
+        return normalizeStopFinalizationReceipt(
+          await invokeAsync(
+            authority,
+            "finalizeWriterLaunchStopped",
+            [finalizationInput],
+            outcomeCode,
+          ),
+          baseInput,
+          evidence,
+          outcomeCode,
+        );
+      } catch {
+        try {
+          const phaseReadback = snapshotData(
+            await readStopOperationReceipt(baseInput, claimToken),
+            outcomeCode,
+          );
+          const phase = normalizeStopReconcileReceipt(
+            phaseReadback,
+            baseInput,
+            outcomeCode,
+          );
+          ensure(
+            phase.claimTokenMatched === true &&
+              (phase.status === "starting" ||
+                phase.status === "uncertain"),
+            outcomeCode,
+          );
+          expectedOperationRevision =
+            phase.status === "uncertain" ? "2" : "1";
+        } catch {
+          // A committed receipt fails the active-phase normalizer and is
+          // accepted only by the exact terminal relation below.
+        }
+      }
+    }
+    let terminalReadback;
+    try {
+      terminalReadback = snapshotData(
+        await readStopOperationReceipt(baseInput, claimToken),
+        outcomeCode,
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    return normalizeCommittedStopReadbackReceipt(
+      terminalReadback,
+      baseInput,
+      claimToken,
+      evidence,
       outcomeCode,
     );
   }
