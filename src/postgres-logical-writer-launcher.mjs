@@ -2940,7 +2940,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       request: claim.attempt.request,
       state: "registering",
       stopBaseInput: null,
-      stopClaimAttemptedFor: null,
+      stopClaimDispatchWitnessFor: null,
       stopEvidence: null,
       stopReceipt: null,
       stopWriter: callbackReceipt.stopWriter,
@@ -3789,35 +3789,53 @@ export function createPostgresLogicalWriterLauncher(...args) {
               }
             }
 
-            let claimAttempted =
-              record.stopClaimAttemptedFor === stopOperation;
+            let hasClaimDispatchWitness =
+              record.stopClaimDispatchWitnessFor === stopOperation;
             if (phase.status === "prepared") {
-              record.stopClaimAttemptedFor = stopOperation;
-              claimAttempted = true;
+              record.stopClaimDispatchWitnessFor = null;
+              hasClaimDispatchWitness = false;
+              let claimValue;
+              let claimInvocationFailed = false;
               try {
+                claimValue = await invokeAsync(
+                  authority,
+                  "claimWriterLaunchStopDispatch",
+                  [
+                    exactFrozenRecord({
+                      ...baseInput,
+                      expectedOperationRevision: "0",
+                    }),
+                  ],
+                  outcomeCode,
+                );
+              } catch {
+                claimInvocationFailed = true;
+                record.stopClaimDispatchWitnessFor = stopOperation;
+                hasClaimDispatchWitness = true;
+                phase = await reconcileStopOperation(baseInput);
+                if (phase.status !== "starting") {
+                  record.stopClaimDispatchWitnessFor = null;
+                  hasClaimDispatchWitness = false;
+                }
+              }
+              if (!claimInvocationFailed) {
                 phase = normalizeStopClaimReceipt(
-                  await invokeAsync(
-                    authority,
-                    "claimWriterLaunchStopDispatch",
-                    [
-                      exactFrozenRecord({
-                        ...baseInput,
-                        expectedOperationRevision: "0",
-                      }),
-                    ],
-                    outcomeCode,
-                  ),
+                  claimValue,
                   baseInput,
                   outcomeCode,
                 );
-                ensure(phase.status === "starting", outcomeCode);
-              } catch {
-                phase = await reconcileStopOperation(baseInput);
+                ensure(
+                  phase.dispatchGranted === true &&
+                    phase.status === "starting",
+                  outcomeCode,
+                );
+                record.stopClaimDispatchWitnessFor = stopOperation;
+                hasClaimDispatchWitness = true;
               }
             }
             ensure(
               phase.status === "starting" &&
-                record.stopClaimAttemptedFor === stopOperation,
+                record.stopClaimDispatchWitnessFor === stopOperation,
               outcomeCode,
             );
 
@@ -3843,7 +3861,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 record.pendingStop = null;
                 record.state = "lost";
               }
-              if (claimAttempted) {
+              if (hasClaimDispatchWitness) {
                 await bestEffortMarkStopUncertain(
                   baseInput,
                   uncertaintyState,

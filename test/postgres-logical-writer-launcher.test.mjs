@@ -853,6 +853,20 @@ class MemoryLaunchAuthority {
     if (this.behaviour.stopClaimThrowBeforeCommit) {
       throw new Error("stop claim unavailable before commit");
     }
+    if (this.behaviour.stopClaimLosesPreparedRace) {
+      this.stopState = "starting";
+      const operation = this.stopOperation();
+      const reservation = this.stopReservation(operation);
+      return {
+        dispatchGranted: false,
+        launch: clone(this.stopBaseInput.request.launch),
+        operation,
+        reservation,
+        session: this.stopSession(operation, reservation),
+        status: "starting",
+        stop: this.stopRecord(operation),
+      };
+    }
     this.stopState = "starting";
     if (this.behaviour.stopClaimThrowAfterCommit) {
       throw new Error("lost stop claim acknowledgement");
@@ -1645,6 +1659,78 @@ test("same-process stop claim acknowledgement loss proves starting before physic
   );
   assert.equal(value.authority.calls.stopReconcile, 1);
   assert.equal(value.authority.calls.markUncertain, 0);
+});
+
+test("a pre-commit stop claim failure clears its witness before retry", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopClaimThrowBeforeCommit = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "prepared");
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.supervisorStopCalls, 0);
+
+  value.authority.behaviour.stopClaimThrowBeforeCommit = false;
+  const stopped = await value.facade.stopWriterForCapture(resolverInput(value));
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.authority.calls.stopClaim, 2);
+  assert.equal(value.authority.calls.stopReconcile, 2);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.supervisorStopCalls, 1);
+});
+
+test("a rejected stop claim witness cannot authorize a foreign starting state", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopClaimThrowBeforeCommit = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "prepared");
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.supervisorStopCalls, 0);
+
+  value.authority.stopState = "starting";
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.stopReconcile, 2);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.supervisorStopCalls, 0);
+});
+
+test("a lost stop claim race never authorizes physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopClaimLosesPreparedRace = true;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.stopState, "starting");
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.supervisorStopCalls, 0);
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.supervisorStopCalls, 0);
 });
 
 test("exact stop replay resumes a retained prepared operation before physical stop", async () => {

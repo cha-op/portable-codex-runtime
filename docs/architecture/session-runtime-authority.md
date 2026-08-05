@@ -1075,7 +1075,9 @@ composition confirms exact capture completion. The launcher caches the first
 frozen stop operation input. A retry reads that exact operation through
 `reconcileOperation()`: `prepared` may repeat claim, while `starting` may enter
 the first physical stop only when the retained record proves this facade
-previously attempted that exact claim and has not entered the coordinator.
+received the exact claim grant or lost that exact claim acknowledgement and
+has not entered the coordinator. An explicit non-grant never creates this
+witness.
 `uncertain`, `committed`, foreign, and cold-start state remain closed.
 
 The immutable historical launch attempt still says `started` after the stop

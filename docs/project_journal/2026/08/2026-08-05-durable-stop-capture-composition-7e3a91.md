@@ -31,9 +31,10 @@ detached-destination activation, and bounded restart recovery remain closed.
   frozen `{capability, evidence, resolution, stop}`.
 - The launcher retains the first exact stop operation input. Later calls use
   `reconcileOperation()` and proceed only from `prepared`, or from `starting`
-  with the same record's claim-attempt witness while it still proves the
-  coordinator and physical stop have not begun. It never repeats claim for
-  known `starting` state or synthesizes operation timestamps from a session.
+  with the same record's true-grant or thrown-acknowledgement witness while it
+  still proves the coordinator and physical stop have not begun. An explicit
+  non-grant never creates that witness. It never repeats claim for known
+  `starting` state or synthesizes operation timestamps from a session.
 - The composition independently derives the same stop ID from its prepared
   tuple before it accepts any receipt. A valid receipt for a different request
   or checkpoint is rejected before capture.
