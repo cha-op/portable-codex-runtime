@@ -389,6 +389,113 @@ test("durable stop composition retains v1 receipt compatibility", async () => {
   assert.equal(launcherFixture.calls.retire.length, 1);
 });
 
+test("stop callback cannot poison exact receipt binding", { concurrency: false }, async () => {
+  const { backend, calls: backendCalls } = createBackend();
+  const defineProperty = Object.defineProperty;
+  const objectIsDescriptor = Object.getOwnPropertyDescriptor(Object, "is");
+  const launcherFixture = createLauncher({
+    stop(_input, result) {
+      defineProperty(Object, "is", {
+        ...objectIsDescriptor,
+        value: () => true,
+      });
+      return deepFreeze({
+        ...result,
+        stop: {
+          ...result.stop,
+          operation: {
+            ...result.stop.operation,
+            request: {
+              ...result.stop.operation.request,
+              dispatchClaimSha256: "e".repeat(64),
+            },
+          },
+        },
+      });
+    },
+  });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  let failure = null;
+  try {
+    await composition.runCapture(captureOptions(backend));
+  } catch (error) {
+    failure = error;
+  } finally {
+    defineProperty(Object, "is", objectIsDescriptor);
+  }
+
+  assert(
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    )(failure),
+  );
+  assert.equal(launcherFixture.calls.stop.length, 1);
+  assert.equal(backendCalls.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+});
+
+test("stop callback cannot replace validated retirement resolution", { concurrency: false }, async () => {
+  const { backend, calls: backendCalls } = createBackend();
+  const defineProperty = Object.defineProperty;
+  const freezeDescriptor = Object.getOwnPropertyDescriptor(Object, "freeze");
+  const originalFreeze = freezeDescriptor.value;
+  const objectHasOwn = Object.hasOwn;
+  const foreignResolution = originalFreeze({ foreign: true });
+  let replacementCalls = 0;
+  const launcherFixture = createLauncher({
+    stop(_input, result) {
+      defineProperty(Object, "freeze", {
+        ...freezeDescriptor,
+        value(value) {
+          if (
+            value !== null &&
+            typeof value === "object" &&
+            objectHasOwn(value, "capability") &&
+            objectHasOwn(value, "evidence") &&
+            objectHasOwn(value, "resolution") &&
+            objectHasOwn(value, "stop")
+          ) {
+            replacementCalls += 1;
+            return { ...value, resolution: foreignResolution };
+          }
+          return originalFreeze(value);
+        },
+      });
+      return result;
+    },
+  });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  let result;
+  let failure = null;
+  try {
+    result = await composition.runCapture(captureOptions(backend));
+  } catch (error) {
+    failure = error;
+  } finally {
+    defineProperty(Object, "freeze", freezeDescriptor);
+  }
+
+  if (failure !== null) throw failure;
+  assert.equal(replacementCalls, 0);
+  assert.equal(backendCalls.length, 1);
+  assert.equal(launcherFixture.calls.retire.length, 1);
+  assert.strictEqual(
+    launcherFixture.calls.retire[0],
+    launcherFixture.defaultStopped.resolution,
+  );
+  assert.notStrictEqual(launcherFixture.calls.retire[0], foreignResolution);
+  assert.deepEqual(result, {
+    checkpoint: backendCalls[0].checkpoint,
+    mutation: mutationResult(backendCalls[0].request),
+  });
+});
+
 test("durable stop composition rejects caller-supplied stopped-writer evidence", async () => {
   const { backend, calls: backendCalls } = createBackend();
   const launcherFixture = createLauncher();

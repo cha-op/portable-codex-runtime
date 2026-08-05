@@ -16,10 +16,31 @@ import {
   compareFencingEpochs,
 } from "./session-storage-contracts.mjs";
 
+// Map membership, one-use state, and the captured backend function are the
+// dispatch authority. A stop collaborator must not replace those identities by
+// mutating shared intrinsics after preparation.
+const arrayEveryIntrinsic = Array.prototype.every;
+const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayIsArray = Array.isArray;
+const objectCreate = Object.create;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const objectIsFrozen = Object.isFrozen;
+const objectKeys = Object.keys;
+const objectPrototype = Object.prototype;
+const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
+const { isProxy: isProxyValue } = utilTypes;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapHasIntrinsic = WeakMap.prototype.has;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+
 // Each API dispatches at most once per invocation. The backend owns durable
 // operationId replay and must atomically recheck its authoritative writer fence.
 
-const CORE_ERROR_MESSAGES = Object.freeze({
+const CORE_ERROR_MESSAGES = objectFreeze({
   checkpoint_outcome_uncertain: "Checkpoint capture outcome is uncertain",
   checkpoint_reconciliation_outcome_uncertain:
     "Checkpoint capture reconciliation outcome is uncertain",
@@ -27,16 +48,36 @@ const CORE_ERROR_MESSAGES = Object.freeze({
   unsupported_checkpoint_class: "Checkpoint class is not supported by the clean snapshot core",
 });
 
+function weakMapGet(value, key) {
+  return reflectApply(weakMapGetIntrinsic, value, [key]);
+}
+
+function weakMapHas(value, key) {
+  return reflectApply(weakMapHasIntrinsic, value, [key]);
+}
+
+function weakMapSet(value, key, entry) {
+  reflectApply(weakMapSetIntrinsic, value, [key, entry]);
+}
+
+function arrayEvery(value, callback) {
+  return reflectApply(arrayEveryIntrinsic, value, [callback]);
+}
+
+function arrayIncludes(value, candidate) {
+  return reflectApply(arrayIncludesIntrinsic, value, [candidate]);
+}
+
 export class SessionSnapshotCoreError extends Error {
   constructor(code) {
-    if (!Object.hasOwn(CORE_ERROR_MESSAGES, code)) {
+    if (!objectHasOwn(CORE_ERROR_MESSAGES, code)) {
       throw new TypeError("unsupported session snapshot core error code");
     }
     super(CORE_ERROR_MESSAGES[code]);
     this.name = "SessionSnapshotCoreError";
     this.code = code;
     this.retryable = false;
-    Object.freeze(this);
+    objectFreeze(this);
   }
 }
 
@@ -50,10 +91,10 @@ function ensureContract(condition, code, message) {
 
 function assertExactOptions(value, keys, label) {
   if (
-    utilTypes.isProxy(value) ||
+    isProxyValue(value) ||
     value === null ||
     typeof value !== "object" ||
-    Array.isArray(value)
+    arrayIsArray(value)
   ) {
     failContract("invalid_checkpoint", `${label} must be a plain object`);
   }
@@ -61,33 +102,37 @@ function assertExactOptions(value, keys, label) {
   let prototype;
   let actual;
   try {
-    prototype = Object.getPrototypeOf(value);
-    actual = Reflect.ownKeys(value);
+    prototype = objectGetPrototypeOf(value);
+    actual = reflectOwnKeys(value);
   } catch {
     failContract("invalid_checkpoint", `${label} must be a plain object`);
   }
   ensureContract(
-    [Object.prototype, null].includes(prototype),
+    arrayIncludes([objectPrototype, null], prototype),
     "invalid_checkpoint",
     `${label} must be a plain object`,
   );
   ensureContract(
     actual.length === keys.length &&
-      actual.every((key) => typeof key === "string" && keys.includes(key)),
+      arrayEvery(
+        actual,
+        (key) => typeof key === "string" && arrayIncludes(keys, key),
+      ),
     "invalid_checkpoint",
     `${label} contains unexpected or missing fields`,
   );
 
-  const normalized = Object.create(null);
-  for (const key of actual) {
+  const normalized = objectCreate(null);
+  for (let index = 0; index < actual.length; index += 1) {
+    const key = actual[index];
     let descriptor;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(value, key);
+      descriptor = objectGetOwnPropertyDescriptor(value, key);
     } catch {
       failContract("invalid_checkpoint", `${label} fields must be plain data properties`);
     }
     ensureContract(
-      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
       "invalid_checkpoint",
       `${label} fields must be enumerable plain data properties`,
     );
@@ -170,8 +215,8 @@ function assertStoppedWriterEvidence(value) {
   ensureContract(
     value !== null &&
       typeof value === "object" &&
-      !utilTypes.isProxy(value) &&
-      !Array.isArray(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
     "invalid_checkpoint",
     "stopped writer evidence must be an opaque non-proxy object handle",
   );
@@ -222,7 +267,8 @@ function assertBackendCheckpointResult(
     storageRef === undefined ? { manifest } : { manifest, storageRef };
   const checkpoint = assertCheckpointDescriptor(envelope.checkpoint, checkpointOptions);
   ensureContract(
-    Object.keys(expectedCheckpoint).every(
+    arrayEvery(
+      objectKeys(expectedCheckpoint),
       (key) => checkpoint[key] === expectedCheckpoint[key],
     ),
     "invalid_checkpoint",
@@ -233,7 +279,7 @@ function assertBackendCheckpointResult(
 }
 
 function frozenResult(checkpoint, mutation) {
-  return Object.freeze({ checkpoint, mutation });
+  return objectFreeze({ checkpoint, mutation });
 }
 
 const preparedCleanCheckpointCaptures = new WeakMap();
@@ -323,7 +369,7 @@ export function prepareCleanCheckpointCapture(options) {
   );
 
   const capture = checkedBackendMethod(storageBackend, "captureCheckpoint");
-  const prepared = Object.freeze({
+  const prepared = objectFreeze({
     attachment: matched.attachment,
     backend: storageBackend,
     checkpoint,
@@ -331,7 +377,7 @@ export function prepareCleanCheckpointCapture(options) {
     request: mutationRequest,
     storageRef: matched.storageRef,
   });
-  preparedCleanCheckpointCaptures.set(prepared, {
+  weakMapSet(preparedCleanCheckpointCaptures, prepared, {
     capture,
     state: "prepared",
   });
@@ -352,14 +398,17 @@ export async function capturePreparedCleanCheckpoint(options) {
   ensureContract(
     preparedCapture !== null &&
       typeof preparedCapture === "object" &&
-      !utilTypes.isProxy(preparedCapture) &&
-      !Array.isArray(preparedCapture) &&
-      Object.isFrozen(preparedCapture) &&
-      preparedCleanCheckpointCaptures.has(preparedCapture),
+      !isProxyValue(preparedCapture) &&
+      !arrayIsArray(preparedCapture) &&
+      objectIsFrozen(preparedCapture) &&
+      weakMapHas(preparedCleanCheckpointCaptures, preparedCapture),
     "invalid_checkpoint",
     "prepared checkpoint capture is invalid",
   );
-  const preparedState = preparedCleanCheckpointCaptures.get(preparedCapture);
+  const preparedState = weakMapGet(
+    preparedCleanCheckpointCaptures,
+    preparedCapture,
+  );
   ensureContract(
     preparedState.state === "prepared",
     "invalid_checkpoint",
@@ -379,15 +428,14 @@ export async function capturePreparedCleanCheckpoint(options) {
   } = preparedCapture;
 
   try {
-    const result = await capture.call(
-      backend,
-      Object.freeze({
+    const result = await reflectApply(capture, backend, [
+      objectFreeze({
         attachment,
         checkpoint,
         request,
         stoppedWriterEvidence: writerEvidence,
       }),
-    );
+    ]);
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: checkpoint,
       manifest,
@@ -510,10 +558,9 @@ export async function reconcileCleanCheckpointCapture(options) {
     "reconcileCheckpointCapture",
   );
   try {
-    const result = await reconcile.call(
-      storageBackend,
-      Object.freeze({ checkpoint: descriptor, request: mutationRequest }),
-    );
+    const result = await reflectApply(reconcile, storageBackend, [
+      objectFreeze({ checkpoint: descriptor, request: mutationRequest }),
+    ]);
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: descriptor,
       manifest: sessionManifest,
@@ -588,10 +635,9 @@ export async function restoreCleanCheckpoint(options) {
 
   const restore = checkedBackendMethod(storageBackend, "restoreCheckpoint");
   try {
-    const result = await restore.call(
-      storageBackend,
-      Object.freeze({ checkpoint: descriptor, request: mutationRequest }),
-    );
+    const result = await reflectApply(restore, storageBackend, [
+      objectFreeze({ checkpoint: descriptor, request: mutationRequest }),
+    ]);
     return assertBackendCheckpointResult(result, {
       expectedCheckpoint: descriptor,
       manifest: sessionManifest,

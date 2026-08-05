@@ -350,6 +350,246 @@ test("prepared clean capture reuses the exact canonical tuple and descriptor", a
   assert.deepEqual(ordinaryResult.mutation, preparedResult.mutation);
 });
 
+test("prepared capture resists post-preparation intrinsic poisoning", { concurrency: false }, async () => {
+  const { backend, calls } = createBackend();
+  const options = captureOptions(backend);
+  const { stoppedWriterEvidence, ...preparationOptions } = options;
+  const preparedCapture = prepareCleanCheckpointCapture(preparationOptions);
+  const dispatchOptions = { preparedCapture, stoppedWriterEvidence };
+  const defineProperty = Object.defineProperty;
+  const objectHasOwn = Object.hasOwn;
+  const descriptors = {
+    captureCall: Object.getOwnPropertyDescriptor(
+      backend.captureCheckpoint,
+      "call",
+    ),
+    objectFreeze: Object.getOwnPropertyDescriptor(Object, "freeze"),
+    reflectApply: Object.getOwnPropertyDescriptor(Reflect, "apply"),
+    weakMapGet: Object.getOwnPropertyDescriptor(WeakMap.prototype, "get"),
+    weakMapHas: Object.getOwnPropertyDescriptor(WeakMap.prototype, "has"),
+    weakMapSet: Object.getOwnPropertyDescriptor(WeakMap.prototype, "set"),
+  };
+  const originalFreeze = descriptors.objectFreeze.value;
+  const forgedWriterEvidence = originalFreeze(Object.create(null));
+  const poisonCalls = [];
+  let forgedCaptureCalls = 0;
+  const poison = (name) =>
+    function poisonedIntrinsic() {
+      poisonCalls.push(name);
+      throw new Error(`mutable intrinsic used after preparation: ${name}`);
+    };
+  const replace = (target, key, descriptor, value) => {
+    defineProperty(target, key, { ...descriptor, value });
+  };
+  replace(
+    Object,
+    "freeze",
+    descriptors.objectFreeze,
+    function poisonedFreeze(value) {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        objectHasOwn(value, "stoppedWriterEvidence")
+      ) {
+        poisonCalls.push("Object.freeze");
+        return originalFreeze({
+          ...value,
+          stoppedWriterEvidence: forgedWriterEvidence,
+        });
+      }
+      return originalFreeze(value);
+    },
+  );
+  replace(Reflect, "apply", descriptors.reflectApply, poison("Reflect.apply"));
+  replace(
+    WeakMap.prototype,
+    "get",
+    descriptors.weakMapGet,
+    function poisonedWeakMapGet() {
+      poisonCalls.push("WeakMap.prototype.get");
+      return {
+        capture(_input) {
+          forgedCaptureCalls += 1;
+          return backendCheckpointResult(_input);
+        },
+        state: "prepared",
+      };
+    },
+  );
+  replace(
+    WeakMap.prototype,
+    "has",
+    descriptors.weakMapHas,
+    function poisonedWeakMapHas() {
+      poisonCalls.push("WeakMap.prototype.has");
+      return true;
+    },
+  );
+  replace(
+    WeakMap.prototype,
+    "set",
+    descriptors.weakMapSet,
+    poison("WeakMap.prototype.set"),
+  );
+  defineProperty(backend.captureCheckpoint, "call", {
+    configurable: true,
+    enumerable: false,
+    value(_receiver, input) {
+      poisonCalls.push("captureCheckpoint.call");
+      return backendCheckpointResult(input);
+    },
+    writable: true,
+  });
+
+  let result;
+  let replayFailure = null;
+  let failure = null;
+  try {
+    result = await capturePreparedCleanCheckpoint(dispatchOptions);
+    try {
+      await capturePreparedCleanCheckpoint(dispatchOptions);
+    } catch (error) {
+      replayFailure = error;
+    }
+  } catch (error) {
+    failure = error;
+  } finally {
+    defineProperty(Object, "freeze", descriptors.objectFreeze);
+    defineProperty(Reflect, "apply", descriptors.reflectApply);
+    defineProperty(WeakMap.prototype, "get", descriptors.weakMapGet);
+    defineProperty(WeakMap.prototype, "has", descriptors.weakMapHas);
+    defineProperty(WeakMap.prototype, "set", descriptors.weakMapSet);
+    if (descriptors.captureCall === undefined) {
+      delete backend.captureCheckpoint.call;
+    } else {
+      defineProperty(
+        backend.captureCheckpoint,
+        "call",
+        descriptors.captureCall,
+      );
+    }
+  }
+
+  assert.deepEqual(poisonCalls, []);
+  if (failure !== null) throw failure;
+  assert(
+    replayFailure instanceof SessionStorageContractError &&
+      replayFailure.code === "invalid_checkpoint",
+  );
+  assert.equal(forgedCaptureCalls, 0);
+  assert.equal(calls.capture.length, 1);
+  assert.strictEqual(
+    calls.capture[0].stoppedWriterEvidence,
+    stoppedWriterEvidence,
+  );
+  assert.deepEqual(result, backendCheckpointResult(calls.capture[0]));
+});
+
+test("capture preparation resists targeted WeakMap.set poisoning", { concurrency: false }, async () => {
+  const { backend, calls } = createBackend();
+  const options = captureOptions(backend);
+  const { stoppedWriterEvidence, ...preparationOptions } = options;
+  const defineProperty = Object.defineProperty;
+  const reflectApply = Reflect.apply;
+  const setDescriptor = Object.getOwnPropertyDescriptor(
+    WeakMap.prototype,
+    "set",
+  );
+  const originalSet = setDescriptor.value;
+  let poisonCalls = 0;
+  let preparedCapture;
+
+  defineProperty(WeakMap.prototype, "set", {
+    ...setDescriptor,
+    value(key, value) {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        value.state === "prepared" &&
+        typeof value.capture === "function"
+      ) {
+        poisonCalls += 1;
+        throw new Error("prepared capture state intercepted");
+      }
+      return reflectApply(originalSet, this, [key, value]);
+    },
+  });
+  try {
+    preparedCapture = prepareCleanCheckpointCapture(preparationOptions);
+  } finally {
+    defineProperty(WeakMap.prototype, "set", setDescriptor);
+  }
+
+  assert.equal(poisonCalls, 0);
+  const result = await capturePreparedCleanCheckpoint({
+    preparedCapture,
+    stoppedWriterEvidence,
+  });
+  assert.equal(calls.capture.length, 1);
+  assert.deepEqual(result, backendCheckpointResult(calls.capture[0]));
+});
+
+test("dispatch envelope cannot substitute another real prepared token", { concurrency: false }, async () => {
+  const first = createBackend();
+  const second = createBackend();
+  const firstOptions = captureOptions(first.backend);
+  const secondOptions = captureOptions(second.backend);
+  const {
+    stoppedWriterEvidence,
+    ...firstPreparationOptions
+  } = firstOptions;
+  const {
+    stoppedWriterEvidence: _secondStoppedWriterEvidence,
+    ...secondPreparationOptions
+  } = secondOptions;
+  const preparedCapture = prepareCleanCheckpointCapture(
+    firstPreparationOptions,
+  );
+  const substituteCapture = prepareCleanCheckpointCapture(
+    secondPreparationOptions,
+  );
+  const dispatchOptions = { preparedCapture, stoppedWriterEvidence };
+  const defineProperty = Object.defineProperty;
+  const descriptor = Object.getOwnPropertyDescriptor(
+    Object,
+    "getOwnPropertyDescriptor",
+  );
+  const originalGetOwnPropertyDescriptor = descriptor.value;
+  let poisonCalls = 0;
+
+  defineProperty(Object, "getOwnPropertyDescriptor", {
+    ...descriptor,
+    value(value, key) {
+      if (value === dispatchOptions && key === "preparedCapture") {
+        poisonCalls += 1;
+        return {
+          ...originalGetOwnPropertyDescriptor(value, key),
+          value: substituteCapture,
+        };
+      }
+      return originalGetOwnPropertyDescriptor(value, key);
+    },
+  });
+  let result;
+  let failure = null;
+  try {
+    result = await capturePreparedCleanCheckpoint(dispatchOptions);
+  } catch (error) {
+    failure = error;
+  } finally {
+    defineProperty(Object, "getOwnPropertyDescriptor", descriptor);
+  }
+
+  if (failure !== null) throw failure;
+  assert.equal(poisonCalls, 0);
+  assert.equal(first.calls.capture.length, 1);
+  assert.equal(second.calls.capture.length, 0);
+  assert.deepEqual(
+    result,
+    backendCheckpointResult(first.calls.capture[0]),
+  );
+});
+
 test("a failed prepared capture token cannot dispatch a second time", async () => {
   const { backend, calls } = createBackend({
     capture() {

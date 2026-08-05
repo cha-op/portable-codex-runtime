@@ -8,17 +8,33 @@ import {
   derivePostgresLogicalWriterStopOperationId,
 } from "./postgres-logical-writer-launcher.mjs";
 
+// The validated receipt and retirement resolution must remain bound to the
+// stopped writer even when the stop collaborator mutates shared intrinsics.
+const arrayEveryIntrinsic = Array.prototype.every;
+const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayIsArray = Array.isArray;
+const arraySomeIntrinsic = Array.prototype.some;
+const objectCreate = Object.create;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const objectIs = Object.is;
+const objectIsFrozen = Object.isFrozen;
+const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const promiseSpeciesSymbol = Symbol.species;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApply = Reflect.apply;
+const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const {
   isGeneratorObject: isGeneratorObjectValue,
   isPromise: isPromiseValue,
+  isProxy: isProxyValue,
 } = utilTypes;
 
-const ERROR_MESSAGES = Object.freeze({
+const ERROR_MESSAGES = objectFreeze({
   invalid_postgres_durable_stop_capture_composition_options:
     "PostgreSQL durable stop and capture composition options are invalid",
   invalid_postgres_durable_stop_capture_composition_request:
@@ -29,7 +45,7 @@ const ERROR_MESSAGES = Object.freeze({
     "PostgreSQL durable stop and capture retirement outcome is uncertain",
 });
 
-const EVIDENCE_KEYS = Object.freeze([
+const EVIDENCE_KEYS = objectFreeze([
   "contractVersion",
   "launchAttemptId",
   "processIncarnationId",
@@ -38,20 +54,20 @@ const EVIDENCE_KEYS = Object.freeze([
   "supervisorId",
   "writerIncarnationId",
 ]);
-const RESOLUTION_KEYS = Object.freeze([
+const RESOLUTION_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
   "processIncarnationId",
   "stopOperationId",
   "writer",
   "writerIncarnationId",
 ]);
-const STOP_RESULT_KEYS = Object.freeze([
+const STOP_RESULT_KEYS = objectFreeze([
   "capability",
   "evidence",
   "resolution",
   "stop",
 ]);
-const STOP_RECEIPT_KEYS = Object.freeze([
+const STOP_RECEIPT_KEYS = objectFreeze([
   "status",
   "session",
   "operation",
@@ -60,7 +76,7 @@ const STOP_RECEIPT_KEYS = Object.freeze([
   "launch",
   "stop",
 ]);
-const STOP_RECORD_KEYS = Object.freeze([
+const STOP_RECORD_KEYS = objectFreeze([
   "contractVersion",
   "launchAttemptId",
   "request",
@@ -68,19 +84,19 @@ const STOP_RECORD_KEYS = Object.freeze([
   "state",
   "stopOperationId",
 ]);
-const STOP_TERMINAL_RESULT_KEYS = Object.freeze([
+const STOP_TERMINAL_RESULT_KEYS = objectFreeze([
   "evidence",
   "outcome",
   "resultVersion",
 ]);
-const STOP_REQUEST_V1_KEYS = Object.freeze(["contractVersion", "launch"]);
-const STOP_REQUEST_V2_KEYS = Object.freeze([
+const STOP_REQUEST_V1_KEYS = objectFreeze(["contractVersion", "launch"]);
+const STOP_REQUEST_V2_KEYS = objectFreeze([
   "contractVersion",
   "dispatchClaimSha256",
   "launch",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
-const CAPTURE_OPTION_KEYS = Object.freeze([
+const CAPTURE_OPTION_KEYS = objectFreeze([
   "attachment",
   "backend",
   "canonicalLease",
@@ -94,7 +110,7 @@ const CAPTURE_OPTION_KEYS = Object.freeze([
 
 export class PostgresDurableStopCaptureCompositionError extends Error {
   constructor(code) {
-    if (!Object.hasOwn(ERROR_MESSAGES, code)) {
+    if (!objectHasOwn(ERROR_MESSAGES, code)) {
       throw new TypeError(
         "Unsupported PostgreSQL durable stop and capture composition error",
       );
@@ -103,7 +119,7 @@ export class PostgresDurableStopCaptureCompositionError extends Error {
     this.name = "PostgresDurableStopCaptureCompositionError";
     this.code = code;
     this.retryable = false;
-    Object.freeze(this);
+    objectFreeze(this);
   }
 }
 
@@ -119,41 +135,55 @@ function regexpTest(pattern, value) {
   return reflectApply(regexpExecIntrinsic, pattern, [value]) !== null;
 }
 
+function arrayEvery(value, callback) {
+  return reflectApply(arrayEveryIntrinsic, value, [callback]);
+}
+
+function arrayIncludes(value, candidate) {
+  return reflectApply(arrayIncludesIntrinsic, value, [candidate]);
+}
+
+function arraySome(value, callback) {
+  return reflectApply(arraySomeIntrinsic, value, [callback]);
+}
+
 function exactDataObject(value, keys, code, { frozen = false } = {}) {
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !utilTypes.isProxy(value) &&
-      !Array.isArray(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
     code,
   );
   let prototype;
   let actualKeys;
   try {
-    prototype = Object.getPrototypeOf(value);
-    actualKeys = Reflect.ownKeys(value);
+    prototype = objectGetPrototypeOf(value);
+    actualKeys = reflectOwnKeys(value);
   } catch {
     fail(code);
   }
   ensure(
-    (prototype === Object.prototype || prototype === null) &&
-      (!frozen || Object.isFrozen(value)) &&
+    (prototype === objectPrototype || prototype === null) &&
+      (!frozen || objectIsFrozen(value)) &&
       actualKeys.length === keys.length &&
-      actualKeys.every(
-        (key) => typeof key === "string" && keys.includes(key),
+      arrayEvery(
+        actualKeys,
+        (key) => typeof key === "string" && arrayIncludes(keys, key),
       ),
     code,
   );
-  const normalized = Object.create(null);
-  for (const key of actualKeys) {
+  const normalized = objectCreate(null);
+  for (let index = 0; index < actualKeys.length; index += 1) {
+    const key = actualKeys[index];
     let descriptor;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(value, key);
+      descriptor = objectGetOwnPropertyDescriptor(value, key);
     } catch {
       fail(code);
     }
     ensure(
-      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
       code,
     );
     normalized[key] = descriptor.value;
@@ -165,9 +195,9 @@ function frozenRecord(value, code) {
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !utilTypes.isProxy(value) &&
-      !Array.isArray(value) &&
-      Object.isFrozen(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value) &&
+      objectIsFrozen(value),
     code,
   );
   return value;
@@ -175,16 +205,17 @@ function frozenRecord(value, code) {
 
 function frozenDataProjection(value, keys, code) {
   const record = frozenRecord(value, code);
-  const normalized = Object.create(null);
-  for (const key of keys) {
+  const normalized = objectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
     let descriptor;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(record, key);
+      descriptor = objectGetOwnPropertyDescriptor(record, key);
     } catch {
       fail(code);
     }
     ensure(
-      descriptor?.enumerable === true && Object.hasOwn(descriptor, "value"),
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
       code,
     );
     normalized[key] = descriptor.value;
@@ -197,8 +228,8 @@ function opaqueHandle(value, code) {
   let prototype;
   let keys;
   try {
-    prototype = Object.getPrototypeOf(handle);
-    keys = Reflect.ownKeys(handle);
+    prototype = objectGetPrototypeOf(handle);
+    keys = reflectOwnKeys(handle);
   } catch {
     fail(code);
   }
@@ -209,7 +240,7 @@ function opaqueHandle(value, code) {
 function opaqueId(value, code) {
   ensure(
     typeof value === "string" &&
-      /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value),
+      regexpTest(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u, value),
     code,
   );
   return value;
@@ -220,16 +251,16 @@ function isSafePromiseConstructor(value) {
   if (
     value === null ||
     typeof value !== "object" ||
-    utilTypes.isProxy(value) ||
-    !Object.isFrozen(value)
+    isProxyValue(value) ||
+    !objectIsFrozen(value)
   ) {
     return false;
   }
   let prototype;
   let keys;
   try {
-    prototype = Object.getPrototypeOf(value);
-    keys = Reflect.ownKeys(value);
+    prototype = objectGetPrototypeOf(value);
+    keys = reflectOwnKeys(value);
   } catch {
     return false;
   }
@@ -240,14 +271,14 @@ function isSafePromiseConstructor(value) {
   ) {
     return false;
   }
-  const descriptor = Object.getOwnPropertyDescriptor(
+  const descriptor = objectGetOwnPropertyDescriptor(
     value,
     promiseSpeciesSymbol,
   );
   return (
     descriptor?.configurable === false &&
     descriptor.enumerable === false &&
-    Object.hasOwn(descriptor, "value") &&
+    objectHasOwn(descriptor, "value") &&
     descriptor.value === PromiseConstructor &&
     descriptor.writable === false
   );
@@ -256,28 +287,28 @@ function isSafePromiseConstructor(value) {
 function isSafeNativePromise(value) {
   if (
     !isPromiseValue(value) ||
-    utilTypes.isProxy(value) ||
+    isProxyValue(value) ||
     isGeneratorObjectValue(value)
   ) {
     return false;
   }
   let current = value;
   while (current !== null) {
-    if (utilTypes.isProxy(current)) return false;
+    if (isProxyValue(current)) return false;
     let descriptor;
     try {
-      descriptor = Object.getOwnPropertyDescriptor(current, "constructor");
+      descriptor = objectGetOwnPropertyDescriptor(current, "constructor");
     } catch {
       return false;
     }
     if (descriptor !== undefined) {
       return (
-        Object.hasOwn(descriptor, "value") &&
+        objectHasOwn(descriptor, "value") &&
         isSafePromiseConstructor(descriptor.value)
       );
     }
     try {
-      current = Object.getPrototypeOf(current);
+      current = objectGetPrototypeOf(current);
     } catch {
       return false;
     }
@@ -286,31 +317,34 @@ function isSafeNativePromise(value) {
 }
 
 function sameEvidence(left, right) {
-  return EVIDENCE_KEYS.every((key) => left[key] === right[key]);
+  return arrayEvery(EVIDENCE_KEYS, (key) => left[key] === right[key]);
 }
 
 function sameLaunchIdentity(left, right) {
-  return [
-    "launchAttemptId",
-    "processIncarnationId",
-    "supervisorId",
-    "writerIncarnationId",
-  ].every((key) => left[key] === right[key]);
+  return arrayEvery(
+    [
+      "launchAttemptId",
+      "processIncarnationId",
+      "supervisorId",
+      "writerIncarnationId",
+    ],
+    (key) => left[key] === right[key],
+  );
 }
 
 function sameFrozenData(left, right, state = { nodes: 0 }, depth = 0) {
-  if (Object.is(left, right)) return true;
+  if (objectIs(left, right)) return true;
   if (
     left === null ||
     right === null ||
     typeof left !== "object" ||
     typeof right !== "object" ||
-    utilTypes.isProxy(left) ||
-    utilTypes.isProxy(right) ||
-    Array.isArray(left) ||
-    Array.isArray(right) ||
-    !Object.isFrozen(left) ||
-    !Object.isFrozen(right) ||
+    isProxyValue(left) ||
+    isProxyValue(right) ||
+    arrayIsArray(left) ||
+    arrayIsArray(right) ||
+    !objectIsFrozen(left) ||
+    !objectIsFrozen(right) ||
     depth >= 24 ||
     state.nodes >= 1_024
   ) {
@@ -321,36 +355,40 @@ function sameFrozenData(left, right, state = { nodes: 0 }, depth = 0) {
   let leftKeys;
   let rightKeys;
   try {
-    leftPrototype = Object.getPrototypeOf(left);
-    rightPrototype = Object.getPrototypeOf(right);
-    leftKeys = Reflect.ownKeys(left);
-    rightKeys = Reflect.ownKeys(right);
+    leftPrototype = objectGetPrototypeOf(left);
+    rightPrototype = objectGetPrototypeOf(right);
+    leftKeys = reflectOwnKeys(left);
+    rightKeys = reflectOwnKeys(right);
   } catch {
     return false;
   }
   if (
     leftPrototype !== rightPrototype ||
-    (leftPrototype !== Object.prototype && leftPrototype !== null) ||
+    (leftPrototype !== objectPrototype && leftPrototype !== null) ||
     leftKeys.length !== rightKeys.length ||
-    leftKeys.some((key) => typeof key !== "string" || !rightKeys.includes(key))
+    arraySome(
+      leftKeys,
+      (key) => typeof key !== "string" || !arrayIncludes(rightKeys, key),
+    )
   ) {
     return false;
   }
   state.nodes += 1;
-  for (const key of leftKeys) {
+  for (let index = 0; index < leftKeys.length; index += 1) {
+    const key = leftKeys[index];
     let leftDescriptor;
     let rightDescriptor;
     try {
-      leftDescriptor = Object.getOwnPropertyDescriptor(left, key);
-      rightDescriptor = Object.getOwnPropertyDescriptor(right, key);
+      leftDescriptor = objectGetOwnPropertyDescriptor(left, key);
+      rightDescriptor = objectGetOwnPropertyDescriptor(right, key);
     } catch {
       return false;
     }
     if (
       leftDescriptor?.enumerable !== true ||
       rightDescriptor?.enumerable !== true ||
-      !Object.hasOwn(leftDescriptor, "value") ||
-      !Object.hasOwn(rightDescriptor, "value") ||
+      !objectHasOwn(leftDescriptor, "value") ||
+      !objectHasOwn(rightDescriptor, "value") ||
       !sameFrozenData(
         leftDescriptor.value,
         rightDescriptor.value,
@@ -373,13 +411,15 @@ function normalizeEvidence(value, code) {
       evidence.status === "complete-stopped",
     code,
   );
-  for (const key of [
+  const idKeys = [
     "launchAttemptId",
     "processIncarnationId",
     "proofId",
     "supervisorId",
     "writerIncarnationId",
-  ]) {
+  ];
+  for (let index = 0; index < idKeys.length; index += 1) {
+    const key = idKeys[index];
     opaqueId(evidence[key], code);
   }
   return evidence;
@@ -413,7 +453,7 @@ function normalizeStopRequest(value, code) {
   const record = frozenRecord(value, code);
   let contractVersionDescriptor;
   try {
-    contractVersionDescriptor = Object.getOwnPropertyDescriptor(
+    contractVersionDescriptor = objectGetOwnPropertyDescriptor(
       record,
       "contractVersion",
     );
@@ -422,7 +462,7 @@ function normalizeStopRequest(value, code) {
   }
   ensure(
     contractVersionDescriptor?.enumerable === true &&
-      Object.hasOwn(contractVersionDescriptor, "value"),
+      objectHasOwn(contractVersionDescriptor, "value"),
     code,
   );
   const contractVersion = contractVersionDescriptor.value;
@@ -600,7 +640,7 @@ function normalizeStoppedCapture(value, preparedCapture, code) {
     preparedCapture,
     code,
   );
-  return Object.freeze({
+  return objectFreeze({
     capability,
     evidence: stopped.evidence,
     resolution: stopped.resolution,
@@ -608,7 +648,7 @@ function normalizeStoppedCapture(value, preparedCapture, code) {
   });
 }
 
-const absorbRetirementRejection = Object.freeze(
+const absorbRetirementRejection = objectFreeze(
   function absorbRetirementRejection() {},
 );
 
@@ -628,21 +668,21 @@ function collaboratorMethod(value, name, code) {
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !utilTypes.isProxy(value) &&
-      Object.isFrozen(value),
+      !isProxyValue(value) &&
+      objectIsFrozen(value),
     code,
   );
   let descriptor;
   try {
-    descriptor = Object.getOwnPropertyDescriptor(value, name);
+    descriptor = objectGetOwnPropertyDescriptor(value, name);
   } catch {
     fail(code);
   }
   ensure(
     descriptor?.enumerable === true &&
-      Object.hasOwn(descriptor, "value") &&
+      objectHasOwn(descriptor, "value") &&
       typeof descriptor.value === "function" &&
-      !utilTypes.isProxy(descriptor.value),
+      !isProxyValue(descriptor.value),
     code,
   );
   return descriptor.value;
@@ -682,7 +722,7 @@ export function createPostgresDurableStopCaptureComposition(options) {
     } catch {
       fail(requestCode);
     }
-    const stopInput = Object.freeze({
+    const stopInput = objectFreeze({
       attachment: preparedCapture.attachment,
       checkpoint: preparedCapture.checkpoint,
       request: preparedCapture.request,
@@ -739,9 +779,9 @@ export function createPostgresDurableStopCaptureComposition(options) {
     return result;
   };
 
-  Object.freeze(runCapture);
-  return Object.freeze({ runCapture });
+  objectFreeze(runCapture);
+  return objectFreeze({ runCapture });
 }
 
-Object.freeze(PostgresDurableStopCaptureCompositionError.prototype);
-Object.freeze(PostgresDurableStopCaptureCompositionError);
+objectFreeze(PostgresDurableStopCaptureCompositionError.prototype);
+objectFreeze(PostgresDurableStopCaptureCompositionError);
