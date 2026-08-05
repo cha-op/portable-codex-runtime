@@ -393,6 +393,7 @@ class MemoryLaunchAuthority {
     this.stopResult = null;
     this.stopTerminalRevision = null;
     this.stopFinalizationMutation = null;
+    this.stopReconcileMutation = null;
   }
 
   beginNextAttempt({ expectedSession, generation }) {
@@ -420,6 +421,7 @@ class MemoryLaunchAuthority {
     this.stopResult = null;
     this.stopTerminalRevision = null;
     this.stopFinalizationMutation = null;
+    this.stopReconcileMutation = null;
   }
 
   seed(request, state, launchEvidence = null) {
@@ -818,13 +820,16 @@ class MemoryLaunchAuthority {
         this.stopBaseInput.request.dispatchClaimSha256;
     const operation = this.stopOperation();
     const reservation = this.stopReservation(operation);
-    return {
+    const receipt = {
       claimTokenMatched,
       operation,
       reservation,
       session: this.stopSession(operation, reservation),
       status: operation.state,
     };
+    return this.stopReconcileMutation === null
+      ? receipt
+      : this.stopReconcileMutation(clone(receipt));
   }
 
   async claimWriterLaunchAttemptDispatch(input) {
@@ -1111,6 +1116,9 @@ class MemoryLaunchAuthority {
       ),
     );
     if (this.stopState === "committed") {
+      if (this.behaviour.stopFinalizeThrowAfterCommitAlways) {
+        throw new Error("lost stop finalization acknowledgement");
+      }
       const operation = this.stopOperation();
       const reservation = this.stopReservation(operation);
       const replay = {
@@ -1140,7 +1148,10 @@ class MemoryLaunchAuthority {
       outcome: "writer-launch-stopped",
       resultVersion: 1,
     };
-    if (this.behaviour.stopFinalizeThrowAfterCommit) {
+    if (
+      this.behaviour.stopFinalizeThrowAfterCommit ||
+      this.behaviour.stopFinalizeThrowAfterCommitAlways
+    ) {
       this.behaviour.stopFinalizeThrowAfterCommit = false;
       throw new Error("lost stop finalization acknowledgement");
     }
@@ -1744,6 +1755,24 @@ test("stop finalization acknowledgement loss replays without a second physical s
   assert.equal(value.authority.stopState, "committed");
 });
 
+test("persistent stop finalization acknowledgement loss uses exact terminal readback", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopFinalizeThrowAfterCommitAlways = true;
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.finalized, false);
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 3);
+  assert.equal(value.authority.calls.stopReconcile, 4);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.authority.stopState, "committed");
+});
+
 test("an uncertain stop finalizes at revision two without a second physical stop", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
@@ -2110,7 +2139,7 @@ for (const durableState of ["starting", "uncertain"]) {
   });
 }
 
-test("malformed committed stop proof never yields a capability", async () => {
+test("persistent malformed stop finalization uses exact terminal readback", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
   value.authority.stopFinalizationMutation = (receipt) => {
@@ -2118,18 +2147,96 @@ test("malformed committed stop proof never yields a capability", async () => {
     return receipt;
   };
 
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.finalized, false);
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 3);
+  assert.equal(value.authority.calls.stopReconcile, 4);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.deepEqual(
+    value.facade.resolveStoppedWriter(resolverInput(value)),
+    stopped.resolution,
+  );
+});
+
+test("fresh non-committed stop readback fails closed after finalization exhaustion", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopFinalizeThrowBeforeCommit = true;
+
   await assert.rejects(
     value.facade.stopWriterForCapture(resolverInput(value)),
     assertLauncherError("logical_writer_launch_outcome_uncertain"),
   );
+
   assert.equal(value.supervisorStopCalls, 1);
   assert.equal(value.authority.calls.finalizeWriterStopped, 3);
+  assert.equal(value.authority.calls.stopReconcile, 4);
   assert.equal(value.authority.calls.markUncertain, 1);
+  assert.equal(value.authority.stopState, "uncertain");
   assert.throws(
     () => value.facade.resolveStoppedWriter(resolverInput(value)),
     assertLauncherError("invalid_logical_writer_launch_request"),
   );
 });
+
+const committedStopReadbackDriftCases = [
+  ["request", (receipt) => {
+    receipt.operation.request.launch.supervisorId = "foreign-supervisor";
+  }],
+  ["claim token", (receipt) => {
+    receipt.claimTokenMatched = false;
+  }],
+  ["complete evidence", (receipt) => {
+    delete receipt.operation.result.evidence.writerIncarnationId;
+  }],
+  ["released reservation", (receipt) => {
+    receipt.reservation.state = "committed";
+  }],
+  ["terminal session pointer", (receipt) => {
+    receipt.session.document.lastOperation.operationId =
+      "foreign-stop-operation";
+  }],
+  ["terminal session revision", (receipt) => {
+    receipt.session.revision = (
+      BigInt(receipt.session.revision) + 1n
+    ).toString();
+  }],
+];
+
+for (const [relation, mutate] of committedStopReadbackDriftCases) {
+  test(`committed stop readback rejects ${relation} drift`, async () => {
+    const value = await fixture();
+    await value.facade.runLaunch(runInput(value));
+    value.authority.stopFinalizationMutation = (receipt) => {
+      receipt.session.document.lastOperation.resultSha256 = "d".repeat(64);
+      return receipt;
+    };
+    value.authority.stopReconcileMutation = (receipt) => {
+      mutate(receipt);
+      return receipt;
+    };
+
+    await assert.rejects(
+      value.facade.stopWriterForCapture(resolverInput(value)),
+      assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    );
+
+    assert.equal(value.supervisorStopCalls, 1);
+    assert.equal(value.authority.calls.finalizeWriterStopped, 3);
+    assert.equal(value.authority.calls.stopReconcile, 4);
+    assert.equal(value.authority.calls.markUncertain, 1);
+    assert.equal(value.authority.stopState, "committed");
+    assert.throws(
+      () => value.facade.resolveStoppedWriter(resolverInput(value)),
+      assertLauncherError("invalid_logical_writer_launch_request"),
+    );
+  });
+}
 
 test("concurrent same-tuple stop calls issue one capability and stop once", async () => {
   const value = await fixture();
