@@ -21,6 +21,7 @@ import {
 } from "../src/stopped-directory-backend.mjs";
 import {
   FilesystemOperationJournal,
+  operationJournalBindingSha256,
   operationJournalRecordFilename,
 } from "../src/filesystem-operation-journal.mjs";
 import {
@@ -718,6 +719,29 @@ function createMutationAuthority(fixture, options = {}) {
   };
 
   const restoreContext = (admission) => {
+    const restoreContextContractVersion =
+      options.restoreContextContractVersion ?? 3;
+    const generationBinding = {
+      attachment: attachment(fixture.restoreWriterLease, {
+        attachmentId: "attachment-restore-001",
+        operationId: "operation-attach-restore-001",
+        proofId: "proof-attachment-restore-001",
+        rootPath:
+          options.restoreGenerationBindingRootPath ??
+          fixture.destinationDirectory,
+        storageId: RESTORE_STORAGE_ID,
+      }),
+      captureAttemptId: CAPTURE_ATTEMPT_ID,
+      captureOperationId: CAPTURE_OPERATION_ID,
+      catalogueSha256: "c".repeat(64),
+      checkpoint: admission.checkpoint,
+      contractVersion: 1,
+      destinationIsolationProofId: DESTINATION_ISOLATION_PROOF_ID,
+      destinationState: "detached",
+      generationId: "restore-generation-001",
+      request: admission.request,
+      reservationId: "reservation-restore-001",
+    };
     const context = {
       artifactDirectory: fixture.artifactDirectory,
       artifactOwnedRoot: fixture.artifactOwnedRoot,
@@ -728,6 +752,12 @@ function createMutationAuthority(fixture, options = {}) {
       destinationOwnedRoot: fixture.destinationOwnedRoot,
       destinationState: "detached",
       now: NOW,
+      ...(restoreContextContractVersion === 3
+        ? {
+            generationBinding,
+            publicationMode: "fresh-or-exact-replay",
+          }
+        : {}),
       reservationId: "reservation-restore-001",
       result: fixedResult(admission.checkpoint, admission.request),
       storageRef: storageRef({ storageId: RESTORE_STORAGE_ID }),
@@ -1077,6 +1107,8 @@ function createMutationAuthority(fixture, options = {}) {
     },
   };
   const authority = {
+    restoreContextContractVersion:
+      options.restoreContextContractVersion ?? 3,
     runCapture:
       options.captureReturnFactory === undefined
         ? normalAuthority.runCapture
@@ -1399,7 +1431,7 @@ function restoreDispatchInput(fixture, overrides = {}) {
 test("backend exposes the fixed directory surface and delegates lifecycle operations", async (t) => {
   const fixture = await createFixture(t);
 
-  assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 2);
+  assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 3);
   assert.equal(CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION, 2);
   assert.strictEqual(assertStorageBackend(fixture.backend), fixture.backend);
   assert.equal(fixture.backend.contractVersion, 1);
@@ -1983,6 +2015,12 @@ test("restore requires a newer current fence, trusted proof, and detached destin
     completion.materialization.coordinatorBindingSha256,
     /^[0-9a-f]{64}$/u,
   );
+  assert.equal(
+    completion.materialization.coordinatorBindingSha256,
+    operationJournalBindingSha256(
+      fixture.mutation.state.restoreContexts[0].generationBinding,
+    ),
+  );
   assert.equal(await pathExists(fixture.destinationDirectory), true);
   assert.equal(
     fixture.mutation.state.restoreContexts[0].destinationState,
@@ -2037,7 +2075,9 @@ test("restore requires a newer current fence, trusted proof, and detached destin
 });
 
 test("adapter v2 replays a committed v1 restore binding with legacy v2 materialization", async (t) => {
-  const fixture = await createFixture(t);
+  const fixture = await createFixture(t, {
+    restoreContextContractVersion: 2,
+  });
   const capability = await issueCapability(fixture);
   await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
   fixture.observation.preseeding = true;
@@ -2102,6 +2142,107 @@ test("adapter v2 replays a committed v1 restore binding with legacy v2 materiali
     "authority:restore:finalized",
     "authority:restore:end",
   ]);
+});
+
+test("adapter v2 restore context cannot create an absent legacy publication", async (t) => {
+  const fixture = await createFixture(t, {
+    restoreContextContractVersion: 2,
+  });
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+
+  await assert.rejects(
+    restoreCleanCheckpoint(restoreCoreOptions(fixture)),
+    (error) =>
+      error instanceof SessionSnapshotCoreError &&
+      error.code === "restore_outcome_uncertain",
+  );
+
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+});
+
+test("adapter v3 rejects an explicit reduced restore generation binding", async (t) => {
+  const fixture = await createFixture(t, {
+    restoreContext: (admission) => ({
+      generationBinding: {
+        checkpoint: admission.checkpoint,
+        contractVersion: 1,
+        destinationIsolationProofId: DESTINATION_ISOLATION_PROOF_ID,
+        reservationId: "reservation-restore-001",
+      },
+    }),
+  });
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+
+  await assert.rejects(
+    restoreCleanCheckpoint(restoreCoreOptions(fixture)),
+    (error) =>
+      error instanceof SessionSnapshotCoreError &&
+      error.code === "restore_outcome_uncertain",
+  );
+
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+});
+
+test("adapter v3 rejects a binding attachment root that differs from the restore destination", async (t) => {
+  const fixture = await createFixture(t, {
+    restoreGenerationBindingRootPath:
+      "/var/lib/portable-codex/restore/other-session",
+  });
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+  const publicationEventsBeforeRestore = fixture.observation.events.filter(
+    (event) => event.startsWith("publication:"),
+  );
+
+  await assert.rejects(
+    restoreCleanCheckpoint(restoreCoreOptions(fixture)),
+    (error) =>
+      error instanceof SessionSnapshotCoreError &&
+      error.code === "restore_outcome_uncertain",
+  );
+
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+  assert.deepEqual(
+    fixture.observation.events.filter((event) =>
+      event.startsWith("publication:"),
+    ),
+    publicationEventsBeforeRestore,
+  );
+});
+
+test("adapter v3 cannot downgrade to the legacy null generation binding", async (t) => {
+  const fixture = await createFixture(t, {
+    restoreContext: { generationBinding: null },
+  });
+  const capability = await issueCapability(fixture);
+  await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+
+  await assert.rejects(
+    restoreCleanCheckpoint(restoreCoreOptions(fixture)),
+    (error) =>
+      error instanceof SessionSnapshotCoreError &&
+      error.code === "restore_outcome_uncertain",
+  );
+
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
 });
 
 test("adapter resumes a historical materialized v2 restore without recopying", async (t) => {

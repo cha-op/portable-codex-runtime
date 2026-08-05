@@ -1927,6 +1927,14 @@ export class StoppedDirectoryPublication {
   }
 
   async publishRestoreDestination(options) {
+    return this.#publishRestoreDestination(options, false);
+  }
+
+  async verifyCommittedRestoreDestination(options) {
+    return this.#publishRestoreDestination(options, true);
+  }
+
+  async #publishRestoreDestination(options, requireCommittedOperation) {
     const normalized = exactOptions(options, [
       "artifactDirectory",
       "artifactOwnedRoot",
@@ -1949,6 +1957,7 @@ export class StoppedDirectoryPublication {
       kind: "restore-destination",
       operationId: snapshot.operationId,
       request: snapshot.request,
+      requireCommittedOperation,
       requireFreshOperation: false,
       result: snapshot.result,
       sourceDirectory: normalized.artifactDirectory,
@@ -2521,6 +2530,12 @@ export class StoppedDirectoryPublication {
           observed.record.state,
         );
         publicationMayHaveOccurred = false;
+      }
+      // A non-committed journal phase cannot classify the physical rename.
+      // Reject committed-only verification only after the locked topology
+      // probes have either preserved uncertainty or proved final absence.
+      if (options.requireCommittedOperation && observedState !== "committed") {
+        fail("publication_recovery_required", "not-committed");
       }
       if (sourceContinuityFailed) {
         if (publicationMayHaveOccurred) {

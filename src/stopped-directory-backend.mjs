@@ -70,6 +70,8 @@ const publishRestoreDestinationIntrinsic =
   StoppedDirectoryPublication.prototype.publishRestoreDestination;
 const verifyCommittedCheckpointArtifactIntrinsic =
   StoppedDirectoryPublication.prototype.verifyCommittedCheckpointArtifact;
+const verifyCommittedRestoreDestinationIntrinsic =
+  StoppedDirectoryPublication.prototype.verifyCommittedRestoreDestination;
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
@@ -260,6 +262,24 @@ const RESTORE_CONTEXT_KEYS = objectFreeze([
   "result",
   "storageRef",
 ]);
+const RESTORE_CONTEXT_WITH_GENERATION_BINDING_KEYS = objectFreeze([
+  ...RESTORE_CONTEXT_KEYS,
+  "generationBinding",
+  "publicationMode",
+]);
+const RESTORE_GENERATION_BINDING_KEYS = objectFreeze([
+  "attachment",
+  "captureAttemptId",
+  "captureOperationId",
+  "catalogueSha256",
+  "checkpoint",
+  "contractVersion",
+  "destinationIsolationProofId",
+  "destinationState",
+  "generationId",
+  "request",
+  "reservationId",
+]);
 const RESULT_KEYS = objectFreeze(["checkpoint", "mutation"]);
 const PUBLICATION_OUTCOME_KEYS = objectFreeze([
   "materialization",
@@ -310,7 +330,7 @@ const CHECKPOINT_MATERIALIZATION_CONTRACT_VERSION = 2;
 const LEGACY_RESTORE_MATERIALIZATION_CONTRACT_VERSION = 2;
 const RESTORE_MATERIALIZATION_CONTRACT_VERSION = 3;
 
-export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 2;
+export const STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION = 3;
 
 export class StoppedDirectoryBackendError extends Error {
   constructor(code) {
@@ -1191,11 +1211,59 @@ function captureJournalBinding(context, request, resolved) {
 }
 
 function restoreJournalBinding(context, request) {
+  if (context.generationBinding === null) {
+    return exactFrozenRecord({
+      binding: exactFrozenRecord({
+        checkpoint: request.checkpoint,
+        contractVersion: RESTORE_JOURNAL_BINDING_CONTRACT_VERSION,
+        destinationIsolationProofId: context.destinationIsolationProofId,
+        reservationId: context.reservationId,
+      }),
+      committedOnly: true,
+    });
+  }
+  const binding = assertExactDataObject(
+    context.generationBinding,
+    RESTORE_GENERATION_BINDING_KEYS,
+    failUncertain,
+  );
+  const bindingAttachment = runRuntimeValidator(() =>
+    assertSessionAttachment(binding.attachment),
+  );
+  assertRobustAttachment(bindingAttachment, failUncertain);
+  // Protected property: the restore journal binding and publication plan must
+  // identify the exact same canonical attachment directory. Both paths have
+  // already passed their canonical absolute-path validators, so exact equality
+  // is the only relevant identity signal; filesystem metadata is not involved.
+  ensureUncertain(
+    binding.contractVersion === RESTORE_JOURNAL_BINDING_CONTRACT_VERSION &&
+      binding.destinationState === "detached" &&
+      binding.destinationIsolationProofId ===
+        context.destinationIsolationProofId &&
+      binding.reservationId === context.reservationId &&
+      typeof binding.captureAttemptId === "string" &&
+      regexpTest(UUID_PATTERN, binding.captureAttemptId) &&
+      typeof binding.captureOperationId === "string" &&
+      regexpTest(OPAQUE_ID_PATTERN, binding.captureOperationId) &&
+      typeof binding.catalogueSha256 === "string" &&
+      regexpTest(DIGEST_PATTERN, binding.catalogueSha256) &&
+      typeof binding.generationId === "string" &&
+      regexpTest(OPAQUE_ID_PATTERN, binding.generationId) &&
+      sameFlatRecord(binding.checkpoint, request.checkpoint) &&
+      sameMutationRequest(binding.request, request.request) &&
+      bindingAttachment.rootPath === context.destination.directory &&
+      bindingAttachment.sessionId === request.request.sessionId &&
+      bindingAttachment.backendId === request.request.backendId &&
+      bindingAttachment.storageId === request.request.storageId &&
+      bindingAttachment.leaseId === context.canonicalLease.leaseId &&
+      bindingAttachment.holderId === context.canonicalLease.holderId &&
+      bindingAttachment.fencingEpoch === context.canonicalLease.fencingEpoch &&
+      (context.publicationMode === "fresh-or-exact-replay" ||
+        context.publicationMode === "committed-only"),
+  );
   return exactFrozenRecord({
-    checkpoint: request.checkpoint,
-    contractVersion: RESTORE_JOURNAL_BINDING_CONTRACT_VERSION,
-    destinationIsolationProofId: context.destinationIsolationProofId,
-    reservationId: context.reservationId,
+    binding: context.generationBinding,
+    committedOnly: context.publicationMode === "committed-only",
   });
 }
 
@@ -1372,11 +1440,20 @@ function normalizeCaptureReconciliationContext(value, request) {
   return exactFrozenRecord({ artifact, captureAttempt });
 }
 
-function normalizeRestoreContext(value, request) {
+function normalizeRestoreContext(value, request, contextContractVersion) {
+  ensureUncertain(
+    contextContractVersion === 2 || contextContractVersion === 3,
+  );
+  const hasGenerationBinding = contextContractVersion === 3;
   const context = assertExactDataObject(
     value,
-    RESTORE_CONTEXT_KEYS,
+    hasGenerationBinding
+      ? RESTORE_CONTEXT_WITH_GENERATION_BINDING_KEYS
+      : RESTORE_CONTEXT_KEYS,
     failUncertain,
+  );
+  ensureUncertain(
+    !hasGenerationBinding || context.generationBinding !== null,
   );
   const { canonicalLease, storageRef } = normalizeStorageAndFence({
     canonicalLease: context.canonicalLease,
@@ -1421,7 +1498,9 @@ function normalizeRestoreContext(value, request) {
     canonicalLease,
     destination,
     destinationIsolationProofId,
+    generationBinding: hasGenerationBinding ? context.generationBinding : null,
     now: context.now,
+    publicationMode: hasGenerationBinding ? context.publicationMode : null,
     reservationId,
     result,
     storageRef,
@@ -1473,12 +1552,35 @@ export class StoppedDirectoryBackend {
       () => lifecycleBackend.backendId,
     );
     ensureInvalid(lifecycleBackendId === backendId);
-    const authorityOptions = assertExactDataObject(options.mutationAuthority, [
-      "runCapture",
-      "runCaptureReconciliation",
-      "runRestore",
-    ]);
+    let authorityKeys;
+    try {
+      authorityKeys = reflectOwnKeys(options.mutationAuthority);
+    } catch {
+      failInvalid();
+    }
+    const versionedRestoreContext =
+      authorityKeys.length === 4 &&
+      arrayIncludes(authorityKeys, "restoreContextContractVersion");
+    const authorityOptions = assertExactDataObject(
+      options.mutationAuthority,
+      versionedRestoreContext
+        ? [
+            "restoreContextContractVersion",
+            "runCapture",
+            "runCaptureReconciliation",
+            "runRestore",
+          ]
+        : ["runCapture", "runCaptureReconciliation", "runRestore"],
+    );
+    const restoreContextContractVersion = versionedRestoreContext
+      ? authorityOptions.restoreContextContractVersion
+      : 2;
+    ensureInvalid(
+      restoreContextContractVersion === 2 ||
+        restoreContextContractVersion === 3,
+    );
     const authority = exactFrozenRecord({
+      restoreContextContractVersion,
       runCapture: assertTrustedFunction(authorityOptions.runCapture),
       runCaptureReconciliation: assertTrustedFunction(
         authorityOptions.runCaptureReconciliation,
@@ -1745,17 +1847,24 @@ export class StoppedDirectoryBackend {
         this.#authority.runRestore,
         admission,
         async (rawContext) => {
-          const context = normalizeRestoreContext(rawContext, request);
-          const bindingRecord = restoreJournalBinding(context, request);
+          const context = normalizeRestoreContext(
+            rawContext,
+            request,
+            this.#authority.restoreContextContractVersion,
+          );
+          const bindingPlan = restoreJournalBinding(context, request);
+          const publicationMethod = bindingPlan.committedOnly
+            ? verifyCommittedRestoreDestinationIntrinsic
+            : publishRestoreDestinationIntrinsic;
           const publicationOutcome = await callIntrinsic(
-            publishRestoreDestinationIntrinsic,
+            publicationMethod,
             this.#publication,
             [
               exactFrozenRecord({
                 artifactDirectory: context.artifact.directory,
                 artifactOwnedRoot: context.artifact.ownedRoot,
                 artifactProof: context.artifactProof,
-                binding: bindingRecord,
+                binding: bindingPlan.binding,
                 destinationDirectory: context.destination.directory,
                 destinationOwnedRoot: context.destination.ownedRoot,
                 operationId: request.request.operationId,

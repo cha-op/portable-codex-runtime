@@ -467,6 +467,13 @@ their digest-bound portable mode beneath a private `0700` storage authority.
 Same-byte physical-object replacement, inode reuse, or permission broadening therefore cannot advance
 to rename or committed replay.
 
+`verifyCommittedRestoreDestination()` applies that same physical-outcome rule
+before its transition-free committed-only rejection. A locked, identity-bound
+`materialized` candidate with an absent final path proves `not-committed`; an
+already visible final path remains `uncertain` even though the journal has not
+advanced to `committed`. The verifier never repairs the journal or moves either
+path.
+
 Production root ACL inspection uses the stopped-tree platform defaults. A host
 adapter that provides an equivalent trusted ACL capability may inject
 `inspectOwnedRootAcl` and `inspectOwnedRootAncestorAcl`; the same inspectors are

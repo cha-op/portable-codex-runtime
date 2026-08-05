@@ -2837,7 +2837,10 @@ test(
       maxTransactionAttempts: 3,
     });
     await store.migrate();
-    const authority = new PostgresSessionAuthority({ store });
+    const authority = new PostgresSessionAuthority({
+      restoreLaunchV2FleetCompatible: true,
+      store,
+    });
     const operationGuard = new PostgresOperationGuard({
       dedicatedPool: guardPool,
     });
@@ -6655,6 +6658,62 @@ test(
     );
 
     await t.test(
+      "restore V2 reads preserve terminal pre-dispatch cancellation",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const input = restoreGenerationOperationInputV2(
+          fixture.attached.session,
+          admission,
+          restoreGenerationLaunchIntent(fixture.attached.session),
+        );
+        const readInput = {
+          checkpoint: admission.checkpoint,
+          request: admission.request,
+        };
+
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        const cancelled = await authority.cancelPreparedOperation({
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+          reason: "restore-publication-not-started",
+        });
+        assertOperationReceipt(cancelled, "committed");
+        assert.equal(cancelled.cancelled, true);
+        assert.equal(cancelled.operation.revision, "1");
+        assert.deepEqual(cancelled.operation.result, {
+          outcome: "cancelled-before-dispatch",
+          reason: "restore-publication-not-started",
+          resultVersion: 1,
+        });
+
+        const read =
+          await authority.readRestoreDestinationGenerationOperation(
+            readInput,
+          );
+        assert.equal(read.status, "cancelled-before-dispatch");
+        assert.equal(read.operation.state, "committed");
+        assert.equal(read.operation.revision, "1");
+        assert.equal(read.reservation.state, "released");
+        assert.equal(read.generation, null);
+        assert.equal(read.catalogue, null);
+        assert.deepEqual(read.operation, cancelled.operation);
+        assert.deepEqual(read.reservation, cancelled.reservation);
+        assert.deepEqual(read.session, cancelled.session);
+      },
+    );
+
+    await t.test(
       "restore launch handoff rolls back every authority write and rejects crossed intent",
       async () => {
         const sessionId = randomUUID();
@@ -6676,7 +6735,33 @@ test(
           admission,
           launchIntent,
         );
-        await authority.reserveOperation(input);
+        const restoreReadInput = {
+          checkpoint: admission.checkpoint,
+          request: admission.request,
+        };
+        const absent =
+          await authority.readRestoreDestinationGenerationOperation(
+            restoreReadInput,
+          );
+        assert.equal(absent.status, "absent");
+        const closedFleetAuthority = new PostgresSessionAuthority({ store });
+        await assert.rejects(
+          closedFleetAuthority.reserveOperation(input),
+          assertAuthorityCode(
+            "restore_launch_v2_fleet_capability_required",
+          ),
+        );
+        const reservedRestore = await authority.reserveOperation(input);
+        assertOperationReceipt(reservedRestore, "prepared");
+        const prepared =
+          await authority.readRestoreDestinationGenerationOperation(
+            restoreReadInput,
+          );
+        assert.equal(prepared.status, "prepared");
+        const closedFleetReplay =
+          await closedFleetAuthority.reserveOperation(input);
+        assertOperationReceipt(closedFleetReplay, "prepared");
+        assert.equal(closedFleetReplay.acquired, false);
         const claimed =
           await authority.claimRestoreDestinationGenerationDispatch({
             ...structuredClone(input),
@@ -6685,6 +6770,15 @@ test(
             expectedOperationRevision: "0",
             generationId: `restore-generation-${randomUUID()}`,
           });
+        const starting =
+          await authority.readRestoreDestinationGenerationOperation(
+            restoreReadInput,
+          );
+        assert.equal(starting.status, "starting");
+        assert.equal(
+          starting.generation.generationId,
+          claimed.generation.generationId,
+        );
         const handoffInput = {
           launch: launchIntent,
           restore: {
@@ -6776,6 +6870,15 @@ test(
           assert.equal(
             handedOff.launch.attempt.launchAttemptId,
             launchIntent.launchAttemptId,
+          );
+          const committedRestore =
+            await authority.readRestoreDestinationGenerationOperation(
+              restoreReadInput,
+            );
+          assert.equal(committedRestore.status, "committed");
+          assert.deepEqual(
+            committedRestore.generation,
+            handedOff.generation,
           );
           const committed =
             await readRestoreLaunchHandoffTransactionState(

@@ -27,9 +27,12 @@ The implemented authority provides:
   started/stopped finalization, readback, and bounded recovery;
 - a hardened process-local logical-writer-launcher facade with exact image
   consumption, external launch, provisional writer registration, and
-  no-relaunch reconciliation; and
+  no-relaunch reconciliation;
 - typed launch-stop authority plus bounded prepared/active/current-launch
-  discovery.
+  discovery; and
+- a production-neutral restore composition facade that passes one full typed
+  generation binding through publication, confirms the atomic handoff, and
+  only then enters prepared-launch admission.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
@@ -49,9 +52,11 @@ exact current session, measured image, and trusted supervisor outcome without
 calling a launcher. The logical-launcher foundation now composes the original
 one-use image capability, external launch callback, and exact same-process
 writer registration. Typed stop state preserves that original launch until
-exact complete-stopped proof. Production generation publication,
-launcher/recovery, durable stop/capture, and `runRestore()` integration remain
-the next serial slice.
+exact complete-stopped proof. The standalone restore composition now orders
+typed generation publication, atomic handoff, and prepared launch without
+being wired into the production checkpoint adapter. Durable stop/capture,
+bounded no-relaunch recovery, and production `runRestore()` integration remain
+later serial slices.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -104,8 +109,11 @@ session pointer to its immutable launch operation. That durable pointer and its
 serialized IDs still do not authorize process creation. The process-local
 launcher facade consumes the exact opaque image reservation and registers the
 exact returned writer; neither step supplies physical exclusion evidence.
-That evidence must come from a capable storage backend or supervisor, and full
-production restore/stop composition remains a later slice.
+The restore composition admits publication only with the full authority-owned
+generation binding and confirms handoff before invoking prepared launch. That
+still does not supply durable stop/capture or physical exclusion evidence;
+those must come from a capable storage backend or supervisor, and production
+restore/stop composition remains a later slice.
 
 ## Implemented Canonical Session Registry
 
@@ -880,6 +888,14 @@ restore materialisation contract v2 after an upgrade, but this typed authority
 deliberately rejects that physical compatibility result because it lacks the
 coordinator-binding digest.
 
+`readRestoreDestinationGenerationOperation()` also represents the one legal
+claim-free terminal exception explicitly. A version 2 operation that was
+cancelled while still `prepared` remains relationally `committed` at revision
+1 with a released reservation, but its read receipt reports
+`status: "cancelled-before-dispatch"` and null generation/catalogue. This keeps
+the permanent cancellation replayable without presenting it as a committed
+restore generation; composition must stop before preparation or publication.
+
 Bounded recovery enumerates only retained `starting` or `uncertain`
 restore-generation operations whose exact authorised generation and source
 catalogue still validate. The generation relation has no deletion or
@@ -1214,12 +1230,17 @@ fail closed; it must be drained or quarantined rather than being given a
 synthetic registry history. This also means an old completed handoff does not
 gain new provenance merely because its operation row can be backfilled.
 
-Version 2 creation is not yet reachable from production `runRestore()`. Before
-a later release enables that path, every authority and recovery node that can
-observe the same database must first understand version 2, and activation must
-be held behind an explicit fleet-capability gate. A mixed fleet must continue
-creating version 1 work rather than let an older recovery worker fail an entire
-page on an unknown durable request.
+`PostgresSessionAuthority` defaults
+`restoreLaunchV2FleetCompatible` to `false`. With that startup option closed,
+`reserveOperation()` rejects only a fresh version 2 restore operation, after it
+has first checked for an exact durable operation replay. Existing prepared,
+starting, uncertain, or committed work therefore remains readable and
+replayable, and typed finalisation plus recovery enumeration do not consult the
+fresh-creation gate. An operator may set the option to `true` only after every
+authority and recovery node sharing the database understands version 2. A
+mixed fleet must leave it false and create no new version 2 work. Production
+`createPostgresCheckpointMutationAuthority().runRestore()` remains unavailable
+regardless of this option.
 
 The launcher facade adds a split preparation path for this transaction.
 `prepareLaunchIntent()` revalidates the original opaque image reservation and
@@ -1285,24 +1306,99 @@ successor of the original handoff and returns the same terminal launch state.
 Standalone version 1 launch reservations retain their ordinary cancellation
 reason, clock, timestamp, and replay behavior unchanged.
 
-This slice intentionally does not verify a committed publication, route the
-coordinator's stop callback through PostgreSQL, join stop proof to capture,
-create an operational recovery service, or enable production restore.
+The atomic handoff primitive itself does not invoke or verify publication,
+route the coordinator's stop callback through PostgreSQL, join stop proof to
+capture, create an operational recovery service, or enable production restore.
+
+## Implemented Restore Publication-to-Launch Composition
+
+`createPostgresRestorePublicationLaunchComposition()` is a standalone,
+production-neutral facade: it makes the complete publication-to-launch order
+testable without replacing or enabling the production checkpoint mutation
+authority. Its frozen `runRestore(admission, publish)` method composes one
+trusted authority, operation guard, restore-preparation callback, logical
+launcher, and deployment capability gate.
+
+The facade requires two independent rollout decisions. The authority instance
+must have fresh version 2 creation enabled as described above. The facade first
+uses the authority's typed read API to distinguish an absent operation from an
+exact prepared, starting, uncertain, or committed replay. Only the absent path
+calls `fleetCapabilityGate()` with capability
+`restore-generation-v2-launch-handoff-v1`; only the exact frozen
+`RESTORE_LAUNCH_V2_FLEET_CONFIRMED` sentinel proceeds. The callback gate is an
+invocation-time deployment assertion before preparation or durable creation.
+It cannot strand exact replay or recovery when rollout policy later closes.
+
+One admitted invocation follows this order:
+
+1. read the exact durable restore state, gate only an absent operation, obtain
+   the isolated destination, generation, launch-attempt, path, and opaque image
+   preparation, then derive the exact durable launch intent without consuming
+   that image reservation;
+2. acquire the exact restore operation's PostgreSQL session advisory guard,
+   re-read the same durable operation and request, and prove the guard remains
+   held around every publication-sensitive boundary; preparation remains
+   outside this guard so a launcher backed by the same database pool cannot
+   starve behind the guard connection;
+3. reserve only an absent operation and definitely claim a prepared version 2
+   restore. Lost reserve acknowledgement is resolved by typed readback; lost
+   claim acknowledgement or any starting/uncertain/committed replay is never
+   granted fresh publication authority;
+4. call the publisher exactly once with callback contract version 3, the exact
+   authority-returned generation binding, source artefact proof, lease,
+   storage, destination, predetermined result, direct owned-root path plan,
+   and an explicit `fresh-or-exact-replay` or `committed-only` mode;
+5. independently ask the bound `StoppedDirectoryPublication` instance to
+   verify the exact committed journal and physical destination, then require
+   that result and materialisation to match the backend callback's original
+   completion object. A deterministic coordinator digest alone is not commit
+   authority;
+6. atomically finalise the restore generation and materialise the prepared
+   launch attempt, then revalidate the full receipt against the exact handoff
+   input: both operations and reservations, the committed generation and
+   catalogue, the restore terminal anchor, the launch attempt request, and the
+   canonical active or terminal session relation must all agree. If only the
+   handoff acknowledgement is lost, re-prove guard ownership before replaying
+   that same handoff once; and
+7. release the publication guard, then call `runPreparedLaunch()` with the
+   original opaque reservation and the same launch-attempt ID. That path
+   claims or reconciles only the already-reserved attempt and never creates a
+   second launch operation. A reported `started` result is accepted only after
+   its complete committed operation, released reservation, attempt request,
+   supervisor evidence, launch pointer, and terminal session anchor have been
+   revalidated.
+
+The composition advertises `restoreContextContractVersion: 3`. The
+stopped-directory backend validates its full version 1 generation-binding
+document against the checkpoint, mutation request, detached destination,
+attachment, and current lease, and passes that exact object unchanged as the
+publication journal's coordinator binding. A legacy version 2 callback has no
+binding or mode field: the backend derives its historical four-field version 1
+journal binding internally and invokes committed verification only. Version 3
+rejects an explicitly reduced binding, and only a definitely granted fresh
+claim may request fresh-or-exact-replay publication. A fresh outcome must
+remain materialisation contract version 3.
+
+Before definite restore dispatch, a failed composition makes a best-effort
+strict cancellation of only the prepared operation. After dispatch but before
+confirmed handoff, it makes a best-effort transition to `uncertain`; it never
+claims that publication was absent. A confirmed handoff remains durable even
+if prepared launch later fails or becomes ambiguous, so the normal
+no-relaunch reconciliation contract owns that attempt. The facade returns the
+validated publication completion only after prepared launch reports the exact
+started attempt.
+
+This facade is deliberately not installed in
+`createPostgresCheckpointMutationAuthority()`. That production authority's
+`runRestore()` still rejects with `postgres_checkpoint_restore_unavailable`
+without invoking its publication callback.
 
 ## Remaining Production Restore Composition
 
-The launcher foundation and atomic handoff close the process-local
-image-consumption, external launch, provisional registration, no-relaunch
-reconciliation, and committed-generation-to-prepared-launch crash boundaries.
-They do not yet compose the complete production restore protocol. Later serial
-pull requests must:
+The standalone facade closes the in-process generation
+publication-to-prepared-launch ordering boundary. It does not yet compose the
+complete production restore protocol. Later serial pull requests must:
 
-- pass one typed destination generation and its exact coordinator binding
-  through physical publication, then verify the committed result before
-  treating it as usable;
-- dispatch the already-reserved launch with the original image reservation, or
-  with a newly minted exact-match reservation while it is still durably
-  `prepared`, and route every active attempt without another launch;
 - compose bounded generation, prepared-launch, active-attempt, and
   current-launch recovery into an operational service;
 - route the coordinator's complete stop through `writer-launch-stop-v1` and
@@ -1409,8 +1505,15 @@ Logical-launcher foundation validation must cover exact reservation
 revalidation and one-use consumption, no callback before durable `starting`,
 single external launch, register-before-finalise ordering, no-relaunch
 reconciliation, provisional-handle loss, typed complete-stop finalisation, and
-bounded discovery. The next integration slice must add whole-protocol
-generation publication, launcher/recovery, durable stop/capture, and
-`runRestore()` failure-injection coverage.
+bounded discovery. Restore composition validation covers default-closed fresh
+version 2 creation, exact replay while that gate is closed, invocation-time
+fleet gating before preparation or durable work, full generation-binding
+publication, forged-callback rejection through independent committed-state
+verification, publication-before-handoff order, handoff acknowledgement
+replay with a fresh guard-ownership proof, forged handoff and started-result
+relation rejection, and launch only after confirmed handoff. The
+next integration slices must add bounded launcher/recovery service wiring,
+durable stop/capture, production `runRestore()`, and whole-protocol
+failure-injection coverage.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.
