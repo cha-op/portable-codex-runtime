@@ -1335,6 +1335,129 @@ test("started-result validation enforces exact handoff revision transitions", as
   assert.equal(validated.operation.revision, "3");
 });
 
+test("started-result validation rejects stable session drift across active handoff states", async () => {
+  const value = await fixture();
+  const revisionTwoResult = await value.facade.runLaunch(runInput(value));
+  const revisionThreeResult = startedResultAtRevision(
+    revisionTwoResult,
+    "3",
+  );
+  const transitions = [
+    { result: revisionTwoResult, state: "prepared" },
+    { result: revisionTwoResult, state: "starting" },
+    { result: revisionThreeResult, state: "uncertain" },
+  ];
+  const forgeries = [
+    {
+      field: "sessionId",
+      mutate(session) {
+        session.sessionId = "019f3d80-0000-7000-8000-000000000099";
+      },
+    },
+    {
+      field: "createdAt",
+      mutate(session) {
+        session.createdAt = "2026-08-04T11:59:59.000Z";
+      },
+    },
+    {
+      field: "documentVersion",
+      mutate(session) {
+        session.document.documentVersion = 2;
+      },
+    },
+    {
+      field: "manifest",
+      mutate(session) {
+        session.document.manifest.codex.ephemeral = true;
+      },
+    },
+    {
+      field: "storageRef",
+      mutate(session) {
+        session.document.storageRef.storageId = "volume-forged";
+      },
+    },
+    {
+      field: "backendCapabilities",
+      mutate(session) {
+        session.document.backendCapabilities.atomicPointInTimeCheckpoint = true;
+      },
+    },
+    {
+      field: "lifecycle",
+      mutate(session) {
+        session.document.lifecycle = "BLOCKED";
+      },
+    },
+    {
+      field: "writerEpoch",
+      mutate(session) {
+        session.document.writerEpoch = "12";
+      },
+    },
+    {
+      field: "lease",
+      mutate(session) {
+        session.document.lease.expiresAt = "2027-08-05T12:00:00.000Z";
+      },
+    },
+    {
+      field: "attachment",
+      mutate(session) {
+        session.document.attachment.rootPath =
+          "/var/lib/portable-codex/session-forged";
+      },
+    },
+    {
+      field: "recovery",
+      mutate(session) {
+        session.document.recovery = { reason: "forged-recovery" };
+      },
+    },
+  ];
+
+  for (
+    let transitionIndex = 0;
+    transitionIndex < transitions.length;
+    transitionIndex += 1
+  ) {
+    const transition = transitions[transitionIndex];
+    const handoff = handoffReceiptForStartedResult(
+      transition.result,
+      transition.state,
+    );
+    const accepted = assertLogicalWriterLaunchStartedResult({
+      handoff,
+      result: transition.result,
+    });
+    assert.equal(
+      accepted.operation.revision,
+      transition.state === "uncertain" ? "3" : "2",
+    );
+
+    for (
+      let forgeryIndex = 0;
+      forgeryIndex < forgeries.length;
+      forgeryIndex += 1
+    ) {
+      const forgery = forgeries[forgeryIndex];
+      const forged = clone(transition.result);
+      forged.writer = transition.result.writer;
+      forgery.mutate(forged.session);
+      assert.throws(
+        () =>
+          assertLogicalWriterLaunchStartedResult({
+            handoff,
+            result: forged,
+          }),
+        assertLauncherError("logical_writer_launch_outcome_uncertain"),
+        `${transition.state}/${forgery.field}`,
+      );
+    }
+  }
+});
+
 test("prepares one exact durable launch seed without consuming or reserving", async () => {
   const value = await fixture();
 

@@ -65,7 +65,18 @@ unavailable.
   Its `started` result is accepted only when the full terminal
   operation/reservation/session/evidence relation validates and the durable
   revision is exactly 2 after prepared/starting, exactly 3 after uncertain, or
-  unchanged for committed replay.
+  unchanged for committed replay. Stable session identity—including its
+  manifest, storage, backend capabilities, attachment, lease, lifecycle,
+  recovery state, writer epoch, document version, creation time, and session
+  ID—must still match the atomic handoff while operation-owned pointers,
+  history, revision, launch state, and update time follow their own transition
+  contracts.
+- A supported version 2 expected session remains unchanged inside the durable
+  operation request while the authority upgrades its current active and
+  terminal session receipts to document version 3. Those receipts must match
+  the complete expected document after applying only that version upgrade and
+  the authority-owned active-operation pointer. Version 1 restore sessions
+  remain unsupported and fail before fleet gating or durable work.
 - A failure before definite publication dispatch may cancel only the prepared
   restore. A failure after dispatch but before confirmed handoff leaves or
   marks durable uncertainty. A launch failure after handoff remains owned by
@@ -103,6 +114,12 @@ unavailable.
   wrapper. Its four own data fields are sampled once into a frozen wrapper,
   preserving the opaque inner reservation identity while preventing a later
   outer-property swap between launch preparation and execution.
+- Session comparisons protect content stability, not JavaScript object
+  identity. A legal version 2-to-3 authority upgrade is accepted only at the
+  current-session boundary; every unrelated stable field is reconstructed from
+  the expected session and compared as one canonical document. The terminal
+  launcher result independently binds the same stable identity back to the
+  handoff receipt.
 - The standalone facade does not provide durable complete-stop proof, capture
   admission, bounded operational recovery, a concrete container driver, or
   production adapter enablement.

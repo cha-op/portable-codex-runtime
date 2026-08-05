@@ -144,7 +144,7 @@ function authoritySession(value) {
     sessionId: value.sessionId,
     revision: value.revision,
     document: {
-      documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
+      documentVersion: document.documentVersion,
       manifest: canonicalManifest,
       storageRef: {
         contractVersion: document.storageRef.contractVersion,
@@ -294,7 +294,9 @@ function attachment() {
   };
 }
 
-function expectedSession() {
+function expectedSession(
+  documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION,
+) {
   return deepFreeze({
     createdAt: "2026-08-04T11:00:00.000Z",
     document: {
@@ -306,7 +308,7 @@ function expectedSession() {
         fencing: "epoch-enforced",
         normalDirectoryAttachment: true,
       },
-      documentVersion: 3,
+      documentVersion,
       lastOperation: {
         conflictClass: "session-mutation",
         expectedSessionRevision: "0",
@@ -580,6 +582,7 @@ function activeSession(base, operationValue, reservationValue, revision) {
   const session = clone(authoritySession(base));
   session.revision = revision;
   session.updatedAt = operationValue.updatedAt;
+  session.document.documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION;
   session.document.activeOperation = activePointer(
     operationValue,
     reservationValue,
@@ -591,6 +594,7 @@ function terminalSession(base, operationValue, reservationValue, revision) {
   const session = clone(authoritySession(base));
   session.revision = revision;
   session.updatedAt = operationValue.updatedAt;
+  session.document.documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION;
   session.document.activeOperation = null;
   session.document.lastOperation = terminalPointer(
     operationValue,
@@ -652,7 +656,9 @@ class MemoryAuthority {
     this.claimAcknowledgementLost = false;
     this.claimFailureBeforeDispatch =
       options.claimFailureBeforeDispatch === true;
-    this.expectedSession = expectedSession();
+    this.expectedSession = expectedSession(
+      options.expectedDocumentVersion ?? SESSION_AUTHORITY_DOCUMENT_VERSION,
+    );
     this.handoffFailures = options.handoffFailures ?? 0;
     this.handoffReceiptMutation = options.handoffReceiptMutation ?? null;
     this.handoffCalls = 0;
@@ -1355,6 +1361,51 @@ test("committed restore publication hands off atomically before prepared launch"
   ]);
 });
 
+test("v2 expected session upgrades authority receipts to v3 without rewriting the operation input", async (t) => {
+  const value = await fixture(t, { expectedDocumentVersion: 2 });
+
+  const completion = await value.composer.runRestore(
+    admission(),
+    value.publish,
+  );
+
+  assert.equal(completion.replayed, false);
+  assert.equal(
+    value.authority.input.expectedSession.document.documentVersion,
+    2,
+  );
+  assert.equal(
+    value.authority.prepared.operation.expectedSession.document.documentVersion,
+    2,
+  );
+  assert.equal(value.authority.prepared.session.document.documentVersion, 3);
+  assert.equal(
+    value.authority.claim.operation.expectedSession.document.documentVersion,
+    2,
+  );
+  assert.equal(value.authority.claim.session.document.documentVersion, 3);
+  assert.equal(value.authority.handoffCalls, 1);
+  assert.equal(value.launcher.launchCalls, 1);
+});
+
+test("v1 initial restore session fails before the fleet gate or durable work", async (t) => {
+  const value = await fixture(t, { expectedDocumentVersion: 1 });
+
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(value.gateCalls, 0);
+  assert.equal(value.preparationCalls, 0);
+  assert.equal(value.events.includes("authority.reserve"), false);
+  assert.equal(value.events.includes("authority.claim"), false);
+  assert.equal(value.publicationCalls, 0);
+  assert.equal(value.launcher.runCalls, 0);
+});
+
 test("preparation snapshots one image reservation capability across prepare and run", async (t) => {
   const reservationA = Object.freeze(Object.create(null));
   const reservationB = Object.freeze(Object.create(null));
@@ -1580,6 +1631,34 @@ test("active session relation rejects stable-field forgery with a poisoned Array
   assert.equal(value.launcher.runCalls, 0);
 });
 
+test("active session relation rejects a downgraded current document version before claim", async (t) => {
+  const value = await fixture(t, {
+    expectedDocumentVersion: 2,
+    reserveReceiptMutation(receipt) {
+      receipt.session.document.documentVersion = 2;
+      return receipt;
+    },
+  });
+
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(
+    value.authority.prepared.operation.expectedSession.document.documentVersion,
+    2,
+  );
+  assert.equal(value.authority.prepared.session.document.documentVersion, 2);
+  assert.equal(value.authority.phase, "prepared");
+  assert.equal(value.events.includes("authority.claim"), false);
+  assert.equal(value.publicationCalls, 0);
+  assert.equal(value.authority.handoffCalls, 0);
+  assert.equal(value.launcher.runCalls, 0);
+});
+
 test("a forged handoff session relation is rejected before launch", async (t) => {
   const value = await fixture(t, {
     handoffReceiptMutation(receipt) {
@@ -1640,6 +1719,27 @@ test("a forged launch success relation is rejected after durable handoff", async
       result.operation.expectedSession.revision = "5";
       result.reservation.expectedSessionRevision = "5";
       result.session.document.lastOperation.expectedSessionRevision = "5";
+      return result;
+    },
+  });
+
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(value.authority.handoffCalls, 1);
+  assert.equal(value.authority.phase, "committed");
+  assert.equal(value.launcher.runCalls, 1);
+  assert.equal(value.launcher.launchCalls, 1);
+});
+
+test("a forged started session identity is rejected after durable handoff", async (t) => {
+  const value = await fixture(t, {
+    launchResultMutation(result) {
+      result.session.document.writerEpoch = "999";
       return result;
     },
   });

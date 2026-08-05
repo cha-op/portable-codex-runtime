@@ -139,19 +139,6 @@ const SESSION_DOCUMENT_KEYS = objectFreeze([
   "storageRef",
   "writerEpoch",
 ]);
-const ACTIVE_SESSION_STABLE_DOCUMENT_KEYS = objectFreeze([
-  "attachment",
-  "backendCapabilities",
-  "documentVersion",
-  "lastOperation",
-  "launch",
-  "lease",
-  "lifecycle",
-  "manifest",
-  "recovery",
-  "storageRef",
-  "writerEpoch",
-]);
 const OPERATION_KEYS = objectFreeze([
   "conflictClass",
   "createdAt",
@@ -663,7 +650,8 @@ function normalizeSession(value, admission, code) {
     fail(code);
   }
   ensure(
-    session.sessionId === admission.checkpoint.sessionId &&
+    (document.documentVersion === 2 || document.documentVersion === 3) &&
+      session.sessionId === admission.checkpoint.sessionId &&
       document.lifecycle === "ATTACHED" &&
       document.activeOperation === null &&
       document.launch === null &&
@@ -1077,14 +1065,28 @@ function validateActiveSession(
     code,
     true,
   );
-  for (
-    let index = 0;
-    index < ACTIVE_SESSION_STABLE_DOCUMENT_KEYS.length;
-    index += 1
-  ) {
-    const key = ACTIVE_SESSION_STABLE_DOCUMENT_KEYS[index];
-    ensure(sameData(document[key], expectedDocument[key], code), code);
-  }
+  // Protect session content stability rather than object identity. An active
+  // transition may only upgrade the document version, replace its active
+  // pointer, advance the revision, and move the operation-owned timestamp.
+  const stableDocument = exactFrozenRecord({
+    activeOperation: document.activeOperation,
+    attachment: expectedDocument.attachment,
+    backendCapabilities: expectedDocument.backendCapabilities,
+    documentVersion: 3,
+    lastOperation: expectedDocument.lastOperation,
+    launch: expectedDocument.launch,
+    lease: expectedDocument.lease,
+    lifecycle: expectedDocument.lifecycle,
+    manifest: expectedDocument.manifest,
+    recovery: expectedDocument.recovery,
+    storageRef: expectedDocument.storageRef,
+    writerEpoch: expectedDocument.writerEpoch,
+  });
+  ensure(
+    document.documentVersion === 3 &&
+      sameData(session.document, stableDocument, code),
+    code,
+  );
   canonicalData(sessionValue, code);
   return sessionValue;
 }

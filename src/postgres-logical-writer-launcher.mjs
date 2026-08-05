@@ -1979,6 +1979,32 @@ function successResult(receipt, writer) {
   });
 }
 
+function stableSessionProjection(value, code) {
+  const session = exactDataObject(value, SESSION_KEYS, code);
+  const document = exactDataObject(
+    session.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+  );
+  // Operation-owned pointers/history, revision, and updatedAt are validated by
+  // their transition contracts. Every other session field remains stable.
+  return exactFrozenRecord({
+    createdAt: session.createdAt,
+    document: exactFrozenRecord({
+      attachment: document.attachment,
+      backendCapabilities: document.backendCapabilities,
+      documentVersion: document.documentVersion,
+      lease: document.lease,
+      lifecycle: document.lifecycle,
+      manifest: document.manifest,
+      recovery: document.recovery,
+      storageRef: document.storageRef,
+      writerEpoch: document.writerEpoch,
+    }),
+    sessionId: session.sessionId,
+  });
+}
+
 /**
  * Revalidates a terminal started result against its complete durable launch
  * request, operation, reservation, session pointer, and supervisor evidence,
@@ -2092,7 +2118,11 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
       receipt.reservation.createdAt === handoff.reservation.createdAt &&
       receipt.reservation.updatedAt === receipt.operation.updatedAt &&
       receipt.reservation.releasedAt === receipt.operation.updatedAt &&
-      receipt.session.createdAt === handoff.session.createdAt &&
+      sameContent(
+        stableSessionProjection(receipt.session, code),
+        stableSessionProjection(handoff.session, code),
+        code,
+      ) &&
       canonicalTimestampMilliseconds(receipt.session.updatedAt, code) >=
         canonicalTimestampMilliseconds(receipt.operation.updatedAt, code) &&
       BigIntConstructor(receipt.session.revision) >=
