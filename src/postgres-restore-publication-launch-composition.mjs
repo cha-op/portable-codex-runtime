@@ -947,14 +947,15 @@ function normalizeRestoreReadReceipt(value, admission, code) {
     admission,
     relationCode,
   );
-  const cancellationRequest = cancelledBeforeDispatch
-    ? normalizeRestoreOperationRequestV2(
-        operation.request,
-        operation.expectedSession,
-        admission,
-        relationCode,
-      )
-    : null;
+  const committedRequest =
+    operation.state === "committed"
+      ? normalizeRestoreOperationRequestV2(
+          operation.request,
+          operation.expectedSession,
+          admission,
+          relationCode,
+        )
+      : null;
   ensure(
     operation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
       operation.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
@@ -966,9 +967,9 @@ function normalizeRestoreReadReceipt(value, admission, code) {
         ? operation.retiredAt === operation.updatedAt
         : operation.retiredAt === null) &&
       (cancelledBeforeDispatch
-        ? cancellationRequest.request.contractVersion === 2 &&
+        ? committedRequest.request.contractVersion === 2 &&
           sameData(
-            cancellationRequest.request.admission,
+            committedRequest.request.admission,
             admission,
             relationCode,
           )
@@ -980,6 +981,17 @@ function normalizeRestoreReadReceipt(value, admission, code) {
   );
   timestampMilliseconds(operation.createdAt, relationCode);
   timestampMilliseconds(operation.updatedAt, relationCode);
+  if (committedRequest !== null) {
+    ensure(
+      operation.requestSha256 ===
+        authorityOperationRequestSha256(
+          committedRequest.expectedSession,
+          committedRequest.request,
+          relationCode,
+        ),
+      relationCode,
+    );
+  }
   const operationRevision = revision(operation.revision, relationCode);
   ensure(
     (receipt.status === "prepared" && operationRevision === 0n) ||
@@ -1058,14 +1070,8 @@ function normalizeRestoreReadReceipt(value, admission, code) {
       relationCode,
     );
     ensure(
-      operation.requestSha256 ===
-        authorityOperationRequestSha256(
-          cancellationRequest.expectedSession,
-          cancellationRequest.request,
-          relationCode,
-        ) &&
-        reservation.reservationId ===
-          `reservation-${sha256String(operation.operationId, relationCode)}`,
+      reservation.reservationId ===
+        `reservation-${sha256String(operation.operationId, relationCode)}`,
       relationCode,
     );
     validateCancelledTerminalSession(
@@ -1969,18 +1975,26 @@ export function createPostgresRestorePublicationLaunchComposition(...args) {
         admission,
         outcomeCode,
       );
-      const launchIntent = await invokeCollaborator(
-        launcher,
-        "prepareLaunchIntent",
-        [
-          exactFrozenRecord({
-            expectedSession: initial.session,
-            imageReservation: preparation.imageReservation,
-            launchAttemptId: preparation.launchAttemptId,
-          }),
-        ],
-        outcomeCode,
-      );
+      // Once the restore handoff is committed, its canonical request is the
+      // durable launch-intent authority. Revalidating the one-use image
+      // capability here would reject a legitimate replay after the writer
+      // launch consumed it. A still-prepared writer attempt remains protected:
+      // runPreparedLaunch validates and consumes the reservation before dispatch.
+      const launchIntent =
+        initial.status === "committed"
+          ? initial.operation.request.launchIntent
+          : await invokeCollaborator(
+              launcher,
+              "prepareLaunchIntent",
+              [
+                exactFrozenRecord({
+                  expectedSession: initial.session,
+                  imageReservation: preparation.imageReservation,
+                  launchAttemptId: preparation.launchAttemptId,
+                }),
+              ],
+              outcomeCode,
+            );
       ensure(
         objectIsFrozen(launchIntent) &&
           launchIntent.launchAttemptId === preparation.launchAttemptId,

@@ -9,8 +9,12 @@ import {
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
+  MAX_WRITER_LEASE_DURATION_MILLISECONDS,
+  WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  PostgresSessionAuthorityError,
+  assertCommittedSessionTransitionProof,
   createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
@@ -249,6 +253,72 @@ function terminalPointer(operation, reservation) {
     ...activePointer(operation, reservation),
     resultSha256: jsonSha256(operation.result),
   };
+}
+
+function renewCommittedSession(receipt) {
+  const before = clone(receipt.session);
+  const operationId = "writer-lease-renew-operation-001";
+  const request = {
+    contractVersion: 1,
+    leaseDurationMilliseconds: MAX_WRITER_LEASE_DURATION_MILLISECONDS,
+  };
+  const requestSha256 =
+    "571385319cbb365bf4da0b03745c305b93f71039046735049d16bd2cf0a3c33f";
+  const renewedLease = {
+    ...clone(before.document.lease),
+    expiresAt: "2027-08-04T23:59:59.000Z",
+  };
+  const result = {
+    resultVersion: 1,
+    outcome: "writer-lease-renewed",
+    lease: renewedLease,
+    attachment: clone(before.document.attachment),
+  };
+  const updatedAt = "2027-08-03T23:59:58.000Z";
+  const operation = {
+    operationId,
+    sessionId: before.sessionId,
+    kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSession: before,
+    request,
+    requestSha256,
+    state: "committed",
+    revision: "0",
+    result,
+    createdAt: updatedAt,
+    updatedAt,
+    retiredAt: updatedAt,
+  };
+  const reservation = {
+    reservationId: `reservation-${createHash("sha256")
+      .update(operationId)
+      .digest("hex")}`,
+    operationId,
+    sessionId: before.sessionId,
+    kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+    expectedSessionRevision: before.revision,
+    state: "released",
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    requestSha256,
+    createdAt: updatedAt,
+    updatedAt,
+    expiresAt: null,
+    releasedAt: updatedAt,
+  };
+  const after = clone(before);
+  after.document.lease = renewedLease;
+  after.document.lastOperation = terminalPointer(operation, reservation);
+  after.revision = (BigInt(before.revision) + 1n).toString();
+  after.updatedAt = updatedAt;
+  receipt.session = after;
+  receipt.sessionTransition = {
+    after,
+    before,
+    operation,
+    reservation,
+  };
+  return receipt;
 }
 
 function handoffReceiptForStartedResult(result, state = "prepared") {
@@ -547,6 +617,7 @@ class MemoryLaunchAuthority {
       operation,
       reservation,
       session: this.session(operation, reservation),
+      sessionTransition: null,
       status: operation.state,
     };
   }
@@ -842,6 +913,15 @@ function assertLauncherError(code, retryable = false) {
     assert.equal(error.retryable, retryable);
     assert.equal(Object.isFrozen(error), true);
     assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  };
+}
+
+function assertSessionAuthorityError(code) {
+  return (error) => {
+    assert.ok(error instanceof PostgresSessionAuthorityError);
+    assert.equal(error.code, code);
+    assert.equal(Object.isFrozen(error), true);
     return true;
   };
 }
@@ -2041,6 +2121,189 @@ test("committed prepared replay returns the original local writer without relaun
   assert.equal(value.launchCalls, 1);
   assert.equal(value.reconcileCalls, 0);
   assert.equal(value.inspectionCount, inspectionsAfterStart);
+});
+
+test("committed replay accepts a lease renewal between handoff and durable reread", async () => {
+  const value = await fixture();
+  seedPreparedLaunchHandoff(value);
+  const started = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+  const handoff = {
+    attempt: started.attempt,
+    operation: started.operation,
+    reservation: started.reservation,
+    session: started.session,
+    status: "committed",
+  };
+  const inspectionsAfterHandoff = value.inspectionCount;
+  value.authority.readReceiptMutation = renewCommittedSession;
+  const proofFixture = renewCommittedSession(value.authority.receipt());
+  const validatedProof = assertCommittedSessionTransitionProof(
+    proofFixture.sessionTransition,
+  );
+  assert.deepEqual(
+    JSON.parse(jsonStringify(validatedProof.after)),
+    JSON.parse(jsonStringify(proofFixture.session)),
+  );
+  assert.equal(
+    validatedProof.operation.requestSha256,
+    proofFixture.sessionTransition.operation.requestSha256,
+  );
+
+  const replayed = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+  const validated = assertLogicalWriterLaunchStartedResult({
+    handoff,
+    result: replayed,
+  });
+
+  assert.equal(validated.status, "started");
+  assert.equal(Object.hasOwn(replayed, "sessionTransition"), false);
+  assert.equal(Object.hasOwn(validated, "sessionTransition"), false);
+  assert.strictEqual(validated.writer, started.writer);
+  assert.equal(
+    BigInt(validated.session.revision),
+    BigInt(handoff.session.revision) + 1n,
+  );
+  assert.equal(
+    validated.session.document.lease.expiresAt,
+    "2027-08-04T23:59:59.000Z",
+  );
+  assert.equal(
+    validated.session.document.lastOperation.operationId,
+    "writer-lease-renew-operation-001",
+  );
+  assert.deepEqual(
+    validated.session.document.launch,
+    handoff.session.document.launch,
+  );
+  assert.equal(value.authority.calls.claim, 1);
+  assert.equal(value.authority.calls.finalizeStarted, 1);
+  assert.equal(value.launchCalls, 1);
+  assert.equal(value.inspectionCount, inspectionsAfterHandoff);
+
+  const revalidated = assertLogicalWriterLaunchStartedResult({
+    handoff,
+    result: validated,
+  });
+  assert.deepEqual(revalidated.session, validated.session);
+  assert.strictEqual(revalidated.writer, started.writer);
+
+  const postRenewalHandoff = {
+    attempt: replayed.attempt,
+    operation: replayed.operation,
+    reservation: replayed.reservation,
+    session: replayed.session,
+    status: "committed",
+  };
+  const unchanged = assertLogicalWriterLaunchStartedResult({
+    handoff: postRenewalHandoff,
+    result: replayed,
+  });
+  assert.deepEqual(unchanged.session, postRenewalHandoff.session);
+
+  const detachedPostRenewal = clone(replayed);
+  detachedPostRenewal.writer = replayed.writer;
+  const detachedUnchanged = assertLogicalWriterLaunchStartedResult({
+    handoff: postRenewalHandoff,
+    result: detachedPostRenewal,
+  });
+  assert.deepEqual(
+    detachedUnchanged.session,
+    postRenewalHandoff.session,
+  );
+  assert.equal(Object.hasOwn(detachedUnchanged, "sessionTransition"), false);
+
+  const detached = clone(replayed);
+  detached.writer = replayed.writer;
+  assert.throws(
+    () =>
+      assertLogicalWriterLaunchStartedResult({
+        handoff,
+        result: detached,
+      }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    "a complete canonical proof without its authority-read identity",
+  );
+
+  const extended = {
+    ...replayed,
+    sessionTransition: proofFixture.sessionTransition,
+  };
+  assert.throws(
+    () =>
+      assertLogicalWriterLaunchStartedResult({
+        handoff,
+        result: extended,
+      }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    "v1 started results reject a public transition proof field",
+  );
+});
+
+test("committed session transition proof rejects relational tampering", async () => {
+  const value = await fixture();
+  seedPreparedLaunchHandoff(value);
+  await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+  const proof = renewCommittedSession(
+    value.authority.receipt(),
+  ).sessionTransition;
+  assert.doesNotThrow(() =>
+    assertCommittedSessionTransitionProof(proof),
+  );
+  const forgeries = [
+    {
+      name: "session revision",
+      mutate(candidate) {
+        candidate.after.revision = candidate.before.revision;
+      },
+    },
+    {
+      name: "session terminal pointer",
+      mutate(candidate) {
+        candidate.after.document.lastOperation = null;
+      },
+    },
+    {
+      name: "access policy",
+      mutate(candidate) {
+        candidate.before.document.backendCapabilities.fencing = "automatic";
+      },
+    },
+    {
+      name: "operation request",
+      mutate(candidate) {
+        candidate.operation.request.leaseDurationMilliseconds -= 1;
+      },
+    },
+    {
+      name: "operation result",
+      mutate(candidate) {
+        candidate.operation.result.attachment.rootPath =
+          "/var/lib/portable-codex/session-forged";
+      },
+    },
+    {
+      name: "reservation",
+      mutate(candidate) {
+        candidate.reservation.reservationId = "reservation-forged";
+      },
+    },
+  ];
+
+  for (const forgery of forgeries) {
+    const forged = clone(proof);
+    forgery.mutate(forged);
+    assert.throws(
+      () => assertCommittedSessionTransitionProof(forged),
+      assertSessionAuthorityError("operation_state_invalid"),
+      forgery.name,
+    );
+  }
 });
 
 test("rejects active prepared-handoff recovery bound to another supervisor", async () => {

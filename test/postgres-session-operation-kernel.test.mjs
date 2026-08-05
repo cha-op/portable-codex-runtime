@@ -32,6 +32,7 @@ import {
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
+  assertCommittedSessionTransitionProof,
   assertRestoreGenerationLaunchHandoffReceipt,
 } from "../src/postgres-session-authority.mjs";
 import {
@@ -9506,6 +9507,29 @@ test("writer lease renewal preserves the current launch identity while extending
     options.operationId,
   );
   assert.deepEqual(readAttempt.launch, expectedSession.document.launch);
+  assert.notEqual(readAttempt.sessionTransition, null);
+  assert.equal(
+    readAttempt.sessionTransition.operation.operationId,
+    options.operationId,
+  );
+  assert.equal(
+    readAttempt.sessionTransition.operation.requestSha256,
+    readAttempt.session.document.lastOperation.requestSha256,
+  );
+  assert.equal(
+    readAttempt.sessionTransition.reservation.reservationId,
+    readAttempt.session.document.lastOperation.reservationId,
+  );
+  assert.deepEqual(
+    JSON.parse(
+      JSON.stringify(
+        assertCommittedSessionTransitionProof(
+          readAttempt.sessionTransition,
+        ),
+      ),
+    ),
+    JSON.parse(JSON.stringify(readAttempt.sessionTransition)),
+  );
   assert.equal(
     authorityQueries(clients[1]).filter(
       (args) =>
@@ -9579,6 +9603,19 @@ test("checkpoint last-operation replacement preserves and independently validate
     checkpoint.options.operationId,
   );
   assert.deepEqual(readAttempt.launch, readSession.document.launch);
+  assert.notEqual(readAttempt.sessionTransition, null);
+  assert.equal(
+    readAttempt.sessionTransition.operation.operationId,
+    checkpoint.options.operationId,
+  );
+  assert.deepEqual(
+    readAttempt.sessionTransition.before,
+    checkpoint.options.expectedSession,
+  );
+  assert.deepEqual(
+    readAttempt.sessionTransition.after,
+    readAttempt.session,
+  );
   assert.equal(
     authorityQueries(clients[0]).filter(
       (args) =>

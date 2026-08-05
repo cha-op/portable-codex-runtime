@@ -17,6 +17,9 @@ import {
   operationJournalBindingSha256,
 } from "../src/filesystem-operation-journal.mjs";
 import {
+  PlatformImageReservationCoordinator,
+} from "../src/platform-image-reservation.mjs";
+import {
   PostgresRestorePublicationLaunchCompositionError,
   RESTORE_LAUNCH_V2_FLEET_CONFIRMED,
   createPostgresRestorePublicationLaunchComposition,
@@ -41,7 +44,49 @@ const LAUNCH_ATTEMPT_ID = "writer-launch-001";
 const GENERATION_ID = "restore-generation-001";
 const DESTINATION_ISOLATION_PROOF_ID = "destination-isolation-proof-001";
 const NOW = "2026-08-04T12:00:00.000Z";
-const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const OCI_MANIFEST_MEDIA_TYPE =
+  "application/vnd.oci.image.manifest.v1+json";
+const OCI_CONFIG_MEDIA_TYPE = "application/vnd.oci.image.config.v1+json";
+const OCI_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip";
+const CODEX_VERSION = "codex-cli 0.142.4";
+const IMAGE_CONFIG_BYTES = Buffer.from(
+  JSON.stringify({
+    architecture: "arm64",
+    config: { Env: ["PATH=/usr/local/bin:/usr/bin:/bin"] },
+    os: "linux",
+    rootfs: {
+      diff_ids: [`sha256:${"d".repeat(64)}`],
+      type: "layers",
+    },
+  }),
+  "utf8",
+);
+const IMAGE_MANIFEST_BYTES = Buffer.from(
+  JSON.stringify({
+    config: {
+      digest: `sha256:${sha256(IMAGE_CONFIG_BYTES)}`,
+      mediaType: OCI_CONFIG_MEDIA_TYPE,
+      size: IMAGE_CONFIG_BYTES.byteLength,
+    },
+    layers: [
+      {
+        digest: `sha256:${"c".repeat(64)}`,
+        mediaType: OCI_LAYER_MEDIA_TYPE,
+        size: 1024,
+      },
+    ],
+    mediaType: OCI_MANIFEST_MEDIA_TYPE,
+    schemaVersion: 2,
+  }),
+  "utf8",
+);
+const IMAGE_DESCRIPTOR = Object.freeze({
+  bytes: IMAGE_MANIFEST_BYTES,
+  digest: `sha256:${sha256(IMAGE_MANIFEST_BYTES)}`,
+  mediaType: OCI_MANIFEST_MEDIA_TYPE,
+  size: IMAGE_MANIFEST_BYTES.byteLength,
+});
+const IMAGE_DIGEST = IMAGE_DESCRIPTOR.digest;
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
 
 const TRUSTED_JOURNAL_ACL_INSPECTORS = Object.freeze({
@@ -256,9 +301,9 @@ function manifest() {
     },
     runtime: {
       codexSandbox: "danger-full-access",
-      codexVersion: "codex-cli 0.142.4",
+      codexVersion: CODEX_VERSION,
       imageDigest: IMAGE_DIGEST,
-      imageMediaType: "application/vnd.oci.image.manifest.v1+json",
+      imageMediaType: OCI_MANIFEST_MEDIA_TYPE,
       platform: "linux/arm64",
     },
   });
@@ -1097,8 +1142,16 @@ class MemoryLauncher {
       this.started = true;
     }
     assert.strictEqual(
-      input.imageReservation,
-      this.prepareImageReservation,
+      input.imageReservation.configBytes,
+      this.prepareImageReservation.configBytes,
+    );
+    assert.strictEqual(
+      input.imageReservation.descriptor,
+      this.prepareImageReservation.descriptor,
+    );
+    assert.strictEqual(
+      input.imageReservation.inspectCodex,
+      this.prepareImageReservation.inspectCodex,
     );
     this.runImageReservation = input.imageReservation;
     this.runOpaqueReservation = input.imageReservation.reservation;
@@ -1208,6 +1261,59 @@ class MemoryLauncher {
   }
 }
 
+class OneUseImageCapabilityLauncher extends MemoryLauncher {
+  constructor(events, imageReservation, authority, imageReservations) {
+    super(events, imageReservation, authority);
+    this.imageReservations = imageReservations;
+    this.prepareCalls = 0;
+  }
+
+  async prepareLaunchIntent(input) {
+    this.events.push("launcher.prepare");
+    this.prepareCalls += 1;
+    assert.notStrictEqual(input.imageReservation, this.imageReservation);
+    assert.equal(Object.isFrozen(input.imageReservation), true);
+    assert.strictEqual(
+      input.imageReservation.configBytes,
+      this.imageReservation.configBytes,
+    );
+    assert.strictEqual(
+      input.imageReservation.descriptor,
+      this.imageReservation.descriptor,
+    );
+    assert.strictEqual(
+      input.imageReservation.inspectCodex,
+      this.imageReservation.inspectCodex,
+    );
+    assert.strictEqual(
+      input.imageReservation.reservation,
+      this.imageReservation.reservation,
+    );
+    this.prepareImageReservation = input.imageReservation;
+    this.prepareOpaqueReservation = input.imageReservation.reservation;
+    const measuredImage = await this.imageReservations.revalidateReservation(
+      input.imageReservation,
+    );
+    return deepFreeze({
+      launchAttemptId: input.launchAttemptId,
+      measuredImage,
+      supervisor: {
+        contractVersion: 1,
+        supervisorId: "supervisor-001",
+      },
+    });
+  }
+
+  async runPreparedLaunch(input) {
+    if (!this.started) {
+      await this.imageReservations.consumeReservation(
+        input.imageReservation,
+      );
+    }
+    return await super.runPreparedLaunch(input);
+  }
+}
+
 class MemoryGuard {
   constructor(events, options = {}) {
     this.events = events;
@@ -1253,12 +1359,9 @@ async function fixture(t, options = {}) {
     ...options,
     artifactProof: publicationFixture.artifactProof,
   });
-  const launcher = new MemoryLauncher(
-    events,
-    imageReservation,
-    authority,
-    options,
-  );
+  const launcher =
+    options.launcherFactory?.({ authority, events, imageReservation }) ??
+    new MemoryLauncher(events, imageReservation, authority, options);
   const guard = new MemoryGuard(events, options);
   let gateCalls = 0;
   let preparationCalls = 0;
@@ -2021,6 +2124,13 @@ test("committed replay bypasses the fresh gate and does not relaunch", async (t)
   await value.composer.runRestore(admission(), value.publish);
   assert.equal(value.authority.handoffReceipt.status, "committed");
   assert.notEqual(value.authority.handoffReceipt.session.document.launch, null);
+  assert.equal(
+    value.authority.committed.operation.requestSha256,
+    operationRequestSha256({
+      expectedSession: value.authority.committed.operation.expectedSession,
+      request: value.authority.committed.operation.request,
+    }),
+  );
   value.setGateResult(Object.freeze(Object.create(null)));
 
   const replay = await value.composer.runRestore(admission(), value.publish);
@@ -2031,6 +2141,87 @@ test("committed replay bypasses the fresh gate and does not relaunch", async (t)
   assert.deepEqual(value.authority.handoffRevisions, ["1", "1"]);
   assert.equal(value.launcher.runCalls, 2);
   assert.equal(value.launcher.launchCalls, 1);
+});
+
+test("committed replay uses durable launch intent after image capability consumption", async (t) => {
+  const imageReservations = new PlatformImageReservationCoordinator();
+  let imageAvailable = true;
+  let inspectionCalls = 0;
+  const inspectCodex = async () => {
+    inspectionCalls += 1;
+    if (!imageAvailable) throw new Error("platform image unavailable");
+    return {
+      codexBinaryPath: "/opt/portable-codex/bin/codex",
+      codexBinarySha256: "c".repeat(64),
+      codexVersion: CODEX_VERSION,
+    };
+  };
+  const reservation = await imageReservations.reservePlatformImage({
+    configBytes: IMAGE_CONFIG_BYTES,
+    descriptor: IMAGE_DESCRIPTOR,
+    inspectCodex,
+    sessionManifest: manifest(),
+  });
+  const imageReservation = Object.freeze({
+    configBytes: IMAGE_CONFIG_BYTES,
+    descriptor: IMAGE_DESCRIPTOR,
+    inspectCodex,
+    reservation: reservation.reservation,
+  });
+  const value = await fixture(t, {
+    imageReservation,
+    launcherFactory({ authority, events }) {
+      return new OneUseImageCapabilityLauncher(
+        events,
+        imageReservation,
+        authority,
+        imageReservations,
+      );
+    },
+  });
+
+  await value.composer.runRestore(admission(), value.publish);
+
+  assert.equal(value.authority.handoffReceipt.status, "committed");
+  assert.equal(value.launcher.prepareCalls, 1);
+  assert.equal(value.launcher.launchCalls, 1);
+  assert.equal(inspectionCalls, 3);
+  await assert.rejects(
+    imageReservations.revalidateReservation(imageReservation),
+    (error) => error?.code === "platform_image_reservation_rejected",
+  );
+  imageAvailable = false;
+
+  const replay = await value.composer.runRestore(admission(), value.publish);
+
+  assert.equal(replay.replayed, true);
+  assert.equal(value.launcher.prepareCalls, 1);
+  assert.equal(value.launcher.runCalls, 2);
+  assert.equal(value.launcher.launchCalls, 1);
+  assert.equal(inspectionCalls, 3);
+});
+
+test("committed replay rejects a forged durable launch intent before capability use", async (t) => {
+  const value = await fixture(t);
+  await value.composer.runRestore(admission(), value.publish);
+  const forged = clone(value.authority.committed);
+  forged.operation.request.launchIntent.supervisor.supervisorId =
+    "forged-supervisor";
+  value.authority.committed = deepFreeze(forged);
+  const retryEventIndex = value.events.length;
+
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(value.launcher.runCalls, 1);
+  assert.equal(value.launcher.launchCalls, 1);
+  assert.deepEqual(value.events.slice(retryEventIndex), [
+    "authority.read-restore",
+  ]);
 });
 
 test("handoff acknowledgement loss replays the same handoff before one launch", async (t) => {

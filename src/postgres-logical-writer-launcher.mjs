@@ -7,8 +7,10 @@ import {
 import {
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_OPERATION_CONFLICT_CLASS,
+  WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  assertCommittedSessionTransitionProof,
   createWriterLaunchAttemptOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
@@ -68,6 +70,10 @@ const regexpExecIntrinsic = RegExp.prototype.exec;
 const stoppedRegisterWriterIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.registerWriter;
 const TypeErrorConstructor = TypeError;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapHasIntrinsic = WeakMap.prototype.has;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakMapConstructor = WeakMap;
 const WeakSetConstructor = WeakSet;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
@@ -338,6 +344,7 @@ const READ_RECEIPT_KEYS = objectFreeze([
   "operation",
   "reservation",
   "session",
+  "sessionTransition",
   "status",
 ]);
 const STARTED_RESULT_VALIDATION_KEYS = objectFreeze([
@@ -435,6 +442,7 @@ const ERROR_MESSAGES = objectFreeze({
   logical_writer_launch_outcome_uncertain:
     "Logical writer launch outcome is uncertain",
 });
+const AUTHORITY_SESSION_TRANSITIONS_BY_RESULT = new WeakMapConstructor();
 const INTERNAL_ERRORS = new WeakSetConstructor();
 const promiseSpeciesHolder = objectFreeze(
   objectCreate(null, {
@@ -469,6 +477,18 @@ function mapHas(map, key) {
 
 function mapSet(map, key, value) {
   callIntrinsic(mapSetIntrinsic, map, [key, value]);
+}
+
+function weakMapGet(map, key) {
+  return callIntrinsic(weakMapGetIntrinsic, map, [key]);
+}
+
+function weakMapHas(map, key) {
+  return callIntrinsic(weakMapHasIntrinsic, map, [key]);
+}
+
+function weakMapSet(map, key, value) {
+  callIntrinsic(weakMapSetIntrinsic, map, [key, value]);
 }
 
 function weakSetAdd(set, value) {
@@ -1864,6 +1884,20 @@ function normalizeReadReceipt(value, launchAttemptId, code) {
   if (launch !== null) {
     ensure(sameContent(common.session.document.launch, launch, code), code);
   }
+  let sessionTransition = null;
+  if (common.receipt.sessionTransition !== null) {
+    try {
+      sessionTransition = assertCommittedSessionTransitionProof(
+        common.receipt.sessionTransition,
+      );
+    } catch {
+      fail(code);
+    }
+    ensure(
+      sameContent(sessionTransition.after, common.session, code),
+      code,
+    );
+  }
   return exactFrozenRecord({
     attempt,
     evidence: common.normalizedOperation.terminal.evidence,
@@ -1871,6 +1905,7 @@ function normalizeReadReceipt(value, launchAttemptId, code) {
     operation: common.operation,
     reservation: common.reservation,
     session: common.session,
+    sessionTransition,
     status:
       common.operation.state === "committed"
         ? common.normalizedOperation.terminal.status
@@ -1966,7 +2001,7 @@ function transitionInput(operation) {
 }
 
 function successResult(receipt, writer) {
-  return exactFrozenRecord({
+  const result = exactFrozenRecord({
     contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
     attempt: receipt.attempt,
     evidence: receipt.evidence,
@@ -1977,6 +2012,18 @@ function successResult(receipt, writer) {
     status: receipt.status,
     writer,
   });
+  if (
+    result.status === "started" &&
+    receipt.sessionTransition !== null &&
+    receipt.sessionTransition !== undefined
+  ) {
+    weakMapSet(
+      AUTHORITY_SESSION_TRANSITIONS_BY_RESULT,
+      result,
+      receipt.sessionTransition,
+    );
+  }
+  return result;
 }
 
 function stableSessionProjection(value, code) {
@@ -2003,6 +2050,106 @@ function stableSessionProjection(value, code) {
     }),
     sessionId: session.sessionId,
   });
+}
+
+function assertSessionLease(value, code) {
+  try {
+    return assertLeaseGrant(value);
+  } catch {
+    fail(code);
+  }
+}
+
+function validateCommittedSessionEvolution(
+  currentValue,
+  handoffValue,
+  sessionTransition,
+  code,
+) {
+  const current = exactDataObject(currentValue, SESSION_KEYS, code);
+  const handoff = exactDataObject(handoffValue, SESSION_KEYS, code);
+  if (sameContent(current, handoff, code)) {
+    return true;
+  }
+  ensure(
+    sessionTransition !== null &&
+      sameContent(sessionTransition.before, handoff, code) &&
+      sameContent(sessionTransition.after, current, code),
+    code,
+  );
+  const currentDocument = exactDataObject(
+    current.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+  );
+  const handoffDocument = exactDataObject(
+    handoff.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+  );
+  const currentLease = assertSessionLease(currentDocument.lease, code);
+  const handoffLease = assertSessionLease(handoffDocument.lease, code);
+  const stableCurrentDocument = exactFrozenRecord({
+    attachment: currentDocument.attachment,
+    backendCapabilities: currentDocument.backendCapabilities,
+    documentVersion: currentDocument.documentVersion,
+    launch: currentDocument.launch,
+    lifecycle: currentDocument.lifecycle,
+    manifest: currentDocument.manifest,
+    recovery: currentDocument.recovery,
+    storageRef: currentDocument.storageRef,
+    writerEpoch: currentDocument.writerEpoch,
+  });
+  const stableHandoffDocument = exactFrozenRecord({
+    attachment: handoffDocument.attachment,
+    backendCapabilities: handoffDocument.backendCapabilities,
+    documentVersion: handoffDocument.documentVersion,
+    launch: handoffDocument.launch,
+    lifecycle: handoffDocument.lifecycle,
+    manifest: handoffDocument.manifest,
+    recovery: handoffDocument.recovery,
+    storageRef: handoffDocument.storageRef,
+    writerEpoch: handoffDocument.writerEpoch,
+  });
+
+  // Protect logical session/launch identity and access policy, not snapshot
+  // object identity. A different snapshot requires one complete canonical
+  // authority transition. Only a committed lease-renew result may extend the
+  // same lease; every other accepted transition must preserve it exactly.
+  const leaseUnchanged = sameContent(currentLease, handoffLease, code);
+  const transitionOperation = sessionTransition.operation;
+  ensure(
+    current.sessionId === handoff.sessionId &&
+      current.createdAt === handoff.createdAt &&
+      canonicalTimestampMilliseconds(current.updatedAt, code) >=
+        canonicalTimestampMilliseconds(handoff.updatedAt, code) &&
+      sameContent(stableCurrentDocument, stableHandoffDocument, code) &&
+      (leaseUnchanged ||
+        (transitionOperation.kind === WRITER_LEASE_RENEW_OPERATION_KIND &&
+          transitionOperation.state === "committed" &&
+          transitionOperation.revision === "0" &&
+          transitionOperation.result?.outcome ===
+            "writer-lease-renewed" &&
+          currentLease.contractVersion === handoffLease.contractVersion &&
+          currentLease.sessionId === handoffLease.sessionId &&
+          currentLease.leaseId === handoffLease.leaseId &&
+          currentLease.holderId === handoffLease.holderId &&
+          currentLease.fencingEpoch === handoffLease.fencingEpoch &&
+          canonicalTimestampMilliseconds(currentLease.expiresAt, code) >
+            canonicalTimestampMilliseconds(handoffLease.expiresAt, code) &&
+          sameContent(
+            transitionOperation.result.lease,
+            currentLease,
+            code,
+          ) &&
+          sameContent(
+            transitionOperation.result.attachment,
+            currentDocument.attachment,
+            code,
+          ))),
+    code,
+  );
+  return true;
 }
 
 /**
@@ -2040,6 +2187,7 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
       operation: handoffInput.operation,
       reservation: handoffInput.reservation,
       session: handoffSession,
+      sessionTransition: null,
       status: handoffInput.status,
     }),
     launchAttemptId,
@@ -2055,10 +2203,23 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
         : handoff.launch === null),
     code,
   );
-  const result = exactDataObject(options.result, STARTED_RESULT_KEYS, code);
+  const rawResult = options.result;
+  const result = exactDataObject(rawResult, STARTED_RESULT_KEYS, code);
+  const transitionIdentityPresent = weakMapHas(
+    AUTHORITY_SESSION_TRANSITIONS_BY_RESULT,
+    rawResult,
+  );
+  const sessionTransition = transitionIdentityPresent
+    ? weakMapGet(AUTHORITY_SESSION_TRANSITIONS_BY_RESULT, rawResult)
+    : null;
+  const transitionIdentityRequired =
+    handoff.operation.state === "committed" &&
+    !sameContent(result.session, handoff.session, code);
   ensure(
     result.contractVersion === LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION &&
-      result.status === "started",
+      result.status === "started" &&
+      (!transitionIdentityRequired ||
+        transitionIdentityPresent),
     code,
   );
   const writer = assertOpaqueWriterHandle(result.writer, code);
@@ -2069,6 +2230,7 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
       operation: result.operation,
       reservation: result.reservation,
       session: result.session,
+      sessionTransition,
       status: result.operation?.state,
     }),
     launchAttemptId,
@@ -2118,11 +2280,18 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
       receipt.reservation.createdAt === handoff.reservation.createdAt &&
       receipt.reservation.updatedAt === receipt.operation.updatedAt &&
       receipt.reservation.releasedAt === receipt.operation.updatedAt &&
-      sameContent(
-        stableSessionProjection(receipt.session, code),
-        stableSessionProjection(handoff.session, code),
-        code,
-      ) &&
+      (handoff.operation.state === "committed"
+        ? validateCommittedSessionEvolution(
+            receipt.session,
+            handoff.session,
+            receipt.sessionTransition,
+            code,
+          )
+        : sameContent(
+            stableSessionProjection(receipt.session, code),
+            stableSessionProjection(handoff.session, code),
+            code,
+          )) &&
       canonicalTimestampMilliseconds(receipt.session.updatedAt, code) >=
         canonicalTimestampMilliseconds(receipt.operation.updatedAt, code) &&
       BigIntConstructor(receipt.session.revision) >=
@@ -2132,8 +2301,7 @@ export function assertLogicalWriterLaunchStartedResult(...args) {
       (handoff.operation.state !== "committed" ||
         (sameContent(receipt.operation, handoff.operation, code) &&
           sameContent(receipt.reservation, handoff.reservation, code) &&
-          sameContent(receipt.attempt, handoff.attempt, code) &&
-          sameContent(receipt.session, handoff.session, code))) &&
+          sameContent(receipt.attempt, handoff.attempt, code))) &&
       sameContent(result.attempt, receipt.attempt, code) &&
       sameContent(result.evidence, receipt.evidence, code) &&
       sameContent(result.launch, receipt.launch, code) &&

@@ -337,6 +337,12 @@ const RESTORE_GENERATION_LAUNCH_HANDOFF_RESTORE_KEYS = Object.freeze([
   "operation",
   "reservation",
 ]);
+const COMMITTED_SESSION_TRANSITION_PROOF_KEYS = Object.freeze([
+  "after",
+  "before",
+  "operation",
+  "reservation",
+]);
 const OPERATION_SNAPSHOT_KEYS = Object.freeze([
   "conflictClass",
   "createdAt",
@@ -7284,6 +7290,139 @@ function validatedHandoffReservationSnapshot(value, code) {
   return value;
 }
 
+function canonicalCommittedTransitionOperation(value, code) {
+  const normalized = exactPlainObject(
+    value,
+    OPERATION_SNAPSHOT_KEYS,
+    code,
+  );
+  let input;
+  try {
+    input = canonicalOperationInput({
+      expectedSession: normalized.expectedSession,
+      kind: normalized.kind,
+      operationId: normalized.operationId,
+      request: normalized.request,
+    });
+  } catch {
+    fail(code);
+  }
+  const revision = canonicalRevisionForCode(normalized.revision, code);
+  const createdAt = canonicalTimestampString(normalized.createdAt, code);
+  const updatedAt = canonicalTimestampString(normalized.updatedAt, code);
+  const retiredAt = canonicalTimestampString(normalized.retiredAt, code);
+  ensure(
+    normalized.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      normalized.sessionId === input.expectedSession.sessionId &&
+      normalized.state === "committed" &&
+      normalized.requestSha256 === input.requestSha256 &&
+      retiredAt === updatedAt &&
+      timestampMilliseconds(updatedAt) >= timestampMilliseconds(createdAt),
+    code,
+  );
+  const result = canonicalCommittedResult(
+    normalized.result,
+    input,
+    revision,
+    code,
+  );
+  ensure(
+    canonicalSerialize(normalized.result) === canonicalSerialize(result) &&
+      (revision !== "0" || createdAt === updatedAt),
+    code,
+  );
+  const operation = deepFreeze({
+    operationId: input.operationId,
+    sessionId: input.expectedSession.sessionId,
+    kind: input.kind,
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSession: input.expectedSession,
+    request: input.request,
+    requestSha256: input.requestSha256,
+    state: "committed",
+    revision,
+    result,
+    createdAt,
+    updatedAt,
+    retiredAt,
+  });
+  validateOperationIdentity(operation, input);
+  return deepFreeze({ input, operation });
+}
+
+function canonicalCommittedTransitionReservation(value, code) {
+  const validated = validatedHandoffReservationSnapshot(value, code);
+  return deepFreeze({
+    reservationId: canonicalOpaqueId(
+      validated.reservationId,
+      128,
+      code,
+    ),
+    operationId: canonicalOpaqueId(validated.operationId, 128, code),
+    sessionId: canonicalSessionId(validated.sessionId, code),
+    kind: canonicalOpaqueId(validated.kind, 64, code),
+    expectedSessionRevision: canonicalRevisionForCode(
+      validated.expectedSessionRevision,
+      code,
+    ),
+    state: validated.state,
+    conflictClass: validated.conflictClass,
+    requestSha256: validated.requestSha256,
+    createdAt: canonicalTimestampString(validated.createdAt, code),
+    updatedAt: canonicalTimestampString(validated.updatedAt, code),
+    expiresAt: null,
+    releasedAt: canonicalTimestampString(validated.releasedAt, code),
+  });
+}
+
+/**
+ * Validates one complete committed session transition using the canonical
+ * typed operation request/result relation and its released reservation.
+ */
+export function assertCommittedSessionTransitionProof(...args) {
+  const code = "operation_state_invalid";
+  ensure(args.length === 1, code);
+  const proof = exactPlainObject(
+    args[0],
+    COMMITTED_SESSION_TRANSITION_PROOF_KEYS,
+    code,
+  );
+  const before = expectedSnapshotFromValue(proof.before, code);
+  const after = expectedSnapshotFromValue(proof.after, code);
+  const normalizedOperation = canonicalCommittedTransitionOperation(
+    proof.operation,
+    code,
+  );
+  const operation = normalizedOperation.operation;
+  const reservation = canonicalCommittedTransitionReservation(
+    proof.reservation,
+    code,
+  );
+  ensure(
+    canonicalSnapshotBytes(operation.expectedSession) ===
+        canonicalSnapshotBytes(before) &&
+      after.sessionId === before.sessionId &&
+      after.document.activeOperation === null &&
+      BigIntConstructor(after.revision) ===
+        BigIntConstructor(before.revision) +
+          BigIntConstructor(operation.revision) +
+          1n,
+    code,
+  );
+  validateOperationReservation(
+    operation,
+    reservation,
+    normalizedOperation.input,
+  );
+  validateLastOperationPointer(after, operation, reservation);
+  return deepFreeze({
+    after,
+    before,
+    operation,
+    reservation,
+  });
+}
+
 /**
  * Revalidates the complete durable restore-to-launch handoff receipt without
  * issuing SQL or trusting a caller-supplied projection of its relations.
@@ -11231,12 +11370,25 @@ export class PostgresSessionAuthority {
         session.document.launch?.launchAttemptId === input.operationId
           ? session.document.launch
           : null;
+      const sessionTransition =
+        observed.active === null &&
+        observed.terminal !== null &&
+        observed.terminal.operation.operationId !==
+          observed.operation.operationId
+          ? assertCommittedSessionTransitionProof({
+              after: session,
+              before: observed.terminal.operation.expectedSession,
+              operation: observed.terminal.operation,
+              reservation: observed.terminal.reservation,
+            })
+          : null;
       return operationReceipt({
         attempt: writerLaunchAttemptRecord(input, observed.operation),
         launch,
         operation: observed.operation,
         reservation: observed.reservation,
         session,
+        sessionTransition,
       });
     });
   }

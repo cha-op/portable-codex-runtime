@@ -46,6 +46,12 @@ unavailable.
   atomic handoff. Keeping preparation outside the guard avoids shared-pool
   starvation while retaining the publication-sensitive serialization
   boundary.
+- A committed restore replay treats the canonical durable request as the
+  launch-intent authority. It revalidates the complete operation request
+  digest, reuses the persisted launch intent, and does not revalidate an image
+  capability that the first successful launch already consumed. A launch
+  attempt that is still prepared remains responsible for validating and
+  consuming its original opaque reservation before dispatch.
 - Physical publication receives the authority-returned full generation
   binding plus the exact artefact, lease, storage, destination, path, and
   predetermined-result context. Its coordinator-binding digest must match the
@@ -69,11 +75,17 @@ unavailable.
   operation/reservation/session/evidence relation validates and the durable
   revision is exactly 2 after prepared/starting, exactly 3 after uncertain, or
   unchanged for committed replay. Stable session identity—including its
-  manifest, storage, backend capabilities, attachment, lease, lifecycle,
-  recovery state, writer epoch, document version, creation time, and session
-  ID—must still match the atomic handoff while operation-owned pointers,
-  history, revision, launch state, and update time follow their own transition
-  contracts.
+  manifest, storage, backend capabilities, attachment, lifecycle, recovery
+  state, writer epoch, document version, creation time, session ID, and
+  committed launch pointer—must still match the atomic handoff. A later
+  single committed authority-validated operation may advance operation
+  pointers, revision and update time, and a canonical lease-renew result may
+  extend the same lease identity. The read receipt carries that operation's
+  complete predecessor, result and released-reservation relation, and the
+  launcher retains its same-process authority-read identity. Active,
+  multi-step, detached or self-constructed proofs, same-revision content drift,
+  lease replacement or expiry rollback, and access-policy changes remain
+  rejected.
 - A supported version 2 expected session remains unchanged inside the durable
   operation request while the authority upgrades its current active and
   terminal session receipts to document version 3. Those receipts must match
@@ -123,12 +135,22 @@ unavailable.
   wrapper. Its four own data fields are sampled once into a frozen wrapper,
   preserving the opaque inner reservation identity while preventing a later
   outer-property swap between launch preparation and execution.
-- Session comparisons protect content stability, not JavaScript object
-  identity. A legal version 2-to-3 authority upgrade is accepted only at the
-  current-session boundary; every unrelated stable field is reconstructed from
-  the expected session and compared as one canonical document. The terminal
-  launcher result independently binds the same stable identity back to the
-  handoff receipt.
+- A one-use image capability protects launch dispatch, not durable replay of a
+  launch that is already committed. The canonical operation request digest
+  protects the persisted launch intent against substitution, while the writer
+  launcher's prepared path remains the sole consumer of the opaque capability.
+- Session comparisons protect stable identity, content and access policy, not
+  JavaScript object identity or an obsolete whole-snapshot equality. A legal
+  version 2-to-3 authority upgrade is accepted only at the current-session
+  boundary; every unrelated stable field is reconstructed from the expected
+  session and compared as one canonical document. The terminal launcher result
+  independently binds that stable identity and committed launch pointer back to
+  the handoff receipt. A different snapshot is accepted only through one
+  complete DB-validated committed transition whose exact predecessor is the
+  handoff snapshot; a module-private weak identity prevents a copied or
+  self-constructed relation from substituting for the authority read whenever
+  that transition is needed to cross between different snapshots. Exact-equal
+  handoff and result snapshots do not depend on that auxiliary identity.
 - Journal phase is not physical publication proof. For a committed-only restore
   check, only locked candidate/final topology under the bound storage identity
   can downgrade a `materialized` outcome to `not-committed`; visible final
