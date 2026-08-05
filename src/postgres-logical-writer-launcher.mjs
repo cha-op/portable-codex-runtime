@@ -340,6 +340,28 @@ const READ_RECEIPT_KEYS = objectFreeze([
   "session",
   "status",
 ]);
+const STARTED_RESULT_VALIDATION_KEYS = objectFreeze([
+  "handoff",
+  "result",
+]);
+const HANDOFF_RESULT_KEYS = objectFreeze([
+  "attempt",
+  "operation",
+  "reservation",
+  "session",
+  "status",
+]);
+const STARTED_RESULT_KEYS = objectFreeze([
+  "attempt",
+  "contractVersion",
+  "evidence",
+  "launch",
+  "operation",
+  "reservation",
+  "session",
+  "status",
+  "writer",
+]);
 const FINALIZE_RECEIPT_KEYS = objectFreeze([
   "attempt",
   "finalized",
@@ -1955,6 +1977,133 @@ function successResult(receipt, writer) {
     status: receipt.status,
     writer,
   });
+}
+
+/**
+ * Revalidates a terminal started result against its complete durable launch
+ * request, operation, reservation, session pointer, and supervisor evidence,
+ * while binding every immutable field to the atomic-handoff receipt.
+ */
+export function assertLogicalWriterLaunchStartedResult(...args) {
+  const code = "logical_writer_launch_outcome_uncertain";
+  ensure(args.length === 1, code);
+  const options = exactDataObject(
+    args[0],
+    STARTED_RESULT_VALIDATION_KEYS,
+    code,
+  );
+  const handoffInput = exactDataObject(
+    options.handoff,
+    HANDOFF_RESULT_KEYS,
+    code,
+  );
+  const handoffAttempt = exactDataObject(
+    handoffInput.attempt,
+    ATTEMPT_KEYS,
+    code,
+  );
+  const launchAttemptId = assertOpaqueId(
+    handoffAttempt.launchAttemptId,
+    code,
+  );
+  const handoffSession = normalizeSession(handoffInput.session, code);
+  const handoff = normalizeReadReceipt(
+    exactFrozenRecord({
+      attempt: handoffInput.attempt,
+      launch: handoffSession.document.launch,
+      operation: handoffInput.operation,
+      reservation: handoffInput.reservation,
+      session: handoffSession,
+      status: handoffInput.status,
+    }),
+    launchAttemptId,
+    code,
+  );
+  ensure(
+    arrayIncludes(
+      ["prepared", "starting", "uncertain", "started"],
+      handoff.status,
+    ) &&
+      (handoff.status === "started"
+        ? handoff.launch !== null
+        : handoff.launch === null),
+    code,
+  );
+  const result = exactDataObject(options.result, STARTED_RESULT_KEYS, code);
+  ensure(
+    result.contractVersion === LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION &&
+      result.status === "started",
+    code,
+  );
+  const writer = assertOpaqueWriterHandle(result.writer, code);
+  const receipt = normalizeReadReceipt(
+    exactFrozenRecord({
+      attempt: result.attempt,
+      launch: result.launch,
+      operation: result.operation,
+      reservation: result.reservation,
+      session: result.session,
+      status: result.operation?.state,
+    }),
+    launchAttemptId,
+    code,
+  );
+  ensure(
+    receipt.status === "started" &&
+      receipt.operation.operationId === handoff.operation.operationId &&
+      receipt.operation.sessionId === handoff.operation.sessionId &&
+      receipt.operation.kind === handoff.operation.kind &&
+      receipt.operation.conflictClass === handoff.operation.conflictClass &&
+      receipt.operation.requestSha256 === handoff.operation.requestSha256 &&
+      receipt.operation.createdAt === handoff.operation.createdAt &&
+      canonicalTimestampMilliseconds(receipt.operation.updatedAt, code) >=
+        canonicalTimestampMilliseconds(handoff.operation.updatedAt, code) &&
+      sameContent(
+        receipt.operation.expectedSession,
+        handoff.operation.expectedSession,
+        code,
+      ) &&
+      sameContent(
+        receipt.operation.request,
+        handoff.operation.request,
+        code,
+      ) &&
+      receipt.reservation.reservationId ===
+        handoff.reservation.reservationId &&
+      receipt.reservation.operationId ===
+        handoff.reservation.operationId &&
+      receipt.reservation.sessionId === handoff.reservation.sessionId &&
+      receipt.reservation.kind === handoff.reservation.kind &&
+      receipt.reservation.conflictClass ===
+        handoff.reservation.conflictClass &&
+      receipt.reservation.expectedSessionRevision ===
+        handoff.reservation.expectedSessionRevision &&
+      receipt.reservation.requestSha256 ===
+        handoff.reservation.requestSha256 &&
+      receipt.reservation.createdAt === handoff.reservation.createdAt &&
+      receipt.reservation.updatedAt === receipt.operation.updatedAt &&
+      receipt.reservation.releasedAt === receipt.operation.updatedAt &&
+      receipt.session.createdAt === handoff.session.createdAt &&
+      canonicalTimestampMilliseconds(receipt.session.updatedAt, code) >=
+        canonicalTimestampMilliseconds(receipt.operation.updatedAt, code) &&
+      BigIntConstructor(receipt.session.revision) >=
+        BigIntConstructor(receipt.operation.expectedSession.revision) +
+          BigIntConstructor(receipt.operation.revision) +
+          1n &&
+      (handoff.operation.state !== "committed" ||
+        (sameContent(receipt.operation, handoff.operation, code) &&
+          sameContent(receipt.reservation, handoff.reservation, code) &&
+          sameContent(receipt.attempt, handoff.attempt, code) &&
+          sameContent(receipt.session, handoff.session, code))) &&
+      sameContent(result.attempt, receipt.attempt, code) &&
+      sameContent(result.evidence, receipt.evidence, code) &&
+      sameContent(result.launch, receipt.launch, code) &&
+      sameContent(result.operation, receipt.operation, code) &&
+      sameContent(result.reservation, receipt.reservation, code) &&
+      sameContent(result.session, receipt.session, code),
+    code,
+  );
+  return successResult(receipt, writer);
 }
 
 function sha256Parts(parts, code) {

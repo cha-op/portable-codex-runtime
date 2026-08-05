@@ -703,6 +703,27 @@ test("registration and read input validation happen before PostgreSQL access", a
       error instanceof PostgresSessionAuthorityError &&
       error.code === "invalid_authority_options",
   );
+  for (const value of [null, 1, "true", {}, []]) {
+    assert.throws(
+      () =>
+        new PostgresSessionAuthority({
+          restoreLaunchV2FleetCompatible: value,
+          store,
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_authority_options",
+    );
+  }
+  assert.equal(
+    Object.isFrozen(
+      new PostgresSessionAuthority({
+        restoreLaunchV2FleetCompatible: true,
+        store,
+      }),
+    ),
+    true,
+  );
 
   await assertAuthorityError(
     authority.registerSession({

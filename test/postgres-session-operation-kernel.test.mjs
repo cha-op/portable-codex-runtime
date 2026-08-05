@@ -32,6 +32,7 @@ import {
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
+  assertRestoreGenerationLaunchHandoffReceipt,
 } from "../src/postgres-session-authority.mjs";
 import {
   createSessionManifest,
@@ -2496,6 +2497,18 @@ function restoreGenerationCommittedSteps(
   return steps;
 }
 
+function restoreGenerationOperationReadSteps(fixture, state) {
+  const relationSteps =
+    state === "committed"
+      ? restoreGenerationCommittedSteps(fixture)
+      : restoreGenerationActiveSteps(fixture, state);
+  return [
+    relationSteps[0],
+    rows(restoreGenerationOperationRow(fixture, state)),
+    ...relationSteps.slice(1),
+  ];
+}
+
 function restoreGenerationCancelledFixture(fixture) {
   const reason = "caller-abandoned-before-restore-dispatch";
   const result = cancellationResult(reason);
@@ -3809,7 +3822,10 @@ function authorityWithScripts(...scripts) {
     maxTransactionAttempts: 1,
   });
   return {
-    authority: new PostgresSessionAuthority({ store }),
+    authority: new PostgresSessionAuthority({
+      restoreLaunchV2FleetCompatible: true,
+      store,
+    }),
     clients,
     pool,
     store,
@@ -10604,6 +10620,258 @@ test("restore generation v2 request durably binds an exact launch intent without
   }
 });
 
+test("restore generation V2 fleet gate blocks only fresh durable creation", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const freshClient = new ScriptedClient([
+    rows(fixture.writer.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(),
+  ]);
+  const replayClient = new ScriptedClient(
+    restoreGenerationActiveSteps(fixture, "prepared"),
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([freshClient, replayClient]),
+    maxTransactionAttempts: 1,
+  });
+  const authority = new PostgresSessionAuthority({ store });
+
+  await assertAuthorityError(
+    authority.reserveOperation(fixture.options),
+    { code: "restore_launch_v2_fleet_capability_required" },
+  );
+  const replay = await authority.reserveOperation(fixture.options);
+
+  assert.equal(replay.acquired, false);
+  assert.equal(replay.operation.state, "prepared");
+  assert.equal(
+    authorityQueries(freshClient).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  freshClient.assertExhausted();
+  replayClient.assertExhausted();
+});
+
+test("restore generation operation read proves an exact absent V2 replay without mutation", async () => {
+  const fixture = restoreGenerationFixture({
+    destinationStorageId: "volume-restore-002",
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const { authority, clients } = authorityWithScripts([
+    rows(fixture.writer.session),
+    rows(),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(),
+  ]);
+
+  const observed =
+    await authority.readRestoreDestinationGenerationOperation({
+      checkpoint: fixture.source.checkpoint,
+      request: fixture.mutationRequest,
+    });
+
+  assert.deepEqual(observed, {
+    catalogue: null,
+    generation: null,
+    operation: null,
+    reservation: null,
+    session: snapshotFromSessionRow(fixture.writer.session),
+    status: "absent",
+  });
+  assert.notEqual(
+    fixture.source.checkpoint.storageId,
+    fixture.mutationRequest.storageId,
+  );
+  assertDeepFrozen(observed);
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore generation operation read returns exact prepared, starting, uncertain, and committed V2 relations", async () => {
+  const fixture = restoreGenerationFixture({
+    destinationStorageId: "volume-restore-002",
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const states = ["prepared", "starting", "uncertain", "committed"];
+  const { authority, clients } = authorityWithScripts(
+    ...states.map((state) =>
+      restoreGenerationOperationReadSteps(fixture, state),
+    ),
+  );
+
+  for (let index = 0; index < states.length; index += 1) {
+    const state = states[index];
+    const observed =
+      await authority.readRestoreDestinationGenerationOperation({
+        checkpoint: fixture.source.checkpoint,
+        request: fixture.mutationRequest,
+      });
+
+    assert.equal(observed.status, state);
+    assert.equal(observed.operation.operationId, fixture.options.operationId);
+    assert.equal(observed.operation.state, state);
+    assert.equal(observed.reservation.operationId, fixture.options.operationId);
+    if (state === "prepared") {
+      assert.equal(observed.generation, null);
+      assert.equal(observed.catalogue, null);
+    } else {
+      assert.equal(observed.generation.generationId, fixture.generationId);
+      assert.equal(
+        observed.generation.state,
+        state === "committed" ? "committed" : "authorized",
+      );
+      assert.equal(
+        observed.catalogue.checkpointId,
+        fixture.source.checkpoint.checkpointId,
+      );
+    }
+    assertDeepFrozen(observed);
+    assert.equal(
+      authorityQueries(clients[index]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[index].assertExhausted();
+  }
+});
+
+test("restore generation operation read rejects V1, mismatched, claimed, and corrupt state without mutation", async (t) => {
+  const legacy = restoreGenerationFixture();
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const mismatchedCheckpoint = {
+    ...structuredClone(fixture.source.checkpoint),
+    artifactId: "checkpoint-artifact-mismatch",
+    checkpointId: "checkpoint-mismatch",
+  };
+  const mismatchedRequest = {
+    ...structuredClone(fixture.mutationRequest),
+    target: {
+      artifactId: mismatchedCheckpoint.artifactId,
+      checkpointId: mismatchedCheckpoint.checkpointId,
+      kind: "checkpoint",
+    },
+  };
+  const corruptSteps = restoreGenerationOperationReadSteps(
+    fixture,
+    "prepared",
+  );
+  corruptSteps[4] = rows(restoreGenerationRow(fixture));
+  const corruptRequestOperation = restoreGenerationOperationRow(
+    fixture,
+    "prepared",
+  );
+  corruptRequestOperation.request.payload = {
+    ...corruptRequestOperation.request.payload,
+    contractVersion: 3,
+  };
+  const scenarios = [
+    {
+      code: "operation_identity_conflict",
+      name: "V1 operation",
+      input: {
+        checkpoint: legacy.source.checkpoint,
+        request: legacy.mutationRequest,
+      },
+      steps: [
+        rows(legacy.writer.session),
+        rows(restoreGenerationOperationRow(legacy, "prepared")),
+      ],
+    },
+    {
+      code: "operation_identity_conflict",
+      name: "mismatched admission",
+      input: {
+        checkpoint: mismatchedCheckpoint,
+        request: mismatchedRequest,
+      },
+      steps: [
+        rows(fixture.writer.session),
+        rows(restoreGenerationOperationRow(fixture, "prepared")),
+      ],
+    },
+    {
+      code: "operation_identity_conflict",
+      name: "operation ID claim without operation",
+      input: {
+        checkpoint: fixture.source.checkpoint,
+        request: fixture.mutationRequest,
+      },
+      steps: [
+        rows(fixture.writer.session),
+        rows(),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(fixture.writer.committedOperation),
+        rows(fixture.writer.releasedReservation),
+        rows(
+          operationIdRegistryRow({
+            claimantOperationId: null,
+            operationId: fixture.options.operationId,
+            sessionId: fixture.options.expectedSession.sessionId,
+          }),
+        ),
+      ],
+    },
+    {
+      code: "operation_state_invalid",
+      name: "corrupt stored request",
+      input: {
+        checkpoint: fixture.source.checkpoint,
+        request: fixture.mutationRequest,
+      },
+      steps: [
+        rows(fixture.writer.session),
+        rows(corruptRequestOperation),
+      ],
+    },
+    {
+      code: "operation_state_invalid",
+      name: "corrupt prepared relation",
+      input: {
+        checkpoint: fixture.source.checkpoint,
+        request: fixture.mutationRequest,
+      },
+      steps: corruptSteps.slice(0, 5),
+    },
+  ];
+  const { authority, clients } = authorityWithScripts(
+    ...scenarios.map((scenario) => scenario.steps),
+  );
+
+  for (let index = 0; index < scenarios.length; index += 1) {
+    const scenario = scenarios[index];
+    await t.test(scenario.name, async () => {
+      await assertAuthorityError(
+        authority.readRestoreDestinationGenerationOperation(scenario.input),
+        { code: scenario.code },
+      );
+      assert.equal(
+        authorityQueries(clients[index]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      assert.equal(queryTexts(clients[index]).includes("ROLLBACK"), true);
+      clients[index].assertExhausted();
+    });
+  }
+});
+
 test("restore generation claim accepts an exact checkpoint from replacement destination storage", async () => {
   const fixture = restoreGenerationFixture({
     destinationStorageId: "volume-restore-002",
@@ -12232,17 +12500,23 @@ test("restore generation V2 claim at bigint max-7 covers both handoff routes", a
             expectedOperationRevision: "1",
           })
         : null;
+      const handoffInput = {
+        launch: restore.launchIntent,
+        restore: {
+          ...restore.options,
+          completion: restore.completion,
+          expectedOperationRevision: route.restoreUncertain ? "2" : "1",
+        },
+      };
       const handoff =
         await authority.finalizeRestoreDestinationGenerationAndReserveWriterLaunchAttempt(
-          {
-            launch: restore.launchIntent,
-            restore: {
-              ...restore.options,
-              completion: restore.completion,
-              expectedOperationRevision: route.restoreUncertain ? "2" : "1",
-            },
-          },
+          handoffInput,
         );
+      const validatedHandoff =
+        assertRestoreGenerationLaunchHandoffReceipt({
+          input: handoffInput,
+          receipt: handoff,
+        });
       const launchClaimed = await authority.claimWriterLaunchAttemptDispatch({
         ...fixture.options,
         expectedOperationRevision: "0",
@@ -12276,6 +12550,7 @@ test("restore generation V2 claim at bigint max-7 covers both handoff routes", a
         );
       }
       assert.equal(handoff.restore.finalized, true);
+      assert.deepEqual(validatedHandoff, handoff);
       assert.equal(launchClaimed.dispatchGranted, true);
       assert.equal(launchUncertain.changed, true);
       assert.equal(launchFinalized.finalized, true);
@@ -13217,6 +13492,31 @@ test("restore generation typed APIs reject non-exact contracts before PostgreSQL
         generationId: fixture.generationId,
         request: fixture.mutationRequest,
         extra: true,
+      }),
+    () =>
+      authority.readRestoreDestinationGenerationOperation({
+        checkpoint: fixture.source.checkpoint,
+        request: fixture.mutationRequest,
+        extra: true,
+      }),
+    () =>
+      authority.readRestoreDestinationGenerationOperation({
+        checkpoint: {
+          ...fixture.source.checkpoint,
+          checkpointClass: "crash-prefix",
+        },
+        request: fixture.mutationRequest,
+      }),
+    () =>
+      authority.readRestoreDestinationGenerationOperation({
+        checkpoint: fixture.source.checkpoint,
+        request: {
+          ...fixture.mutationRequest,
+          target: {
+            ...fixture.mutationRequest.target,
+            artifactId: "checkpoint-artifact-mismatch",
+          },
+        },
       }),
   ];
 

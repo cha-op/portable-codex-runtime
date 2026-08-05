@@ -1927,6 +1927,14 @@ export class StoppedDirectoryPublication {
   }
 
   async publishRestoreDestination(options) {
+    return this.#publishRestoreDestination(options, false);
+  }
+
+  async verifyCommittedRestoreDestination(options) {
+    return this.#publishRestoreDestination(options, true);
+  }
+
+  async #publishRestoreDestination(options, requireCommittedOperation) {
     const normalized = exactOptions(options, [
       "artifactDirectory",
       "artifactOwnedRoot",
@@ -1949,6 +1957,7 @@ export class StoppedDirectoryPublication {
       kind: "restore-destination",
       operationId: snapshot.operationId,
       request: snapshot.request,
+      requireCommittedOperation,
       requireFreshOperation: false,
       result: snapshot.result,
       sourceDirectory: normalized.artifactDirectory,
@@ -2261,6 +2270,9 @@ export class StoppedDirectoryPublication {
         PUBLICATION_STATE_RANK[hintedState]
       ) {
         fail("publication_outcome_uncertain", "uncertain");
+      }
+      if (options.requireCommittedOperation && observedState !== "committed") {
+        fail("publication_recovery_required", "not-committed");
       }
       if (["materialized", "committed"].includes(observedState)) {
         source = unobservedSource;

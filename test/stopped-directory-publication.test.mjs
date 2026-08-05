@@ -1802,6 +1802,42 @@ test("restore publication publishes a raw isolated payload and preserves its art
   assert.deepEqual(result.materialization, journalRecord.materialization);
 });
 
+test("committed restore verification never creates an absent publication", async (t) => {
+  const fixture = await createFixture(t);
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+
+  assert.equal(
+    (await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })).record,
+    null,
+  );
+  await assertPathAbsent(fixture.destinationDirectory);
+});
+
+test("committed restore verification replays exact durable publication", async (t) => {
+  const fixture = await createFixture(t);
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  const published = await fixture.publication.publishRestoreDestination(options);
+
+  const verified =
+    await fixture.publication.verifyCommittedRestoreDestination(options);
+
+  assert.equal(verified.replayed, true);
+  assert.deepEqual(verified.result, published.result);
+  assert.deepEqual(verified.materialization, published.materialization);
+});
+
 test("upgrade replays a historical committed restore materialization v2", async (t) => {
   let afterCopyCalls = 0;
   const fixture = await createFixture(t, {

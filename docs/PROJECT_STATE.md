@@ -126,16 +126,18 @@
   version 2 adds a permanent `restore_destination_generations` relation with
   independent generation and operation identities, same-session operation and
   checkpoint foreign keys, and exact authorized/committed row-shape
-  constraints.
+  constraints. Migration version 3 adds the permanent global operation-ID
+  registry, backfills direct operations, and requires a version 2 restore to
+  claim its launch-attempt ID before publication dispatch.
 - Typed restore-generation authority now reserves the exact
   `{checkpoint, request}` admission, claims one generation and
   destination-isolation proof under the database-clock lease and restore
   fence, and atomically finalises the committed generation with its operation,
   reservation, and session terminal anchor. Claim replay never grants a second
   dispatch; exact finalisation replay and bounded `starting`/`uncertain`
-  recovery remain available on the migration version 2 schema.
-- Typed durable writer-launch attempts now reuse the permanent operation and
-  reservation rows without migration version 3. One operation ID is also the
+  recovery remain available through the ordered migration chain.
+- Typed durable writer-launch attempts reuse the permanent operation and
+  reservation lifecycle rows. One globally registered operation ID is also the
   launch-attempt ID and binds a committed destination generation, exact
   attachment, stable lease and fence tuple, bounded measured-image projection,
   and trusted supervisor identity. Definite claim revalidates the generation's
@@ -176,16 +178,36 @@
   launches without reconstructing process-local authority.
 - Restore-generation request version 2 durably records the exact measured
   image, supervisor, and launch-attempt identity before publication begins.
-  One serializable authority transition commits the generation, retires the
+  Fresh version 2 reservation is disabled by default and requires an explicit
+  fleet-compatibility startup option; the gate applies only after exact replay
+  lookup, so existing operation replay, finalisation, and recovery remain
+  available. Definite restore dispatch permanently claims the launch ID. One
+  later serializable authority transition commits the generation, retires the
   restore operation, creates the exact prepared launch operation and
   reservation, and advances the canonical session twice. The launcher can
   prepare the process-local image capability before publication and later
   claim only that pre-reserved attempt, so a crash cannot leave a newly
   committed generation without discoverable launch work.
+- A production-neutral PostgreSQL restore composition facade now reads exact
+  durable operation state before applying its fresh-only fleet gate. It
+  prepares the isolated restore and launch intent outside the PostgreSQL
+  operation guard, then holds that guard across durable re-read, claim, one
+  backend publication callback, independent committed-publication
+  verification, and atomic handoff. Prepared launch runs only after the guard
+  is released and only on that durable attempt. The facade revalidates the
+  complete authority handoff relation, re-proves guard ownership before an
+  acknowledgement-loss retry, and accepts launch success only with a complete
+  committed operation/reservation/session/evidence relation. Restore callback contract v3
+  passes the authority's complete generation binding unchanged through the
+  stopped-directory backend and explicitly distinguishes fresh publication
+  from committed-only replay. A legacy v2 callback derives its historical
+  four-field version 1 binding internally and can only verify an already
+  committed publication.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until later serial pull requests verify committed generation publication,
-  route coordinator stop through the durable transition, add bounded
-  no-relaunch recovery, and wire the complete protocol into `runRestore()`.
+  even though the standalone composition path is testable. Later serial pull
+  requests must route coordinator stop through the durable transition, add
+  bounded no-relaunch recovery, join stop proof to capture, and wire the
+  complete protocol into `runRestore()`.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -242,6 +264,8 @@
   `docs/project_journal/2026/08/2026-08-04-logical-writer-launcher-foundation-b6d3e1.md`
 - Atomic restore-to-launch handoff:
   `docs/project_journal/2026/08/2026-08-04-restore-launch-handoff-5a7c2e.md`
+- Restore publication-to-launch composition:
+  `docs/project_journal/2026/08/2026-08-04-restore-publication-launch-composition-93b7d2.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -254,6 +278,7 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  authority until exact generation publication, launcher and no-relaunch
-  recovery, durable stop/capture composition, and recovery-service wiring are
-  integrated into `runRestore()` and verified as one fail-closed protocol.
+  authority. The standalone publication-to-launch composition is not enough:
+  bounded no-relaunch recovery, durable stop/capture composition, and
+  production-adapter wiring must still be integrated into `runRestore()` and
+  verified as one fail-closed protocol.

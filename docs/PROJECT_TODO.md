@@ -63,10 +63,14 @@
   request that durably binds one launch intent, one serializable transaction
   that commits the generation and reserves that exact launch attempt, and a
   launcher path that consumes only the already-reserved attempt.
-- [pending] After a fleet-wide version 2 capability gate, compose committed
-  restore publication, durable stop/capture callbacks, and bounded no-relaunch
-  recovery services; only then enable `runRestore()` under fail-closed
-  ambiguous outcomes.
+- [done] Add default-closed fresh version 2 fleet admission and a separately
+  gated, production-neutral facade that passes the full typed generation
+  binding through committed restore publication, confirms the atomic handoff,
+  and invokes only the already-reserved prepared launch attempt.
+- [pending] Compose durable stop/capture callbacks and bounded generation,
+  prepared-launch, active-attempt, and current-launch recovery services; only
+  then wire the complete protocol into production `runRestore()` under
+  fail-closed ambiguous outcomes.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

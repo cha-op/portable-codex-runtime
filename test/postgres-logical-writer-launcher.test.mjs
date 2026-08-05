@@ -16,6 +16,7 @@ import {
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
+  assertLogicalWriterLaunchStartedResult,
   createPostgresLogicalWriterLauncher,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
@@ -247,6 +248,37 @@ function terminalPointer(operation, reservation) {
   return {
     ...activePointer(operation, reservation),
     resultSha256: jsonSha256(operation.result),
+  };
+}
+
+function preparedReceiptForStartedResult(result) {
+  const operation = clone(result.operation);
+  operation.result = null;
+  operation.retiredAt = null;
+  operation.revision = "0";
+  operation.state = "prepared";
+  operation.updatedAt = operation.createdAt;
+  const reservation = clone(result.reservation);
+  reservation.releasedAt = null;
+  reservation.state = "prepared";
+  reservation.updatedAt = reservation.createdAt;
+  const session = clone(operation.expectedSession);
+  session.document.activeOperation = activePointer(operation, reservation);
+  session.document.launch = null;
+  session.revision = (BigInt(operation.expectedSession.revision) + 1n).toString();
+  session.updatedAt = operation.createdAt;
+  return {
+    attempt: {
+      contractVersion: 1,
+      launchAttemptId: operation.operationId,
+      request: clone(operation.request),
+      result: null,
+      state: "prepared",
+    },
+    operation,
+    reservation,
+    session,
+    status: "prepared",
   };
 }
 
@@ -1198,6 +1230,45 @@ test("exports one exact frozen facade and starts/registers before durable finali
   assert.throws(
     () => value.facade.resolveStoppedWriter(resolverInput(value)),
     assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+});
+
+test("started-result validation binds the full durable launch relation", async () => {
+  const value = await fixture();
+  const result = await value.facade.runLaunch(runInput(value));
+
+  const validated = assertLogicalWriterLaunchStartedResult({
+    handoff: preparedReceiptForStartedResult(result),
+    result,
+  });
+
+  assert.equal(validated.status, "started");
+  assert.strictEqual(validated.writer, result.writer);
+  assert.deepEqual(validated.launch, result.launch);
+
+  const replayed = assertLogicalWriterLaunchStartedResult({
+    handoff: {
+      attempt: result.attempt,
+      operation: result.operation,
+      reservation: result.reservation,
+      session: result.session,
+      status: "committed",
+    },
+    result,
+  });
+  assert.equal(replayed.status, "started");
+  assert.strictEqual(replayed.writer, result.writer);
+
+  const forged = clone(result);
+  forged.writer = result.writer;
+  forged.session.document.launch.launchResultSha256 = "f".repeat(64);
+  assert.throws(
+    () =>
+      assertLogicalWriterLaunchStartedResult({
+        handoff: preparedReceiptForStartedResult(result),
+        result: forged,
+      }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
   );
 });
 

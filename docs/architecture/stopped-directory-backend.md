@@ -16,7 +16,7 @@ prevents the adapter from inventing attachment or lease authority.
 
 The module exports:
 
-- `STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION`, with value `2`;
+- `STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION`, with value `3`;
 - `StoppedDirectoryBackendError`; and
 - `StoppedDirectoryBackend`.
 
@@ -308,7 +308,8 @@ whose fencing epoch is not strictly newer than the checkpoint source epoch.
 The authority must still revalidate the actual current canonical fence inside
 its guarded transaction.
 
-The authority invokes `publish(context)` exactly once with:
+An authority that declares `restoreContextContractVersion: 3` invokes
+`publish(context)` exactly once with:
 
 ```js
 {
@@ -320,20 +321,33 @@ The authority invokes `publish(context)` exactly once with:
   destinationIsolationProofId,
   destinationOwnedRoot,
   destinationState,
+  generationBinding,
   now,
+  publicationMode,
   reservationId,
   result,
   storageRef,
 }
 ```
 
-`destinationState` must be exactly `"detached"`. The callback revalidates
-the newer current fence, storage binding, predetermined result, trusted
-artefact proof, destination isolation proof, detached state, and complete path
-plan before calling `publishRestoreDestination()`. The restore publication
-binding remains at v1 independently of the v2 adapter and v2 capture binding,
-so an upgraded backend can still replay an exact committed restore started by
-the previous adapter version.
+`destinationState` must be exactly `"detached"`. `generationBinding` must be
+the complete typed version 1 generation-binding document and
+`publicationMode` must be either `"fresh-or-exact-replay"` or
+`"committed-only"`. The callback revalidates the newer current fence, storage
+binding, predetermined result, trusted artefact proof, destination isolation
+proof, detached state, complete path plan, and every generation relation. It
+then calls `publishRestoreDestination()` only for fresh-or-exact-replay mode;
+committed-only mode calls `verifyCommittedRestoreDestination()` and cannot
+advance an absent, prepared, or materialized journal.
+
+An authority that omits `restoreContextContractVersion`, or explicitly
+declares version 2, retains the historical context shape without
+`generationBinding` or `publicationMode`. The backend internally derives the
+legacy four-field version 1 journal binding and permits only committed
+verification. A version 3 authority cannot deliberately downgrade by passing
+a reduced binding. The restore publication binding remains at v1 independently
+of adapter and capture contract versions, so an upgraded backend can still
+read-only replay an exact committed restore started by the previous adapter.
 
 The frozen restore completion contains `materialization`, `replayed`, and
 `result`. A fresh restore materialisation is contract v3 and carries the
@@ -342,13 +356,13 @@ For upgrade recovery, a completion with `replayed: true` may instead retain an
 exact historical contract v2 materialisation without that digest; the backend
 rejects the same v2 shape on a non-replayed outcome. This read-only physical
 replay does not make the legacy result admissible to a typed generation
-authority. The adapter's v1 coordinator projection is sufficient only for
-legacy adapter replay; it is not the complete typed generation binding required
-by PostgreSQL generation document v2. A later production composition must pass
-the exact claimed generation binding to the publisher. The authority must
-durably finalize launcher-visible destination state and return that same
-completion object before the backend reports success. A published path or
-journal record alone is not writable-launch authority.
+authority. The adapter's legacy four-field coordinator projection is
+sufficient only for version 2 committed replay; it is not the complete typed
+generation binding required by PostgreSQL generation document v2. Contract
+version 3 passes the exact claimed generation binding to the publisher. The
+authority must durably finalize launcher-visible destination state and return
+that same completion object before the backend reports success. A published
+path or journal record alone is not writable-launch authority.
 
 ## Callback and Uncertainty Contract
 

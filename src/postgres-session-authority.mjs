@@ -315,6 +315,71 @@ const RESTORE_GENERATION_LAUNCH_HANDOFF_INPUT_KEYS = Object.freeze([
   "launch",
   "restore",
 ]);
+const RESTORE_GENERATION_LAUNCH_HANDOFF_VALIDATION_KEYS = Object.freeze([
+  "input",
+  "receipt",
+]);
+const RESTORE_GENERATION_LAUNCH_HANDOFF_RECEIPT_KEYS = Object.freeze([
+  "generation",
+  "launch",
+  "restore",
+  "session",
+  "status",
+]);
+const RESTORE_GENERATION_LAUNCH_HANDOFF_LAUNCH_KEYS = Object.freeze([
+  "attempt",
+  "operation",
+  "reservation",
+]);
+const RESTORE_GENERATION_LAUNCH_HANDOFF_RESTORE_KEYS = Object.freeze([
+  "catalogue",
+  "finalized",
+  "operation",
+  "reservation",
+]);
+const OPERATION_SNAPSHOT_KEYS = Object.freeze([
+  "conflictClass",
+  "createdAt",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+  "requestSha256",
+  "result",
+  "retiredAt",
+  "revision",
+  "sessionId",
+  "state",
+  "updatedAt",
+]);
+const RESERVATION_SNAPSHOT_KEYS = Object.freeze([
+  "conflictClass",
+  "createdAt",
+  "expectedSessionRevision",
+  "expiresAt",
+  "kind",
+  "operationId",
+  "releasedAt",
+  "requestSha256",
+  "reservationId",
+  "sessionId",
+  "state",
+  "updatedAt",
+]);
+const WRITER_LAUNCH_ATTEMPT_RECORD_KEYS = Object.freeze([
+  "contractVersion",
+  "launchAttemptId",
+  "request",
+  "result",
+  "state",
+]);
+const CHECKPOINT_CATALOGUE_SNAPSHOT_KEYS = Object.freeze([
+  "captureAttemptId",
+  "checkpointId",
+  "committedAt",
+  "document",
+  "sessionId",
+]);
 const RESTORE_GENERATION_COMPLETION_KEYS = Object.freeze([
   "materialization",
   "replayed",
@@ -323,6 +388,10 @@ const RESTORE_GENERATION_COMPLETION_KEYS = Object.freeze([
 const RESTORE_GENERATION_READ_KEYS = Object.freeze([
   "checkpoint",
   "generationId",
+  "request",
+]);
+const RESTORE_GENERATION_RECONCILIATION_KEYS = Object.freeze([
+  "checkpoint",
   "request",
 ]);
 const RESTORE_GENERATION_RECOVERY_LIST_KEYS = Object.freeze([
@@ -692,6 +761,8 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore destination generation identity is already bound to a different operation",
   restore_generation_not_authorized:
     "Restore destination generation is not actively authorized",
+  restore_launch_v2_fleet_capability_required:
+    "Restore-to-launch version 2 requires confirmed fleet compatibility",
   writer_launch_attempt_not_authorized:
     "Writer launch attempt is not actively authorized",
   session_identity_conflict:
@@ -4833,6 +4904,37 @@ function restoreGenerationReadInput(options) {
   return deepFreeze({ checkpoint, generationId, request });
 }
 
+function restoreGenerationReconciliationInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    RESTORE_GENERATION_RECONCILIATION_KEYS,
+    "invalid_operation_request",
+  );
+  let checkpoint;
+  try {
+    checkpoint = assertCheckpointDescriptor(normalized.checkpoint);
+  } catch {
+    fail("invalid_operation_request");
+  }
+  checkpoint = canonicalJsonObject(checkpoint, "invalid_operation_request");
+  const request = canonicalRestoreMutationRequest(
+    normalized.request,
+    "invalid_operation_request",
+  );
+  ensure(
+    checkpoint.checkpointClass === "clean" &&
+      request.sessionId === checkpoint.sessionId &&
+      request.backendId === checkpoint.backendId &&
+      request.operation === "restore" &&
+      request.target.checkpointId === checkpoint.checkpointId &&
+      request.target.artifactId === checkpoint.artifactId &&
+      BigIntConstructor(request.fencingEpoch) >
+        BigIntConstructor(checkpoint.sourceFencingEpoch),
+    "invalid_operation_request",
+  );
+  return deepFreeze({ checkpoint, request });
+}
+
 function restoreGenerationRecoveryListInput(options) {
   const normalized = exactPlainObject(
     options,
@@ -6539,11 +6641,20 @@ function validateOperationIdentity(operation, input) {
   ensure(
     operation.operationId === input.operationId &&
       operation.sessionId === input.expectedSession.sessionId &&
-      operation.kind === input.kind &&
-      operation.requestSha256 === input.requestSha256 &&
-      canonicalSnapshotBytes(operation.expectedSession) ===
-        canonicalSnapshotBytes(input.expectedSession) &&
-      canonicalSerialize(operation.request) === canonicalSerialize(input.request),
+      operation.kind === input.kind,
+    "operation_identity_conflict",
+  );
+  ensure(
+    operation.requestSha256 === input.requestSha256,
+    "operation_identity_conflict",
+  );
+  ensure(
+    canonicalSnapshotBytes(operation.expectedSession) ===
+      canonicalSnapshotBytes(input.expectedSession),
+    "operation_identity_conflict",
+  );
+  ensure(
+    canonicalSerialize(operation.request) === canonicalSerialize(input.request),
     "operation_identity_conflict",
   );
 }
@@ -7101,6 +7212,281 @@ function restoreLaunchHandoffReceipt({
     session,
     status: launchOperation.state,
   });
+}
+
+function validatedHandoffOperationSnapshot(value, code) {
+  const operation = exactPlainObject(value, OPERATION_SNAPSHOT_KEYS, code);
+  const createdAt = canonicalTimestampString(operation.createdAt, code);
+  const updatedAt = canonicalTimestampString(operation.updatedAt, code);
+  const retiredAt =
+    operation.retiredAt === null
+      ? null
+      : canonicalTimestampString(operation.retiredAt, code);
+  const state = canonicalOpaqueId(operation.state, 32, code);
+  const revision = canonicalRevisionForCode(operation.revision, code);
+  ensure(
+    operation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      typeof operation.requestSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, operation.requestSha256) &&
+      timestampMilliseconds(updatedAt) >= timestampMilliseconds(createdAt) &&
+      (reflectApply(arrayIncludesIntrinsic, ACTIVE_OPERATION_STATES, [state]) ||
+        state === "committed") &&
+      ((state === "prepared" && revision === "0") ||
+        (state === "starting" && revision === "1") ||
+        (state === "uncertain" && revision === "2") ||
+        (state === "committed" &&
+          (revision === "1" || revision === "2" || revision === "3"))) &&
+      (state === "committed"
+        ? retiredAt === updatedAt && operation.result !== null
+        : retiredAt === null && operation.result === null),
+    code,
+  );
+  canonicalOpaqueId(operation.operationId, 128, code);
+  canonicalOpaqueId(operation.kind, 64, code);
+  canonicalSessionId(operation.sessionId, code);
+  expectedSnapshotFromValue(operation.expectedSession, code);
+  canonicalJsonObject(operation.request, code);
+  if (operation.result !== null) canonicalJsonObject(operation.result, code);
+  return value;
+}
+
+function validatedHandoffReservationSnapshot(value, code) {
+  const reservation = exactPlainObject(
+    value,
+    RESERVATION_SNAPSHOT_KEYS,
+    code,
+  );
+  const createdAt = canonicalTimestampString(reservation.createdAt, code);
+  const updatedAt = canonicalTimestampString(reservation.updatedAt, code);
+  const releasedAt =
+    reservation.releasedAt === null
+      ? null
+      : canonicalTimestampString(reservation.releasedAt, code);
+  ensure(
+    reservation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      reservation.expiresAt === null &&
+      typeof reservation.requestSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, reservation.requestSha256) &&
+      timestampMilliseconds(updatedAt) >= timestampMilliseconds(createdAt) &&
+      (reflectApply(arrayIncludesIntrinsic, ACTIVE_OPERATION_STATES, [
+        reservation.state,
+      ]) || reservation.state === "released") &&
+      (reservation.state === "released"
+        ? releasedAt === updatedAt
+        : releasedAt === null),
+    code,
+  );
+  canonicalOpaqueId(reservation.reservationId, 128, code);
+  canonicalOpaqueId(reservation.operationId, 128, code);
+  canonicalOpaqueId(reservation.kind, 64, code);
+  canonicalSessionId(reservation.sessionId, code);
+  canonicalRevisionForCode(reservation.expectedSessionRevision, code);
+  return value;
+}
+
+/**
+ * Revalidates the complete durable restore-to-launch handoff receipt without
+ * issuing SQL or trusting a caller-supplied projection of its relations.
+ */
+export function assertRestoreGenerationLaunchHandoffReceipt(...args) {
+  const code = "operation_state_invalid";
+  ensure(args.length === 1, code);
+  const options = exactPlainObject(
+    args[0],
+    RESTORE_GENERATION_LAUNCH_HANDOFF_VALIDATION_KEYS,
+    code,
+  );
+  const input = restoreGenerationLaunchHandoffInput(options.input);
+  const receipt = options.receipt;
+  const normalized = exactPlainObject(
+    receipt,
+    RESTORE_GENERATION_LAUNCH_HANDOFF_RECEIPT_KEYS,
+    code,
+  );
+  const launch = exactPlainObject(
+    normalized.launch,
+    RESTORE_GENERATION_LAUNCH_HANDOFF_LAUNCH_KEYS,
+    code,
+  );
+  const restore = exactPlainObject(
+    normalized.restore,
+    RESTORE_GENERATION_LAUNCH_HANDOFF_RESTORE_KEYS,
+    code,
+  );
+  const generation = exactPlainObject(
+    normalized.generation,
+    RESTORE_GENERATION_SNAPSHOT_KEYS,
+    code,
+  );
+  const catalogue = exactPlainObject(
+    restore.catalogue,
+    CHECKPOINT_CATALOGUE_SNAPSHOT_KEYS,
+    code,
+  );
+  const attempt = exactPlainObject(
+    launch.attempt,
+    WRITER_LAUNCH_ATTEMPT_RECORD_KEYS,
+    code,
+  );
+  const catalogueDocument = exactPlainObject(
+    catalogue.document,
+    CHECKPOINT_CATALOGUE_DOCUMENT_KEYS,
+    code,
+  );
+  ensure(
+    typeof restore.finalized === "boolean" &&
+      generation.state === "committed" &&
+      generation.document !== null &&
+      catalogueDocument.contractVersion ===
+        CHECKPOINT_CATALOGUE_CONTRACT_VERSION &&
+      normalized.status === launch.operation.state &&
+      attempt.contractVersion ===
+        WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION,
+    code,
+  );
+  canonicalOpaqueId(generation.generationId, 128, code);
+  canonicalOpaqueId(generation.operationId, 128, code);
+  canonicalOpaqueId(generation.checkpointId, 128, code);
+  canonicalSessionId(generation.sessionId, code);
+  canonicalTimestampString(generation.claimedAt, code);
+  canonicalTimestampString(generation.committedAt, code);
+  canonicalJsonObject(generation.binding, code);
+  canonicalJsonObject(generation.document, code);
+  canonicalSessionId(catalogue.captureAttemptId, code);
+  canonicalOpaqueId(catalogue.checkpointId, 128, code);
+  canonicalSessionId(catalogue.sessionId, code);
+  canonicalTimestampString(catalogue.committedAt, code);
+  canonicalJsonObject(catalogue.document, code);
+  const catalogueArtifactProof = exactPlainObject(
+    catalogueDocument.artifactProof,
+    CHECKPOINT_ARTIFACT_PROOF_KEYS,
+    code,
+  );
+  const captureOperationId = canonicalOpaqueId(
+    catalogueArtifactProof.captureOperationId,
+    128,
+    code,
+  );
+  canonicalCheckpointArtifactProof(
+    catalogueDocument.artifactProof,
+    captureOperationId,
+    code,
+  );
+  const source = deepFreeze({
+    attempt: deepFreeze({ captureAttemptId: catalogue.captureAttemptId }),
+    catalogue: restore.catalogue,
+    operation: deepFreeze({ operationId: captureOperationId }),
+  });
+  const generationBinding = canonicalRestoreGenerationBinding(
+    generation.binding,
+    input.restore,
+    source,
+    generation.generationId,
+    code,
+  );
+  const generationDocument = canonicalRestoreGenerationDocument(
+    generation.document,
+    input.restore,
+    source,
+    generationBinding,
+    code,
+  );
+  ensure(
+    canonicalSerialize(canonicalJsonObject(generation.binding, code)) ===
+        canonicalSerialize(canonicalJsonObject(generationBinding, code)) &&
+      canonicalSerialize(canonicalJsonObject(generation.document, code)) ===
+        canonicalSerialize(canonicalJsonObject(generationDocument, code)),
+    code,
+  );
+  canonicalOpaqueId(attempt.launchAttemptId, 128, code);
+  canonicalJsonObject(attempt.request, code);
+  if (attempt.result !== null) canonicalJsonObject(attempt.result, code);
+
+  const restoreOperation = validatedHandoffOperationSnapshot(
+    restore.operation,
+    code,
+  );
+  const restoreReservation = validatedHandoffReservationSnapshot(
+    restore.reservation,
+    code,
+  );
+  const launchOperation = validatedHandoffOperationSnapshot(
+    launch.operation,
+    code,
+  );
+  const launchReservation = validatedHandoffReservationSnapshot(
+    launch.reservation,
+    code,
+  );
+  const restoreResult = canonicalCommittedResult(
+    restoreOperation.result,
+    input.restore,
+    restoreOperation.revision,
+    code,
+  );
+  ensure(
+    restoreOperation.state === "committed" &&
+      canonicalSerialize(canonicalJsonObject(restoreOperation.result, code)) ===
+        canonicalSerialize(canonicalJsonObject(restoreResult, code)) &&
+      BigIntConstructor(restoreOperation.revision) ===
+        BigIntConstructor(input.restore.expectedOperationRevision) + 1n &&
+      generation.operationId === restoreOperation.operationId &&
+      generation.sessionId === restoreOperation.sessionId &&
+      generation.checkpointId ===
+        input.restore.request.admission.checkpoint.checkpointId &&
+      catalogue.checkpointId === generation.checkpointId &&
+      catalogue.sessionId === generation.sessionId &&
+      timestampMilliseconds(generation.committedAt) >=
+        timestampMilliseconds(generation.claimedAt) &&
+      attempt.launchAttemptId === launchOperation.operationId &&
+      attempt.state === launchOperation.state &&
+      canonicalSerialize(attempt.request) ===
+        canonicalSerialize(launchOperation.request) &&
+      canonicalSerialize(attempt.result) ===
+        canonicalSerialize(launchOperation.result),
+    code,
+  );
+  const restoreTerminalSession = restoreTerminalSessionForLaunchHandoff(
+    input.restore,
+    restoreOperation,
+    restoreReservation,
+  );
+  const launchInput = writerLaunchAttemptInputForRestoreHandoff(
+    input.restore,
+    normalized.generation,
+    restoreTerminalSession,
+    input.launch,
+  );
+  if (launchOperation.state === "committed") {
+    const launchResult = canonicalCommittedResult(
+      launchOperation.result,
+      launchInput,
+      launchOperation.revision,
+      code,
+    );
+    ensure(
+      canonicalSerialize(canonicalJsonObject(launchOperation.result, code)) ===
+        canonicalSerialize(canonicalJsonObject(launchResult, code)),
+      code,
+    );
+  }
+  const validated = restoreLaunchHandoffReceipt({
+    generation: normalized.generation,
+    launchInput,
+    launchOperation,
+    launchReservation,
+    restoreCatalogue: restore.catalogue,
+    restoreFinalized: restore.finalized,
+    restoreInput: input.restore,
+    restoreOperation,
+    restoreReservation,
+    session: expectedSnapshotFromValue(normalized.session, code),
+  });
+  ensure(
+    canonicalSerialize(validated) === canonicalSerialize(receipt),
+    code,
+  );
+  return validated;
 }
 
 function isAtomicRestoreLaunchHandoff(session, observed) {
@@ -8592,12 +8978,24 @@ async function finalizeWriterLaunchStop(store, options) {
 }
 
 export class PostgresSessionAuthority {
+  #restoreLaunchV2FleetCompatible;
+
   #store;
 
   constructor(options) {
+    let optionKeys;
+    try {
+      optionKeys = reflectOwnKeys(options);
+    } catch {
+      fail("invalid_authority_options");
+    }
+    const expectedOptionKeys =
+      optionKeys.length === 1
+        ? ["store"]
+        : ["restoreLaunchV2FleetCompatible", "store"];
     const normalized = exactPlainObject(
       options,
-      ["store"],
+      expectedOptionKeys,
       "invalid_authority_options",
     );
     let prototype;
@@ -8617,6 +9015,13 @@ export class PostgresSessionAuthority {
         objectIsFrozen(normalized.store),
       "invalid_authority_options",
     );
+    ensure(
+      !objectHasOwn(normalized, "restoreLaunchV2FleetCompatible") ||
+        typeof normalized.restoreLaunchV2FleetCompatible === "boolean",
+      "invalid_authority_options",
+    );
+    this.#restoreLaunchV2FleetCompatible =
+      normalized.restoreLaunchV2FleetCompatible === true;
     this.#store = normalized.store;
     objectFreeze(this);
   }
@@ -9107,6 +9512,13 @@ export class PostgresSessionAuthority {
             session,
           });
         }
+        ensure(
+          input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND ||
+            input.request.contractVersion !==
+              RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 ||
+            this.#restoreLaunchV2FleetCompatible,
+          "restore_launch_v2_fleet_capability_required",
+        );
         if (
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
           input.expectedSession.document.attachment === null
@@ -10371,6 +10783,100 @@ export class PostgresSessionAuthority {
         restoreOperation,
         restoreReservation,
         session: updatedSession,
+      });
+    });
+  }
+
+  async readRestoreDestinationGenerationOperation(options) {
+    const readInput = restoreGenerationReconciliationInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        readInput.request.sessionId,
+        false,
+      );
+      const storedOperation = await readOperationSnapshot(
+        transaction,
+        readInput.request.operationId,
+        false,
+      );
+      if (storedOperation === null) {
+        await validateSessionRelations(transaction, session, false);
+        const conflictingClaim = await readOperationIdClaim(
+          transaction,
+          readInput.request.operationId,
+          false,
+        );
+        ensure(conflictingClaim === null, "operation_identity_conflict");
+        return operationReceipt({
+          catalogue: null,
+          generation: null,
+          operation: null,
+          reservation: null,
+          session,
+          status: "absent",
+        });
+      }
+
+      ensure(
+        storedOperation.kind ===
+          RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+        "operation_identity_conflict",
+      );
+      let requestedInput;
+      try {
+        requestedInput = restoreGenerationInput(
+          inputForOperation(storedOperation),
+          OPERATION_INPUT_KEYS,
+          "operation_state_invalid",
+        );
+      } catch {
+        fail("operation_state_invalid");
+      }
+      ensure(
+        requestedInput.request.contractVersion ===
+            RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 &&
+          canonicalSerialize(requestedInput.request.admission.checkpoint) ===
+            canonicalSerialize(readInput.checkpoint) &&
+          canonicalSerialize(requestedInput.request.admission.request) ===
+            canonicalSerialize(readInput.request),
+        "operation_identity_conflict",
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        requestedInput,
+        false,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.generation !== null,
+        "operation_state_invalid",
+      );
+      const generation = observed.generation.generation;
+      const catalogue = observed.generation.source?.catalogue ?? null;
+      if (observed.operation.state === "prepared") {
+        ensure(
+          generation === null && catalogue === null,
+          "operation_state_invalid",
+        );
+      } else {
+        ensure(
+          (observed.operation.state === "starting" ||
+            observed.operation.state === "uncertain" ||
+            observed.operation.state === "committed") &&
+            generation !== null &&
+            catalogue !== null,
+          "operation_state_invalid",
+        );
+      }
+      return operationReceipt({
+        catalogue,
+        generation,
+        operation: observed.operation,
+        reservation: observed.reservation,
+        session,
       });
     });
   }
