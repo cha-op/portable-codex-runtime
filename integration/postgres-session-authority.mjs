@@ -6658,6 +6658,62 @@ test(
     );
 
     await t.test(
+      "restore V2 reads preserve terminal pre-dispatch cancellation",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const admission = restoreGenerationAdmission(
+          fixture.attached,
+          fixture.checkpoint,
+        );
+        const input = restoreGenerationOperationInputV2(
+          fixture.attached.session,
+          admission,
+          restoreGenerationLaunchIntent(fixture.attached.session),
+        );
+        const readInput = {
+          checkpoint: admission.checkpoint,
+          request: admission.request,
+        };
+
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        const cancelled = await authority.cancelPreparedOperation({
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+          reason: "restore-publication-not-started",
+        });
+        assertOperationReceipt(cancelled, "committed");
+        assert.equal(cancelled.cancelled, true);
+        assert.equal(cancelled.operation.revision, "1");
+        assert.deepEqual(cancelled.operation.result, {
+          outcome: "cancelled-before-dispatch",
+          reason: "restore-publication-not-started",
+          resultVersion: 1,
+        });
+
+        const read =
+          await authority.readRestoreDestinationGenerationOperation(
+            readInput,
+          );
+        assert.equal(read.status, "cancelled-before-dispatch");
+        assert.equal(read.operation.state, "committed");
+        assert.equal(read.operation.revision, "1");
+        assert.equal(read.reservation.state, "released");
+        assert.equal(read.generation, null);
+        assert.equal(read.catalogue, null);
+        assert.deepEqual(read.operation, cancelled.operation);
+        assert.deepEqual(read.reservation, cancelled.reservation);
+        assert.deepEqual(read.session, cancelled.session);
+      },
+    );
+
+    await t.test(
       "restore launch handoff rolls back every authority write and rejects crossed intent",
       async () => {
         const sessionId = randomUUID();

@@ -888,6 +888,14 @@ restore materialisation contract v2 after an upgrade, but this typed authority
 deliberately rejects that physical compatibility result because it lacks the
 coordinator-binding digest.
 
+`readRestoreDestinationGenerationOperation()` also represents the one legal
+claim-free terminal exception explicitly. A version 2 operation that was
+cancelled while still `prepared` remains relationally `committed` at revision
+1 with a released reservation, but its read receipt reports
+`status: "cancelled-before-dispatch"` and null generation/catalogue. This keeps
+the permanent cancellation replayable without presenting it as a committed
+restore generation; composition must stop before preparation or publication.
+
 Bounded recovery enumerates only retained `starting` or `uncertain`
 restore-generation operations whose exact authorised generation and source
 catalogue still validate. The generation relation has no deletion or

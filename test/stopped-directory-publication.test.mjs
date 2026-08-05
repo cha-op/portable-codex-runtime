@@ -1824,6 +1824,116 @@ test("committed restore verification never creates an absent publication", async
   await assertPathAbsent(fixture.destinationDirectory);
 });
 
+test("committed restore verification keeps a materialized final-only publication uncertain", async (t) => {
+  const guard = { armed: false, calls: [] };
+  let failAfterRename = false;
+  const fixture = await createFixture(t, {
+    JournalClass: armableJournalClass(guard),
+    faults: {
+      async afterRename() {
+        if (failAfterRename) throw new Error("retain final-only restore state");
+      },
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  failAfterRename = true;
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+  failAfterRename = false;
+  const candidate = candidatePath(
+    fixture.destinationOwnedRoot,
+    RESTORE_OPERATION_ID,
+    fixture.destinationDirectory,
+  );
+  const recordBefore = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(recordBefore.record.state, "materialized");
+  assert.equal(await pathExists(candidate), false);
+  assert.equal(await pathExists(fixture.destinationDirectory), true);
+  guard.armed = true;
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_outcome_uncertain",
+        "uncertain",
+      ),
+  );
+
+  assert.deepEqual(guard.calls, []);
+  assert.deepEqual(
+    await fixture.journal.read({ operationId: RESTORE_OPERATION_ID }),
+    recordBefore,
+  );
+  assert.equal(await pathExists(candidate), false);
+  assert.equal(await pathExists(fixture.destinationDirectory), true);
+});
+
+test("committed restore verification proves a retained materialized candidate was not published", async (t) => {
+  const guard = { armed: false, calls: [] };
+  let failAfterMaterialized = false;
+  const fixture = await createFixture(t, {
+    JournalClass: armableJournalClass(guard),
+    faults: {
+      async afterMaterialized() {
+        if (failAfterMaterialized) {
+          throw new Error("retain candidate-only restore state");
+        }
+      },
+    },
+  });
+  await publishFixtureArtifact(fixture);
+  const options = restoreOptions(fixture);
+  failAfterMaterialized = true;
+  await assert.rejects(
+    fixture.publication.publishRestoreDestination(options),
+    (error) =>
+      assertPublicationError(error, "publication_io_failed", "not-committed"),
+  );
+  failAfterMaterialized = false;
+  const candidate = candidatePath(
+    fixture.destinationOwnedRoot,
+    RESTORE_OPERATION_ID,
+    fixture.destinationDirectory,
+  );
+  const recordBefore = await fixture.journal.read({
+    operationId: RESTORE_OPERATION_ID,
+  });
+  assert.equal(recordBefore.record.state, "materialized");
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+  guard.armed = true;
+
+  await assert.rejects(
+    fixture.publication.verifyCommittedRestoreDestination(options),
+    (error) =>
+      assertPublicationError(
+        error,
+        "publication_recovery_required",
+        "not-committed",
+      ),
+  );
+
+  assert.deepEqual(guard.calls, []);
+  assert.deepEqual(
+    await fixture.journal.read({ operationId: RESTORE_OPERATION_ID }),
+    recordBefore,
+  );
+  assert.equal(await pathExists(candidate), true);
+  assert.equal(await pathExists(fixture.destinationDirectory), false);
+});
+
 test("committed restore verification replays exact durable publication", async (t) => {
   const fixture = await createFixture(t);
   await publishFixtureArtifact(fixture);

@@ -1,3 +1,4 @@
+import { Hash, createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import {
   basename as pathBasename,
@@ -32,10 +33,13 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arraySortIntrinsic = Array.prototype.sort;
 const ArrayConstructor = Array;
 const BigIntConstructor = BigInt;
+const createHashIntrinsic = createHash;
 const DateConstructor = Date;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const functionToStringIntrinsic = Function.prototype.toString;
+const hashDigestIntrinsic = Hash.prototype.digest;
+const hashUpdateIntrinsic = Hash.prototype.update;
 const jsonStringifyIntrinsic = JSON.stringify;
 const objectCreate = Object.create;
 const objectDefineProperty = Object.defineProperty;
@@ -193,6 +197,28 @@ const RESTORE_READ_RECEIPT_KEYS = objectFreeze([
   "session",
   "status",
 ]);
+const CANCELLATION_RESULT_KEYS = objectFreeze([
+  "outcome",
+  "reason",
+  "resultVersion",
+]);
+const RESTORE_OPERATION_REQUEST_V2_KEYS = objectFreeze([
+  "admission",
+  "contractVersion",
+  "launchIntent",
+  "predeterminedResult",
+]);
+const LAST_OPERATION_KEYS = objectFreeze([
+  "conflictClass",
+  "expectedSessionRevision",
+  "kind",
+  "operationId",
+  "operationRevision",
+  "requestSha256",
+  "reservationId",
+  "resultSha256",
+  "state",
+]);
 const GENERATION_KEYS = objectFreeze([
   "binding",
   "checkpointId",
@@ -274,12 +300,16 @@ const HANDOFF_RESTORE_KEYS = objectFreeze([
   "reservation",
 ]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
+const CANCELLATION_RECEIPT_INVALID_CODE =
+  "postgres_restore_publication_launch_composition_cancellation_receipt_invalid";
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_postgres_restore_publication_launch_composition_options:
     "PostgreSQL restore publication and launch composition options are invalid",
   invalid_postgres_restore_publication_launch_composition_request:
     "PostgreSQL restore publication and launch composition request is invalid",
+  [CANCELLATION_RECEIPT_INVALID_CODE]:
+    "PostgreSQL restore publication and launch cancellation receipt is invalid",
   postgres_restore_publication_launch_composition_outcome_uncertain:
     "PostgreSQL restore publication and launch composition outcome is uncertain",
   restore_launch_v2_fleet_capability_required:
@@ -473,6 +503,36 @@ function canonicalData(value, code) {
 
 function sameData(left, right, code) {
   return canonicalData(left, code) === canonicalData(right, code);
+}
+
+function canonicalJsonSha256(value, code) {
+  let serialized;
+  try {
+    serialized = callIntrinsic(jsonStringifyIntrinsic, JSON, [value]);
+  } catch {
+    fail(code);
+  }
+  ensure(typeof serialized === "string", code);
+  return sha256String(serialized, code);
+}
+
+function sha256String(value, code) {
+  ensure(typeof value === "string", code);
+  let hash;
+  let digest;
+  try {
+    hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
+    callIntrinsic(hashUpdateIntrinsic, hash, [value, "utf8"]);
+    digest = callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    typeof digest === "string" &&
+      regexpTest(SHA256_PATTERN, digest),
+    code,
+  );
+  return digest;
 }
 
 function assertOpaqueId(value, code) {
@@ -675,6 +735,162 @@ function normalizeSession(value, admission, code) {
   return exactFrozenRecord({ attachment, lease, session: value, storageRef });
 }
 
+function canonicalAuthorityExpectedSession(value, code) {
+  const document = value.document;
+  const manifest = document.manifest;
+  ensure(
+    document.activeOperation === null &&
+      document.launch === null &&
+      document.recovery === null,
+    code,
+  );
+  const canonicalManifest = exactFrozenRecord({
+    schemaVersion: manifest.schemaVersion,
+    sessionId: manifest.sessionId,
+    codex: exactFrozenRecord({
+      rootThreadId: manifest.codex.rootThreadId,
+      sessionId: manifest.codex.sessionId,
+      ephemeral: manifest.codex.ephemeral,
+      historyMode: manifest.codex.historyMode,
+    }),
+    runtime: exactFrozenRecord({
+      imageDigest: manifest.runtime.imageDigest,
+      imageMediaType: manifest.runtime.imageMediaType,
+      platform: manifest.runtime.platform,
+      codexVersion: manifest.runtime.codexVersion,
+      codexSandbox: manifest.runtime.codexSandbox,
+    }),
+    layoutVersion: manifest.layoutVersion,
+    authMode: manifest.authMode,
+    agents: exactFrozenRecord({
+      defaultMaxSubagents: manifest.agents.defaultMaxSubagents,
+      maxSubagents: manifest.agents.maxSubagents,
+      maxDepth: manifest.agents.maxDepth,
+    }),
+  });
+  const lease = exactFrozenRecord({
+    contractVersion: document.lease.contractVersion,
+    sessionId: document.lease.sessionId,
+    leaseId: document.lease.leaseId,
+    holderId: document.lease.holderId,
+    fencingEpoch: document.lease.fencingEpoch,
+    expiresAt: document.lease.expiresAt,
+  });
+  const attachment = exactFrozenRecord({
+    contractVersion: document.attachment.contractVersion,
+    backendId: document.attachment.backendId,
+    storageId: document.attachment.storageId,
+    sessionId: document.attachment.sessionId,
+    attachmentId: document.attachment.attachmentId,
+    leaseId: document.attachment.leaseId,
+    holderId: document.attachment.holderId,
+    fencingEpoch: document.attachment.fencingEpoch,
+    operationId: document.attachment.operationId,
+    proofId: document.attachment.proofId,
+    kind: document.attachment.kind,
+    rootPath: document.attachment.rootPath,
+    mode: document.attachment.mode,
+  });
+  const lastOperation =
+    document.lastOperation === null
+      ? null
+      : exactFrozenRecord({
+          conflictClass: document.lastOperation.conflictClass,
+          expectedSessionRevision:
+            document.lastOperation.expectedSessionRevision,
+          kind: document.lastOperation.kind,
+          operationId: document.lastOperation.operationId,
+          operationRevision: document.lastOperation.operationRevision,
+          requestSha256: document.lastOperation.requestSha256,
+          reservationId: document.lastOperation.reservationId,
+          resultSha256: document.lastOperation.resultSha256,
+          state: document.lastOperation.state,
+        });
+  return exactFrozenRecord({
+    sessionId: value.sessionId,
+    revision: value.revision,
+    document: exactFrozenRecord({
+      documentVersion: document.documentVersion,
+      manifest: canonicalManifest,
+      storageRef: exactFrozenRecord({
+        contractVersion: document.storageRef.contractVersion,
+        backendId: document.storageRef.backendId,
+        storageId: document.storageRef.storageId,
+        sessionId: document.storageRef.sessionId,
+      }),
+      backendCapabilities: exactFrozenRecord({
+        atomicPointInTimeCheckpoint:
+          document.backendCapabilities.atomicPointInTimeCheckpoint,
+        exclusiveWriterAttachment:
+          document.backendCapabilities.exclusiveWriterAttachment,
+        fencing: document.backendCapabilities.fencing,
+        normalDirectoryAttachment:
+          document.backendCapabilities.normalDirectoryAttachment,
+      }),
+      lifecycle: document.lifecycle,
+      writerEpoch: document.writerEpoch,
+      lease,
+      attachment,
+      activeOperation: null,
+      lastOperation,
+      recovery: null,
+      launch: null,
+    }),
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  });
+}
+
+function normalizeRestoreOperationRequestV2(
+  value,
+  expectedSession,
+  admission,
+  code,
+) {
+  const request = exactObject(
+    value,
+    RESTORE_OPERATION_REQUEST_V2_KEYS,
+    code,
+    true,
+  );
+  const canonicalExpectedSession = canonicalAuthorityExpectedSession(
+    expectedSession,
+    code,
+  );
+  ensure(sameData(expectedSession, canonicalExpectedSession, code), code);
+  let canonicalRequest;
+  try {
+    canonicalRequest = createRestoreDestinationGenerationOperationRequestV2({
+      admission,
+      expectedSession: canonicalExpectedSession,
+      launchIntent: request.launchIntent,
+    });
+  } catch {
+    fail(code);
+  }
+  ensure(sameData(value, canonicalRequest, code), code);
+  return exactFrozenRecord({
+    expectedSession: canonicalExpectedSession,
+    request: canonicalRequest,
+  });
+}
+
+function authorityOperationRequestSha256(
+  expectedSession,
+  request,
+  code,
+) {
+  return canonicalJsonSha256(
+    exactFrozenRecord({
+      requestVersion: 1,
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      expectedSession,
+      payload: request,
+    }),
+    code,
+  );
+}
+
 function normalizeRestoreReadReceipt(value, admission, code) {
   const receipt = exactObject(
     value,
@@ -684,11 +900,23 @@ function normalizeRestoreReadReceipt(value, admission, code) {
   );
   ensure(
     arrayIncludes(
-      ["absent", "prepared", "starting", "uncertain", "committed"],
+      [
+        "absent",
+        "prepared",
+        "starting",
+        "uncertain",
+        "committed",
+        "cancelled-before-dispatch",
+      ],
       receipt.status,
     ),
     code,
   );
+  const cancelledBeforeDispatch =
+    receipt.status === "cancelled-before-dispatch";
+  const relationCode = cancelledBeforeDispatch
+    ? CANCELLATION_RECEIPT_INVALID_CODE
+    : code;
   if (receipt.status === "absent") {
     ensure(
       receipt.operation === null &&
@@ -711,47 +939,64 @@ function normalizeRestoreReadReceipt(value, admission, code) {
   const operation = exactObject(
     receipt.operation,
     OPERATION_KEYS,
-    code,
+    relationCode,
     true,
   );
   const expected = normalizeSession(
     operation.expectedSession,
     admission,
-    code,
+    relationCode,
   );
+  const cancellationRequest = cancelledBeforeDispatch
+    ? normalizeRestoreOperationRequestV2(
+        operation.request,
+        operation.expectedSession,
+        admission,
+        relationCode,
+      )
+    : null;
   ensure(
     operation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
       operation.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
       operation.operationId === admission.request.operationId &&
       operation.sessionId === admission.request.sessionId &&
-      operation.state === receipt.status &&
-      (receipt.status === "committed"
+      operation.state ===
+        (cancelledBeforeDispatch ? "committed" : receipt.status) &&
+      (operation.state === "committed"
         ? operation.retiredAt === operation.updatedAt
         : operation.retiredAt === null) &&
-      operation.request?.contractVersion === 2 &&
-      sameData(operation.request.admission, admission, code) &&
+      (cancelledBeforeDispatch
+        ? cancellationRequest.request.contractVersion === 2 &&
+          sameData(
+            cancellationRequest.request.admission,
+            admission,
+            relationCode,
+          )
+        : operation.request?.contractVersion === 2 &&
+          sameData(operation.request.admission, admission, code)) &&
       typeof operation.requestSha256 === "string" &&
       regexpTest(SHA256_PATTERN, operation.requestSha256),
-    code,
+    relationCode,
   );
-  timestampMilliseconds(operation.createdAt, code);
-  timestampMilliseconds(operation.updatedAt, code);
-  const operationRevision = revision(operation.revision, code);
+  timestampMilliseconds(operation.createdAt, relationCode);
+  timestampMilliseconds(operation.updatedAt, relationCode);
+  const operationRevision = revision(operation.revision, relationCode);
   ensure(
     (receipt.status === "prepared" && operationRevision === 0n) ||
       (receipt.status === "starting" && operationRevision === 1n) ||
       (receipt.status === "uncertain" && operationRevision === 2n) ||
+      (cancelledBeforeDispatch && operationRevision === 1n) ||
       (receipt.status === "committed" &&
         (operationRevision === 2n || operationRevision === 3n)),
-    code,
+    relationCode,
   );
   const reservation = exactObject(
     receipt.reservation,
     RESERVATION_KEYS,
-    code,
+    relationCode,
     true,
   );
-  const active = receipt.status !== "committed";
+  const active = operation.state !== "committed";
   ensure(
     reservation.conflictClass === operation.conflictClass &&
       reservation.operationId === operation.operationId &&
@@ -766,7 +1011,7 @@ function normalizeRestoreReadReceipt(value, admission, code) {
       (active
         ? reservation.releasedAt === null
         : reservation.releasedAt === operation.updatedAt),
-    code,
+    relationCode,
   );
   if (active) {
     ensure(operation.result === null, code);
@@ -777,7 +1022,7 @@ function normalizeRestoreReadReceipt(value, admission, code) {
       receipt.reservation,
       code,
     );
-  } else {
+  } else if (!cancelledBeforeDispatch) {
     ensure(operation.result !== null, code);
     const currentSession = exactObject(
       receipt.session,
@@ -787,6 +1032,58 @@ function normalizeRestoreReadReceipt(value, admission, code) {
     );
     ensure(currentSession.sessionId === expected.session.sessionId, code);
     canonicalData(receipt.session, code);
+  }
+
+  if (cancelledBeforeDispatch) {
+    const result = exactObject(
+      operation.result,
+      CANCELLATION_RESULT_KEYS,
+      relationCode,
+      true,
+    );
+    const canonicalResult = exactFrozenRecord({
+      resultVersion: 1,
+      outcome: "cancelled-before-dispatch",
+      reason: result.reason,
+    });
+    ensure(
+      result.resultVersion === canonicalResult.resultVersion &&
+        result.outcome === canonicalResult.outcome &&
+        typeof result.reason === "string" &&
+        result.reason.length <= 64 &&
+        regexpTest(OPAQUE_ID_PATTERN, result.reason) &&
+        sameData(operation.result, canonicalResult, relationCode) &&
+        receipt.generation === null &&
+        receipt.catalogue === null,
+      relationCode,
+    );
+    ensure(
+      operation.requestSha256 ===
+        authorityOperationRequestSha256(
+          cancellationRequest.expectedSession,
+          cancellationRequest.request,
+          relationCode,
+        ) &&
+        reservation.reservationId ===
+          `reservation-${sha256String(operation.operationId, relationCode)}`,
+      relationCode,
+    );
+    validateCancelledTerminalSession(
+      receipt.session,
+      expected.session,
+      receipt.operation,
+      receipt.reservation,
+      canonicalResult,
+      relationCode,
+    );
+    return exactFrozenRecord({
+      ...expected,
+      catalogue: null,
+      generation: null,
+      operation: receipt.operation,
+      reservation: receipt.reservation,
+      status: receipt.status,
+    });
   }
 
   if (receipt.status === "prepared") {
@@ -1087,6 +1384,94 @@ function validateActiveSession(
       sameData(session.document, stableDocument, code),
     code,
   );
+  canonicalData(sessionValue, code);
+  return sessionValue;
+}
+
+function validateCancelledTerminalSession(
+  sessionValue,
+  expectedSession,
+  operation,
+  reservation,
+  canonicalResult,
+  code,
+) {
+  const session = exactObject(sessionValue, SESSION_KEYS, code, true);
+  const document = exactObject(
+    session.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+    true,
+  );
+  const last = exactObject(
+    document.lastOperation,
+    LAST_OPERATION_KEYS,
+    code,
+    true,
+  );
+  const expectedDocument = exactObject(
+    expectedSession.document,
+    SESSION_DOCUMENT_KEYS,
+    code,
+    true,
+  );
+  const expectedUpdatedAt = timestampMilliseconds(
+    expectedSession.updatedAt,
+    code,
+  );
+  const operationCreatedAt = timestampMilliseconds(
+    operation.createdAt,
+    code,
+  );
+  const operationUpdatedAt = timestampMilliseconds(
+    operation.updatedAt,
+    code,
+  );
+
+  // Protect the durable relational identity and content of the cancellation.
+  // sessionId/createdAt preserve the session identity; updatedAt/revision bind
+  // the one terminal transition; documentVersion/activeOperation prove that
+  // the operation retired; lastOperation binds the operation, reservation,
+  // request, and result; and the stable document comparison prevents changes
+  // to unrelated session business state.
+  ensure(
+    session.sessionId === expectedSession.sessionId &&
+      session.createdAt === expectedSession.createdAt &&
+      session.updatedAt === operation.updatedAt &&
+      operationUpdatedAt >= operationCreatedAt &&
+      operationCreatedAt >= expectedUpdatedAt &&
+      revision(session.revision, code) ===
+        revision(expectedSession.revision, code) +
+          revision(operation.revision, code) +
+          1n &&
+      document.documentVersion === 3 &&
+      document.activeOperation === null &&
+      last.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      last.expectedSessionRevision === expectedSession.revision &&
+      last.kind === operation.kind &&
+      last.operationId === operation.operationId &&
+      last.operationRevision === operation.revision &&
+      last.requestSha256 === operation.requestSha256 &&
+      last.reservationId === reservation.reservationId &&
+      last.resultSha256 === canonicalJsonSha256(canonicalResult, code) &&
+      last.state === operation.state,
+    code,
+  );
+  const stableDocument = exactFrozenRecord({
+    activeOperation: null,
+    attachment: expectedDocument.attachment,
+    backendCapabilities: expectedDocument.backendCapabilities,
+    documentVersion: 3,
+    lastOperation: document.lastOperation,
+    launch: expectedDocument.launch,
+    lease: expectedDocument.lease,
+    lifecycle: expectedDocument.lifecycle,
+    manifest: expectedDocument.manifest,
+    recovery: expectedDocument.recovery,
+    storageRef: expectedDocument.storageRef,
+    writerEpoch: expectedDocument.writerEpoch,
+  });
+  ensure(sameData(session.document, stableDocument, code), code);
   canonicalData(sessionValue, code);
   return sessionValue;
 }
@@ -1481,6 +1866,7 @@ export function createPostgresRestorePublicationLaunchComposition(...args) {
     "invalid_postgres_restore_publication_launch_composition_request";
   const outcomeCode =
     "postgres_restore_publication_launch_composition_outcome_uncertain";
+  const cancellationReceiptCode = CANCELLATION_RECEIPT_INVALID_CODE;
   const fleetCode = "restore_launch_v2_fleet_capability_required";
   ensure(args.length === 1, optionCode);
   const options = exactObject(args[0], OPTION_KEYS, optionCode);
@@ -1537,6 +1923,9 @@ export function createPostgresRestorePublicationLaunchComposition(...args) {
     let preparedLaunchAttemptId = null;
     try {
       const initial = await readRestore(admission);
+      if (initial.status === "cancelled-before-dispatch") {
+        fail(outcomeCode);
+      }
       if (initial.status === "absent") {
         const gateContext = exactFrozenRecord({
           capability: "restore-generation-v2-launch-handoff-v1",
@@ -1924,7 +2313,13 @@ export function createPostgresRestorePublicationLaunchComposition(...args) {
       return guardedResult.completion;
     } catch (error) {
       if (callIntrinsic(weakSetHasIntrinsic, INTERNAL_ERRORS, [error])) {
-        if (error.code === requestCode || error.code === fleetCode) throw error;
+        if (
+          error.code === requestCode ||
+          error.code === fleetCode ||
+          error.code === cancellationReceiptCode
+        ) {
+          throw error;
+        }
       }
       if (
         dispatchDefinitelyBegan &&

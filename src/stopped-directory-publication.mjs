@@ -2271,9 +2271,6 @@ export class StoppedDirectoryPublication {
       ) {
         fail("publication_outcome_uncertain", "uncertain");
       }
-      if (options.requireCommittedOperation && observedState !== "committed") {
-        fail("publication_recovery_required", "not-committed");
-      }
       if (["materialized", "committed"].includes(observedState)) {
         source = unobservedSource;
       } else {
@@ -2533,6 +2530,12 @@ export class StoppedDirectoryPublication {
           observed.record.state,
         );
         publicationMayHaveOccurred = false;
+      }
+      // A non-committed journal phase cannot classify the physical rename.
+      // Reject committed-only verification only after the locked topology
+      // probes have either preserved uncertainty or proved final absence.
+      if (options.requireCommittedOperation && observedState !== "committed") {
+        fail("publication_recovery_required", "not-committed");
       }
       if (sourceContinuityFailed) {
         if (publicationMayHaveOccurred) {

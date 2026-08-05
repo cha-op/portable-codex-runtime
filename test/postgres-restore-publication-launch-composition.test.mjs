@@ -665,6 +665,7 @@ class MemoryAuthority {
     this.handoffRevisions = [];
     this.input = null;
     this.claim = null;
+    this.cancelled = null;
     this.committed = null;
     this.handoffReceipt = null;
     this.phase = "absent";
@@ -814,6 +815,16 @@ class MemoryAuthority {
       });
     }
     if (this.phase === "uncertain") return this.uncertain;
+    if (this.phase === "cancelled") {
+      return deepFreeze({
+        catalogue: null,
+        generation: null,
+        operation: this.cancelled.operation,
+        reservation: this.cancelled.reservation,
+        session: this.cancelled.session,
+        status: "cancelled-before-dispatch",
+      });
+    }
     return this.committed;
   }
 
@@ -966,6 +977,22 @@ class MemoryAuthority {
 
   async reconcileOperation() {
     this.events.push("authority.reconcile");
+    if (this.phase === "prepared") {
+      return deepFreeze({
+        operation: this.prepared.operation,
+        reservation: this.prepared.reservation,
+        session: this.prepared.session,
+        status: "prepared",
+      });
+    }
+    if (this.phase === "cancelled") {
+      return deepFreeze({
+        operation: this.cancelled.operation,
+        reservation: this.cancelled.reservation,
+        session: this.cancelled.session,
+        status: "committed",
+      });
+    }
     return deepFreeze({
       operation: null,
       reservation: null,
@@ -974,9 +1001,47 @@ class MemoryAuthority {
     });
   }
 
-  async cancelPreparedOperation() {
+  async cancelPreparedOperation(input) {
     this.events.push("authority.cancel");
-    return deepFreeze({});
+    if (this.phase === "cancelled") {
+      return deepFreeze({ cancelled: false, ...clone(this.cancelled) });
+    }
+    assert.equal(this.phase, "prepared");
+    assert.equal(input.operationId, this.prepared.operation.operationId);
+    assert.equal(input.expectedOperationRevision, "0");
+    const result = deepFreeze({
+      resultVersion: 1,
+      outcome: "cancelled-before-dispatch",
+      reason: input.reason,
+    });
+    const cancelledOperation = deepFreeze({
+      ...clone(this.prepared.operation),
+      result,
+      retiredAt: NOW,
+      revision: "1",
+      state: "committed",
+      updatedAt: NOW,
+    });
+    const cancelledReservation = deepFreeze({
+      ...clone(this.prepared.reservation),
+      releasedAt: NOW,
+      state: "released",
+      updatedAt: NOW,
+    });
+    const cancelledSession = terminalSession(
+      cancelledOperation.expectedSession,
+      cancelledOperation,
+      cancelledReservation,
+      (BigInt(cancelledOperation.expectedSession.revision) + 2n).toString(),
+    );
+    this.cancelled = deepFreeze({
+      operation: cancelledOperation,
+      reservation: cancelledReservation,
+      session: cancelledSession,
+      status: "committed",
+    });
+    this.phase = "cancelled";
+    return deepFreeze({ cancelled: true, ...clone(this.cancelled) });
   }
 }
 
@@ -1582,6 +1647,150 @@ test("an observed reserve replay is never cancelled as invocation-owned", async 
   assert.equal(value.events.includes("authority.cancel"), false);
   assert.equal(value.publicationCalls, 0);
   assert.equal(value.launcher.launchCalls, 0);
+});
+
+test("a pre-dispatch cancellation is terminal on the next exact restore read", async (t) => {
+  const value = await fixture(t, { claimFailureBeforeDispatch: true });
+
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(value.authority.phase, "cancelled");
+  assert.equal(value.authority.cancelled.operation.state, "committed");
+  assert.equal(value.authority.cancelled.operation.revision, "1");
+  assert.deepEqual(value.authority.cancelled.operation.result, {
+    outcome: "cancelled-before-dispatch",
+    reason: "restore-publication-not-started",
+    resultVersion: 1,
+  });
+  assert.equal(value.preparationCalls, 1);
+  assert.equal(value.publicationCalls, 0);
+  assert.equal(value.launcher.launchCalls, 0);
+
+  const retryEventIndex = value.events.length;
+  await assert.rejects(
+    value.composer.runRestore(admission(), value.publish),
+    assertCompositionError(
+      "postgres_restore_publication_launch_composition_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(value.authority.phase, "cancelled");
+  assert.equal(value.preparationCalls, 1);
+  assert.equal(value.publicationCalls, 0);
+  assert.equal(value.launcher.launchCalls, 0);
+  assert.deepEqual(value.events.slice(retryEventIndex), [
+    "authority.read-restore",
+  ]);
+});
+
+test("malformed pre-dispatch cancellation relations fail before retry work", async (t) => {
+  const cases = [
+    {
+      mutate(receipt) {
+        receipt.session.revision = "999";
+      },
+      name: "terminal session revision",
+    },
+    {
+      mutate(receipt) {
+        receipt.session.updatedAt = "2026-08-04T12:00:01.000Z";
+      },
+      name: "terminal session timestamp",
+    },
+    {
+      mutate(receipt) {
+        receipt.session.document.writerEpoch = "999";
+      },
+      name: "terminal session stable content",
+    },
+    {
+      mutate(receipt) {
+        receipt.session.document.lastOperation.operationId =
+          "forged-restore-operation";
+      },
+      name: "terminal last-operation identity",
+    },
+    {
+      mutate(receipt) {
+        receipt.session.document.lastOperation.resultSha256 = "f".repeat(64);
+      },
+      name: "terminal result digest",
+    },
+    {
+      mutate(receipt) {
+        receipt.reservation.releasedAt = "2026-08-04T12:00:01.000Z";
+      },
+      name: "released reservation timestamp",
+    },
+    {
+      mutate(receipt) {
+        receipt.reservation.reservationId = "forged-reservation";
+      },
+      name: "released reservation pointer",
+    },
+    {
+      mutate(receipt) {
+        const forgedRequestSha256 = "e".repeat(64);
+        receipt.operation.requestSha256 = forgedRequestSha256;
+        receipt.reservation.requestSha256 = forgedRequestSha256;
+        receipt.session.document.lastOperation.requestSha256 =
+          forgedRequestSha256;
+      },
+      name: "synchronized request digest",
+    },
+    {
+      mutate(receipt) {
+        receipt.reservation.reservationId = "forged-reservation";
+        receipt.session.document.lastOperation.reservationId =
+          "forged-reservation";
+      },
+      name: "synchronized reservation pointer",
+    },
+    {
+      mutate(receipt) {
+        receipt.operation.request.predeterminedResult.mutation.proofId =
+          "proof-forged-restore-result";
+      },
+      name: "V2 predetermined request relation",
+    },
+  ];
+
+  for (const { mutate, name } of cases) {
+    await t.test(name, async (t) => {
+      const value = await fixture(t, { claimFailureBeforeDispatch: true });
+      await assert.rejects(
+        value.composer.runRestore(admission(), value.publish),
+        assertCompositionError(
+          "postgres_restore_publication_launch_composition_outcome_uncertain",
+        ),
+      );
+      assert.equal(value.authority.phase, "cancelled");
+
+      const forged = clone(value.authority.cancelled);
+      mutate(forged);
+      value.authority.cancelled = deepFreeze(forged);
+      const retryEventIndex = value.events.length;
+
+      await assert.rejects(
+        value.composer.runRestore(admission(), value.publish),
+        assertCompositionError(
+          "postgres_restore_publication_launch_composition_cancellation_receipt_invalid",
+        ),
+      );
+
+      assert.equal(value.preparationCalls, 1);
+      assert.equal(value.publicationCalls, 0);
+      assert.equal(value.launcher.launchCalls, 0);
+      assert.deepEqual(value.events.slice(retryEventIndex), [
+        "authority.read-restore",
+      ]);
+    });
+  }
 });
 
 test("active session relation rejects stable-field forgery with a poisoned Array iterator", async (t) => {

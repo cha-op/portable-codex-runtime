@@ -10856,7 +10856,16 @@ export class PostgresSessionAuthority {
       );
       const generation = observed.generation.generation;
       const catalogue = observed.generation.source?.catalogue ?? null;
+      const cancelledBeforeDispatch =
+        observed.operation.state === "committed" &&
+        observed.operation.result?.outcome ===
+          "cancelled-before-dispatch";
       if (observed.operation.state === "prepared") {
+        ensure(
+          generation === null && catalogue === null,
+          "operation_state_invalid",
+        );
+      } else if (cancelledBeforeDispatch) {
         ensure(
           generation === null && catalogue === null,
           "operation_state_invalid",
@@ -10877,6 +10886,9 @@ export class PostgresSessionAuthority {
         operation: observed.operation,
         reservation: observed.reservation,
         session,
+        status: cancelledBeforeDispatch
+          ? "cancelled-before-dispatch"
+          : observed.operation.state,
       });
     });
   }

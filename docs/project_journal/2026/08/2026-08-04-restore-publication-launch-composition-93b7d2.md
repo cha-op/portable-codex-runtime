@@ -34,7 +34,10 @@ unavailable.
   exact typed durable read. Only an absent operation requires its
   invocation-time `fleetCapabilityGate()` to return the frozen
   `RESTORE_LAUNCH_V2_FLEET_CONFIRMED` sentinel before restore preparation or
-  durable creation; exact replay bypasses that fresh-work gate.
+  durable creation; exact replay bypasses that fresh-work gate. A terminal
+  version 2 `cancelled-before-dispatch` read preserves its committed revision-1
+  operation and released reservation but has no generation or catalogue; the
+  facade rejects it immediately before gating, preparation, or publication.
 - The facade prepares the isolated destination, opaque image reservation, and
   durable launch intent before taking the restore operation guard. Under the
   guard it re-reads the exact request, reserves or claims only when required,
@@ -77,6 +80,12 @@ unavailable.
   the complete expected document after applying only that version upgrade and
   the authority-owned active-operation pointer. Version 1 restore sessions
   remain unsupported and fail before fleet gating or durable work.
+- Committed-only restore verification classifies physical publication only
+  after binding the target filesystem/root identity and probing candidate and
+  final paths under the publication lock. A retained `materialized` candidate
+  with an absent final path is proven `not-committed`; a final-only state after
+  rename remains `uncertain`. Verification performs no journal transition or
+  path mutation.
 - A failure before definite publication dispatch may cancel only the prepared
   restore. A failure after dispatch but before confirmed handoff leaves or
   marks durable uncertainty. A launch failure after handoff remains owned by
@@ -120,6 +129,10 @@ unavailable.
   the expected session and compared as one canonical document. The terminal
   launcher result independently binds the same stable identity back to the
   handoff receipt.
+- Journal phase is not physical publication proof. For a committed-only restore
+  check, only locked candidate/final topology under the bound storage identity
+  can downgrade a `materialized` outcome to `not-committed`; visible final
+  state stays uncertain until the durable journal is committed.
 - The standalone facade does not provide durable complete-stop proof, capture
   admission, bounded operational recovery, a concrete container driver, or
   production adapter enablement.
