@@ -9941,6 +9941,95 @@ test("writer launch stop request owns the exact current launch pointer", async (
   }
 });
 
+test("writer launch stop reconcile distinguishes exact and superseded absent preconditions", async () => {
+  const fixture = writerLaunchStopFixture();
+  const renewalOptions = renewOptions(fixture.options.expectedSession);
+  const renewal = renewalResult(
+    renewalOptions,
+    LAUNCH_RENEW_AUTHORITY_NOW,
+  );
+  const renewalOperation = operationRow("committed", {
+    options: renewalOptions,
+    revision: "0",
+    createdAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    updatedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    retiredAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    result: renewal,
+  });
+  const renewalReservation = reservationRow("released", {
+    options: renewalOptions,
+    createdAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    updatedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+    releasedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+  });
+  const renewedSession = renewedSessionRow({
+    options: renewalOptions,
+    result: renewal,
+    updatedAt: LAUNCH_RENEW_TRANSACTION_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      ...writerLaunchCommittedSteps(fixture.launch, {
+        result: fixture.launchResult,
+      }),
+      rows(),
+      rows(),
+    ],
+    [
+      rows(renewedSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(renewalOperation),
+      rows(renewalReservation),
+      ...writerLaunchCommittedRelationSteps(fixture.launch, {
+        result: fixture.launchResult,
+      }),
+      rows(),
+      rows(),
+    ],
+  );
+
+  const exact = await authority.reconcileWriterLaunchStopOperation(
+    fixture.options,
+  );
+  const superseded = await authority.reconcileWriterLaunchStopOperation(
+    fixture.options,
+  );
+  await assertAuthorityError(
+    authority.reconcileWriterLaunchStopOperation({
+      ...fixture.options,
+      extra: true,
+    }),
+    { code: "invalid_operation_request" },
+  );
+
+  assert.equal(exact.status, "absent");
+  assert.equal(exact.expectedSessionMatched, true);
+  assert.deepEqual(exact.session, fixture.options.expectedSession);
+  assert.equal(superseded.status, "absent");
+  assert.equal(superseded.expectedSessionMatched, false);
+  assert.deepEqual(
+    superseded.session,
+    snapshotFromSessionRow(renewedSession),
+  );
+  assertDeepFrozen(exact);
+  assertDeepFrozen(superseded);
+  for (const client of clients) {
+    assert.deepEqual(
+      authorityQueries(client)[0],
+      extendedQuery(`${READ_SESSION_QUERY} FOR UPDATE`, [
+        fixture.options.expectedSession.sessionId,
+      ]),
+    );
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
 test("writer launch stop claim, finalize, and exact replay clear only the current launch", async () => {
   const fixture = writerLaunchStopFixture();
   const startingOperation = writerLaunchStopOperationRow(

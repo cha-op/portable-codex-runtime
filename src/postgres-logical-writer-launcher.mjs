@@ -134,7 +134,7 @@ const AUTHORITY_METHODS = objectFreeze([
   "markOperationUncertain",
   "readSession",
   "readWriterLaunchAttempt",
-  "reconcileOperation",
+  "reconcileWriterLaunchStopOperation",
   "reserveOperation",
 ]);
 const RUN_INPUT_KEYS = objectFreeze([
@@ -165,6 +165,7 @@ const STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
   "request",
 ]);
 const STOP_FINALIZATION_MAX_ATTEMPTS = 3;
+const STOP_RESERVATION_MAX_ATTEMPTS = 3;
 const STOP_RESOLUTION_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
   "processIncarnationId",
@@ -370,6 +371,13 @@ const STOP_RESERVE_RECEIPT_KEYS = objectFreeze([
   "status",
 ]);
 const STOP_RECONCILE_RECEIPT_KEYS = objectFreeze([
+  "operation",
+  "reservation",
+  "session",
+  "status",
+]);
+const STOP_RECONCILE_ABSENT_RECEIPT_KEYS = objectFreeze([
+  "expectedSessionMatched",
   "operation",
   "reservation",
   "session",
@@ -2111,27 +2119,56 @@ function normalizeStopReserveReceipt(value, baseInput, code) {
 }
 
 function normalizeStopReconcileReceipt(value, baseInput, code) {
-  const receipt = exactDataObject(
+  const receipt = exactDataObjectVariant(
     value,
-    STOP_RECONCILE_RECEIPT_KEYS,
+    [STOP_RECONCILE_RECEIPT_KEYS, STOP_RECONCILE_ABSENT_RECEIPT_KEYS],
     code,
   );
   const session = normalizeSession(receipt.session, code);
   if (receipt.operation === null || receipt.reservation === null) {
+    const expectedSessionMatched = receipt.expectedSessionMatched;
+    const exactExpectedSession = sameContent(
+      session,
+      baseInput.expectedSession,
+      code,
+    );
     ensure(
       receipt.operation === null &&
         receipt.reservation === null &&
         receipt.status === "absent" &&
-        sameContent(session, baseInput.expectedSession, code),
+        typeof expectedSessionMatched === "boolean" &&
+        expectedSessionMatched === exactExpectedSession &&
+        (expectedSessionMatched ||
+          (session.sessionId === baseInput.expectedSession.sessionId &&
+            session.createdAt === baseInput.expectedSession.createdAt &&
+            sameContent(
+              session.document.manifest,
+              baseInput.expectedSession.document.manifest,
+              code,
+            ) &&
+            sameContent(
+              session.document.storageRef,
+              baseInput.expectedSession.document.storageRef,
+              code,
+            ) &&
+            sameContent(
+              session.document.backendCapabilities,
+              baseInput.expectedSession.document.backendCapabilities,
+              code,
+            ) &&
+            BigIntConstructor(session.revision) >
+              BigIntConstructor(baseInput.expectedSession.revision))),
       code,
     );
     return exactFrozenRecord({
+      expectedSessionMatched,
       operation: null,
       reservation: null,
       session,
       status: "absent",
     });
   }
+  ensure(!objectHasOwn(receipt, "expectedSessionMatched"), code);
   const operation = normalizeStopPhaseOperation(
     receipt.operation,
     baseInput,
@@ -3703,13 +3740,35 @@ export function createPostgresLogicalWriterLauncher(...args) {
     return normalizeStopReconcileReceipt(
       await invokeAsync(
         authority,
-        "reconcileOperation",
+        "reconcileWriterLaunchStopOperation",
         [baseInput],
         outcomeCode,
       ),
       baseInput,
       outcomeCode,
     );
+  }
+
+  function stopBaseInputForSession(
+    expectedSession,
+    record,
+    stopOperation,
+    code,
+  ) {
+    let typedRequest;
+    try {
+      typedRequest = createWriterLaunchStopOperationRequest({
+        expectedSession,
+      });
+    } catch {
+      fail(code);
+    }
+    return exactFrozenRecord({
+      expectedSession,
+      kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+      operationId: stopOperation,
+      request: typedRequest,
+    });
   }
 
   async function reserveStopOperation(baseInput) {
@@ -3778,20 +3837,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 outcomeCode,
               );
               validateCurrentStopSession(expectedSession, record, outcomeCode);
-              let typedRequest;
-              try {
-                typedRequest = createWriterLaunchStopOperationRequest({
-                  expectedSession,
-                });
-              } catch {
-                fail(optionCode);
-              }
-              baseInput = exactFrozenRecord({
+              baseInput = stopBaseInputForSession(
                 expectedSession,
-                kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
-                operationId: stopOperation,
-                request: typedRequest,
-              });
+                record,
+                stopOperation,
+                optionCode,
+              );
               record.stopBaseInput = baseInput;
             }
             ensure(
@@ -3804,23 +3855,52 @@ export function createPostgresLogicalWriterLauncher(...args) {
               outcomeCode,
             );
 
-            let phase;
+            let phase = null;
             if (retainedBaseInput) {
               phase = await reconcileStopOperation(baseInput);
-            } else {
+            }
+            for (
+              let attempt = 0;
+              attempt < STOP_RESERVATION_MAX_ATTEMPTS;
+              attempt += 1
+            ) {
+              if (
+                phase?.status === "absent" &&
+                !phase.expectedSessionMatched
+              ) {
+                validateCurrentStopSession(
+                  phase.session,
+                  record,
+                  outcomeCode,
+                );
+                ensure(
+                  canonicalTimestampMilliseconds(
+                    phase.session.document.lease.expiresAt,
+                    outcomeCode,
+                  ) >=
+                    canonicalTimestampMilliseconds(
+                      baseInput.expectedSession.document.lease.expiresAt,
+                      outcomeCode,
+                    ),
+                  outcomeCode,
+                );
+                baseInput = stopBaseInputForSession(
+                  phase.session,
+                  record,
+                  stopOperation,
+                  outcomeCode,
+                );
+                record.stopBaseInput = baseInput;
+                phase = null;
+              }
+              if (phase !== null && phase.status !== "absent") break;
               try {
                 phase = await reserveStopOperation(baseInput);
               } catch {
                 phase = await reconcileStopOperation(baseInput);
               }
             }
-            if (phase.status === "absent") {
-              try {
-                phase = await reserveStopOperation(baseInput);
-              } catch {
-                phase = await reconcileStopOperation(baseInput);
-              }
-            }
+            ensure(phase !== null && phase.status !== "absent", outcomeCode);
 
             let hasAcknowledgedClaimGrant =
               record.stopClaimGrantAcknowledgedFor === stopOperation;

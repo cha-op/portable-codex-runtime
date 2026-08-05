@@ -29,14 +29,20 @@ detached-destination activation, and bounded restart recovery remain closed.
   capture tuple plus launch-attempt ID, persists and finalizes the durable stop,
   validates a stop-specific committed transition proof, and returns exact
   frozen `{capability, evidence, resolution, stop}`.
-- The launcher retains the first exact stop operation input. Later calls use
-  `reconcileOperation()` and proceed only from `prepared`, or from `starting`
-  only after the same record received the exact true-grant receipt while it
-  still proves the coordinator and physical stop have not begun. A thrown claim
-  or explicit non-grant never creates that witness because the durable state
-  cannot distinguish acknowledgement loss from a foreign claimant. It never
-  repeats claim for known `starting` state or synthesizes operation timestamps
-  from a session.
+- The launcher freezes each stop operation input before reserve. The dedicated
+  `reconcileWriterLaunchStopOperation()` path locks the canonical session,
+  resolves an exact existing operation before absence, and distinguishes an
+  exact absent precondition from a strictly newer same-incarnation snapshot.
+  Only the latter may refresh the input after the complete stop relation and
+  lease expiration are revalidated against both registration and the prior
+  input. This recovers a renewal between read and reserve without discarding an
+  ambiguously committed operation. Later calls proceed only from `prepared`,
+  or from `starting` only after the same record received the exact true-grant
+  receipt while it still proves the coordinator and physical stop have not
+  begun. A thrown claim or explicit non-grant never creates that witness
+  because the durable state cannot distinguish acknowledgement loss from a
+  foreign claimant. It never repeats claim for known `starting` state or
+  synthesizes operation timestamps from a session.
 - Stop preflight accepts a current lease only when its contract, session,
   lease, holder, and fencing-epoch identity remains exact and its canonical
   expiration has not moved backwards. This preserves stop/capture across
@@ -108,12 +114,18 @@ recovery or a cross-process or cross-host fence.
 - On Node.js `v24.18.0`, `node --check` passed for the stopped-writer
   coordinator, authority, launcher, snapshot core, and new composition modules.
 - The five focused stopped-writer coordinator, launcher, snapshot-core,
-  composition, and operation-kernel test files passed with exit 0 and no
-  failures. They include direct same-session cross-backend/storage registration
-  exclusion, concurrent capability consumption, renewed-lease stop admission,
-  exact prepared and uncertain-finalization stop replay, rejection of
-  claim-acknowledgement ambiguity and foreign `starting`, and ordinary
-  launch-reconciliation rejection after a joined durable stop.
+  composition, and operation-kernel test files passed 543/543. They include
+  direct same-session cross-backend/storage registration exclusion, concurrent
+  capability consumption, renewed-lease stop admission, a lease renewal
+  between stop read and reserve, locked absent-precondition classification,
+  refreshed-reserve acknowledgement loss, expiry rollback rejection, exact
+  prepared and uncertain-finalization stop replay, rejection of
+  claim-acknowledgement ambiguity and foreign `starting`, and ordinary launch
+  reconciliation rejection after a joined durable stop.
+- The PostgreSQL integration gate now drives the real interleaving from the
+  launcher's first stop-session read through a committed lease renewal, stale
+  reserve rejection, locked absence proof, refreshed reserve, uncertain stop,
+  and exact finalization. It remains part of the required PR CI matrix.
 - `test/stopped-directory-backend.test.mjs` passed with 91 dot-reporter test
   markers and no failures.
 - The complete unit suite passed with exit 0 when it skipped only

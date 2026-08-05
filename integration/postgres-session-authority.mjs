@@ -24,7 +24,6 @@ import {
 import {
   PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
-  derivePostgresLogicalWriterStopOperationId,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
@@ -6540,7 +6539,7 @@ test(
     );
 
     await t.test(
-      "logical writer launcher finalizes an uncertain renewed stop and keeps launch readback closed",
+      "logical writer launcher recovers a read-reserve renewal race before uncertain stop finalization",
       async () => {
         const sessionId = randomUUID();
         sessionIds.push(sessionId);
@@ -6573,7 +6572,65 @@ test(
         const supervisorId = `supervisor-${randomUUID()}`;
         let launchCalls = 0;
         let stopCalls = 0;
+        let renewedDuringStopReserve = null;
+        let stopReadSession = null;
+        let stopRenewalArmed = false;
+        let stopReserveAttempts = 0;
         let stopUncertaintyInput = null;
+        const launcherAuthority = {
+          async cancelPreparedOperation(options) {
+            return authority.cancelPreparedOperation(options);
+          },
+          async claimWriterLaunchAttemptDispatch(options) {
+            return authority.claimWriterLaunchAttemptDispatch(options);
+          },
+          async claimWriterLaunchStopDispatch(options) {
+            return authority.claimWriterLaunchStopDispatch(options);
+          },
+          async finalizeWriterLaunchAttemptStarted(options) {
+            return authority.finalizeWriterLaunchAttemptStarted(options);
+          },
+          async finalizeWriterLaunchAttemptStopped(options) {
+            return authority.finalizeWriterLaunchAttemptStopped(options);
+          },
+          async finalizeWriterLaunchStopped(options) {
+            return authority.finalizeWriterLaunchStopped(options);
+          },
+          async markOperationUncertain(options) {
+            return authority.markOperationUncertain(options);
+          },
+          async readSession(options) {
+            const session = await authority.readSession(options);
+            if (stopRenewalArmed) {
+              stopReadSession = structuredClone(session);
+            }
+            return session;
+          },
+          async readWriterLaunchAttempt(options) {
+            return authority.readWriterLaunchAttempt(options);
+          },
+          async reconcileWriterLaunchStopOperation(options) {
+            return authority.reconcileWriterLaunchStopOperation(options);
+          },
+          async reserveOperation(options) {
+            if (options.kind === WRITER_LAUNCH_STOP_OPERATION_KIND) {
+              stopReserveAttempts += 1;
+              if (stopRenewalArmed) {
+                stopRenewalArmed = false;
+                assert.notEqual(stopReadSession, null);
+                renewedDuringStopReserve = await authority.renewWriterLease(
+                  writerLeaseRenewalInput(stopReadSession),
+                );
+                assertOperationReceipt(
+                  renewedDuringStopReserve,
+                  "committed",
+                );
+              }
+              stopUncertaintyInput = structuredClone(options);
+            }
+            return authority.reserveOperation(options);
+          },
+        };
         const launchWriter = async (context) => {
           launchCalls += 1;
           assert.equal(
@@ -6605,7 +6662,7 @@ test(
           throw new Error("committed launches must not reach the supervisor");
         };
         const facade = createPostgresLogicalWriterLauncher({
-          authority,
+          authority: launcherAuthority,
           imageReservations,
           operationGuard,
           stoppedWriterCoordinator:
@@ -6674,22 +6731,8 @@ test(
         );
         assert.equal(guardResult, "guard-reacquired");
 
-        const renewalInput = writerLeaseRenewalInput(current);
-        const renewed = await authority.renewWriterLease(renewalInput);
-        assertOperationReceipt(renewed, "committed");
-        assert.equal(renewed.renewed, true);
-        assert.equal(
-          renewed.session.document.lease.expiresAt >
-            started.attempt.request.lease.expiresAt,
-          true,
-        );
-        assert.deepEqual(
-          JSON.parse(JSON.stringify(renewed.session.document.launch)),
-          JSON.parse(JSON.stringify(started.launch)),
-        );
-
         const capture = checkpointCaptureAdmission(
-          { session: renewed.session },
+          { session: current },
           {
             processIncarnationId: started.evidence.processIncarnationId,
             writerIncarnationId: started.evidence.writerIncarnationId,
@@ -6700,25 +6743,18 @@ test(
           checkpoint: capture.checkpoint,
           request: capture.request,
         };
-        stopUncertaintyInput = {
-          expectedSession: renewed.session,
-          kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
-          operationId: derivePostgresLogicalWriterStopOperationId({
-            ...captureInput,
-            launchAttemptId,
-          }),
-          request: createWriterLaunchStopOperationRequest({
-            expectedSession: renewed.session,
-          }),
-        };
+        stopRenewalArmed = true;
         const stopped = await facade.stopWriterForCapture(captureInput);
+        assert.notEqual(renewedDuringStopReserve, null);
+        assert.equal(renewedDuringStopReserve.renewed, true);
+        assert.equal(stopReserveAttempts, 2);
         assert.equal(stopped.stop.status, "committed");
         assert.equal(stopped.stop.operation.revision, "3");
         assert.equal(stopped.evidence.status, "complete-stopped");
         assert.equal(stopCalls, 1);
         assert.deepEqual(
           stopped.stop.operation.expectedSession.document.lease,
-          renewed.session.document.lease,
+          renewedDuringStopReserve.session.document.lease,
         );
         assert.deepEqual(
           stopped.resolution.canonicalLeaseAtRegistration,

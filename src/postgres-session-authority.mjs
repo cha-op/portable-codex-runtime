@@ -9432,6 +9432,64 @@ export class PostgresSessionAuthority {
     });
   }
 
+  async reconcileWriterLaunchStopOperation(options) {
+    const input = writerLaunchStopInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      // Lock the session before proving absence so an earlier ambiguous
+      // reserve must finish committing or rolling back before this read.
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      if (observed.operation !== null) {
+        ensure(
+          observed.reservation !== null && observed.launchStop !== null,
+          "operation_state_invalid",
+        );
+        return operationReceipt({
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+        });
+      }
+      ensure(observed.active === null, "session_operation_conflict");
+      const operationIdClaim = await readOperationIdClaim(
+        transaction,
+        input.operationId,
+        false,
+      );
+      ensure(operationIdClaim === null, "operation_identity_conflict");
+
+      const expectedSessionMatched =
+        canonicalSnapshotBytes(session) ===
+        canonicalSnapshotBytes(input.expectedSession);
+      if (!expectedSessionMatched) {
+        ensure(
+          session.createdAt === input.expectedSession.createdAt &&
+            canonicalIdentityBytes(session.document) ===
+              canonicalIdentityBytes(input.expectedSession.document) &&
+            BigIntConstructor(session.revision) >
+              BigIntConstructor(input.expectedSession.revision),
+          "session_revision_conflict",
+        );
+      }
+      return operationReceipt({
+        expectedSessionMatched,
+        operation: null,
+        reservation: null,
+        session,
+        status: "absent",
+      });
+    });
+  }
+
   async claimOperationDispatch(options) {
     const input = operationInputWithExpectedRevision(options, "0");
     ensure(

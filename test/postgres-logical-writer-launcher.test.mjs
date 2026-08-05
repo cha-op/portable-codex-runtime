@@ -9,6 +9,7 @@ import {
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
+  WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
@@ -684,6 +685,29 @@ class MemoryLaunchAuthority {
     this.events.push("authority.reserve");
     if (input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND) {
       if (this.stopState === "absent") {
+        if (this.behaviour.stopSessionSupersededBeforeReserve !== undefined) {
+          const supersession =
+            this.behaviour.stopSessionSupersededBeforeReserve;
+          this.behaviour.stopSessionSupersededBeforeReserve = undefined;
+          const currentSession = this.receipt().session;
+          this.currentLeaseOverride = clone(supersession.lease);
+          this.sessionRevisionOverride = (
+            BigInt(currentSession.revision) + 1n
+          ).toString();
+          this.sessionUpdatedAtOverride = supersession.updatedAt;
+          this.lastOperationOverride = {
+            conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+            expectedSessionRevision: currentSession.revision,
+            kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+            operationId: "writer-lease-renewal-001",
+            operationRevision: "0",
+            requestSha256: "e".repeat(64),
+            reservationId: "reservation-writer-lease-renewal-001",
+            resultSha256: "f".repeat(64),
+            state: "committed",
+          };
+          throw new Error("stop session precondition superseded");
+        }
         const expectedSession = canonicalAuthoritySession(
           input.expectedSession,
         );
@@ -744,7 +768,7 @@ class MemoryLaunchAuthority {
     };
   }
 
-  async reconcileOperation(input) {
+  async reconcileWriterLaunchStopOperation(input) {
     this.calls.stopReconcile += 1;
     this.events.push("authority.reconcile-stop");
     if (this.behaviour.stopReconcileThrowsOnce) {
@@ -759,10 +783,20 @@ class MemoryLaunchAuthority {
       this.stopState = "starting";
     }
     if (this.stopState === "absent") {
+      const expectedSession = canonicalAuthoritySession(
+        input.expectedSession,
+      );
+      const session = canonicalAuthoritySession(
+        this.state === "committed"
+          ? this.receipt().session
+          : this.expectedSession,
+      );
       return {
+        expectedSessionMatched:
+          jsonStringify(session) === jsonStringify(expectedSession),
         operation: null,
         reservation: null,
-        session: canonicalAuthoritySession(input.expectedSession),
+        session,
         status: "absent",
       };
     }
@@ -1706,6 +1740,96 @@ test("a renewed lease preserves the registered writer identity for stop", async 
     stopped.resolution.canonicalLeaseAtRegistration.expiresAt,
     "2027-08-04T12:00:00.000Z",
   );
+});
+
+test("stop refreshes a lease renewal that supersedes its first reserve precondition", async () => {
+  const value = await fixture();
+  const started = await value.facade.runLaunch(runInput(value));
+  const reservesBeforeStop = value.authority.calls.reserve;
+  const renewedLease = lease({
+    expiresAt: "2027-08-04T12:05:00.000Z",
+  });
+  value.authority.behaviour.stopSessionSupersededBeforeReserve = {
+    lease: renewedLease,
+    updatedAt: "2026-08-04T12:00:04.500Z",
+  };
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(
+    stopped.stop.operation.expectedSession.revision,
+    (BigInt(started.session.revision) + 1n).toString(),
+  );
+  assert.deepEqual(
+    stopped.stop.operation.expectedSession.document.lease,
+    renewedLease,
+  );
+  assert.deepEqual(
+    stopped.resolution.canonicalLeaseAtRegistration,
+    started.attempt.request.lease,
+  );
+  assert.equal(value.authority.calls.reserve - reservesBeforeStop, 2);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 1);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.ok(
+    value.events.indexOf("authority.read-session") <
+      value.events.indexOf("authority.reconcile-stop"),
+  );
+  assert.ok(
+    value.events.indexOf("authority.reconcile-stop") <
+      value.events.indexOf("authority.claim-stop"),
+  );
+});
+
+test("refreshed stop reserve acknowledgement loss reconciles the renewed identity", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const reservesBeforeStop = value.authority.calls.reserve;
+  value.authority.behaviour.stopSessionSupersededBeforeReserve = {
+    lease: lease({ expiresAt: "2027-08-04T12:05:00.000Z" }),
+    updatedAt: "2026-08-04T12:00:04.500Z",
+  };
+  value.authority.behaviour.stopReserveThrowAfterCommit = true;
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.authority.calls.reserve - reservesBeforeStop, 2);
+  assert.equal(value.authority.calls.stopReconcile, 2);
+  assert.equal(value.authority.calls.stopClaim, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 1);
+  assert.equal(value.supervisorStopCalls, 1);
+});
+
+test("stop rejects a superseding revision that rolls back its retained lease expiry", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.currentLeaseOverride = lease({
+    expiresAt: "2027-08-04T12:05:00.000Z",
+  });
+  value.authority.behaviour.stopSessionSupersededBeforeReserve = {
+    lease: lease({ expiresAt: "2027-08-04T12:04:00.000Z" }),
+    updatedAt: "2026-08-04T12:00:04.500Z",
+  };
+  const reservesBeforeStop = value.authority.calls.reserve;
+
+  await assert.rejects(
+    value.facade.stopWriterForCapture(resolverInput(value)),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+
+  assert.equal(value.authority.calls.reserve - reservesBeforeStop, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.authority.calls.stopClaim, 0);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+  assert.equal(value.supervisorStopCalls, 0);
 });
 
 for (const [name, currentLease] of [

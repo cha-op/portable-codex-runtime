@@ -172,12 +172,16 @@
   writer as reclaimable. Within one canonical same-process stopped-writer
   coordinator, any retained writer blocks physical successor launch for that
   session across backend and storage slots until explicit retirement. Exact
-  stop retries reuse the original frozen operation input and reconcile durable
-  `prepared` or explicitly granted `starting` state without repeating claim or
-  physical stop. Claim acknowledgement loss and an explicit non-grant remain
-  closed because the durable operation does not identify its claimant. A lease
-  renewal may extend expiration while the stable registered writer-fence tuple
-  remains exact; expiry rollback or identity drift rejects before stop reserve.
+  stop retries preserve an exact frozen operation input until the locked
+  authority proves both the operation and its ID claim absent. A strictly newer
+  same-incarnation session may then replace that input only after the complete
+  stop relation and lease expiry remain monotonic from the retained
+  precondition. Durable `prepared` or explicitly granted `starting` state
+  reconciles without repeating claim or physical stop. Claim acknowledgement
+  loss and an explicit non-grant remain closed because the durable operation
+  does not identify its claimant. A lease renewal may extend expiration while
+  the stable registered writer-fence tuple remains exact; expiry rollback or
+  identity drift rejects before stop reserve.
   After one confirmed physical stop, exact reconciliation selects revision 2
   only for an authority-proven `uncertain` stop and otherwise retains revision 1
   for terminal replay; neither path repeats the physical callback.

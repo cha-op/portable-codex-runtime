@@ -1071,15 +1071,24 @@ calls. `stopWriterForCapture()` derives the stop operation from that complete
 tuple and launch attempt, owns the joined durable stop admission, and returns
 the exact frozen `{capability, evidence, resolution, stop}` receipt.
 `retireStoppedWriter(resolution)` releases the retained indexes only after the
-composition confirms exact capture completion. The launcher caches the first
-frozen stop operation input. A retry reads that exact operation through
-`reconcileOperation()`: `prepared` may repeat claim, while `starting` may enter
-the first physical stop only when the retained record proves this facade
-received and validated the exact `dispatchGranted: true` claim receipt and has
-not entered the coordinator. An invocation error or explicit non-grant never
-creates this witness: without a durable claimant token, local acknowledgement
-loss is indistinguishable from a foreign claimant winning before readback.
-`uncertain`, `committed`, foreign, and cold-start state remain closed.
+composition confirms exact capture completion. The launcher freezes each stop
+operation input before reserve. `reconcileWriterLaunchStopOperation()` locks
+the session before it proves absence, resolves an exact existing operation
+before considering session drift, and reports whether an absent operation's
+expected session still matches. Only when both the operation and operation-ID
+claim are absent may the same session incarnation with a strictly newer
+revision offer a replacement snapshot. The launcher then revalidates the
+complete current stop relation and requires lease expiration to remain
+monotonic from both registration and the retained stop precondition before
+freezing a replacement input. This closes the read/renew/reserve race without
+discarding an operation whose reserve acknowledgement may have been lost.
+`prepared` may repeat claim, while `starting` may enter the first physical stop
+only when the retained record proves this facade received and validated the
+exact `dispatchGranted: true` claim receipt and has not entered the coordinator. An
+invocation error or explicit non-grant never creates this witness: without a
+durable claimant token, local acknowledgement loss is indistinguishable from a
+foreign claimant winning before readback. `uncertain`, `committed`, foreign,
+and cold-start state remain closed.
 
 The stop preflight compares the current lease's stable contract, session,
 lease, holder, and fencing-epoch identity with the lease registered for the
