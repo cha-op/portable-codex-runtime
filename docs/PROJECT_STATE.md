@@ -178,36 +178,24 @@
   launches without reconstructing process-local authority.
 - Restore-generation request version 2 durably records the exact measured
   image, supervisor, and launch-attempt identity before publication begins.
-  Fresh version 2 reservation is disabled by default and requires an explicit
-  fleet-compatibility startup option; the gate applies only after exact replay
-  lookup, so existing operation replay, finalisation, and recovery remain
-  available. Definite restore dispatch permanently claims the launch ID. One
-  later serializable authority transition commits the generation, retires the
+  One serializable authority transition commits the generation, retires the
   restore operation, creates the exact prepared launch operation and
   reservation, and advances the canonical session twice. The launcher can
   prepare the process-local image capability before publication and later
   claim only that pre-reserved attempt, so a crash cannot leave a newly
   committed generation without discoverable launch work.
-- A production-neutral PostgreSQL restore composition facade now reads exact
-  durable operation state before applying its fresh-only fleet gate. It
-  prepares the isolated restore and launch intent outside the PostgreSQL
-  operation guard, then holds that guard across durable re-read, claim, one
-  backend publication callback, independent committed-publication
-  verification, and atomic handoff. Prepared launch runs only after the guard
-  is released and only on that durable attempt. The facade revalidates the
-  complete authority handoff relation, re-proves guard ownership before an
-  acknowledgement-loss retry, and accepts launch success only with a complete
-  committed operation/reservation/session/evidence relation. Restore callback contract v3
-  passes the authority's complete generation binding unchanged through the
-  stopped-directory backend and explicitly distinguishes fresh publication
-  from committed-only replay. A legacy v2 callback derives its historical
-  four-field version 1 binding internally and can only verify an already
-  committed publication.
+- The attempted standalone restore publication-to-launch facade was reverted
+  after review proved that it conflated an existing active
+  `attachment.rootPath` with the absent detached pathname required by atomic
+  restore publication. Production restore remains fail-closed. A later slice
+  must publish to an independent detached destination, obtain provider-backed
+  attachment evidence for the committed object, and atomically replace the
+  canonical session/launch attachment only after the old attachment is
+  stopped, fenced, and detached.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  even though the standalone composition path is testable. Later serial pull
-  requests must route coordinator stop through the durable transition, add
-  bounded no-relaunch recovery, join stop proof to capture, and wire the
-  complete protocol into `runRestore()`.
+  until later serial pull requests verify committed generation publication,
+  route coordinator stop through the durable transition, add bounded
+  no-relaunch recovery, and wire the complete protocol into `runRestore()`.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -264,8 +252,8 @@
   `docs/project_journal/2026/08/2026-08-04-logical-writer-launcher-foundation-b6d3e1.md`
 - Atomic restore-to-launch handoff:
   `docs/project_journal/2026/08/2026-08-04-restore-launch-handoff-5a7c2e.md`
-- Restore publication-to-launch composition:
-  `docs/project_journal/2026/08/2026-08-04-restore-publication-launch-composition-93b7d2.md`
+- Restore publication attachment-contract correction:
+  `docs/project_journal/2026/08/2026-08-05-restore-publication-attachment-contract-4c7a91.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -278,7 +266,8 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  authority. The standalone publication-to-launch composition is not enough:
-  bounded no-relaunch recovery, durable stop/capture composition, and
-  production-adapter wiring must still be integrated into `runRestore()` and
-  verified as one fail-closed protocol.
+  authority until the old attachment is durably stopped/fenced/detached, an
+  independently published destination receives provider-backed attachment
+  evidence, the authority atomically activates that attachment for the launch
+  request, and launcher/no-relaunch recovery is verified as one fail-closed
+  protocol.
