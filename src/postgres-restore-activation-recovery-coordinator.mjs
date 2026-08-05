@@ -6,9 +6,15 @@ import {
   RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+  SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  assertSessionAuthoritySnapshot,
+  assertSessionOperationBinding,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreDestinationGenerationOperationRequest,
+  createWriterLaunchAttemptOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
   assertCheckpointDescriptor,
@@ -16,12 +22,14 @@ import {
   assertRestoreAttachmentActivationRequest,
   assertRestoreAttachmentActivationResult,
   assertStorageMutationRequest,
+  assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arrayPrototype = Array.prototype;
+const arraySortIntrinsic = Array.prototype.sort;
 const BigIntConstructor = BigInt;
 const bigIntToStringIntrinsic = BigInt.prototype.toString;
 const createHashIntrinsic = createHash;
@@ -46,6 +54,8 @@ const numberIsFinite = Number.isFinite;
 const hashPrototype = objectGetPrototypeOf(createHash("sha256"));
 const hashDigestIntrinsic = hashPrototype.digest;
 const hashUpdateIntrinsic = hashPrototype.update;
+const JsonObject = JSON;
+const jsonStringifyIntrinsic = JSON.stringify;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
 const promiseSpeciesSymbol = Symbol.species;
@@ -54,13 +64,19 @@ const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const TypeErrorConstructor = TypeError;
+const authorityInvocationUncertain = objectFreeze(objectCreate(null));
+const promiseSettlementBrand = objectFreeze(objectCreate(null));
 
 const runExclusiveIntrinsic = PostgresOperationGuard.prototype.runExclusive;
 const verifyCommittedRestoreDestinationIntrinsic =
   StoppedDirectoryPublication.prototype.verifyCommittedRestoreDestination;
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const PERSISTENT_OBJECT_ID_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const UINT64_PATTERN = /^(0|[1-9][0-9]{0,19})$/u;
 const MAX_DATA_DEPTH = 32;
 const MAX_DATA_NODES = 16_384;
@@ -169,12 +185,86 @@ const GENERATION_DOCUMENT_KEYS = objectFreeze([
   "materialization",
   "result",
 ]);
+const GENERATION_BINDING_KEYS = objectFreeze([
+  "attachment",
+  "captureAttemptId",
+  "captureOperationId",
+  "catalogueSha256",
+  "checkpoint",
+  "contractVersion",
+  "destinationIsolationProofId",
+  "destinationState",
+  "generationId",
+  "request",
+  "reservationId",
+]);
+const GENERATION_TERMINAL_RESULT_KEYS = objectFreeze([
+  "catalogueSha256",
+  "checkpointId",
+  "generationDocumentSha256",
+  "generationId",
+  "outcome",
+  "resultVersion",
+]);
 const CATALOGUE_KEYS = objectFreeze([
   "captureAttemptId",
   "checkpointId",
   "committedAt",
   "document",
   "sessionId",
+]);
+const CATALOGUE_DOCUMENT_KEYS = objectFreeze([
+  "artifactProof",
+  "contractVersion",
+  "materialization",
+  "result",
+]);
+const CHECKPOINT_ARTIFACT_PROOF_KEYS = objectFreeze([
+  "artifactManifestDigest",
+  "captureOperationId",
+  "modeledDigest",
+]);
+const CHECKPOINT_MATERIALIZATION_KEYS = objectFreeze([
+  "artifactManifestDigest",
+  "contractVersion",
+  "modeledDigest",
+  "publicationId",
+  "publicationKind",
+  "stagedRoot",
+  "treeIdentityDigest",
+]);
+const RESTORE_MATERIALIZATION_KEYS = objectFreeze([
+  "artifactManifestDigest",
+  "contractVersion",
+  "coordinatorBindingSha256",
+  "modeledDigest",
+  "publicationId",
+  "publicationKind",
+  "stagedRoot",
+  "treeIdentityDigest",
+]);
+const STAGED_ROOT_KEYS = objectFreeze([
+  "filesystemId",
+  "objectIdentityScheme",
+  "objectId",
+]);
+const CHECKPOINT_CAPTURE_RESULT_KEYS = objectFreeze([
+  "checkpoint",
+  "mutation",
+]);
+const STORAGE_MUTATION_RESULT_KEYS = objectFreeze([
+  "backendId",
+  "contractVersion",
+  "fencingEpoch",
+  "holderId",
+  "leaseId",
+  "operation",
+  "operationId",
+  "proofId",
+  "sessionId",
+  "status",
+  "storageId",
+  "target",
 ]);
 const GENERATION_READ_RECEIPT_KEYS = objectFreeze([
   "catalogue",
@@ -246,6 +336,52 @@ const ACTIVATION_OPERATION_REQUEST_KEYS = objectFreeze([
   "leaseDurationMilliseconds",
   "predecessor",
 ]);
+const ACTIVE_OPERATION_POINTER_KEYS = objectFreeze([
+  "conflictClass",
+  "expectedSessionRevision",
+  "kind",
+  "operationId",
+  "operationRevision",
+  "requestSha256",
+  "reservationId",
+  "state",
+]);
+const WRITER_LAUNCH_RESULT_KEYS = objectFreeze([
+  "evidence",
+  "outcome",
+  "resultVersion",
+]);
+const CANCELLATION_RESULT_KEYS = objectFreeze([
+  "outcome",
+  "reason",
+  "resultVersion",
+]);
+const WRITER_LAUNCH_EVIDENCE_KEYS = objectFreeze([
+  "contractVersion",
+  "launchAttemptId",
+  "processIncarnationId",
+  "proofId",
+  "status",
+  "supervisorId",
+  "writerIncarnationId",
+]);
+const WRITER_LAUNCH_POINTER_KEYS = objectFreeze([
+  "attachmentId",
+  "attachmentSha256",
+  "contractVersion",
+  "fencingEpoch",
+  "generation",
+  "launchAttemptId",
+  "launchResultSha256",
+  "leaseId",
+  "leaseSha256",
+  "measuredImageSha256",
+  "processIncarnationId",
+  "startedAt",
+  "supervisorId",
+  "supervisorProofId",
+  "writerIncarnationId",
+]);
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_postgres_restore_activation_recovery_coordinator_options:
@@ -272,6 +408,153 @@ function sha256(value) {
   const hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
   callIntrinsic(hashUpdateIntrinsic, hash, [value, "utf8"]);
   return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+}
+
+function canonicalSerialize(value, code) {
+  const state = { nodes: 0 };
+
+  function visit(candidate, depth) {
+    state.nodes += 1;
+    ensure(depth <= MAX_DATA_DEPTH && state.nodes <= MAX_DATA_NODES, code);
+    if (
+      candidate === null ||
+      typeof candidate === "boolean" ||
+      typeof candidate === "string"
+    ) {
+      return candidate;
+    }
+    if (typeof candidate === "number") {
+      ensure(numberIsFinite(candidate), code);
+      return candidate;
+    }
+    ensure(
+      typeof candidate === "object" && !isProxyValue(candidate),
+      code,
+    );
+    const keys = reflectOwnKeys(candidate);
+    if (arrayIsArray(candidate)) {
+      ensure(
+        candidate.length <= MAX_DATA_ARRAY_ENTRIES &&
+          keys.length === candidate.length + 1 &&
+          keys[keys.length - 1] === "length",
+        code,
+      );
+      const result = [];
+      for (let index = 0; index < candidate.length; index += 1) {
+        ensure(keys[index] === `${index}`, code);
+        const descriptor = objectGetOwnPropertyDescriptor(
+          candidate,
+          keys[index],
+        );
+        ensure(
+          descriptor?.enumerable === true &&
+            objectHasOwn(descriptor, "value"),
+          code,
+        );
+        result[index] = visit(descriptor.value, depth + 1);
+      }
+      return result;
+    }
+    ensure(keys.length <= MAX_DATA_OBJECT_KEYS, code);
+    for (let index = 0; index < keys.length; index += 1) {
+      ensure(typeof keys[index] === "string", code);
+    }
+    const result = objectCreate(null);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      const descriptor = objectGetOwnPropertyDescriptor(candidate, key);
+      ensure(
+        descriptor?.enumerable === true &&
+          objectHasOwn(descriptor, "value"),
+        code,
+      );
+      result[key] = visit(descriptor.value, depth + 1);
+    }
+    return result;
+  }
+
+  let serialized;
+  try {
+    serialized = callIntrinsic(jsonStringifyIntrinsic, JsonObject, [
+      visit(value, 0),
+    ]);
+  } catch (error) {
+    if (
+      error instanceof PostgresRestoreActivationRecoveryCoordinatorError
+    ) {
+      throw error;
+    }
+    fail(code);
+  }
+  ensure(typeof serialized === "string", code);
+  return serialized;
+}
+
+function canonicalJsonData(value, code) {
+  const state = { nodes: 0 };
+
+  function visit(candidate, depth) {
+    state.nodes += 1;
+    ensure(depth <= MAX_DATA_DEPTH && state.nodes <= MAX_DATA_NODES, code);
+    if (candidate === null || typeof candidate === "boolean") {
+      return candidate;
+    }
+    if (typeof candidate === "string") {
+      ensure(candidate.length <= MAX_DATA_STRING_LENGTH, code);
+      return candidate;
+    }
+    if (typeof candidate === "number") {
+      ensure(numberIsFinite(candidate), code);
+      return candidate;
+    }
+    ensure(
+      typeof candidate === "object" && !isProxyValue(candidate),
+      code,
+    );
+    const keys = reflectOwnKeys(candidate);
+    if (arrayIsArray(candidate)) {
+      ensure(
+        candidate.length <= MAX_DATA_ARRAY_ENTRIES &&
+          keys.length === candidate.length + 1 &&
+          keys[keys.length - 1] === "length",
+        code,
+      );
+      const result = [];
+      for (let index = 0; index < candidate.length; index += 1) {
+        ensure(keys[index] === `${index}`, code);
+        const descriptor = objectGetOwnPropertyDescriptor(
+          candidate,
+          keys[index],
+        );
+        ensure(
+          descriptor?.enumerable === true &&
+            objectHasOwn(descriptor, "value"),
+          code,
+        );
+        result[index] = visit(descriptor.value, depth + 1);
+      }
+      return result;
+    }
+    ensure(keys.length <= MAX_DATA_OBJECT_KEYS, code);
+    for (let index = 0; index < keys.length; index += 1) {
+      ensure(typeof keys[index] === "string", code);
+    }
+    callIntrinsic(arraySortIntrinsic, keys, []);
+    const result = objectCreate(null);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      const descriptor = objectGetOwnPropertyDescriptor(candidate, key);
+      ensure(
+        descriptor?.enumerable === true &&
+          objectHasOwn(descriptor, "value"),
+        code,
+      );
+      result[key] = visit(descriptor.value, depth + 1);
+    }
+    return result;
+  }
+
+  return visit(value, 0);
 }
 
 function fail(code) {
@@ -463,6 +746,11 @@ function opaqueId(value, code) {
   return value;
 }
 
+function canonicalUuid(value, code) {
+  ensure(typeof value === "string" && regexpTest(UUID_PATTERN, value), code);
+  return value;
+}
+
 function trustedFunction(value, code) {
   ensure(
     typeof value === "function" &&
@@ -510,6 +798,60 @@ function isSafePromiseSpeciesHolder(value) {
   );
 }
 
+function promiseSettlementCarrier(status, value) {
+  return exactFrozenRecord({
+    brand: promiseSettlementBrand,
+    status,
+    value,
+  });
+}
+
+function promiseFulfillmentCarrier(value) {
+  return promiseSettlementCarrier("fulfilled", value);
+}
+
+function promiseRejectionCarrier() {
+  return promiseSettlementCarrier("rejected", null);
+}
+
+objectFreeze(promiseFulfillmentCarrier);
+objectFreeze(promiseRejectionCarrier);
+
+function unwrapPromiseSettlementCarrier(value, code) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !isProxyValue(value) &&
+      objectGetPrototypeOf(value) === null &&
+      objectIsFrozen(value),
+    code,
+  );
+  const keys = reflectOwnKeys(value);
+  ensure(
+    keys.length === 3 &&
+      keys[0] === "brand" &&
+      keys[1] === "status" &&
+      keys[2] === "value",
+    code,
+  );
+  const brand = objectGetOwnPropertyDescriptor(value, "brand");
+  const status = objectGetOwnPropertyDescriptor(value, "status");
+  const payload = objectGetOwnPropertyDescriptor(value, "value");
+  ensure(
+    brand?.value === promiseSettlementBrand &&
+      status?.enumerable === true &&
+      objectHasOwn(status, "value") &&
+      (status.value === "fulfilled" || status.value === "rejected") &&
+      payload?.enumerable === true &&
+      objectHasOwn(payload, "value"),
+    code,
+  );
+  return exactFrozenRecord({
+    status: status.value,
+    value: payload.value,
+  });
+}
+
 function normalizeSafeNativePromise(value) {
   if (
     !isPromiseValue(value) ||
@@ -539,12 +881,14 @@ function normalizeSafeNativePromise(value) {
   ) {
     return null;
   }
-  if (descriptor.value === PromiseConstructor) return value;
+  if (descriptor.value === PromiseConstructor) {
+    return exactFrozenRecord({ promise: value, wrapped: false });
+  }
   if (!isSafePromiseSpeciesHolder(descriptor.value)) return null;
   try {
     const normalized = callIntrinsic(promiseThenIntrinsic, value, [
-      undefined,
-      undefined,
+      promiseFulfillmentCarrier,
+      promiseRejectionCarrier,
     ]);
     objectDefineProperty(normalized, "constructor", {
       configurable: false,
@@ -552,29 +896,86 @@ function normalizeSafeNativePromise(value) {
       value: PromiseConstructor,
       writable: false,
     });
-    return normalized;
+    return exactFrozenRecord({ promise: normalized, wrapped: true });
   } catch {
     return null;
   }
 }
 
-async function settleTrusted(value, code) {
-  if (isGeneratorObjectValue(value)) fail(code);
-  if (!isPromiseValue(value)) return value;
-  const normalized = normalizeSafeNativePromise(value);
-  ensure(normalized !== null, code);
-  try {
-    const settled = await normalized;
-    if (isGeneratorObjectValue(settled)) fail(code);
-    return settled;
-  } catch (error) {
-    if (
-      error instanceof PostgresRestoreActivationRecoveryCoordinatorError
-    ) {
-      throw error;
-    }
-    fail(code);
+function hasThenProperty(value, code) {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return false;
   }
+  let candidate = value;
+  let depth = 0;
+  while (candidate !== null) {
+    ensure(depth <= MAX_DATA_DEPTH && !isProxyValue(candidate), code);
+    let descriptor;
+    try {
+      descriptor = objectGetOwnPropertyDescriptor(candidate, "then");
+      candidate = objectGetPrototypeOf(candidate);
+    } catch {
+      fail(code);
+    }
+    if (descriptor !== undefined) return true;
+    depth += 1;
+  }
+  return false;
+}
+
+function createTrustedSettlement(value, code) {
+  ensure(!isProxyValue(value) && !isGeneratorObjectValue(value), code);
+  if (isPromiseValue(value)) {
+    const normalized = normalizeSafeNativePromise(value);
+    ensure(normalized !== null, code);
+    return exactFrozenRecord({ kind: "promise", value: normalized });
+  }
+  return createTrustedValueSettlement(value, code);
+}
+
+function createTrustedValueSettlement(value, code) {
+  ensure(
+    !isProxyValue(value) &&
+      !isGeneratorObjectValue(value) &&
+      !isPromiseValue(value),
+    code,
+  );
+  ensure(!hasThenProperty(value, code), code);
+  return exactFrozenRecord({ kind: "value", value });
+}
+
+function rejectTrustedSettlement(code, rejectionMarker) {
+  if (rejectionMarker !== null) throw rejectionMarker;
+  fail(code);
+}
+
+async function awaitTrustedSettlement(
+  settlement,
+  code,
+  rejectionMarker = null,
+) {
+  if (settlement.kind === "value") return settlement;
+  let settled;
+  try {
+    settled = await settlement.value.promise;
+  } catch {
+    rejectTrustedSettlement(code, rejectionMarker);
+  }
+  if (settlement.value.wrapped) {
+    const carrier = unwrapPromiseSettlementCarrier(settled, code);
+    if (carrier.status === "rejected") {
+      rejectTrustedSettlement(code, rejectionMarker);
+    }
+    settled = carrier.value;
+  }
+  return createTrustedValueSettlement(settled, code);
+}
+
+function settleTrusted(value, code) {
+  return createTrustedSettlement(value, code);
 }
 
 function sameJson(left, right, code) {
@@ -611,6 +1012,14 @@ function sameJson(left, right, code) {
   return compare(left, right, 0);
 }
 
+function sameCanonicalJson(left, right, code) {
+  return sameJson(
+    canonicalJsonData(left, code),
+    canonicalJsonData(right, code),
+    code,
+  );
+}
+
 function normalizeSnapshot(value, expectedSessionId, code) {
   const snapshot = exactDataObject(value, SNAPSHOT_KEYS, code);
   exactDataObject(snapshot.document, DOCUMENT_KEYS, code);
@@ -626,6 +1035,551 @@ function normalizeSnapshot(value, expectedSessionId, code) {
   return snapshot;
 }
 
+function normalizeCanonicalSnapshot(value, expectedSessionId, code) {
+  const snapshot = normalizeSnapshot(value, expectedSessionId, code);
+  let canonical;
+  try {
+    canonical = assertSessionAuthoritySnapshot(value);
+  } catch {
+    fail(code);
+  }
+  ensure(sameJson(snapshot, canonical, code), code);
+  return snapshot;
+}
+
+function authorityDocumentWithState(
+  value,
+  {
+    activeOperation = value.activeOperation,
+    attachment = value.attachment,
+    lastOperation = value.lastOperation,
+    launch = value.launch,
+    lease = value.lease,
+    lifecycle = value.lifecycle,
+    writerEpoch = value.writerEpoch,
+  },
+  code,
+) {
+  const document = exactDataObject(value, DOCUMENT_KEYS, code);
+  return {
+    documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
+    manifest: document.manifest,
+    storageRef: document.storageRef,
+    backendCapabilities: document.backendCapabilities,
+    lifecycle,
+    writerEpoch,
+    lease,
+    attachment,
+    activeOperation,
+    lastOperation,
+    recovery: document.recovery,
+    launch,
+  };
+}
+
+function authoritySnapshotWithState(
+  value,
+  { document = value.document, revision = value.revision, updatedAt },
+  code,
+) {
+  const snapshot = normalizeSnapshot(value, value.sessionId, code);
+  const candidate = {
+    sessionId: snapshot.sessionId,
+    revision,
+    document,
+    createdAt: snapshot.createdAt,
+    updatedAt,
+  };
+  try {
+    return assertSessionAuthoritySnapshot(candidate);
+  } catch {
+    fail(code);
+  }
+}
+
+function revisionAfter(value, increments, code) {
+  canonicalRevision(value, code);
+  let revision;
+  try {
+    revision = callIntrinsic(
+      bigIntToStringIntrinsic,
+      BigIntConstructor(value) + BigIntConstructor(increments),
+      [],
+    );
+  } catch {
+    fail(code);
+  }
+  canonicalRevision(revision, code);
+  return revision;
+}
+
+function activeOperationPointer(operation, reservation) {
+  return {
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision: operation.expectedSession.revision,
+    kind: operation.kind,
+    operationId: operation.operationId,
+    operationRevision: operation.revision,
+    requestSha256: operation.requestSha256,
+    reservationId: reservation.reservationId,
+    state: operation.state,
+  };
+}
+
+function lastOperationPointer(operation, reservation, code) {
+  return {
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    expectedSessionRevision: operation.expectedSession.revision,
+    kind: operation.kind,
+    operationId: operation.operationId,
+    operationRevision: operation.revision,
+    requestSha256: operation.requestSha256,
+    reservationId: reservation.reservationId,
+    resultSha256: sha256(canonicalSerialize(operation.result, code)),
+    state: operation.state,
+  };
+}
+
+function validateActiveOperationSession(
+  session,
+  operation,
+  reservation,
+  expectedDocument,
+  code,
+) {
+  const activeOperation = exactDataObject(
+    session.document.activeOperation,
+    ACTIVE_OPERATION_POINTER_KEYS,
+    code,
+  );
+  ensure(
+    operation.state !== "committed" &&
+      reservation.state === operation.state &&
+      reservation.createdAt === operation.createdAt &&
+      reservation.updatedAt === operation.updatedAt &&
+      session.sessionId === operation.sessionId &&
+      session.createdAt === operation.expectedSession.createdAt &&
+      session.updatedAt === operation.updatedAt &&
+      session.revision ===
+        revisionAfter(
+          operation.expectedSession.revision,
+          BigIntConstructor(operation.revision) + 1n,
+          code,
+        ) &&
+      sameJson(
+        activeOperation,
+        activeOperationPointer(operation, reservation),
+        code,
+      ) &&
+      sameJson(session.document, expectedDocument, code),
+    code,
+  );
+}
+
+function validateLaunchOperationTiming(operation, reservation, code) {
+  const createdAt = timestampMilliseconds(operation.createdAt, code);
+  const updatedAt = timestampMilliseconds(operation.updatedAt, code);
+  ensure(
+    (operation.state === "prepared"
+      ? updatedAt === createdAt
+      : updatedAt >= createdAt) &&
+      reservation.createdAt === operation.createdAt &&
+      reservation.updatedAt === operation.updatedAt,
+    code,
+  );
+}
+
+function validateActivationOperationBindingAndTiming(
+  operation,
+  reservation,
+  code,
+) {
+  ensure(
+    timestampMilliseconds(operation.updatedAt, code) >=
+        timestampMilliseconds(operation.createdAt, code) &&
+      reservation.createdAt === operation.createdAt &&
+      reservation.updatedAt === operation.updatedAt,
+    code,
+  );
+}
+
+function normalizeWriterLaunchCancellationResult(value, code) {
+  const result = exactDataObject(value, CANCELLATION_RESULT_KEYS, code);
+  const canonicalResult = {
+    resultVersion: 1,
+    outcome: "cancelled-before-dispatch",
+    reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  };
+  ensure(
+    result.resultVersion === canonicalResult.resultVersion &&
+      result.outcome === canonicalResult.outcome &&
+      result.reason === canonicalResult.reason &&
+      sameJson(result, canonicalResult, code),
+    code,
+  );
+  return canonicalResult;
+}
+
+function normalizeWriterLaunchTerminalResult(
+  value,
+  launchOperation,
+  code,
+) {
+  const result = exactDataObject(value, WRITER_LAUNCH_RESULT_KEYS, code);
+  const evidence = exactDataObject(
+    result.evidence,
+    WRITER_LAUNCH_EVIDENCE_KEYS,
+    code,
+  );
+  const status = evidence.status;
+  const outcome =
+    status === "started"
+      ? "writer-launch-started"
+      : status === "not-started"
+        ? "writer-launch-not-started"
+        : status === "complete-stopped"
+          ? "writer-launch-complete-stopped"
+          : null;
+  const processIncarnationId = evidence.processIncarnationId;
+  const writerIncarnationId = evidence.writerIncarnationId;
+  ensure(
+    result.resultVersion === 1 &&
+      result.outcome === outcome &&
+      evidence.contractVersion === 1 &&
+      evidence.launchAttemptId === launchOperation.operationId &&
+      evidence.supervisorId ===
+        launchOperation.request.supervisor.supervisorId &&
+      ((status === "not-started" &&
+        processIncarnationId === null &&
+        writerIncarnationId === null) ||
+        ((status === "started" || status === "complete-stopped") &&
+          processIncarnationId !== null &&
+          writerIncarnationId !== null)),
+    code,
+  );
+  opaqueId(evidence.proofId, code);
+  if (processIncarnationId !== null) opaqueId(processIncarnationId, code);
+  if (writerIncarnationId !== null) opaqueId(writerIncarnationId, code);
+  const canonicalEvidence = {
+    contractVersion: 1,
+    launchAttemptId: launchOperation.operationId,
+    processIncarnationId,
+    proofId: evidence.proofId,
+    status,
+    supervisorId: launchOperation.request.supervisor.supervisorId,
+    writerIncarnationId,
+  };
+  const canonicalResult = {
+    evidence: canonicalEvidence,
+    outcome,
+    resultVersion: 1,
+  };
+  ensure(
+    sameJson(evidence, canonicalEvidence, code) &&
+      sameJson(result, canonicalResult, code),
+    code,
+  );
+  return canonicalResult;
+}
+
+function writerLaunchPointer(launchOperation, result, code) {
+  const request = launchOperation.request;
+  const evidence = result.evidence;
+  ensure(result.outcome === "writer-launch-started", code);
+  return {
+    attachmentId: request.attachment.attachmentId,
+    attachmentSha256: sha256(
+      canonicalSerialize(request.attachment, code),
+    ),
+    contractVersion: 1,
+    fencingEpoch: request.fencingEpoch,
+    generation: request.generation,
+    launchAttemptId: launchOperation.operationId,
+    launchResultSha256: sha256(canonicalSerialize(result, code)),
+    leaseId: request.lease.leaseId,
+    leaseSha256: sha256(canonicalSerialize(request.lease, code)),
+    measuredImageSha256: sha256(
+      canonicalSerialize(request.measuredImage, code),
+    ),
+    processIncarnationId: evidence.processIncarnationId,
+    startedAt: launchOperation.updatedAt,
+    supervisorId: request.supervisor.supervisorId,
+    supervisorProofId: evidence.proofId,
+    writerIncarnationId: evidence.writerIncarnationId,
+  };
+}
+
+function validateCommittedLaunchSession(
+  session,
+  launchOperation,
+  reservation,
+  code,
+) {
+  const cancelledBeforeDispatch =
+    launchOperation.result?.outcome === "cancelled-before-dispatch";
+  const result = cancelledBeforeDispatch
+    ? normalizeWriterLaunchCancellationResult(
+        launchOperation.result,
+        code,
+      )
+    : normalizeWriterLaunchTerminalResult(
+        launchOperation.result,
+        launchOperation,
+        code,
+      );
+  if (cancelledBeforeDispatch) {
+    ensure(
+      launchOperation.revision === "1" &&
+        timestampMilliseconds(launchOperation.updatedAt, code) >=
+          timestampMilliseconds(
+            launchOperation.request.lease.expiresAt,
+            code,
+          ),
+      code,
+    );
+  } else {
+    ensure(
+      launchOperation.revision === "2" ||
+        launchOperation.revision === "3",
+      code,
+    );
+  }
+  const expectedLaunch =
+    result.outcome === "writer-launch-started"
+      ? writerLaunchPointer(launchOperation, result, code)
+      : launchOperation.expectedSession.document.launch;
+  if (expectedLaunch !== null) {
+    exactDataObject(expectedLaunch, WRITER_LAUNCH_POINTER_KEYS, code);
+  }
+  const expectedDocument = authorityDocumentWithState(
+    launchOperation.expectedSession.document,
+    {
+      activeOperation: null,
+      lastOperation: lastOperationPointer(
+        launchOperation,
+        reservation,
+        code,
+      ),
+      launch: expectedLaunch,
+    },
+    code,
+  );
+  const terminalRevision = revisionAfter(
+    launchOperation.expectedSession.revision,
+    BigIntConstructor(launchOperation.revision) + 1n,
+    code,
+  );
+  const atTerminalRevision =
+    BigIntConstructor(session.revision) ===
+    BigIntConstructor(terminalRevision);
+  ensure(
+    reservation.state === "released" &&
+      reservation.releasedAt === launchOperation.updatedAt &&
+      launchOperation.retiredAt === launchOperation.updatedAt &&
+      session.sessionId === launchOperation.sessionId &&
+      session.createdAt === launchOperation.expectedSession.createdAt &&
+      BigIntConstructor(session.revision) >=
+        BigIntConstructor(terminalRevision) &&
+      sameJson(
+        session.document.manifest,
+        launchOperation.expectedSession.document.manifest,
+        code,
+      ) &&
+      sameJson(
+        session.document.storageRef,
+        launchOperation.expectedSession.document.storageRef,
+        code,
+      ) &&
+      sameJson(
+        session.document.backendCapabilities,
+        launchOperation.expectedSession.document.backendCapabilities,
+        code,
+      ) &&
+      (!atTerminalRevision ||
+        (session.updatedAt === launchOperation.updatedAt &&
+          sameJson(session.document, expectedDocument, code))),
+    code,
+  );
+}
+
+function validateActivationReadSession(
+  session,
+  activationRequest,
+  operation,
+  reservation,
+  code,
+) {
+  if (operation.state === "committed") return;
+  const expectedDocument = authorityDocumentWithState(
+    operation.expectedSession.document,
+    {
+      activeOperation: activeOperationPointer(operation, reservation),
+      attachment: null,
+      launch: null,
+      lease: activationRequest.lease,
+      lifecycle: "ATTACHING",
+      writerEpoch: activationRequest.lease.fencingEpoch,
+    },
+    code,
+  );
+  const expectedSession = authoritySnapshotWithState(
+    operation.expectedSession,
+    {
+      document: expectedDocument,
+      revision: revisionAfter(
+        operation.expectedSession.revision,
+        BigIntConstructor(operation.revision) + 1n,
+        code,
+      ),
+      updatedAt: operation.updatedAt,
+    },
+    code,
+  );
+  validateActiveOperationSession(
+    session,
+    operation,
+    reservation,
+    expectedSession.document,
+    code,
+  );
+}
+
+function validateCommittedActivationSession(
+  session,
+  activationRequest,
+  activationResult,
+  operation,
+  reservation,
+  code,
+) {
+  const terminalSession = activationTerminalSession(
+    operation,
+    reservation,
+    activationRequest,
+    activationResult,
+    code,
+  );
+  const atTerminalRevision =
+    BigIntConstructor(session.revision) ===
+    BigIntConstructor(terminalSession.revision);
+  ensure(
+    session.sessionId === operation.sessionId &&
+      session.createdAt === operation.expectedSession.createdAt &&
+      BigIntConstructor(session.revision) >=
+        BigIntConstructor(terminalSession.revision) &&
+      sameJson(
+        session.document.manifest,
+        operation.expectedSession.document.manifest,
+        code,
+      ) &&
+      sameJson(
+        session.document.storageRef,
+        operation.expectedSession.document.storageRef,
+        code,
+      ) &&
+      sameJson(
+        session.document.backendCapabilities,
+        operation.expectedSession.document.backendCapabilities,
+        code,
+      ) &&
+      (!atTerminalRevision ||
+        (session.updatedAt === operation.updatedAt &&
+          sameJson(session.document, terminalSession.document, code))),
+    code,
+  );
+}
+
+function activationTerminalSession(
+  operation,
+  reservation,
+  activationRequest,
+  activationResult,
+  code,
+) {
+  const expectedDocument = authorityDocumentWithState(
+    operation.expectedSession.document,
+    {
+      activeOperation: null,
+      attachment: activationResult.attachment,
+      lastOperation: lastOperationPointer(operation, reservation, code),
+      launch: null,
+      lease: activationRequest.lease,
+      lifecycle: "ATTACHED",
+      writerEpoch: activationRequest.lease.fencingEpoch,
+    },
+    code,
+  );
+  return authoritySnapshotWithState(
+    operation.expectedSession,
+    {
+      document: expectedDocument,
+      revision: revisionAfter(
+        operation.expectedSession.revision,
+        BigIntConstructor(operation.revision) + 1n,
+        code,
+      ),
+      updatedAt: operation.updatedAt,
+    },
+    code,
+  );
+}
+
+function validateActivationCommitTransition(
+  read,
+  operation,
+  reservation,
+  activationRequest,
+  activationResult,
+  code,
+) {
+  const previousOperation = read.operation;
+  const previousReservation = read.reservation;
+  if (previousOperation.state === "committed") {
+    ensure(
+      sameJson(operation, previousOperation, code) &&
+        sameJson(reservation, previousReservation, code),
+      code,
+    );
+    return activationTerminalSession(
+      operation,
+      reservation,
+      activationRequest,
+      activationResult,
+      code,
+    );
+  }
+  ensure(
+    previousOperation.state !== "committed" &&
+      operation.state === "committed" &&
+      operation.conflictClass === previousOperation.conflictClass &&
+      operation.operationId === previousOperation.operationId &&
+      operation.sessionId === previousOperation.sessionId &&
+      operation.kind === previousOperation.kind &&
+      operation.requestSha256 === previousOperation.requestSha256 &&
+      operation.createdAt === previousOperation.createdAt &&
+      operation.revision ===
+        revisionAfter(previousOperation.revision, 1, code) &&
+      sameJson(
+        operation.expectedSession,
+        previousOperation.expectedSession,
+        code,
+      ) &&
+      sameJson(operation.request, previousOperation.request, code) &&
+      reservation.reservationId === previousReservation.reservationId &&
+      reservation.createdAt === previousReservation.createdAt &&
+      reservation.updatedAt === operation.updatedAt &&
+      reservation.releasedAt === operation.updatedAt,
+    code,
+  );
+  return activationTerminalSession(
+    operation,
+    reservation,
+    activationRequest,
+    activationResult,
+    code,
+  );
+}
+
 function normalizeOperation(value, expected, code) {
   const operation = exactDataObject(value, OPERATION_KEYS, code);
   const expectedSession = normalizeSnapshot(
@@ -633,13 +1587,26 @@ function normalizeOperation(value, expected, code) {
     operation.sessionId,
     code,
   );
+  let binding;
+  try {
+    binding = assertSessionOperationBinding({
+      expectedSession: operation.expectedSession,
+      kind: operation.kind,
+      operationId: operation.operationId,
+      request: operation.request,
+    });
+  } catch {
+    fail(code);
+  }
   ensure(
     operation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
       operation.operationId === expected.operationId &&
       operation.kind === expected.kind &&
       operation.sessionId === expectedSession.sessionId &&
       arrayIncludes(expected.states, operation.state) &&
-      sameJson(operation.request, expected.request, code),
+      sameJson(operation.expectedSession, binding.expectedSession, code) &&
+      sameJson(operation.request, expected.request, code) &&
+      operation.requestSha256 === binding.requestSha256,
     code,
   );
   canonicalSha256(operation.requestSha256, code);
@@ -679,10 +1646,10 @@ function normalizeOperation(value, expected, code) {
       code,
     );
   }
-  return operation;
+  return exactFrozenRecord({ binding, operation });
 }
 
-function normalizeReservation(value, operation, code) {
+function normalizeReservation(value, operation, binding, code) {
   const reservation = exactDataObject(value, RESERVATION_KEYS, code);
   ensure(
     reservation.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
@@ -692,6 +1659,7 @@ function normalizeReservation(value, operation, code) {
       reservation.expectedSessionRevision ===
         operation.expectedSession.revision &&
       reservation.requestSha256 === operation.requestSha256 &&
+      reservation.reservationId === binding.reservationId &&
       reservation.expiresAt === null,
     code,
   );
@@ -715,6 +1683,329 @@ function normalizeReservation(value, operation, code) {
   return reservation;
 }
 
+function operationJournalBindingSha256(value, code) {
+  return sha256(
+    `portable-codex-operation-journal-binding-v1\0${canonicalSerialize(
+      canonicalJsonData(value, code),
+      code,
+    )}\n`,
+  );
+}
+
+function normalizeCheckpointArtifactProof(value, code) {
+  const proof = exactDataObject(
+    value,
+    CHECKPOINT_ARTIFACT_PROOF_KEYS,
+    code,
+  );
+  canonicalSha256(proof.artifactManifestDigest, code);
+  opaqueId(proof.captureOperationId, code);
+  canonicalSha256(proof.modeledDigest, code);
+  const canonical = {
+    artifactManifestDigest: proof.artifactManifestDigest,
+    captureOperationId: proof.captureOperationId,
+    modeledDigest: proof.modeledDigest,
+  };
+  ensure(sameJson(proof, canonical, code), code);
+  return canonical;
+}
+
+function normalizePublicationMaterialization(
+  value,
+  artifactProof,
+  publicationKind,
+  coordinatorBinding,
+  code,
+  requireCanonicalOrder = true,
+) {
+  const restoreDestination = publicationKind === "restore-destination";
+  const materialization = exactDataObject(
+    value,
+    restoreDestination
+      ? RESTORE_MATERIALIZATION_KEYS
+      : CHECKPOINT_MATERIALIZATION_KEYS,
+    code,
+  );
+  const stagedRoot = exactDataObject(
+    materialization.stagedRoot,
+    STAGED_ROOT_KEYS,
+    code,
+  );
+  canonicalSha256(materialization.artifactManifestDigest, code);
+  canonicalSha256(materialization.modeledDigest, code);
+  canonicalSha256(materialization.treeIdentityDigest, code);
+  opaqueId(materialization.publicationId, code);
+  opaqueId(stagedRoot.filesystemId, code);
+  opaqueId(stagedRoot.objectIdentityScheme, code);
+  ensure(
+    regexpTest(PERSISTENT_OBJECT_ID_PATTERN, stagedRoot.objectId) &&
+      materialization.artifactManifestDigest ===
+        artifactProof.artifactManifestDigest &&
+      materialization.modeledDigest === artifactProof.modeledDigest &&
+      materialization.publicationKind === publicationKind &&
+      materialization.contractVersion ===
+        (restoreDestination ? 3 : 2),
+    code,
+  );
+  if (restoreDestination) {
+    canonicalSha256(materialization.coordinatorBindingSha256, code);
+    ensure(
+      materialization.coordinatorBindingSha256 ===
+        operationJournalBindingSha256(coordinatorBinding, code),
+      code,
+    );
+  }
+  const canonicalStagedRoot = {
+    filesystemId: stagedRoot.filesystemId,
+    objectIdentityScheme: stagedRoot.objectIdentityScheme,
+    objectId: stagedRoot.objectId,
+  };
+  const canonical = {
+    artifactManifestDigest: materialization.artifactManifestDigest,
+    ...(restoreDestination
+      ? {
+          coordinatorBindingSha256:
+            materialization.coordinatorBindingSha256,
+        }
+      : {}),
+    contractVersion: materialization.contractVersion,
+    modeledDigest: materialization.modeledDigest,
+    publicationId: materialization.publicationId,
+    publicationKind,
+    stagedRoot: canonicalStagedRoot,
+    treeIdentityDigest: materialization.treeIdentityDigest,
+  };
+  if (requireCanonicalOrder) {
+    ensure(sameJson(materialization, canonical, code), code);
+  }
+  return canonical;
+}
+
+function normalizeCatalogueDocument(value, candidate, code) {
+  const document = exactDataObject(
+    value,
+    CATALOGUE_DOCUMENT_KEYS,
+    code,
+  );
+  const artifactProof = normalizeCheckpointArtifactProof(
+    document.artifactProof,
+    code,
+  );
+  const materialization = normalizePublicationMaterialization(
+    document.materialization,
+    artifactProof,
+    "checkpoint-artifact",
+    null,
+    code,
+  );
+  const result = exactDataObject(
+    document.result,
+    CHECKPOINT_CAPTURE_RESULT_KEYS,
+    code,
+  );
+  let resultCheckpoint;
+  try {
+    resultCheckpoint = assertCheckpointDescriptor(result.checkpoint);
+  } catch {
+    fail(code);
+  }
+  ensure(sameJson(resultCheckpoint, candidate.checkpoint, code), code);
+  const rawMutation = exactDataObject(
+    result.mutation,
+    STORAGE_MUTATION_RESULT_KEYS,
+    code,
+  );
+  const captureRequestValue = {
+    backendId: rawMutation.backendId,
+    contractVersion: rawMutation.contractVersion,
+    fencingEpoch: rawMutation.fencingEpoch,
+    holderId: rawMutation.holderId,
+    leaseId: rawMutation.leaseId,
+    operation: rawMutation.operation,
+    operationId: rawMutation.operationId,
+    sessionId: rawMutation.sessionId,
+    storageId: rawMutation.storageId,
+    target: rawMutation.target,
+  };
+  let captureRequest;
+  let captureResult;
+  try {
+    captureRequest = assertStorageMutationRequest(captureRequestValue);
+    captureResult = assertStorageMutationResult(rawMutation, {
+      request: captureRequest,
+    });
+  } catch {
+    fail(code);
+  }
+  const checkpoint = candidate.checkpoint;
+  ensure(
+    captureRequest.operation === "checkpoint" &&
+      captureRequest.operationId === artifactProof.captureOperationId &&
+      captureRequest.sessionId === checkpoint.sessionId &&
+      captureRequest.backendId === checkpoint.backendId &&
+      captureRequest.storageId === checkpoint.storageId &&
+      captureRequest.fencingEpoch === checkpoint.sourceFencingEpoch &&
+      captureRequest.target.artifactId === checkpoint.artifactId &&
+      captureRequest.target.checkpointId === checkpoint.checkpointId &&
+      captureResult.proofId ===
+        `proof-checkpoint-${sha256(
+          `checkpoint-capture-proof:${captureRequest.operationId}`,
+        )}`,
+    code,
+  );
+  const canonicalMutation = {
+    backendId: captureResult.backendId,
+    contractVersion: captureResult.contractVersion,
+    fencingEpoch: captureResult.fencingEpoch,
+    holderId: captureResult.holderId,
+    leaseId: captureResult.leaseId,
+    operation: captureResult.operation,
+    operationId: captureResult.operationId,
+    proofId: captureResult.proofId,
+    sessionId: captureResult.sessionId,
+    status: captureResult.status,
+    storageId: captureResult.storageId,
+    target: captureResult.target,
+  };
+  const canonicalResult = {
+    checkpoint: candidate.checkpoint,
+    mutation: canonicalMutation,
+  };
+  const canonical = {
+    artifactProof,
+    contractVersion: 1,
+    materialization,
+    result: canonicalResult,
+  };
+  ensure(
+    document.contractVersion === 1 &&
+      sameJson(result, canonicalResult, code) &&
+      sameJson(document, canonical, code),
+    code,
+  );
+  return canonical;
+}
+
+function normalizeCatalogue(value, candidate, code) {
+  const catalogue = exactDataObject(value, CATALOGUE_KEYS, code);
+  const document = normalizeCatalogueDocument(
+    catalogue.document,
+    candidate,
+    code,
+  );
+  canonicalUuid(catalogue.captureAttemptId, code);
+  canonicalTimestamp(catalogue.committedAt, code);
+  const canonical = {
+    captureAttemptId: catalogue.captureAttemptId,
+    checkpointId: candidate.checkpoint.checkpointId,
+    committedAt: catalogue.committedAt,
+    document,
+    sessionId: candidate.checkpoint.sessionId,
+  };
+  ensure(sameJson(catalogue, canonical, code), code);
+  return canonical;
+}
+
+function normalizeGenerationOperationRequest(
+  value,
+  expectedSession,
+  candidate,
+  code,
+) {
+  const request = exactDataObject(
+    value,
+    GENERATION_OPERATION_REQUEST_KEYS,
+    code,
+  );
+  exactDataObject(request.admission, GENERATION_ADMISSION_KEYS, code);
+  let canonical;
+  try {
+    canonical = createRestoreDestinationGenerationOperationRequest({
+      admission: {
+        checkpoint: candidate.checkpoint,
+        request: candidate.request,
+      },
+      expectedSession,
+    });
+  } catch {
+    fail(code);
+  }
+  ensure(sameJson(request, canonical, code), code);
+  return canonical;
+}
+
+function normalizeGenerationBinding(
+  value,
+  operation,
+  reservation,
+  candidate,
+  catalogue,
+  generationId,
+  code,
+) {
+  const binding = exactDataObject(value, GENERATION_BINDING_KEYS, code);
+  opaqueId(binding.destinationIsolationProofId, code);
+  const canonical = canonicalJsonData({
+    attachment: operation.expectedSession.document.attachment,
+    captureAttemptId: catalogue.captureAttemptId,
+    captureOperationId:
+      catalogue.document.artifactProof.captureOperationId,
+    catalogueSha256: sha256(canonicalSerialize(catalogue.document, code)),
+    checkpoint: candidate.checkpoint,
+    contractVersion: 1,
+    destinationIsolationProofId: binding.destinationIsolationProofId,
+    destinationState: "detached",
+    generationId,
+    request: candidate.request,
+    reservationId: reservation.reservationId,
+  }, code);
+  ensure(sameJson(binding, canonical, code), code);
+  return canonical;
+}
+
+function normalizeGenerationDocument(
+  value,
+  operation,
+  catalogue,
+  generationBinding,
+  code,
+) {
+  const document = exactDataObject(
+    value,
+    GENERATION_DOCUMENT_KEYS,
+    code,
+  );
+  const artifactProof = normalizeCheckpointArtifactProof(
+    document.artifactProof,
+    code,
+  );
+  ensure(
+    sameJson(artifactProof, catalogue.document.artifactProof, code),
+    code,
+  );
+  const materialization = normalizePublicationMaterialization(
+    document.materialization,
+    artifactProof,
+    "restore-destination",
+    generationBinding,
+    code,
+  );
+  const canonical = {
+    artifactProof,
+    contractVersion:
+      RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION,
+    materialization,
+    result: operation.request.predeterminedResult,
+  };
+  ensure(
+    document.contractVersion ===
+        RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION &&
+      sameJson(document, canonical, code),
+    code,
+  );
+  return canonical;
+}
+
 function normalizeGeneration(value, expected, code) {
   const generation = exactDataObject(value, GENERATION_KEYS, code);
   ensure(
@@ -727,66 +2018,152 @@ function normalizeGeneration(value, expected, code) {
   );
   canonicalTimestamp(generation.claimedAt, code);
   canonicalTimestamp(generation.committedAt, code, true);
-  ensure(
-    generation.binding !== null &&
-      typeof generation.binding === "object" &&
-      !arrayIsArray(generation.binding),
-    code,
-  );
   if (generation.state === "authorized") {
     ensure(generation.committedAt === null && generation.document === null, code);
   } else {
     ensure(
       generation.state === "committed" &&
         generation.committedAt !== null &&
-        generation.document !== null &&
-        typeof generation.document === "object" &&
-        !arrayIsArray(generation.document),
+        generation.document !== null,
       code,
     );
   }
   return generation;
 }
 
-function normalizeCatalogue(value, candidate, code) {
-  const catalogue = exactDataObject(value, CATALOGUE_KEYS, code);
-  ensure(
-    catalogue.checkpointId === candidate.checkpoint.checkpointId &&
-      catalogue.sessionId === candidate.checkpoint.sessionId &&
-      catalogue.document !== null &&
-      typeof catalogue.document === "object" &&
-      !arrayIsArray(catalogue.document),
-    code,
-  );
-  opaqueId(catalogue.captureAttemptId, code);
-  canonicalTimestamp(catalogue.committedAt, code);
-  return catalogue;
-}
-
-function normalizeGenerationOperationRequest(value, candidate, code) {
-  const request = exactDataObject(
+function normalizeGenerationTerminalResult(
+  value,
+  candidate,
+  catalogue,
+  generation,
+  code,
+) {
+  const result = exactDataObject(
     value,
-    GENERATION_OPERATION_REQUEST_KEYS,
+    GENERATION_TERMINAL_RESULT_KEYS,
     code,
   );
-  const admission = exactDataObject(
-    request.admission,
-    GENERATION_ADMISSION_KEYS,
-    code,
-  );
-  ensure(
-    request.contractVersion === 1 &&
-      sameJson(admission.checkpoint, candidate.checkpoint, code) &&
-      sameJson(admission.request, candidate.request, code) &&
-      request.predeterminedResult !== null &&
-      typeof request.predeterminedResult === "object" &&
-      !arrayIsArray(request.predeterminedResult),
-    code,
-  );
-  return request;
+  const canonical = {
+    catalogueSha256: sha256(canonicalSerialize(catalogue.document, code)),
+    checkpointId: candidate.checkpoint.checkpointId,
+    generationDocumentSha256: sha256(
+      canonicalSerialize(generation.document, code),
+    ),
+    generationId: generation.generationId,
+    outcome: "restore-generation-committed",
+    resultVersion: 1,
+  };
+  ensure(sameJson(result, canonical, code), code);
+  return canonical;
 }
 
-function normalizeGenerationReceipt(value, candidate, finalized, code) {
+function validateGenerationTiming(operation, reservation, generation, code) {
+  const createdAt = timestampMilliseconds(operation.createdAt, code);
+  const updatedAt = timestampMilliseconds(operation.updatedAt, code);
+  const claimedAt = timestampMilliseconds(generation.claimedAt, code);
+  ensure(
+    updatedAt >= createdAt &&
+      reservation.createdAt === operation.createdAt &&
+      reservation.updatedAt === operation.updatedAt &&
+      claimedAt >= createdAt &&
+      claimedAt <= updatedAt &&
+      (operation.state !== "starting" ||
+        generation.claimedAt === operation.updatedAt),
+    code,
+  );
+  if (operation.state === "committed") {
+    ensure(
+      generation.committedAt === operation.updatedAt &&
+        timestampMilliseconds(generation.committedAt, code) >= claimedAt,
+      code,
+    );
+  }
+}
+
+function validateCommittedGenerationSession(
+  session,
+  operation,
+  reservation,
+  code,
+) {
+  const expectedDocument = authorityDocumentWithState(
+    operation.expectedSession.document,
+    {
+      activeOperation: null,
+      lastOperation: lastOperationPointer(operation, reservation, code),
+    },
+    code,
+  );
+  const terminalRevision = revisionAfter(
+    operation.expectedSession.revision,
+    BigIntConstructor(operation.revision) + 1n,
+    code,
+  );
+  const atTerminalRevision = session.revision === terminalRevision;
+  ensure(
+    session.sessionId === operation.sessionId &&
+      session.createdAt === operation.expectedSession.createdAt &&
+      BigIntConstructor(session.revision) >=
+        BigIntConstructor(terminalRevision) &&
+      sameJson(
+        session.document.manifest,
+        operation.expectedSession.document.manifest,
+        code,
+      ) &&
+      sameJson(
+        session.document.storageRef,
+        operation.expectedSession.document.storageRef,
+        code,
+      ) &&
+      sameJson(
+        session.document.backendCapabilities,
+        operation.expectedSession.document.backendCapabilities,
+        code,
+      ) &&
+      (!atTerminalRevision ||
+        (session.updatedAt === operation.updatedAt &&
+          sameJson(session.document, expectedDocument, code))),
+    code,
+  );
+}
+
+function validateCommittedGenerationTransition(
+  previous,
+  operation,
+  reservation,
+  generation,
+  code,
+) {
+  if (previous === null) return;
+  const previousOperation = previous.operation;
+  const previousReservation = previous.reservation;
+  const previousGeneration = previous.generation;
+  ensure(
+    previousOperation.state === "uncertain" &&
+      operation.revision ===
+        revisionAfter(previousOperation.revision, 1, code) &&
+      operation.conflictClass === previousOperation.conflictClass &&
+      operation.operationId === previousOperation.operationId &&
+      operation.sessionId === previousOperation.sessionId &&
+      operation.kind === previousOperation.kind &&
+      operation.requestSha256 === previousOperation.requestSha256 &&
+      operation.createdAt === previousOperation.createdAt &&
+      sameJson(operation.expectedSession, previousOperation.expectedSession, code) &&
+      sameJson(operation.request, previousOperation.request, code) &&
+      reservation.reservationId === previousReservation.reservationId &&
+      reservation.createdAt === previousReservation.createdAt &&
+      generation.claimedAt === previousGeneration.claimedAt &&
+      sameJson(generation.binding, previousGeneration.binding, code),
+    code,
+  );
+}
+
+function normalizeGenerationReceipt(
+  value,
+  candidate,
+  { completion = null, finalized = false, previous = null } = {},
+  code,
+) {
   const receipt = exactDataObject(
     value,
     finalized
@@ -794,12 +2171,14 @@ function normalizeGenerationReceipt(value, candidate, finalized, code) {
       : GENERATION_READ_RECEIPT_KEYS,
     code,
   );
+  const rawOperation = exactDataObject(receipt.operation, OPERATION_KEYS, code);
   const request = normalizeGenerationOperationRequest(
-    receipt.operation?.request,
+    rawOperation.request,
+    rawOperation.expectedSession,
     candidate,
     code,
   );
-  const operation = normalizeOperation(
+  const normalizedOperation = normalizeOperation(
     receipt.operation,
     {
       kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
@@ -807,6 +2186,14 @@ function normalizeGenerationReceipt(value, candidate, finalized, code) {
       request,
       states: ["starting", "uncertain", "committed"],
     },
+    code,
+  );
+  const operation = normalizedOperation.operation;
+  const catalogue = normalizeCatalogue(receipt.catalogue, candidate, code);
+  const reservation = normalizeReservation(
+    receipt.reservation,
+    operation,
+    normalizedOperation.binding,
     code,
   );
   const generation = normalizeGeneration(
@@ -820,37 +2207,85 @@ function normalizeGenerationReceipt(value, candidate, finalized, code) {
     },
     code,
   );
-  normalizeCatalogue(receipt.catalogue, candidate, code);
-  normalizeReservation(receipt.reservation, operation, code);
-  normalizeSnapshot(receipt.session, operation.sessionId, code);
+  const generationBinding = normalizeGenerationBinding(
+    generation.binding,
+    operation,
+    reservation,
+    candidate,
+    catalogue,
+    generation.generationId,
+    code,
+  );
+  const session = normalizeCanonicalSnapshot(
+    receipt.session,
+    operation.sessionId,
+    code,
+  );
+  validateGenerationTiming(operation, reservation, generation, code);
   ensure(
     receipt.status === (finalized ? operation.state : generation.state),
     code,
   );
   if (finalized) ensure(typeof receipt.finalized === "boolean", code);
-  return receipt;
-}
-
-function validateCommittedGenerationCompletion(receipt, completion, code) {
-  const document = exactDataObject(
-    receipt.generation.document,
-    GENERATION_DOCUMENT_KEYS,
-    code,
-  );
-  ensure(
-    receipt.operation.state === "committed" &&
-      receipt.generation.state === "committed" &&
-      document.contractVersion ===
-        RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION &&
-      sameJson(document.materialization, completion.materialization, code) &&
-      sameJson(document.result, completion.result, code) &&
-      sameJson(
-        document.artifactProof,
-        receipt.catalogue.document.artifactProof,
+  if (operation.state === "committed") {
+    ensure(operation.revision === "2" || operation.revision === "3", code);
+    const generationDocument = normalizeGenerationDocument(
+      generation.document,
+      operation,
+      catalogue,
+      generationBinding,
+      code,
+    );
+    generation.document = generationDocument;
+    normalizeGenerationTerminalResult(
+      operation.result,
+      candidate,
+      catalogue,
+      generation,
+      code,
+    );
+    if (completion !== null) {
+      const completionMaterialization = normalizePublicationMaterialization(
+        completion.materialization,
+        generationDocument.artifactProof,
+        "restore-destination",
+        generationBinding,
+        code,
+        false,
+      );
+      ensure(
+        sameJson(generationDocument.materialization, completionMaterialization, code) &&
+          sameJson(generationDocument.result, completion.result, code),
+        code,
+      );
+    }
+    validateCommittedGenerationTransition(
+      previous,
+      operation,
+      reservation,
+      generation,
+      code,
+    );
+    validateCommittedGenerationSession(session, operation, reservation, code);
+  } else {
+    ensure(
+      operation.state === "starting" || operation.state === "uncertain",
+      code,
+    );
+    validateActiveOperationSession(
+      session,
+      operation,
+      reservation,
+      authorityDocumentWithState(
+        operation.expectedSession.document,
+        {
+          activeOperation: activeOperationPointer(operation, reservation),
+        },
         code,
       ),
-    code,
-  );
+      code,
+    );
+  }
   return receipt;
 }
 
@@ -897,8 +2332,16 @@ function normalizeActivationTerminalResult(
   ensure(
     result.outcome === "restore-attachment-activated" &&
       result.resultVersion === 1 &&
-      sameJson(result.activationRequest, activationRequest, code) &&
-      sameJson(result.activationResult, activationResult, code),
+      sameCanonicalJson(
+        result.activationRequest,
+        activationRequest,
+        code,
+      ) &&
+      sameCanonicalJson(
+        result.activationResult,
+        activationResult,
+        code,
+      ),
     code,
   );
   return result;
@@ -928,12 +2371,12 @@ function validateActivationRequestAuthorityBinding(
     `writer-attachment:${operation.operationId}`,
   )}`;
   ensure(
-    sameJson(
+    sameCanonicalJson(
       activationRequest.manifest,
       expectedSession.document.manifest,
       code,
     ) &&
-      sameJson(
+      sameCanonicalJson(
         activationRequest.storageRef,
         expectedSession.document.storageRef,
         code,
@@ -973,7 +2416,7 @@ function normalizeActivationReadReceipt(value, candidate, code) {
     code,
   );
   ensure(sameJson(request, candidate.request, code), code);
-  const operation = normalizeOperation(
+  const normalizedOperation = normalizeOperation(
     receipt.operation,
     {
       kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
@@ -983,6 +2426,7 @@ function normalizeActivationReadReceipt(value, candidate, code) {
     },
     code,
   );
+  const operation = normalizedOperation.operation;
   const generationReference = request.generation;
   const generation = normalizeGeneration(
     receipt.generation,
@@ -995,8 +2439,22 @@ function normalizeActivationReadReceipt(value, candidate, code) {
     },
     code,
   );
-  normalizeReservation(receipt.reservation, operation, code);
-  normalizeSnapshot(receipt.session, operation.sessionId, code);
+  const reservation = normalizeReservation(
+    receipt.reservation,
+    operation,
+    normalizedOperation.binding,
+    code,
+  );
+  const session = normalizeCanonicalSnapshot(
+    receipt.session,
+    operation.sessionId,
+    code,
+  );
+  validateActivationOperationBindingAndTiming(
+    operation,
+    reservation,
+    code,
+  );
   let activationRequest;
   try {
     activationRequest = assertRestoreAttachmentActivationRequest(
@@ -1013,6 +2471,10 @@ function normalizeActivationReadReceipt(value, candidate, code) {
   );
   ensure(receipt.status === operation.state, code);
   if (operation.state === "committed") {
+    ensure(
+      operation.revision === "2" || operation.revision === "3",
+      code,
+    );
     let terminalActivationResult;
     try {
       terminalActivationResult = assertRestoreAttachmentActivationResult(
@@ -1028,13 +2490,29 @@ function normalizeActivationReadReceipt(value, candidate, code) {
       terminalActivationResult,
       code,
     );
+    validateCommittedActivationSession(
+      session,
+      activationRequest,
+      terminalActivationResult,
+      operation,
+      reservation,
+      code,
+    );
+  } else {
+    validateActivationReadSession(
+      session,
+      activationRequest,
+      operation,
+      reservation,
+      code,
+    );
   }
   return exactFrozenRecord({
     activationRequest,
     generation,
     operation,
-    reservation: receipt.reservation,
-    session: receipt.session,
+    reservation,
+    session,
     status: receipt.status,
   });
 }
@@ -1044,6 +2522,7 @@ function normalizeActivationHandoffReceipt(
   candidate,
   activationRequest,
   activationResult,
+  read,
   code,
 ) {
   const receipt = exactDataObject(
@@ -1068,7 +2547,7 @@ function normalizeActivationHandoffReceipt(
     code,
   );
   ensure(sameJson(request, candidate.request, code), code);
-  const operation = normalizeOperation(
+  const normalizedOperation = normalizeOperation(
     activation.operation,
     {
       kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
@@ -1078,16 +2557,30 @@ function normalizeActivationHandoffReceipt(
     },
     code,
   );
+  const operation = normalizedOperation.operation;
   normalizeActivationTerminalResult(
     operation.result,
     activationRequest,
     activationResult,
     code,
   );
-  normalizeReservation(activation.reservation, operation, code);
+  const activationReservation = normalizeReservation(
+    activation.reservation,
+    operation,
+    normalizedOperation.binding,
+    code,
+  );
+  validateActivationOperationBindingAndTiming(
+    operation,
+    activationReservation,
+    code,
+  );
   ensure(typeof activation.finalized === "boolean", code);
+  if (read.operation.state === "committed") {
+    ensure(activation.finalized === false, code);
+  }
   const generationReference = request.generation;
-  normalizeGeneration(
+  const generation = normalizeGeneration(
     receipt.generation,
     {
       checkpointId: generationReference.checkpointId,
@@ -1098,18 +2591,68 @@ function normalizeActivationHandoffReceipt(
     },
     code,
   );
+  ensure(sameJson(generation, read.generation, code), code);
+  const expectedLaunchSession = validateActivationCommitTransition(
+    read,
+    operation,
+    activationReservation,
+    activationRequest,
+    activationResult,
+    code,
+  );
+  let expectedLaunchRequest;
+  try {
+    expectedLaunchRequest = createWriterLaunchAttemptOperationRequest({
+      expectedSession: expectedLaunchSession,
+      generation: read.generation,
+      measuredImage: request.launchIntent.measuredImage,
+      supervisor: request.launchIntent.supervisor,
+    });
+  } catch {
+    fail(code);
+  }
   const launch = exactDataObject(receipt.launch, LAUNCH_RECEIPT_KEYS, code);
-  const launchOperation = normalizeOperation(
+  const normalizedLaunchOperation = normalizeOperation(
     launch.operation,
     {
       kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
       operationId: request.launchIntent.launchAttemptId,
-      request: launch.operation?.request,
+      request: expectedLaunchRequest,
       states: ["prepared", "starting", "uncertain", "committed"],
     },
     code,
   );
-  normalizeReservation(launch.reservation, launchOperation, code);
+  const launchOperation = normalizedLaunchOperation.operation;
+  ensure(
+    activation.finalized === false ||
+      (launchOperation.state === "prepared" &&
+        launchOperation.revision === "0"),
+    code,
+  );
+  ensure(
+    sameJson(
+      launchOperation.expectedSession,
+      expectedLaunchSession,
+      code,
+    ) &&
+      launchOperation.createdAt === operation.updatedAt,
+    code,
+  );
+  const launchReservation = normalizeReservation(
+    launch.reservation,
+    launchOperation,
+    normalizedLaunchOperation.binding,
+    code,
+  );
+  ensure(
+    launchReservation.createdAt === launchOperation.createdAt,
+    code,
+  );
+  validateLaunchOperationTiming(
+    launchOperation,
+    launchReservation,
+    code,
+  );
   const attempt = exactDataObject(
     launch.attempt,
     LAUNCH_ATTEMPT_KEYS,
@@ -1123,7 +2666,36 @@ function normalizeActivationHandoffReceipt(
       sameJson(attempt.result, launchOperation.result, code),
     code,
   );
-  normalizeSnapshot(receipt.session, operation.sessionId, code);
+  const session = normalizeCanonicalSnapshot(
+    receipt.session,
+    operation.sessionId,
+    code,
+  );
+  if (launchOperation.state === "committed") {
+    validateCommittedLaunchSession(
+      session,
+      launchOperation,
+      launchReservation,
+      code,
+    );
+  } else {
+    validateActiveOperationSession(
+      session,
+      launchOperation,
+      launchReservation,
+      authorityDocumentWithState(
+        expectedLaunchSession.document,
+        {
+          activeOperation: activeOperationPointer(
+            launchOperation,
+            launchReservation,
+          ),
+        },
+        code,
+      ),
+      code,
+    );
+  }
   ensure(receipt.status === attempt.state, code);
   return receipt;
 }
@@ -1149,11 +2721,21 @@ function normalizeGenerationCandidate(value, code) {
   } catch {
     fail(code);
   }
+  checkpoint = clonePlainData(canonicalJsonData(checkpoint, code), code);
+  request = clonePlainData(canonicalJsonData(request, code), code);
+  let newerFencingEpoch;
+  try {
+    newerFencingEpoch =
+      BigIntConstructor(request.fencingEpoch) >
+      BigIntConstructor(checkpoint.sourceFencingEpoch);
+  } catch {
+    fail(code);
+  }
   ensure(
     request.operation === "restore" &&
       request.sessionId === checkpoint.sessionId &&
       request.backendId === checkpoint.backendId &&
-      request.storageId === checkpoint.storageId &&
+      newerFencingEpoch &&
       request.target.checkpointId === checkpoint.checkpointId &&
       request.target.artifactId === checkpoint.artifactId,
     code,
@@ -1391,14 +2973,21 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
   const outcomeCode =
     "postgres_restore_activation_recovery_coordinator_outcome_uncertain";
 
-  async function invokeAuthority(method, input) {
+  async function invokeAuthoritySettlement(method, input) {
     let pending;
     try {
       pending = callIntrinsic(authority[method], authority.receiver, [input]);
     } catch {
-      fail(outcomeCode);
+      throw authorityInvocationUncertain;
     }
-    const settled = await settleTrusted(pending, outcomeCode);
+    return awaitTrustedSettlement(
+      settleTrusted(pending, outcomeCode),
+      outcomeCode,
+      authorityInvocationUncertain,
+    );
+  }
+
+  function cloneAuthoritySettlement(settled) {
     try {
       return clonePlainData(settled, outcomeCode);
     } catch (error) {
@@ -1411,6 +3000,63 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     }
   }
 
+  async function invokeAuthority(method, input) {
+    let settlement;
+    try {
+      settlement = await invokeAuthoritySettlement(method, input);
+    } catch (error) {
+      if (error === authorityInvocationUncertain) fail(outcomeCode);
+      throw error;
+    }
+    return cloneAuthoritySettlement(settlement.value);
+  }
+
+  async function invokeActivationFinalizerWithOneRetry(input) {
+    try {
+      return await invokeAuthoritySettlement(
+        "finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt",
+        input,
+      );
+    } catch (error) {
+      if (error !== authorityInvocationUncertain) throw error;
+    }
+    try {
+      return await invokeAuthoritySettlement(
+        "finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt",
+        input,
+      );
+    } catch (error) {
+      if (error === authorityInvocationUncertain) fail(outcomeCode);
+      throw error;
+    }
+  }
+
+  async function finalizeActivationHandoff(
+    read,
+    candidate,
+    activationRequest,
+    activationResult,
+    expectedOperationRevision,
+  ) {
+    const input = exactFrozenRecord({
+      ...operationTransitionInput(
+        read.operation,
+        expectedOperationRevision,
+        outcomeCode,
+      ),
+      activationResult,
+    });
+    const settlement = await invokeActivationFinalizerWithOneRetry(input);
+    return normalizeActivationHandoffReceipt(
+      cloneAuthoritySettlement(settlement.value),
+      candidate,
+      activationRequest,
+      activationResult,
+      read,
+      outcomeCode,
+    );
+  }
+
   async function resolveDestination(kind, candidate, read) {
     let pending;
     try {
@@ -1420,10 +3066,11 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     } catch {
       fail(outcomeCode);
     }
-    return normalizeDestination(
-      await settleTrusted(pending, outcomeCode),
+    const settlement = await awaitTrustedSettlement(
+      settleTrusted(pending, outcomeCode),
       outcomeCode,
     );
+    return normalizeDestination(settlement.value, outcomeCode);
   }
 
   async function probeGuard(probe) {
@@ -1439,7 +3086,10 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     } catch {
       fail(outcomeCode);
     }
-    await settleTrusted(pending, outcomeCode);
+    await awaitTrustedSettlement(
+      settleTrusted(pending, outcomeCode),
+      outcomeCode,
+    );
   }
 
   async function markStartingUncertain(read) {
@@ -1479,7 +3129,12 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     } catch {
       fail(outcomeCode);
     }
-    return settleTrusted(pending, outcomeCode);
+    return (
+      await awaitTrustedSettlement(
+        settleTrusted(pending, outcomeCode),
+        outcomeCode,
+      )
+    ).value;
   }
 
   async function reconcileRestoreGenerationInternal(candidateValue) {
@@ -1496,7 +3151,7 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
           request: candidate.request,
         }),
         candidate,
-        false,
+        {},
         outcomeCode,
       );
       if (read.operation.state === "committed") return read;
@@ -1509,7 +3164,7 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
             request: candidate.request,
           }),
           candidate,
-          false,
+          {},
           outcomeCode,
         );
         if (read.operation.state === "committed") return read;
@@ -1540,22 +3195,17 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
         ),
         outcomeCode,
       );
+      let finalizationSettlement;
       try {
-        const finalized = normalizeGenerationReceipt(
-          await invokeAuthority("finalizeRestoreDestinationGeneration", {
+        finalizationSettlement = await invokeAuthoritySettlement(
+          "finalizeRestoreDestinationGeneration",
+          {
             ...operationTransitionInput(read.operation, "2", outcomeCode),
             completion,
-          }),
-          candidate,
-          true,
-          outcomeCode,
+          },
         );
-        return validateCommittedGenerationCompletion(
-          finalized,
-          completion,
-          outcomeCode,
-        );
-      } catch {
+      } catch (error) {
+        if (error !== authorityInvocationUncertain) throw error;
         const replay = normalizeGenerationReceipt(
           await invokeAuthority("readRestoreDestinationGeneration", {
             checkpoint: candidate.checkpoint,
@@ -1563,16 +3213,20 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
             request: candidate.request,
           }),
           candidate,
-          false,
+          { completion, previous: read },
           outcomeCode,
         );
         ensure(replay.operation.state === "committed", outcomeCode);
-        return validateCommittedGenerationCompletion(
-          replay,
-          completion,
-          outcomeCode,
-        );
+        return replay;
       }
+      const finalized = normalizeGenerationReceipt(
+        cloneAuthoritySettlement(finalizationSettlement.value),
+        candidate,
+        { completion, finalized: true, previous: read },
+        outcomeCode,
+      );
+      ensure(finalized.operation.state === "committed", outcomeCode);
+      return finalized;
     });
   }
 
@@ -1587,7 +3241,15 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
         candidate,
         outcomeCode,
       );
-      if (read.operation.state === "committed") return read;
+      if (read.operation.state === "committed") {
+        return finalizeActivationHandoff(
+          read,
+          candidate,
+          read.activationRequest,
+          read.operation.result.activationResult,
+          revisionAfter(read.operation.revision, -1, outcomeCode),
+        );
+      }
       if (read.operation.state === "starting") {
         await markStartingUncertain(read);
         read = normalizeActivationReadReceipt(
@@ -1597,7 +3259,15 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
           candidate,
           outcomeCode,
         );
-        if (read.operation.state === "committed") return read;
+        if (read.operation.state === "committed") {
+          return finalizeActivationHandoff(
+            read,
+            candidate,
+            read.activationRequest,
+            read.operation.result.activationResult,
+            revisionAfter(read.operation.revision, -1, outcomeCode),
+          );
+        }
       }
       ensure(
         read.operation.state === "uncertain" &&
@@ -1621,9 +3291,17 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       } catch {
         fail(outcomeCode);
       }
+      const completionMaterialization = normalizePublicationMaterialization(
+        completion.materialization,
+        read.generation.document.artifactProof,
+        "restore-destination",
+        read.generation.binding,
+        outcomeCode,
+        false,
+      );
       ensure(
         sameJson(
-          completion.materialization,
+          completionMaterialization,
           read.generation.document.materialization,
           outcomeCode,
         ) &&
@@ -1651,10 +3329,12 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       } catch {
         fail(outcomeCode);
       }
-      rawActivationResult = await settleTrusted(
-        rawActivationResult,
-        outcomeCode,
-      );
+      rawActivationResult = (
+        await awaitTrustedSettlement(
+          settleTrusted(rawActivationResult, outcomeCode),
+          outcomeCode,
+        )
+      ).value;
       let activationResult;
       try {
         activationResult = assertRestoreAttachmentActivationResult(
@@ -1664,39 +3344,18 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       } catch {
         fail(outcomeCode);
       }
+      activationResult = clonePlainData(
+        canonicalJsonData(activationResult, outcomeCode),
+        outcomeCode,
+      );
       await probeGuard(probe);
-      try {
-        return normalizeActivationHandoffReceipt(
-          await invokeAuthority(
-            "finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt",
-            {
-              ...operationTransitionInput(read.operation, "2", outcomeCode),
-              activationResult,
-            },
-          ),
-          candidate,
-          activationRequest,
-          activationResult,
-          outcomeCode,
-        );
-      } catch {
-        const replay = normalizeActivationReadReceipt(
-          await invokeAuthority(
-            "readRestoreAttachmentActivation",
-            { operationId: candidate.activationOperationId },
-          ),
-          candidate,
-          outcomeCode,
-        );
-        ensure(replay.operation.state === "committed", outcomeCode);
-        normalizeActivationTerminalResult(
-          replay.operation.result,
-          activationRequest,
-          activationResult,
-          outcomeCode,
-        );
-        return replay;
-      }
+      return finalizeActivationHandoff(
+        read,
+        candidate,
+        activationRequest,
+        activationResult,
+        "2",
+      );
     });
   }
 

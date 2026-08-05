@@ -13,7 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { FilesystemOperationJournal } from "../src/filesystem-operation-journal.mjs";
+import {
+  FilesystemOperationJournal,
+  snapshotOperationJournalBinding,
+} from "../src/filesystem-operation-journal.mjs";
 import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
 import {
   PostgresRestoreActivationRecoveryCoordinatorError,
@@ -24,7 +27,12 @@ import {
   RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+  WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  assertSessionAuthoritySnapshot,
+  assertSessionOperationBinding,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreDestinationGenerationOperationRequest,
+  createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import { createSessionManifest } from "../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../src/stopped-directory-publication.mjs";
@@ -36,6 +44,7 @@ const BACKEND_ID = "single-attach-test";
 const STORAGE_ID = "volume-001";
 const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
+const CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000003";
 const CAPTURE_OPERATION_ID = "capture-operation-001";
 const RESTORE_OPERATION_ID = "restore-operation-001";
 const GENERATION_ID = "restore-generation-001";
@@ -47,6 +56,190 @@ const ACTIVATION_LEASE_ID = `lease-${createHash("sha256")
   .update(`writer-lease:${ACTIVATION_OPERATION_ID}`, "utf8")
   .digest("hex")}`;
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
+
+function serializedSha256(value) {
+  return createHash("sha256")
+    .update(JSON.stringify(value), "utf8")
+    .digest("hex");
+}
+
+function requestSha256(expectedSession, request) {
+  return serializedSha256({
+    requestVersion: 1,
+    conflictClass: "session-mutation",
+    expectedSession,
+    payload: request,
+  });
+}
+
+function reversedDataObject(value) {
+  return Object.fromEntries(Object.entries(value).reverse());
+}
+
+function canonicalJsonFixture(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => canonicalJsonFixture(entry));
+  }
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, canonicalJsonFixture(value[key])]),
+  );
+}
+
+function reversedJsonFixture(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => reversedJsonFixture(entry));
+  }
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .reverse()
+      .map((key) => [key, reversedJsonFixture(value[key])]),
+  );
+}
+
+function synchronizeForgedOperationDigest(receipt) {
+  const digest = requestSha256(
+    receipt.operation.expectedSession,
+    receipt.operation.request,
+  );
+  receipt.operation.requestSha256 = digest;
+  receipt.reservation.requestSha256 = digest;
+  receipt.session.document.activeOperation.requestSha256 = digest;
+}
+
+function synchronizeCommittedGenerationOperation(receipt) {
+  const digest = authorityOperationBinding(
+    receipt.operation.kind,
+    receipt.operation.operationId,
+    receipt.operation.expectedSession,
+    receipt.operation.request,
+  ).requestSha256;
+  receipt.operation.requestSha256 = digest;
+  receipt.reservation.requestSha256 = digest;
+  receipt.operation.result.generationDocumentSha256 = serializedSha256(
+    receipt.generation.document,
+  );
+  receipt.session.document.lastOperation.requestSha256 = digest;
+  receipt.session.document.lastOperation.resultSha256 = serializedSha256(
+    receipt.operation.result,
+  );
+}
+
+function authorityOperationBinding(
+  kind,
+  operationId,
+  expectedSession,
+  request,
+) {
+  return assertSessionOperationBinding({
+    expectedSession,
+    kind,
+    operationId,
+    request,
+  });
+}
+
+function reservationIdForOperation(operationId) {
+  return `reservation-${createHash("sha256")
+    .update(operationId, "utf8")
+    .digest("hex")}`;
+}
+
+function safePromiseSpeciesHolder() {
+  const holder = Object.create(null);
+  Object.defineProperty(holder, Symbol.species, {
+    configurable: false,
+    enumerable: false,
+    value: Promise,
+    writable: false,
+  });
+  return Object.freeze(holder);
+}
+
+function withSafePromiseSpecies(promise) {
+  Object.defineProperty(promise, "constructor", {
+    configurable: false,
+    enumerable: false,
+    value: safePromiseSpeciesHolder(),
+    writable: false,
+  });
+  return promise;
+}
+
+function activeOperationPointer(operationValue, reservationValue) {
+  return {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: operationValue.expectedSession.revision,
+    kind: operationValue.kind,
+    operationId: operationValue.operationId,
+    operationRevision: operationValue.revision,
+    requestSha256: operationValue.requestSha256,
+    reservationId: reservationValue.reservationId,
+    state: operationValue.state,
+  };
+}
+
+function lastOperationPointer(operationValue, reservationValue) {
+  return {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: operationValue.expectedSession.revision,
+    kind: operationValue.kind,
+    operationId: operationValue.operationId,
+    operationRevision: operationValue.revision,
+    requestSha256: operationValue.requestSha256,
+    reservationId: reservationValue.reservationId,
+    resultSha256: serializedSha256(operationValue.result),
+    state: operationValue.state,
+  };
+}
+
+function writerLaunchPointer(operationValue) {
+  const request = operationValue.request;
+  const evidence = operationValue.result.evidence;
+  return {
+    attachmentId: request.attachment.attachmentId,
+    attachmentSha256: serializedSha256(request.attachment),
+    contractVersion: 1,
+    fencingEpoch: request.fencingEpoch,
+    generation: request.generation,
+    launchAttemptId: operationValue.operationId,
+    launchResultSha256: serializedSha256(operationValue.result),
+    leaseId: request.lease.leaseId,
+    leaseSha256: serializedSha256(request.lease),
+    measuredImageSha256: serializedSha256(request.measuredImage),
+    processIncarnationId: evidence.processIncarnationId,
+    startedAt: operationValue.updatedAt,
+    supervisorId: request.supervisor.supervisorId,
+    supervisorProofId: evidence.proofId,
+    writerIncarnationId: evidence.writerIncarnationId,
+  };
+}
+
+function synchronizeLaunchRequestBindings(receipt) {
+  receipt.launch.attempt.request = structuredClone(
+    receipt.launch.operation.request,
+  );
+  let digest;
+  try {
+    digest = authorityOperationBinding(
+      receipt.launch.operation.kind,
+      receipt.launch.operation.operationId,
+      receipt.launch.operation.expectedSession,
+      receipt.launch.operation.request,
+    ).requestSha256;
+  } catch {
+    digest = requestSha256(
+      receipt.launch.operation.expectedSession,
+      receipt.launch.operation.request,
+    );
+  }
+  receipt.launch.operation.requestSha256 = digest;
+  receipt.launch.reservation.requestSha256 = digest;
+  receipt.session.document.activeOperation.requestSha256 = digest;
+}
 
 const TRUSTED_JOURNAL_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
@@ -115,6 +308,7 @@ function mutationRequest(
     fencingEpoch,
     holderId,
     leaseId,
+    storageId = STORAGE_ID,
   },
 ) {
   return {
@@ -126,7 +320,7 @@ function mutationRequest(
     operation,
     operationId,
     sessionId: SESSION_ID,
-    storageId: STORAGE_ID,
+    storageId,
     target:
       operation === "attach"
         ? { attachmentId, kind: "attachment" }
@@ -138,7 +332,7 @@ function mutationRequest(
   };
 }
 
-function checkpoint() {
+function checkpoint(storageId = STORAGE_ID) {
   return {
     artifactId: ARTIFACT_ID,
     backendId: BACKEND_ID,
@@ -151,14 +345,30 @@ function checkpoint() {
     imageDigest: IMAGE_DIGEST,
     sessionId: SESSION_ID,
     sourceFencingEpoch: "11",
-    storageId: STORAGE_ID,
+    storageId,
   };
 }
 
 function mutationResult(request) {
+  const proofId =
+    request.operation === "checkpoint"
+      ? `proof-checkpoint-${createHash("sha256")
+          .update(
+            `checkpoint-capture-proof:${request.operationId}`,
+            "utf8",
+          )
+          .digest("hex")}`
+      : request.operation === "restore"
+        ? `proof-restore-${createHash("sha256")
+            .update(
+              `restore-destination-proof:${request.operationId}`,
+              "utf8",
+            )
+            .digest("hex")}`
+        : `proof-${request.operation}-001`;
   return {
     ...request,
-    proofId: `proof-${request.operation}-001`,
+    proofId,
     status:
       request.operation === "checkpoint"
         ? "checkpoint-created"
@@ -168,25 +378,98 @@ function mutationResult(request) {
   };
 }
 
-function publicationResult(request) {
+function publicationResult(request, checkpointValue = checkpoint()) {
   return {
-    checkpoint: checkpoint(),
-    mutation: mutationResult(request),
+    checkpoint: checkpointValue,
+    mutation: canonicalMutationResult(request),
   };
 }
 
-function coordinatorBinding(request) {
+function canonicalMutationResult(request) {
+  const result = mutationResult(request);
   return {
-    backendId: BACKEND_ID,
-    operation: "restore",
-    operationId: request.operationId,
-    request,
-    sessionId: SESSION_ID,
-    storageId: STORAGE_ID,
+    backendId: result.backendId,
+    contractVersion: result.contractVersion,
+    fencingEpoch: result.fencingEpoch,
+    holderId: result.holderId,
+    leaseId: result.leaseId,
+    operation: result.operation,
+    operationId: result.operationId,
+    proofId: result.proofId,
+    sessionId: result.sessionId,
+    status: result.status,
+    storageId: result.storageId,
+    target: result.target,
   };
 }
 
-async function createPublishedRestoreFixture(t) {
+function canonicalMaterialization(materialization, restoreDestination) {
+  return {
+    artifactManifestDigest: materialization.artifactManifestDigest,
+    ...(restoreDestination
+      ? {
+          coordinatorBindingSha256:
+            materialization.coordinatorBindingSha256,
+        }
+      : {}),
+    contractVersion: materialization.contractVersion,
+    modeledDigest: materialization.modeledDigest,
+    publicationId: materialization.publicationId,
+    publicationKind: materialization.publicationKind,
+    stagedRoot: {
+      filesystemId: materialization.stagedRoot.filesystemId,
+      objectIdentityScheme:
+        materialization.stagedRoot.objectIdentityScheme,
+      objectId: materialization.stagedRoot.objectId,
+    },
+    treeIdentityDigest: materialization.treeIdentityDigest,
+  };
+}
+
+function checkpointCatalogueDocument(
+  capture,
+  captureRequest,
+  artifactProof,
+  checkpointValue,
+) {
+  return {
+    artifactProof,
+    contractVersion: 1,
+    materialization: canonicalMaterialization(
+      capture.materialization,
+      false,
+    ),
+    result: {
+      checkpoint: checkpointValue,
+      mutation: canonicalMutationResult(captureRequest),
+    },
+  };
+}
+
+function restoreGenerationBinding(
+  catalogueDocument,
+  restoreRequest,
+  checkpointValue,
+) {
+  return structuredClone(snapshotOperationJournalBinding({
+    attachment: restoreGenerationExpectedSession().document.attachment,
+    captureAttemptId: CAPTURE_ATTEMPT_ID,
+    captureOperationId: CAPTURE_OPERATION_ID,
+    catalogueSha256: serializedSha256(catalogueDocument),
+    checkpoint: checkpointValue,
+    contractVersion: 1,
+    destinationIsolationProofId: "destination-isolation-proof-001",
+    destinationState: "detached",
+    generationId: GENERATION_ID,
+    request: restoreRequest,
+    reservationId: reservationIdForOperation(RESTORE_OPERATION_ID),
+  }));
+}
+
+async function createPublishedRestoreFixture(
+  t,
+  { sourceStorageId = STORAGE_ID } = {},
+) {
   const root = await mkdtemp(
     join(tmpdir(), "restore-activation-coordinator-test-"),
   );
@@ -244,6 +527,7 @@ async function createPublishedRestoreFixture(t) {
     destinationOwnedRoot,
     "restored-session",
   );
+  const sourceCheckpoint = checkpoint(sourceStorageId);
   const captureRequest = mutationRequest(
     "checkpoint",
     CAPTURE_OPERATION_ID,
@@ -251,6 +535,7 @@ async function createPublishedRestoreFixture(t) {
       fencingEpoch: "11",
       holderId: "capture-host-001",
       leaseId: "capture-lease-001",
+      storageId: sourceStorageId,
     },
   );
   const capture = await publication.publishCheckpointArtifact({
@@ -261,11 +546,11 @@ async function createPublishedRestoreFixture(t) {
       operation: "checkpoint",
       operationId: CAPTURE_OPERATION_ID,
       sessionId: SESSION_ID,
-      storageId: STORAGE_ID,
+      storageId: sourceStorageId,
     },
     operationId: CAPTURE_OPERATION_ID,
     request: captureRequest,
-    result: publicationResult(captureRequest),
+    result: publicationResult(captureRequest, sourceCheckpoint),
     sourceDirectory,
     sourceOwnedRoot,
   });
@@ -274,13 +559,26 @@ async function createPublishedRestoreFixture(t) {
     captureOperationId: CAPTURE_OPERATION_ID,
     modeledDigest: capture.materialization.modeledDigest,
   };
+  const catalogueDocument = checkpointCatalogueDocument(
+    capture,
+    captureRequest,
+    artifactProof,
+    sourceCheckpoint,
+  );
   const restoreRequest = mutationRequest("restore", RESTORE_OPERATION_ID, {
     fencingEpoch: "12",
     holderId: "restore-host-001",
     leaseId: "restore-lease-001",
   });
-  const binding = coordinatorBinding(restoreRequest);
-  const restoreResult = publicationResult(restoreRequest);
+  const binding = restoreGenerationBinding(
+    catalogueDocument,
+    restoreRequest,
+    sourceCheckpoint,
+  );
+  const restoreResult = publicationResult(
+    restoreRequest,
+    sourceCheckpoint,
+  );
   const restore = await publication.publishRestoreDestination({
     artifactDirectory,
     artifactOwnedRoot,
@@ -296,6 +594,8 @@ async function createPublishedRestoreFixture(t) {
     artifactOwnedRoot,
     artifactProof,
     binding,
+    catalogueDocument,
+    checkpoint: sourceCheckpoint,
     destinationDirectory,
     destinationOwnedRoot,
     journal,
@@ -385,18 +685,19 @@ function sessionManifest() {
 }
 
 function activationRequest(fixture) {
+  const expectedSession = authoritySnapshot();
   const lease = {
     contractVersion: 1,
-    expiresAt: "2026-08-05T00:13:00.000Z",
-    fencingEpoch: "13",
-    holderId: "activation-host-001",
-    leaseId: ACTIVATION_LEASE_ID,
     sessionId: SESSION_ID,
+    leaseId: ACTIVATION_LEASE_ID,
+    holderId: "activation-host-001",
+    fencingEpoch: "13",
+    expiresAt: "2026-08-05T00:13:00.000Z",
   };
   return {
     contractVersion: 1,
     lease,
-    manifest: sessionManifest(),
+    manifest: structuredClone(expectedSession.document.manifest),
     mutationRequest: mutationRequest("attach", ACTIVATION_OPERATION_ID, {
       attachmentId: ATTACHMENT_ID,
       fencingEpoch: lease.fencingEpoch,
@@ -418,12 +719,7 @@ function activationRequest(fixture) {
       treeIdentityDigest:
         fixture.restore.materialization.treeIdentityDigest,
     },
-    storageRef: {
-      backendId: BACKEND_ID,
-      contractVersion: 1,
-      sessionId: SESSION_ID,
-      storageId: STORAGE_ID,
-    },
+    storageRef: structuredClone(expectedSession.document.storageRef),
   };
 }
 
@@ -431,19 +727,19 @@ function activationResult(request) {
   const mutation = mutationResult(request.mutationRequest);
   return {
     attachment: {
-      attachmentId: ATTACHMENT_ID,
-      backendId: BACKEND_ID,
       contractVersion: 1,
-      fencingEpoch: request.lease.fencingEpoch,
-      holderId: request.lease.holderId,
-      kind: "directory",
+      backendId: BACKEND_ID,
+      storageId: STORAGE_ID,
+      sessionId: SESSION_ID,
+      attachmentId: ATTACHMENT_ID,
       leaseId: request.lease.leaseId,
-      mode: "read-write",
+      holderId: request.lease.holderId,
+      fencingEpoch: request.lease.fencingEpoch,
       operationId: request.mutationRequest.operationId,
       proofId: mutation.proofId,
+      kind: "directory",
       rootPath: request.publication.root.rootPath,
-      sessionId: SESSION_ID,
-      storageId: STORAGE_ID,
+      mode: "read-write",
     },
     contractVersion: 1,
     mutationResult: mutation,
@@ -455,13 +751,16 @@ function committedGeneration(fixture) {
   return {
     binding: fixture.binding,
     checkpointId: CHECKPOINT_ID,
-    claimedAt: "2026-08-05T00:01:00.000Z",
-    committedAt: "2026-08-05T00:02:00.000Z",
+    claimedAt: "2026-08-05T00:03:00.000Z",
+    committedAt: "2026-08-05T00:04:00.000Z",
     document: {
       artifactProof: fixture.artifactProof,
       contractVersion:
         RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION,
-      materialization: fixture.restore.materialization,
+      materialization: canonicalMaterialization(
+        fixture.restore.materialization,
+        true,
+      ),
       result: fixture.restoreResult,
     },
     generationId: GENERATION_ID,
@@ -473,15 +772,25 @@ function committedGeneration(fixture) {
 
 function authorityDocument() {
   return {
-    activeOperation: null,
-    attachment: null,
+    documentVersion: 3,
+    manifest: sessionManifest(),
+    storageRef: {
+      backendId: BACKEND_ID,
+      contractVersion: 1,
+      sessionId: SESSION_ID,
+      storageId: STORAGE_ID,
+    },
     backendCapabilities: {
       atomicPointInTimeCheckpoint: true,
       exclusiveWriterAttachment: true,
       fencing: "epoch-enforced",
       normalDirectoryAttachment: true,
     },
-    documentVersion: 3,
+    lifecycle: "DETACHED",
+    writerEpoch: "12",
+    lease: null,
+    attachment: null,
+    activeOperation: null,
     lastOperation: {
       conflictClass: "session-mutation",
       expectedSessionRevision: "17",
@@ -489,45 +798,109 @@ function authorityDocument() {
       operationId: "detach-operation-001",
       operationRevision: "2",
       requestSha256: "8".repeat(64),
-      reservationId: "detach-reservation-001",
+      reservationId: reservationIdForOperation("detach-operation-001"),
       resultSha256: "9".repeat(64),
       state: "committed",
     },
-    launch: null,
-    lease: null,
-    lifecycle: "DETACHED",
-    manifest: sessionManifest(),
     recovery: null,
-    storageRef: {
-      backendId: BACKEND_ID,
-      contractVersion: 1,
-      sessionId: SESSION_ID,
-      storageId: STORAGE_ID,
-    },
-    writerEpoch: "12",
+    launch: null,
   };
 }
 
 function authoritySnapshot(revision = "20") {
-  return {
-    createdAt: "2026-08-05T00:00:00.000Z",
-    document: authorityDocument(),
-    revision,
+  const snapshot = {
     sessionId: SESSION_ID,
+    revision: "20",
+    document: authorityDocument(),
+    createdAt: "2026-08-05T00:00:00.000Z",
     updatedAt: "2026-08-05T00:03:00.000Z",
   };
+  const canonical = structuredClone(
+    authorityOperationBinding(
+      "test-operation-v1",
+      "canonical-snapshot-operation-001",
+      snapshot,
+      {},
+    ).expectedSession,
+  );
+  canonical.revision = revision;
+  return canonical;
 }
 
-function operation(state, kind, operationId, request, result = null) {
+function restoreGenerationExpectedSession(revision = "20") {
+  const snapshot = authoritySnapshot(revision);
+  snapshot.document.lifecycle = "ATTACHED";
+  snapshot.document.writerEpoch = "12";
+  snapshot.document.lease = {
+    contractVersion: 1,
+    sessionId: SESSION_ID,
+    leaseId: "restore-lease-001",
+    holderId: "restore-host-001",
+    fencingEpoch: "12",
+    expiresAt: "2026-08-05T00:13:00.000Z",
+  };
+  snapshot.document.attachment = {
+    contractVersion: 1,
+    backendId: BACKEND_ID,
+    storageId: STORAGE_ID,
+    sessionId: SESSION_ID,
+    attachmentId: "restore-source-attachment-001",
+    leaseId: "restore-lease-001",
+    holderId: "restore-host-001",
+    fencingEpoch: "12",
+    operationId: "restore-source-attach-operation-001",
+    proofId: "restore-source-attach-proof-001",
+    kind: "directory",
+    rootPath: "/restore/source",
+    mode: "read-write",
+  };
+  snapshot.document.lastOperation = {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: "17",
+    kind: "writer-attachment-acquire-v1",
+    operationId: "restore-source-attach-operation-001",
+    operationRevision: "2",
+    requestSha256: "a".repeat(64),
+    reservationId: reservationIdForOperation(
+      "restore-source-attach-operation-001",
+    ),
+    resultSha256: "b".repeat(64),
+    state: "committed",
+  };
+  return structuredClone(
+    authorityOperationBinding(
+      "test-operation-v1",
+      "canonical-generation-snapshot-operation-001",
+      snapshot,
+      {},
+    ).expectedSession,
+  );
+}
+
+function operation(
+  state,
+  kind,
+  operationId,
+  request,
+  result = null,
+  expectedSessionValue = authoritySnapshot(),
+) {
   const committed = state === "committed";
+  const expectedSession = expectedSessionValue;
+  const binding = authorityOperationBinding(
+    kind,
+    operationId,
+    expectedSession,
+    request,
+  );
   return {
     conflictClass: "session-mutation",
     createdAt: "2026-08-05T00:03:00.000Z",
-    expectedSession: authoritySnapshot(),
+    expectedSession,
     kind,
     operationId,
     request,
-    requestSha256: "f".repeat(64),
+    requestSha256: binding.requestSha256,
     result,
     retiredAt: committed ? "2026-08-05T00:04:00.000Z" : null,
     revision: state === "starting" ? "1" : state === "uncertain" ? "2" : committed ? "3" : "0",
@@ -550,7 +923,7 @@ function reservationFor(operationValue) {
     operationId: operationValue.operationId,
     releasedAt: committed ? operationValue.updatedAt : null,
     requestSha256: operationValue.requestSha256,
-    reservationId: `reservation-${operationValue.operationId}`,
+    reservationId: reservationIdForOperation(operationValue.operationId),
     sessionId: SESSION_ID,
     state: committed ? "released" : operationValue.state,
     updatedAt: operationValue.updatedAt,
@@ -559,54 +932,100 @@ function reservationFor(operationValue) {
 
 function catalogue(fixture) {
   return {
-    captureAttemptId: "capture-attempt-001",
+    captureAttemptId: CAPTURE_ATTEMPT_ID,
     checkpointId: CHECKPOINT_ID,
     committedAt: "2026-08-05T00:01:00.000Z",
-    document: { artifactProof: fixture.artifactProof },
+    document: fixture.catalogueDocument,
     sessionId: SESSION_ID,
   };
 }
 
 function generationRead(fixture, state, finalized = false) {
-  const operationRequest = {
-    predeterminedResult: fixture.restoreResult,
-    admission: {
-      checkpoint: checkpoint(),
-      request: fixture.restoreRequest,
-    },
-    contractVersion: 1,
-  };
+  const expectedSession = restoreGenerationExpectedSession();
+  const operationRequest = structuredClone(
+    createRestoreDestinationGenerationOperationRequest({
+      admission: {
+        checkpoint: fixture.checkpoint,
+        request: fixture.restoreRequest,
+      },
+      expectedSession,
+    }),
+  );
   const operationValue = operation(
     state,
     RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
     RESTORE_OPERATION_ID,
     operationRequest,
-    state === "committed"
-      ? { outcome: "restore-generation-committed" }
-      : null,
+    null,
+    expectedSession,
   );
+  const reservationValue = reservationFor(operationValue);
+  const generationValue =
+    state === "committed"
+      ? committedGeneration(fixture)
+      : {
+          binding: fixture.binding,
+          checkpointId: CHECKPOINT_ID,
+          claimedAt: operationValue.createdAt,
+          committedAt: null,
+          document: null,
+          generationId: GENERATION_ID,
+          operationId: RESTORE_OPERATION_ID,
+          sessionId: SESSION_ID,
+          state: "authorized",
+        };
+  if (state === "committed") {
+    operationValue.result = {
+      catalogueSha256: serializedSha256(fixture.catalogueDocument),
+      checkpointId: CHECKPOINT_ID,
+      generationDocumentSha256: serializedSha256(
+        generationValue.document,
+      ),
+      generationId: GENERATION_ID,
+      outcome: "restore-generation-committed",
+      resultVersion: 1,
+    };
+  }
+  const session = structuredClone(assertSessionAuthoritySnapshot({
+    sessionId: SESSION_ID,
+    revision: (
+      BigInt(operationValue.expectedSession.revision) +
+      BigInt(operationValue.revision) +
+      1n
+    ).toString(),
+    document: {
+      ...operationValue.expectedSession.document,
+      activeOperation:
+        state === "committed"
+          ? null
+          : activeOperationPointer(operationValue, reservationValue),
+      lastOperation:
+        state === "committed"
+          ? lastOperationPointer(operationValue, reservationValue)
+          : operationValue.expectedSession.document.lastOperation,
+    },
+    createdAt: operationValue.expectedSession.createdAt,
+    updatedAt: operationValue.updatedAt,
+  }));
   const receipt = {
     catalogue: catalogue(fixture),
-    generation:
-      state === "committed"
-        ? committedGeneration(fixture)
-        : {
-            binding: fixture.binding,
-            checkpointId: CHECKPOINT_ID,
-            claimedAt: "2026-08-05T00:01:00.000Z",
-            committedAt: null,
-            document: null,
-            generationId: GENERATION_ID,
-            operationId: RESTORE_OPERATION_ID,
-            sessionId: SESSION_ID,
-            state: "authorized",
-          },
+    generation: generationValue,
     operation: operationValue,
-    reservation: reservationFor(operationValue),
-    session: authoritySnapshot(state === "committed" ? "23" : "21"),
+    reservation: reservationValue,
+    session,
     status: state === "committed" ? "committed" : "authorized",
   };
   return finalized ? { ...receipt, finalized: true } : receipt;
+}
+
+function directCommittedGenerationRead(fixture, finalized = false) {
+  const receipt = generationRead(fixture, "committed", finalized);
+  receipt.operation.revision = "2";
+  receipt.session.revision = (
+    BigInt(receipt.operation.expectedSession.revision) + 3n
+  ).toString();
+  receipt.session.document.lastOperation.operationRevision = "2";
+  return receipt;
 }
 
 function activationMeasuredImage() {
@@ -659,9 +1078,17 @@ function activationOperationRequest(fixture) {
   });
 }
 
-function activationRead(fixture, state, request, resultOverride = null) {
+function activationRead(
+  fixture,
+  state,
+  request,
+  resultOverride = null,
+  operationRevision = null,
+) {
   const operationRequest = activationOperationRequest(fixture);
   const providerResult = resultOverride ?? activationResult(request);
+  const storedActivationRequest = canonicalJsonFixture(request);
+  const storedProviderResult = canonicalJsonFixture(providerResult);
   const operationValue = operation(
     state,
     RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
@@ -669,33 +1096,140 @@ function activationRead(fixture, state, request, resultOverride = null) {
     operationRequest,
     state === "committed"
       ? {
-          activationRequest: request,
-          activationResult: providerResult,
+          activationRequest: storedActivationRequest,
+          activationResult: storedProviderResult,
           outcome: "restore-attachment-activated",
           resultVersion: 1,
         }
       : null,
   );
+  if (operationRevision !== null) {
+    operationValue.revision = operationRevision;
+  }
+  const reservation = reservationFor(operationValue);
+  const terminalRevision = (
+    BigInt(operationValue.expectedSession.revision) +
+    BigInt(operationValue.revision) +
+    1n
+  ).toString();
+  const session = structuredClone(assertSessionAuthoritySnapshot(
+    state === "committed"
+      ? {
+          sessionId: SESSION_ID,
+          revision: (BigInt(terminalRevision) + 3n).toString(),
+          document: {
+            ...operationValue.expectedSession.document,
+            activeOperation: null,
+            attachment: providerResult.attachment,
+            lastOperation: {
+              conflictClass: "session-mutation",
+              expectedSessionRevision: terminalRevision,
+              kind: "writer-launch-attempt-v1",
+              operationId: "later-activation-launch-attempt-001",
+              operationRevision: "2",
+              requestSha256: "2".repeat(64),
+              reservationId: reservationIdForOperation(
+                "later-activation-launch-attempt-001",
+              ),
+              resultSha256: "3".repeat(64),
+              state: "committed",
+            },
+            launch: null,
+            lease: request.lease,
+            lifecycle: "ATTACHED",
+            writerEpoch: request.lease.fencingEpoch,
+          },
+          createdAt: operationValue.expectedSession.createdAt,
+          updatedAt: "2026-08-05T00:06:00.000Z",
+        }
+      : {
+          sessionId: SESSION_ID,
+          revision: terminalRevision,
+          document: {
+            ...operationValue.expectedSession.document,
+            activeOperation: activeOperationPointer(
+              operationValue,
+              reservation,
+            ),
+            attachment: null,
+            launch: null,
+            lease: request.lease,
+            lifecycle: "ATTACHING",
+            writerEpoch: request.lease.fencingEpoch,
+          },
+          createdAt: operationValue.expectedSession.createdAt,
+          updatedAt: operationValue.updatedAt,
+        },
+  ));
   return {
-    activationRequest: request,
+    activationRequest: storedActivationRequest,
     generation: committedGeneration(fixture),
     operation: operationValue,
-    reservation: reservationFor(operationValue),
-    session: authoritySnapshot(state === "committed" ? "25" : "23"),
+    reservation,
+    session,
     status: state,
   };
 }
 
-function activationHandoff(fixture, request) {
-  const activation = activationRead(fixture, "committed", request);
-  const launchRequest = { source: "restore-activation" };
+function activationHandoff(fixture, request, operationRevision = "3") {
+  const activation = activationRead(
+    fixture,
+    "committed",
+    request,
+    null,
+    operationRevision,
+  );
+  const prepared = activationResult(request);
+  const terminalSession = structuredClone(assertSessionAuthoritySnapshot({
+    sessionId: SESSION_ID,
+    revision: (
+      BigInt(activation.operation.expectedSession.revision) +
+      BigInt(activation.operation.revision) +
+      1n
+    ).toString(),
+    document: {
+      ...activation.operation.expectedSession.document,
+      activeOperation: null,
+      attachment: prepared.attachment,
+      lastOperation: lastOperationPointer(
+        activation.operation,
+        activation.reservation,
+      ),
+      launch: null,
+      lease: request.lease,
+      lifecycle: "ATTACHED",
+      writerEpoch: request.lease.fencingEpoch,
+    },
+    createdAt: activation.operation.expectedSession.createdAt,
+    updatedAt: activation.operation.updatedAt,
+  }));
+  const launchIntent = activationOperationRequest(fixture).launchIntent;
+  const launchRequest = createWriterLaunchAttemptOperationRequest({
+    expectedSession: terminalSession,
+    generation: committedGeneration(fixture),
+    measuredImage: launchIntent.measuredImage,
+    supervisor: launchIntent.supervisor,
+  });
   const launchOperation = operation(
     "prepared",
     WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
-    activationOperationRequest(fixture).launchIntent.launchAttemptId,
+    launchIntent.launchAttemptId,
     launchRequest,
   );
-  return {
+  launchOperation.createdAt = activation.operation.updatedAt;
+  launchOperation.expectedSession = terminalSession;
+  launchOperation.requestSha256 = authorityOperationBinding(
+    launchOperation.kind,
+    launchOperation.operationId,
+    terminalSession,
+    launchRequest,
+  ).requestSha256;
+  launchOperation.updatedAt = activation.operation.updatedAt;
+  const launchReservation = reservationFor(launchOperation);
+  launchReservation.reservationId = reservationIdForOperation(
+    launchOperation.operationId,
+  );
+  const receipt = {
     activation: {
       finalized: true,
       operation: activation.operation,
@@ -711,19 +1245,242 @@ function activationHandoff(fixture, request) {
         state: "prepared",
       },
       operation: launchOperation,
-      reservation: reservationFor(launchOperation),
+      reservation: launchReservation,
     },
-    session: authoritySnapshot("26"),
+    session: {
+      ...terminalSession,
+      document: {
+        ...terminalSession.document,
+        activeOperation: activeOperationPointer(
+          launchOperation,
+          launchReservation,
+        ),
+      },
+      revision: (BigInt(terminalSession.revision) + 1n).toString(),
+      updatedAt: launchOperation.updatedAt,
+    },
     status: "prepared",
   };
+  receipt.session = structuredClone(
+    assertSessionAuthoritySnapshot(receipt.session),
+  );
+  return receipt;
+}
+
+function committedLaunchHandoff(
+  fixture,
+  request,
+  { operationRevision = "2", status = "started" } = {},
+) {
+  const receipt = structuredClone(activationHandoff(fixture, request));
+  const operationValue = receipt.launch.operation;
+  const reservationValue = receipt.launch.reservation;
+  const processIncarnationId =
+    status === "not-started" ? null : "process-incarnation-001";
+  const writerIncarnationId =
+    status === "not-started" ? null : "writer-incarnation-001";
+  const outcome =
+    status === "started"
+      ? "writer-launch-started"
+      : status === "not-started"
+        ? "writer-launch-not-started"
+        : "writer-launch-complete-stopped";
+  const evidence = {
+    contractVersion: 1,
+    launchAttemptId: operationValue.operationId,
+    processIncarnationId,
+    proofId: `launch-proof-${status}-001`,
+    status,
+    supervisorId: operationValue.request.supervisor.supervisorId,
+    writerIncarnationId,
+  };
+  operationValue.result = {
+    evidence,
+    outcome,
+    resultVersion: 1,
+  };
+  operationValue.retiredAt = "2026-08-05T00:05:00.000Z";
+  operationValue.revision = operationRevision;
+  operationValue.state = "committed";
+  operationValue.updatedAt = operationValue.retiredAt;
+  reservationValue.releasedAt = operationValue.updatedAt;
+  reservationValue.state = "released";
+  reservationValue.updatedAt = operationValue.updatedAt;
+  receipt.activation.finalized = false;
+  receipt.launch.attempt.result = structuredClone(operationValue.result);
+  receipt.launch.attempt.state = "committed";
+  receipt.session = {
+    sessionId: SESSION_ID,
+    revision: (
+      BigInt(operationValue.expectedSession.revision) +
+      BigInt(operationValue.revision) +
+      1n
+    ).toString(),
+    document: {
+      ...operationValue.expectedSession.document,
+      activeOperation: null,
+      lastOperation: lastOperationPointer(
+        operationValue,
+        reservationValue,
+      ),
+      launch:
+        status === "started"
+          ? writerLaunchPointer(operationValue)
+          : operationValue.expectedSession.document.launch,
+    },
+    createdAt: operationValue.expectedSession.createdAt,
+    updatedAt: operationValue.updatedAt,
+  };
+  receipt.status = "committed";
+  receipt.session = structuredClone(
+    assertSessionAuthoritySnapshot(receipt.session),
+  );
+  return receipt;
+}
+
+function synchronizeCommittedLaunchReceipt(receipt) {
+  const operationValue = receipt.launch.operation;
+  const reservationValue = receipt.launch.reservation;
+  receipt.launch.attempt.result = structuredClone(operationValue.result);
+  receipt.launch.attempt.state = "committed";
+  receipt.session.revision = (
+    BigInt(operationValue.expectedSession.revision) +
+    BigInt(operationValue.revision) +
+    1n
+  ).toString();
+  receipt.session.document.activeOperation = null;
+  receipt.session.document.lastOperation = lastOperationPointer(
+    operationValue,
+    reservationValue,
+  );
+  receipt.session.updatedAt = operationValue.updatedAt;
+  receipt.status = "committed";
+  receipt.session = structuredClone(
+    assertSessionAuthoritySnapshot(receipt.session),
+  );
+}
+
+function cancelledLaunchHandoff(fixture, request) {
+  const receipt = structuredClone(activationHandoff(fixture, request));
+  const operationValue = receipt.launch.operation;
+  const reservationValue = receipt.launch.reservation;
+  operationValue.result = {
+    resultVersion: 1,
+    outcome: "cancelled-before-dispatch",
+    reason: WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  };
+  operationValue.retiredAt = operationValue.request.lease.expiresAt;
+  operationValue.revision = "1";
+  operationValue.state = "committed";
+  operationValue.updatedAt = operationValue.retiredAt;
+  reservationValue.releasedAt = operationValue.updatedAt;
+  reservationValue.state = "released";
+  reservationValue.updatedAt = operationValue.updatedAt;
+  receipt.activation.finalized = false;
+  receipt.session.document.launch = null;
+  synchronizeCommittedLaunchReceipt(receipt);
+  return receipt;
+}
+
+function activeLaunchHandoff(
+  fixture,
+  request,
+  state,
+  updatedAt = "2026-08-05T00:05:00.000Z",
+) {
+  const receipt = structuredClone(activationHandoff(fixture, request));
+  const operationValue = receipt.launch.operation;
+  const reservationValue = receipt.launch.reservation;
+  operationValue.revision = state === "starting" ? "1" : "2";
+  operationValue.state = state;
+  operationValue.updatedAt = updatedAt;
+  reservationValue.state = state;
+  reservationValue.updatedAt = updatedAt;
+  receipt.activation.finalized = false;
+  receipt.launch.attempt.state = state;
+  receipt.session.revision = (
+    BigInt(operationValue.expectedSession.revision) +
+    BigInt(operationValue.revision) +
+    1n
+  ).toString();
+  receipt.session.document.activeOperation = activeOperationPointer(
+    operationValue,
+    reservationValue,
+  );
+  receipt.session.updatedAt = updatedAt;
+  receipt.status = state;
+  receipt.session = structuredClone(
+    assertSessionAuthoritySnapshot(receipt.session),
+  );
+  return receipt;
+}
+
+function advanceCommittedLaunchCurrentSession(
+  receipt,
+  { detached = false } = {},
+) {
+  const terminalRevision = receipt.session.revision;
+  const laterOperationId = detached
+    ? "later-writer-release-001"
+    : "later-writer-launch-stop-001";
+  const updatedAt = new Date(
+    Date.parse(receipt.launch.operation.updatedAt) + 60_000,
+  ).toISOString();
+  receipt.session.revision = (BigInt(terminalRevision) + 3n).toString();
+  receipt.session.document.lifecycle = detached ? "DETACHED" : "ATTACHED";
+  receipt.session.document.lease = detached
+    ? null
+    : receipt.launch.operation.request.lease;
+  receipt.session.document.attachment = detached
+    ? null
+    : receipt.launch.operation.request.attachment;
+  receipt.session.document.activeOperation = null;
+  receipt.session.document.lastOperation = {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: terminalRevision,
+    kind: detached ? "writer-release-v1" : "writer-launch-stop-v1",
+    operationId: laterOperationId,
+    operationRevision: "2",
+    requestSha256: "6".repeat(64),
+    reservationId: reservationIdForOperation(laterOperationId),
+    resultSha256: "7".repeat(64),
+    state: "committed",
+  };
+  receipt.session.document.launch = null;
+  receipt.session.updatedAt = updatedAt;
+  receipt.session = structuredClone(
+    assertSessionAuthoritySnapshot(receipt.session),
+  );
+  return receipt;
 }
 
 function generationCandidate(fixture) {
   return {
-    checkpoint: checkpoint(),
+    checkpoint: fixture.checkpoint,
     generationId: GENERATION_ID,
     request: fixture.restoreRequest,
   };
+}
+
+function advanceCommittedGenerationCurrentSession(receipt) {
+  const terminalRevision = receipt.session.revision;
+  receipt.session.revision = (BigInt(terminalRevision) + 3n).toString();
+  receipt.session.document.activeOperation = null;
+  receipt.session.document.lastOperation = {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: terminalRevision,
+    kind: "writer-launch-attempt-v1",
+    operationId: "later-generation-launch-attempt-001",
+    operationRevision: "2",
+    requestSha256: "4".repeat(64),
+    reservationId: reservationIdForOperation(
+      "later-generation-launch-attempt-001",
+    ),
+    resultSha256: "5".repeat(64),
+    state: "committed",
+  };
+  receipt.session.updatedAt = "2026-08-05T00:06:00.000Z";
+  return receipt;
 }
 
 function activationCandidate(fixture, state = "uncertain") {
@@ -833,6 +1590,34 @@ function assertCoordinatorCode(code) {
   };
 }
 
+async function assertPromptCoordinatorRejection(promise, code) {
+  let timeout;
+  const deadline = new Promise((_, reject) => {
+    timeout = setTimeout(
+      () => reject(new Error("coordinator settlement timed out")),
+      2_000,
+    );
+  });
+  try {
+    await assert.rejects(
+      Promise.race([promise, deadline]),
+      assertCoordinatorCode(code),
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+test("uses the authority's fixed operation-envelope serialization order", () => {
+  assert.equal(
+    requestSha256(
+      { sessionId: "session-001" },
+      { contractVersion: 1 },
+    ),
+    "9f129ee7ec8f27ce24f9e1e751d7ffaba48c8fa434f5a82bca58e7ba3d38b772",
+  );
+});
+
 test("reconciles one committed restore generation without source, image, or launch work", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
@@ -872,6 +1657,320 @@ test("reconciles one committed restore generation without source, image, or laun
   assert.deepEqual(storage.providerCalls, []);
   assert.deepEqual(storage.forbiddenCalls, []);
   assert.deepEqual(fixture.transitionGuard.calls, []);
+});
+
+test("accepts a committed restore generation copied across storage IDs", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t, {
+    sourceStorageId: "source-volume-001",
+  });
+  await makeSourceUnavailable(fixture);
+  assert.equal(fixture.checkpoint.storageId, "source-volume-001");
+  assert.equal(fixture.restoreRequest.storageId, STORAGE_ID);
+  const authority = authorityHarness({
+    "read-generation": async () =>
+      generationRead(fixture, "committed"),
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("activation provider must not run for generation replay");
+  });
+  const { coordinator, destinations } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreGeneration(
+    generationCandidate(fixture),
+  );
+
+  assert.equal(result.operation.state, "committed");
+  assert.deepEqual(destinations, []);
+  assert.deepEqual(storage.providerCalls, []);
+});
+
+test("canonicalizes reordered generation candidates before authority reads", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const candidate = generationCandidate(fixture);
+  candidate.checkpoint = reversedDataObject(candidate.checkpoint);
+  candidate.request = reversedDataObject(candidate.request);
+  candidate.request.target = reversedDataObject(candidate.request.target);
+  const authority = authorityHarness({
+    "read-generation": async (input) => {
+      assert.equal(
+        JSON.stringify(input.checkpoint),
+        JSON.stringify(fixture.checkpoint),
+      );
+      assert.equal(
+        JSON.stringify(input.request),
+        JSON.stringify(fixture.restoreRequest),
+      );
+      return generationRead(fixture, "committed");
+    },
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("committed generation replay must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreGeneration(candidate);
+
+  assert.equal(result.operation.state, "committed");
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects a stale restore-generation fence before authority work", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  const candidate = structuredClone(generationCandidate(fixture));
+  candidate.request.fencingEpoch = fixture.checkpoint.sourceFencingEpoch;
+  const authority = authorityHarness({});
+  const storage = storageBackendHarness(async () => {
+    throw new Error("a stale generation request must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreGeneration(candidate),
+    assertCoordinatorCode(
+      "invalid_postgres_restore_activation_recovery_coordinator_request",
+    ),
+  );
+
+  assert.deepEqual(authority.calls, []);
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("accepts a direct committed generation at operation revision two", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const authority = authorityHarness({
+    "read-generation": async () => directCommittedGenerationRead(fixture),
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("committed generation replay must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreGeneration(
+    generationCandidate(fixture),
+  );
+
+  assert.equal(result.operation.revision, "2");
+  assert.equal(result.session.revision, "23");
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("accepts valid later current-session history for a committed generation", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const current = advanceCommittedGenerationCurrentSession(
+    generationRead(fixture, "committed"),
+  );
+  const authority = authorityHarness({
+    "read-generation": async () => current,
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("generation history replay must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreGeneration(
+    generationCandidate(fixture),
+  );
+
+  assert.equal(result.session.revision, "27");
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects inconsistent later current-session history for a committed generation", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const forged = advanceCommittedGenerationCurrentSession(
+    generationRead(fixture, "committed"),
+  );
+  forged.session.document.lastOperation.operationRevision = "1";
+  const authority = authorityHarness({
+    "read-generation": async () => forged,
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("invalid generation history must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreGeneration(generationCandidate(fixture)),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects incomplete committed generation authority relations on fast return", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const scenarios = [
+    ["binding", (receipt) => {
+      receipt.generation.binding.destinationState = "attached";
+    }],
+    ["catalogue", (receipt) => {
+      delete receipt.catalogue.document.result;
+    }],
+    ["generation document", (receipt) => {
+      receipt.generation.document.materialization.publicationKind =
+        "checkpoint-artifact";
+    }],
+    ["terminal result", (receipt) => {
+      delete receipt.operation.result.resultVersion;
+    }],
+    ["generation timestamp", (receipt) => {
+      receipt.generation.claimedAt = "2026-08-05T00:02:00.000Z";
+    }],
+    ["typed request", (receipt) => {
+      receipt.operation.request.predeterminedResult.mutation.proofId =
+        "forged-restore-proof-001";
+      receipt.generation.document.result = structuredClone(
+        receipt.operation.request.predeterminedResult,
+      );
+      synchronizeCommittedGenerationOperation(receipt);
+    }],
+  ];
+
+  for (const [scenario, mutate] of scenarios) {
+    const forged = generationRead(fixture, "committed");
+    mutate(forged);
+    const authority = authorityHarness({
+      "read-generation": async () => forged,
+    });
+    const storage = storageBackendHarness(async () => {
+      throw new Error("invalid generation receipt must not attach");
+    });
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreGeneration(generationCandidate(fixture)),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.equal(storage.providerCalls.length, 0, scenario);
+  }
+});
+
+test("does not launder a malformed generation finalizer receipt through readback", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const malformed = generationRead(fixture, "committed", true);
+  delete malformed.operation.result.resultVersion;
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-generation": async () => malformed,
+    "read-generation": async () => {
+      readCalls += 1;
+      return readCalls === 1
+        ? generationRead(fixture, "uncertain")
+        : generationRead(fixture, "committed");
+    },
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("generation reconciliation must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreGeneration(generationCandidate(fixture)),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(readCalls, 1);
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects a revision-two generation receipt from the uncertain finalizer path", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const forged = directCommittedGenerationRead(fixture, true);
+  const authority = authorityHarness({
+    "finalize-generation": async () => forged,
+    "read-generation": async () => generationRead(fixture, "uncertain"),
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("generation reconciliation must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreGeneration(generationCandidate(fixture)),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("accepts a revision-three idempotent generation finalization replay", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const replay = generationRead(fixture, "committed", true);
+  replay.finalized = false;
+  const authority = authorityHarness({
+    "finalize-generation": async () => replay,
+    "read-generation": async () => generationRead(fixture, "uncertain"),
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("generation reconciliation must not attach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreGeneration(
+    generationCandidate(fixture),
+  );
+
+  assert.equal(result.finalized, false);
+  assert.equal(result.operation.revision, "3");
+  assert.equal(storage.providerCalls.length, 0);
 });
 
 test("converts a starting generation to uncertain before committed replay", async (t) => {
@@ -1004,7 +2103,10 @@ test("verifies, prepares, and atomically finalizes one restore attachment activa
   const authority = authorityHarness({
     "finalize-activation": async (input) => {
       assert.equal(input.expectedOperationRevision, "2");
-      assert.deepEqual(input.activationResult, prepared);
+      assert.equal(
+        JSON.stringify(input.activationResult),
+        JSON.stringify(canonicalJsonFixture(prepared)),
+      );
       assert.deepEqual(Reflect.ownKeys(input).sort(), [
         "activationResult",
         "expectedOperationRevision",
@@ -1045,20 +2147,582 @@ test("verifies, prepares, and atomically finalizes one restore attachment activa
   assert.deepEqual(fixture.transitionGuard.calls, []);
 });
 
-test("recovers activation finalization acknowledgement loss without a second attach", async (t) => {
+test("accepts a reordered valid activation provider result with a canonical authority handoff", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
   const request = activationRequest(fixture);
   const prepared = activationResult(request);
-  let state = "uncertain";
-  let finalizeCalls = 0;
+  const reordered = reversedJsonFixture(prepared);
   const authority = authorityHarness({
-    "finalize-activation": async () => {
-      finalizeCalls += 1;
-      state = "committed";
-      throw new Error("activation finalization acknowledgement lost");
+    "finalize-activation": async (input) => {
+      assert.equal(
+        JSON.stringify(input.activationResult),
+        JSON.stringify(canonicalJsonFixture(prepared)),
+      );
+      return activationHandoff(fixture, request);
     },
-    "read-activation": async () => activationRead(fixture, state, request),
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(async () => reordered);
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.activation.operation.state, "committed");
+  assert.equal(result.launch.operation.state, "prepared");
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("accepts a bound idempotent handoff replay with finalized false", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = structuredClone(activationHandoff(fixture, request));
+  replay.activation.finalized = false;
+  const authority = authorityHarness({
+    "finalize-activation": async () => replay,
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.activation.finalized, false);
+  assert.equal(result.launch.operation.state, "prepared");
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("accepts bound starting and uncertain launch replays after createdAt", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+
+  for (const state of ["starting", "uncertain"]) {
+    const replay = activeLaunchHandoff(fixture, request, state);
+    const authority = authorityHarness({
+      "finalize-activation": async () => replay,
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(async () => activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    const result = await coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    );
+
+    assert.equal(result.activation.finalized, false, state);
+    assert.equal(result.launch.operation.state, state, state);
+  }
+});
+
+test("rejects finalized true once the launch has advanced past prepared", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forged = activeLaunchHandoff(fixture, request, "starting");
+  forged.activation.finalized = true;
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => forged,
+    "read-activation": async () => {
+      readCalls += 1;
+      return activationRead(fixture, "uncertain", request);
+    },
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(readCalls, 1);
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("accepts an idempotent replay whose launch already committed", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = committedLaunchHandoff(fixture, request);
+  const authority = authorityHarness({
+    "finalize-activation": async () => replay,
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.activation.finalized, false);
+  assert.equal(result.launch.operation.state, "committed");
+  assert.equal(result.session.document.activeOperation, null);
+  assert.equal(
+    result.session.document.launch.launchAttemptId,
+    result.launch.operation.operationId,
+  );
+  assert.equal(
+    result.session.document.lastOperation.operationId,
+    result.launch.operation.operationId,
+  );
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("accepts non-started and complete-stopped launch terminal replays", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const scenarios = [
+    {
+      operationRevision: "2",
+      outcome: "writer-launch-not-started",
+      status: "not-started",
+    },
+    {
+      operationRevision: "3",
+      outcome: "writer-launch-complete-stopped",
+      status: "complete-stopped",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const replay = committedLaunchHandoff(fixture, request, scenario);
+    const authority = authorityHarness({
+      "finalize-activation": async () => replay,
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(async () =>
+      activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    const result = await coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    );
+
+    assert.equal(
+      result.launch.operation.revision,
+      scenario.operationRevision,
+      scenario.status,
+    );
+    assert.equal(
+      result.launch.operation.result.outcome,
+      scenario.outcome,
+      scenario.status,
+    );
+    assert.equal(result.session.document.launch, null, scenario.status);
+    assert.equal(
+      result.launch.operation.result.evidence.processIncarnationId,
+      scenario.status === "not-started"
+        ? null
+        : "process-incarnation-001",
+      scenario.status,
+    );
+    assert.equal(
+      result.launch.operation.result.evidence.writerIncarnationId,
+      scenario.status === "not-started"
+        ? null
+        : "writer-incarnation-001",
+      scenario.status,
+    );
+    assert.equal(storage.providerCalls.length, 1, scenario.status);
+  }
+});
+
+test("accepts an expired pre-dispatch launch cancellation replay", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = cancelledLaunchHandoff(fixture, request);
+  const authority = authorityHarness({
+    "finalize-activation": async () => replay,
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.launch.operation.state, "committed");
+  assert.equal(
+    result.launch.operation.result.reason,
+    WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
+  );
+  assert.equal(result.session.document.activeOperation, null);
+  assert.equal(
+    result.session.document.lastOperation.operationId,
+    result.launch.operation.operationId,
+  );
+});
+
+test("accepts later current-session history for committed launch outcomes", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const scenarios = [
+    [
+      "started",
+      advanceCommittedLaunchCurrentSession(
+        committedLaunchHandoff(fixture, request),
+      ),
+      "2026-08-05T00:06:00.000Z",
+    ],
+    [
+      "cancelled",
+      advanceCommittedLaunchCurrentSession(
+        cancelledLaunchHandoff(fixture, request),
+        { detached: true },
+      ),
+      "2026-08-05T00:14:00.000Z",
+    ],
+  ];
+
+  for (const [scenario, replay, expectedUpdatedAt] of scenarios) {
+    const authority = authorityHarness({
+      "finalize-activation": async () => replay,
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(async () =>
+      activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    const result = await coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    );
+
+    assert.equal(result.launch.operation.state, "committed", scenario);
+    assert.equal(result.session.revision, replay.session.revision, scenario);
+    assert.equal(result.session.updatedAt, expectedUpdatedAt, scenario);
+  }
+});
+
+test("rejects later committed launch history with a different session identity", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = advanceCommittedLaunchCurrentSession(
+    committedLaunchHandoff(fixture, request),
+  );
+  replay.session.document.storageRef.storageId = "forged-volume-001";
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => replay,
+    "read-activation": async () => {
+      readCalls += 1;
+      return activationRead(fixture, "uncertain", request);
+    },
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(readCalls, 1);
+});
+
+test("rejects committed writer evidence at the cancellation-only revision", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = committedLaunchHandoff(fixture, request);
+  replay.launch.operation.revision = "1";
+  synchronizeCommittedLaunchReceipt(replay);
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => replay,
+    "read-activation": async () => {
+      readCalls += 1;
+      return activationRead(fixture, "uncertain", request);
+    },
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(readCalls, 1);
+});
+
+test("rejects malformed or premature launch cancellation replays", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const scenarios = [
+    ["wrong reason", (receipt) => {
+      receipt.launch.operation.result.reason =
+        "caller-abandoned-before-dispatch";
+    }],
+    ["extra result field", (receipt) => {
+      receipt.launch.operation.result.unexpected = true;
+    }],
+    ["before lease expiry", (receipt) => {
+      const updatedAt = "2026-08-05T00:12:59.999Z";
+      receipt.launch.operation.updatedAt = updatedAt;
+      receipt.launch.operation.retiredAt = updatedAt;
+      receipt.launch.reservation.updatedAt = updatedAt;
+      receipt.launch.reservation.releasedAt = updatedAt;
+    }],
+    ["wrong revision", (receipt) => {
+      receipt.launch.operation.revision = "2";
+    }],
+  ];
+
+  for (const [scenario, mutate] of scenarios) {
+    const forged = cancelledLaunchHandoff(fixture, request);
+    mutate(forged);
+    synchronizeCommittedLaunchReceipt(forged);
+    let readCalls = 0;
+    const authority = authorityHarness({
+      "finalize-activation": async () => forged,
+      "read-activation": async () => {
+        readCalls += 1;
+        return activationRead(fixture, "uncertain", request);
+      },
+    });
+    const storage = storageBackendHarness(async () => activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.equal(readCalls, 1, scenario);
+  }
+});
+
+test("rejects launch receipts whose updatedAt predates createdAt", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forgedUpdatedAt = "2026-08-05T00:03:59.000Z";
+  const scenarios = [
+    ["prepared", structuredClone(activationHandoff(fixture, request))],
+    [
+      "starting",
+      activeLaunchHandoff(
+        fixture,
+        request,
+        "starting",
+        forgedUpdatedAt,
+      ),
+    ],
+    [
+      "uncertain",
+      activeLaunchHandoff(
+        fixture,
+        request,
+        "uncertain",
+        forgedUpdatedAt,
+      ),
+    ],
+  ];
+  scenarios[0][1].launch.operation.updatedAt = forgedUpdatedAt;
+  scenarios[0][1].launch.reservation.updatedAt = forgedUpdatedAt;
+  scenarios[0][1].session.updatedAt = forgedUpdatedAt;
+
+  for (const [scenario, forged] of scenarios) {
+    const authority = authorityHarness({
+      "finalize-activation": async () => forged,
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(async () => activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+  }
+});
+
+test("rejects launch handoffs that are only receipt-internally consistent", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  const scenarios = [
+    ["attachment", (receipt) => {
+      receipt.launch.operation.request.attachment.attachmentId =
+        "forged-attachment-001";
+      receipt.launch.operation.expectedSession.document.attachment
+        .attachmentId = "forged-attachment-001";
+      receipt.session.document.attachment.attachmentId =
+        "forged-attachment-001";
+    }],
+    ["lease", (receipt) => {
+      receipt.launch.operation.request.lease.leaseId = "forged-lease-001";
+      receipt.launch.operation.expectedSession.document.lease.leaseId =
+        "forged-lease-001";
+      receipt.session.document.lease.leaseId = "forged-lease-001";
+    }],
+    ["generation", (receipt) => {
+      receipt.launch.operation.request.generation.generationId =
+        "forged-generation-001";
+    }],
+    ["measured-image", (receipt) => {
+      receipt.launch.operation.request.measuredImage.runtimeIdentity
+        .codexBinarySha256 = "b".repeat(64);
+    }],
+    ["supervisor", (receipt) => {
+      receipt.launch.operation.request.supervisor.supervisorId =
+        "forged-supervisor-001";
+    }],
+    ["expected-session", (receipt) => {
+      receipt.launch.operation.expectedSession.document.attachment
+        .attachmentId = "forged-attachment-001";
+    }],
+    ["reservation", (receipt) => {
+      receipt.launch.reservation.reservationId = "forged-reservation-001";
+      receipt.session.document.activeOperation.reservationId =
+        "forged-reservation-001";
+    }],
+    ["active-pointer", (receipt) => {
+      receipt.session.document.activeOperation.operationRevision = "1";
+    }],
+  ];
+
+  for (const [scenario, mutate] of scenarios) {
+    const forged = structuredClone(activationHandoff(fixture, request));
+    mutate(forged);
+    synchronizeLaunchRequestBindings(forged);
+    const authority = authorityHarness({
+      "finalize-activation": async () => forged,
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(async () => prepared);
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.equal(storage.providerCalls.length, 1, scenario);
+  }
+});
+
+test("does not launder a malformed handoff through committed readback", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  const malformed = structuredClone(activationHandoff(fixture, request));
+  delete malformed.launch;
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => malformed,
+    "read-activation": async () => {
+      readCalls += 1;
+      return activationRead(
+        fixture,
+        readCalls === 1 ? "uncertain" : "committed",
+        request,
+      );
+    },
   });
   const storage = storageBackendHarness(async () => prepared);
   const { coordinator } = createCoordinator(
@@ -1067,26 +2731,516 @@ test("recovers activation finalization acknowledgement loss without a second att
     storage,
   );
 
-  const first = await coordinator.reconcileRestoreAttachmentActivation(
-    activationCandidate(fixture),
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
   );
-  const second = await coordinator.reconcileRestoreAttachmentActivation(
+
+  assert.equal(readCalls, 1);
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("does not treat malformed immediate or fulfilled handoffs as acknowledgement loss", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const scenarios = [
+    [
+      "immediate thenable",
+      (calls) => ({
+        then() {
+          calls.then += 1;
+        },
+      }),
+    ],
+    [
+      "fulfilled generator",
+      (calls) =>
+        Promise.resolve((function* invalidHandoff() {
+          calls.body += 1;
+          yield activationHandoff(fixture, request);
+        })()),
+    ],
+  ];
+
+  for (const [scenario, makeHandoff] of scenarios) {
+    const calls = { body: 0, then: 0 };
+    let readCalls = 0;
+    const harness = authorityHarness({
+      "read-activation": async () => {
+        readCalls += 1;
+        return activationRead(
+          fixture,
+          readCalls === 1 ? "uncertain" : "committed",
+          request,
+        );
+      },
+    });
+    harness.authority
+      .finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt =
+        function finalizeRestoreAttachmentActivation() {
+          return makeHandoff(calls);
+        };
+    const storage = storageBackendHarness(async () =>
+      activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      harness.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.equal(readCalls, 1, scenario);
+    assert.deepEqual(calls, { body: 0, then: 0 }, scenario);
+  }
+});
+
+test("rejects forged activation operation bindings before provider work", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const scenarios = [
+    ["request digest", (receipt) => {
+      const forged = "a".repeat(64);
+      receipt.operation.requestSha256 = forged;
+      receipt.reservation.requestSha256 = forged;
+      receipt.session.document.activeOperation.requestSha256 = forged;
+    }],
+    ["reservation id", (receipt) => {
+      const forged = "forged-reservation-001";
+      receipt.reservation.reservationId = forged;
+      receipt.session.document.activeOperation.reservationId = forged;
+    }],
+    ["reservation timestamp", (receipt) => {
+      receipt.reservation.updatedAt = "2026-08-05T00:03:01.000Z";
+    }],
+    ["reordered expected snapshot", (receipt) => {
+      receipt.operation.expectedSession = reversedDataObject(
+        receipt.operation.expectedSession,
+      );
+      synchronizeForgedOperationDigest(receipt);
+    }],
+    ["reordered nested expected-session identity", (receipt) => {
+      const manifest = receipt.operation.expectedSession.document.manifest;
+      manifest.runtime = reversedDataObject(manifest.runtime);
+      receipt.session.document.manifest = structuredClone(manifest);
+      receipt.activationRequest.manifest = structuredClone(manifest);
+      synchronizeForgedOperationDigest(receipt);
+    }],
+  ];
+
+  for (const [scenario, mutate] of scenarios) {
+    const forged = activationRead(fixture, "uncertain", request);
+    mutate(forged);
+    let finalizeCalls = 0;
+    const authority = authorityHarness({
+      "finalize-activation": async () => {
+        finalizeCalls += 1;
+        return activationHandoff(fixture, request);
+      },
+      "read-activation": async () => forged,
+    });
+    const storage = storageBackendHarness(async () =>
+      activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.equal(finalizeCalls, 0, scenario);
+    assert.equal(storage.providerCalls.length, 0, scenario);
+  }
+});
+
+test("rejects activation operation timestamps that run backwards", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+
+  for (const state of ["starting", "uncertain", "committed"]) {
+    const forged = activationRead(fixture, state, request);
+    const updatedAt = "2026-08-05T00:02:59.000Z";
+    forged.operation.updatedAt = updatedAt;
+    forged.reservation.updatedAt = updatedAt;
+    if (state === "committed") {
+      forged.operation.retiredAt = updatedAt;
+      forged.reservation.releasedAt = updatedAt;
+    } else {
+      forged.session.updatedAt = updatedAt;
+    }
+    const authority = authorityHarness({
+      "read-activation": async () => forged,
+    });
+    const storage = storageBackendHarness(async () =>
+      activationResult(request));
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      state,
+    );
+
+    assert.equal(storage.providerCalls.length, 0, state);
+  }
+});
+
+test("accepts an activation commit whose wall clock precedes the prior read", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prior = activationRead(fixture, "uncertain", request);
+  prior.operation.updatedAt = "2026-08-05T00:05:00.000Z";
+  prior.reservation.updatedAt = prior.operation.updatedAt;
+  prior.session.updatedAt = prior.operation.updatedAt;
+  const authority = authorityHarness({
+    "finalize-activation": async () =>
+      activationHandoff(fixture, request),
+    "read-activation": async () => prior,
+  });
+  const storage = storageBackendHarness(async () =>
+    activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
     activationCandidate(fixture),
   );
 
-  assert.equal(first.operation.state, "committed");
-  assert.equal(second.operation.state, "committed");
+  assert.equal(result.activation.operation.updatedAt, "2026-08-05T00:04:00.000Z");
+  assert.equal(result.launch.operation.state, "prepared");
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("rejects committed activation history below its terminal revision", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forged = activationRead(fixture, "committed", request);
+  forged.session.revision = "23";
+  const authority = authorityHarness({
+    "read-activation": async () => forged,
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects a committed activation at the pre-terminal revision", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forged = activationRead(fixture, "committed", request);
+  forged.operation.revision = "1";
+  forged.session.revision = "22";
+  const authority = authorityHarness({
+    "read-activation": async () => forged,
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects inconsistent later current-session history for a committed activation", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forged = activationRead(fixture, "committed", request);
+  forged.session.document.lastOperation.operationRevision = "1";
+  let finalizeCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      return activationHandoff(fixture, request);
+    },
+    "read-activation": async () => forged,
+  });
+  const storage = storageBackendHarness(async () =>
+    activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(finalizeCalls, 0);
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("replays the atomic finalizer for an already committed activation", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = structuredClone(activationHandoff(fixture, request));
+  replay.activation.finalized = false;
+  let finalizeCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async (input) => {
+      finalizeCalls += 1;
+      assert.equal(input.expectedOperationRevision, "2");
+      return replay;
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "committed", request),
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("an already committed activation must not reattach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.activation.finalized, false);
+  assert.equal(result.launch.operation.state, "prepared");
   assert.equal(finalizeCalls, 1);
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("replays a revision-two activation committed during uncertain-transition acknowledgement loss", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const replay = structuredClone(activationHandoff(fixture, request, "2"));
+  replay.activation.finalized = false;
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async (input) => {
+      assert.equal(input.expectedOperationRevision, "1");
+      return replay;
+    },
+    "mark-uncertain": async (input) => {
+      assert.equal(input.expectedOperationRevision, "1");
+      throw new Error("uncertain transition acknowledgement lost");
+    },
+    "read-activation": async () => {
+      readCalls += 1;
+      return activationRead(
+        fixture,
+        readCalls === 1 ? "starting" : "committed",
+        request,
+        null,
+        readCalls === 1 ? null : "2",
+      );
+    },
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("a committed activation readback must not reattach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.activation.operation.revision, "2");
+  assert.equal(result.launch.operation.state, "prepared");
+  assert.deepEqual(
+    authority.calls.map(([name]) => name),
+    [
+      "read-activation",
+      "mark-uncertain",
+      "read-activation",
+      "finalize-activation",
+    ],
+  );
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("rejects finalized true when replaying an already committed activation", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const authority = authorityHarness({
+    "finalize-activation": async () => activationHandoff(fixture, request),
+    "read-activation": async () =>
+      activationRead(fixture, "committed", request),
+  });
+  const storage = storageBackendHarness(async () => {
+    throw new Error("an already committed activation must not reattach");
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(storage.providerCalls.length, 0);
+});
+
+test("recovers activation finalization acknowledgement loss without a second attach", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  const replay = structuredClone(activationHandoff(fixture, request));
+  replay.activation.finalized = false;
+  let finalizeCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      if (finalizeCalls === 1) {
+        throw new Error("activation finalization acknowledgement lost");
+      }
+      return replay;
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(async () => prepared);
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    activationCandidate(fixture),
+  );
+
+  assert.equal(result.activation.operation.state, "committed");
+  assert.equal(result.activation.finalized, false);
+  assert.equal(result.launch.operation.state, "prepared");
+  assert.equal(finalizeCalls, 2);
   assert.equal(storage.providerCalls.length, 1);
   assert.deepEqual(
     authority.calls.map(([name]) => name),
     [
       "read-activation",
       "finalize-activation",
-      "read-activation",
-      "read-activation",
+      "finalize-activation",
     ],
   );
+  assert.deepEqual(storage.forbiddenCalls, []);
+  assert.deepEqual(fixture.transitionGuard.calls, []);
+});
+
+test("fails after two uncertain activation finalization attempts without a second attach", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  let finalizeCalls = 0;
+  let readCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      throw new Error("activation finalization outcome remains uncertain");
+    },
+    "read-activation": async () => {
+      readCalls += 1;
+      return activationRead(fixture, "uncertain", request);
+    },
+  });
+  const storage = storageBackendHarness(async () =>
+    activationResult(request));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(readCalls, 1);
+  assert.equal(finalizeCalls, 2);
+  assert.equal(storage.providerCalls.length, 1);
   assert.deepEqual(storage.forbiddenCalls, []);
   assert.deepEqual(fixture.transitionGuard.calls, []);
 });
@@ -1142,6 +3296,527 @@ test("rejects a provider Promise subclass without invoking its overridden then",
   assert.deepEqual(fixture.transitionGuard.calls, []);
 });
 
+test("maps provider-created coordinator-error Promise rejections to uncertainty", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forgedReason =
+    new PostgresRestoreActivationRecoveryCoordinatorError(
+      "invalid_postgres_restore_activation_recovery_coordinator_request",
+    );
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      throw new Error("rejected provider result must not finalize");
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() => Promise.reject(forgedReason));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    (error) => {
+      assert.notEqual(error, forgedReason);
+      return assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      )(error);
+    },
+  );
+});
+
+test("rejects an ordinary provider thenable before invoking then", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  let thenCalls = 0;
+  let finalizeCalls = 0;
+  const thenable = {
+    then(resolve) {
+      thenCalls += 1;
+      resolve(prepared);
+    },
+  };
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      throw new Error("ordinary thenable must not reach finalization");
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() => thenable);
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(thenCalls, 0);
+  assert.equal(finalizeCalls, 0);
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("rejects a top-level provider Proxy without invoking a trap", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const trapCalls = {
+    get: 0,
+    getOwnPropertyDescriptor: 0,
+    getPrototypeOf: 0,
+  };
+  let finalizeCalls = 0;
+  const proxied = new Proxy(activationResult(request), {
+    get(target, key, receiver) {
+      trapCalls.get += 1;
+      return Reflect.get(target, key, receiver);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      trapCalls.getOwnPropertyDescriptor += 1;
+      return Reflect.getOwnPropertyDescriptor(target, key);
+    },
+    getPrototypeOf(target) {
+      trapCalls.getPrototypeOf += 1;
+      return Reflect.getPrototypeOf(target);
+    },
+  });
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      throw new Error("provider Proxy must not reach finalization");
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() => proxied);
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.deepEqual(trapCalls, {
+    get: 0,
+    getOwnPropertyDescriptor: 0,
+    getPrototypeOf: 0,
+  });
+  assert.equal(finalizeCalls, 0);
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("rejects a never-completing ordinary thenable without hanging", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  let thenCalls = 0;
+  let finalizeCalls = 0;
+  const neverCompletes = {
+    then() {
+      thenCalls += 1;
+    },
+  };
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      throw new Error("never-completing thenable must not finalize");
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() => neverCompletes);
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assertPromptCoordinatorRejection(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+  );
+
+  assert.equal(thenCalls, 0);
+  assert.equal(finalizeCalls, 0);
+  assert.equal(storage.providerCalls.length, 1);
+});
+
+test("rejects direct hostile async-shaped provider values without executing user code", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  const scenarios = [
+    ["own then accessor", (calls) => {
+      const value = {};
+      Object.defineProperty(value, "then", {
+        get() {
+          calls.getter += 1;
+          return () => {
+            calls.then += 1;
+          };
+        },
+      });
+      return value;
+    }],
+    ["inherited then accessor", (calls) => {
+      const prototype = {};
+      Object.defineProperty(prototype, "then", {
+        get() {
+          calls.getter += 1;
+          return () => {
+            calls.then += 1;
+          };
+        },
+      });
+      return Object.create(prototype);
+    }],
+    ["own callable then", (calls) => ({
+      then() {
+        calls.then += 1;
+      },
+    })],
+    ["own non-callable then", () => ({ then: 1 })],
+    ["inherited callable then", (calls) =>
+      Object.create({
+        then() {
+          calls.then += 1;
+        },
+      })],
+    ["inherited non-callable then", () =>
+      Object.create({ then: 1 })],
+    ["generator with hostile then", (calls) => {
+      function* hostileGenerator() {
+        calls.body += 1;
+        yield prepared;
+      }
+      const value = hostileGenerator();
+      value.then = () => {
+        calls.then += 1;
+      };
+      return value;
+    }],
+    ["async generator with hostile then", (calls) => {
+      async function* hostileAsyncGenerator() {
+        calls.body += 1;
+        yield prepared;
+      }
+      const value = hostileAsyncGenerator();
+      value.then = () => {
+        calls.then += 1;
+      };
+      return value;
+    }],
+    ["Promise constructor accessor", (calls) => {
+      const value = Promise.resolve(prepared);
+      Object.defineProperty(value, "constructor", {
+        get() {
+          calls.getter += 1;
+          return Promise;
+        },
+      });
+      return value;
+    }],
+    ["proxy prototype", (calls) => {
+      const prototype = new Proxy({}, {
+        get() {
+          calls.trap += 1;
+        },
+        getOwnPropertyDescriptor() {
+          calls.trap += 1;
+        },
+        getPrototypeOf() {
+          calls.trap += 1;
+        },
+      });
+      return Object.create(prototype);
+    }],
+    ["Promise proxy prototype", (calls) => {
+      const prototype = new Proxy({}, {
+        get() {
+          calls.trap += 1;
+        },
+        getOwnPropertyDescriptor() {
+          calls.trap += 1;
+        },
+        getPrototypeOf() {
+          calls.trap += 1;
+        },
+      });
+      const value = Promise.resolve(prepared);
+      Object.setPrototypeOf(value, prototype);
+      return value;
+    }],
+    ["Promise prototype reset", () => {
+      const value = Promise.resolve(prepared);
+      Object.setPrototypeOf(value, null);
+      return value;
+    }],
+    ["revoked top-level Proxy", (calls) => {
+      const revocable = Proxy.revocable(prepared, {
+        get() {
+          calls.trap += 1;
+        },
+        getOwnPropertyDescriptor() {
+          calls.trap += 1;
+        },
+        getPrototypeOf() {
+          calls.trap += 1;
+        },
+      });
+      revocable.revoke();
+      return revocable.proxy;
+    }],
+  ];
+
+  for (const [scenario, makeValue] of scenarios) {
+    const calls = { body: 0, getter: 0, then: 0, trap: 0 };
+    let finalizeCalls = 0;
+    const value = makeValue(calls);
+    const authority = authorityHarness({
+      "finalize-activation": async () => {
+        finalizeCalls += 1;
+        throw new Error("hostile provider value must not finalize");
+      },
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(() => value);
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.deepEqual(
+      calls,
+      { body: 0, getter: 0, then: 0, trap: 0 },
+      scenario,
+    );
+    assert.equal(finalizeCalls, 0, scenario);
+    assert.equal(storage.providerCalls.length, 1, scenario);
+  }
+});
+
+test("accepts native Promises without reading an own hostile then accessor", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+
+  for (const species of ["intrinsic", "safe holder"]) {
+    const prepared = activationResult(request);
+    let thenGetterCalls = 0;
+    let thenCalls = 0;
+    let pending = Promise.resolve(prepared);
+    Object.defineProperty(pending, "then", {
+      configurable: true,
+      get() {
+        thenGetterCalls += 1;
+        return () => {
+          thenCalls += 1;
+        };
+      },
+    });
+    if (species === "safe holder") {
+      pending = withSafePromiseSpecies(pending);
+    }
+    const authority = authorityHarness({
+      "finalize-activation": async () =>
+        activationHandoff(fixture, request),
+      "read-activation": async () =>
+        activationRead(fixture, "uncertain", request),
+    });
+    const storage = storageBackendHarness(() => pending);
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    const result = await coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    );
+
+    assert.equal(result.launch.operation.state, "prepared", species);
+    assert.equal(thenGetterCalls, 0, species);
+    assert.equal(thenCalls, 0, species);
+  }
+});
+
+test("rejects safe-species fulfillment mutated into a thenable without invoking it", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  let thenGetterCalls = 0;
+  let thenCalls = 0;
+  let finalizeCalls = 0;
+  const pending = withSafePromiseSpecies(Promise.resolve(prepared));
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      return activationHandoff(fixture, request);
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() => {
+    queueMicrotask(() => {
+      Object.defineProperty(prepared, "then", {
+        configurable: true,
+        get() {
+          thenGetterCalls += 1;
+          return () => {
+            thenCalls += 1;
+          };
+        },
+      });
+    });
+    return pending;
+  });
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(thenGetterCalls, 0);
+  assert.equal(thenCalls, 0);
+  assert.equal(finalizeCalls, 0);
+});
+
+test("rejects a Promise smuggled through outer fulfillment before reading its then", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const inner = Promise.resolve(activationResult(request));
+  Object.setPrototypeOf(inner, null);
+  let resolveOuter;
+  const outer = new Promise((resolve) => {
+    resolveOuter = resolve;
+  });
+  resolveOuter(inner);
+  Object.setPrototypeOf(inner, Promise.prototype);
+  let thenGetterCalls = 0;
+  let thenCalls = 0;
+  Object.defineProperty(inner, "then", {
+    configurable: true,
+    get() {
+      thenGetterCalls += 1;
+      return () => {
+        thenCalls += 1;
+      };
+    },
+  });
+  let finalizeCalls = 0;
+  const authority = authorityHarness({
+    "finalize-activation": async () => {
+      finalizeCalls += 1;
+      return activationHandoff(fixture, request);
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() => outer);
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(thenGetterCalls, 0);
+  assert.equal(thenCalls, 0);
+  assert.equal(finalizeCalls, 0);
+});
+
+test("maps safe-species Promise rejection to a fresh uncertainty error", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const forgedReason =
+    new PostgresRestoreActivationRecoveryCoordinatorError(
+      "invalid_postgres_restore_activation_recovery_coordinator_request",
+    );
+  const authority = authorityHarness({
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request),
+  });
+  const storage = storageBackendHarness(() =>
+    withSafePromiseSpecies(Promise.reject(forgedReason)));
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture),
+    ),
+    (error) => {
+      assert.notEqual(error, forgedReason);
+      return assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      )(error);
+    },
+  );
+});
+
 test("rejects executable and incomplete authority receipts before provider work", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
@@ -1179,7 +3854,7 @@ test("rejects executable and incomplete authority receipts before provider work"
           return Reflect.get(target, key, receiver);
         },
       });
-    } else {
+    } else if (scenario === "incomplete") {
       delete receipt.reservation;
     }
     const authority = authorityHarness({
@@ -1214,29 +3889,27 @@ test("rejects executable and incomplete authority receipts before provider work"
   }
 });
 
-test("rejects a conflicting committed activation readback after lost finalization acknowledgement", async (t) => {
+test("rejects a conflicting activation handoff returned by the acknowledgement-loss retry", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
   const request = activationRequest(fixture);
   const prepared = activationResult(request);
-  const conflicting = structuredClone(prepared);
-  conflicting.attachment.proofId = "proof-attach-conflict";
-  conflicting.mutationResult.proofId = "proof-attach-conflict";
-  let committed = false;
+  const conflicting = structuredClone(activationHandoff(fixture, request));
+  conflicting.activation.operation.result.activationResult.attachment.proofId =
+    "proof-attach-conflict";
+  conflicting.activation.operation.result.activationResult.mutationResult.proofId =
+    "proof-attach-conflict";
   let finalizeCalls = 0;
   const authority = authorityHarness({
     "finalize-activation": async () => {
       finalizeCalls += 1;
-      committed = true;
-      throw new Error("activation finalization acknowledgement lost");
+      if (finalizeCalls === 1) {
+        throw new Error("activation finalization acknowledgement lost");
+      }
+      return conflicting;
     },
     "read-activation": async () =>
-      activationRead(
-        fixture,
-        committed ? "committed" : "uncertain",
-        request,
-        committed ? conflicting : null,
-      ),
+      activationRead(fixture, "uncertain", request),
   });
   const storage = storageBackendHarness(async () => prepared);
   const { coordinator } = createCoordinator(
@@ -1254,7 +3927,7 @@ test("rejects a conflicting committed activation readback after lost finalizatio
     ),
   );
 
-  assert.equal(finalizeCalls, 1);
+  assert.equal(finalizeCalls, 2);
   assert.equal(storage.providerCalls.length, 1);
   assert.deepEqual(storage.forbiddenCalls, []);
   assert.deepEqual(fixture.transitionGuard.calls, []);

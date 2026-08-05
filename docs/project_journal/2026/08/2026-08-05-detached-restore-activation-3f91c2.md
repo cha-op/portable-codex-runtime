@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-05
 updated: 2026-08-05
 branch: wip/detached-restore-activation
-pr:
+pr: 30
 supersedes: []
 superseded_by:
 ---
@@ -156,7 +156,15 @@ reports unreadable or failed revalidation separately from absence.
 - `docs/architecture/stopped-directory-publication.md`
 - Focused committed-destination publication coverage: 13/13 passing; full
   `test/stopped-directory-publication.test.mjs`: 178/178 passing.
-- `test/postgres-restore-activation-recovery-coordinator.test.mjs`: 10/10
+- `test/postgres-restore-activation-recovery-coordinator.test.mjs`: 55/55
+  passing; coverage includes canonical authority receipt reconstruction,
+  source-free generation replay, activation acknowledgement loss, provider
+  key-order normalization, and prepared/starting/uncertain/terminal launch
+  handoffs.
+- `test/postgres-session-operation-kernel.test.mjs`: 210/210 passing,
+  including activation-created prepared, starting, and uncertain launch
+  recovery provenance.
+- The combined coordinator and operation-kernel run completed 265/265
   passing.
 - `node --check src/postgres-restore-activation-recovery-service.mjs` and
   `test/postgres-restore-activation-recovery-service.test.mjs`: 13/13 passing.
@@ -166,6 +174,9 @@ reports unreadable or failed revalidation separately from absence.
   v2 correction: `No findings.`
 - Independent migration, authority, lock-order, revision-budget, and replay
   audit: `No findings.`
+- Final independent full-diff and test-contract audits after the receipt,
+  canonical-order, snapshot-history, and reachable-fixture fixes:
+  `No findings.`
 - Node.js `v24.18.0` from the installed runtime inventory:
   `npm test -- --test-reporter=dot` completed with exit 0. The managed sandbox
   made the unchanged live app-server `fs.watch` test fail with `EMFILE`; the

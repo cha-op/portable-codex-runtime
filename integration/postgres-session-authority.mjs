@@ -2166,7 +2166,11 @@ function checkpointCompletion(context, replayed) {
 function assertOperationReceipt(
   receipt,
   state,
-  { currentTerminal = state === "committed" } = {},
+  {
+    activeOperationId =
+      state === "committed" ? null : receipt.operation.operationId,
+    currentTerminal = state === "committed",
+  } = {},
 ) {
   assert.equal(receipt.status, state);
   assert.equal(receipt.operation.state, state);
@@ -2177,7 +2181,7 @@ function assertOperationReceipt(
   assert.equal(
     receipt.session.document.activeOperation?.operationId ??
       null,
-    state === "committed" ? null : receipt.operation.operationId,
+    activeOperationId,
   );
   if (currentTerminal) {
     assert.equal(state, "committed");
@@ -2817,7 +2821,10 @@ test(
               "SELECT operation_id",
               "FROM session_authority.operation_id_registry",
               "WHERE session_id = ANY($1::uuid[])",
-              "AND claim_type = 'restore-launch-intent-v2'",
+              "AND claim_type IN (",
+              "'restore-launch-intent-v2',",
+              "'restore-activation-launch-intent-v1'",
+              ")",
               ")",
             ].join(" "),
             [sessionIds],
@@ -2826,7 +2833,10 @@ test(
             [
               "DELETE FROM session_authority.operation_id_registry",
               "WHERE session_id = ANY($1::uuid[])",
-              "AND claim_type = 'restore-launch-intent-v2'",
+              "AND claim_type IN (",
+              "'restore-launch-intent-v2',",
+              "'restore-activation-launch-intent-v1'",
+              ")",
             ].join(" "),
             [sessionIds],
           );
@@ -6645,7 +6655,14 @@ test(
         const read = await authority.readRestoreAttachmentActivation({
           operationId: activationInput.operationId,
         });
-        assertOperationReceipt(read, "committed");
+        assertOperationReceipt(read, "committed", {
+          activeOperationId: launchAttemptId,
+          currentTerminal: false,
+        });
+        assert.equal(
+          read.session.document.lastOperation.operationId,
+          activationInput.operationId,
+        );
         assert.deepEqual(
           structuredClone(read.activationRequest),
           structuredClone(claimed.activationRequest),

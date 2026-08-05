@@ -3753,7 +3753,7 @@ function canonicalOperationEnvelope(value, code) {
   });
 }
 
-function canonicalOperationInput(options, keys = OPERATION_INPUT_KEYS) {
+function canonicalOperationBinding(options, keys = OPERATION_INPUT_KEYS) {
   const normalized = exactPlainObject(
     options,
     keys,
@@ -3803,8 +3803,40 @@ function canonicalOperationInput(options, keys = OPERATION_INPUT_KEYS) {
     reservationId,
     serializedEnvelope,
   });
+  return input;
+}
+
+function canonicalOperationInput(options, keys = OPERATION_INPUT_KEYS) {
+  const input = canonicalOperationBinding(options, keys);
   validateTypedOperationInput(input);
   return input;
+}
+
+/**
+ * Canonicalizes the shared identity binding for one session operation.
+ * Consumers that validate persisted operation receipts can use this helper
+ * without duplicating the authority's snapshot and envelope byte contract.
+ */
+export function assertSessionOperationBinding(...args) {
+  ensure(args.length === 1, "invalid_operation_request");
+  const input = canonicalOperationBinding(args[0]);
+  return deepFreeze({
+    expectedSession: input.expectedSession,
+    kind: input.kind,
+    operationId: input.operationId,
+    request: input.request,
+    requestSha256: input.requestSha256,
+    reservationId: input.reservationId,
+  });
+}
+
+/**
+ * Canonicalizes and validates one complete session-authority snapshot,
+ * including its active or terminal revision-state relation.
+ */
+export function assertSessionAuthoritySnapshot(...args) {
+  ensure(args.length === 1, "invalid_operation_request");
+  return expectedSnapshotFromValue(args[0]);
 }
 
 function canonicalLeaseDuration(value, code) {
@@ -10623,7 +10655,11 @@ export class PostgresSessionAuthority {
               canonicalSerialize(operation),
           "operation_state_invalid",
         );
-        isAtomicRestoreLaunchHandoff(session, observed);
+        isAtomicRestoreLaunchHandoff(session, observed) ||
+          isAtomicRestoreAttachmentActivationLaunchHandoff(
+            session,
+            observed,
+          );
         if (index < candidateCount) {
           candidates[index] = deepFreeze({
             launchAttemptId: input.operationId,

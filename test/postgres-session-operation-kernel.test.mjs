@@ -123,6 +123,10 @@ const RESTORE_ACTIVATION_PREPARED_NOW = "2026-07-29T12:36:20.000Z";
 const RESTORE_ACTIVATION_DISPATCH_NOW = "2026-07-29T12:36:21.000Z";
 const RESTORE_ACTIVATION_AUTHORITY_NOW = "2026-07-29T12:36:21.500Z";
 const RESTORE_ACTIVATION_FINALIZE_NOW = "2026-07-29T12:36:22.000Z";
+const RESTORE_ACTIVATION_LAUNCH_DISPATCH_NOW =
+  "2026-07-29T12:36:23.000Z";
+const RESTORE_ACTIVATION_LAUNCH_UNCERTAIN_NOW =
+  "2026-07-29T12:36:24.000Z";
 const REPLAY_STOP_PREPARED_NOW = "2026-07-29T12:35:24.000Z";
 const REPLAY_STOP_DISPATCH_NOW = "2026-07-29T12:35:25.000Z";
 const REPLAY_STOP_FINALIZE_NOW = "2026-07-29T12:35:26.000Z";
@@ -3738,22 +3742,110 @@ function restoreAttachmentActivationLaunchFixture(fixture) {
   };
 }
 
-function restoreAttachmentActivationLaunchPreparedSessionRow(fixture) {
-  const launch = restoreAttachmentActivationLaunchFixture(fixture);
+function restoreAttachmentActivationLaunchActiveSessionRow(
+  fixture,
+  {
+    launch = restoreAttachmentActivationLaunchFixture(fixture),
+    state = "prepared",
+    updatedAt = RESTORE_ACTIVATION_FINALIZE_NOW,
+  } = {},
+) {
   const expected = launch.options.expectedSession;
+  const operationRevision =
+    state === "prepared" ? "0" : state === "starting" ? "1" : "2";
   return sessionRow({
     sessionId: expected.sessionId,
-    revision: (BigInt(expected.revision) + 1n).toString(),
+    revision: (
+      BigInt(expected.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
     sessionDocument: document(expected.sessionId, {
       ...structuredClone(expected.document),
-      activeOperation: activeOperation("prepared", {
-        operationRevision: "0",
+      activeOperation: activeOperation(state, {
+        operationRevision,
         options: launch.options,
       }),
     }),
     createdAt: expected.createdAt,
-    updatedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+    updatedAt,
   });
+}
+
+function restoreAttachmentActivationLaunchProducerRelationSteps(
+  fixture,
+  launchIdClaim,
+) {
+  return [
+    rows(restoreAttachmentActivationCommittedOperationRow(fixture)),
+    rows(restoreAttachmentActivationReleasedReservationRow(fixture)),
+    ...writerLaunchGenerationReferenceSteps(fixture.launch),
+    rows(fixture.releaseOperation),
+    rows(fixture.releaseReservation),
+    rows(writerLaunchStopOperationRow(fixture.stop, "committed")),
+    rows(writerLaunchStopReservationRow(fixture.stop, "released")),
+    ...writerLaunchCommittedRelationSteps(fixture.launch),
+    rows(launchIdClaim),
+  ];
+}
+
+function restoreAttachmentActivationLaunchRecoverySteps(
+  fixture,
+  {
+    launch = restoreAttachmentActivationLaunchFixture(fixture),
+    state = "prepared",
+    launchCreatedAt = RESTORE_ACTIVATION_FINALIZE_NOW,
+    launchUpdatedAt =
+      state === "prepared"
+        ? RESTORE_ACTIVATION_FINALIZE_NOW
+        : state === "starting"
+          ? RESTORE_ACTIVATION_LAUNCH_DISPATCH_NOW
+          : RESTORE_ACTIVATION_LAUNCH_UNCERTAIN_NOW,
+    launchIdClaim = restoreAttachmentActivationLaunchIdClaimRow(fixture, {
+      materializedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+    }),
+  } = {},
+) {
+  const launchOperation = writerLaunchOperationRow(launch, state, {
+    createdAt: launchCreatedAt,
+    updatedAt: launchUpdatedAt,
+  });
+  const launchReservation = writerLaunchReservationRow(
+    launch,
+    state,
+    {
+      createdAt: launchCreatedAt,
+      updatedAt: launchUpdatedAt,
+    },
+  );
+  const steps = [
+    rows(launchOperation),
+    rows(
+      restoreAttachmentActivationLaunchActiveSessionRow(fixture, {
+        launch,
+        state,
+        updatedAt: launchUpdatedAt,
+      }),
+    ),
+    rows(launchOperation),
+    rows(launchReservation),
+  ];
+  if (state !== "prepared") {
+    steps.push(...writerLaunchGenerationReferenceSteps(fixture.launch));
+    steps.push(
+      ...restoreAttachmentActivationLaunchProducerRelationSteps(
+        fixture,
+        launchIdClaim,
+      ),
+    );
+  }
+  steps.push(
+    ...restoreAttachmentActivationLaunchProducerRelationSteps(
+      fixture,
+      launchIdClaim,
+    ),
+  );
+  return steps;
 }
 
 function writerLaunchCheckpointReplacementFixture(launch) {
@@ -11282,6 +11374,103 @@ test("writer launch recovery enumeration includes exact prepared intents", async
   clients[0].assertExhausted();
 });
 
+test("writer launch recovery enumeration validates activation-created handoff provenance", async (t) => {
+  const fixture = restoreAttachmentActivationFixture();
+  const launch = restoreAttachmentActivationLaunchFixture(fixture);
+
+  for (const state of ["prepared", "starting", "uncertain"]) {
+    await t.test(`valid ${state} handoff`, async () => {
+      const { authority, clients } = authorityWithScripts(
+        restoreAttachmentActivationLaunchRecoverySteps(fixture, { state }),
+      );
+
+      const page = await authority.listWriterLaunchAttemptRecoveryCandidates({
+        afterSessionId: null,
+        limit: 1,
+      });
+
+      assert.deepEqual(page, {
+        candidates: [
+          {
+            launchAttemptId: launch.options.operationId,
+            request: launch.request,
+            state,
+          },
+        ],
+        nextAfterSessionId: null,
+      });
+      assertDeepFrozen(page);
+      clients[0].assertExhausted();
+    });
+  }
+
+  const corruptedSupervisor = {
+    ...structuredClone(launch.supervisor),
+    supervisorId: "restore-activation-supervisor-corrupt",
+  };
+  const corruptedRequest = createWriterLaunchAttemptOperationRequest({
+    expectedSession: launch.options.expectedSession,
+    generation: launch.generation,
+    measuredImage: launch.measuredImage,
+    supervisor: corruptedSupervisor,
+  });
+  const corruptedLaunch = {
+    ...launch,
+    options: {
+      ...launch.options,
+      request: corruptedRequest,
+    },
+    request: corruptedRequest,
+    supervisor: corruptedSupervisor,
+  };
+  const corruptionCases = [
+    {
+      name: "activation-derived launch input",
+      steps: restoreAttachmentActivationLaunchRecoverySteps(fixture, {
+        launch: corruptedLaunch,
+      }),
+    },
+    {
+      name: "materialized launch claim timestamp",
+      steps: restoreAttachmentActivationLaunchRecoverySteps(fixture, {
+        launchIdClaim: restoreAttachmentActivationLaunchIdClaimRow(
+          fixture,
+          { materializedAt: "2026-07-29T12:36:23.000Z" },
+        ),
+      }),
+    },
+    {
+      name: "launch createdAt provenance",
+      steps: restoreAttachmentActivationLaunchRecoverySteps(fixture, {
+        state: "starting",
+        launchCreatedAt: "2026-07-29T12:36:22.500Z",
+      }),
+    },
+  ];
+  for (const corruption of corruptionCases) {
+    await t.test(corruption.name, async () => {
+      const { authority, clients } = authorityWithScripts(
+        corruption.steps,
+      );
+
+      await assertAuthorityError(
+        authority.listWriterLaunchAttemptRecoveryCandidates({
+          afterSessionId: null,
+          limit: 1,
+        }),
+        { code: "operation_state_invalid" },
+      );
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+});
+
 test("current writer launch recovery uses sparse bounded session pages", async () => {
   const launch = writerLaunchFixture({
     destinationIsolationProofId: "destination-isolation-proof-current-page",
@@ -15520,7 +15709,7 @@ test("restore attachment activation finalization atomically commits the attachme
           materializedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
         }),
       ),
-      rows(restoreAttachmentActivationLaunchPreparedSessionRow(fixture)),
+      rows(restoreAttachmentActivationLaunchActiveSessionRow(fixture)),
     ],
   });
 
