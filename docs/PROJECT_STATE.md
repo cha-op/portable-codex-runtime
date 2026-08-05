@@ -176,10 +176,16 @@
   authority proves both the operation and its ID claim absent. A strictly newer
   same-incarnation session may then replace that input only after the complete
   stop relation and lease expiry remain monotonic from the retained
-  precondition. Durable `prepared` or explicitly granted `starting` state
-  reconciles without repeating claim or physical stop. Claim acknowledgement
-  loss and an explicit non-grant remain closed because the durable operation
-  does not identify its claimant. A lease renewal may extend expiration while
+  precondition. Stop request contract version 2 persists only a
+  domain-separated digest of a high-entropy dispatch claimant token; the raw
+  token stays in the local writer record and is required by typed claim and
+  reconciliation. Exact legacy version 1 requests remain readable and
+  finalizable with their original edge-only claim semantics. Durable v2
+  `prepared` or token-matched `starting` state reconciles without repeating
+  physical stop. A local attempted-claim witness plus the durable token match
+  recovers COMMIT acknowledgement loss, while a pre-commit failure, foreign
+  token, explicit mismatch, or never-attempted `starting` state remains
+  closed. A lease renewal may extend expiration while
   the stable registered writer-fence tuple remains exact; expiry rollback or
   identity drift rejects before stop reserve.
   After one confirmed physical stop, exact reconciliation selects revision 2

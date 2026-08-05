@@ -1082,13 +1082,17 @@ complete current stop relation and requires lease expiration to remain
 monotonic from both registration and the retained stop precondition before
 freezing a replacement input. This closes the read/renew/reserve race without
 discarding an operation whose reserve acknowledgement may have been lost.
-`prepared` may repeat claim, while `starting` may enter the first physical stop
-only when the retained record proves this facade received and validated the
-exact `dispatchGranted: true` claim receipt and has not entered the coordinator. An
-invocation error or explicit non-grant never creates this witness: without a
-durable claimant token, local acknowledgement loss is indistinguishable from a
-foreign claimant winning before readback. `uncertain`, `committed`, foreign,
-and cold-start state remain closed.
+`prepared` may repeat claim. Stop request contract version 2 stores a
+domain-separated SHA-256 digest of a high-entropy dispatch claimant token,
+while the raw token remains only in the local writer record and travels as an
+outer argument to typed claim and reconciliation. `starting` may enter the first physical stop
+only when reconciliation proves that token match, the local record proves it
+attempted the claim, and it has not entered the coordinator. This distinguishes
+a committed claim whose acknowledgement was lost from a pre-commit failure or
+a foreign token without persisting the bearer. An explicit mismatch,
+never-attempted `starting`, `uncertain`, `committed`, and cold-start state remain
+closed. Exact legacy request version 1 remains readable and finalizable; its
+claim path retains the original edge-only grant and cannot use token recovery.
 
 The stop preflight compares the current lease's stable contract, session,
 lease, holder, and fencing-epoch identity with the lease registered for the
@@ -1104,10 +1108,14 @@ to reject serialized history as a local handle or complete-stop authority.
 
 The PostgreSQL authority separately adds typed `writer-launch-stop-v1` state.
 `createWriterLaunchStopOperationRequest()` accepts only a version 3 `ATTACHED`
-session with no other active operation and embeds its complete current-launch
-pointer. `claimWriterLaunchStopDispatch()` grants the typed
-`prepared -> starting` transition once; it deliberately does not make lease
-validity a stop gate, and `starting` or `uncertain` retains the launch.
+session with no other active operation. Exact request version 1 embeds the
+complete current-launch pointer; version 2 additionally embeds the dispatch
+claimant digest. V1 claim/reconcile retains the original receipt shape and
+edge-only semantics. V2 `claimWriterLaunchStopDispatch()` requires the matching
+raw token and grants the typed `prepared -> starting` transition once.
+Same-token replay reports a matched claimant without granting the edge again;
+a mismatched token performs no transition. Lease validity is deliberately not
+a stop gate, and `starting` or `uncertain` retains the launch.
 `finalizeWriterLaunchStopped()` accepts only the complete seven-field
 supervisor evidence for the original launch with `status: "complete-stopped"`.
 After one confirmed physical stop, the launcher first finalizes revision 1 and

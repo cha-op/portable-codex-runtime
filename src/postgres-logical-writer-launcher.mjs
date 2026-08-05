@@ -1,4 +1,4 @@
-import { Hash, createHash } from "node:crypto";
+import { Hash, createHash, randomUUID } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -32,6 +32,7 @@ const ArrayConstructor = Array;
 const arrayPrototype = Array.prototype;
 const BigIntConstructor = BigInt;
 const createHashIntrinsic = createHash;
+const randomUUIDIntrinsic = randomUUID;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const DateConstructor = Date;
@@ -166,6 +167,7 @@ const STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
 ]);
 const STOP_FINALIZATION_MAX_ATTEMPTS = 3;
 const STOP_RESERVATION_MAX_ATTEMPTS = 3;
+const WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION = 2;
 const STOP_RESOLUTION_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
   "processIncarnationId",
@@ -371,12 +373,14 @@ const STOP_RESERVE_RECEIPT_KEYS = objectFreeze([
   "status",
 ]);
 const STOP_RECONCILE_RECEIPT_KEYS = objectFreeze([
+  "claimTokenMatched",
   "operation",
   "reservation",
   "session",
   "status",
 ]);
 const STOP_RECONCILE_ABSENT_RECEIPT_KEYS = objectFreeze([
+  "claimTokenMatched",
   "expectedSessionMatched",
   "operation",
   "reservation",
@@ -384,6 +388,7 @@ const STOP_RECONCILE_ABSENT_RECEIPT_KEYS = objectFreeze([
   "status",
 ]);
 const STOP_CLAIM_RECEIPT_KEYS = objectFreeze([
+  "claimTokenMatched",
   "dispatchGranted",
   "launch",
   "operation",
@@ -408,6 +413,11 @@ const STOP_RECORD_KEYS = objectFreeze([
   "result",
   "state",
   "stopOperationId",
+]);
+const STOP_REQUEST_KEYS = objectFreeze([
+  "contractVersion",
+  "dispatchClaimSha256",
+  "launch",
 ]);
 const READ_RECEIPT_KEYS = objectFreeze([
   "attempt",
@@ -2074,7 +2084,7 @@ function normalizeStopPhaseOperation(value, baseInput, states, code) {
 function normalizeStopRecord(value, operation, baseInput, code) {
   const stop = exactDataObject(value, STOP_RECORD_KEYS, code);
   ensure(
-    stop.contractVersion === LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION &&
+    stop.contractVersion === baseInput.request.contractVersion &&
       stop.launchAttemptId === baseInput.request.launch.launchAttemptId &&
       stop.stopOperationId === baseInput.operationId &&
       stop.state === operation.state &&
@@ -2136,6 +2146,7 @@ function normalizeStopReconcileReceipt(value, baseInput, code) {
       receipt.operation === null &&
         receipt.reservation === null &&
         receipt.status === "absent" &&
+        receipt.claimTokenMatched === false &&
         typeof expectedSessionMatched === "boolean" &&
         expectedSessionMatched === exactExpectedSession &&
         (expectedSessionMatched ||
@@ -2161,6 +2172,7 @@ function normalizeStopReconcileReceipt(value, baseInput, code) {
       code,
     );
     return exactFrozenRecord({
+      claimTokenMatched: false,
       expectedSessionMatched,
       operation: null,
       reservation: null,
@@ -2169,6 +2181,7 @@ function normalizeStopReconcileReceipt(value, baseInput, code) {
     });
   }
   ensure(!objectHasOwn(receipt, "expectedSessionMatched"), code);
+  ensure(typeof receipt.claimTokenMatched === "boolean", code);
   const operation = normalizeStopPhaseOperation(
     receipt.operation,
     baseInput,
@@ -2189,6 +2202,7 @@ function normalizeStopReconcileReceipt(value, baseInput, code) {
   validateSessionPointer(session, operation, reservation, null, code);
   validateActiveSessionRelation(session, operation, reservation, code);
   return exactFrozenRecord({
+    claimTokenMatched: receipt.claimTokenMatched,
     operation,
     reservation,
     session,
@@ -2198,7 +2212,11 @@ function normalizeStopReconcileReceipt(value, baseInput, code) {
 
 function normalizeStopClaimReceipt(value, baseInput, code) {
   const receipt = exactDataObject(value, STOP_CLAIM_RECEIPT_KEYS, code);
-  ensure(typeof receipt.dispatchGranted === "boolean", code);
+  ensure(
+    typeof receipt.claimTokenMatched === "boolean" &&
+      typeof receipt.dispatchGranted === "boolean",
+    code,
+  );
   const operation = normalizeStopPhaseOperation(
     receipt.operation,
     baseInput,
@@ -2217,6 +2235,7 @@ function normalizeStopClaimReceipt(value, baseInput, code) {
       session.sessionId === operation.sessionId &&
       sameContent(launch, baseInput.request.launch, code) &&
       sameContent(session.document.launch, launch, code) &&
+      (!receipt.dispatchGranted || receipt.claimTokenMatched) &&
       (receipt.dispatchGranted
         ? operation.state === "starting"
         : operation.state === "prepared" ||
@@ -2233,6 +2252,7 @@ function normalizeStopClaimReceipt(value, baseInput, code) {
     code,
   );
   return exactFrozenRecord({
+    claimTokenMatched: receipt.claimTokenMatched,
     dispatchGranted: receipt.dispatchGranted,
     launch,
     operation,
@@ -2367,6 +2387,35 @@ function canonicalJsonProjectionSha256(value, code) {
   return canonicalJsonSha256(
     canonicalJsonDataTree(snapshotData(value, code)),
     code,
+  );
+}
+
+function createStopClaimToken(code) {
+  let token;
+  try {
+    token = callIntrinsic(randomUUIDIntrinsic, undefined, []);
+  } catch {
+    fail(code);
+  }
+  ensure(typeof token === "string" && regexpTest(UUID_PATTERN, token), code);
+  return token;
+}
+
+function stopClaimTokenMatchesRequest(claimToken, requestValue, code) {
+  const request = exactDataObject(requestValue, STOP_REQUEST_KEYS, code);
+  ensure(
+    request.contractVersion === WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+    code,
+  );
+  return (
+    sha256Parts(
+      [
+        "portable-codex-runtime:writer-launch-stop-claim:v1",
+        "\0",
+        claimToken,
+      ],
+      code,
+    ) === assertSha256(request.dispatchClaimSha256, code)
   );
 }
 
@@ -2978,7 +3027,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
       request: claim.attempt.request,
       state: "registering",
       stopBaseInput: null,
-      stopClaimGrantAcknowledgedFor: null,
+      stopClaimAttemptedFor: null,
+      stopClaimToken: null,
       stopEvidence: null,
       stopReceipt: null,
       stopWriter: callbackReceipt.stopWriter,
@@ -3061,10 +3111,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
             try {
               const phase = await reconcileStopOperation(
                 record.pendingStop.baseInput,
+                record.stopClaimToken,
               );
               ensure(
-                phase.status === "starting" ||
-                  phase.status === "uncertain",
+                phase.claimTokenMatched === true &&
+                  (phase.status === "starting" ||
+                    phase.status === "uncertain"),
                 outcomeCode,
               );
               expectedOperationRevision =
@@ -3685,6 +3737,16 @@ export function createPostgresLogicalWriterLauncher(...args) {
         record.authorizedStopOperationId === derivedStopOperationId,
       code,
     );
+    if (record.authorizedStopOperationId === null) {
+      // The raw bearer never enters the durable operation or public
+      // resolution; only its domain-separated digest is persisted.
+      record.stopClaimToken = createStopClaimToken(code);
+    }
+    ensure(
+      typeof record.stopClaimToken === "string" &&
+        regexpTest(UUID_PATTERN, record.stopClaimToken),
+      code,
+    );
     record.authorizedCapture = capture;
     record.authorizedStopOperationId = derivedStopOperationId;
     return record;
@@ -3736,12 +3798,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
     );
   }
 
-  async function reconcileStopOperation(baseInput) {
+  async function reconcileStopOperation(baseInput, claimToken) {
     return normalizeStopReconcileReceipt(
       await invokeAsync(
         authority,
         "reconcileWriterLaunchStopOperation",
-        [baseInput],
+        [exactFrozenRecord({ ...baseInput, claimToken })],
         outcomeCode,
       ),
       baseInput,
@@ -3753,11 +3815,13 @@ export function createPostgresLogicalWriterLauncher(...args) {
     expectedSession,
     record,
     stopOperation,
+    claimToken,
     code,
   ) {
     let typedRequest;
     try {
       typedRequest = createWriterLaunchStopOperationRequest({
+        claimToken,
         expectedSession,
       });
     } catch {
@@ -3809,6 +3873,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
     const capture = normalizeCaptureTuple(stopArgs[0], optionCode);
     const initialRecord = captureRecord(capture, ["ready"], optionCode);
     const stopOperation = initialRecord.authorizedStopOperationId;
+    const claimToken = initialRecord.stopClaimToken;
+    ensure(
+      typeof claimToken === "string" && regexpTest(UUID_PATTERN, claimToken),
+      optionCode,
+    );
     const uncertaintyState = { attempted: false };
     try {
       return await invokeGuard(
@@ -3841,6 +3910,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 expectedSession,
                 record,
                 stopOperation,
+                claimToken,
                 optionCode,
               );
               record.stopBaseInput = baseInput;
@@ -3851,13 +3921,18 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   baseInput.request.launch,
                   record.launch,
                   outcomeCode,
+                ) &&
+                stopClaimTokenMatchesRequest(
+                  claimToken,
+                  baseInput.request,
+                  outcomeCode,
                 ),
               outcomeCode,
             );
 
             let phase = null;
             if (retainedBaseInput) {
-              phase = await reconcileStopOperation(baseInput);
+              phase = await reconcileStopOperation(baseInput, claimToken);
             }
             for (
               let attempt = 0;
@@ -3888,6 +3963,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   phase.session,
                   record,
                   stopOperation,
+                  claimToken,
                   outcomeCode,
                 );
                 record.stopBaseInput = baseInput;
@@ -3897,16 +3973,20 @@ export function createPostgresLogicalWriterLauncher(...args) {
               try {
                 phase = await reserveStopOperation(baseInput);
               } catch {
-                phase = await reconcileStopOperation(baseInput);
+                phase = await reconcileStopOperation(baseInput, claimToken);
               }
             }
             ensure(phase !== null && phase.status !== "absent", outcomeCode);
 
-            let hasAcknowledgedClaimGrant =
-              record.stopClaimGrantAcknowledgedFor === stopOperation;
+            if (
+              phase.status !== "prepared" &&
+              phase.claimTokenMatched !== true
+            ) {
+              phase = await reconcileStopOperation(baseInput, claimToken);
+            }
+
             if (phase.status === "prepared") {
-              record.stopClaimGrantAcknowledgedFor = null;
-              hasAcknowledgedClaimGrant = false;
+              record.stopClaimAttemptedFor = stopOperation;
               let claimValue;
               let claimInvocationFailed = false;
               try {
@@ -3916,6 +3996,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   [
                     exactFrozenRecord({
                       ...baseInput,
+                      claimToken,
                       expectedOperationRevision: "0",
                     }),
                   ],
@@ -3923,9 +4004,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 );
               } catch {
                 claimInvocationFailed = true;
-                record.stopClaimGrantAcknowledgedFor = null;
-                hasAcknowledgedClaimGrant = false;
-                phase = await reconcileStopOperation(baseInput);
+                phase = await reconcileStopOperation(baseInput, claimToken);
               }
               if (!claimInvocationFailed) {
                 phase = normalizeStopClaimReceipt(
@@ -3933,15 +4012,26 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   baseInput,
                   outcomeCode,
                 );
-                if (phase.dispatchGranted) {
-                  record.stopClaimGrantAcknowledgedFor = stopOperation;
-                  hasAcknowledgedClaimGrant = true;
-                }
+              }
+              if (
+                phase.status === "prepared" ||
+                phase.claimTokenMatched !== true
+              ) {
+                record.stopClaimAttemptedFor = null;
               }
             }
             const physicalStopAuthorized =
+              // Protect claimant identity, not mere starting-state content:
+              // the durable digest, authority match, and local attempted edge
+              // must all identify this record's claim.
               phase.status === "starting" &&
-              record.stopClaimGrantAcknowledgedFor === stopOperation;
+              phase.claimTokenMatched === true &&
+              record.stopClaimAttemptedFor === stopOperation &&
+              stopClaimTokenMatchesRequest(
+                claimToken,
+                baseInput.request,
+                outcomeCode,
+              );
             if (!physicalStopAuthorized && phase.status !== "prepared") {
               record.state = "lost";
             }
@@ -3969,7 +4059,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 record.pendingStop = null;
                 record.state = "lost";
               }
-              if (hasAcknowledgedClaimGrant) {
+              if (physicalStopAuthorized) {
                 await bestEffortMarkStopUncertain(
                   baseInput,
                   uncertaintyState,

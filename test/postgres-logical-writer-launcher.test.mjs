@@ -15,7 +15,6 @@ import {
   WRITER_LAUNCH_STOP_OPERATION_KIND,
   assertCommittedWriterLaunchStopTransitionProof,
   createWriterLaunchAttemptOperationRequest,
-  createWriterLaunchStopOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
@@ -79,6 +78,12 @@ function jsonSha256(value) {
 
 function textSha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function stopClaimSha256(claimToken) {
+  return textSha256(
+    `portable-codex-runtime:writer-launch-stop-claim:v1\0${claimToken}`,
+  );
 }
 
 function imageFixture() {
@@ -639,7 +644,7 @@ class MemoryLaunchAuthority {
 
   stopRecord(operation = this.stopOperation()) {
     return {
-      contractVersion: 1,
+      contractVersion: this.stopBaseInput.request.contractVersion,
       launchAttemptId: this.stopBaseInput.request.launch.launchAttemptId,
       request: clone(this.stopBaseInput.request),
       result: clone(operation.result),
@@ -715,9 +720,7 @@ class MemoryLaunchAuthority {
           expectedSession,
           kind: input.kind,
           operationId: input.operationId,
-          request: createWriterLaunchStopOperationRequest({
-            expectedSession,
-          }),
+          request: clone(input.request),
         };
         this.stopState = "prepared";
         if (this.behaviour.stopReserveThrowAfterCommit) {
@@ -792,6 +795,7 @@ class MemoryLaunchAuthority {
           : this.expectedSession,
       );
       return {
+        claimTokenMatched: false,
         expectedSessionMatched:
           jsonStringify(session) === jsonStringify(expectedSession),
         operation: null,
@@ -800,13 +804,19 @@ class MemoryLaunchAuthority {
         status: "absent",
       };
     }
+    const { claimToken, ...baseInput } = input;
     assert.deepEqual(
-      JSON.parse(jsonStringify(input)),
+      JSON.parse(jsonStringify(baseInput)),
       JSON.parse(jsonStringify(this.stopBaseInput)),
     );
+    const claimTokenMatched =
+      !this.behaviour.stopForeignClaimBeforeReconcile &&
+      stopClaimSha256(claimToken) ===
+        this.stopBaseInput.request.dispatchClaimSha256;
     const operation = this.stopOperation();
     const reservation = this.stopReservation(operation);
     return {
+      claimTokenMatched,
       operation,
       reservation,
       session: this.stopSession(operation, reservation),
@@ -873,8 +883,9 @@ class MemoryLaunchAuthority {
   async claimWriterLaunchStopDispatch(input) {
     this.calls.stopClaim += 1;
     this.events.push("authority.claim-stop");
+    const { claimToken, ...transitionInput } = input;
     assert.deepEqual(
-      JSON.parse(jsonStringify(input)),
+      JSON.parse(jsonStringify(transitionInput)),
       JSON.parse(
         jsonStringify({
           ...this.stopBaseInput,
@@ -882,10 +893,14 @@ class MemoryLaunchAuthority {
         }),
       ),
     );
+    const claimTokenMatched =
+      stopClaimSha256(claimToken) ===
+      this.stopBaseInput.request.dispatchClaimSha256;
     if (this.stopState !== "prepared") {
       const operation = this.stopOperation();
       const reservation = this.stopReservation(operation);
       return {
+        claimTokenMatched,
         dispatchGranted: false,
         launch: clone(this.stopBaseInput.request.launch),
         operation,
@@ -898,11 +913,26 @@ class MemoryLaunchAuthority {
     if (this.behaviour.stopClaimThrowBeforeCommit) {
       throw new Error("stop claim unavailable before commit");
     }
+    if (!claimTokenMatched) {
+      const operation = this.stopOperation();
+      const reservation = this.stopReservation(operation);
+      return {
+        claimTokenMatched: false,
+        dispatchGranted: false,
+        launch: clone(this.stopBaseInput.request.launch),
+        operation,
+        reservation,
+        session: this.stopSession(operation, reservation),
+        status: "prepared",
+        stop: this.stopRecord(operation),
+      };
+    }
     if (this.behaviour.stopClaimLosesPreparedRace) {
       this.stopState = "starting";
       const operation = this.stopOperation();
       const reservation = this.stopReservation(operation);
       return {
+        claimTokenMatched: false,
         dispatchGranted: false,
         launch: clone(this.stopBaseInput.request.launch),
         operation,
@@ -919,6 +949,7 @@ class MemoryLaunchAuthority {
     const operation = this.stopOperation();
     const reservation = this.stopReservation(operation);
     return {
+      claimTokenMatched,
       dispatchGranted: true,
       launch: clone(this.stopBaseInput.request.launch),
       operation,
@@ -1669,6 +1700,19 @@ test("exports one exact frozen facade and starts/registers before durable finali
   assert.equal(stopped.evidence.status, "complete-stopped");
   assert.equal(stopped.evidence.proofId, resolved.stopOperationId);
   assert.equal(stopped.stop.status, "committed");
+  assert.deepEqual(Reflect.ownKeys(stopped.stop.operation.request), [
+    "contractVersion",
+    "dispatchClaimSha256",
+    "launch",
+  ]);
+  assert.match(
+    stopped.stop.operation.request.dispatchClaimSha256,
+    /^[0-9a-f]{64}$/u,
+  );
+  assert.equal(
+    Object.hasOwn(stopped.stop.operation.request, "claimToken"),
+    false,
+  );
   assertCommittedWriterLaunchStopTransitionProof({
     after: stopped.stop.session,
     before: stopped.stop.operation.expectedSession,
@@ -1863,7 +1907,7 @@ for (const [name, currentLease] of [
   });
 }
 
-test("stop claim acknowledgement loss remains closed before physical stop", async () => {
+test("stop claim acknowledgement loss recovers the owned physical stop", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
   const readsBeforeStop = value.events.filter(
@@ -1871,13 +1915,13 @@ test("stop claim acknowledgement loss remains closed before physical stop", asyn
   ).length;
   value.authority.behaviour.stopClaimThrowAfterCommit = true;
 
-  await assert.rejects(
-    value.facade.stopWriterForCapture(resolverInput(value)),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
   );
 
-  assert.equal(value.authority.stopState, "starting");
-  assert.equal(value.supervisorStopCalls, 0);
+  assert.equal(stopped.stop.status, "committed");
+  assert.equal(value.authority.stopState, "committed");
+  assert.equal(value.supervisorStopCalls, 1);
   assert.equal(value.authority.calls.stopClaim, 1);
   assert.equal(
     value.events.filter((entry) => entry === "authority.read-session").length -
@@ -1886,7 +1930,7 @@ test("stop claim acknowledgement loss remains closed before physical stop", asyn
   );
   assert.equal(value.authority.calls.stopReconcile, 1);
   assert.equal(value.authority.calls.markUncertain, 0);
-  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 1);
 
   await assert.rejects(
     value.facade.stopWriterForCapture(resolverInput(value)),
@@ -1894,7 +1938,7 @@ test("stop claim acknowledgement loss remains closed before physical stop", asyn
   );
   assert.equal(value.authority.calls.stopClaim, 1);
   assert.equal(value.authority.calls.stopReconcile, 1);
-  assert.equal(value.supervisorStopCalls, 0);
+  assert.equal(value.supervisorStopCalls, 1);
 });
 
 test("a pre-commit stop claim failure clears its witness before retry", async () => {
@@ -2017,7 +2061,7 @@ test("exact stop replay resumes a retained prepared operation before physical st
   assert.equal(value.supervisorStopCalls, 1);
 });
 
-test("exact stop replay cannot adopt an unacknowledged starting claim", async () => {
+test("exact stop replay recovers an owned unacknowledged starting claim", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
   value.authority.behaviour.stopClaimThrowAfterCommit = true;
@@ -2030,14 +2074,14 @@ test("exact stop replay cannot adopt an unacknowledged starting claim", async ()
   assert.equal(value.authority.stopState, "starting");
   assert.equal(value.supervisorStopCalls, 0);
 
-  await assert.rejects(
-    value.facade.stopWriterForCapture(resolverInput(value)),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
   );
+  assert.equal(stopped.stop.status, "committed");
   assert.equal(value.authority.calls.stopClaim, 1);
   assert.equal(value.authority.calls.stopReconcile, 2);
-  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
-  assert.equal(value.supervisorStopCalls, 0);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 1);
+  assert.equal(value.supervisorStopCalls, 1);
 });
 
 for (const durableState of ["starting", "uncertain"]) {

@@ -78,6 +78,7 @@ const RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-launch-intent-v2";
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION = 1;
+const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2 = 2;
 const WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_POINTER_CONTRACT_VERSION = 1;
 const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
@@ -139,6 +140,14 @@ const OPERATION_TRANSITION_INPUT_KEYS = Object.freeze([
   "kind",
   "operationId",
   "request",
+]);
+const WRITER_LAUNCH_STOP_RECONCILE_INPUT_KEYS = Object.freeze([
+  "claimToken",
+  ...OPERATION_INPUT_KEYS,
+]);
+const WRITER_LAUNCH_STOP_TRANSITION_INPUT_KEYS = Object.freeze([
+  "claimToken",
+  ...OPERATION_TRANSITION_INPUT_KEYS,
 ]);
 const OPERATION_CANCELLATION_INPUT_KEYS = Object.freeze([
   "expectedOperationRevision",
@@ -404,6 +413,13 @@ const WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS = Object.freeze([
   "contractVersion",
   "launch",
 ]);
+const WRITER_LAUNCH_STOP_OPERATION_REQUEST_V2_KEYS = Object.freeze([
+  "contractVersion",
+  "dispatchClaimSha256",
+  "launch",
+]);
+const WRITER_LAUNCH_STOP_CLAIM_DOMAIN =
+  "portable-codex-runtime:writer-launch-stop-claim:v1";
 const WRITER_LAUNCH_GENERATION_KEYS = Object.freeze([
   "bindingSha256",
   "checkpointId",
@@ -3366,9 +3382,18 @@ export function createWriterLaunchAttemptOperationRequest(options) {
 }
 
 function writerLaunchStopOperationRequest(value, expectedSession, code) {
+  const contractVersion = ownDataValue(value, "contractVersion", code);
+  ensure(
+    contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION ||
+      contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2,
+    code,
+  );
   const request = exactPlainObject(
     value,
-    WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS,
+    contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION
+      ? WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS
+      : WRITER_LAUNCH_STOP_OPERATION_REQUEST_V2_KEYS,
     code,
   );
   const document = expectedSession.document;
@@ -3378,18 +3403,27 @@ function writerLaunchStopOperationRequest(value, expectedSession, code) {
     code,
   );
   ensure(
-    request.contractVersion ===
-        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION &&
-      document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+    document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
       document.lifecycle === "ATTACHED" &&
       document.activeOperation === null &&
       document.launch !== null &&
       canonicalSerialize(launch) === canonicalSerialize(document.launch),
     code,
   );
+  if (contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2) {
+    ensure(
+      typeof request.dispatchClaimSha256 === "string" &&
+        regexpTest(SHA256_PATTERN, request.dispatchClaimSha256),
+      code,
+    );
+  }
   return canonicalJsonObject(
     {
-      contractVersion: WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+      contractVersion,
+      ...(contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+        ? { dispatchClaimSha256: request.dispatchClaimSha256 }
+        : {}),
       launch,
     },
     code,
@@ -3397,9 +3431,12 @@ function writerLaunchStopOperationRequest(value, expectedSession, code) {
 }
 
 export function createWriterLaunchStopOperationRequest(options) {
+  const hasClaimToken = hasWriterLaunchStopClaimToken(options);
   const normalized = exactPlainObject(
     options,
-    ["expectedSession"],
+    hasClaimToken
+      ? ["claimToken", "expectedSession"]
+      : ["expectedSession"],
     "invalid_operation_request",
   );
   const expectedSession = expectedSnapshotFromValue(
@@ -3408,7 +3445,17 @@ export function createWriterLaunchStopOperationRequest(options) {
   );
   return writerLaunchStopOperationRequest(
     {
-      contractVersion: WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+      contractVersion: hasClaimToken
+        ? WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+        : WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+      ...(hasClaimToken
+        ? {
+            dispatchClaimSha256: writerLaunchStopClaimSha256(
+              normalized.claimToken,
+              "invalid_operation_request",
+            ),
+          }
+        : {}),
       launch: expectedSession.document.launch,
     },
     expectedSession,
@@ -4314,14 +4361,70 @@ function writerLaunchStopInput(
   return deepFreeze({ ...input, request });
 }
 
-function writerLaunchStopTransitionInput(options) {
+function canonicalWriterLaunchStopClaimToken(value, code) {
+  ensure(
+    typeof value === "string" && regexpTest(UUID_PATTERN, value),
+    code,
+  );
+  return value;
+}
+
+function hasWriterLaunchStopClaimToken(options) {
+  return (
+    options !== null &&
+    typeof options === "object" &&
+    !arrayIsArray(options) &&
+    !isProxyValue(options) &&
+    objectHasOwn(options, "claimToken")
+  );
+}
+
+function writerLaunchStopClaimSha256(value, code) {
+  const claimToken = canonicalWriterLaunchStopClaimToken(value, code);
+  return sha256(`${WRITER_LAUNCH_STOP_CLAIM_DOMAIN}\0${claimToken}`);
+}
+
+function writerLaunchStopReconcileInput(options) {
+  const hasClaimToken = hasWriterLaunchStopClaimToken(options);
   const input = writerLaunchStopInput(
     options,
-    OPERATION_TRANSITION_INPUT_KEYS,
+    hasClaimToken
+      ? WRITER_LAUNCH_STOP_RECONCILE_INPUT_KEYS
+      : OPERATION_INPUT_KEYS,
+  );
+  ensure(
+    (input.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2) === hasClaimToken,
+    "invalid_operation_request",
+  );
+  if (!hasClaimToken) return input;
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_STOP_RECONCILE_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    ...input,
+    claimToken: canonicalWriterLaunchStopClaimToken(
+      normalized.claimToken,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function writerLaunchStopTransitionInput(options) {
+  const hasClaimToken = hasWriterLaunchStopClaimToken(options);
+  const input = writerLaunchStopInput(
+    options,
+    hasClaimToken
+      ? WRITER_LAUNCH_STOP_TRANSITION_INPUT_KEYS
+      : OPERATION_TRANSITION_INPUT_KEYS,
   );
   const normalized = exactPlainObject(
     options,
-    OPERATION_TRANSITION_INPUT_KEYS,
+    hasClaimToken
+      ? WRITER_LAUNCH_STOP_TRANSITION_INPUT_KEYS
+      : OPERATION_TRANSITION_INPUT_KEYS,
     "invalid_operation_request",
   );
   const expectedOperationRevision = canonicalRevisionForCode(
@@ -4329,7 +4432,23 @@ function writerLaunchStopTransitionInput(options) {
     "invalid_operation_request",
   );
   ensure(expectedOperationRevision === "0", "invalid_operation_request");
-  return deepFreeze({ ...input, expectedOperationRevision });
+  ensure(
+    (input.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2) === hasClaimToken,
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    ...input,
+    ...(hasClaimToken
+      ? {
+          claimToken: canonicalWriterLaunchStopClaimToken(
+            normalized.claimToken,
+            "invalid_operation_request",
+          ),
+        }
+      : {}),
+    expectedOperationRevision,
+  });
 }
 
 function canonicalWriterLaunchEvidence(value, input, statuses, code) {
@@ -6556,7 +6675,7 @@ function writerLaunchAttemptRecord(input, operation) {
 
 function writerLaunchStopRecord(input, operation) {
   return deepFreeze({
-    contractVersion: WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+    contractVersion: input.request.contractVersion,
     launchAttemptId: input.request.launch.launchAttemptId,
     request: input.request,
     result: operation.result,
@@ -9433,7 +9552,7 @@ export class PostgresSessionAuthority {
   }
 
   async reconcileWriterLaunchStopOperation(options) {
-    const input = writerLaunchStopInput(options);
+    const input = writerLaunchStopReconcileInput(options);
     return runSerializable(this.#store, async (transaction) => {
       // Lock the session before proving absence so an earlier ambiguous
       // reserve must finish committing or rolling back before this read.
@@ -9454,6 +9573,16 @@ export class PostgresSessionAuthority {
           "operation_state_invalid",
         );
         return operationReceipt({
+          ...(input.request.contractVersion ===
+          WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+            ? {
+                claimTokenMatched:
+                  writerLaunchStopClaimSha256(
+                    input.claimToken,
+                    "invalid_operation_request",
+                  ) === input.request.dispatchClaimSha256,
+              }
+            : {}),
           operation: observed.operation,
           reservation: observed.reservation,
           session,
@@ -9481,6 +9610,10 @@ export class PostgresSessionAuthority {
         );
       }
       return operationReceipt({
+        ...(input.request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+          ? { claimTokenMatched: false }
+          : {}),
         expectedSessionMatched,
         operation: null,
         reservation: null,
@@ -10854,8 +10987,18 @@ export class PostgresSessionAuthority {
           observed.launchStop !== null,
         "operation_transition_conflict",
       );
+      const usesClaimToken =
+        input.request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2;
+      const claimTokenMatched =
+        usesClaimToken &&
+        writerLaunchStopClaimSha256(
+          input.claimToken,
+          "invalid_operation_request",
+        ) === input.request.dispatchClaimSha256;
       if (observed.operation.state !== "prepared") {
         return operationReceipt({
+          ...(usesClaimToken ? { claimTokenMatched } : {}),
           dispatchGranted: false,
           launch: currentWriterLaunchForAttempt(
             session,
@@ -10875,6 +11018,17 @@ export class PostgresSessionAuthority {
             canonicalSerialize(input.request.launch),
         "operation_transition_conflict",
       );
+      if (usesClaimToken && !claimTokenMatched) {
+        return operationReceipt({
+          claimTokenMatched: false,
+          dispatchGranted: false,
+          launch: session.document.launch,
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+          stop: writerLaunchStopRecord(input, observed.operation),
+        });
+      }
       revisionAfter(session.revision, 3);
       const operationRows = rowsFromResult(
         await transaction.query(START_OPERATION_QUERY.text, [
@@ -10905,6 +11059,7 @@ export class PostgresSessionAuthority {
       );
       validateActivePointer(updatedSession, operation, reservation);
       return operationReceipt({
+        ...(usesClaimToken ? { claimTokenMatched: true } : {}),
         dispatchGranted: true,
         launch: updatedSession.document.launch,
         operation,

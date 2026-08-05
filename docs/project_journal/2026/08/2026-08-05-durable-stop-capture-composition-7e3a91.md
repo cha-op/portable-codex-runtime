@@ -37,12 +37,17 @@ detached-destination activation, and bounded restart recovery remain closed.
   lease expiration are revalidated against both registration and the prior
   input. This recovers a renewal between read and reserve without discarding an
   ambiguously committed operation. Later calls proceed only from `prepared`,
-  or from `starting` only after the same record received the exact true-grant
-  receipt while it still proves the coordinator and physical stop have not
-  begun. A thrown claim or explicit non-grant never creates that witness
-  because the durable state cannot distinguish acknowledgement loss from a
-  foreign claimant. It never repeats claim for known `starting` state or
-  synthesizes operation timestamps from a session.
+  or from `starting` only after the same record attempted the claim and the
+  authority proves that the durable operation matches its retained raw
+  dispatch claimant token. Request contract version 2 persists only the
+  token's domain-separated SHA-256 digest; claim and reconciliation carry the
+  raw token outside the stored operation. Exact legacy version 1 requests
+  retain their original edge-only claim and terminal recovery paths. V2
+  recovers a committed claim whose
+  acknowledgement was lost without adopting a pre-commit failure, foreign
+  token, explicit mismatch, or never-attempted `starting` state. It never
+  repeats claim for known owned `starting` state or synthesizes operation
+  timestamps from a session.
 - Stop preflight accepts a current lease only when its contract, session,
   lease, holder, and fencing-epoch identity remains exact and its canonical
   expiration has not moved backwards. This preserves stop/capture across

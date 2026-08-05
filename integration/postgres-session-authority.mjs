@@ -1844,11 +1844,18 @@ function writerLaunchStopInput(
   expectedSession,
   { operationId = `writer-launch-stop-${randomUUID()}` } = {},
 ) {
+  const claimToken = randomUUID();
   return {
-    expectedSession,
-    kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
-    operationId,
-    request: createWriterLaunchStopOperationRequest({ expectedSession }),
+    claimToken,
+    input: {
+      expectedSession,
+      kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+      operationId,
+      request: createWriterLaunchStopOperationRequest({
+        claimToken,
+        expectedSession,
+      }),
+    },
   };
 }
 
@@ -6539,7 +6546,7 @@ test(
     );
 
     await t.test(
-      "logical writer launcher recovers a read-reserve renewal race before uncertain stop finalization",
+      "logical writer launcher recovers renewal and stop-claim acknowledgement loss before finalization",
       async () => {
         const sessionId = randomUUID();
         sessionIds.push(sessionId);
@@ -6576,7 +6583,13 @@ test(
         let stopReadSession = null;
         let stopRenewalArmed = false;
         let stopReserveAttempts = 0;
+        let stopClaimAcknowledgementLosses = 0;
         let stopUncertaintyInput = null;
+        const stopClaimLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+          }),
+        });
         const launcherAuthority = {
           async cancelPreparedOperation(options) {
             return authority.cancelPreparedOperation(options);
@@ -6585,6 +6598,12 @@ test(
             return authority.claimWriterLaunchAttemptDispatch(options);
           },
           async claimWriterLaunchStopDispatch(options) {
+            if (stopClaimAcknowledgementLosses === 0) {
+              stopClaimAcknowledgementLosses += 1;
+              return stopClaimLossAuthority.claimWriterLaunchStopDispatch(
+                options,
+              );
+            }
             return authority.claimWriterLaunchStopDispatch(options);
           },
           async finalizeWriterLaunchAttemptStarted(options) {
@@ -6748,6 +6767,7 @@ test(
         assert.notEqual(renewedDuringStopReserve, null);
         assert.equal(renewedDuringStopReserve.renewed, true);
         assert.equal(stopReserveAttempts, 2);
+        assert.equal(stopClaimAcknowledgementLosses, 1);
         assert.equal(stopped.stop.status, "committed");
         assert.equal(stopped.stop.operation.revision, "3");
         assert.equal(stopped.evidence.status, "complete-stopped");
@@ -7833,7 +7853,10 @@ test(
           [launchInput.operationId],
         );
         assert.equal(originalBefore.rows.length, 1);
-        const stopInput = writerLaunchStopInput(launched.session);
+        const {
+          claimToken: stopClaimToken,
+          input: stopInput,
+        } = writerLaunchStopInput(launched.session);
         const prepared = await authority.reserveOperation(stopInput);
         assertOperationReceipt(prepared, "prepared");
 
@@ -7843,6 +7866,7 @@ test(
         );
         const claimInput = {
           ...structuredClone(stopInput),
+          claimToken: stopClaimToken,
           expectedOperationRevision: "0",
         };
         const claimLossAuthority = new PostgresSessionAuthority({
@@ -7860,7 +7884,24 @@ test(
           );
         assertOperationReceipt(claimReplay, "starting");
         assert.equal(claimReplay.dispatchGranted, false);
+        assert.equal(claimReplay.claimTokenMatched, true);
         assert.deepEqual(claimReplay.session.document.launch, launched.launch);
+        const wrongTokenReplay =
+          await authority.claimWriterLaunchStopDispatch({
+            ...structuredClone(stopInput),
+            claimToken: randomUUID(),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(wrongTokenReplay, "starting");
+        assert.equal(wrongTokenReplay.dispatchGranted, false);
+        assert.equal(wrongTokenReplay.claimTokenMatched, false);
+        const reconciledClaim =
+          await authority.reconcileWriterLaunchStopOperation({
+            ...structuredClone(stopInput),
+            claimToken: stopClaimToken,
+          });
+        assertOperationReceipt(reconciledClaim, "starting");
+        assert.equal(reconciledClaim.claimTokenMatched, true);
 
         const uncertain = await authority.markOperationUncertain({
           ...structuredClone(stopInput),
