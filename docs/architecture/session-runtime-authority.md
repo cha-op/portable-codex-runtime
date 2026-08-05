@@ -1101,6 +1101,11 @@ pointer. `claimWriterLaunchStopDispatch()` grants the typed
 validity a stop gate, and `starting` or `uncertain` retains the launch.
 `finalizeWriterLaunchStopped()` accepts only the complete seven-field
 supervisor evidence for the original launch with `status: "complete-stopped"`.
+After one confirmed physical stop, the launcher first finalizes revision 1 and
+uses exact operation reconciliation to select revision 2 only when authority
+readback proves `uncertain`. A committed readback is recovered through the
+matching predecessor-revision replay; no finalization retry invokes physical
+stop again.
 It leaves the original started operation unchanged while atomically releasing
 the stop reservation, clearing the current launch, and advancing
 `lastOperation`. The authority does not call a supervisor automatically.

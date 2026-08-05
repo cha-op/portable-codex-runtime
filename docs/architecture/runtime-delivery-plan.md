@@ -218,8 +218,10 @@ Restore and launcher authority are now split into eight serial pull requests:
      reconcile only the exact same-process `prepared` or explicitly granted
      `starting` pre-dispatch state, accept lease-expiration extension only for
      the same stable writer-fence identity, and block same-session successor
-     launch in the canonical local coordinator until retirement. Ambiguous stop,
-     finalisation, capture, or retirement stays fail-closed.
+     launch in the canonical local coordinator until retirement. Finalize from
+     exact `starting` or authority-proven `uncertain` without repeating physical
+     stop. Ambiguous stop, finalisation, capture, or retirement stays
+     fail-closed.
 7. **Detached restore activation and recovery composition**
    - Keep the absent restore-publication destination independent from the
      current active attachment. After exact committed publication, obtain

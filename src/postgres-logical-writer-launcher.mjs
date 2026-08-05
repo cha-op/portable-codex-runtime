@@ -164,6 +164,7 @@ const STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
   "launchAttemptId",
   "request",
 ]);
+const STOP_FINALIZATION_MAX_ATTEMPTS = 3;
 const STOP_RESOLUTION_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
   "processIncarnationId",
@@ -2134,7 +2135,7 @@ function normalizeStopReconcileReceipt(value, baseInput, code) {
   const operation = normalizeStopPhaseOperation(
     receipt.operation,
     baseInput,
-    ["prepared", "starting"],
+    ["prepared", "starting", "uncertain"],
     code,
   );
   const reservation = normalizeReservation(
@@ -2995,13 +2996,18 @@ export function createPostgresLogicalWriterLauncher(...args) {
           supervisorId: record.supervisorId,
           writerIncarnationId: record.writerIncarnationId,
         });
-        const finalizationInput = exactFrozenRecord({
-          ...record.pendingStop.baseInput,
-          evidence: stopEvidence,
-          expectedOperationRevision: "1",
-        });
         let stopReceipt = null;
-        for (let attempt = 0; attempt < 2 && stopReceipt === null; attempt += 1) {
+        let expectedOperationRevision = "1";
+        for (
+          let attempt = 0;
+          attempt < STOP_FINALIZATION_MAX_ATTEMPTS && stopReceipt === null;
+          attempt += 1
+        ) {
+          const finalizationInput = exactFrozenRecord({
+            ...record.pendingStop.baseInput,
+            evidence: stopEvidence,
+            expectedOperationRevision,
+          });
           try {
             stopReceipt = normalizeStopFinalizationReceipt(
               await invokeAsync(
@@ -3015,8 +3021,22 @@ export function createPostgresLogicalWriterLauncher(...args) {
               outcomeCode,
             );
           } catch {
-            // One exact replay distinguishes acknowledgement loss from an
-            // unresolved durable stop outcome without repeating physical stop.
+            try {
+              const phase = await reconcileStopOperation(
+                record.pendingStop.baseInput,
+              );
+              ensure(
+                phase.status === "starting" ||
+                  phase.status === "uncertain",
+                outcomeCode,
+              );
+              expectedOperationRevision =
+                phase.status === "uncertain" ? "2" : "1";
+            } catch {
+              // A committed readback intentionally fails the active-phase
+              // normalizer. Retrying the same predecessor revision then uses
+              // the authority's exact terminal replay without repeating stop.
+            }
           }
         }
         ensure(stopReceipt !== null, outcomeCode);

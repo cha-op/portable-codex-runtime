@@ -1021,13 +1021,24 @@ class MemoryLaunchAuthority {
   async finalizeWriterLaunchStopped(input) {
     this.calls.finalizeWriterStopped += 1;
     this.events.push("authority.finalize-writer-stopped");
+    if (
+      this.behaviour.stopMarkUncertainBeforeFinalize &&
+      this.stopState === "starting"
+    ) {
+      this.behaviour.stopMarkUncertainBeforeFinalize = false;
+      this.stopState = "uncertain";
+    }
+    const expectedOperationRevision =
+      this.stopState === "uncertain" || this.stopTerminalRevision === "3"
+        ? "2"
+        : "1";
     assert.deepEqual(
       JSON.parse(jsonStringify(input)),
       JSON.parse(
         jsonStringify({
           ...this.stopBaseInput,
           evidence: input.evidence,
-          expectedOperationRevision: "1",
+          expectedOperationRevision,
         }),
       ),
     );
@@ -1652,6 +1663,23 @@ test("stop finalization acknowledgement loss replays without a second physical s
   assert.equal(value.authority.stopState, "committed");
 });
 
+test("an uncertain stop finalizes at revision two without a second physical stop", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopMarkUncertainBeforeFinalize = true;
+
+  const stopped = await value.facade.stopWriterForCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.stop.finalized, true);
+  assert.equal(stopped.stop.operation.revision, "3");
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 2);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.equal(value.authority.stopState, "committed");
+});
+
 test("a renewed lease preserves the registered writer identity for stop", async () => {
   const value = await fixture();
   const started = await value.facade.runLaunch(runInput(value));
@@ -1888,26 +1916,28 @@ test("exact stop replay cannot adopt an unacknowledged starting claim", async ()
   assert.equal(value.supervisorStopCalls, 0);
 });
 
-test("a starting stop without this record's claim witness never dispatches physical stop", async () => {
-  const value = await fixture();
-  await value.facade.runLaunch(runInput(value));
-  value.authority.behaviour.stopReserveThrowAfterCommit = true;
-  value.authority.behaviour.stopReconcileThrowsOnce = true;
+for (const durableState of ["starting", "uncertain"]) {
+  test(`a ${durableState} stop without this record's claim grant never dispatches physical stop`, async () => {
+    const value = await fixture();
+    await value.facade.runLaunch(runInput(value));
+    value.authority.behaviour.stopReserveThrowAfterCommit = true;
+    value.authority.behaviour.stopReconcileThrowsOnce = true;
 
-  await assert.rejects(
-    value.facade.stopWriterForCapture(resolverInput(value)),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
-  );
-  assert.equal(value.authority.stopState, "prepared");
-  value.authority.stopState = "starting";
+    await assert.rejects(
+      value.facade.stopWriterForCapture(resolverInput(value)),
+      assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    );
+    assert.equal(value.authority.stopState, "prepared");
+    value.authority.stopState = durableState;
 
-  await assert.rejects(
-    value.facade.stopWriterForCapture(resolverInput(value)),
-    assertLauncherError("logical_writer_launch_outcome_uncertain"),
-  );
-  assert.equal(value.authority.calls.stopClaim, 0);
-  assert.equal(value.supervisorStopCalls, 0);
-});
+    await assert.rejects(
+      value.facade.stopWriterForCapture(resolverInput(value)),
+      assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    );
+    assert.equal(value.authority.calls.stopClaim, 0);
+    assert.equal(value.supervisorStopCalls, 0);
+  });
+}
 
 test("malformed committed stop proof never yields a capability", async () => {
   const value = await fixture();
@@ -1922,7 +1952,7 @@ test("malformed committed stop proof never yields a capability", async () => {
     assertLauncherError("logical_writer_launch_outcome_uncertain"),
   );
   assert.equal(value.supervisorStopCalls, 1);
-  assert.equal(value.authority.calls.finalizeWriterStopped, 2);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 3);
   assert.equal(value.authority.calls.markUncertain, 1);
   assert.throws(
     () => value.facade.resolveStoppedWriter(resolverInput(value)),

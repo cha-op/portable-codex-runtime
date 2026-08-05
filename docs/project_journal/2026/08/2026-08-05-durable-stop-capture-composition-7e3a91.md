@@ -41,6 +41,10 @@ detached-destination activation, and bounded restart recovery remain closed.
   lease, holder, and fencing-epoch identity remains exact and its canonical
   expiration has not moved backwards. This preserves stop/capture across
   ordinary renewal without treating expiration extension as a new writer.
+- After the one physical stop returns exact confirmation, finalization starts
+  from revision 1, reconciles the exact durable stop after a failed attempt,
+  and selects revision 2 only for a validated `uncertain` phase. Exact terminal
+  replay recovers acknowledgement loss without invoking physical stop again.
 - The composition independently derives the same stop ID from its prepared
   tuple before it accepts any receipt. A valid receipt for a different request
   or checkpoint is rejected before capture.
@@ -107,9 +111,9 @@ recovery or a cross-process or cross-host fence.
   composition, and operation-kernel test files passed with exit 0 and no
   failures. They include direct same-session cross-backend/storage registration
   exclusion, concurrent capability consumption, renewed-lease stop admission,
-  exact prepared stop replay, rejection of claim-acknowledgement ambiguity and
-  foreign `starting`, and ordinary launch-reconciliation rejection after a
-  joined durable stop.
+  exact prepared and uncertain-finalization stop replay, rejection of
+  claim-acknowledgement ambiguity and foreign `starting`, and ordinary
+  launch-reconciliation rejection after a joined durable stop.
 - `test/stopped-directory-backend.test.mjs` passed with 91 dot-reporter test
   markers and no failures.
 - The complete unit suite passed with exit 0 when it skipped only

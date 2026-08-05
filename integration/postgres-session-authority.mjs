@@ -24,6 +24,7 @@ import {
 import {
   PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
+  derivePostgresLogicalWriterStopOperationId,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
@@ -6539,7 +6540,7 @@ test(
     );
 
     await t.test(
-      "logical writer launcher stops a renewed writer and keeps launch readback closed",
+      "logical writer launcher finalizes an uncertain renewed stop and keeps launch readback closed",
       async () => {
         const sessionId = randomUUID();
         sessionIds.push(sessionId);
@@ -6572,6 +6573,7 @@ test(
         const supervisorId = `supervisor-${randomUUID()}`;
         let launchCalls = 0;
         let stopCalls = 0;
+        let stopUncertaintyInput = null;
         const launchWriter = async (context) => {
           launchCalls += 1;
           assert.equal(
@@ -6589,6 +6591,12 @@ test(
             ),
             stopWriter: async function stopWriter() {
               stopCalls += 1;
+              assert.notEqual(stopUncertaintyInput, null);
+              const uncertain = await authority.markOperationUncertain({
+                ...stopUncertaintyInput,
+                expectedOperationRevision: "1",
+              });
+              assertOperationReceipt(uncertain, "uncertain");
               return STOPPED_WRITER_STOP_CONFIRMED;
             },
           };
@@ -6676,8 +6684,8 @@ test(
           true,
         );
         assert.deepEqual(
-          renewed.session.document.launch,
-          started.launch,
+          JSON.parse(JSON.stringify(renewed.session.document.launch)),
+          JSON.parse(JSON.stringify(started.launch)),
         );
 
         const capture = checkpointCaptureAdmission(
@@ -6687,12 +6695,25 @@ test(
             writerIncarnationId: started.evidence.writerIncarnationId,
           },
         );
-        const stopped = await facade.stopWriterForCapture({
+        const captureInput = {
           attachment: capture.attachment,
           checkpoint: capture.checkpoint,
           request: capture.request,
-        });
+        };
+        stopUncertaintyInput = {
+          expectedSession: renewed.session,
+          kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+          operationId: derivePostgresLogicalWriterStopOperationId({
+            ...captureInput,
+            launchAttemptId,
+          }),
+          request: createWriterLaunchStopOperationRequest({
+            expectedSession: renewed.session,
+          }),
+        };
+        const stopped = await facade.stopWriterForCapture(captureInput);
         assert.equal(stopped.stop.status, "committed");
+        assert.equal(stopped.stop.operation.revision, "3");
         assert.equal(stopped.evidence.status, "complete-stopped");
         assert.equal(stopCalls, 1);
         assert.deepEqual(

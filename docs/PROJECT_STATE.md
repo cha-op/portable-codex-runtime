@@ -178,6 +178,9 @@
   closed because the durable operation does not identify its claimant. A lease
   renewal may extend expiration while the stable registered writer-fence tuple
   remains exact; expiry rollback or identity drift rejects before stop reserve.
+  After one confirmed physical stop, exact reconciliation selects revision 2
+  only for an authority-proven `uncertain` stop and otherwise retains revision 1
+  for terminal replay; neither path repeats the physical callback.
 - Typed `writer-launch-stop-v1` authority preserves the original started
   attempt and clears the current-launch relation only for exact
   `complete-stopped` evidence from the bound supervisor. Historical stop or
