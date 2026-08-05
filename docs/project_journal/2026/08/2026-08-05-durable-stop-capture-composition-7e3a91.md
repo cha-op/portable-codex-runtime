@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-05
 updated: 2026-08-05
 branch: wip/durable-stop-capture-composition
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/29
 supersedes: []
 superseded_by:
 ---
