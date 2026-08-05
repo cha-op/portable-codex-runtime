@@ -15,6 +15,7 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arraySomeIntrinsic = Array.prototype.some;
 const objectCreate = Object.create;
+const objectDefineProperty = Object.defineProperty;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
@@ -23,8 +24,9 @@ const objectIs = Object.is;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
+const promisePrototype = Promise.prototype;
 const promiseSpeciesSymbol = Symbol.species;
-const promiseThenIntrinsic = Promise.prototype.then;
+const promiseThenIntrinsic = promisePrototype.then;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -246,8 +248,7 @@ function opaqueId(value, code) {
   return value;
 }
 
-function isSafePromiseConstructor(value) {
-  if (value === PromiseConstructor) return true;
+function isSafePromiseSpeciesHolder(value) {
   if (
     value === null ||
     typeof value !== "object" ||
@@ -284,36 +285,53 @@ function isSafePromiseConstructor(value) {
   );
 }
 
-function isSafeNativePromise(value) {
+function normalizeSafeNativePromise(value) {
   if (
     !isPromiseValue(value) ||
     isProxyValue(value) ||
     isGeneratorObjectValue(value)
   ) {
-    return false;
+    return null;
   }
-  let current = value;
-  while (current !== null) {
-    if (isProxyValue(current)) return false;
-    let descriptor;
-    try {
-      descriptor = objectGetOwnPropertyDescriptor(current, "constructor");
-    } catch {
-      return false;
-    }
-    if (descriptor !== undefined) {
-      return (
-        objectHasOwn(descriptor, "value") &&
-        isSafePromiseConstructor(descriptor.value)
+  let prototype;
+  let descriptor;
+  try {
+    prototype = objectGetPrototypeOf(value);
+    descriptor = objectGetOwnPropertyDescriptor(value, "constructor");
+    if (descriptor === undefined) {
+      descriptor = objectGetOwnPropertyDescriptor(
+        promisePrototype,
+        "constructor",
       );
     }
-    try {
-      current = objectGetPrototypeOf(current);
-    } catch {
-      return false;
-    }
+  } catch {
+    return null;
   }
-  return false;
+  if (
+    prototype !== promisePrototype ||
+    descriptor === undefined ||
+    !objectHasOwn(descriptor, "value")
+  ) {
+    return null;
+  }
+  if (descriptor.value === PromiseConstructor) return value;
+  if (!isSafePromiseSpeciesHolder(descriptor.value)) return null;
+
+  try {
+    const normalized = reflectApply(promiseThenIntrinsic, value, [
+      undefined,
+      undefined,
+    ]);
+    objectDefineProperty(normalized, "constructor", {
+      configurable: false,
+      enumerable: false,
+      value: PromiseConstructor,
+      writable: false,
+    });
+    return normalized;
+  } catch {
+    return null;
+  }
 }
 
 function sameEvidence(left, right) {
@@ -653,9 +671,10 @@ const absorbRetirementRejection = objectFreeze(
 );
 
 function drainRetirementPromise(value) {
-  if (!isSafeNativePromise(value)) return;
+  const normalized = normalizeSafeNativePromise(value);
+  if (normalized === null) return;
   try {
-    reflectApply(promiseThenIntrinsic, value, [
+    reflectApply(promiseThenIntrinsic, normalized, [
       undefined,
       absorbRetirementRejection,
     ]);
@@ -734,7 +753,8 @@ export function createPostgresDurableStopCaptureComposition(options) {
     } catch {
       fail(outcomeCode);
     }
-    ensure(isSafeNativePromise(pendingStop), outcomeCode);
+    pendingStop = normalizeSafeNativePromise(pendingStop);
+    ensure(pendingStop !== null, outcomeCode);
 
     let stoppedValue;
     try {

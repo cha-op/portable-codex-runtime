@@ -389,6 +389,66 @@ test("durable stop composition retains v1 receipt compatibility", async () => {
   assert.equal(launcherFixture.calls.retire.length, 1);
 });
 
+test("Promise subclasses are rejected before an overridden then can run", async () => {
+  const { backend, calls: backendCalls } = createBackend();
+  let stopCalls = 0;
+  let retireCalls = 0;
+  let thenCalls = 0;
+  class SpoofedStopPromise extends Promise {
+    then(onFulfilled, onRejected) {
+      thenCalls += 1;
+      return Promise.resolve(Object.freeze({ forged: true })).then(
+        onFulfilled,
+        onRejected,
+      );
+    }
+  }
+  const speciesHolder = Object.freeze(
+    Object.create(null, {
+      [Symbol.species]: {
+        configurable: false,
+        enumerable: false,
+        value: Promise,
+        writable: false,
+      },
+    }),
+  );
+  const stopWriterForCapture = function (input) {
+    stopCalls += 1;
+    const pending = new SpoofedStopPromise((resolve) => {
+      resolve(stoppedCaptureResult(input));
+    });
+    Object.defineProperty(pending, "constructor", {
+      configurable: false,
+      enumerable: false,
+      value: speciesHolder,
+      writable: false,
+    });
+    return pending;
+  };
+  const retireStoppedWriter = function () {
+    retireCalls += 1;
+  };
+  Object.freeze(stopWriterForCapture);
+  Object.freeze(retireStoppedWriter);
+  const launcher = Object.freeze({
+    retireStoppedWriter,
+    stopWriterForCapture,
+  });
+  const composition = createPostgresDurableStopCaptureComposition({ launcher });
+
+  await assert.rejects(
+    () => composition.runCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(stopCalls, 1);
+  assert.equal(thenCalls, 0);
+  assert.equal(backendCalls.length, 0);
+  assert.equal(retireCalls, 0);
+});
+
 test("stop callback cannot poison exact receipt binding", { concurrency: false }, async () => {
   const { backend, calls: backendCalls } = createBackend();
   const defineProperty = Object.defineProperty;

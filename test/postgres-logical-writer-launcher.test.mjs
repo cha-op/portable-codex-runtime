@@ -2934,10 +2934,11 @@ test("real logical writer launcher composes one v2 stop, capture, and retirement
   const captureTuple = resolverInput(value);
 
   let stoppedResult = null;
+  let stoppedPromise = null;
   let retireCalls = 0;
-  const stopWriterForCapture = async function (input) {
-    stoppedResult = await value.facade.stopWriterForCapture(input);
-    return stoppedResult;
+  const stopWriterForCapture = function (input) {
+    stoppedPromise = value.facade.stopWriterForCapture(input);
+    return stoppedPromise;
   };
   const retireStoppedWriter = function (input) {
     retireCalls += 1;
@@ -3001,6 +3002,9 @@ test("real logical writer launcher composes one v2 stop, capture, and retirement
     request: captureTuple.request,
     storageRef: storageRef(),
   });
+  stoppedResult = await Reflect.apply(Promise.prototype.then, stoppedPromise, [
+    (value) => value,
+  ]);
 
   assert.equal(stoppedResult.stop.stop.contractVersion, 2);
   for (const request of [
