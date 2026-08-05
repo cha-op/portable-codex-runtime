@@ -6728,7 +6728,9 @@ test(
         const historical = await authority.readWriterLaunchAttempt({
           operationId: launchAttemptId,
         });
-        assertOperationReceipt(historical, "committed");
+        assertOperationReceipt(historical, "committed", {
+          currentTerminal: false,
+        });
         assert.equal(
           historical.operation.result.outcome,
           "writer-launch-started",
