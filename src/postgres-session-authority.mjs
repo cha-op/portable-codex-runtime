@@ -12,6 +12,8 @@ import {
 import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
+  assertRestoreAttachmentActivationRequest,
+  assertRestoreAttachmentActivationResult,
   assertSessionAttachment,
   assertSessionAttachmentMatches,
   assertSessionManifest,
@@ -35,6 +37,8 @@ export const WRITER_FORCE_FENCE_OPERATION_KIND = "writer-force-fence-v1";
 export const CHECKPOINT_CAPTURE_OPERATION_KIND = "checkpoint-capture-v1";
 export const RESTORE_DESTINATION_GENERATION_OPERATION_KIND =
   "restore-destination-generation-v1";
+export const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND =
+  "restore-attachment-activation-v1";
 export const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND =
   "writer-launch-attempt-v1";
 export const WRITER_LAUNCH_STOP_OPERATION_KIND = "writer-launch-stop-v1";
@@ -72,10 +76,13 @@ const RESTORE_DESTINATION_MATERIALIZATION_CONTRACT_VERSION = 3;
 const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION = 1;
 const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 = 2;
 const RESTORE_DESTINATION_GENERATION_BINDING_CONTRACT_VERSION = 1;
-const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
+export const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
+const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION = 1;
 const DIRECT_OPERATION_ID_CLAIM_TYPE = "direct-operation";
 const RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-launch-intent-v2";
+const RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
+  "restore-activation-launch-intent-v1";
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2 = 2;
@@ -364,6 +371,48 @@ const RESTORE_GENERATION_TERMINAL_RESULT_KEYS = Object.freeze([
   "generationId",
   "outcome",
   "resultVersion",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_REQUEST_KEYS = Object.freeze([
+  "contractVersion",
+  "destinationRootPath",
+  "generation",
+  "holderId",
+  "launchIntent",
+  "leaseDurationMilliseconds",
+  "predecessor",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_KEYS = Object.freeze([
+  "attachmentId",
+  "detachOperationId",
+  "stopOperationId",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_CLAIM_INPUT_KEYS = Object.freeze([
+  "expectedOperationRevision",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_FINALIZATION_INPUT_KEYS = Object.freeze([
+  "activationResult",
+  "expectedOperationRevision",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_TERMINAL_RESULT_KEYS = Object.freeze([
+  "activationRequest",
+  "activationResult",
+  "outcome",
+  "resultVersion",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_READ_KEYS = Object.freeze([
+  "operationId",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_LIST_KEYS = Object.freeze([
+  "afterSessionId",
+  "limit",
 ]);
 const COMMITTED_WRITER_LAUNCH_STOP_PROOF_KEYS = Object.freeze([
   "after",
@@ -743,6 +792,8 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore destination generation identity is already bound to a different operation",
   restore_generation_not_authorized:
     "Restore destination generation is not actively authorized",
+  restore_attachment_activation_not_authorized:
+    "Restore attachment activation is not actively authorized",
   writer_launch_attempt_not_authorized:
     "Writer launch attempt is not actively authorized",
   session_identity_conflict:
@@ -967,6 +1018,33 @@ const LIST_RESTORE_GENERATION_RECOVERY_AFTER_QUERY = Object.freeze({
     "LIMIT $2::integer",
   ].join(" "),
 });
+const LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_FIRST_PAGE_QUERY =
+  Object.freeze({
+    queryMode: "extended",
+    text: [
+      `SELECT ${OPERATION_RETURNING_COLUMNS}`,
+      "FROM session_authority.operation_claims",
+      "WHERE kind = 'restore-attachment-activation-v1'",
+      "AND state IN ('starting', 'uncertain')",
+      "AND retired_at IS NULL",
+      "ORDER BY session_id ASC",
+      "LIMIT $1::integer",
+    ].join(" "),
+  });
+const LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_AFTER_QUERY =
+  Object.freeze({
+    queryMode: "extended",
+    text: [
+      `SELECT ${OPERATION_RETURNING_COLUMNS}`,
+      "FROM session_authority.operation_claims",
+      "WHERE kind = 'restore-attachment-activation-v1'",
+      "AND state IN ('starting', 'uncertain')",
+      "AND retired_at IS NULL",
+      "AND session_id > $1::uuid",
+      "ORDER BY session_id ASC",
+      "LIMIT $2::integer",
+    ].join(" "),
+  });
 const LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
@@ -1050,6 +1128,18 @@ const INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
     `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
   ].join(" "),
 });
+const INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.operation_id_registry",
+    "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+    "claimed_at, materialized_at)",
+    `VALUES ($1, $2::uuid, '${RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE}',`,
+    "$3, $4::jsonb, $5, NULL)",
+    "ON CONFLICT DO NOTHING",
+    `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
 const INSERT_PRECLAIMED_OPERATION_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
@@ -1075,6 +1165,36 @@ const MATERIALIZE_RESTORE_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
     "SET materialized_at = $3",
     "WHERE operation_id = $1 AND session_id = $2::uuid",
     `AND claim_type = '${RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+    "AND claimant_operation_id = $4 AND binding = $5::jsonb",
+    "AND materialized_at IS NULL",
+    `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const INSERT_PRECLAIMED_RESTORE_ACTIVATION_LAUNCH_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.operation_claims",
+    "(operation_id, session_id, kind, request, result, state, revision,",
+    "created_at, updated_at, retired_at)",
+    "SELECT $1::character varying(128), $2::uuid, $3, $4::jsonb,",
+    "NULL, 'prepared', 0, $5, $5, NULL",
+    "FROM session_authority.operation_id_registry",
+    "WHERE operation_id = $1::character varying(128)",
+    "AND session_id = $2::uuid",
+    `AND claim_type = '${RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+    "AND claimant_operation_id = $6 AND binding = $7::jsonb",
+    "AND materialized_at IS NULL",
+    "ON CONFLICT (operation_id) DO NOTHING",
+    `RETURNING ${OPERATION_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "UPDATE session_authority.operation_id_registry",
+    "SET materialized_at = $3",
+    "WHERE operation_id = $1 AND session_id = $2::uuid",
+    `AND claim_type = '${RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
     "AND claimant_operation_id = $4 AND binding = $5::jsonb",
     "AND materialized_at IS NULL",
     `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
@@ -1608,7 +1728,14 @@ function canonicalJsonValue(value, state, code) {
         ownKeys[index],
         code,
       );
-      ensure(!regexpTest(SENSITIVE_OPERATION_KEY_PATTERN, key), code);
+      // Session manifests carry the public runtime selector `authMode`.
+      // Restore activation must persist that exact manifest, while all other
+      // auth- and credential-shaped operation keys remain rejected.
+      ensure(
+        key === "authMode" ||
+          !regexpTest(SENSITIVE_OPERATION_KEY_PATTERN, key),
+        code,
+      );
       consumeOperationJsonBytes(state, 1, code);
     }
     const keys = sortedStringKeys(ownKeys, code);
@@ -2100,7 +2227,9 @@ function canonicalDocument(value, code) {
         lease.fencingEpoch === writerEpoch &&
         launch === null &&
         activeOperation !== null &&
-        activeOperation.kind === WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND &&
+        (activeOperation.kind === WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND ||
+          activeOperation.kind ===
+            RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND) &&
         (activeOperation.state === "starting" ||
           activeOperation.state === "uncertain"),
       code,
@@ -3105,6 +3234,149 @@ export function createRestoreDestinationGenerationOperationRequestV2(
   );
 }
 
+function canonicalRestoreAttachmentActivationPredecessor(
+  value,
+  expectedSession,
+  code,
+) {
+  const predecessor = exactPlainObject(
+    value,
+    RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_KEYS,
+    code,
+  );
+  const lastOperation = expectedSession.document.lastOperation;
+  ensure(
+    lastOperation !== null &&
+      (lastOperation.kind === WRITER_RELEASE_OPERATION_KIND ||
+        lastOperation.kind === WRITER_FORCE_FENCE_OPERATION_KIND),
+    code,
+  );
+  const result = deepFreeze({
+    attachmentId: canonicalOpaqueId(
+      predecessor.attachmentId,
+      128,
+      code,
+    ),
+    detachOperationId: canonicalOpaqueId(
+      predecessor.detachOperationId,
+      128,
+      code,
+    ),
+    stopOperationId: canonicalOpaqueId(
+      predecessor.stopOperationId,
+      128,
+      code,
+    ),
+  });
+  ensure(
+    result.detachOperationId === lastOperation.operationId &&
+      result.stopOperationId !== result.detachOperationId,
+    code,
+  );
+  return result;
+}
+
+function restoreAttachmentActivationOperationRequest(
+  value,
+  expectedSession,
+  code,
+  epochExhaustionCode = code,
+) {
+  const request = exactPlainObject(
+    value,
+    RESTORE_ATTACHMENT_ACTIVATION_OPERATION_REQUEST_KEYS,
+    code,
+  );
+  const document = expectedSession.document;
+  ensure(
+    request.contractVersion ===
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION &&
+      document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+      document.lifecycle === "DETACHED" &&
+      document.lease === null &&
+      document.attachment === null &&
+      document.launch === null &&
+      document.activeOperation === null,
+    code,
+  );
+  ensure(
+    BigIntConstructor(document.writerEpoch) < UINT64_MAX,
+    epochExhaustionCode,
+  );
+  const generation = canonicalWriterLaunchGeneration(
+    request.generation,
+    expectedSession,
+    code,
+  );
+  const launchIntent = canonicalRestoreGenerationLaunchIntent(
+    request.launchIntent,
+    expectedSession,
+    code,
+  );
+  const predecessor = canonicalRestoreAttachmentActivationPredecessor(
+    request.predecessor,
+    expectedSession,
+    code,
+  );
+  return canonicalJsonObject(
+    {
+      contractVersion:
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION,
+      destinationRootPath: canonicalAttachmentRootPath(
+        request.destinationRootPath,
+        code,
+      ),
+      generation,
+      holderId: canonicalOpaqueId(request.holderId, 128, code),
+      launchIntent,
+      leaseDurationMilliseconds: canonicalLeaseDuration(
+        request.leaseDurationMilliseconds,
+        code,
+      ),
+      predecessor,
+    },
+    code,
+  );
+}
+
+export function createRestoreAttachmentActivationOperationRequest(options) {
+  const normalized = exactPlainObject(
+    options,
+    [
+      "destinationRootPath",
+      "expectedSession",
+      "generation",
+      "holderId",
+      "launchIntent",
+      "leaseDurationMilliseconds",
+      "predecessor",
+    ],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  return restoreAttachmentActivationOperationRequest(
+    {
+      contractVersion:
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION,
+      destinationRootPath: normalized.destinationRootPath,
+      generation: writerLaunchGenerationReference(
+        normalized.generation,
+        expectedSession,
+        "invalid_operation_request",
+      ),
+      holderId: normalized.holderId,
+      launchIntent: normalized.launchIntent,
+      leaseDurationMilliseconds: normalized.leaseDurationMilliseconds,
+      predecessor: normalized.predecessor,
+    },
+    expectedSession,
+    "invalid_operation_request",
+  );
+}
+
 function canonicalWriterLaunchGeneration(value, expectedSession, code) {
   const generation = exactPlainObject(
     value,
@@ -3481,7 +3753,7 @@ function canonicalOperationEnvelope(value, code) {
   });
 }
 
-function canonicalOperationInput(options, keys = OPERATION_INPUT_KEYS) {
+function canonicalOperationBinding(options, keys = OPERATION_INPUT_KEYS) {
   const normalized = exactPlainObject(
     options,
     keys,
@@ -3531,8 +3803,40 @@ function canonicalOperationInput(options, keys = OPERATION_INPUT_KEYS) {
     reservationId,
     serializedEnvelope,
   });
+  return input;
+}
+
+function canonicalOperationInput(options, keys = OPERATION_INPUT_KEYS) {
+  const input = canonicalOperationBinding(options, keys);
   validateTypedOperationInput(input);
   return input;
+}
+
+/**
+ * Canonicalizes the shared identity binding for one session operation.
+ * Consumers that validate persisted operation receipts can use this helper
+ * without duplicating the authority's snapshot and envelope byte contract.
+ */
+export function assertSessionOperationBinding(...args) {
+  ensure(args.length === 1, "invalid_operation_request");
+  const input = canonicalOperationBinding(args[0]);
+  return deepFreeze({
+    expectedSession: input.expectedSession,
+    kind: input.kind,
+    operationId: input.operationId,
+    request: input.request,
+    requestSha256: input.requestSha256,
+    reservationId: input.reservationId,
+  });
+}
+
+/**
+ * Canonicalizes and validates one complete session-authority snapshot,
+ * including its active or terminal revision-state relation.
+ */
+export function assertSessionAuthoritySnapshot(...args) {
+  ensure(args.length === 1, "invalid_operation_request");
+  return expectedSnapshotFromValue(args[0]);
 }
 
 function canonicalLeaseDuration(value, code) {
@@ -3731,6 +4035,19 @@ function validateTypedOperationInput(input) {
       input.operationId === request.admission.request.operationId,
       "invalid_operation_request",
     );
+  } else if (
+    input.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND
+  ) {
+    const request = restoreAttachmentActivationOperationRequest(
+      input.request,
+      input.expectedSession,
+      "invalid_operation_request",
+      "writer_epoch_exhausted",
+    );
+    ensure(
+      input.operationId !== request.launchIntent.launchAttemptId,
+      "invalid_operation_request",
+    );
   } else if (input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND) {
     writerLaunchAttemptOperationRequest(
       input.request,
@@ -3846,6 +4163,167 @@ function attachMutationRequestFor(input, lease, code) {
     },
     code,
   );
+}
+
+function restoreAttachmentActivationLeaseFor(
+  input,
+  authorityNow,
+  fencingEpoch,
+  code,
+) {
+  const request = restoreAttachmentActivationOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  return canonicalLeaseGrant(
+    {
+      contractVersion: STORAGE_CONTRACT_VERSION,
+      sessionId: input.expectedSession.sessionId,
+      leaseId: leaseIdForOperation(input.operationId),
+      holderId: request.holderId,
+      fencingEpoch,
+      expiresAt: timestampAfter(
+        authorityNow,
+        request.leaseDurationMilliseconds,
+        code,
+      ),
+    },
+    code,
+  );
+}
+
+function restoreAttachmentPublicationFor(input, generation, code) {
+  const request = restoreAttachmentActivationOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  ensure(
+    generation.state === "committed" &&
+      generation.document !== null &&
+      generation.document.contractVersion ===
+        RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION,
+    code,
+  );
+  const materialization = generation.document.materialization;
+  return canonicalJsonObject(
+    {
+      artifactManifestDigest: materialization.artifactManifestDigest,
+      coordinatorBindingSha256: materialization.coordinatorBindingSha256,
+      modeledDigest: materialization.modeledDigest,
+      publicationId: materialization.publicationId,
+      publicationKind: materialization.publicationKind,
+      root: {
+        filesystemId: materialization.stagedRoot.filesystemId,
+        objectIdentityScheme:
+          materialization.stagedRoot.objectIdentityScheme,
+        objectId: materialization.stagedRoot.objectId,
+        rootPath: request.destinationRootPath,
+      },
+      treeIdentityDigest: materialization.treeIdentityDigest,
+    },
+    code,
+  );
+}
+
+function structurallyCanonicalRestoreAttachmentActivationRequest(
+  value,
+  input,
+  code,
+) {
+  let activationRequest;
+  try {
+    activationRequest = assertRestoreAttachmentActivationRequest(value);
+  } catch {
+    fail(code);
+  }
+  const request = restoreAttachmentActivationOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  const expectedEpoch = nextWriterEpochForCode(
+    input.expectedSession.document.writerEpoch,
+    code,
+  );
+  ensure(
+    canonicalSerialize(
+      canonicalJsonObject(activationRequest.manifest, code),
+    ) ===
+        canonicalSerialize(
+          canonicalJsonObject(
+            input.expectedSession.document.manifest,
+            code,
+          ),
+        ) &&
+      canonicalSerialize(
+        canonicalJsonObject(activationRequest.storageRef, code),
+      ) ===
+        canonicalSerialize(
+          canonicalJsonObject(
+            input.expectedSession.document.storageRef,
+            code,
+          ),
+        ) &&
+      activationRequest.lease.sessionId === input.expectedSession.sessionId &&
+      activationRequest.lease.leaseId === leaseIdForOperation(input.operationId) &&
+      activationRequest.lease.holderId === request.holderId &&
+      activationRequest.lease.fencingEpoch === expectedEpoch &&
+      timestampMilliseconds(activationRequest.lease.expiresAt) -
+          request.leaseDurationMilliseconds >=
+        timestampMilliseconds(input.expectedSession.updatedAt) &&
+      activationRequest.mutationRequest.operationId === input.operationId &&
+      activationRequest.mutationRequest.target.attachmentId ===
+        attachmentIdForOperation(input.operationId) &&
+      activationRequest.publication.root.rootPath ===
+        request.destinationRootPath,
+    code,
+  );
+  return canonicalJsonObject(activationRequest, code);
+}
+
+function restoreAttachmentActivationRequestFor(
+  input,
+  generation,
+  lease,
+  code,
+) {
+  let activationRequest;
+  try {
+    activationRequest = assertRestoreAttachmentActivationRequest({
+      contractVersion:
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION,
+      lease,
+      manifest: input.expectedSession.document.manifest,
+      mutationRequest: attachMutationRequestFor(input, lease, code),
+      publication: restoreAttachmentPublicationFor(input, generation, code),
+      storageRef: input.expectedSession.document.storageRef,
+    });
+  } catch {
+    fail(code);
+  }
+  return structurallyCanonicalRestoreAttachmentActivationRequest(
+    activationRequest,
+    input,
+    code,
+  );
+}
+
+function canonicalRestoreAttachmentActivationProviderResult(
+  value,
+  activationRequest,
+  code,
+) {
+  let result;
+  try {
+    result = assertRestoreAttachmentActivationResult(value, {
+      request: activationRequest,
+    });
+  } catch {
+    fail(code);
+  }
+  return canonicalJsonObject(result, code);
 }
 
 function canonicalAttachMutationResult(value, request, code) {
@@ -4311,6 +4789,40 @@ function restoreGenerationTransitionInput(options) {
     expectedOperationRevision,
     generationId,
   });
+}
+
+function restoreAttachmentActivationInput(
+  options,
+  keys = OPERATION_INPUT_KEYS,
+  code = "invalid_operation_request",
+) {
+  const input = canonicalOperationInput(options, keys);
+  ensure(input.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND, code);
+  const request = restoreAttachmentActivationOperationRequest(
+    input.request,
+    input.expectedSession,
+    code,
+  );
+  ensure(input.operationId !== request.launchIntent.launchAttemptId, code);
+  return deepFreeze({ ...input, request });
+}
+
+function restoreAttachmentActivationTransitionInput(options) {
+  const input = restoreAttachmentActivationInput(
+    options,
+    RESTORE_ATTACHMENT_ACTIVATION_CLAIM_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    RESTORE_ATTACHMENT_ACTIVATION_CLAIM_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(expectedOperationRevision === "0", "invalid_operation_request");
+  return deepFreeze({ ...input, expectedOperationRevision });
 }
 
 function writerLaunchAttemptInput(
@@ -4952,6 +5464,35 @@ function restoreGenerationLaunchHandoffInput(options) {
   return deepFreeze({ launch, restore });
 }
 
+function restoreAttachmentActivationFinalizationInput(options) {
+  const input = restoreAttachmentActivationInput(
+    options,
+    RESTORE_ATTACHMENT_ACTIVATION_FINALIZATION_INPUT_KEYS,
+  );
+  const normalized = exactPlainObject(
+    options,
+    RESTORE_ATTACHMENT_ACTIVATION_FINALIZATION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const expectedOperationRevision = canonicalRevisionForCode(
+    normalized.expectedOperationRevision,
+    "invalid_operation_request",
+  );
+  ensure(
+    expectedOperationRevision === "1" ||
+      expectedOperationRevision === "2",
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    ...input,
+    activationResult: canonicalJsonObject(
+      normalized.activationResult,
+      "invalid_operation_request",
+    ),
+    expectedOperationRevision,
+  });
+}
+
 function restoreGenerationReadInput(options) {
   const normalized = exactPlainObject(
     options,
@@ -4991,6 +5532,28 @@ function restoreGenerationRecoveryListInput(options) {
   const normalized = exactPlainObject(
     options,
     RESTORE_GENERATION_RECOVERY_LIST_KEYS,
+    "invalid_operation_request",
+  );
+  const afterSessionId =
+    normalized.afterSessionId === null
+      ? null
+      : canonicalSessionId(
+          normalized.afterSessionId,
+          "invalid_operation_request",
+        );
+  ensure(
+    numberIsSafeInteger(normalized.limit) &&
+      normalized.limit >= 1 &&
+      normalized.limit <= 100,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ afterSessionId, limit: normalized.limit });
+}
+
+function restoreAttachmentActivationRecoveryListInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_LIST_KEYS,
     "invalid_operation_request",
   );
   const afterSessionId =
@@ -6009,6 +6572,60 @@ function canonicalRestoreGenerationStoredResult(value, input, code) {
   });
 }
 
+function canonicalRestoreAttachmentActivationStoredResult(
+  value,
+  input,
+  code,
+) {
+  const result = exactPlainObject(
+    value,
+    RESTORE_ATTACHMENT_ACTIVATION_TERMINAL_RESULT_KEYS,
+    code,
+  );
+  ensure(
+    input.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+      result.resultVersion === OPERATION_RESULT_VERSION &&
+      result.outcome === "restore-attachment-activated",
+    code,
+  );
+  const activationRequest =
+    structurallyCanonicalRestoreAttachmentActivationRequest(
+      result.activationRequest,
+      input,
+      code,
+    );
+  const activationResult =
+    canonicalRestoreAttachmentActivationProviderResult(
+      result.activationResult,
+      activationRequest,
+      code,
+    );
+  return deepFreeze({
+    activationRequest,
+    activationResult,
+    outcome: "restore-attachment-activated",
+    resultVersion: OPERATION_RESULT_VERSION,
+  });
+}
+
+function restoreAttachmentActivationTerminalResult(
+  input,
+  activationRequest,
+  activationResult,
+  code,
+) {
+  return canonicalRestoreAttachmentActivationStoredResult(
+    {
+      activationRequest,
+      activationResult,
+      outcome: "restore-attachment-activated",
+      resultVersion: OPERATION_RESULT_VERSION,
+    },
+    input,
+    code,
+  );
+}
+
 function canonicalCommittedResult(value, input, revision, code) {
   const outcome = ownDataValue(value, "outcome", code);
   if (outcome === "cancelled-before-dispatch") {
@@ -6072,6 +6689,18 @@ function canonicalCommittedResult(value, input, revision, code) {
       code,
     );
     return canonicalRestoreGenerationStoredResult(value, input, code);
+  }
+  if (outcome === "restore-attachment-activated") {
+    ensure(
+      input.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+        (revision === "2" || revision === "3"),
+      code,
+    );
+    return canonicalRestoreAttachmentActivationStoredResult(
+      value,
+      input,
+      code,
+    );
   }
   if (
     outcome === "writer-launch-started" ||
@@ -6256,7 +6885,9 @@ function operationIdClaimSnapshotFromRow(row) {
     );
   } else {
     ensure(
-      claimType === RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE &&
+      (claimType === RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE ||
+        claimType ===
+          RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE) &&
         claimantOperationId !== null &&
         claimantOperationId !== operationId &&
         binding !== null &&
@@ -6285,6 +6916,29 @@ function validateRestoreLaunchIdClaim(claim, input, materialization) {
       claim.sessionId === input.expectedSession.sessionId &&
       claim.claimType ===
         RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE &&
+      claim.claimantOperationId === input.operationId &&
+      canonicalSerialize(claim.binding) ===
+        canonicalSerialize(input.request.launchIntent) &&
+      (materialization === "either" ||
+        (materialization === "reserved" &&
+          claim.materializedAt === null) ||
+        (materialization === "materialized" &&
+          claim.materializedAt !== null)),
+    "operation_state_invalid",
+  );
+  return claim;
+}
+
+function validateRestoreAttachmentActivationLaunchIdClaim(
+  claim,
+  input,
+  materialization,
+) {
+  ensure(
+    claim.operationId === input.request.launchIntent.launchAttemptId &&
+      claim.sessionId === input.expectedSession.sessionId &&
+      claim.claimType ===
+        RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE &&
       claim.claimantOperationId === input.operationId &&
       canonicalSerialize(claim.binding) ===
         canonicalSerialize(input.request.launchIntent) &&
@@ -6752,6 +7406,42 @@ function inputForOperation(operation) {
 
 function validateActiveBusinessState(session, operation) {
   const expectedDocument = operation.expectedSession.document;
+  if (
+    operation.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+    operation.state !== "prepared"
+  ) {
+    const input = restoreAttachmentActivationInput(
+      inputForOperation(operation),
+      OPERATION_INPUT_KEYS,
+      "operation_state_invalid",
+    );
+    const request = input.request;
+    const lease = session.document.lease;
+    const expectedEpoch = nextWriterEpochForCode(
+      expectedDocument.writerEpoch,
+      "operation_state_invalid",
+    );
+    ensure(
+      session.document.lifecycle === "ATTACHING" &&
+        session.document.writerEpoch === expectedEpoch &&
+        lease !== null &&
+        session.document.attachment === null &&
+        session.document.launch === null &&
+        lease.sessionId === operation.sessionId &&
+        lease.leaseId === leaseIdForOperation(operation.operationId) &&
+        lease.holderId === request.holderId &&
+        lease.fencingEpoch === expectedEpoch &&
+        timestampMilliseconds(lease.expiresAt) -
+            request.leaseDurationMilliseconds >=
+          timestampMilliseconds(
+            operation.state === "starting"
+              ? operation.updatedAt
+              : operation.createdAt,
+          ),
+      "operation_state_invalid",
+    );
+    return;
+  }
   const typedWriterOperation =
     operation.kind === WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND ||
     operation.kind === WRITER_RELEASE_OPERATION_KIND ||
@@ -6890,6 +7580,43 @@ function validateTerminalBusinessState(terminalBase, operation) {
         operation.expectedSession.document.lifecycle === "ATTACHED" &&
         canonicalBusinessBytes(terminalBase.document) ===
           canonicalBusinessBytes(operation.expectedSession.document),
+      "operation_state_invalid",
+    );
+    return;
+  }
+  if (result.outcome === "restore-attachment-activated") {
+    const activationResult = result.activationResult;
+    const activationRequest = result.activationRequest;
+    ensure(
+      operation.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+        terminalBase.document.lifecycle === "ATTACHED" &&
+        terminalBase.document.writerEpoch ===
+          activationRequest.lease.fencingEpoch &&
+        canonicalSerialize(
+          canonicalJsonObject(
+            terminalBase.document.lease,
+            "operation_state_invalid",
+          ),
+        ) ===
+          canonicalSerialize(
+            canonicalJsonObject(
+              activationRequest.lease,
+              "operation_state_invalid",
+            ),
+          ) &&
+        canonicalSerialize(
+          canonicalJsonObject(
+            terminalBase.document.attachment,
+            "operation_state_invalid",
+          ),
+        ) ===
+          canonicalSerialize(
+            canonicalJsonObject(
+              activationResult.attachment,
+              "operation_state_invalid",
+            ),
+          ) &&
+        terminalBase.document.launch === null,
       "operation_state_invalid",
     );
     return;
@@ -7343,6 +8070,119 @@ function writerLaunchAttemptInputForRestoreHandoff(
   return input;
 }
 
+function restoreAttachmentActivationTerminalSessionForLaunchHandoff(
+  input,
+  operation,
+  reservation,
+) {
+  ensure(
+    operation.state === "committed" &&
+      operation.result?.outcome === "restore-attachment-activated",
+    "operation_state_invalid",
+  );
+  const session = expectedSnapshotFromValue(
+    {
+      createdAt: input.expectedSession.createdAt,
+      document: documentWithAuthorityState(
+        input.expectedSession.document,
+        {
+          activeOperation: null,
+          attachment: operation.result.activationResult.attachment,
+          lastOperation: lastPointerFor(operation, reservation),
+          lease: operation.result.activationRequest.lease,
+          lifecycle: "ATTACHED",
+          writerEpoch:
+            operation.result.activationRequest.lease.fencingEpoch,
+        },
+      ),
+      revision: revisionAfter(
+        input.expectedSession.revision,
+        BigIntConstructor(operation.revision) + 1n,
+        "operation_state_invalid",
+      ),
+      sessionId: input.expectedSession.sessionId,
+      updatedAt: operation.updatedAt,
+    },
+    "operation_state_invalid",
+  );
+  validateLastOperationPointer(session, operation, reservation);
+  return session;
+}
+
+function writerLaunchAttemptInputForRestoreActivationHandoff(
+  activationInput,
+  generation,
+  expectedSession,
+) {
+  const request = createWriterLaunchAttemptOperationRequest({
+    expectedSession,
+    generation,
+    measuredImage: activationInput.request.launchIntent.measuredImage,
+    supervisor: activationInput.request.launchIntent.supervisor,
+  });
+  return writerLaunchAttemptInput({
+    expectedSession,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    operationId: activationInput.request.launchIntent.launchAttemptId,
+    request,
+  });
+}
+
+function restoreAttachmentActivationHandoffReceipt({
+  activationFinalized,
+  activationInput,
+  activationOperation,
+  activationReservation,
+  generation,
+  launchInput,
+  launchOperation,
+  launchReservation,
+  session,
+}) {
+  ensure(
+    launchOperation.createdAt === activationOperation.updatedAt &&
+      launchReservation.createdAt === activationOperation.updatedAt,
+    "operation_state_invalid",
+  );
+  validateOperationIdentity(activationOperation, activationInput);
+  validateOperationReservation(
+    activationOperation,
+    activationReservation,
+    activationInput,
+  );
+  validateOperationIdentity(launchOperation, launchInput);
+  validateOperationReservation(
+    launchOperation,
+    launchReservation,
+    launchInput,
+  );
+  validateLastOperationPointer(
+    launchInput.expectedSession,
+    activationOperation,
+    activationReservation,
+  );
+  if (launchOperation.state === "committed") {
+    validateCommittedOperationHistory(launchOperation, session);
+  } else {
+    validateActivePointer(session, launchOperation, launchReservation);
+  }
+  return deepFreeze({
+    activation: deepFreeze({
+      finalized: activationFinalized,
+      operation: activationOperation,
+      reservation: activationReservation,
+    }),
+    generation,
+    launch: deepFreeze({
+      attempt: writerLaunchAttemptRecord(launchInput, launchOperation),
+      operation: launchOperation,
+      reservation: launchReservation,
+    }),
+    session,
+    status: launchOperation.state,
+  });
+}
+
 function restoreLaunchHandoffReceipt({
   generation,
   launchInput,
@@ -7485,6 +8325,73 @@ function isAtomicRestoreLaunchHandoff(session, observed) {
   return true;
 }
 
+function isAtomicRestoreAttachmentActivationLaunchHandoff(
+  session,
+  observed,
+) {
+  const active = observed.active;
+  if (
+    active === null ||
+    active.operation.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND
+  ) {
+    return false;
+  }
+  const terminal = observed.terminal;
+  const activation = terminal?.activation;
+  if (
+    activation === null ||
+    activation === undefined ||
+    terminal.operation.kind !== RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND
+  ) {
+    return false;
+  }
+  ensure(
+    activation.generation !== null &&
+      activation.launchIdClaim !== null &&
+      terminal.operation.state === "committed" &&
+      terminal.operation.result?.outcome === "restore-attachment-activated" &&
+      active.launchAttempt !== null,
+    "operation_state_invalid",
+  );
+  const terminalSession =
+    restoreAttachmentActivationTerminalSessionForLaunchHandoff(
+      activation.input,
+      terminal.operation,
+      terminal.reservation,
+    );
+  const launchInput = writerLaunchAttemptInputForRestoreActivationHandoff(
+    activation.input,
+    activation.generation.generation,
+    terminalSession,
+  );
+  ensure(
+    canonicalSerialize(active.launchAttempt.input) ===
+        canonicalSerialize(launchInput) &&
+      active.operation.createdAt === terminal.operation.updatedAt &&
+      active.reservation.createdAt === terminal.operation.updatedAt &&
+      (active.operation.state !== "prepared" ||
+        (active.operation.updatedAt === terminal.operation.updatedAt &&
+          active.reservation.updatedAt === terminal.operation.updatedAt)) &&
+      activation.launchIdClaim.materializedAt ===
+        active.operation.createdAt &&
+      activation.launchIdClaim.materializedAt ===
+        terminal.operation.updatedAt,
+    "operation_state_invalid",
+  );
+  restoreAttachmentActivationHandoffReceipt({
+    activationFinalized: false,
+    activationInput: activation.input,
+    activationOperation: terminal.operation,
+    activationReservation: terminal.reservation,
+    generation: activation.generation.generation,
+    launchInput,
+    launchOperation: active.operation,
+    launchReservation: active.reservation,
+    session,
+  });
+  return true;
+}
+
 async function readRestoreLaunchHandoffReplay(
   transaction,
   session,
@@ -7559,6 +8466,64 @@ async function readRestoreLaunchHandoffReplay(
     restoreInput: input.restore,
     restoreOperation,
     restoreReservation,
+    session,
+  });
+}
+
+async function readRestoreAttachmentActivationHandoffReplay(
+  transaction,
+  session,
+  input,
+  observed,
+) {
+  const operation = observed.operation;
+  const reservation = observed.reservation;
+  const relation = observed.activation;
+  ensure(
+    operation !== null &&
+      reservation !== null &&
+      relation !== null &&
+      relation.generation !== null &&
+      relation.launchIdClaim !== null &&
+      operation.state === "committed" &&
+      operation.result?.outcome === "restore-attachment-activated",
+    "operation_transition_conflict",
+  );
+  const terminalSession =
+    restoreAttachmentActivationTerminalSessionForLaunchHandoff(
+      input,
+      operation,
+      reservation,
+    );
+  const launchInput = writerLaunchAttemptInputForRestoreActivationHandoff(
+    input,
+    relation.generation.generation,
+    terminalSession,
+  );
+  const launchObserved = await readRequestedOperation(
+    transaction,
+    session,
+    launchInput,
+    true,
+  );
+  ensure(
+    launchObserved.operation !== null &&
+      launchObserved.reservation !== null &&
+      launchObserved.launchAttempt !== null &&
+      relation.launchIdClaim.materializedAt ===
+        launchObserved.operation.createdAt &&
+      relation.launchIdClaim.materializedAt === operation.updatedAt,
+    "operation_transition_conflict",
+  );
+  return restoreAttachmentActivationHandoffReceipt({
+    activationFinalized: false,
+    activationInput: input,
+    activationOperation: operation,
+    activationReservation: reservation,
+    generation: relation.generation.generation,
+    launchInput,
+    launchOperation: launchObserved.operation,
+    launchReservation: launchObserved.reservation,
     session,
   });
 }
@@ -7991,6 +8956,227 @@ async function readCommittedRestoreGenerationForLaunch(
   return deepFreeze({ generation, input, operation, reservation, source });
 }
 
+async function readRestoreAttachmentActivationPredecessor(
+  transaction,
+  input,
+  currentSession,
+  forUpdate,
+) {
+  const predecessor = input.request.predecessor;
+  const detachOperation = await readOperationSnapshot(
+    transaction,
+    predecessor.detachOperationId,
+    forUpdate,
+  );
+  ensure(
+    detachOperation !== null &&
+      detachOperation.state === "committed" &&
+      (detachOperation.kind === WRITER_RELEASE_OPERATION_KIND ||
+        detachOperation.kind === WRITER_FORCE_FENCE_OPERATION_KIND) &&
+      detachOperation.result !== null &&
+      (detachOperation.result.outcome === "writer-released" ||
+        detachOperation.result.outcome === "writer-fenced"),
+    "operation_state_invalid",
+  );
+  const detachReservation = await readReservationSnapshot(
+    transaction,
+    detachOperation.operationId,
+    forUpdate,
+  );
+  ensure(detachReservation !== null, "operation_state_invalid");
+  validateLastOperationPointer(
+    input.expectedSession,
+    detachOperation,
+    detachReservation,
+  );
+  validateCommittedOperationHistory(detachOperation, currentSession);
+  const stopPointer = detachOperation.expectedSession.document.lastOperation;
+  ensure(
+    stopPointer !== null &&
+      stopPointer.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+      stopPointer.operationId === predecessor.stopOperationId &&
+      detachOperation.expectedSession.document.lifecycle === "ATTACHED" &&
+      detachOperation.expectedSession.document.launch === null &&
+      detachOperation.expectedSession.document.attachment !== null &&
+      detachOperation.expectedSession.document.attachment.attachmentId ===
+        predecessor.attachmentId,
+    "operation_state_invalid",
+  );
+  const stopOperation = await readOperationSnapshot(
+    transaction,
+    predecessor.stopOperationId,
+    forUpdate,
+  );
+  ensure(
+    stopOperation !== null &&
+      stopOperation.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+      stopOperation.state === "committed" &&
+      stopOperation.result?.outcome === "writer-launch-stopped",
+    "operation_state_invalid",
+  );
+  const stopReservation = await readReservationSnapshot(
+    transaction,
+    stopOperation.operationId,
+    forUpdate,
+  );
+  ensure(stopReservation !== null, "operation_state_invalid");
+  validateLastOperationPointer(
+    detachOperation.expectedSession,
+    stopOperation,
+    stopReservation,
+  );
+  const stopRelation = await validateWriterLaunchStopRelations(
+    transaction,
+    stopOperation,
+    detachOperation.expectedSession,
+    forUpdate,
+  );
+  ensure(
+    stopRelation !== null &&
+      stopRelation.input.request.launch.attachmentId ===
+        predecessor.attachmentId &&
+      canonicalSerialize(stopRelation.input.request.launch.generation) ===
+        canonicalSerialize(input.request.generation),
+    "operation_state_invalid",
+  );
+  return deepFreeze({
+    detachOperation,
+    detachReservation,
+    stopOperation,
+    stopRelation,
+    stopReservation,
+  });
+}
+
+async function validateRestoreAttachmentActivationRelations(
+  transaction,
+  operation,
+  currentSession,
+  forUpdate,
+) {
+  if (operation.kind !== RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND) {
+    return null;
+  }
+  const input = restoreAttachmentActivationInput(
+    inputForOperation(operation),
+    OPERATION_INPUT_KEYS,
+    "operation_state_invalid",
+  );
+  if (
+    operation.state === "committed" &&
+    operation.result?.outcome === "cancelled-before-dispatch"
+  ) {
+    return deepFreeze({
+      activationRequest: null,
+      generation: null,
+      input,
+      launchIdClaim: null,
+      predecessor: null,
+    });
+  }
+  const generation = await readCommittedRestoreGenerationForLaunch(
+    transaction,
+    input.request.generation,
+    currentSession,
+    forUpdate,
+  );
+  const predecessor = await readRestoreAttachmentActivationPredecessor(
+    transaction,
+    input,
+    currentSession,
+    forUpdate,
+  );
+  ensure(
+    canonicalSerialize(
+      canonicalJsonObject(
+        generation.generation.binding.attachment,
+        "operation_state_invalid",
+      ),
+    ) ===
+      canonicalSerialize(
+        canonicalJsonObject(
+          predecessor.detachOperation.expectedSession.document.attachment,
+          "operation_state_invalid",
+        ),
+      ),
+    "operation_state_invalid",
+  );
+  ensure(
+    generation.generation.binding.attachment.attachmentId ===
+      input.request.predecessor.attachmentId,
+    "operation_state_invalid",
+  );
+  if (operation.state === "prepared") {
+    return deepFreeze({
+      activationRequest: null,
+      generation,
+      input,
+      launchIdClaim: null,
+      predecessor,
+    });
+  }
+  const launchIdClaim = await readOperationIdClaim(
+    transaction,
+    input.request.launchIntent.launchAttemptId,
+    forUpdate,
+  );
+  ensure(launchIdClaim !== null, "operation_state_invalid");
+  validateRestoreAttachmentActivationLaunchIdClaim(
+    launchIdClaim,
+    input,
+    operation.state === "committed" ? "materialized" : "reserved",
+  );
+  ensure(
+    timestampMilliseconds(launchIdClaim.claimedAt) >=
+        timestampMilliseconds(operation.createdAt) &&
+      timestampMilliseconds(launchIdClaim.claimedAt) <=
+        timestampMilliseconds(operation.updatedAt) &&
+      (operation.state !== "starting" ||
+        launchIdClaim.claimedAt === operation.updatedAt) &&
+      (operation.state !== "committed" ||
+        launchIdClaim.materializedAt === operation.updatedAt),
+    "operation_state_invalid",
+  );
+  let activationRequest;
+  if (operation.state === "starting" || operation.state === "uncertain") {
+    ensure(
+      currentSession.document.lease !== null,
+      "operation_state_invalid",
+    );
+    activationRequest = restoreAttachmentActivationRequestFor(
+      input,
+      generation.generation,
+      currentSession.document.lease,
+      "operation_state_invalid",
+    );
+  } else {
+    ensure(
+      operation.state === "committed" &&
+        operation.result?.outcome === "restore-attachment-activated",
+      "operation_state_invalid",
+    );
+    activationRequest = operation.result.activationRequest;
+    const expectedRequest = restoreAttachmentActivationRequestFor(
+      input,
+      generation.generation,
+      activationRequest.lease,
+      "operation_state_invalid",
+    );
+    ensure(
+      canonicalSerialize(activationRequest) ===
+        canonicalSerialize(expectedRequest),
+      "operation_state_invalid",
+    );
+  }
+  return deepFreeze({
+    activationRequest,
+    generation,
+    input,
+    launchIdClaim,
+    predecessor,
+  });
+}
+
 async function validateRestoreGenerationRelations(
   transaction,
   operation,
@@ -8095,6 +9281,77 @@ async function validateRestoreGenerationRelations(
   return deepFreeze({ generation, input, launchIdClaim, source });
 }
 
+async function validateWriterLaunchGenerationAttachmentRelation(
+  transaction,
+  input,
+  generation,
+  currentSession,
+  forUpdate,
+) {
+  const generationAttachmentMatches =
+    canonicalSerialize(
+      canonicalJsonObject(
+        generation.generation.binding.attachment,
+        "operation_state_invalid",
+      ),
+    ) === canonicalSerialize(input.request.attachment);
+  let restoreActivation = null;
+  if (!generationAttachmentMatches) {
+    const activationOperation = await readOperationSnapshot(
+      transaction,
+      input.request.attachment.operationId,
+      forUpdate,
+    );
+    const activationReservation = await readReservationSnapshot(
+      transaction,
+      input.request.attachment.operationId,
+      forUpdate,
+    );
+    ensure(
+      activationOperation !== null &&
+        activationOperation.kind ===
+          RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+        activationOperation.state === "committed" &&
+        activationOperation.result?.outcome ===
+          "restore-attachment-activated" &&
+        activationReservation !== null,
+      "operation_state_invalid",
+    );
+    const activationInput = restoreAttachmentActivationInput(
+      inputForOperation(activationOperation),
+      OPERATION_INPUT_KEYS,
+      "operation_state_invalid",
+    );
+    validateOperationReservation(
+      activationOperation,
+      activationReservation,
+      activationInput,
+    );
+    validateCommittedOperationHistory(
+      activationOperation,
+      currentSession,
+    );
+    restoreActivation =
+      await validateRestoreAttachmentActivationRelations(
+        transaction,
+        activationOperation,
+        currentSession,
+        forUpdate,
+      );
+    ensure(
+      restoreActivation !== null &&
+        restoreActivation.generation !== null &&
+        canonicalSerialize(restoreActivation.input.request.generation) ===
+          canonicalSerialize(input.request.generation) &&
+        canonicalSerialize(
+          activationOperation.result?.activationResult.attachment,
+        ) === canonicalSerialize(input.request.attachment),
+      "operation_state_invalid",
+    );
+  }
+  return restoreActivation;
+}
+
 async function validateWriterLaunchAttemptRelations(
   transaction,
   operation,
@@ -8117,7 +9374,12 @@ async function validateWriterLaunchAttemptRelations(
     // Prepared is a cancellable intent, not generation authority. The fresh
     // claim performs the first locked generation read; later active and
     // terminal phases continuously revalidate that durable relation.
-    return deepFreeze({ generation: null, input, launch: null });
+    return deepFreeze({
+      generation: null,
+      input,
+      launch: null,
+      restoreActivation: null,
+    });
   }
   const generation = await readCommittedRestoreGenerationForLaunch(
     transaction,
@@ -8125,16 +9387,14 @@ async function validateWriterLaunchAttemptRelations(
     currentSession,
     forUpdate,
   );
-  ensure(
-    canonicalSerialize(
-      canonicalJsonObject(
-        generation.generation.binding.attachment,
-        "operation_state_invalid",
-      ),
-    ) ===
-      canonicalSerialize(input.request.attachment),
-    "operation_state_invalid",
-  );
+  const restoreActivation =
+    await validateWriterLaunchGenerationAttachmentRelation(
+      transaction,
+      input,
+      generation,
+      currentSession,
+      forUpdate,
+    );
   let launch = null;
   if (operation.state === "committed") {
     ensure(operation.result !== null, "operation_state_invalid");
@@ -8155,7 +9415,7 @@ async function validateWriterLaunchAttemptRelations(
       );
     }
   }
-  return deepFreeze({ generation, input, launch });
+  return deepFreeze({ generation, input, launch, restoreActivation });
 }
 
 async function validateWriterLaunchPointerRelations(
@@ -8334,6 +9594,13 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       session,
       forUpdate,
     );
+    const activation =
+      await validateRestoreAttachmentActivationRelations(
+        transaction,
+        operation,
+        session,
+        forUpdate,
+      );
     const launchAttempt = await validateWriterLaunchAttemptRelations(
       transaction,
       operation,
@@ -8347,6 +9614,7 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       forUpdate,
     );
     active = deepFreeze({
+      activation,
       checkpoint,
       generation,
       launchAttempt,
@@ -8391,6 +9659,13 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       terminalBase,
       false,
     );
+    const activation =
+      await validateRestoreAttachmentActivationRelations(
+        transaction,
+        operation,
+        terminalBase,
+        false,
+      );
     const launchAttempt = await validateWriterLaunchAttemptRelations(
       transaction,
       operation,
@@ -8404,6 +9679,7 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       false,
     );
     terminal = deepFreeze({
+      activation,
       checkpoint,
       generation,
       launchAttempt,
@@ -8465,6 +9741,7 @@ async function readRequestedOperation(
   if (operation === null) {
     return deepFreeze({
       active: relations.active,
+      activation: null,
       checkpoint: null,
       generation: null,
       launchAttempt: null,
@@ -8496,6 +9773,15 @@ async function readRequestedOperation(
           false,
         )
       : current.checkpoint;
+  const activation =
+    current === null
+      ? await validateRestoreAttachmentActivationRelations(
+          transaction,
+          operation,
+          session,
+          false,
+        )
+      : current.activation;
   const generation =
     current === null
       ? await validateRestoreGenerationRelations(
@@ -8528,6 +9814,7 @@ async function readRequestedOperation(
   }
   return deepFreeze({
     active: relations.active,
+    activation,
     checkpoint,
     generation,
     launchAttempt,
@@ -9201,6 +10488,99 @@ export class PostgresSessionAuthority {
     });
   }
 
+  async listRestoreAttachmentActivationRecoveryCandidates(options) {
+    const listInput = restoreAttachmentActivationRecoveryListInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const maximumRows = listInput.limit + 1;
+      const afterCursor = listInput.afterSessionId;
+      const query =
+        afterCursor === null
+          ? LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_FIRST_PAGE_QUERY
+          : LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_AFTER_QUERY;
+      const values =
+        afterCursor === null
+          ? [maximumRows]
+          : [afterCursor, maximumRows];
+      const operationRows = pageRowsFromResult(
+        await transaction.query(query.text, values),
+        maximumRows,
+        "operation_state_invalid",
+      );
+      const candidateCount =
+        operationRows.length > listInput.limit
+          ? listInput.limit
+          : operationRows.length;
+      const candidates = new ArrayConstructor(candidateCount);
+      objectSetPrototypeOf(candidates, null);
+      let previousSessionId = afterCursor;
+      let lastCandidateSessionId = null;
+      for (let index = 0; index < operationRows.length; index += 1) {
+        const operation = operationSnapshotFromRow(
+          ownDataValue(
+            operationRows,
+            reflectApply(StringConstructor, undefined, [index]),
+            "operation_state_invalid",
+          ),
+        );
+        ensure(
+          operation.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+            (operation.state === "starting" ||
+              operation.state === "uncertain") &&
+            operation.retiredAt === null &&
+            (previousSessionId === null ||
+              operation.sessionId > previousSessionId),
+          "operation_state_invalid",
+        );
+        const input = restoreAttachmentActivationInput(
+          inputForOperation(operation),
+          OPERATION_INPUT_KEYS,
+          "operation_state_invalid",
+        );
+        const session = await readSessionSnapshot(
+          transaction,
+          operation.sessionId,
+          false,
+        );
+        const observed = await readRequestedOperation(
+          transaction,
+          session,
+          input,
+          false,
+        );
+        ensure(
+          observed.active !== null &&
+            observed.active.operation.operationId === operation.operationId &&
+            observed.operation !== null &&
+            observed.reservation !== null &&
+            observed.activation !== null &&
+            observed.activation.activationRequest !== null &&
+            (observed.operation.state === "starting" ||
+              observed.operation.state === "uncertain") &&
+            canonicalSerialize(observed.operation) ===
+              canonicalSerialize(operation),
+          "operation_state_invalid",
+        );
+        if (index < candidateCount) {
+          candidates[index] = deepFreeze({
+            activationOperationId: input.operationId,
+            request: input.request,
+            state: observed.operation.state,
+          });
+          lastCandidateSessionId = operation.sessionId;
+        }
+        previousSessionId = operation.sessionId;
+      }
+      objectSetPrototypeOf(candidates, arrayPrototype);
+      return deepFreeze({
+        candidates,
+        nextAfterSessionId:
+          operationRows.length > listInput.limit
+            ? lastCandidateSessionId
+            : null,
+      });
+    });
+  }
+
   async listWriterLaunchAttemptRecoveryCandidates(options) {
     const listInput = writerLaunchAttemptRecoveryListInput(options);
     return runSerializable(this.#store, async (transaction) => {
@@ -9275,7 +10655,11 @@ export class PostgresSessionAuthority {
               canonicalSerialize(operation),
           "operation_state_invalid",
         );
-        isAtomicRestoreLaunchHandoff(session, observed);
+        isAtomicRestoreLaunchHandoff(session, observed) ||
+          isAtomicRestoreAttachmentActivationLaunchHandoff(
+            session,
+            observed,
+          );
         if (index < candidateCount) {
           candidates[index] = deepFreeze({
             launchAttemptId: input.operationId,
@@ -9632,6 +11016,7 @@ export class PostgresSessionAuthority {
         input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND &&
         input.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND &&
         input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+        input.kind !== RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
         input.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
         input.kind !== WRITER_LAUNCH_STOP_OPERATION_KIND,
       "invalid_operation_request",
@@ -10828,6 +12213,441 @@ export class PostgresSessionAuthority {
     });
   }
 
+  async claimRestoreAttachmentActivationDispatch(options) {
+    const input = restoreAttachmentActivationTransitionInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null && observed.reservation !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state !== "prepared") {
+        ensure(
+          observed.activation !== null &&
+            observed.activation.activationRequest !== null,
+          "operation_transition_conflict",
+        );
+        return operationReceipt({
+          activationRequest: observed.activation.activationRequest,
+          dispatchGranted: false,
+          generation: observed.activation.generation.generation,
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+        });
+      }
+      ensure(
+        observed.operation.revision === input.expectedOperationRevision &&
+          observed.activation !== null &&
+          observed.activation.generation !== null &&
+          observed.activation.predecessor !== null &&
+          observed.activation.launchIdClaim === null &&
+          session.document.lifecycle === "DETACHED" &&
+          session.document.lease === null &&
+          session.document.attachment === null &&
+          session.document.launch === null,
+        "operation_transition_conflict",
+      );
+      revisionAfter(session.revision, 7);
+      const fencingEpoch = nextWriterEpoch(session.document.writerEpoch);
+
+      const claimRows = rowsFromResult(
+        await transaction.query(
+          INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY.text,
+          [
+            input.request.launchIntent.launchAttemptId,
+            session.sessionId,
+            input.operationId,
+            canonicalSerialize(input.request.launchIntent),
+            transaction.now,
+          ],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(claimRows.length === 1, "operation_identity_conflict");
+      const launchIdClaim = operationIdClaimSnapshotFromRow(claimRows[0]);
+      validateRestoreAttachmentActivationLaunchIdClaim(
+        launchIdClaim,
+        input,
+        "reserved",
+      );
+
+      const authorityNow = await readAuthorityClock(transaction);
+      ensure(
+        timestampMilliseconds(authorityNow) >=
+          timestampMilliseconds(transaction.now),
+        "session_state_invalid",
+      );
+      const lease = restoreAttachmentActivationLeaseFor(
+        input,
+        authorityNow,
+        fencingEpoch,
+        "operation_state_invalid",
+      );
+      const activationRequest = restoreAttachmentActivationRequestFor(
+        input,
+        observed.activation.generation.generation,
+        lease,
+        "operation_state_invalid",
+      );
+
+      const operationRows = rowsFromResult(
+        await transaction.query(START_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(START_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        reservationRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(reservationRows[0]);
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      ensure(
+        launchIdClaim.claimedAt === operation.updatedAt,
+        "operation_state_invalid",
+      );
+      const nextDocument = documentWithAuthorityState(session.document, {
+        activeOperation: activePointerFor(input, "starting", "1"),
+        attachment: null,
+        lease,
+        lifecycle: "ATTACHING",
+        writerEpoch: fencingEpoch,
+      });
+      const updatedSession = await updateSessionDocument(
+        transaction,
+        session,
+        input,
+        nextDocument,
+      );
+      validateActivePointer(updatedSession, operation, reservation);
+      return operationReceipt({
+        activationRequest,
+        authorityNow,
+        dispatchGranted: true,
+        generation: observed.activation.generation.generation,
+        operation,
+        reservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt(
+    options,
+  ) {
+    const input = restoreAttachmentActivationFinalizationInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.activation !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state === "committed") {
+        ensure(
+          observed.operation.result?.outcome ===
+              "restore-attachment-activated" &&
+            BigIntConstructor(input.expectedOperationRevision) + 1n ===
+              BigIntConstructor(observed.operation.revision),
+          "operation_transition_conflict",
+        );
+        const candidate = canonicalRestoreAttachmentActivationProviderResult(
+          input.activationResult,
+          observed.operation.result.activationRequest,
+          "invalid_operation_request",
+        );
+        ensure(
+          canonicalSerialize(candidate) ===
+            canonicalSerialize(observed.operation.result.activationResult),
+          "operation_result_conflict",
+        );
+        return readRestoreAttachmentActivationHandoffReplay(
+          transaction,
+          session,
+          input,
+          observed,
+        );
+      }
+      ensure(
+        (observed.operation.state === "starting" ||
+          observed.operation.state === "uncertain") &&
+          observed.operation.revision === input.expectedOperationRevision &&
+          observed.activation.activationRequest !== null &&
+          observed.activation.generation !== null &&
+          observed.activation.launchIdClaim !== null &&
+          session.document.lifecycle === "ATTACHING" &&
+          session.document.lease !== null &&
+          session.document.attachment === null,
+        "operation_transition_conflict",
+      );
+      revisionAfter(session.revision, 5);
+      const activationRequest = observed.activation.activationRequest;
+      const activationResult =
+        canonicalRestoreAttachmentActivationProviderResult(
+          input.activationResult,
+          activationRequest,
+          "invalid_operation_request",
+        );
+      const result = restoreAttachmentActivationTerminalResult(
+        input,
+        activationRequest,
+        activationResult,
+        "invalid_operation_request",
+      );
+      const serializedResult = canonicalSerialize(result);
+      const predecessorState = observed.operation.state;
+      const operationRows = rowsFromResult(
+        await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          serializedResult,
+          transaction.now,
+          predecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+          predecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        reservationRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(reservationRows[0]);
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      ensure(
+        canonicalSerialize(operation.result) === serializedResult,
+        "operation_result_conflict",
+      );
+
+      const terminalDocument = documentWithAuthorityState(
+        session.document,
+        {
+          activeOperation: null,
+          attachment: activationResult.attachment,
+          lastOperation: lastPointerFor(operation, reservation),
+          lease: activationRequest.lease,
+          lifecycle: "ATTACHED",
+          writerEpoch: activationRequest.lease.fencingEpoch,
+        },
+      );
+      const terminalSession = await updateSessionDocument(
+        transaction,
+        session,
+        input,
+        terminalDocument,
+      );
+      validateLastOperationPointer(terminalSession, operation, reservation);
+
+      const launchInput =
+        writerLaunchAttemptInputForRestoreActivationHandoff(
+          input,
+          observed.activation.generation.generation,
+          terminalSession,
+        );
+      const launchOperationRows = rowsFromResult(
+        await transaction.query(
+          INSERT_PRECLAIMED_RESTORE_ACTIVATION_LAUNCH_QUERY.text,
+          [
+            launchInput.operationId,
+            terminalSession.sessionId,
+            launchInput.kind,
+            launchInput.serializedEnvelope,
+            transaction.now,
+            input.operationId,
+            canonicalSerialize(input.request.launchIntent),
+          ],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(
+        launchOperationRows.length === 1,
+        "operation_identity_conflict",
+      );
+      const launchOperation = operationSnapshotFromRow(
+        launchOperationRows[0],
+      );
+      validateOperationIdentity(launchOperation, launchInput);
+
+      const launchReservationRows = rowsFromResult(
+        await transaction.query(INSERT_RESERVATION_QUERY.text, [
+          launchInput.reservationId,
+          launchInput.operationId,
+          terminalSession.sessionId,
+          launchInput.kind,
+          terminalSession.revision,
+          canonicalSerialize(reservationPayload(launchInput)),
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        launchReservationRows.length === 1,
+        "operation_state_invalid",
+      );
+      const launchReservation = reservationSnapshotFromRow(
+        launchReservationRows[0],
+      );
+      validateOperationReservation(
+        launchOperation,
+        launchReservation,
+        launchInput,
+      );
+
+      const materializedRows = rowsFromResult(
+        await transaction.query(
+          MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY.text,
+          [
+            launchInput.operationId,
+            terminalSession.sessionId,
+            transaction.now,
+            input.operationId,
+            canonicalSerialize(input.request.launchIntent),
+          ],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(
+        materializedRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const materializedClaim = operationIdClaimSnapshotFromRow(
+        materializedRows[0],
+      );
+      validateRestoreAttachmentActivationLaunchIdClaim(
+        materializedClaim,
+        input,
+        "materialized",
+      );
+      ensure(
+        materializedClaim.claimedAt ===
+            observed.activation.launchIdClaim.claimedAt &&
+          materializedClaim.materializedAt === operation.updatedAt &&
+          materializedClaim.materializedAt === launchOperation.createdAt,
+        "operation_state_invalid",
+      );
+
+      const updatedSession = await updateSessionPhase(
+        transaction,
+        terminalSession,
+        launchInput,
+        activePointerFor(launchInput, "prepared", "0"),
+      );
+      validateActivePointer(
+        updatedSession,
+        launchOperation,
+        launchReservation,
+      );
+      return restoreAttachmentActivationHandoffReceipt({
+        activationFinalized: true,
+        activationInput: input,
+        activationOperation: operation,
+        activationReservation: reservation,
+        generation: observed.activation.generation.generation,
+        launchInput,
+        launchOperation,
+        launchReservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async readRestoreAttachmentActivation(options) {
+    const normalized = exactPlainObject(
+      options,
+      RESTORE_ATTACHMENT_ACTIVATION_READ_KEYS,
+      "invalid_operation_request",
+    );
+    const operationId = canonicalOpaqueId(
+      normalized.operationId,
+      128,
+      "invalid_operation_request",
+    );
+    return runSerializable(this.#store, async (transaction) => {
+      const operation = await readOperationSnapshot(
+        transaction,
+        operationId,
+        false,
+      );
+      ensure(
+        operation !== null &&
+          operation.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+        "restore_attachment_activation_not_authorized",
+      );
+      const input = restoreAttachmentActivationInput(
+        inputForOperation(operation),
+        OPERATION_INPUT_KEYS,
+        "operation_state_invalid",
+      );
+      const session = await readSessionSnapshot(
+        transaction,
+        operation.sessionId,
+        false,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        false,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.activation !== null,
+        "operation_transition_conflict",
+      );
+      return operationReceipt({
+        activationRequest: observed.activation.activationRequest,
+        generation: observed.activation.generation?.generation ?? null,
+        operation: observed.operation,
+        reservation: observed.reservation,
+        session,
+      });
+    });
+  }
+
   async claimWriterLaunchAttemptDispatch(options) {
     const input = writerLaunchAttemptTransitionInput(options);
     return runSerializable(this.#store, async (transaction) => {
@@ -10889,14 +12709,12 @@ export class PostgresSessionAuthority {
         session,
         true,
       );
-      ensure(
-        canonicalSerialize(
-          canonicalJsonObject(
-            generation.generation.binding.attachment,
-            "operation_transition_conflict",
-          ),
-        ) === canonicalSerialize(input.request.attachment),
-        "operation_transition_conflict",
+      await validateWriterLaunchGenerationAttachmentRelation(
+        transaction,
+        input,
+        generation,
+        session,
+        true,
       );
       // Read the non-transactional authority clock only after every
       // generation relation lock has been acquired. Otherwise a wait on the
@@ -12218,6 +14036,7 @@ export class PostgresSessionAuthority {
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND ||
           input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND ||
           input.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND ||
+          input.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND ||
           input.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND ||
           input.kind === WRITER_LAUNCH_STOP_OPERATION_KIND
           ? 2
@@ -12301,7 +14120,11 @@ export class PostgresSessionAuthority {
         "operation_transition_conflict",
       );
       const atomicRestoreLaunchHandoff =
-        isAtomicRestoreLaunchHandoff(session, observed);
+        isAtomicRestoreLaunchHandoff(session, observed) ||
+        isAtomicRestoreAttachmentActivationLaunchHandoff(
+          session,
+          observed,
+        );
       let mutationTimestamp = transaction.now;
       if (atomicRestoreLaunchHandoff) {
         ensure(

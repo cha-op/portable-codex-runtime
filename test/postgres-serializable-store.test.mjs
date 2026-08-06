@@ -46,6 +46,10 @@ const AUTHORITY_MIGRATION_URLS = Object.freeze([
     "../migrations/authority/003-operation-id-registry.sql",
     import.meta.url,
   ),
+  new URL(
+    "../migrations/authority/004-restore-attachment-activation.sql",
+    import.meta.url,
+  ),
 ]);
 
 class FakeClient {
@@ -2401,6 +2405,8 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     {},
     {},
     {},
+    {},
+    {},
     COMMIT_RESULT,
   ]);
   const store = new PostgresSerializableStore({
@@ -2441,12 +2447,17 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
     [2, migrations[1].checksum],
   ]);
-  assert.deepEqual(migrationQueries[10], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[10], [migrations[2].sql]);
   assert.deepEqual(migrationQueries[11], [
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
-    [3, latestMigration.checksum],
+    [3, migrations[2].checksum],
   ]);
-  assert.deepEqual(migrationQueries[12], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[12], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[13], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [4, latestMigration.checksum],
+  ]);
+  assert.deepEqual(migrationQueries[14], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -2469,22 +2480,30 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     migrations[1].sql,
     /UNIQUE \(checkpoint_id, session_id\)/u,
   );
-  assert.match(latestMigration.sql, /operation_id_registry/u);
+  assert.match(migrations[2].sql, /operation_id_registry/u);
   assert.match(
-    latestMigration.sql,
+    migrations[2].sql,
     /request #>> '\{payload,contractVersion\}' = '2'[\s\S]+state <> 'prepared'/u,
   );
   assert.match(
-    latestMigration.sql,
+    migrations[2].sql,
     /claim_type IN \('direct-operation', 'restore-launch-intent-v2'\)/u,
   );
   assert.match(
-    latestMigration.sql,
+    migrations[2].sql,
     /operation_claims_operation_id_registry_fk/u,
   );
   assert.match(
     migrations[1].sql,
     /state IN \('authorized', 'committed'\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /restore-activation-launch-intent-v1/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /operation_claims_enforce_restore_activation_launch_id_claim/u,
   );
   client.assertExhausted();
 });
@@ -2498,6 +2517,8 @@ test("migrate destroys a client when its post-COMMIT reset fails", async () => {
       {},
       {},
       { rows: [] },
+      {},
+      {},
       {},
       {},
       {},
@@ -2560,7 +2581,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v1 ledger by applying v2 and v3", async () => {
+test("migrate upgrades an exact v1 ledger through v4", async () => {
   const migrations = await readAuthorityMigrations();
   const firstMigration = migrations[0];
   const latestMigration = migrations.at(-1);
@@ -2577,6 +2598,8 @@ test("migrate upgrades an exact v1 ledger by applying v2 and v3", async () => {
         },
       ],
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -2598,6 +2621,11 @@ test("migrate upgrades an exact v1 ledger by applying v2 and v3", async () => {
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[1].version, migrations[1].checksum],
     ],
+    [migrations[2].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[2].version, migrations[2].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -2609,7 +2637,7 @@ test("migrate upgrades an exact v1 ledger by applying v2 and v3", async () => {
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v2 ledger by applying only v3", async () => {
+test("migrate upgrades an exact v2 ledger through v4", async () => {
   const migrations = await readAuthorityMigrations();
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
@@ -2625,6 +2653,8 @@ test("migrate upgrades an exact v2 ledger by applying only v3", async () => {
     },
     {},
     {},
+    {},
+    {},
     COMMIT_RESULT,
   ]);
   const store = new PostgresSerializableStore({
@@ -2637,6 +2667,11 @@ test("migrate upgrades an exact v2 ledger by applying only v3", async () => {
     version: SESSION_AUTHORITY_MIGRATION_VERSION,
   });
   assert.deepEqual(nonResetQueries(client).slice(6), [
+    [migrations[2].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[2].version, migrations[2].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -2832,7 +2867,7 @@ test("migrate rejects an exact latest prefix accompanied by an extra version", a
     {
       rows: [
         ...migrations.map(({ checksum, version }) => ({ checksum, version })),
-        { checksum: "0".repeat(64), version: 4 },
+        { checksum: "0".repeat(64), version: 5 },
       ],
     },
     {},
@@ -2961,6 +2996,8 @@ test("migrate rejects a COMMIT acknowledgement that reports ROLLBACK", async () 
     {},
     {},
     {},
+    {},
+    {},
     { command: "ROLLBACK" },
   ]);
   const store = new PostgresSerializableStore({
@@ -2984,6 +3021,8 @@ test("migrate treats a failed COMMIT as uncertain and never reapplies", async ()
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},

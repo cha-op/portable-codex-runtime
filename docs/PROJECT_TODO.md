@@ -69,15 +69,16 @@
   issuing the one-use capability, reconcile same-process pre-dispatch stop
   replay, block same-session successor launch through capture, and retire local
   writer identity only after confirmed capture success.
-- [pending] Model a restore destination independently from the current active
-  attachment. After committed absent-destination publication, obtain
-  provider-backed attachment evidence and atomically bind the canonical
-  session plus prepared launch request to that new attachment; never infer
-  activation from pathname equality.
-- [pending] After a fleet-wide version 2 capability gate, compose committed
-  restore publication, detached-destination activation, and bounded
-  no-relaunch recovery services; only then enable `runRestore()` under
-  fail-closed ambiguous outcomes.
+- [done] Compose detached restore activation and recovery: source-free verify
+  only an exact committed destination, bind version 1 provider attachment
+  evidence without treating pathname equality as authority, atomically install
+  the canonical attachment plus prepared launch, and sweep four bounded
+  generation/activation/launch/current-inventory lanes without relaunching.
+- [pending] After a fleet-wide version 2 capability gate, wire committed
+  restore publication, detached-destination activation, prepared launch, and
+  bounded no-relaunch recovery through the production checkpoint adapter.
+  Keep `runRestore()` fail-closed until that adapter composition and its
+  ambiguous-outcome coverage are complete.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

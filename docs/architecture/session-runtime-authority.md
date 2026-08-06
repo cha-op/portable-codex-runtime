@@ -1363,44 +1363,109 @@ successor of the original handoff and returns the same terminal launch state.
 Standalone version 1 launch reservations retain their ordinary cancellation
 reason, clock, timestamp, and replay behavior unchanged.
 
-This atomic-handoff slice intentionally does not verify a committed
-publication, create an operational recovery service, or enable production
-restore. The separate same-process composition described above now owns the
-durable stop/proof/capture join, but remains unwired to this restore path.
+The historical atomic-handoff path intentionally retains its original
+semantics: it does not activate a detached destination and therefore remains
+unavailable to production restore. The detached activation path below is a
+separate operation kind rather than a reinterpretation of version 2 restore
+history.
+
+## Implemented Detached Restore Activation and Recovery
+
+`restore-attachment-activation-v1` starts only from an exact version 3
+`DETACHED` session with no lease, attachment, launch, or active operation. Its
+immutable request binds one committed restore-generation reference, the
+detached destination root, holder, bounded lease duration, launch intent, and
+predecessor `{attachmentId, stopOperationId, detachOperationId}`. Relational
+validation walks that predecessor history: the bound writer launch must have a
+committed complete-stop operation, its exact attachment must then have a
+committed release or force-fence operation, and that attachment must be the
+one retained by the restore generation. A pathname alone cannot satisfy this
+history.
+
+Migration version 4 extends the permanent operation-ID registry with the
+`restore-activation-launch-intent-v1` claim. Activation dispatch locks and
+revalidates the session, operation, reservation, generation, stop, detach, and
+registry relations; reserves the launch-attempt ID; advances the writer epoch;
+and installs a deterministic lease while the canonical session enters
+`ATTACHING`. The deterministic attach mutation, lease ID, attachment ID, and
+launch intent are all derived or fixed before the provider call. Providers
+remain outside PostgreSQL transactions.
+
+The provider request carries the canonical manifest and storage reference,
+the exact new lease and attach mutation, and the committed publication's
+filesystem/object identity plus materialization digests. The provider result
+must echo that publication and prove the exact attachment, mutation result,
+lease, fence, and root path. Object identity and content binding come from the
+publication proof; root-path equality is only correlation evidence.
+
+`finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt()` performs
+one `SERIALIZABLE` transition that:
+
+1. commits the exact provider activation result and retires its reservation;
+2. installs the provider-proven attachment and lease as canonical `ATTACHED`
+   state;
+3. materializes the preclaimed `writer-launch-attempt-v1` operation and
+   reservation for that exact attachment, generation, image, and supervisor;
+4. marks the permanent launch-ID claim materialized; and
+5. advances the session so its active pointer names the prepared launch.
+
+Rollback exposes none of those writes. Exact replay validates the complete
+activation result, launch operation, reservation, registry claim, generation,
+and session revisions. A lost finalization acknowledgement is accepted only
+when readback proves the same provider result; a conflicting committed result
+remains uncertain and never invokes a second provider attachment.
+
+`PostgresRestoreActivationRecoveryCoordinator` supplies the source-free
+physical reconciliation boundary. For a retained version 1 generation it
+holds the per-operation PostgreSQL advisory guard, reads canonical authority,
+converts `starting` to `uncertain` when needed, calls only
+`verifyCommittedRestoreDestination()`, and binds the finalized or replayed
+generation document to that exact verified materialization, result, and
+catalogue artifact proof. Historical version 2 generations stay with their
+original atomic handoff and are rejected by this coordinator so they cannot be
+activated against the old attachment.
+
+For a retained activation, the same guard spans committed destination
+verification, the idempotent provider attachment call, and atomic
+activation-to-launch finalization. Every authority and provider result crosses
+an exact bounded data boundary; unsafe Promises, generators, Proxies,
+accessors, malformed receipts, object replacement, changed content, or changed
+access policy fail closed as an uncertain outcome.
+
+`PostgresRestoreActivationRecoveryService` runs four independently paginated
+keyset lanes in fixed order: generation reconciliation, activation
+reconciliation, prepared/active launch-attempt reconciliation, and current
+launch inventory. One service instance admits only one batch or sweep at a
+time. Abort stops new admission but drains the one in-flight candidate before
+advancing its settled cursor. Generation, activation, and launch-attempt
+failures remain `pending`; current launches are reported only as
+`requires-stop-or-fence`. The service accepts no image resolver, launch
+callback, writer handle, publication callback, or opaque capability and can
+neither relaunch nor adopt a running process.
 
 ## Remaining Production Restore Composition
 
-The launcher foundation and atomic handoff close the process-local
-image-consumption, external launch, provisional registration, no-relaunch
-reconciliation, and logical generation-to-launch reservation boundaries for
-an already authoritative attachment. They do not prove that a newly published
-restore destination is that attachment, and they do not yet compose the
-complete production restore protocol. Later serial pull requests must:
+The launcher foundation plus detached activation now close the committed
+publication, provider-backed attachment, atomic prepared-launch reservation,
+and bounded no-relaunch recovery boundaries. They remain independent protocol
+components rather than a production restore entry point. Later serial pull
+requests must:
 
 - consume the exact durable stop-to-capture result as a prerequisite, then
   physically fence and detach the old attachment before any restored
   attachment can become launch authority;
-- pass one typed destination generation and its exact coordinator binding
-  through physical publication to an independent detached, absent final
-  pathname, then verify the committed object before treating it as usable;
-- obtain provider-backed attachment evidence for that exact committed object
-  and atomically replace the canonical session and prepared launch attachment.
-  Pathname equality is correlation only and cannot prove attachment authority
-  or filesystem object identity;
 - dispatch the already-reserved launch with the original image reservation, or
   with a newly minted exact-match reservation while it is still durably
   `prepared`, and route every active attempt without another launch;
-- compose bounded generation, prepared-launch, active-attempt, and
-  current-launch recovery into an operational service;
+- schedule and persist the four-lane recovery service's independent cursors;
 - wire the whole protocol into `runRestore()` only after every uncertain
   publication, launch, registration, stop, and finalisation boundary remains
   fail-closed.
 
 Until that integration lands, the production checkpoint adapter rejects
-restore. The resolver alone is not stop/capture authority, and the standalone
-same-process stop-to-capture facade is not yet wired into the production
-adapter; neither supplies detached-destination activation, bounded restart
-recovery, or production restore enablement.
+restore. The resolver alone is not stop/capture authority, and neither the
+same-process stop-to-capture facade nor the detached activation/recovery
+components are wired into the production adapter.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -1499,8 +1564,8 @@ reconciliation, provisional-handle loss, typed complete-stop finalisation, and
 bounded discovery. Durable stop-to-capture validation covers exact tuple-bound
 stop identity, one physical stop, committed-transition proof before capability
 issue, one-use capture admission, and retained local identity after ambiguity.
-The next integration slice must add detached-destination activation, bounded
-launcher/recovery service wiring, and production `runRestore()`
-failure-injection coverage.
+The next integration slice must wire durable stop, detached publication,
+activation, prepared launch, and scheduled recovery through production
+`runRestore()` with complete failure-injection coverage.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

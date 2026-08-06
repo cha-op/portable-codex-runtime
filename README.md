@@ -10,6 +10,9 @@ primitive, the storage contracts, journal, local stopped-directory
 publication, same-process stopped-writer authority, and a composed
 stopped-directory backend for guarded clean capture, committed-result
 reconciliation, and restore.
+It also includes source-free committed restore-destination verification, a
+versioned provider attachment proof, atomic detached activation into a
+prepared launch, and four bounded no-relaunch recovery lanes.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -68,6 +71,10 @@ envelopes, declared storage backend capabilities, structural rootless worker
 directory binds, and recovery checkpoint classes. Physical launch, fencing,
 and snapshot authorization remain the responsibility of later concrete
 adapters and their conformance tests.
+An optional version 1 restore-attachment activation extension binds the exact
+committed publication object and materialization digest to the provider's
+attach mutation, canonical attachment, and proof. Path equality remains
+correlation evidence rather than object or attachment authority.
 The worker sees one ordinary directory at `/session`; a host storage agent owns
 raw volumes, filesystem images, attach/mount operations, and stale-writer
 fencing. `CODEX_HOME`, the effective Codex `sqlite_home`, and the workspace
@@ -160,7 +167,8 @@ composition; the serialized ID is not self-authenticating.
 `authorized` and `committed` generation rows remain permanent, and a claim
 whose commit acknowledgement is lost never grants a second publication
 dispatch. Publication still runs outside the database transaction, and a
-committed generation is only input to the later logical launcher admission.
+committed generation is durable input to the later atomic handoff or detached
+activation; it is not attachment or launch authority by itself.
 The same operation and reservation schema now also carries typed durable
 writer-launch attempts. One attempt binds an exact committed generation,
 attachment, lease and fence tuple, bounded measured-image projection, and
@@ -214,15 +222,38 @@ same-process coordinator stop through that durable transition and composes one
 clean capture. Its locked stop reconciliation preserves an ambiguously
 committed operation identity while allowing a strictly newer, validated lease
 snapshot to replace a pre-reserve input only after the authority proves the
-operation absent. Restart recovery and production restore remain separate,
-still-closed boundaries.
+operation absent.
 
-Production restore therefore remains fail-closed. Later serial pull requests
-must verify exact typed generation publication, compose durable stop/capture
-callbacks and bounded no-relaunch recovery, and only then wire and enable
-`runRestore()`. Crash-consistent ext4 or filesystem-image backend execution
-also remains later work; neither a database lease nor a higher epoch is a
-physical writer fence.
+Detached restore activation now composes the next authority boundary after the
+predecessor is stopped, fenced, and canonically detached.
+`verifyCommittedRestoreDestination()` is source-free and read-only: it
+revalidates only the exact committed journal record, trusted capture proof,
+publication identity, final filesystem object, modeled tree, and access-policy
+binding. It never reads the old capture source or advances an absent,
+`prepared`, or `materialized` publication. The optional provider version 1
+extension then returns attachment and mutation proof for that same published
+object. Typed `restore-attachment-activation-v1` finalization serializably
+installs the exact canonical attachment and materializes its predeclared
+`writer-launch-attempt-v1` as `prepared` in one atomic transition. Exact
+readback resolves commit acknowledgement loss without a second provider
+activation.
+
+The bounded restore recovery service sweeps four independent keyset lanes:
+destination generations, attachment activations, prepared or active launch
+attempts, and current-launch inventory. Recovery may verify committed
+publication, replay an idempotent provider activation, finalize durable state,
+or reconcile stopped-only supervisor evidence. It never republishes, reserves
+or consumes an image, invokes the launch callback, reconstructs an opaque
+writer capability, or treats current-launch inventory as adoptable work.
+
+Production restore therefore remains fail-closed. The next serial slice is
+production adapter wiring behind the fleet capability gate; it does not need
+to invent new activation or recovery semantics. It must connect
+committed publication, detached activation, prepared launch, and bounded
+no-relaunch recovery to the checkpoint adapter before enabling `runRestore()`.
+Crash-consistent ext4 or filesystem-image backend execution, differential
+compression, periodic backup, and cross-host restore verification remain later
+work; neither a database lease nor a higher epoch is a physical writer fence.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -313,6 +344,12 @@ exactly validates an already committed record and final artefact. `prepared`
 and `materialized` operations remain operator evidence and are never advanced
 by automatic reconciliation.
 
+The committed restore-destination verifier has the same source-free,
+read-only boundary. It additionally binds the trusted capture proof and exact
+restore-generation journal input to the final object's persistent identity,
+modeled content digest, and access-policy evidence. It never reopens the source
+artefact or turns a visible destination pathname into activation authority.
+
 This boundary supports only an approved local filesystem. NFS, other remote or
 unknown filesystem semantics, canonical fence checks, stopped-writer
 authentication, and non-cooperating same-UID races at the final POSIX rename
@@ -325,9 +362,11 @@ The v2 stopped-directory backend composes the same-process capability, a
 durable mutation-authority and catalogue seam, and local publication into the
 snapshot core's storage-backend contract. It owns only `captureCheckpoint`
 and `restoreCheckpoint` in the base contract, and exposes the optional v1
-`reconcileCheckpointCapture` extension. Provision, writable attachment
-preparation, detach, force-fence, and destroy operations delegate to a
-validated lifecycle backend with the same backend ID.
+`reconcileCheckpointCapture` extension. When the validated lifecycle backend
+declares matching support, it also delegates the optional version 1
+`prepareRestoreAttachment` provider extension with the same backend ID.
+Provision, writable attachment preparation, detach, force-fence, and destroy
+operations remain delegated lifecycle work.
 
 Capture consumes the exact stopped-writer capability once. While the
 coordinator callback is active, the mutation authority holds the canonical
@@ -373,8 +412,12 @@ state. The process-local launcher foundation now composes one-use image
 consumption, external launch, exact provisional writer registration, and
 no-relaunch attempt reconciliation. The atomic handoff additionally binds a
 committed restore generation to an already-prepared durable launch attempt.
-Restore remains fail-closed until later serial slices verify publication and
-compose launcher recovery plus durable stop/capture through `runRestore()`. See
+Detached activation now adds source-free destination verification, exact
+provider attachment proof, atomic canonical attachment plus prepared launch,
+and four-lane no-relaunch recovery. Production restore remains fail-closed
+until the next adapter-wiring slice connects those completed logical boundaries
+through `runRestore()`; filesystem-image execution and differential backup
+remain later work. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

@@ -30,6 +30,8 @@ import {
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
 import {
+  RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  assertRestoreAttachmentActivationBackend,
   assertStorageBackend,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
@@ -470,7 +472,7 @@ async function inspectTestPersistentObjectIdentity(path) {
   };
 }
 
-function createLifecycleBackend() {
+function createLifecycleBackend({ restoreActivation = false } = {}) {
   const calls = [];
   const delegatedResult = Object.freeze({ delegated: true });
   const backend = {
@@ -499,6 +501,17 @@ function createLifecycleBackend() {
     backend[method] = async function delegate(input) {
       assert.strictEqual(this, backend);
       calls.push({ input, method });
+      return delegatedResult;
+    };
+  }
+  if (restoreActivation) {
+    backend.restoreAttachmentActivationContractVersion =
+      RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION;
+    backend.prepareRestoreAttachment = async function delegateRestoreActivation(
+      input,
+    ) {
+      assert.strictEqual(this, backend);
+      calls.push({ input, method: "prepareRestoreAttachment" });
       return delegatedResult;
     };
   }
@@ -1458,6 +1471,90 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
     (error) =>
       assertBackendError(error, "invalid_stopped_directory_backend_request"),
   );
+});
+
+test("backend exposes restore attachment activation only when the lifecycle provider supports it", async (t) => {
+  const base = await createFixture(t);
+  assert.equal("prepareRestoreAttachment" in base.backend, false);
+  assert.equal(
+    "restoreAttachmentActivationContractVersion" in base.backend,
+    false,
+  );
+
+  const lifecycle = createLifecycleBackend({ restoreActivation: true });
+  const fixture = await createFixture(t, { lifecycle });
+  assert.strictEqual(
+    assertRestoreAttachmentActivationBackend(fixture.backend),
+    fixture.backend,
+  );
+  assert.equal(
+    fixture.backend.restoreAttachmentActivationContractVersion,
+    RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  );
+  assert.equal(
+    Object.hasOwn(fixture.backend, "prepareRestoreAttachment"),
+    true,
+  );
+  assert.equal(Object.isFrozen(fixture.backend.prepareRestoreAttachment), true);
+
+  const input = Object.freeze({ activation: "provider-owned-contract" });
+  assert.strictEqual(
+    await fixture.backend.prepareRestoreAttachment(input),
+    lifecycle.delegatedResult,
+  );
+  assert.deepEqual(lifecycle.calls.at(-1), {
+    input,
+    method: "prepareRestoreAttachment",
+  });
+
+  for (const invalidLifecycle of [
+    (() => {
+      const value = createLifecycleBackend({ restoreActivation: true });
+      value.backend.restoreAttachmentActivationContractVersion = 2;
+      return value.backend;
+    })(),
+    (() => {
+      const value = createLifecycleBackend({ restoreActivation: true });
+      delete value.backend.prepareRestoreAttachment;
+      return value.backend;
+    })(),
+  ]) {
+    assert.throws(
+      () =>
+        new StoppedDirectoryBackend({
+          backendId: BACKEND_ID,
+          coordinator: fixture.coordinator,
+          lifecycleBackend: invalidLifecycle,
+          mutationAuthority: fixture.mutation.authority,
+          publication: fixture.publication,
+          resolveStoppedWriter() {},
+        }),
+      (error) =>
+        assertBackendError(error, "invalid_stopped_directory_backend_request"),
+    );
+  }
+});
+
+test("restore attachment activation delegation contains provider errors", async (t) => {
+  const lifecycle = createLifecycleBackend({ restoreActivation: true });
+  lifecycle.backend.prepareRestoreAttachment = async function failActivation(
+    input,
+  ) {
+    assert.strictEqual(this, lifecycle.backend);
+    lifecycle.calls.push({ input, method: "prepareRestoreAttachment" });
+    throw new Error("private provider activation failure");
+  };
+  const fixture = await createFixture(t, { lifecycle });
+
+  let observed;
+  await assert.rejects(
+    fixture.backend.prepareRestoreAttachment(Object.freeze({ attempt: 1 })),
+    (error) => {
+      observed = error;
+      return assertBackendError(error);
+    },
+  );
+  assert.equal(observed.message.includes("private provider"), false);
 });
 
 test("lifecycle delegation contains collaborator errors without leaking details", async (t) => {

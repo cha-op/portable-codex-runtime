@@ -9,7 +9,8 @@ the local stopped-directory publication layer, and the backend-neutral
 snapshot core's exact result contract.
 
 The adapter owns only checkpoint capture and restore. Session provisioning,
-writable attachment preparation, detach, fencing, and destruction remain the
+writable attachment preparation, detach, fencing, destruction, and optional
+activation of an already-published restore destination remain the
 responsibility of a separately validated lifecycle backend. This division
 keeps storage lifecycle policy out of the local publication primitive and
 prevents the adapter from inventing attachment or lease authority.
@@ -55,9 +56,15 @@ The adapter separately advertises
 `reconcileCheckpointCapture()` extension. The extension does not change the v1
 base storage-backend method set.
 
+When the lifecycle backend exposes both
+`restoreAttachmentActivationContractVersion: 1` and
+`prepareRestoreAttachment()`, the adapter validates and delegates that optional
+extension as an exact pair. Supplying only one member fails construction. The
+extension also leaves the v1 base storage-backend method set unchanged.
+
 ## Lifecycle Delegation
 
-The adapter delegates these five operations to the validated lifecycle
+The adapter delegates these five base operations to the validated lifecycle
 backend:
 
 - `provisionSession`;
@@ -74,7 +81,9 @@ layers must prevent a stale writer from crossing the mutation guard.
 
 `captureCheckpoint` and `restoreCheckpoint` implement the base mutation
 contract. `reconcileCheckpointCapture` implements the optional committed
-capture-reconciliation extension.
+capture-reconciliation extension. If present, `prepareRestoreAttachment`
+implements only the optional detached-destination activation extension; it is
+not synthesized from `prepareWritableAttachment`.
 
 ## Trusted Collaborators
 
@@ -349,6 +358,31 @@ the exact claimed generation binding to the publisher. The authority must
 durably finalize launcher-visible destination state and return that same
 completion object before the backend reports success. A published path or
 journal record alone is not writable-launch authority.
+
+## Detached Restore Attachment Activation
+
+The optional activation contract accepts one exact v1 request containing the
+canonical session manifest and storage reference, a database-issued lease, an
+`attach` mutation request, and the committed publication projection. That
+projection binds the publication ID, coordinator-binding digest, modeled and
+tree-identity digests, artifact-manifest digest, filesystem ID, persistent
+object-ID scheme/value, and detached destination root.
+
+The lifecycle provider must return the exact v1 activation result: its normal
+attachment and attach-mutation result plus a byte-equivalent publication echo.
+The attachment must match the canonical manifest, storage reference, lease,
+fence, deterministic operation and attachment IDs, mutation proof, and root
+path. Root-path equality correlates the provider mount with the detached
+destination; the echoed persistent object and content evidence is what binds
+the attachment to the committed publication.
+
+`StoppedDirectoryBackend` does not call this method from `runRestore()` and
+does not convert publication success into attachment authority. It merely
+preserves an optional provider capability so the separate PostgreSQL restore
+activation coordinator can verify the committed destination, call the
+provider outside the database transaction, and atomically install the result
+with a prepared launch. Provider failure or an unsafe asynchronous result stays
+uncertain; no fallback calls the ordinary writable-attachment method.
 
 ## Callback and Uncertainty Contract
 

@@ -10,6 +10,7 @@ import {
   MAX_AGENT_DEPTH,
   MAX_SUBAGENTS,
   PLATFORM_IMAGE_MEDIA_TYPES,
+  RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   SESSION_AUTH_MODE,
   SESSION_WORKER_LAYOUT,
   SESSION_WORKER_ROOT,
@@ -21,6 +22,9 @@ import {
   assertLeaseGrant,
   assertLeaseRenewal,
   assertResolvedPlatformImageMatchesManifest,
+  assertRestoreAttachmentActivationBackend,
+  assertRestoreAttachmentActivationRequest,
+  assertRestoreAttachmentActivationResult,
   assertSessionAttachment,
   assertSessionAttachmentMatches,
   assertSessionManifest,
@@ -211,6 +215,67 @@ function mutationRequest(overrides = {}) {
     operationId: `operation-${operation}-001`,
     target: targets[operation],
     ...overrides,
+  };
+}
+
+function restoreAttachmentPublication(overrides = {}) {
+  const root = {
+    filesystemId: "test-filesystem-001",
+    objectIdentityScheme: "test-persistent-object-v1",
+    objectId: "restore-object-001",
+    rootPath: "/var/lib/portable-codex/restored-session-001",
+    ...(overrides.root ?? {}),
+  };
+  return {
+    artifactManifestDigest: "b".repeat(64),
+    coordinatorBindingSha256: "c".repeat(64),
+    modeledDigest: "d".repeat(64),
+    publicationId: "publication-restore-001",
+    publicationKind: "restore-destination",
+    root,
+    treeIdentityDigest: "e".repeat(64),
+    ...overrides,
+    root,
+  };
+}
+
+function restoreAttachmentActivationRequest(overrides = {}) {
+  return {
+    contractVersion: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    lease: lease(),
+    manifest: sessionManifest(),
+    mutationRequest: mutationRequest({ operation: "attach" }),
+    publication: restoreAttachmentPublication(),
+    storageRef: storageRef(),
+    ...overrides,
+  };
+}
+
+function restoreAttachmentActivationResult(request, overrides = {}) {
+  const {
+    attachment: attachmentOverrides = {},
+    mutationResult: mutationResultOverrides = {},
+    ...resultOverrides
+  } = overrides;
+  const mutationResult = {
+    ...request.mutationRequest,
+    proofId: "proof-attachment-001",
+    status: "attached",
+    ...mutationResultOverrides,
+  };
+  return {
+    attachment: attachment({
+      attachmentId: request.mutationRequest.target.attachmentId,
+      operationId: request.mutationRequest.operationId,
+      proofId: mutationResult.proofId,
+      rootPath: request.publication.root.rootPath,
+      ...attachmentOverrides,
+    }),
+    contractVersion: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    mutationResult,
+    publication: structuredClone(request.publication),
+    ...resultOverrides,
+    mutationResult,
   };
 }
 
@@ -975,6 +1040,375 @@ test("checkpoint capture reconciliation is an optional versioned backend extensi
       assertCode("invalid_storage_backend"),
     );
   }
+});
+
+test("restore attachment activation is an optional versioned backend extension", () => {
+  const base = storageBackend();
+  assert.equal(RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION, 1);
+  assert.equal(assertStorageBackend(base), base);
+  assert.throws(
+    () => assertRestoreAttachmentActivationBackend(base),
+    assertCode("invalid_storage_backend"),
+  );
+
+  const extended = {
+    ...base,
+    restoreAttachmentActivationContractVersion:
+      RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    prepareRestoreAttachment: async () => {},
+  };
+  assert.equal(assertStorageBackend(extended), extended);
+  assert.equal(assertRestoreAttachmentActivationBackend(extended), extended);
+
+  for (const invalid of [
+    { ...extended, restoreAttachmentActivationContractVersion: 2 },
+    { ...extended, prepareRestoreAttachment: undefined },
+  ]) {
+    assert.throws(
+      () => assertRestoreAttachmentActivationBackend(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+
+  let reads = 0;
+  const accessor = { ...extended };
+  Object.defineProperty(accessor, "prepareRestoreAttachment", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return async () => {};
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentActivationBackend(accessor),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(reads, 0);
+
+  let traps = 0;
+  const hostile = new Proxy(extended, {
+    get() {
+      traps += 1;
+      throw new Error("proxy trap must not run");
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentActivationBackend(hostile),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
+});
+
+test("restore attachment activation binds publication, attach mutation, and writer fence", () => {
+  const request = restoreAttachmentActivationRequest();
+  const result = restoreAttachmentActivationResult(request);
+  const checkedRequest = assertRestoreAttachmentActivationRequest(request);
+  const checkedResult = assertRestoreAttachmentActivationResult(result, {
+    request,
+  });
+
+  assert.deepEqual(checkedRequest, request);
+  assert.deepEqual(checkedResult, result);
+  for (const value of [
+    checkedRequest,
+    checkedRequest.lease,
+    checkedRequest.manifest,
+    checkedRequest.mutationRequest,
+    checkedRequest.publication,
+    checkedRequest.publication.root,
+    checkedRequest.storageRef,
+    checkedResult,
+    checkedResult.attachment,
+    checkedResult.mutationResult,
+    checkedResult.publication,
+    checkedResult.publication.root,
+  ]) {
+    assert.equal(Object.isFrozen(value), true);
+  }
+
+  assert.deepEqual(
+    assertRestoreAttachmentActivationRequest(checkedRequest),
+    checkedRequest,
+  );
+  assert.deepEqual(
+    assertRestoreAttachmentActivationResult(checkedResult, {
+      request: checkedRequest,
+    }),
+    checkedResult,
+  );
+
+  request.publication.root.objectId = "mutated-object";
+  request.mutationRequest.operationId = "operation-mutated";
+  result.attachment.rootPath = "/var/lib/portable-codex/mutated";
+  assert.equal(checkedRequest.publication.root.objectId, "restore-object-001");
+  assert.equal(checkedRequest.mutationRequest.operationId, "operation-attach-001");
+  assert.equal(
+    checkedResult.attachment.rootPath,
+    "/var/lib/portable-codex/restored-session-001",
+  );
+});
+
+test("restore attachment activation accepts provider-declared aliases without treating path as identity", () => {
+  const first = restoreAttachmentActivationRequest();
+  const alias = restoreAttachmentActivationRequest({
+    publication: restoreAttachmentPublication({
+      root: {
+        objectId: first.publication.root.objectId,
+        rootPath: "/srv/portable-codex/restore-alias-001",
+      },
+    }),
+  });
+
+  assert.notEqual(first.publication.root.rootPath, alias.publication.root.rootPath);
+  assert.equal(first.publication.root.objectId, alias.publication.root.objectId);
+  assert.doesNotThrow(() =>
+    assertRestoreAttachmentActivationResult(
+      restoreAttachmentActivationResult(first),
+      { request: first },
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertRestoreAttachmentActivationResult(
+      restoreAttachmentActivationResult(alias),
+      { request: alias },
+    ),
+  );
+  assert.throws(
+    () =>
+      assertRestoreAttachmentActivationResult(
+        restoreAttachmentActivationResult(alias),
+        { request: first },
+      ),
+    assertCode("invalid_restore_attachment_activation"),
+  );
+});
+
+test("restore attachment activation rejects non-exact and mismatched requests", () => {
+  const request = restoreAttachmentActivationRequest();
+  const invalidRequests = [
+    { ...request, extra: true },
+    { ...request, contractVersion: 2 },
+    {
+      ...request,
+      mutationRequest: mutationRequest({ operation: "restore" }),
+    },
+    {
+      ...request,
+      mutationRequest: mutationRequest({
+        operation: "attach",
+        backendId: "other-backend",
+      }),
+    },
+    {
+      ...request,
+      mutationRequest: mutationRequest({
+        operation: "attach",
+        leaseId: "lease-002",
+      }),
+    },
+    {
+      ...request,
+      publication: { ...request.publication, extra: true },
+    },
+    {
+      ...request,
+      publication: {
+        ...request.publication,
+        root: { ...request.publication.root, extra: true },
+      },
+    },
+    {
+      ...request,
+      publication: {
+        ...request.publication,
+        artifactManifestDigest: `sha256:${"b".repeat(64)}`,
+      },
+    },
+    {
+      ...request,
+      publication: {
+        ...request.publication,
+        publicationKind: "checkpoint-artifact",
+      },
+    },
+    {
+      ...request,
+      publication: {
+        ...request.publication,
+        root: { ...request.publication.root, rootPath: "relative/restore" },
+      },
+    },
+    {
+      ...request,
+      publication: {
+        ...request.publication,
+        root: { ...request.publication.root, objectId: `a${"b".repeat(256)}` },
+      },
+    },
+  ];
+
+  for (const invalid of invalidRequests) {
+    assert.throws(
+      () => assertRestoreAttachmentActivationRequest(invalid),
+      (error) =>
+        error instanceof SessionStorageContractError &&
+        [
+          "invalid_restore_attachment_activation",
+          "invalid_storage_mutation",
+          "stale_fence",
+        ].includes(error.code),
+    );
+  }
+});
+
+test("restore attachment activation result requires exact provider proof echoes", () => {
+  const request = restoreAttachmentActivationRequest();
+  const result = restoreAttachmentActivationResult(request);
+  const otherPublication = restoreAttachmentPublication({
+    root: { objectId: "restore-object-002" },
+  });
+  const invalidResults = [
+    { ...result, extra: true },
+    { ...result, contractVersion: 2 },
+    { ...result, publication: otherPublication },
+    restoreAttachmentActivationResult(request, {
+      attachment: { rootPath: "/var/lib/portable-codex/other-root" },
+    }),
+    restoreAttachmentActivationResult(request, {
+      attachment: { operationId: "operation-attach-002" },
+    }),
+    restoreAttachmentActivationResult(request, {
+      attachment: { attachmentId: "attachment-002" },
+    }),
+    restoreAttachmentActivationResult(request, {
+      attachment: { proofId: "proof-attachment-002" },
+    }),
+    {
+      ...result,
+      mutationResult: {
+        ...result.mutationResult,
+        proofId: "proof-attachment-002",
+      },
+    },
+  ];
+
+  for (const invalid of invalidResults) {
+    assert.throws(
+      () => assertRestoreAttachmentActivationResult(invalid, { request }),
+      assertCode("invalid_restore_attachment_activation"),
+    );
+  }
+  assert.throws(
+    () =>
+      assertRestoreAttachmentActivationResult(
+        restoreAttachmentActivationResult(request, {
+          mutationResult: { operationId: "operation-attach-002" },
+        }),
+        { request },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+});
+
+test("restore attachment activation rejects accessors and proxies before observation", () => {
+  let reads = 0;
+  const accessorRequest = restoreAttachmentActivationRequest();
+  Object.defineProperty(accessorRequest, "publication", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return restoreAttachmentPublication();
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentActivationRequest(accessorRequest),
+    assertCode("invalid_restore_attachment_activation"),
+  );
+  assert.equal(reads, 0);
+
+  const nestedAccessorRequest = restoreAttachmentActivationRequest();
+  Object.defineProperty(nestedAccessorRequest.publication.root, "objectId", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "restore-object-001";
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentActivationRequest(nestedAccessorRequest),
+    assertCode("invalid_restore_attachment_activation"),
+  );
+  assert.equal(reads, 0);
+
+  const request = restoreAttachmentActivationRequest();
+  const result = restoreAttachmentActivationResult(request);
+  const options = { request };
+  Object.defineProperty(options, "request", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return request;
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentActivationResult(result, options),
+    assertCode("invalid_restore_attachment_activation"),
+  );
+  assert.equal(reads, 0);
+
+  let traps = 0;
+  const hostile = new Proxy(request, {
+    ownKeys() {
+      traps += 1;
+      throw new Error("proxy trap must not run");
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentActivationRequest(hostile),
+    assertCode("invalid_restore_attachment_activation"),
+  );
+  assert.equal(traps, 0);
+});
+
+test("restore attachment activation validation resists intrinsic poisoning", () => {
+  const request = restoreAttachmentActivationRequest();
+  const result = restoreAttachmentActivationResult(request);
+  const originalIncludes = Array.prototype.includes;
+  const originalEvery = Array.prototype.every;
+  const originalKeys = Object.keys;
+  const originalStructuredClone = globalThis.structuredClone;
+  let poisonedCalls = 0;
+  let checkedRequest;
+  let checkedResult;
+  try {
+    Array.prototype.includes = () => {
+      poisonedCalls += 1;
+      return false;
+    };
+    Array.prototype.every = () => {
+      poisonedCalls += 1;
+      return false;
+    };
+    Object.keys = () => {
+      poisonedCalls += 1;
+      return [];
+    };
+    globalThis.structuredClone = () => {
+      poisonedCalls += 1;
+      throw new Error("poisoned structuredClone");
+    };
+    checkedRequest = assertRestoreAttachmentActivationRequest(request);
+    checkedResult = assertRestoreAttachmentActivationResult(result, { request });
+  } finally {
+    Array.prototype.includes = originalIncludes;
+    Array.prototype.every = originalEvery;
+    Object.keys = originalKeys;
+    globalThis.structuredClone = originalStructuredClone;
+  }
+
+  assert.equal(poisonedCalls, 0);
+  assert.deepEqual(checkedRequest, request);
+  assert.deepEqual(checkedResult, result);
 });
 
 test("storage provisioning is an idempotent control-plane mutation without writer authority", () => {

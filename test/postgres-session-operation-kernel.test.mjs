@@ -15,6 +15,7 @@ import {
 import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
+  createRestoreAttachmentActivationOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
@@ -23,6 +24,7 @@ import {
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
+  RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
@@ -60,6 +62,12 @@ const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const SUPERVISOR_ID = "supervisor-001";
 const SUPERVISOR_PROOF_ID = "supervisor-proof-001";
 const STOP_OPERATION_ID = "stop-operation-001";
+const RESTORE_ACTIVATION_OPERATION_ID =
+  "restore-attachment-activation-operation-001";
+const RESTORE_ACTIVATION_DETACH_OPERATION_ID =
+  "restore-attachment-activation-detach-001";
+const RESTORE_ACTIVATION_LAUNCH_OPERATION_ID =
+  "restore-attachment-activation-launch-001";
 const STOP_CLAIM_TOKEN = "019f2100-0000-7000-8000-000000000007";
 const OTHER_STOP_CLAIM_TOKEN = "019f2100-0000-7000-8000-000000000008";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
@@ -108,6 +116,17 @@ const LAUNCH_STOP_PREPARED_NOW = "2026-07-29T12:36:00.000Z";
 const LAUNCH_STOP_DISPATCH_NOW = "2026-07-29T12:36:01.000Z";
 const LAUNCH_STOP_UNCERTAIN_NOW = "2026-07-29T12:36:02.000Z";
 const LAUNCH_STOP_FINALIZE_NOW = "2026-07-29T12:36:03.000Z";
+const RESTORE_ACTIVATION_DETACH_PREPARED_NOW =
+  "2026-07-29T12:36:10.000Z";
+const RESTORE_ACTIVATION_DETACH_NOW = "2026-07-29T12:36:12.000Z";
+const RESTORE_ACTIVATION_PREPARED_NOW = "2026-07-29T12:36:20.000Z";
+const RESTORE_ACTIVATION_DISPATCH_NOW = "2026-07-29T12:36:21.000Z";
+const RESTORE_ACTIVATION_AUTHORITY_NOW = "2026-07-29T12:36:21.500Z";
+const RESTORE_ACTIVATION_FINALIZE_NOW = "2026-07-29T12:36:22.000Z";
+const RESTORE_ACTIVATION_LAUNCH_DISPATCH_NOW =
+  "2026-07-29T12:36:23.000Z";
+const RESTORE_ACTIVATION_LAUNCH_UNCERTAIN_NOW =
+  "2026-07-29T12:36:24.000Z";
 const REPLAY_STOP_PREPARED_NOW = "2026-07-29T12:35:24.000Z";
 const REPLAY_STOP_DISPATCH_NOW = "2026-07-29T12:35:25.000Z";
 const REPLAY_STOP_FINALIZE_NOW = "2026-07-29T12:35:26.000Z";
@@ -224,6 +243,15 @@ const LIST_RESTORE_GENERATION_RECOVERY_AFTER_QUERY = [
   "ORDER BY session_id ASC",
   "LIMIT $2::integer",
 ].join(" ");
+const LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_FIRST_PAGE_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.operation_claims",
+  "WHERE kind = 'restore-attachment-activation-v1'",
+  "AND state IN ('starting', 'uncertain')",
+  "AND retired_at IS NULL",
+  "ORDER BY session_id ASC",
+  "LIMIT $1::integer",
+].join(" ");
 const LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.operation_claims",
@@ -285,6 +313,15 @@ const INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY = [
   "ON CONFLICT DO NOTHING",
   `RETURNING ${OPERATION_ID_CLAIM_COLUMNS}`,
 ].join(" ");
+const INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY = [
+  "INSERT INTO session_authority.operation_id_registry",
+  "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+  "claimed_at, materialized_at)",
+  "VALUES ($1, $2::uuid, 'restore-activation-launch-intent-v1',",
+  "$3, $4::jsonb, $5, NULL)",
+  "ON CONFLICT DO NOTHING",
+  `RETURNING ${OPERATION_ID_CLAIM_COLUMNS}`,
+].join(" ");
 const INSERT_PRECLAIMED_OPERATION_QUERY = [
   "INSERT INTO session_authority.operation_claims",
   "(operation_id, session_id, kind, request, result, state, revision,",
@@ -305,6 +342,30 @@ const MATERIALIZE_RESTORE_LAUNCH_ID_CLAIM_QUERY = [
   "SET materialized_at = $3",
   "WHERE operation_id = $1 AND session_id = $2::uuid",
   "AND claim_type = 'restore-launch-intent-v2'",
+  "AND claimant_operation_id = $4 AND binding = $5::jsonb",
+  "AND materialized_at IS NULL",
+  `RETURNING ${OPERATION_ID_CLAIM_COLUMNS}`,
+].join(" ");
+const INSERT_PRECLAIMED_RESTORE_ACTIVATION_LAUNCH_QUERY = [
+  "INSERT INTO session_authority.operation_claims",
+  "(operation_id, session_id, kind, request, result, state, revision,",
+  "created_at, updated_at, retired_at)",
+  "SELECT $1::character varying(128), $2::uuid, $3, $4::jsonb,",
+  "NULL, 'prepared', 0, $5, $5, NULL",
+  "FROM session_authority.operation_id_registry",
+  "WHERE operation_id = $1::character varying(128)",
+  "AND session_id = $2::uuid",
+  "AND claim_type = 'restore-activation-launch-intent-v1'",
+  "AND claimant_operation_id = $6 AND binding = $7::jsonb",
+  "AND materialized_at IS NULL",
+  "ON CONFLICT (operation_id) DO NOTHING",
+  `RETURNING ${OPERATION_COLUMNS}`,
+].join(" ");
+const MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY = [
+  "UPDATE session_authority.operation_id_registry",
+  "SET materialized_at = $3",
+  "WHERE operation_id = $1 AND session_id = $2::uuid",
+  "AND claim_type = 'restore-activation-launch-intent-v1'",
   "AND claimant_operation_id = $4 AND binding = $5::jsonb",
   "AND materialized_at IS NULL",
   `RETURNING ${OPERATION_ID_CLAIM_COLUMNS}`,
@@ -3362,6 +3423,429 @@ function writerLaunchStopCommittedSteps(
       result: fixture.launchResult,
     }),
   ];
+}
+
+function restoreAttachmentActivationFixture() {
+  const launch = writerLaunchFixture();
+  const stop = writerLaunchStopFixture({ launch });
+  const stoppedSession = snapshotFromSessionRow(
+    writerLaunchStopCommittedSessionRow(stop),
+  );
+  const releaseOptions = writerReleaseOptions(
+    {
+      expectedSession: stoppedSession,
+      result: {
+        attachment: structuredClone(stoppedSession.document.attachment),
+      },
+    },
+    { operationId: RESTORE_ACTIVATION_DETACH_OPERATION_ID },
+  );
+  const releaseMutationResult = writerReleaseMutationResult(releaseOptions);
+  const releaseResult = writerReleaseResult(
+    releaseOptions,
+    releaseMutationResult,
+  );
+  const releaseOperation = writerTerminalOperationRow({
+    createdAt: RESTORE_ACTIVATION_DETACH_PREPARED_NOW,
+    options: releaseOptions,
+    result: releaseResult,
+    revision: "2",
+    updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+  });
+  const releaseReservation = reservationRow("released", {
+    options: releaseOptions,
+    createdAt: RESTORE_ACTIVATION_DETACH_PREPARED_NOW,
+    updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+    releasedAt: RESTORE_ACTIVATION_DETACH_NOW,
+  });
+  const detachedSession = snapshotFromSessionRow(
+    writerDetachedSessionRow({
+      operationRevision: "2",
+      options: releaseOptions,
+      result: releaseResult,
+      updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+    }),
+  );
+  const generation = writerLaunchGenerationSnapshot(launch.restore);
+  const launchIntent = {
+    launchAttemptId: RESTORE_ACTIVATION_LAUNCH_OPERATION_ID,
+    measuredImage: writerLaunchMeasuredImage(detachedSession),
+    supervisor: {
+      contractVersion: 1,
+      supervisorId: "restore-activation-supervisor-001",
+    },
+  };
+  const request = createRestoreAttachmentActivationOperationRequest({
+    destinationRootPath:
+      "/var/lib/portable-codex/restores/activation-session-001",
+    expectedSession: detachedSession,
+    generation,
+    holderId: "restore-activation-host-001",
+    launchIntent,
+    leaseDurationMilliseconds: 60_000,
+    predecessor: {
+      attachmentId: releaseResult.attachment.attachmentId,
+      detachOperationId: releaseOptions.operationId,
+      stopOperationId: stop.options.operationId,
+    },
+  });
+  const options = {
+    expectedSession: detachedSession,
+    kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+    operationId: RESTORE_ACTIVATION_OPERATION_ID,
+    request,
+  };
+  return {
+    generation,
+    launch,
+    launchIntent,
+    options,
+    releaseOperation,
+    releaseOptions,
+    releaseReservation,
+    releaseResult,
+    request,
+    stop,
+  };
+}
+
+function restoreAttachmentActivationLease(fixture) {
+  return writerLease(
+    fixture.options,
+    RESTORE_ACTIVATION_AUTHORITY_NOW,
+  );
+}
+
+function restoreAttachmentActivationOperationRow(fixture, state) {
+  return operationRow(state, {
+    options: fixture.options,
+    revision: state === "prepared" ? "0" : "1",
+    createdAt: RESTORE_ACTIVATION_PREPARED_NOW,
+    updatedAt:
+      state === "prepared"
+        ? RESTORE_ACTIVATION_PREPARED_NOW
+        : RESTORE_ACTIVATION_DISPATCH_NOW,
+  });
+}
+
+function restoreAttachmentActivationReservationRow(fixture, state) {
+  return reservationRow(state, {
+    options: fixture.options,
+    createdAt: RESTORE_ACTIVATION_PREPARED_NOW,
+    updatedAt:
+      state === "prepared"
+        ? RESTORE_ACTIVATION_PREPARED_NOW
+        : RESTORE_ACTIVATION_DISPATCH_NOW,
+  });
+}
+
+function restoreAttachmentActivationPhaseSessionRow(fixture, state) {
+  const expected = fixture.options.expectedSession;
+  const starting = state === "starting";
+  const lease = starting
+    ? restoreAttachmentActivationLease(fixture)
+    : null;
+  return sessionRow({
+    sessionId: expected.sessionId,
+    revision: (BigInt(expected.revision) + (starting ? 2n : 1n)).toString(),
+    sessionDocument: document(expected.sessionId, {
+      ...structuredClone(expected.document),
+      activeOperation: activeOperation(state, {
+        operationRevision: starting ? "1" : "0",
+        options: fixture.options,
+      }),
+      attachment: null,
+      launch: null,
+      lease,
+      lifecycle: starting ? "ATTACHING" : "DETACHED",
+      writerEpoch: starting
+        ? (BigInt(expected.document.writerEpoch) + 1n).toString()
+        : expected.document.writerEpoch,
+    }),
+    createdAt: expected.createdAt,
+    updatedAt:
+      starting
+        ? RESTORE_ACTIVATION_DISPATCH_NOW
+        : RESTORE_ACTIVATION_PREPARED_NOW,
+  });
+}
+
+function restoreAttachmentActivationLaunchIdClaimRow(
+  fixture,
+  { materializedAt = null } = {},
+) {
+  return operationIdRegistryRow({
+    binding: canonicalPayload(fixture.launchIntent),
+    claimType: "restore-activation-launch-intent-v1",
+    claimedAt: RESTORE_ACTIVATION_DISPATCH_NOW,
+    claimantOperationId: fixture.options.operationId,
+    materializedAt,
+    operationId: fixture.launchIntent.launchAttemptId,
+    sessionId: fixture.options.expectedSession.sessionId,
+  });
+}
+
+function restoreAttachmentActivationRelationSteps(fixture, state) {
+  const steps = [
+    ...writerLaunchGenerationReferenceSteps(fixture.launch),
+    rows(fixture.releaseOperation),
+    rows(fixture.releaseReservation),
+    rows(writerLaunchStopOperationRow(fixture.stop, "committed")),
+    rows(writerLaunchStopReservationRow(fixture.stop, "released")),
+    ...writerLaunchCommittedRelationSteps(fixture.launch),
+  ];
+  if (state !== "prepared") {
+    steps.push(rows(restoreAttachmentActivationLaunchIdClaimRow(fixture)));
+  }
+  return steps;
+}
+
+function restoreAttachmentActivationActiveSteps(fixture, state) {
+  return [
+    rows(restoreAttachmentActivationPhaseSessionRow(fixture, state)),
+    rows(restoreAttachmentActivationOperationRow(fixture, state)),
+    rows(restoreAttachmentActivationReservationRow(fixture, state)),
+    ...restoreAttachmentActivationRelationSteps(fixture, state),
+    rows(fixture.releaseOperation),
+    rows(fixture.releaseReservation),
+  ];
+}
+
+function restoreAttachmentActivationProviderRequest(fixture) {
+  const lease = restoreAttachmentActivationLease(fixture);
+  const materialization = fixture.generation.document.materialization;
+  return {
+    contractVersion: 1,
+    lease,
+    manifest: structuredClone(
+      fixture.options.expectedSession.document.manifest,
+    ),
+    mutationRequest: writerMutationRequest(fixture.options, lease),
+    publication: {
+      artifactManifestDigest: materialization.artifactManifestDigest,
+      coordinatorBindingSha256: materialization.coordinatorBindingSha256,
+      modeledDigest: materialization.modeledDigest,
+      publicationId: materialization.publicationId,
+      publicationKind: materialization.publicationKind,
+      root: {
+        ...structuredClone(materialization.stagedRoot),
+        rootPath: fixture.request.destinationRootPath,
+      },
+      treeIdentityDigest: materialization.treeIdentityDigest,
+    },
+    storageRef: structuredClone(
+      fixture.options.expectedSession.document.storageRef,
+    ),
+  };
+}
+
+function restoreAttachmentActivationProviderResult(fixture) {
+  const request = restoreAttachmentActivationProviderRequest(fixture);
+  const proofId = "restore-attachment-activation-proof-001";
+  return {
+    attachment: writerAttachment(fixture.options, request.lease, {
+      proofId,
+      rootPath: fixture.request.destinationRootPath,
+    }),
+    contractVersion: 1,
+    mutationResult: {
+      ...structuredClone(request.mutationRequest),
+      proofId,
+      status: "attached",
+    },
+    publication: structuredClone(request.publication),
+  };
+}
+
+function restoreAttachmentActivationTerminalResult(fixture) {
+  return {
+    activationRequest: canonicalPayload(
+      restoreAttachmentActivationProviderRequest(fixture),
+    ),
+    activationResult: canonicalPayload(
+      restoreAttachmentActivationProviderResult(fixture),
+    ),
+    outcome: "restore-attachment-activated",
+    resultVersion: 1,
+  };
+}
+
+function restoreAttachmentActivationCommittedOperationRow(fixture) {
+  return operationRow("committed", {
+    options: fixture.options,
+    revision: "2",
+    createdAt: RESTORE_ACTIVATION_PREPARED_NOW,
+    updatedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+    result: restoreAttachmentActivationTerminalResult(fixture),
+    retiredAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+  });
+}
+
+function restoreAttachmentActivationReleasedReservationRow(fixture) {
+  return reservationRow("released", {
+    options: fixture.options,
+    createdAt: RESTORE_ACTIVATION_PREPARED_NOW,
+    updatedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+    releasedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+  });
+}
+
+function restoreAttachmentActivationTerminalSessionRow(fixture) {
+  const expected = fixture.options.expectedSession;
+  const result = restoreAttachmentActivationTerminalResult(fixture);
+  const activationRequest =
+    restoreAttachmentActivationProviderRequest(fixture);
+  const activationResult = restoreAttachmentActivationProviderResult(fixture);
+  return sessionRow({
+    sessionId: expected.sessionId,
+    revision: (BigInt(expected.revision) + 3n).toString(),
+    sessionDocument: document(expected.sessionId, {
+      ...structuredClone(expected.document),
+      activeOperation: null,
+      attachment: structuredClone(activationResult.attachment),
+      lastOperation: terminalPointer({
+        operationRevision: "2",
+        options: fixture.options,
+        result,
+      }),
+      launch: null,
+      lease: structuredClone(activationRequest.lease),
+      lifecycle: "ATTACHED",
+      writerEpoch: activationRequest.lease.fencingEpoch,
+    }),
+    createdAt: expected.createdAt,
+    updatedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+  });
+}
+
+function restoreAttachmentActivationLaunchFixture(fixture) {
+  const expectedSession = snapshotFromSessionRow(
+    restoreAttachmentActivationTerminalSessionRow(fixture),
+  );
+  const request = createWriterLaunchAttemptOperationRequest({
+    expectedSession,
+    generation: fixture.generation,
+    measuredImage: fixture.launchIntent.measuredImage,
+    supervisor: fixture.launchIntent.supervisor,
+  });
+  return {
+    generation: fixture.generation,
+    measuredImage: fixture.launchIntent.measuredImage,
+    options: {
+      expectedSession,
+      kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+      operationId: fixture.launchIntent.launchAttemptId,
+      request,
+    },
+    request,
+    supervisor: fixture.launchIntent.supervisor,
+  };
+}
+
+function restoreAttachmentActivationLaunchActiveSessionRow(
+  fixture,
+  {
+    launch = restoreAttachmentActivationLaunchFixture(fixture),
+    state = "prepared",
+    updatedAt = RESTORE_ACTIVATION_FINALIZE_NOW,
+  } = {},
+) {
+  const expected = launch.options.expectedSession;
+  const operationRevision =
+    state === "prepared" ? "0" : state === "starting" ? "1" : "2";
+  return sessionRow({
+    sessionId: expected.sessionId,
+    revision: (
+      BigInt(expected.revision) +
+      BigInt(operationRevision) +
+      1n
+    ).toString(),
+    sessionDocument: document(expected.sessionId, {
+      ...structuredClone(expected.document),
+      activeOperation: activeOperation(state, {
+        operationRevision,
+        options: launch.options,
+      }),
+    }),
+    createdAt: expected.createdAt,
+    updatedAt,
+  });
+}
+
+function restoreAttachmentActivationLaunchProducerRelationSteps(
+  fixture,
+  launchIdClaim,
+) {
+  return [
+    rows(restoreAttachmentActivationCommittedOperationRow(fixture)),
+    rows(restoreAttachmentActivationReleasedReservationRow(fixture)),
+    ...writerLaunchGenerationReferenceSteps(fixture.launch),
+    rows(fixture.releaseOperation),
+    rows(fixture.releaseReservation),
+    rows(writerLaunchStopOperationRow(fixture.stop, "committed")),
+    rows(writerLaunchStopReservationRow(fixture.stop, "released")),
+    ...writerLaunchCommittedRelationSteps(fixture.launch),
+    rows(launchIdClaim),
+  ];
+}
+
+function restoreAttachmentActivationLaunchRecoverySteps(
+  fixture,
+  {
+    launch = restoreAttachmentActivationLaunchFixture(fixture),
+    state = "prepared",
+    launchCreatedAt = RESTORE_ACTIVATION_FINALIZE_NOW,
+    launchUpdatedAt =
+      state === "prepared"
+        ? RESTORE_ACTIVATION_FINALIZE_NOW
+        : state === "starting"
+          ? RESTORE_ACTIVATION_LAUNCH_DISPATCH_NOW
+          : RESTORE_ACTIVATION_LAUNCH_UNCERTAIN_NOW,
+    launchIdClaim = restoreAttachmentActivationLaunchIdClaimRow(fixture, {
+      materializedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+    }),
+  } = {},
+) {
+  const launchOperation = writerLaunchOperationRow(launch, state, {
+    createdAt: launchCreatedAt,
+    updatedAt: launchUpdatedAt,
+  });
+  const launchReservation = writerLaunchReservationRow(
+    launch,
+    state,
+    {
+      createdAt: launchCreatedAt,
+      updatedAt: launchUpdatedAt,
+    },
+  );
+  const steps = [
+    rows(launchOperation),
+    rows(
+      restoreAttachmentActivationLaunchActiveSessionRow(fixture, {
+        launch,
+        state,
+        updatedAt: launchUpdatedAt,
+      }),
+    ),
+    rows(launchOperation),
+    rows(launchReservation),
+  ];
+  if (state !== "prepared") {
+    steps.push(...writerLaunchGenerationReferenceSteps(fixture.launch));
+    steps.push(
+      ...restoreAttachmentActivationLaunchProducerRelationSteps(
+        fixture,
+        launchIdClaim,
+      ),
+    );
+  }
+  steps.push(
+    ...restoreAttachmentActivationLaunchProducerRelationSteps(
+      fixture,
+      launchIdClaim,
+    ),
+  );
+  return steps;
 }
 
 function writerLaunchCheckpointReplacementFixture(launch) {
@@ -10890,6 +11374,103 @@ test("writer launch recovery enumeration includes exact prepared intents", async
   clients[0].assertExhausted();
 });
 
+test("writer launch recovery enumeration validates activation-created handoff provenance", async (t) => {
+  const fixture = restoreAttachmentActivationFixture();
+  const launch = restoreAttachmentActivationLaunchFixture(fixture);
+
+  for (const state of ["prepared", "starting", "uncertain"]) {
+    await t.test(`valid ${state} handoff`, async () => {
+      const { authority, clients } = authorityWithScripts(
+        restoreAttachmentActivationLaunchRecoverySteps(fixture, { state }),
+      );
+
+      const page = await authority.listWriterLaunchAttemptRecoveryCandidates({
+        afterSessionId: null,
+        limit: 1,
+      });
+
+      assert.deepEqual(page, {
+        candidates: [
+          {
+            launchAttemptId: launch.options.operationId,
+            request: launch.request,
+            state,
+          },
+        ],
+        nextAfterSessionId: null,
+      });
+      assertDeepFrozen(page);
+      clients[0].assertExhausted();
+    });
+  }
+
+  const corruptedSupervisor = {
+    ...structuredClone(launch.supervisor),
+    supervisorId: "restore-activation-supervisor-corrupt",
+  };
+  const corruptedRequest = createWriterLaunchAttemptOperationRequest({
+    expectedSession: launch.options.expectedSession,
+    generation: launch.generation,
+    measuredImage: launch.measuredImage,
+    supervisor: corruptedSupervisor,
+  });
+  const corruptedLaunch = {
+    ...launch,
+    options: {
+      ...launch.options,
+      request: corruptedRequest,
+    },
+    request: corruptedRequest,
+    supervisor: corruptedSupervisor,
+  };
+  const corruptionCases = [
+    {
+      name: "activation-derived launch input",
+      steps: restoreAttachmentActivationLaunchRecoverySteps(fixture, {
+        launch: corruptedLaunch,
+      }),
+    },
+    {
+      name: "materialized launch claim timestamp",
+      steps: restoreAttachmentActivationLaunchRecoverySteps(fixture, {
+        launchIdClaim: restoreAttachmentActivationLaunchIdClaimRow(
+          fixture,
+          { materializedAt: "2026-07-29T12:36:23.000Z" },
+        ),
+      }),
+    },
+    {
+      name: "launch createdAt provenance",
+      steps: restoreAttachmentActivationLaunchRecoverySteps(fixture, {
+        state: "starting",
+        launchCreatedAt: "2026-07-29T12:36:22.500Z",
+      }),
+    },
+  ];
+  for (const corruption of corruptionCases) {
+    await t.test(corruption.name, async () => {
+      const { authority, clients } = authorityWithScripts(
+        corruption.steps,
+      );
+
+      await assertAuthorityError(
+        authority.listWriterLaunchAttemptRecoveryCandidates({
+          afterSessionId: null,
+          limit: 1,
+        }),
+        { code: "operation_state_invalid" },
+      );
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+});
+
 test("current writer launch recovery uses sparse bounded session pages", async () => {
   const launch = writerLaunchFixture({
     destinationIsolationProofId: "destination-isolation-proof-current-page",
@@ -14958,6 +15539,250 @@ test("checkpoint catalogue digest tampering fails strict relational readback", a
       /^(?:INSERT|UPDATE) /u.test(queryText(args)),
     ),
     false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore attachment activation claim preclaims one launch and returns the exact provider request", async () => {
+  const fixture = restoreAttachmentActivationFixture();
+  const claim = restoreAttachmentActivationLaunchIdClaimRow(fixture);
+  const { authority, clients } = authorityWithScripts({
+    options: {
+      authorityNow: RESTORE_ACTIVATION_AUTHORITY_NOW,
+      now: RESTORE_ACTIVATION_DISPATCH_NOW,
+    },
+    steps: [
+      ...restoreAttachmentActivationActiveSteps(fixture, "prepared"),
+      rows(claim),
+      rows(restoreAttachmentActivationOperationRow(fixture, "starting")),
+      rows(
+        restoreAttachmentActivationReservationRow(fixture, "starting"),
+      ),
+      rows(restoreAttachmentActivationPhaseSessionRow(fixture, "starting")),
+    ],
+  });
+
+  const receipt =
+    await authority.claimRestoreAttachmentActivationDispatch({
+      ...structuredClone(fixture.options),
+      expectedOperationRevision: "0",
+    });
+
+  assert.equal(receipt.status, "starting");
+  assert.equal(receipt.dispatchGranted, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(receipt.generation)),
+    JSON.parse(JSON.stringify(fixture.generation)),
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(receipt.activationRequest.lease)),
+    JSON.parse(
+      JSON.stringify(restoreAttachmentActivationLease(fixture)),
+    ),
+  );
+  assert.equal(
+    receipt.activationRequest.mutationRequest.operationId,
+    fixture.options.operationId,
+  );
+  assert.equal(
+    receipt.activationRequest.mutationRequest.target.attachmentId,
+    derivedAttachmentId(fixture.options.operationId),
+  );
+  assert.equal(
+    receipt.activationRequest.publication.root.objectId,
+    fixture.generation.document.materialization.stagedRoot.objectId,
+  );
+  assert.equal(
+    receipt.activationRequest.publication.root.rootPath,
+    fixture.request.destinationRootPath,
+  );
+  assert.equal(
+    receipt.session.document.activeOperation.operationId,
+    fixture.options.operationId,
+  );
+  assert.equal(receipt.session.document.lifecycle, "ATTACHING");
+  assertDeepFrozen(receipt);
+
+  const queryArguments = authorityQueries(clients[0]);
+  assert.deepEqual(
+    queryArguments.find(
+      (args) =>
+        queryText(args) ===
+        INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY,
+    ),
+    extendedQuery(INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY, [
+      fixture.launchIntent.launchAttemptId,
+      fixture.options.expectedSession.sessionId,
+      fixture.options.operationId,
+      JSON.stringify(canonicalPayload(fixture.launchIntent)),
+      RESTORE_ACTIVATION_DISPATCH_NOW,
+    ]),
+  );
+  const mutationOrder = queryArguments
+    .map(queryText)
+    .filter((text) => /^(?:INSERT|UPDATE) /u.test(text));
+  assert.deepEqual(mutationOrder, [
+    INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY,
+    START_OPERATION_QUERY,
+    START_RESERVATION_QUERY,
+    UPDATE_SESSION_QUERY,
+  ]);
+  assert.ok(
+    queryTexts(clients[0]).indexOf(
+      INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY,
+    ) < queryTexts(clients[0]).indexOf(READ_AUTHORITY_CLOCK_QUERY),
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore attachment activation recovery returns the exact frozen durable request", async () => {
+  const fixture = restoreAttachmentActivationFixture();
+  const { authority, clients } = authorityWithScripts([
+    rows(restoreAttachmentActivationOperationRow(fixture, "starting")),
+    ...restoreAttachmentActivationActiveSteps(fixture, "starting"),
+  ]);
+
+  const page =
+    await authority.listRestoreAttachmentActivationRecoveryCandidates({
+      afterSessionId: null,
+      limit: 10,
+    });
+
+  assert.equal(page.nextAfterSessionId, null);
+  assert.equal(page.candidates.length, 1);
+  assert.deepEqual(Reflect.ownKeys(page.candidates[0]), [
+    "activationOperationId",
+    "request",
+    "state",
+  ]);
+  assert.equal(
+    page.candidates[0].activationOperationId,
+    fixture.options.operationId,
+  );
+  assert.equal(page.candidates[0].state, "starting");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(page.candidates[0].request)),
+    JSON.parse(JSON.stringify(fixture.request)),
+  );
+  assertDeepFrozen(page);
+  assert.deepEqual(
+    authorityQueries(clients[0])[0],
+    extendedQuery(
+      LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_FIRST_PAGE_QUERY,
+      [11],
+    ),
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore attachment activation finalization atomically commits the attachment and prepared launch", async () => {
+  const fixture = restoreAttachmentActivationFixture();
+  const launch = restoreAttachmentActivationLaunchFixture(fixture);
+  const activationResult = restoreAttachmentActivationProviderResult(fixture);
+  const { authority, clients } = authorityWithScripts({
+    options: { now: RESTORE_ACTIVATION_FINALIZE_NOW },
+    steps: [
+      ...restoreAttachmentActivationActiveSteps(fixture, "starting"),
+      rows(restoreAttachmentActivationCommittedOperationRow(fixture)),
+      rows(restoreAttachmentActivationReleasedReservationRow(fixture)),
+      rows(restoreAttachmentActivationTerminalSessionRow(fixture)),
+      rows(
+        writerLaunchOperationRow(launch, "prepared", {
+          createdAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+          updatedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+        }),
+      ),
+      rows(
+        writerLaunchReservationRow(launch, "prepared", {
+          createdAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+          updatedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+        }),
+      ),
+      rows(
+        restoreAttachmentActivationLaunchIdClaimRow(fixture, {
+          materializedAt: RESTORE_ACTIVATION_FINALIZE_NOW,
+        }),
+      ),
+      rows(restoreAttachmentActivationLaunchActiveSessionRow(fixture)),
+    ],
+  });
+
+  const receipt =
+    await authority.finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt(
+      {
+        ...structuredClone(fixture.options),
+        activationResult,
+        expectedOperationRevision: "1",
+      },
+    );
+
+  assert.equal(receipt.status, "prepared");
+  assert.equal(receipt.activation.finalized, true);
+  assert.equal(
+    receipt.activation.operation.result.outcome,
+    "restore-attachment-activated",
+  );
+  assert.equal(
+    receipt.launch.attempt.launchAttemptId,
+    fixture.launchIntent.launchAttemptId,
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(receipt.launch.attempt.request)),
+    JSON.parse(JSON.stringify(launch.request)),
+  );
+  assert.equal(
+    receipt.session.document.attachment.operationId,
+    fixture.options.operationId,
+  );
+  assert.equal(
+    receipt.session.document.activeOperation.operationId,
+    fixture.launchIntent.launchAttemptId,
+  );
+  assert.equal(
+    receipt.session.document.lastOperation.operationId,
+    fixture.options.operationId,
+  );
+  assertDeepFrozen(receipt);
+
+  const queryArguments = authorityQueries(clients[0]);
+  const mutationOrder = queryArguments
+    .map(queryText)
+    .filter((text) => /^(?:INSERT|UPDATE) /u.test(text));
+  assert.deepEqual(mutationOrder, [
+    COMMIT_ACTIVE_OPERATION_QUERY,
+    RELEASE_ACTIVE_RESERVATION_QUERY,
+    UPDATE_SESSION_QUERY,
+    INSERT_PRECLAIMED_RESTORE_ACTIVATION_LAUNCH_QUERY,
+    INSERT_RESERVATION_QUERY,
+    MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY,
+    UPDATE_SESSION_QUERY,
+  ]);
+  assert.deepEqual(
+    queryArguments.find(
+      (args) =>
+        queryText(args) ===
+        MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY,
+    ),
+    extendedQuery(
+      MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY,
+      [
+        fixture.launchIntent.launchAttemptId,
+        fixture.options.expectedSession.sessionId,
+        RESTORE_ACTIVATION_FINALIZE_NOW,
+        fixture.options.operationId,
+        JSON.stringify(canonicalPayload(fixture.launchIntent)),
+      ],
+    ),
+  );
+  assert.equal(
+    queryTexts(clients[0]).filter((text) => text === "COMMIT").length,
+    1,
   );
   clients[0].assertExhausted();
 });
