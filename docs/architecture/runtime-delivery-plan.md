@@ -208,8 +208,9 @@ Restore and launcher authority are now split into eight serial pull requests:
      undispatched request can safely receive the missing pre-publication
      registry claim.
 6. **Durable stop and capture composition (complete)**
-   - Gate version 2 creation on confirmed fleet-wide authority and recovery
-     compatibility before production can persist the new request shape.
+   - Default-deny fresh restore-generation request version 2 creation until
+     startup confirms fleet-wide authority and recovery compatibility. Exact
+     existing replay remains available when the rollout decision later closes.
    - Prepare one exact clean-capture tuple, derive the stop operation from the
      complete tuple and current launch attempt, route one physical stop through
      `writer-launch-stop-v1`, and validate the committed operation,
@@ -228,28 +229,35 @@ Restore and launcher authority are now split into eight serial pull requests:
      provider-backed attachment evidence for that object and atomically
      replace the canonical session attachment while materializing the exact
      prepared launch request.
-   - Require the old attachment to be stopped, fenced, and detached before
-     activation. Pathname equality is correlation only and never proves
-     attachment authority or filesystem object identity.
+   - Require the old attachment to be stopped, cleanly captured, fenced, and
+     detached before activation. Historical request version 1 keeps its exact
+     replay relation; request version 2 binds the committed stop, clean capture,
+     and later detach without equating the stopped writer's generation with the
+     target restore generation. Pathname equality is correlation only and never
+     proves attachment authority or filesystem object identity.
    - Verify committed restore publication against the detached destination
      and activated attachment before any prepared launch can proceed.
    - Add source-free committed-only destination verification and the optional
      version 1 provider activation extension. Bind physical object identity,
      content digest, access policy, attach mutation, and proof echoes without
      treating path equality as attachment authority.
-   - Claim and finalize `restore-attachment-activation-v1` through serializable
-     authority transitions. The final transition installs the exact canonical
-     attachment and materializes its predetermined prepared launch atomically;
-     acknowledgement loss replays the same durable result.
+   - Independently default-deny fresh restore-generation-v2 and capture-bound
+     activation-v2 creation until startup confirms matching fleet
+     compatibility. Exact durable replay bypasses the fresh-work backstop.
+   - Claim and finalize versioned `restore-attachment-activation-v1` requests
+     through serializable authority transitions. The final transition installs
+     the exact canonical attachment and materializes its predetermined prepared
+     launch atomically; acknowledgement loss replays the same durable result.
    - Compose four independently cursor-bounded lanes for retained generation,
      attachment activation, prepared or active launch attempt, and current
      launch inventory. The service is sequential and no-relaunch: it never
      republishes, reserves or consumes an image, invokes a launcher, or
      reconstructs an opaque writer capability.
 8. **Production restore adapter enablement (pending)**
-   - Wire publication, the atomic handoff, prepared launch, no-relaunch
-     recovery, durable stop, and capture composition through the production
-     checkpoint adapter.
+   - Wire publication, durable stop and clean capture, canonical detach,
+     capture-bound activation, prepared launch, no-relaunch recovery, and
+     independent cursor persistence through the production checkpoint adapter
+     behind a separate detached-production fleet capability.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

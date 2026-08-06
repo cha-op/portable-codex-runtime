@@ -225,7 +225,7 @@ snapshot to replace a pre-reserve input only after the authority proves the
 operation absent.
 
 Detached restore activation now composes the next authority boundary after the
-predecessor is stopped, fenced, and canonically detached.
+predecessor is stopped, cleanly captured, fenced, and canonically detached.
 `verifyCommittedRestoreDestination()` is source-free and read-only: it
 revalidates only the exact committed journal record, trusted capture proof,
 publication identity, final filesystem object, modeled tree, and access-policy
@@ -238,6 +238,18 @@ installs the exact canonical attachment and materializes its predeclared
 readback resolves commit acknowledgement loss without a second provider
 activation.
 
+Activation request version 1 retains its historical direct stop-to-detach and
+same-generation predecessor relation for exact replay. Request version 2 adds
+the missing production relation: the current writer's committed stop must feed
+one committed clean checkpoint capture, and only then may release or
+force-fence detach that same old attachment. The target restore generation is
+bound to the old attachment but may differ from the stopped writer's launch
+generation. Independent default-deny authority options gate fresh
+restore-generation-v2 and activation-v2 creation only after exact durable
+lookup: `restoreGenerationV2FleetCompatible` and
+`restoreAttachmentActivationV2FleetCompatible`. Existing replay and recovery
+remain available if rollout policy later closes either gate.
+
 The bounded restore recovery service sweeps four independent keyset lanes:
 destination generations, attachment activations, prepared or active launch
 attempts, and current-launch inventory. Recovery may verify committed
@@ -247,10 +259,11 @@ or consumes an image, invokes the launch callback, reconstructs an opaque
 writer capability, or treats current-launch inventory as adoptable work.
 
 Production restore therefore remains fail-closed. The next serial slice is
-production adapter wiring behind the fleet capability gate; it does not need
-to invent new activation or recovery semantics. It must connect
-committed publication, detached activation, prepared launch, and bounded
-no-relaunch recovery to the checkpoint adapter before enabling `runRestore()`.
+production adapter wiring behind a separate detached-production fleet
+capability. It must connect committed publication, durable stop and clean
+capture, canonical detach, capture-bound activation, prepared launch, and
+bounded no-relaunch recovery to the checkpoint adapter before enabling
+`runRestore()`.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
