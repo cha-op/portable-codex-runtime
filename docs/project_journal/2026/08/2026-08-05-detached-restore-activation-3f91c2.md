@@ -3,7 +3,7 @@ id: 20260805-3f91c2
 title: Detached Restore Activation and Recovery Composition
 status: completed
 created: 2026-08-05
-updated: 2026-08-05
+updated: 2026-08-06
 branch: wip/detached-restore-activation
 pr: 30
 supersedes: []
@@ -44,6 +44,14 @@ object-ID, filesystem-ID, tree-identity, or provider-authority mismatch and
 reports unreadable or failed revalidation separately from absence.
 
 ## Current State
+
+> [!NOTE]
+> Later production-composition exploration proved that activation request
+> version 1's direct stop-to-detach and same-generation predecessor cannot
+> consume the durable stop-to-clean-capture result. Version 1 remains valid for
+> its exact historical replay contract. The capture-bound request version 2
+> correction is tracked in
+> `docs/project_journal/2026/08/2026-08-06-capture-bound-restore-activation-c4a2d8.md`.
 
 - `verifyCommittedRestoreDestination()` is source-free and read-only. It
   accepts only the exact committed restore journal/publication identity,
@@ -141,9 +149,10 @@ reports unreadable or failed revalidation separately from absence.
 
 ## Next Steps
 
-1. Keep production `runRestore()` disabled until the separate production
-   adapter workstream passes its fleet capability gate and composes the full
-   protocol under ambiguous-outcome coverage.
+1. Capture-bound activation request version 2 is implemented in the successor
+   workstream. Keep production `runRestore()` disabled until the separate
+   production adapter workstream passes its invocation-time fleet capability
+   gate and composes the full protocol under ambiguous-outcome coverage.
 2. Leave filesystem-image export, differential compression, cross-host restore,
    and Git Summary to their existing deferred workstreams.
 

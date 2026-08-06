@@ -16,6 +16,7 @@ import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
@@ -116,6 +117,12 @@ const LAUNCH_STOP_PREPARED_NOW = "2026-07-29T12:36:00.000Z";
 const LAUNCH_STOP_DISPATCH_NOW = "2026-07-29T12:36:01.000Z";
 const LAUNCH_STOP_UNCERTAIN_NOW = "2026-07-29T12:36:02.000Z";
 const LAUNCH_STOP_FINALIZE_NOW = "2026-07-29T12:36:03.000Z";
+const RESTORE_ACTIVATION_CAPTURE_PREPARED_NOW =
+  "2026-07-29T12:36:04.000Z";
+const RESTORE_ACTIVATION_CAPTURE_DISPATCH_NOW =
+  "2026-07-29T12:36:05.000Z";
+const RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW =
+  "2026-07-29T12:36:06.000Z";
 const RESTORE_ACTIVATION_DETACH_PREPARED_NOW =
   "2026-07-29T12:36:10.000Z";
 const RESTORE_ACTIVATION_DETACH_NOW = "2026-07-29T12:36:12.000Z";
@@ -1660,11 +1667,14 @@ function checkpointCaptureFixture({
   stopOperationId = STOP_OPERATION_ID,
   writerIncarnationId = WRITER_INCARNATION_ID,
   writerOperationId = OPERATION_ID,
+  writer: suppliedWriter = null,
 } = {}) {
-  const writer = writerAcquiredFixture({
-    operationId: writerOperationId,
-    sessionId,
-  });
+  const writer =
+    suppliedWriter ??
+    writerAcquiredFixture({
+      operationId: writerOperationId,
+      sessionId,
+    });
   const checkpoint = {
     artifactId,
     backendId: writer.expectedSession.document.storageRef.backendId,
@@ -3458,14 +3468,13 @@ function restoreAttachmentActivationFixture() {
     updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
     releasedAt: RESTORE_ACTIVATION_DETACH_NOW,
   });
-  const detachedSession = snapshotFromSessionRow(
-    writerDetachedSessionRow({
-      operationRevision: "2",
-      options: releaseOptions,
-      result: releaseResult,
-      updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
-    }),
-  );
+  const detachedSessionRow = writerDetachedSessionRow({
+    operationRevision: "2",
+    options: releaseOptions,
+    result: releaseResult,
+    updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+  });
+  const detachedSession = snapshotFromSessionRow(detachedSessionRow);
   const generation = writerLaunchGenerationSnapshot(launch.restore);
   const launchIntent = {
     launchAttemptId: RESTORE_ACTIVATION_LAUNCH_OPERATION_ID,
@@ -3496,7 +3505,190 @@ function restoreAttachmentActivationFixture() {
     request,
   };
   return {
+    detachedSessionRow,
     generation,
+    launch,
+    launchIntent,
+    options,
+    releaseOperation,
+    releaseOptions,
+    releaseReservation,
+    releaseResult,
+    request,
+    stop,
+  };
+}
+
+function restoreAttachmentActivationV2Fixture({
+  detachKind = "release",
+} = {}) {
+  const generationProducer = writerLaunchFixture({
+    generationId: "restore-activation-target-generation-001",
+    launchOperationId: "restore-activation-target-unused-launch-001",
+    restoreOperationId: "restore-activation-target-generation-operation-001",
+  });
+  const launch = writerLaunchFixture({
+    generationId: "restore-activation-current-generation-001",
+    launchOperationId: "restore-activation-current-launch-001",
+    restoreOperationId: "restore-activation-current-generation-operation-001",
+  });
+  assert.deepEqual(
+    generationProducer.generation.binding.attachment,
+    launch.generation.binding.attachment,
+  );
+  assert.notEqual(
+    generationProducer.generation.generationId,
+    launch.generation.generationId,
+  );
+  const stop = writerLaunchStopFixture({
+    launch,
+    stopOperationId: "restore-activation-current-stop-001",
+  });
+  const stoppedSession = snapshotFromSessionRow(
+    writerLaunchStopCommittedSessionRow(stop),
+  );
+  const capture = checkpointCaptureFixture({
+    artifactId: "restore-activation-capture-artifact-001",
+    captureAttemptId: "019f2100-0000-7000-8000-000000000009",
+    checkpointId: "restore-activation-capture-checkpoint-001",
+    operationId: "restore-activation-capture-operation-001",
+    processIncarnationId: stop.request.launch.processIncarnationId,
+    publicationId: "restore-activation-capture-publication-001",
+    stopOperationId: stop.options.operationId,
+    writer: {
+      expectedSession: stoppedSession,
+      lease: stoppedSession.document.lease,
+    },
+    writerIncarnationId: stop.request.launch.writerIncarnationId,
+  });
+  const captureResult = checkpointCaptureTerminalResult(capture);
+  const captureOperation = operationRow("committed", {
+    options: capture.options,
+    revision: "3",
+    createdAt: RESTORE_ACTIVATION_CAPTURE_PREPARED_NOW,
+    updatedAt: RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW,
+    result: captureResult,
+    retiredAt: RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW,
+  });
+  const captureReservation = reservationRow("released", {
+    options: capture.options,
+    createdAt: RESTORE_ACTIVATION_CAPTURE_PREPARED_NOW,
+    updatedAt: RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW,
+    releasedAt: RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW,
+  });
+  const captureAttempt = {
+    ...checkpointCaptureAttemptRow(capture),
+    claimed_at: new Date(RESTORE_ACTIVATION_CAPTURE_DISPATCH_NOW),
+  };
+  const captureCatalogue = {
+    ...checkpointCatalogueRow(capture),
+    committed_at: new Date(RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW),
+  };
+  const captureSession = sessionRow({
+    sessionId: stoppedSession.sessionId,
+    revision: (BigInt(stoppedSession.revision) + 4n).toString(),
+    sessionDocument: document(stoppedSession.sessionId, {
+      ...structuredClone(stoppedSession.document),
+      activeOperation: null,
+      lastOperation: terminalPointer({
+        options: capture.options,
+        operationRevision: "3",
+        result: captureResult,
+      }),
+    }),
+    createdAt: stoppedSession.createdAt,
+    updatedAt: RESTORE_ACTIVATION_CAPTURE_FINALIZE_NOW,
+  });
+  const capturedSession = snapshotFromSessionRow(captureSession);
+  const detachFixture = {
+    expectedSession: capturedSession,
+    result: {
+      attachment: structuredClone(capturedSession.document.attachment),
+    },
+  };
+  const releaseOptions =
+    detachKind === "force-fence"
+      ? writerForceFenceOptions(detachFixture, {
+          operationId: RESTORE_ACTIVATION_DETACH_OPERATION_ID,
+        })
+      : writerReleaseOptions(detachFixture, {
+          operationId: RESTORE_ACTIVATION_DETACH_OPERATION_ID,
+        });
+  const releaseResult =
+    detachKind === "force-fence"
+      ? (() => {
+          const writerEpoch = (
+            BigInt(capturedSession.document.writerEpoch) + 1n
+          ).toString();
+          return writerForceFenceResult(
+            releaseOptions,
+            writerEpoch,
+            writerForceFenceProof(releaseOptions, writerEpoch),
+          );
+        })()
+      : writerReleaseResult(
+          releaseOptions,
+          writerReleaseMutationResult(releaseOptions),
+        );
+  const releaseOperation = writerTerminalOperationRow({
+    createdAt: RESTORE_ACTIVATION_DETACH_PREPARED_NOW,
+    options: releaseOptions,
+    result: releaseResult,
+    revision: "2",
+    updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+  });
+  const releaseReservation = reservationRow("released", {
+    options: releaseOptions,
+    createdAt: RESTORE_ACTIVATION_DETACH_PREPARED_NOW,
+    updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+    releasedAt: RESTORE_ACTIVATION_DETACH_NOW,
+  });
+  const detachedSessionRow = writerDetachedSessionRow({
+    operationRevision: "2",
+    options: releaseOptions,
+    result: releaseResult,
+    updatedAt: RESTORE_ACTIVATION_DETACH_NOW,
+  });
+  const detachedSession = snapshotFromSessionRow(detachedSessionRow);
+  const generation = generationProducer.generation;
+  const launchIntent = {
+    launchAttemptId: RESTORE_ACTIVATION_LAUNCH_OPERATION_ID,
+    measuredImage: writerLaunchMeasuredImage(detachedSession),
+    supervisor: {
+      contractVersion: 1,
+      supervisorId: "restore-activation-supervisor-001",
+    },
+  };
+  const request = createRestoreAttachmentActivationOperationRequestV2({
+    destinationRootPath:
+      "/var/lib/portable-codex/restores/activation-session-001",
+    expectedSession: detachedSession,
+    generation,
+    holderId: "restore-activation-host-001",
+    launchIntent,
+    leaseDurationMilliseconds: 60_000,
+    predecessor: {
+      attachmentId: releaseResult.attachment.attachmentId,
+      captureOperationId: capture.options.operationId,
+      detachOperationId: releaseOptions.operationId,
+      stopOperationId: stop.options.operationId,
+    },
+  });
+  const options = {
+    expectedSession: detachedSession,
+    kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+    operationId: RESTORE_ACTIVATION_OPERATION_ID,
+    request,
+  };
+  return {
+    capture,
+    captureAttempt,
+    captureCatalogue,
+    captureOperation,
+    captureReservation,
+    detachedSessionRow,
+    generation,
+    generationProducer,
     launch,
     launchIntent,
     options,
@@ -3586,14 +3778,26 @@ function restoreAttachmentActivationLaunchIdClaimRow(
 }
 
 function restoreAttachmentActivationRelationSteps(fixture, state) {
+  const generationProducer = fixture.generationProducer ?? fixture.launch;
   const steps = [
-    ...writerLaunchGenerationReferenceSteps(fixture.launch),
+    ...writerLaunchGenerationReferenceSteps(generationProducer),
     rows(fixture.releaseOperation),
     rows(fixture.releaseReservation),
+  ];
+  if (fixture.request.contractVersion === 2) {
+    steps.push(
+      rows(fixture.captureOperation),
+      rows(fixture.captureReservation),
+      rows(fixture.captureAttempt),
+      rows(),
+      rows(fixture.captureCatalogue),
+    );
+  }
+  steps.push(
     rows(writerLaunchStopOperationRow(fixture.stop, "committed")),
     rows(writerLaunchStopReservationRow(fixture.stop, "released")),
     ...writerLaunchCommittedRelationSteps(fixture.launch),
-  ];
+  );
   if (state !== "prepared") {
     steps.push(rows(restoreAttachmentActivationLaunchIdClaimRow(fixture)));
   }
@@ -4314,7 +4518,11 @@ function authorityWithScripts(...scripts) {
     maxTransactionAttempts: 1,
   });
   return {
-    authority: new PostgresSessionAuthority({ store }),
+    authority: new PostgresSessionAuthority({
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreGenerationV2FleetCompatible: true,
+      store,
+    }),
     clients,
     pool,
     store,
@@ -11675,6 +11883,71 @@ test("restore generation v2 request durably binds an exact launch intent without
   }
 });
 
+test("restore generation V2 fleet gate is independent, zero-write for fresh work, and replay-transparent", async () => {
+  const fixture = restoreGenerationFixture({
+    launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+  });
+  const freshLookupSteps = [
+    rows(fixture.writer.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.writer.committedOperation),
+    rows(fixture.writer.releasedReservation),
+    rows(),
+  ];
+  const deniedClient = new ScriptedClient(freshLookupSteps);
+  const replayClient = new ScriptedClient(
+    restoreGenerationActiveSteps(fixture, "prepared"),
+  );
+  const deniedStore = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([deniedClient, replayClient]),
+    maxTransactionAttempts: 1,
+  });
+  const closedAuthority = new PostgresSessionAuthority({
+    restoreAttachmentActivationV2FleetCompatible: true,
+    store: deniedStore,
+  });
+
+  await assertAuthorityError(
+    closedAuthority.reserveOperation(fixture.options),
+    { code: "restore_generation_v2_fleet_capability_required" },
+  );
+  const replay = await closedAuthority.reserveOperation(fixture.options);
+
+  assert.equal(replay.acquired, false);
+  assert.equal(replay.operation.state, "prepared");
+  assert.equal(
+    authorityQueries(deniedClient).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  deniedClient.assertExhausted();
+  replayClient.assertExhausted();
+
+  const allowedClient = new ScriptedClient(
+    [
+      ...freshLookupSteps,
+      rows(restoreGenerationOperationRow(fixture, "prepared")),
+      rows(restoreGenerationReservationRow(fixture, "prepared")),
+      rows(restoreGenerationPhaseSessionRow(fixture, "prepared")),
+    ],
+    { now: RESTORE_PREPARED_NOW },
+  );
+  const allowedStore = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([allowedClient]),
+    maxTransactionAttempts: 1,
+  });
+  const allowedAuthority = new PostgresSessionAuthority({
+    restoreGenerationV2FleetCompatible: true,
+    store: allowedStore,
+  });
+  const acquired = await allowedAuthority.reserveOperation(fixture.options);
+
+  assert.equal(acquired.acquired, true);
+  assert.equal(acquired.operation.state, "prepared");
+  allowedClient.assertExhausted();
+});
+
 test("restore generation claim accepts an exact checkpoint from replacement destination storage", async () => {
   const fixture = restoreGenerationFixture({
     destinationStorageId: "volume-restore-002",
@@ -15543,6 +15816,366 @@ test("checkpoint catalogue digest tampering fails strict relational readback", a
   clients[0].assertExhausted();
 });
 
+test("restore attachment activation V2 gate is fresh-only and accepts capture-bound distinct generations", async () => {
+  const fixture = restoreAttachmentActivationV2Fixture();
+  assert.equal(
+    fixture.capture.request.admission.stopOperationId,
+    fixture.request.predecessor.stopOperationId,
+  );
+  assert.equal(
+    fixture.capture.request.admission.attachment.attachmentId,
+    fixture.request.predecessor.attachmentId,
+  );
+  assert.deepEqual(
+    JSON.parse(
+      JSON.stringify(fixture.capture.request.admission.attachment),
+    ),
+    JSON.parse(
+      JSON.stringify(
+        fixture.releaseOptions.expectedSession.document.attachment,
+      ),
+    ),
+  );
+  const freshLookupSteps = [
+    rows(fixture.detachedSessionRow),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(fixture.releaseOperation),
+    rows(fixture.releaseReservation),
+    rows(),
+  ];
+  const deniedClient = new ScriptedClient(freshLookupSteps);
+  const replayClient = new ScriptedClient(
+    restoreAttachmentActivationActiveSteps(fixture, "prepared"),
+  );
+  const deniedStore = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([deniedClient, replayClient]),
+    maxTransactionAttempts: 1,
+  });
+  const closedAuthority = new PostgresSessionAuthority({
+    restoreGenerationV2FleetCompatible: true,
+    store: deniedStore,
+  });
+
+  await assertAuthorityError(
+    closedAuthority.reserveOperation(fixture.options),
+    {
+      code: "restore_attachment_activation_v2_fleet_capability_required",
+    },
+  );
+  const replay = await closedAuthority.reserveOperation(fixture.options);
+
+  assert.equal(replay.acquired, false);
+  assert.equal(replay.operation.state, "prepared");
+  assert.equal(
+    authorityQueries(deniedClient).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  deniedClient.assertExhausted();
+  replayClient.assertExhausted();
+
+  const allowedClient = new ScriptedClient(
+    [
+      ...freshLookupSteps,
+      ...restoreAttachmentActivationRelationSteps(fixture, "prepared"),
+      rows(restoreAttachmentActivationOperationRow(fixture, "prepared")),
+      rows(restoreAttachmentActivationReservationRow(fixture, "prepared")),
+      rows(restoreAttachmentActivationPhaseSessionRow(fixture, "prepared")),
+    ],
+    { now: RESTORE_ACTIVATION_PREPARED_NOW },
+  );
+  const allowedStore = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([allowedClient]),
+    maxTransactionAttempts: 1,
+  });
+  const allowedAuthority = new PostgresSessionAuthority({
+    restoreAttachmentActivationV2FleetCompatible: true,
+    store: allowedStore,
+  });
+  const acquired = await allowedAuthority.reserveOperation(fixture.options);
+
+  assert.equal(acquired.acquired, true);
+  assert.equal(acquired.operation.state, "prepared");
+  assert.notEqual(
+    fixture.request.generation.generationId,
+    fixture.stop.request.launch.generation.generationId,
+  );
+  allowedClient.assertExhausted();
+});
+
+test("restore attachment activation V2 reserves after a committed capture-bound force-fence", async () => {
+  const fixture = restoreAttachmentActivationV2Fixture({
+    detachKind: "force-fence",
+  });
+  const client = new ScriptedClient(
+    [
+      rows(fixture.detachedSessionRow),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(fixture.releaseOperation),
+      rows(fixture.releaseReservation),
+      rows(),
+      ...restoreAttachmentActivationRelationSteps(fixture, "prepared"),
+      rows(restoreAttachmentActivationOperationRow(fixture, "prepared")),
+      rows(restoreAttachmentActivationReservationRow(fixture, "prepared")),
+      rows(restoreAttachmentActivationPhaseSessionRow(fixture, "prepared")),
+    ],
+    { now: RESTORE_ACTIVATION_PREPARED_NOW },
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([client]),
+    maxTransactionAttempts: 1,
+  });
+  const authority = new PostgresSessionAuthority({
+    restoreAttachmentActivationV2FleetCompatible: true,
+    store,
+  });
+
+  const receipt = await authority.reserveOperation(fixture.options);
+
+  assert.equal(fixture.releaseOperation.kind, WRITER_FORCE_FENCE_OPERATION_KIND);
+  assert.equal(fixture.releaseOperation.result.outcome, "writer-fenced");
+  assert.equal(
+    fixture.releaseOptions.expectedSession.document.lastOperation.kind,
+    CHECKPOINT_CAPTURE_OPERATION_KIND,
+  );
+  assert.equal(
+    fixture.releaseOptions.expectedSession.document.lastOperation.operationId,
+    fixture.capture.options.operationId,
+  );
+  assert.equal(receipt.acquired, true);
+  assert.equal(receipt.operation.state, "prepared");
+  assert.equal(receipt.reservation.state, "prepared");
+  assert.equal(
+    receipt.session.document.activeOperation.operationId,
+    fixture.options.operationId,
+  );
+  client.assertExhausted();
+});
+
+test("restore attachment activation V2 rejects substituted capture authority and reordered predecessors before writes", async (t) => {
+  const capturePointerFixture = restoreAttachmentActivationV2Fixture();
+  const capturePointerRequest =
+    createRestoreAttachmentActivationOperationRequestV2({
+      destinationRootPath:
+        capturePointerFixture.request.destinationRootPath,
+      expectedSession: capturePointerFixture.options.expectedSession,
+      generation: capturePointerFixture.generation,
+      holderId: capturePointerFixture.request.holderId,
+      launchIntent: capturePointerFixture.launchIntent,
+      leaseDurationMilliseconds:
+        capturePointerFixture.request.leaseDurationMilliseconds,
+      predecessor: {
+        ...capturePointerFixture.request.predecessor,
+        captureOperationId: "substituted-capture-operation-001",
+      },
+    });
+  const bindingFixture = restoreAttachmentActivationV2Fixture();
+  const driftedAttempt = structuredClone(bindingFixture.captureAttempt);
+  driftedAttempt.binding.attachmentId = "substituted-attachment-001";
+  const reorderedFixture = restoreAttachmentActivationFixture();
+  const reorderedRequest =
+    createRestoreAttachmentActivationOperationRequestV2({
+      destinationRootPath: reorderedFixture.request.destinationRootPath,
+      expectedSession: reorderedFixture.options.expectedSession,
+      generation: reorderedFixture.generation,
+      holderId: reorderedFixture.request.holderId,
+      launchIntent: reorderedFixture.launchIntent,
+      leaseDurationMilliseconds:
+        reorderedFixture.request.leaseDurationMilliseconds,
+      predecessor: {
+        attachmentId: reorderedFixture.request.predecessor.attachmentId,
+        captureOperationId: "missing-ordered-capture-operation-001",
+        detachOperationId:
+          reorderedFixture.request.predecessor.detachOperationId,
+        stopOperationId: reorderedFixture.request.predecessor.stopOperationId,
+      },
+    });
+  const cases = [
+    {
+      fixture: capturePointerFixture,
+      name: "capture operation ID substitution",
+      options: {
+        ...capturePointerFixture.options,
+        request: capturePointerRequest,
+      },
+      relationSteps: [
+        ...writerLaunchGenerationReferenceSteps(
+          capturePointerFixture.generationProducer,
+        ),
+        rows(capturePointerFixture.releaseOperation),
+        rows(capturePointerFixture.releaseReservation),
+      ],
+    },
+    {
+      fixture: bindingFixture,
+      name: "capture attempt attachment binding drift",
+      options: bindingFixture.options,
+      relationSteps: [
+        ...writerLaunchGenerationReferenceSteps(
+          bindingFixture.generationProducer,
+        ),
+        rows(bindingFixture.releaseOperation),
+        rows(bindingFixture.releaseReservation),
+        rows(bindingFixture.captureOperation),
+        rows(bindingFixture.captureReservation),
+        rows(driftedAttempt),
+      ],
+    },
+    {
+      fixture: reorderedFixture,
+      name: "detach still directly follows stop",
+      options: { ...reorderedFixture.options, request: reorderedRequest },
+      relationSteps: [
+        ...writerLaunchGenerationReferenceSteps(reorderedFixture.launch),
+        rows(reorderedFixture.releaseOperation),
+        rows(reorderedFixture.releaseReservation),
+      ],
+    },
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async () => {
+      const client = new ScriptedClient([
+        rows(candidate.fixture.detachedSessionRow),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(candidate.fixture.releaseOperation),
+        rows(candidate.fixture.releaseReservation),
+        rows(),
+        ...candidate.relationSteps,
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new ScriptedPool([client]),
+        maxTransactionAttempts: 1,
+      });
+      const authority = new PostgresSessionAuthority({
+        restoreAttachmentActivationV2FleetCompatible: true,
+        store,
+      });
+
+      await assertAuthorityError(
+        authority.reserveOperation(candidate.options),
+        { code: "operation_state_invalid" },
+      );
+      assert.equal(
+        authorityQueries(client).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      client.assertExhausted();
+    });
+  }
+});
+
+test("restore attachment activation V2 rejects non-terminal predecessors and corrupt capture bindings before writes", async (t) => {
+  const fixture = restoreAttachmentActivationV2Fixture();
+  const asStarting = (operation) => ({
+    ...structuredClone(operation),
+    result: null,
+    retired_at: null,
+    revision: "1",
+    state: "starting",
+  });
+  const nonCleanCapture = structuredClone(fixture.captureOperation);
+  nonCleanCapture.request.payload.admission.checkpoint.checkpointClass =
+    "crash-prefix";
+  const driftedCatalogue = structuredClone(fixture.captureCatalogue);
+  driftedCatalogue.document.materialization.publicationId =
+    "restore-activation-capture-publication-substituted";
+  assert.notEqual(
+    fixture.captureOperation.result.catalogueSha256,
+    sha256(JSON.stringify(driftedCatalogue.document)),
+  );
+
+  const generationSteps = () =>
+    writerLaunchGenerationReferenceSteps(fixture.generationProducer);
+  const committedCapturePrefix = () => [
+    ...generationSteps(),
+    rows(fixture.releaseOperation),
+    rows(fixture.releaseReservation),
+    rows(fixture.captureOperation),
+    rows(fixture.captureReservation),
+    rows(fixture.captureAttempt),
+    rows(),
+  ];
+  const cases = [
+    {
+      name: "non-terminal detach",
+      relationSteps: [
+        ...generationSteps(),
+        rows(asStarting(fixture.releaseOperation)),
+      ],
+    },
+    {
+      name: "non-terminal capture",
+      relationSteps: [
+        ...generationSteps(),
+        rows(fixture.releaseOperation),
+        rows(fixture.releaseReservation),
+        rows(asStarting(fixture.captureOperation)),
+      ],
+    },
+    {
+      name: "non-terminal stop",
+      relationSteps: [
+        ...committedCapturePrefix(),
+        rows(fixture.captureCatalogue),
+        rows(writerLaunchStopOperationRow(fixture.stop, "starting")),
+      ],
+    },
+    {
+      name: "non-clean capture",
+      relationSteps: [
+        ...generationSteps(),
+        rows(fixture.releaseOperation),
+        rows(fixture.releaseReservation),
+        rows(nonCleanCapture),
+      ],
+    },
+    {
+      name: "catalogue/result digest drift",
+      relationSteps: [
+        ...committedCapturePrefix(),
+        rows(driftedCatalogue),
+      ],
+    },
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async () => {
+      const client = new ScriptedClient([
+        rows(fixture.detachedSessionRow),
+        rows({ operation_count: 0, reservation_count: 0 }),
+        rows(fixture.releaseOperation),
+        rows(fixture.releaseReservation),
+        rows(),
+        ...candidate.relationSteps,
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new ScriptedPool([client]),
+        maxTransactionAttempts: 1,
+      });
+      const authority = new PostgresSessionAuthority({
+        restoreAttachmentActivationV2FleetCompatible: true,
+        store,
+      });
+
+      await assertAuthorityError(
+        authority.reserveOperation(fixture.options),
+        { code: "operation_state_invalid" },
+      );
+      assert.equal(
+        authorityQueries(client).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      client.assertExhausted();
+    });
+  }
+});
+
 test("restore attachment activation claim preclaims one launch and returns the exact provider request", async () => {
   const fixture = restoreAttachmentActivationFixture();
   const claim = restoreAttachmentActivationLaunchIdClaimRow(fixture);
@@ -15679,6 +16312,60 @@ test("restore attachment activation recovery returns the exact frozen durable re
     false,
   );
   clients[0].assertExhausted();
+});
+
+test("default-closed activation V2 authority lists and reads an existing recovery candidate", async () => {
+  const fixture = restoreAttachmentActivationV2Fixture();
+  const recoverySteps = () => [
+    rows(restoreAttachmentActivationOperationRow(fixture, "starting")),
+    ...restoreAttachmentActivationActiveSteps(fixture, "starting"),
+  ];
+  const listClient = new ScriptedClient(recoverySteps());
+  const readClient = new ScriptedClient(recoverySteps());
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([listClient, readClient]),
+    maxTransactionAttempts: 1,
+  });
+  const authority = new PostgresSessionAuthority({ store });
+
+  const page =
+    await authority.listRestoreAttachmentActivationRecoveryCandidates({
+      afterSessionId: null,
+      limit: 10,
+    });
+  const receipt = await authority.readRestoreAttachmentActivation({
+    operationId: fixture.options.operationId,
+  });
+
+  assert.equal(page.nextAfterSessionId, null);
+  assert.equal(page.candidates.length, 1);
+  assert.equal(page.candidates[0].state, "starting");
+  assert.equal(page.candidates[0].request.contractVersion, 2);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(page.candidates[0].request)),
+    JSON.parse(JSON.stringify(fixture.request)),
+  );
+  assert.equal(receipt.operation.state, "starting");
+  assert.equal(receipt.operation.request.contractVersion, 2);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(receipt.generation)),
+    JSON.parse(JSON.stringify(fixture.generation)),
+  );
+  assert.equal(
+    receipt.activationRequest.mutationRequest.operationId,
+    fixture.options.operationId,
+  );
+  assertDeepFrozen(page);
+  assertDeepFrozen(receipt);
+  for (const client of [listClient, readClient]) {
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
 });
 
 test("restore attachment activation finalization atomically commits the attachment and prepared launch", async () => {

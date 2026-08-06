@@ -78,6 +78,7 @@ const RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 = 2;
 const RESTORE_DESTINATION_GENERATION_BINDING_CONTRACT_VERSION = 1;
 export const RESTORE_DESTINATION_GENERATION_DOCUMENT_CONTRACT_VERSION = 2;
 const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION = 1;
+const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2 = 2;
 const DIRECT_OPERATION_ID_CLAIM_TYPE = "direct-operation";
 const RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-launch-intent-v2";
@@ -383,6 +384,12 @@ const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_REQUEST_KEYS = Object.freeze([
 ]);
 const RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_KEYS = Object.freeze([
   "attachmentId",
+  "detachOperationId",
+  "stopOperationId",
+]);
+const RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_V2_KEYS = Object.freeze([
+  "attachmentId",
+  "captureOperationId",
   "detachOperationId",
   "stopOperationId",
 ]);
@@ -794,6 +801,10 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore destination generation is not actively authorized",
   restore_attachment_activation_not_authorized:
     "Restore attachment activation is not actively authorized",
+  restore_attachment_activation_v2_fleet_capability_required:
+    "Restore attachment activation version 2 requires confirmed fleet compatibility",
+  restore_generation_v2_fleet_capability_required:
+    "Restore destination generation version 2 requires confirmed fleet compatibility",
   writer_launch_attempt_not_authorized:
     "Writer launch attempt is not actively authorized",
   session_identity_conflict:
@@ -3237,11 +3248,15 @@ export function createRestoreDestinationGenerationOperationRequestV2(
 function canonicalRestoreAttachmentActivationPredecessor(
   value,
   expectedSession,
+  contractVersion,
   code,
 ) {
   const predecessor = exactPlainObject(
     value,
-    RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_KEYS,
+    contractVersion ===
+      RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION
+      ? RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_KEYS
+      : RESTORE_ATTACHMENT_ACTIVATION_PREDECESSOR_V2_KEYS,
     code,
   );
   const lastOperation = expectedSession.document.lastOperation;
@@ -3257,6 +3272,16 @@ function canonicalRestoreAttachmentActivationPredecessor(
       128,
       code,
     ),
+    ...(contractVersion ===
+      RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2
+      ? {
+          captureOperationId: canonicalOpaqueId(
+            predecessor.captureOperationId,
+            128,
+            code,
+          ),
+        }
+      : {}),
     detachOperationId: canonicalOpaqueId(
       predecessor.detachOperationId,
       128,
@@ -3270,7 +3295,11 @@ function canonicalRestoreAttachmentActivationPredecessor(
   });
   ensure(
     result.detachOperationId === lastOperation.operationId &&
-      result.stopOperationId !== result.detachOperationId,
+      result.stopOperationId !== result.detachOperationId &&
+      (contractVersion ===
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION ||
+        (result.captureOperationId !== result.detachOperationId &&
+          result.captureOperationId !== result.stopOperationId)),
     code,
   );
   return result;
@@ -3282,6 +3311,14 @@ function restoreAttachmentActivationOperationRequest(
   code,
   epochExhaustionCode = code,
 ) {
+  const contractVersion = ownDataValue(value, "contractVersion", code);
+  ensure(
+    contractVersion ===
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION ||
+      contractVersion ===
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2,
+    code,
+  );
   const request = exactPlainObject(
     value,
     RESTORE_ATTACHMENT_ACTIVATION_OPERATION_REQUEST_KEYS,
@@ -3289,9 +3326,7 @@ function restoreAttachmentActivationOperationRequest(
   );
   const document = expectedSession.document;
   ensure(
-    request.contractVersion ===
-        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION &&
-      document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
+    document.documentVersion === SESSION_AUTHORITY_DOCUMENT_VERSION &&
       document.lifecycle === "DETACHED" &&
       document.lease === null &&
       document.attachment === null &&
@@ -3316,12 +3351,12 @@ function restoreAttachmentActivationOperationRequest(
   const predecessor = canonicalRestoreAttachmentActivationPredecessor(
     request.predecessor,
     expectedSession,
+    contractVersion,
     code,
   );
   return canonicalJsonObject(
     {
-      contractVersion:
-        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION,
+      contractVersion,
       destinationRootPath: canonicalAttachmentRootPath(
         request.destinationRootPath,
         code,
@@ -3361,6 +3396,46 @@ export function createRestoreAttachmentActivationOperationRequest(options) {
     {
       contractVersion:
         RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION,
+      destinationRootPath: normalized.destinationRootPath,
+      generation: writerLaunchGenerationReference(
+        normalized.generation,
+        expectedSession,
+        "invalid_operation_request",
+      ),
+      holderId: normalized.holderId,
+      launchIntent: normalized.launchIntent,
+      leaseDurationMilliseconds: normalized.leaseDurationMilliseconds,
+      predecessor: normalized.predecessor,
+    },
+    expectedSession,
+    "invalid_operation_request",
+  );
+}
+
+export function createRestoreAttachmentActivationOperationRequestV2(
+  options,
+) {
+  const normalized = exactPlainObject(
+    options,
+    [
+      "destinationRootPath",
+      "expectedSession",
+      "generation",
+      "holderId",
+      "launchIntent",
+      "leaseDurationMilliseconds",
+      "predecessor",
+    ],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  return restoreAttachmentActivationOperationRequest(
+    {
+      contractVersion:
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2,
       destinationRootPath: normalized.destinationRootPath,
       generation: writerLaunchGenerationReference(
         normalized.generation,
@@ -8956,7 +9031,7 @@ async function readCommittedRestoreGenerationForLaunch(
   return deepFreeze({ generation, input, operation, reservation, source });
 }
 
-async function readRestoreAttachmentActivationPredecessor(
+async function readRestoreAttachmentActivationPredecessorV1(
   transaction,
   input,
   currentSession,
@@ -9048,6 +9123,263 @@ async function readRestoreAttachmentActivationPredecessor(
   });
 }
 
+async function readRestoreAttachmentActivationPredecessorV2(
+  transaction,
+  input,
+  currentSession,
+  forUpdate,
+) {
+  const predecessor = input.request.predecessor;
+  const detachOperation = await readOperationSnapshot(
+    transaction,
+    predecessor.detachOperationId,
+    forUpdate,
+  );
+  ensure(
+    detachOperation !== null &&
+      detachOperation.state === "committed" &&
+      (detachOperation.kind === WRITER_RELEASE_OPERATION_KIND ||
+        detachOperation.kind === WRITER_FORCE_FENCE_OPERATION_KIND) &&
+      detachOperation.result !== null &&
+      (detachOperation.result.outcome === "writer-released" ||
+        detachOperation.result.outcome === "writer-fenced"),
+    "operation_state_invalid",
+  );
+  const detachReservation = await readReservationSnapshot(
+    transaction,
+    detachOperation.operationId,
+    forUpdate,
+  );
+  ensure(detachReservation !== null, "operation_state_invalid");
+  validateLastOperationPointer(
+    input.expectedSession,
+    detachOperation,
+    detachReservation,
+  );
+  validateCommittedOperationHistory(detachOperation, currentSession);
+
+  const capturePointer =
+    detachOperation.expectedSession.document.lastOperation;
+  ensure(
+    capturePointer !== null &&
+      capturePointer.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+      capturePointer.operationId === predecessor.captureOperationId &&
+      detachOperation.expectedSession.document.lifecycle === "ATTACHED" &&
+      detachOperation.expectedSession.document.launch === null &&
+      detachOperation.expectedSession.document.attachment !== null &&
+      detachOperation.expectedSession.document.attachment.attachmentId ===
+        predecessor.attachmentId,
+    "operation_state_invalid",
+  );
+  const captureOperation = await readOperationSnapshot(
+    transaction,
+    predecessor.captureOperationId,
+    forUpdate,
+  );
+  ensure(
+    captureOperation !== null &&
+      captureOperation.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+      captureOperation.state === "committed" &&
+      captureOperation.result?.outcome === "checkpoint-captured",
+    "operation_state_invalid",
+  );
+  const captureReservation = await readReservationSnapshot(
+    transaction,
+    captureOperation.operationId,
+    forUpdate,
+  );
+  ensure(captureReservation !== null, "operation_state_invalid");
+  validateLastOperationPointer(
+    detachOperation.expectedSession,
+    captureOperation,
+    captureReservation,
+  );
+  validateCommittedOperationHistory(captureOperation, currentSession);
+  const captureRelation = await validateCheckpointCaptureRelations(
+    transaction,
+    captureOperation,
+    forUpdate,
+  );
+  ensure(
+    captureRelation !== null &&
+      captureRelation.attempt !== null &&
+      captureRelation.catalogue !== null,
+    "operation_state_invalid",
+  );
+  const captureAdmission = captureRelation.input.request.admission;
+  ensure(
+    captureAdmission.checkpoint.checkpointClass === "clean" &&
+      captureAdmission.stopOperationId === predecessor.stopOperationId &&
+      captureAdmission.attachment.attachmentId ===
+        predecessor.attachmentId &&
+      canonicalSerialize(
+        canonicalJsonObject(
+          captureAdmission.attachment,
+          "operation_state_invalid",
+        ),
+      ) ===
+        canonicalSerialize(
+          canonicalJsonObject(
+            detachOperation.expectedSession.document.attachment,
+            "operation_state_invalid",
+          ),
+        ),
+    "operation_state_invalid",
+  );
+  ensure(
+    captureRelation.attempt.operationId ===
+        predecessor.captureOperationId &&
+      captureRelation.attempt.captureAttemptId ===
+        captureAdmission.captureAttemptId &&
+      captureRelation.attempt.binding.attachmentId ===
+        predecessor.attachmentId &&
+      captureRelation.attempt.binding.captureAttemptId ===
+        captureAdmission.captureAttemptId &&
+      captureRelation.attempt.binding.stopOperationId ===
+        predecessor.stopOperationId &&
+      captureRelation.attempt.binding.processIncarnationId ===
+        captureAdmission.processIncarnationId &&
+      captureRelation.attempt.binding.writerIncarnationId ===
+        captureAdmission.writerIncarnationId,
+    "operation_state_invalid",
+  );
+  ensure(
+    captureRelation.catalogue.captureAttemptId ===
+        captureAdmission.captureAttemptId &&
+      captureRelation.catalogue.checkpointId ===
+        captureAdmission.checkpoint.checkpointId &&
+      captureOperation.result.captureAttemptId ===
+        captureAdmission.captureAttemptId &&
+      captureOperation.result.checkpointId ===
+        captureAdmission.checkpoint.checkpointId &&
+      captureOperation.result.catalogueSha256 ===
+        sha256(canonicalSerialize(captureRelation.catalogue.document)),
+    "operation_state_invalid",
+  );
+
+  const stopPointer = captureOperation.expectedSession.document.lastOperation;
+  ensure(
+    stopPointer !== null &&
+      stopPointer.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+      stopPointer.operationId === predecessor.stopOperationId &&
+      captureOperation.expectedSession.document.lifecycle === "ATTACHED" &&
+      captureOperation.expectedSession.document.launch === null &&
+      captureOperation.expectedSession.document.attachment !== null &&
+      captureOperation.expectedSession.document.attachment.attachmentId ===
+        predecessor.attachmentId,
+    "operation_state_invalid",
+  );
+  const stopOperation = await readOperationSnapshot(
+    transaction,
+    predecessor.stopOperationId,
+    forUpdate,
+  );
+  ensure(
+    stopOperation !== null &&
+      stopOperation.kind === WRITER_LAUNCH_STOP_OPERATION_KIND &&
+      stopOperation.state === "committed" &&
+      stopOperation.result?.outcome === "writer-launch-stopped",
+    "operation_state_invalid",
+  );
+  const stopReservation = await readReservationSnapshot(
+    transaction,
+    stopOperation.operationId,
+    forUpdate,
+  );
+  ensure(stopReservation !== null, "operation_state_invalid");
+  validateLastOperationPointer(
+    captureOperation.expectedSession,
+    stopOperation,
+    stopReservation,
+  );
+  const stopRelation = await validateWriterLaunchStopRelations(
+    transaction,
+    stopOperation,
+    captureOperation.expectedSession,
+    forUpdate,
+  );
+  ensure(
+    stopRelation !== null &&
+      stopRelation.input.request.launch.attachmentId ===
+        predecessor.attachmentId &&
+      captureAdmission.processIncarnationId ===
+        stopRelation.input.request.launch.processIncarnationId &&
+      captureAdmission.writerIncarnationId ===
+        stopRelation.input.request.launch.writerIncarnationId,
+    "operation_state_invalid",
+  );
+  return deepFreeze({
+    captureOperation,
+    captureRelation,
+    captureReservation,
+    detachOperation,
+    detachReservation,
+    stopOperation,
+    stopRelation,
+    stopReservation,
+  });
+}
+
+async function readRestoreAttachmentActivationPredecessor(
+  transaction,
+  input,
+  currentSession,
+  forUpdate,
+) {
+  return input.request.contractVersion ===
+    RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION
+    ? readRestoreAttachmentActivationPredecessorV1(
+        transaction,
+        input,
+        currentSession,
+        forUpdate,
+      )
+    : readRestoreAttachmentActivationPredecessorV2(
+        transaction,
+        input,
+        currentSession,
+        forUpdate,
+      );
+}
+
+async function readRestoreAttachmentActivationCoreRelations(
+  transaction,
+  input,
+  currentSession,
+  forUpdate,
+) {
+  const generation = await readCommittedRestoreGenerationForLaunch(
+    transaction,
+    input.request.generation,
+    currentSession,
+    forUpdate,
+  );
+  const predecessor = await readRestoreAttachmentActivationPredecessor(
+    transaction,
+    input,
+    currentSession,
+    forUpdate,
+  );
+  ensure(
+    canonicalSerialize(
+      canonicalJsonObject(
+        generation.generation.binding.attachment,
+        "operation_state_invalid",
+      ),
+    ) ===
+      canonicalSerialize(
+        canonicalJsonObject(
+          predecessor.detachOperation.expectedSession.document.attachment,
+          "operation_state_invalid",
+        ),
+      ) &&
+      generation.generation.binding.attachment.attachmentId ===
+        input.request.predecessor.attachmentId,
+    "operation_state_invalid",
+  );
+  return deepFreeze({ generation, predecessor });
+}
+
 async function validateRestoreAttachmentActivationRelations(
   transaction,
   operation,
@@ -9074,38 +9406,13 @@ async function validateRestoreAttachmentActivationRelations(
       predecessor: null,
     });
   }
-  const generation = await readCommittedRestoreGenerationForLaunch(
-    transaction,
-    input.request.generation,
-    currentSession,
-    forUpdate,
-  );
-  const predecessor = await readRestoreAttachmentActivationPredecessor(
+  const relations = await readRestoreAttachmentActivationCoreRelations(
     transaction,
     input,
     currentSession,
     forUpdate,
   );
-  ensure(
-    canonicalSerialize(
-      canonicalJsonObject(
-        generation.generation.binding.attachment,
-        "operation_state_invalid",
-      ),
-    ) ===
-      canonicalSerialize(
-        canonicalJsonObject(
-          predecessor.detachOperation.expectedSession.document.attachment,
-          "operation_state_invalid",
-        ),
-      ),
-    "operation_state_invalid",
-  );
-  ensure(
-    generation.generation.binding.attachment.attachmentId ===
-      input.request.predecessor.attachmentId,
-    "operation_state_invalid",
-  );
+  const { generation, predecessor } = relations;
   if (operation.state === "prepared") {
     return deepFreeze({
       activationRequest: null,
@@ -10185,12 +10492,44 @@ async function finalizeWriterLaunchStop(store, options) {
 }
 
 export class PostgresSessionAuthority {
+  #restoreAttachmentActivationV2FleetCompatible;
+
+  #restoreGenerationV2FleetCompatible;
+
   #store;
 
   constructor(options) {
+    let optionKeys;
+    try {
+      optionKeys = reflectOwnKeys(options);
+    } catch {
+      fail("invalid_authority_options");
+    }
+    const hasRestoreAttachmentActivationV2FleetCompatible = reflectApply(
+      arrayIncludesIntrinsic,
+      optionKeys,
+      ["restoreAttachmentActivationV2FleetCompatible"],
+    );
+    const hasRestoreGenerationV2FleetCompatible = reflectApply(
+      arrayIncludesIntrinsic,
+      optionKeys,
+      ["restoreGenerationV2FleetCompatible"],
+    );
+    const expectedOptionKeys =
+      hasRestoreAttachmentActivationV2FleetCompatible
+        ? hasRestoreGenerationV2FleetCompatible
+          ? [
+              "restoreAttachmentActivationV2FleetCompatible",
+              "restoreGenerationV2FleetCompatible",
+              "store",
+            ]
+          : ["restoreAttachmentActivationV2FleetCompatible", "store"]
+        : hasRestoreGenerationV2FleetCompatible
+          ? ["restoreGenerationV2FleetCompatible", "store"]
+          : ["store"];
     const normalized = exactPlainObject(
       options,
-      ["store"],
+      expectedOptionKeys,
       "invalid_authority_options",
     );
     let prototype;
@@ -10210,6 +10549,19 @@ export class PostgresSessionAuthority {
         objectIsFrozen(normalized.store),
       "invalid_authority_options",
     );
+    ensure(
+      (!hasRestoreAttachmentActivationV2FleetCompatible ||
+        typeof normalized.restoreAttachmentActivationV2FleetCompatible ===
+          "boolean") &&
+        (!hasRestoreGenerationV2FleetCompatible ||
+          typeof normalized.restoreGenerationV2FleetCompatible ===
+            "boolean"),
+      "invalid_authority_options",
+    );
+    this.#restoreAttachmentActivationV2FleetCompatible =
+      normalized.restoreAttachmentActivationV2FleetCompatible === true;
+    this.#restoreGenerationV2FleetCompatible =
+      normalized.restoreGenerationV2FleetCompatible === true;
     this.#store = normalized.store;
     objectFreeze(this);
   }
@@ -10797,6 +11149,20 @@ export class PostgresSessionAuthority {
             session,
           });
         }
+        ensure(
+          input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND ||
+            input.request.contractVersion !==
+              RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION_V2 ||
+            this.#restoreGenerationV2FleetCompatible,
+          "restore_generation_v2_fleet_capability_required",
+        );
+        ensure(
+          input.kind !== RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND ||
+            input.request.contractVersion !==
+              RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2 ||
+            this.#restoreAttachmentActivationV2FleetCompatible,
+          "restore_attachment_activation_v2_fleet_capability_required",
+        );
         if (
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
           input.expectedSession.document.attachment === null
@@ -10809,6 +11175,18 @@ export class PostgresSessionAuthority {
         }
         ensure(observed.active === null, "session_operation_conflict");
         ensureExactExpectedSession(session, input.expectedSession);
+        if (
+          input.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+          input.request.contractVersion ===
+            RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2
+        ) {
+          await readRestoreAttachmentActivationCoreRelations(
+            transaction,
+            input,
+            session,
+            true,
+          );
+        }
         // Preserve operation recoverability: a prepared operation must retain
         // enough revision space to reach one legal terminal state. BLOCKED
         // force-fence reservations cannot use generic cancellation because it

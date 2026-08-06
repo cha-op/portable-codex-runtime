@@ -1292,12 +1292,16 @@ fail closed; it must be drained or quarantined rather than being given a
 synthetic registry history. This also means an old completed handoff does not
 gain new provenance merely because its operation row can be backfilled.
 
-Version 2 creation is not yet reachable from production `runRestore()`. Before
-a later release enables that path, every authority and recovery node that can
-observe the same database must first understand version 2, and activation must
-be held behind an explicit fleet-capability gate. A mixed fleet must continue
-creating version 1 work rather than let an older recovery worker fail an entire
-page on an unknown durable request.
+Version 2 creation is not yet reachable from production `runRestore()`. Fresh
+generation request version 2 reservation is independently default-denied by
+the authority unless startup supplies
+`restoreGenerationV2FleetCompatible: true`. Exact durable lookup precedes that
+backstop, so replay and recovery of existing work remain available if rollout
+policy later closes the gate.
+Before a later release enables the path, every authority and recovery node
+that can observe the same database must understand the selected request
+version. A mixed fleet must continue creating version 1 work rather than let
+an older recovery worker fail an entire page on an unknown durable request.
 
 The launcher facade adds a split preparation path for this transaction.
 `prepareLaunchIntent()` revalidates the original opaque image reservation and
@@ -1369,27 +1373,44 @@ unavailable to production restore. The detached activation path below is a
 separate operation kind rather than a reinterpretation of version 2 restore
 history.
 
-## Implemented Detached Restore Activation and Recovery
+## Implemented Capture-Bound Detached Restore Activation and Recovery
 
 `restore-attachment-activation-v1` starts only from an exact version 3
 `DETACHED` session with no lease, attachment, launch, or active operation. Its
 immutable request binds one committed restore-generation reference, the
 detached destination root, holder, bounded lease duration, launch intent, and
-predecessor `{attachmentId, stopOperationId, detachOperationId}`. Relational
-validation walks that predecessor history: the bound writer launch must have a
-committed complete-stop operation, its exact attachment must then have a
-committed release or force-fence operation, and that attachment must be the
-one retained by the restore generation. A pathname alone cannot satisfy this
-history.
+versioned predecessor. Request version 1 retains the historical
+`{attachmentId, stopOperationId, detachOperationId}` relation: the bound
+writer launch must have a committed complete-stop operation for the same
+generation, followed directly by committed release or force-fence.
+
+Request version 2 adds `captureOperationId` and follows the production
+relation instead. The current writer must have a committed complete-stop
+operation; one committed clean `checkpoint-capture-v1` must bind that exact
+stop, attachment, capture attempt, result, and catalogue; and release or
+force-fence must then detach the same old attachment. The committed target
+restore generation binds that old attachment but need not equal the stopped
+writer's launch generation. Durable last-operation pointers and complete
+operation/reservation relations prove ordering; timestamps and path equality
+do not. Version 1 remains readable and recoverable without reinterpretation.
+
+Fresh activation request version 2 reservation is separately default-denied
+unless startup supplies
+`restoreAttachmentActivationV2FleetCompatible: true` after confirming all
+authority, API, and recovery nodes sharing the database understand that
+request. The check runs only after exact lookup proves the operation absent
+and before any write. The existing operation kind, JSON envelope, migration-4
+launch-intent registry claim, and recovery candidate shape are unchanged, so
+no schema migration is required.
 
 Migration version 4 extends the permanent operation-ID registry with the
 `restore-activation-launch-intent-v1` claim. Activation dispatch locks and
-revalidates the session, operation, reservation, generation, stop, detach, and
-registry relations; reserves the launch-attempt ID; advances the writer epoch;
-and installs a deterministic lease while the canonical session enters
-`ATTACHING`. The deterministic attach mutation, lease ID, attachment ID, and
-launch intent are all derived or fixed before the provider call. Providers
-remain outside PostgreSQL transactions.
+revalidates the session, operation, reservation, generation, versioned
+stop/capture/detach predecessor, and registry relations; reserves the
+launch-attempt ID; advances the writer epoch; and installs a deterministic
+lease while the canonical session enters `ATTACHING`. The deterministic attach
+mutation, lease ID, attachment ID, and launch intent are all derived or fixed
+before the provider call. Providers remain outside PostgreSQL transactions.
 
 The provider request carries the canonical manifest and storage reference,
 the exact new lease and attach mutation, and the committed publication's
@@ -1445,11 +1466,11 @@ neither relaunch nor adopt a running process.
 
 ## Remaining Production Restore Composition
 
-The launcher foundation plus detached activation now close the committed
-publication, provider-backed attachment, atomic prepared-launch reservation,
-and bounded no-relaunch recovery boundaries. They remain independent protocol
-components rather than a production restore entry point. Later serial pull
-requests must:
+The launcher foundation plus capture-bound detached activation now close the
+committed publication, old-writer stop/capture/detach, provider-backed
+attachment, atomic prepared-launch reservation, and bounded no-relaunch
+recovery boundaries. They remain independent protocol components rather than
+a production restore entry point. Later serial pull requests must:
 
 - consume the exact durable stop-to-capture result as a prerequisite, then
   physically fence and detach the old attachment before any restored
