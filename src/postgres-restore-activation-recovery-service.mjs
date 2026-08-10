@@ -114,6 +114,12 @@ const ACTIVATION_PREDECESSOR_KEYS = objectFreeze([
   "detachOperationId",
   "stopOperationId",
 ]);
+const ACTIVATION_PREDECESSOR_V2_KEYS = objectFreeze([
+  "attachmentId",
+  "captureOperationId",
+  "detachOperationId",
+  "stopOperationId",
+]);
 const LAUNCH_CANDIDATE_KEYS = objectFreeze([
   "launchAttemptId",
   "request",
@@ -732,12 +738,13 @@ function activationCandidate(value, code) {
   const raw = clonePlainJson(value, code);
   const normalized = exactDataObject(raw, ACTIVATION_CANDIDATE_KEYS, code);
   const request = exactDataObject(normalized.request, ACTIVATION_REQUEST_KEYS, code);
+  const captureBound = request.contractVersion === 2;
   ensure(
     normalized.state === "starting" || normalized.state === "uncertain",
     code,
   );
   ensure(
-    request.contractVersion === 1 &&
+    (request.contractVersion === 1 || captureBound) &&
       typeof request.destinationRootPath === "string" &&
       request.destinationRootPath.length > 1 &&
       request.destinationRootPath.length <= 4_096 &&
@@ -752,10 +759,15 @@ function activationCandidate(value, code) {
   validateLaunchIntent(request.launchIntent, code);
   const predecessor = exactDataObject(
     request.predecessor,
-    ACTIVATION_PREDECESSOR_KEYS,
+    captureBound
+      ? ACTIVATION_PREDECESSOR_V2_KEYS
+      : ACTIVATION_PREDECESSOR_KEYS,
     code,
   );
   canonicalOpaqueId(predecessor.attachmentId, code);
+  if (captureBound) {
+    canonicalOpaqueId(predecessor.captureOperationId, code);
+  }
   canonicalOpaqueId(predecessor.detachOperationId, code);
   canonicalOpaqueId(predecessor.stopOperationId, code);
   const sessionId = validateGenerationReference(request.generation, code);

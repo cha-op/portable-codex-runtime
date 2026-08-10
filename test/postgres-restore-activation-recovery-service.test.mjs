@@ -153,11 +153,15 @@ function launchRequest(sessionId = SESSION_ID) {
   };
 }
 
-function activationCandidate(sessionId = SESSION_ID, state = "starting") {
+function activationCandidate(
+  sessionId = SESSION_ID,
+  state = "starting",
+  { v2 = false } = {},
+) {
   return {
     activationOperationId: `activation-${sessionId}`,
     request: {
-      contractVersion: 1,
+      contractVersion: v2 ? 2 : 1,
       destinationRootPath: `/var/lib/portable-codex/${sessionId}`,
       generation: generationReference(sessionId),
       holderId: "host-002",
@@ -165,6 +169,9 @@ function activationCandidate(sessionId = SESSION_ID, state = "starting") {
       leaseDurationMilliseconds: 600_000,
       predecessor: {
         attachmentId: `old-attachment-${sessionId}`,
+        ...(v2
+          ? { captureOperationId: `capture-${sessionId}` }
+          : {}),
         detachOperationId: `detach-${sessionId}`,
         stopOperationId: `stop-${sessionId}`,
       },
@@ -317,6 +324,54 @@ test("runs four bounded recovery lanes without treating current launches as adop
   assertDeepFrozen(service);
 });
 
+test("activation batches admit exact v1 and capture-bound v2 predecessors", async () => {
+  const observed = [];
+  const fixture = callbacks({
+    async listRestoreAttachmentActivationCandidates() {
+      return page([
+        activationCandidate(SESSION_ID),
+        activationCandidate(OTHER_SESSION_ID, "uncertain", { v2: true }),
+      ]);
+    },
+    async reconcileRestoreAttachmentActivation(candidate) {
+      observed.push(candidate);
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+
+  const result = await service.runActivationBatch(request());
+
+  assert.deepEqual(
+    result.results.map(({ sessionId, status }) => ({ sessionId, status })),
+    [
+      { sessionId: SESSION_ID, status: "reconciled" },
+      { sessionId: OTHER_SESSION_ID, status: "reconciled" },
+    ],
+  );
+  assert.equal(observed[0].request.contractVersion, 1);
+  assert.deepEqual(Reflect.ownKeys(observed[0].request.predecessor), [
+    "attachmentId",
+    "detachOperationId",
+    "stopOperationId",
+  ]);
+  assert.equal(observed[1].request.contractVersion, 2);
+  assert.deepEqual(Reflect.ownKeys(observed[1].request.predecessor), [
+    "attachmentId",
+    "captureOperationId",
+    "detachOperationId",
+    "stopOperationId",
+  ]);
+  assert.equal(
+    observed[1].request.predecessor.captureOperationId,
+    `capture-${OTHER_SESSION_ID}`,
+  );
+  assertDeepFrozen(observed[0]);
+  assertDeepFrozen(observed[1]);
+  assertDeepFrozen(result);
+});
+
 test("runSweep preserves independent cursors and fixed lane order", async () => {
   const order = [];
   const fixture = callbacks({
@@ -328,7 +383,10 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
     async listRestoreAttachmentActivationCandidates(input) {
       order.push("activation");
       assert.equal(input.afterSessionId, SESSION_ID);
-      return page([activationCandidate(OTHER_SESSION_ID)], OTHER_SESSION_ID);
+      return page(
+        [activationCandidate(OTHER_SESSION_ID, "starting", { v2: true })],
+        OTHER_SESSION_ID,
+      );
     },
     async listRestoreGenerationCandidates(input) {
       order.push("generation");
@@ -627,6 +685,96 @@ test("malformed pages and candidates fail closed", async () => {
       "postgres_restore_activation_recovery_service_outcome_uncertain",
     ),
   );
+});
+
+test("activation recovery rejects crossed or incomplete predecessor versions", async () => {
+  const v1WithCapture = activationCandidate();
+  v1WithCapture.request.predecessor.captureOperationId =
+    `capture-${SESSION_ID}`;
+  const v2WithoutCapture = activationCandidate(
+    SESSION_ID,
+    "starting",
+    { v2: true },
+  );
+  delete v2WithoutCapture.request.predecessor.captureOperationId;
+  const v2WithInvalidCapture = activationCandidate(
+    SESSION_ID,
+    "starting",
+    { v2: true },
+  );
+  v2WithInvalidCapture.request.predecessor.captureOperationId = "";
+
+  for (const candidate of [
+    v1WithCapture,
+    v2WithoutCapture,
+    v2WithInvalidCapture,
+  ]) {
+    const fixture = callbacks({
+      async listRestoreAttachmentActivationCandidates() {
+        return page([candidate]);
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    await assert.rejects(
+      service.runActivationBatch(request()),
+      assertCode(
+        "postgres_restore_activation_recovery_service_outcome_uncertain",
+      ),
+    );
+  }
+});
+
+test("activation v2 predecessor proxies and accessors fail without traps", async () => {
+  let trapCalls = 0;
+  const proxied = activationCandidate(SESSION_ID, "starting", { v2: true });
+  proxied.request.predecessor = new Proxy(proxied.request.predecessor, {
+    get() {
+      trapCalls += 1;
+      throw new Error("proxy trap must not run");
+    },
+    getOwnPropertyDescriptor() {
+      trapCalls += 1;
+      throw new Error("proxy trap must not run");
+    },
+    getPrototypeOf() {
+      trapCalls += 1;
+      throw new Error("proxy trap must not run");
+    },
+    ownKeys() {
+      trapCalls += 1;
+      throw new Error("proxy trap must not run");
+    },
+  });
+  let getterCalls = 0;
+  const accessor = activationCandidate(SESSION_ID, "starting", { v2: true });
+  Object.defineProperty(accessor.request.predecessor, "captureOperationId", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error("accessor must not run");
+    },
+  });
+
+  for (const candidate of [proxied, accessor]) {
+    const fixture = callbacks({
+      async listRestoreAttachmentActivationCandidates() {
+        return page([candidate]);
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    await assert.rejects(
+      service.runActivationBatch(request()),
+      assertCode(
+        "postgres_restore_activation_recovery_service_outcome_uncertain",
+      ),
+    );
+  }
+  assert.equal(trapCalls, 0);
+  assert.equal(getterCalls, 0);
 });
 
 test("proxy, accessor, and list exceptions do not cross the recovery boundary", async () => {

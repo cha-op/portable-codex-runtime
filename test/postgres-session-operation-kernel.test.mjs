@@ -15816,6 +15816,50 @@ test("checkpoint catalogue digest tampering fails strict relational readback", a
   clients[0].assertExhausted();
 });
 
+test("restore attachment activation option proxies fail before reflective traps", async () => {
+  const fixture = restoreAttachmentActivationV2Fixture();
+  let trapCalls = 0;
+  const hostileOptions = new Proxy(
+    structuredClone(fixture.options),
+    {
+      get() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getOwnPropertyDescriptor() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getPrototypeOf() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      ownKeys() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+    },
+  );
+  const { authority, pool } = authorityWithScripts();
+
+  await assertAuthorityError(
+    authority.reserveOperation(hostileOptions),
+    { code: "invalid_operation_request" },
+  );
+  assert.equal(trapCalls, 0);
+
+  const { proxy: revokedOptions, revoke } = Proxy.revocable(
+    structuredClone(fixture.options),
+    {},
+  );
+  revoke();
+  await assertAuthorityError(
+    authority.reserveOperation(revokedOptions),
+    { code: "invalid_operation_request" },
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
 test("restore attachment activation V2 gate is fresh-only and accepts capture-bound distinct generations", async () => {
   const fixture = restoreAttachmentActivationV2Fixture();
   assert.equal(

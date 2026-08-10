@@ -3,9 +3,9 @@ id: 20260806-c4a2d8
 title: Capture-Bound Restore Activation
 status: completed
 created: 2026-08-06
-updated: 2026-08-06
+updated: 2026-08-10
 branch: wip/capture-bound-restore-activation
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/32
 supersedes: []
 superseded_by:
 ---
@@ -34,10 +34,13 @@ read, replay, and recovery. Production `runRestore()` remains fail-closed.
   both checks.
 - Authority construction rejects proxied option envelopes before reflective
   key discovery, so hostile traps cannot run ahead of fail-closed validation.
-- The recovery coordinator reconstructs either activation request version
-  without changing service candidates, cursor shapes, destination
-  verification, provider activation, or atomic activation-to-launch
-  finalization.
+- Activation option normalization rejects live and revoked proxy envelopes
+  before array or reflective reads, while the internal request validator
+  establishes an exact plain object before reading version descriptors.
+- The recovery service and coordinator accept and reconstruct either exact
+  activation request version without changing candidate or cursor shapes,
+  destination verification, provider activation, or atomic
+  activation-to-launch finalization.
 - Production `runRestore()` remains unavailable pending the separate adapter
   and durable recovery-cursor workstream.
 
@@ -187,7 +190,10 @@ alone is not fleet membership proof.
 - Operation-kernel coverage includes release and force-fence success paths,
   non-terminal and binding-drift predecessor rejection before writes, and
   existing activation-v2 recovery while the fresh-creation fleet gate is
-  closed.
+  closed. Recovery-service coverage admits exact version 1 and capture-bound
+  version 2 candidates through both bounded batch and sweep entrypoints while
+  rejecting crossed schemas, missing capture authority, proxies, and
+  accessors without invoking traps.
 - `git diff --check` and the project-journal validator passed.
 - Real PostgreSQL integration is defined in
   `integration/postgres-session-authority.mjs`; local execution requires

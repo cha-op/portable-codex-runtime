@@ -1828,8 +1828,8 @@ function exactPlainObject(value, keys, code) {
   if (
     value === null ||
     typeof value !== "object" ||
-    arrayIsArray(value) ||
-    isProxyValue(value)
+    isProxyValue(value) ||
+    arrayIsArray(value)
   ) {
     fail(code);
   }
@@ -3311,17 +3311,17 @@ function restoreAttachmentActivationOperationRequest(
   code,
   epochExhaustionCode = code,
 ) {
-  const contractVersion = ownDataValue(value, "contractVersion", code);
+  const request = exactPlainObject(
+    value,
+    RESTORE_ATTACHMENT_ACTIVATION_OPERATION_REQUEST_KEYS,
+    code,
+  );
+  const contractVersion = ownDataValue(request, "contractVersion", code);
   ensure(
     contractVersion ===
         RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION ||
       contractVersion ===
         RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2,
-    code,
-  );
-  const request = exactPlainObject(
-    value,
-    RESTORE_ATTACHMENT_ACTIVATION_OPERATION_REQUEST_KEYS,
     code,
   );
   const document = expectedSession.document;
