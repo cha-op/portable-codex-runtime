@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 
 import {
@@ -774,6 +776,54 @@ test(
         "b2fcc93c8f30a210bfb83386eb8bf70324b2abad3c2ecea56a791f2c66de3233",
       );
     }
+  },
+);
+
+test(
+  "request hashes use the pre-callback createHash intrinsic",
+  { concurrency: false },
+  async () => {
+    const createHashDescriptor = Object.getOwnPropertyDescriptor(
+      crypto,
+      "createHash",
+    );
+    const originalCreateHash = createHashDescriptor.value;
+    let calls = 0;
+    let pollutionInstalled = false;
+    let observedError = null;
+    let result;
+
+    try {
+      result = await runGenerationDigest("reconciled", {
+        onReconcile() {
+          if (pollutionInstalled) return;
+          pollutionInstalled = true;
+          Object.defineProperty(crypto, "createHash", {
+            ...createHashDescriptor,
+            value(...args) {
+              calls += 1;
+              const hash = Reflect.apply(originalCreateHash, undefined, args);
+              hash.update("polluted-prefix", "utf8");
+              return hash;
+            },
+          });
+          syncBuiltinESMExports();
+        },
+      });
+    } catch (error) {
+      observedError = error;
+    } finally {
+      Object.defineProperty(crypto, "createHash", createHashDescriptor);
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(observedError, null);
+    assert.equal(pollutionInstalled, true);
+    assert.equal(calls, 0);
+    assert.equal(
+      result.generation.requestSha256,
+      "b2fcc93c8f30a210bfb83386eb8bf70324b2abad3c2ecea56a791f2c66de3233",
+    );
   },
 );
 

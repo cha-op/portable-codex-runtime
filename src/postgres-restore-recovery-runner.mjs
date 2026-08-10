@@ -10,6 +10,7 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arrayPrototype = Array.prototype;
 const BigIntConstructor = BigInt;
+const createHashIntrinsic = createHash;
 const DateConstructor = Date;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
@@ -40,7 +41,7 @@ const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const TypeErrorConstructor = TypeError;
 
-const hashProbe = createHash("sha256");
+const hashProbe = createHashIntrinsic("sha256");
 const hashPrototype = objectGetPrototypeOf(hashProbe);
 const hashUpdateIntrinsic = hashPrototype.update;
 const hashDigestIntrinsic = hashPrototype.digest;
@@ -694,7 +695,7 @@ function canonicalRequestSha256({
       batch: digestBatch,
     });
     serialized = callIntrinsic(jsonStringifyIntrinsic, JSON, [payload]);
-    hash = callIntrinsic(createHash, undefined, ["sha256"]);
+    hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
     callIntrinsic(hashUpdateIntrinsic, hash, [serialized, "utf8"]);
     return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
   } catch {

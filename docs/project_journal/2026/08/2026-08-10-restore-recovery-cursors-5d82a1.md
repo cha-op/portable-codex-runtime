@@ -38,7 +38,10 @@ or intercept the construction of a private dense result array: control tuples
 are read through their own numeric properties, and every private numeric slot
 is created with the captured data-property intrinsic before it is trusted.
 Runtime validation modes are primitive booleans rather than option bags, so a
-callback cannot inject a later-run policy through `Object.prototype`.
+callback cannot inject a later-run policy through `Object.prototype`. The
+runner also captures its cryptographic constructor before any callback runs,
+so synchronizing a mutated Node builtin export cannot change the durable
+request digest implementation.
 
 ## Scope
 
@@ -105,7 +108,8 @@ callback cannot inject a later-run policy through `Object.prototype`.
   definition rather than assignment or `push`, and the lane table is read by
   own numeric index instead of an inherited iterator. Frozen-record validation
   receives a primitive boolean instead of destructuring an ordinary default
-  object. The runner processes generation, activation, launch-attempt, and
+  object, and digest construction uses the startup-captured `createHash`
+  intrinsic. The runner processes generation, activation, launch-attempt, and
   current-launch in order, preserving earlier durable progress on later
   failure.
 
@@ -119,8 +123,8 @@ callback cannot inject a later-run policy through `Object.prototype`.
   partial failure, deterministic request binding, post-import Array/Object
   prototype pollution, callback-time iterator and numeric-property pollution,
   inherited non-writable numeric properties, inherited option getters across
-  successive runs, single-flight admission, and malformed collaborator
-  boundaries.
+  successive runs, callback-time Node builtin export synchronization,
+  single-flight admission, and malformed collaborator boundaries.
 - Migration executor coverage verifies the checksum-bound version 5 chain and
   upgrade/future-ledger behavior. The PostgreSQL integration gate additionally
   covers the real schema, constraint inventory, four-lane initialization,
