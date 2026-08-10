@@ -404,6 +404,54 @@ epoch, revoked lease, known attachment, and target. Recovery from `BLOCKED`
 requires a new explicit force-fence reservation and dispatch; its dispatch
 advances the epoch again before re-entering `FENCING`.
 
+## Implemented Provider-Backed Writer Detach Composition
+
+The provider-neutral writer-detach composition closes the live orchestration
+gap between these typed authority transitions and storage backend v1. One
+request supplies the complete pre-reserve session snapshot, a globally unique
+operation ID, and the exact attachment target. The composition verifies that
+the backend identity and complete capability tuple match the canonical session
+before the first authority write, then retains that same operation base for
+every later transition.
+
+One branded `PostgresOperationGuard` spans generic reserve, typed dispatch,
+provider execution, proof validation, and typed finalization. Structural guard
+lookalikes cannot enter this composition. Every returned authority receipt is
+boundedly cloned and passed through
+`assertSessionOperationTransitionProof()` so its operation, reservation,
+active or terminal session pointer, typed result, and provider proof form one
+canonical transition before the facade consumes it. The provider is still
+outside every authority transaction. Release passes only the exact
+`mutationRequest` returned by `claimWriterReleaseDispatch()` to
+`detachAttachment()` and validates the returned result with
+`assertStorageMutationResult()`. Force-fence analogously passes only the exact
+`fenceRequest` to `forceFence()` and validates it with
+`assertStorageForceFenceResult()`. A generic detach result, a different proof,
+or a caller-reconstructed envelope cannot cross those boundaries.
+
+Only `dispatchGranted: true` authorizes a provider call. Exact committed replay
+returns the durable terminal receipt without physical work. A retained
+`prepared` operation may claim its first dispatch, but `starting` or
+`uncertain` never authorizes provider replay. Storage backend contract v1 has
+no provider-side reconciliation method keyed by the durable operation ID, so
+the composition records such ambiguous state as `writer-blocked` with
+`provider-outcome-unresolved`. A manual-fencing backend follows the same typed
+force-fence dispatch boundary, calls no provider, and records
+`fence-unavailable` while preserving the advanced epoch and revoked tuple.
+
+Once the composition has validated a successful provider proof, database
+finalization acknowledgement loss is a different uncertainty class. It
+reconciles the durable operation and may replay only the same exact typed
+finalizer at the observed active revision. It never invokes the provider again
+or discards a valid proof by replacing it with `BLOCKED`. Stable public
+completion exposes only the durable operation, reservation, and session, not
+replay-sensitive `acquired`, `dispatchGranted`, or `finalized` flags.
+
+This composition requires no DDL and remains unscheduled. It does not add a
+provider reconciliation extension, choose a physical filesystem backend,
+automatically escalate release to force-fence, enable the detached-production
+fleet capability, or open `runRestore()`.
+
 ## Implemented PostgreSQL Transaction Boundary
 
 The executor gives one callback a checked-out PostgreSQL client and one

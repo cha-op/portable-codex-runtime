@@ -427,6 +427,11 @@ const COMMITTED_WRITER_LAUNCH_STOP_PROOF_KEYS = Object.freeze([
   "operation",
   "reservation",
 ]);
+const SESSION_OPERATION_TRANSITION_PROOF_KEYS = Object.freeze([
+  "operation",
+  "reservation",
+  "session",
+]);
 const COMMITTED_WRITER_LAUNCH_STOP_OPERATION_KEYS = Object.freeze([
   "conflictClass",
   "createdAt",
@@ -7830,6 +7835,135 @@ function validateLastOperationPointer(
   validateOperationReservation(operation, reservation, {
     reservationId: last.reservationId,
   });
+}
+
+function dateFromPublicReceiptTimestamp(value, code) {
+  return new DateConstructor(canonicalTimestampString(value, code));
+}
+
+function nullableDateFromPublicReceiptTimestamp(value, code) {
+  return value === null
+    ? null
+    : dateFromPublicReceiptTimestamp(value, code);
+}
+
+function canonicalPublicOperationTransition(value, code) {
+  const normalized = exactPlainObject(
+    value,
+    COMMITTED_WRITER_LAUNCH_STOP_OPERATION_KEYS,
+    code,
+  );
+  let input;
+  try {
+    input = canonicalOperationInput({
+      expectedSession: normalized.expectedSession,
+      kind: normalized.kind,
+      operationId: normalized.operationId,
+      request: normalized.request,
+    });
+  } catch {
+    fail(code);
+  }
+  const operation = operationSnapshotFromRow({
+    created_at: dateFromPublicReceiptTimestamp(
+      normalized.createdAt,
+      code,
+    ),
+    kind: normalized.kind,
+    operation_id: normalized.operationId,
+    request: input.envelope,
+    result: normalized.result,
+    retired_at: nullableDateFromPublicReceiptTimestamp(
+      normalized.retiredAt,
+      code,
+    ),
+    revision: normalized.revision,
+    session_id: normalized.sessionId,
+    state: normalized.state,
+    updated_at: dateFromPublicReceiptTimestamp(
+      normalized.updatedAt,
+      code,
+    ),
+  });
+  ensure(
+    normalized.conflictClass === SESSION_OPERATION_CONFLICT_CLASS &&
+      normalized.requestSha256 === input.requestSha256,
+    code,
+  );
+  validateOperationIdentity(operation, input);
+  return deepFreeze({ input, operation });
+}
+
+function canonicalPublicOperationReservation(value, code) {
+  const normalized = exactPlainObject(
+    value,
+    COMMITTED_WRITER_LAUNCH_STOP_RESERVATION_KEYS,
+    code,
+  );
+  return reservationSnapshotFromRow({
+    created_at: dateFromPublicReceiptTimestamp(
+      normalized.createdAt,
+      code,
+    ),
+    expected_session_revision: normalized.expectedSessionRevision,
+    expires_at: nullableDateFromPublicReceiptTimestamp(
+      normalized.expiresAt,
+      code,
+    ),
+    kind: normalized.kind,
+    operation_id: normalized.operationId,
+    payload: {
+      conflictClass: normalized.conflictClass,
+      requestSha256: normalized.requestSha256,
+      reservationVersion: RESERVATION_PAYLOAD_VERSION,
+    },
+    released_at: nullableDateFromPublicReceiptTimestamp(
+      normalized.releasedAt,
+      code,
+    ),
+    reservation_id: normalized.reservationId,
+    session_id: normalized.sessionId,
+    state: normalized.state,
+    updated_at: dateFromPublicReceiptTimestamp(
+      normalized.updatedAt,
+      code,
+    ),
+  });
+}
+
+/**
+ * Validates one complete public operation transition receipt against the
+ * authority's canonical operation, reservation, and session relations.
+ */
+export function assertSessionOperationTransitionProof(...args) {
+  const code = "operation_state_invalid";
+  ensure(args.length === 1, code);
+  const proof = exactPlainObject(
+    args[0],
+    SESSION_OPERATION_TRANSITION_PROOF_KEYS,
+    code,
+  );
+  const normalizedOperation = canonicalPublicOperationTransition(
+    proof.operation,
+    code,
+  );
+  const operation = normalizedOperation.operation;
+  const reservation = canonicalPublicOperationReservation(
+    proof.reservation,
+    code,
+  );
+  const session = expectedSnapshotFromValue(proof.session, code);
+  validateOperationReservation(
+    operation,
+    reservation,
+    normalizedOperation.input,
+  );
+  if (operation.state === "committed") {
+    validateLastOperationPointer(session, operation, reservation);
+  } else {
+    validateActivePointer(session, operation, reservation);
+  }
+  return deepFreeze({ operation, reservation, session });
 }
 
 function canonicalCommittedWriterLaunchStopOperation(value, code) {
