@@ -1621,6 +1621,7 @@ function checkpointCaptureAdmission(
     checkpointId = `checkpoint-${randomUUID()}`,
     operationId = `checkpoint-operation-${randomUUID()}`,
     processIncarnationId = `process-${randomUUID()}`,
+    stopOperationId = `stop-${randomUUID()}`,
     writerIncarnationId = `writer-${randomUUID()}`,
   } = {},
 ) {
@@ -1662,7 +1663,7 @@ function checkpointCaptureAdmission(
     checkpoint,
     processIncarnationId,
     request,
-    stopOperationId: `stop-${randomUUID()}`,
+    stopOperationId,
     writerIncarnationId,
   };
 }
@@ -6951,11 +6952,19 @@ test(
 
         const reserved = await authority.reserveOperation(activationInput);
         assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
         const gateClosedReplay =
           await fleetIncompatibleAuthority.reserveOperation(
             structuredClone(activationInput),
           );
-        assert.deepEqual(gateClosedReplay, reserved);
+        assertOperationReceipt(gateClosedReplay, "prepared");
+        assert.equal(gateClosedReplay.acquired, false);
+        assert.deepEqual(gateClosedReplay.operation, reserved.operation);
+        assert.deepEqual(
+          gateClosedReplay.reservation,
+          reserved.reservation,
+        );
+        assert.deepEqual(gateClosedReplay.session, reserved.session);
         const claimed =
           await authority.claimRestoreAttachmentActivationDispatch({
             ...structuredClone(activationInput),
@@ -7516,11 +7525,19 @@ test(
         ]);
         const reserved = await authority.reserveOperation(input);
         assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
         const gateClosedReplay =
           await fleetIncompatibleAuthority.reserveOperation(
             structuredClone(input),
           );
-        assert.deepEqual(gateClosedReplay, reserved);
+        assertOperationReceipt(gateClosedReplay, "prepared");
+        assert.equal(gateClosedReplay.acquired, false);
+        assert.deepEqual(gateClosedReplay.operation, reserved.operation);
+        assert.deepEqual(
+          gateClosedReplay.reservation,
+          reserved.reservation,
+        );
+        assert.deepEqual(gateClosedReplay.session, reserved.session);
         const claimed =
           await authority.claimRestoreDestinationGenerationDispatch({
             ...structuredClone(input),
