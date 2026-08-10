@@ -6974,7 +6974,7 @@ test(
         assert.equal(claimed.dispatchGranted, true);
         assert.deepEqual(
           structuredClone(
-            claimed.operation.request.payload.predecessor,
+            claimed.operation.request.predecessor,
           ),
           structuredClone(activationInput.request.predecessor),
         );
