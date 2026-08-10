@@ -385,7 +385,7 @@ syscall are outside its guarantee. See
 
 ## Stopped-Directory Backend
 
-The v2 stopped-directory backend composes the same-process capability, a
+The v3 stopped-directory backend composes the same-process capability, a
 durable mutation-authority and catalogue seam, and local publication into the
 snapshot core's storage-backend contract. It owns only `captureCheckpoint`
 and `restoreCheckpoint` in the base contract, and exposes the optional v1
@@ -441,10 +441,13 @@ no-relaunch attempt reconciliation. The atomic handoff additionally binds a
 committed restore generation to an already-prepared durable launch attempt.
 Detached activation now adds source-free destination verification, exact
 provider attachment proof, atomic canonical attachment plus prepared launch,
-and four-lane no-relaunch recovery. Production restore remains fail-closed
-until the next adapter-wiring slice connects those completed logical boundaries
-through `runRestore()`; filesystem-image execution and differential backup
-remain later work. See
+and four-lane no-relaunch recovery. The backend's version 3 restore callback
+can now carry the complete authority-issued generation binding to either fresh
+publication or committed-only verification without changing the legacy version
+2 callback. Production restore remains fail-closed until later slices close the
+activation/launch provenance and cross-process recovery-scheduling seams, then
+connect those boundaries through `runRestore()`; filesystem-image execution
+and differential backup remain later work. See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

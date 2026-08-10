@@ -252,10 +252,15 @@
   revision/cycle compare-and-swap, survives restart and commit-acknowledgement
   loss, and preserves earlier lane progress when a later lane fails. It remains
   an unscheduled primitive and does not enable production restore.
+- Stopped-directory backend contract version 3 can transport the complete
+  authority-issued restore-generation binding to fresh publication or to
+  source-free committed verification. Version 2 callback behavior remains
+  compatible, and the new transport seam does not enable `runRestore()`.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until a separate production-adapter slice passes its fleet capability gate
-  and wires committed publication, detached activation, prepared launch, and
-  no-relaunch recovery into `runRestore()`.
+  until later serial slices close activation/launch provenance, add the
+  cross-process fleet and recovery-scheduler guard, and wire committed
+  publication, detached activation, prepared launch, and no-relaunch recovery
+  into `runRestore()`.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -314,6 +319,8 @@
   `docs/project_journal/2026/08/2026-08-04-restore-launch-handoff-5a7c2e.md`
 - Restore publication attachment-contract correction:
   `docs/project_journal/2026/08/2026-08-05-restore-publication-attachment-contract-4c7a91.md`
+- Restore-generation full publication binding:
+  `docs/project_journal/2026/08/2026-08-10-restore-generation-publication-binding-b91f4a.md`
 - Detached restore activation and recovery composition:
   `docs/project_journal/2026/08/2026-08-05-detached-restore-activation-3f91c2.md`
 - Capture-bound restore activation compatibility:

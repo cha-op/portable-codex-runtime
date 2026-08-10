@@ -61,6 +61,8 @@ const RESERVATION_ID = "reservation-001";
 const CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000003";
 const FOREIGN_CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000004";
 const DESTINATION_ISOLATION_PROOF_ID = "destination-isolation-proof-001";
+const RESTORE_GENERATION_ID = "restore-generation-001";
+const RESTORE_CATALOGUE_SHA256 = "c".repeat(64);
 const NOW = Date.parse("2026-07-02T12:00:00.000Z");
 const CREATED_AT = "2026-07-02T12:00:00.000Z";
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
@@ -127,6 +129,37 @@ function restoreLease(overrides = {}) {
     fencingEpoch: "12",
     ...overrides,
   });
+}
+
+function restoreGenerationAttachment(fixture, overrides = {}) {
+  return attachment(fixture.restoreWriterLease, {
+    attachmentId: "attachment-restore-generation-001",
+    operationId: "operation-attach-restore-generation-001",
+    proofId: "proof-attachment-restore-generation-001",
+    rootPath: fixture.sourceDirectory,
+    storageId: RESTORE_STORAGE_ID,
+    ...overrides,
+  });
+}
+
+function restoreGenerationBinding(fixture, admission, overrides = {}) {
+  return {
+    attachment: restoreGenerationAttachment(fixture),
+    captureAttemptId: CAPTURE_ATTEMPT_ID,
+    captureOperationId: CAPTURE_OPERATION_ID,
+    catalogueSha256: RESTORE_CATALOGUE_SHA256,
+    checkpoint: { ...admission.checkpoint },
+    contractVersion: 1,
+    destinationIsolationProofId: DESTINATION_ISOLATION_PROOF_ID,
+    destinationState: "detached",
+    generationId: RESTORE_GENERATION_ID,
+    request: {
+      ...admission.request,
+      target: { ...admission.request.target },
+    },
+    reservationId: "reservation-restore-001",
+    ...overrides,
+  };
 }
 
 function attachment(writerLease = lease(), overrides = {}) {
@@ -731,6 +764,16 @@ function createMutationAuthority(fixture, options = {}) {
   };
 
   const restoreContext = (admission) => {
+    const restoreContextContractVersion =
+      options.restoreContextContractVersion ?? 2;
+    const baseGenerationBinding = restoreGenerationBinding(
+      fixture,
+      admission,
+    );
+    const generationBinding =
+      typeof options.restoreGenerationBinding === "function"
+        ? options.restoreGenerationBinding(baseGenerationBinding, admission)
+        : (options.restoreGenerationBinding ?? baseGenerationBinding);
     const context = {
       artifactDirectory: fixture.artifactDirectory,
       artifactOwnedRoot: fixture.artifactOwnedRoot,
@@ -744,6 +787,12 @@ function createMutationAuthority(fixture, options = {}) {
       reservationId: "reservation-restore-001",
       result: fixedResult(admission.checkpoint, admission.request),
       storageRef: storageRef({ storageId: RESTORE_STORAGE_ID }),
+      ...(restoreContextContractVersion === 3
+        ? {
+            generationBinding,
+            publicationMode: "fresh-or-exact-replay",
+          }
+        : {}),
       ...(typeof options.restoreContext === "function"
         ? options.restoreContext(admission)
         : options.restoreContext),
@@ -1090,6 +1139,12 @@ function createMutationAuthority(fixture, options = {}) {
     },
   };
   const authority = {
+    ...(options.restoreContextContractVersion === undefined
+      ? {}
+      : {
+          restoreContextContractVersion:
+            options.restoreContextContractVersion,
+        }),
     runCapture:
       options.captureReturnFactory === undefined
         ? normalAuthority.runCapture
@@ -1233,6 +1288,79 @@ function createRuntime(fixture, options = {}) {
     },
   });
   return fixture;
+}
+
+const restorePublicationObservers = new WeakMap();
+let observedRestoreBackendModulePromise;
+
+async function loadObservedRestoreBackendModule() {
+  if (observedRestoreBackendModulePromise !== undefined) {
+    return observedRestoreBackendModulePromise;
+  }
+  observedRestoreBackendModulePromise = (async () => {
+    const prototype = StoppedDirectoryPublication.prototype;
+    const methods = [
+      "publishRestoreDestination",
+      "verifyCommittedRestoreDestination",
+    ];
+    const originals = new Map();
+    for (const method of methods) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, method);
+      assert(descriptor);
+      originals.set(method, descriptor);
+      Object.defineProperty(prototype, method, {
+        ...descriptor,
+        async value(options) {
+          const observation = restorePublicationObservers.get(this);
+          let invocation;
+          if (observation !== undefined) {
+            invocation = { method, options };
+            observation.calls.push(invocation);
+            observation.events.push(method);
+            observation.eventSink?.push(`publication:${method}`);
+            await observation.beforeInvocation?.(invocation);
+          }
+          const outcome = await Reflect.apply(descriptor.value, this, [options]);
+          return observation?.transformOutcome === undefined
+            ? outcome
+            : observation.transformOutcome(invocation, outcome);
+        },
+      });
+    }
+    try {
+      return await import(
+        "../src/stopped-directory-backend.mjs?observed-restore-publication=1"
+      );
+    } finally {
+      for (const method of methods) {
+        Object.defineProperty(prototype, method, originals.get(method));
+      }
+    }
+  })();
+  return observedRestoreBackendModulePromise;
+}
+
+async function createObservedRestoreBackend(fixture, options = {}) {
+  const backendModule = await loadObservedRestoreBackendModule();
+  const observation = {
+    calls: [],
+    events: [],
+    eventSink: fixture.observation.events,
+    ...options,
+  };
+  restorePublicationObservers.set(fixture.publication, observation);
+  function resolveStoppedWriterForObservedRestore() {
+    throw new Error("restore does not resolve a stopped writer");
+  }
+  const backend = new backendModule.StoppedDirectoryBackend({
+    backendId: BACKEND_ID,
+    coordinator: fixture.coordinator,
+    lifecycleBackend: fixture.lifecycle.backend,
+    mutationAuthority: fixture.mutation.authority,
+    publication: fixture.publication,
+    resolveStoppedWriter: resolveStoppedWriterForObservedRestore,
+  });
+  return { backend, backendModule, observation };
 }
 
 async function issueCapability(fixture) {
@@ -1412,7 +1540,7 @@ function restoreDispatchInput(fixture, overrides = {}) {
 test("backend exposes the fixed directory surface and delegates lifecycle operations", async (t) => {
   const fixture = await createFixture(t);
 
-  assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 2);
+  assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 3);
   assert.equal(CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION, 2);
   assert.strictEqual(assertStorageBackend(fixture.backend), fixture.backend);
   assert.equal(fixture.backend.contractVersion, 1);
@@ -1471,6 +1599,94 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
     (error) =>
       assertBackendError(error, "invalid_stopped_directory_backend_request"),
   );
+});
+
+test("restore context contract negotiation rejects invalid authority shapes without collaboration", async (t) => {
+  const cases = [
+    ...[
+      ["explicit undefined version", undefined],
+      ["null version", null],
+      ["boolean version", true],
+      ["string version", "3"],
+      ["version 1", 1],
+      ["version 4", 4],
+    ].map(([name, version]) => ({
+      name,
+      createAuthority(methods) {
+        return { restoreContextContractVersion: version, ...methods };
+      },
+    })),
+    {
+      name: "version accessor",
+      createAuthority(methods, observation) {
+        const authority = { ...methods };
+        Object.defineProperty(authority, "restoreContextContractVersion", {
+          enumerable: true,
+          get() {
+            observation.accessorReads += 1;
+            return 3;
+          },
+        });
+        return authority;
+      },
+      assertAfter: (observation) =>
+        assert.equal(observation.accessorReads, 0),
+    },
+    {
+      name: "valid version with an extra authority key",
+      createAuthority(methods) {
+        return {
+          restoreContextContractVersion: 3,
+          ...methods,
+          unexpected: true,
+        };
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (t) => {
+      const fixture = await createFixture(t);
+      const observation = { accessorReads: 0, resolverCalls: 0 };
+      const methods = {
+        runCapture: fixture.mutation.authority.runCapture,
+        runCaptureReconciliation:
+          fixture.mutation.authority.runCaptureReconciliation,
+        runRestore: fixture.mutation.authority.runRestore,
+      };
+      const mutationAuthority = entry.createAuthority(methods, observation);
+      function resolveStoppedWriterForInvalidAuthority() {
+        observation.resolverCalls += 1;
+        throw new Error("invalid construction must not resolve a writer");
+      }
+
+      assert.throws(
+        () =>
+          new StoppedDirectoryBackend({
+            backendId: BACKEND_ID,
+            coordinator: fixture.coordinator,
+            lifecycleBackend: fixture.lifecycle.backend,
+            mutationAuthority,
+            publication: fixture.publication,
+            resolveStoppedWriter: resolveStoppedWriterForInvalidAuthority,
+          }),
+        (error) =>
+          assertBackendError(
+            error,
+            "invalid_stopped_directory_backend_request",
+          ),
+      );
+
+      entry.assertAfter?.(observation);
+      assert.equal(observation.resolverCalls, 0);
+      assert.equal(fixture.stopCalls, 0);
+      assert.deepEqual(fixture.lifecycle.calls, []);
+      assert.equal(fixture.mutation.state.captureRuns, 0);
+      assert.equal(fixture.mutation.state.reconciliationRuns, 0);
+      assert.equal(fixture.mutation.state.restoreRuns, 0);
+      assert.deepEqual(fixture.observation.events, []);
+    });
+  }
 });
 
 test("backend exposes restore attachment activation only when the lifecycle provider supports it", async (t) => {
@@ -2132,6 +2348,670 @@ test("restore requires a newer current fence, trusted proof, and detached destin
     "authority:restore:end",
   ]);
 });
+
+test(
+  "legacy restore contexts keep the reduced binding and publication completion shape",
+  { concurrency: false },
+  async (t) => {
+    for (const scenario of [
+      { name: "implicit legacy contract" },
+      { name: "explicit version 2 contract", restoreContextContractVersion: 2 },
+    ]) {
+      await t.test(scenario.name, async (t) => {
+        const fixture = await createFixture(t, {
+          restoreContextContractVersion:
+            scenario.restoreContextContractVersion,
+        });
+        const capability = await issueCapability(fixture);
+        await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+        fixture.observation.events.length = 0;
+        const { backend, observation } =
+          await createObservedRestoreBackend(fixture);
+
+        const options = restoreCoreOptions(fixture, { backend });
+        const result = await restoreCleanCheckpoint(options);
+        const completion = fixture.mutation.state.restoreFinalizations[0];
+
+        assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+        assert.deepEqual(observation.events, [
+          "publishRestoreDestination",
+        ]);
+        assert.equal(observation.calls.length, 1);
+        const invocation = observation.calls[0];
+        assert.equal(invocation.method, "publishRestoreDestination");
+        exactKeys(invocation.options.binding, [
+          "checkpoint",
+          "contractVersion",
+          "destinationIsolationProofId",
+          "reservationId",
+        ]);
+        assert.deepEqual(invocation.options.binding, {
+          checkpoint: checkpoint(),
+          contractVersion: 1,
+          destinationIsolationProofId: DESTINATION_ISOLATION_PROOF_ID,
+          reservationId: "reservation-restore-001",
+        });
+        assert.equal(Object.isFrozen(invocation.options.binding), true);
+        assert.strictEqual(
+          completion,
+          fixture.mutation.state.restoreCallbackCompletions[0],
+        );
+        exactKeys(completion, ["materialization", "replayed", "result"]);
+        assert.equal(Object.isFrozen(completion), true);
+        assert.equal(completion.replayed, false);
+        assert.deepEqual(completion.result, fixedResult(checkpoint(), options.request));
+        assert.deepEqual(fixture.observation.events, [
+          "authority:restore:start",
+          "publication:publishRestoreDestination",
+          "publication:prepared",
+          "publication:copied",
+          "authority:restore:finalized",
+          "authority:restore:end",
+        ]);
+      });
+    }
+  },
+);
+
+test(
+  "production restore passes one defensive canonical generation binding to fresh publication",
+  { concurrency: false },
+  async (t) => {
+    const fixture = await createFixture(t, {
+      restoreContextContractVersion: 3,
+    });
+    const capability = await issueCapability(fixture);
+    await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+    fixture.observation.events.length = 0;
+    let canonicalSnapshot;
+    const { backend, observation } = await createObservedRestoreBackend(
+      fixture,
+      {
+        beforeInvocation(invocation) {
+          assert.equal(invocation.method, "publishRestoreDestination");
+          const raw = fixture.mutation.state.restoreContexts[0].generationBinding;
+          canonicalSnapshot = JSON.parse(JSON.stringify(raw));
+          assert.deepEqual(invocation.options.binding, canonicalSnapshot);
+          assert.notStrictEqual(invocation.options.binding, raw);
+          assert.notStrictEqual(
+            invocation.options.binding.attachment,
+            raw.attachment,
+          );
+          assert.notStrictEqual(
+            invocation.options.binding.checkpoint,
+            raw.checkpoint,
+          );
+          assert.notStrictEqual(invocation.options.binding.request, raw.request);
+          assert.notStrictEqual(
+            invocation.options.binding.request.target,
+            raw.request.target,
+          );
+          for (const value of [
+            invocation.options,
+            invocation.options.binding,
+            invocation.options.binding.attachment,
+            invocation.options.binding.checkpoint,
+            invocation.options.binding.request,
+            invocation.options.binding.request.target,
+          ]) {
+            assert.equal(Object.isFrozen(value), true);
+          }
+
+          raw.generationId = "restore-generation-mutated";
+          raw.attachment.proofId = "proof-attachment-mutated";
+          raw.checkpoint.checkpointId = "checkpoint-mutated";
+          raw.request.target.artifactId = "artifact-mutated";
+          assert.deepEqual(invocation.options.binding, canonicalSnapshot);
+        },
+      },
+    );
+
+    const options = restoreCoreOptions(fixture, { backend });
+    const result = await restoreCleanCheckpoint(options);
+    const completion = fixture.mutation.state.restoreFinalizations[0];
+
+    assert.deepEqual(result, fixedResult(checkpoint(), options.request));
+    assert.deepEqual(observation.events, ["publishRestoreDestination"]);
+    assert.equal(observation.calls.length, 1);
+    const invocation = observation.calls[0];
+    exactKeys(invocation.options, [
+      "artifactDirectory",
+      "artifactOwnedRoot",
+      "artifactProof",
+      "binding",
+      "destinationDirectory",
+      "destinationOwnedRoot",
+      "operationId",
+      "request",
+      "result",
+    ]);
+    exactKeys(invocation.options.binding, [
+      "attachment",
+      "captureAttemptId",
+      "captureOperationId",
+      "catalogueSha256",
+      "checkpoint",
+      "contractVersion",
+      "destinationIsolationProofId",
+      "destinationState",
+      "generationId",
+      "request",
+      "reservationId",
+    ]);
+    assert.deepEqual(invocation.options.binding, canonicalSnapshot);
+    assert.equal(
+      invocation.options.binding.attachment.rootPath,
+      fixture.sourceDirectory,
+    );
+    assert.notEqual(
+      invocation.options.binding.attachment.rootPath,
+      fixture.destinationDirectory,
+    );
+    assert.strictEqual(
+      completion,
+      fixture.mutation.state.restoreCallbackCompletions[0],
+    );
+    exactKeys(completion, ["materialization", "replayed", "result"]);
+    assert.equal(Object.isFrozen(completion), true);
+    assert.equal(completion.replayed, false);
+    assert.deepEqual(fixture.observation.events, [
+      "authority:restore:start",
+      "publication:publishRestoreDestination",
+      "publication:prepared",
+      "publication:copied",
+      "authority:restore:finalized",
+      "authority:restore:end",
+    ]);
+  },
+);
+
+test(
+  "production committed-only restore verifies without invoking physical publication",
+  { concurrency: false },
+  async (t) => {
+    let publicationMode = "fresh-or-exact-replay";
+    const fixture = await createFixture(t, {
+      restoreContext: () => ({ publicationMode }),
+      restoreContextContractVersion: 3,
+    });
+    const capability = await issueCapability(fixture);
+    await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+    fixture.observation.events.length = 0;
+    const { backend, observation } =
+      await createObservedRestoreBackend(fixture);
+    const options = restoreCoreOptions(fixture, { backend });
+
+    const freshResult = await restoreCleanCheckpoint(options);
+    const freshCompletion = fixture.mutation.state.restoreFinalizations[0];
+    publicationMode = "committed-only";
+    fixture.observation.events.length = 0;
+    const committedResult = await restoreCleanCheckpoint(options);
+    const committedCompletion = fixture.mutation.state.restoreFinalizations[1];
+
+    assert.deepEqual(committedResult, freshResult);
+    assert.deepEqual(observation.events, [
+      "publishRestoreDestination",
+      "verifyCommittedRestoreDestination",
+    ]);
+    assert.equal(
+      observation.calls.filter(
+        ({ method }) => method === "publishRestoreDestination",
+      ).length,
+      1,
+    );
+    assert.equal(
+      observation.calls.filter(
+        ({ method }) => method === "verifyCommittedRestoreDestination",
+      ).length,
+      1,
+    );
+    const verification = observation.calls[1];
+    exactKeys(verification.options, [
+      "artifactProof",
+      "binding",
+      "destinationDirectory",
+      "destinationOwnedRoot",
+      "operationId",
+      "request",
+      "result",
+    ]);
+    assert.equal(Object.hasOwn(verification.options, "artifactDirectory"), false);
+    assert.equal(Object.hasOwn(verification.options, "artifactOwnedRoot"), false);
+    assert.deepEqual(
+      verification.options.binding,
+      observation.calls[0].options.binding,
+    );
+    for (const completion of [freshCompletion, committedCompletion]) {
+      exactKeys(completion, ["materialization", "replayed", "result"]);
+      assert.equal(Object.isFrozen(completion), true);
+      assert.deepEqual(completion.result, fixedResult(checkpoint(), options.request));
+    }
+    assert.equal(freshCompletion.replayed, false);
+    assert.equal(committedCompletion.replayed, true);
+    assert.strictEqual(
+      committedCompletion,
+      fixture.mutation.state.restoreCallbackCompletions[1],
+    );
+    assert.deepEqual(fixture.observation.events, [
+      "authority:restore:start",
+      "publication:verifyCommittedRestoreDestination",
+      "authority:restore:finalized",
+      "authority:restore:end",
+    ]);
+  },
+);
+
+test(
+  "production restore rejects outcomes that weaken full-binding or committed-only evidence",
+  { concurrency: false },
+  async (t) => {
+    const cases = [
+      {
+        name: "fresh publication returns replayed legacy v2 materialization",
+        mode: "fresh-or-exact-replay",
+        expectedMethod: "publishRestoreDestination",
+        transformOutcome(_invocation, outcome) {
+          const legacyMaterialization = {
+            ...outcome.materialization,
+            contractVersion: 2,
+          };
+          delete legacyMaterialization.coordinatorBindingSha256;
+          return Object.freeze({
+            materialization: Object.freeze(legacyMaterialization),
+            replayed: true,
+            result: outcome.result,
+          });
+        },
+      },
+      {
+        name: "committed verifier returns replayed legacy v2 materialization",
+        mode: "committed-only",
+        expectedMethod: "verifyCommittedRestoreDestination",
+        transformOutcome(_invocation, outcome) {
+          const legacyMaterialization = {
+            ...outcome.materialization,
+            contractVersion: 2,
+          };
+          delete legacyMaterialization.coordinatorBindingSha256;
+          return Object.freeze({
+            materialization: Object.freeze(legacyMaterialization),
+            replayed: true,
+            result: outcome.result,
+          });
+        },
+      },
+      {
+        name: "committed verifier reports a non-replayed v3 materialization",
+        mode: "committed-only",
+        expectedMethod: "verifyCommittedRestoreDestination",
+        transformOutcome(_invocation, outcome) {
+          return Object.freeze({
+            materialization: outcome.materialization,
+            replayed: false,
+            result: outcome.result,
+          });
+        },
+      },
+    ];
+
+    for (const entry of cases) {
+      await t.test(entry.name, async (t) => {
+        let publicationMode = "fresh-or-exact-replay";
+        const fixture = await createFixture(t, {
+          restoreContext: () => ({ publicationMode }),
+          restoreContextContractVersion: 3,
+        });
+        const capability = await issueCapability(fixture);
+        await captureCleanCheckpoint(captureCoreOptions(fixture, capability));
+        fixture.observation.events.length = 0;
+        const { backend, observation } = await createObservedRestoreBackend(
+          fixture,
+          {
+            transformOutcome(invocation, outcome) {
+              return invocation.method === entry.expectedMethod
+                ? entry.transformOutcome(invocation, outcome)
+                : outcome;
+            },
+          },
+        );
+        const options = restoreCoreOptions(fixture, { backend });
+
+        if (entry.mode === "committed-only") {
+          await restoreCleanCheckpoint(options);
+          assert.equal(fixture.mutation.state.restoreFinalizations.length, 1);
+          publicationMode = "committed-only";
+          fixture.observation.events.length = 0;
+        }
+
+        await assert.rejects(
+          () => restoreCleanCheckpoint(options),
+          (error) => assertCoreError(error, "restore_outcome_uncertain"),
+        );
+
+        const expectedFinalizations =
+          entry.mode === "committed-only" ? 1 : 0;
+        assert.equal(
+          fixture.mutation.state.restoreFinalizations.length,
+          expectedFinalizations,
+        );
+        assert.equal(
+          fixture.mutation.state.restoreCallbackCompletions.length,
+          expectedFinalizations,
+        );
+        assert.equal(observation.calls.at(-1).method, entry.expectedMethod);
+        assert.equal(
+          fixture.observation.events.includes("authority:restore:finalized"),
+          false,
+        );
+      });
+    }
+  },
+);
+
+test(
+  "production restore rejects non-canonical generation contexts before publication",
+  { concurrency: false },
+  async (t) => {
+    let bindingProxyReads = 0;
+    let nestedProxyReads = 0;
+    let generationAccessorReads = 0;
+    const cases = [
+      {
+        name: "checkpoint mismatch",
+        transform: (binding) => ({
+          ...binding,
+          checkpoint: {
+            ...binding.checkpoint,
+            checkpointId: "checkpoint-substituted",
+          },
+        }),
+      },
+      {
+        name: "request mismatch",
+        transform: (binding) => ({
+          ...binding,
+          request: {
+            ...binding.request,
+            operationId: "operation-restore-substituted",
+          },
+        }),
+      },
+      {
+        name: "nested request target mutation",
+        transform(binding) {
+          binding.request.target.artifactId = "artifact-substituted";
+          return binding;
+        },
+      },
+      {
+        name: "reservation mismatch",
+        transform: (binding) => ({
+          ...binding,
+          reservationId: "reservation-restore-substituted",
+        }),
+      },
+      {
+        name: "destination isolation mismatch",
+        transform: (binding) => ({
+          ...binding,
+          destinationIsolationProofId:
+            "destination-isolation-proof-substituted",
+        }),
+      },
+      {
+        name: "artifact capture mismatch",
+        transform: (binding) => ({
+          ...binding,
+          captureOperationId: "operation-checkpoint-substituted",
+        }),
+      },
+      ...[
+        ["attachment session mismatch", "sessionId", THREAD_ID],
+        ["attachment backend mismatch", "backendId", "backend-substituted"],
+        ["attachment storage mismatch", "storageId", "volume-substituted"],
+        ["attachment lease mismatch", "leaseId", "lease-substituted"],
+        ["attachment holder mismatch", "holderId", "holder-substituted"],
+        ["attachment fence mismatch", "fencingEpoch", "13"],
+      ].map(([name, field, value]) => ({
+        name,
+        transform: (binding) => ({
+          ...binding,
+          attachment: { ...binding.attachment, [field]: value },
+        }),
+      })),
+      ...[
+        [
+          "attachment root equals the destination owned root",
+          (fixture) => fixture.destinationOwnedRoot,
+        ],
+        [
+          "attachment root is an ancestor of the destination owned root",
+          (fixture) => fixture.root,
+        ],
+        [
+          "attachment root is a descendant of the destination owned root",
+          (fixture) => join(fixture.destinationOwnedRoot, "active-session"),
+        ],
+      ].map(([name, rootPath]) => ({
+        name,
+        transform: (binding, fixture) => ({
+          ...binding,
+          attachment: {
+            ...binding.attachment,
+            rootPath: rootPath(fixture),
+          },
+        }),
+      })),
+      ...[
+        [
+          "attachment root equals the artifact owned root",
+          (fixture) => fixture.artifactOwnedRoot,
+        ],
+        [
+          "attachment root is a descendant of the artifact owned root",
+          (fixture) => join(fixture.artifactOwnedRoot, "active-session"),
+        ],
+      ].map(([name, rootPath]) => ({
+        name,
+        transform: (binding, fixture) => ({
+          ...binding,
+          attachment: {
+            ...binding.attachment,
+            rootPath: rootPath(fixture),
+          },
+        }),
+      })),
+      {
+        name: "attachment root is an ancestor of the artifact owned root",
+        context: (_admission, fixture) => ({
+          artifactDirectory: join(
+            fixture.artifactOwnedRoot,
+            "nested-owned-root",
+            "artifact",
+          ),
+          artifactOwnedRoot: join(
+            fixture.artifactOwnedRoot,
+            "nested-owned-root",
+          ),
+        }),
+        transform: (binding, fixture) => ({
+          ...binding,
+          attachment: {
+            ...binding.attachment,
+            rootPath: fixture.artifactOwnedRoot,
+          },
+        }),
+      },
+      {
+        name: "invalid capture-attempt ID",
+        transform: (binding) => ({
+          ...binding,
+          captureAttemptId: "not-a-uuid",
+        }),
+      },
+      {
+        name: "invalid catalogue digest",
+        transform: (binding) => ({
+          ...binding,
+          catalogueSha256: "g".repeat(64),
+        }),
+      },
+      {
+        name: "invalid generation ID",
+        transform: (binding) => ({ ...binding, generationId: "" }),
+      },
+      ...[
+        ["invalid attachment ID", "attachmentId"],
+        ["invalid attachment operation ID", "operationId"],
+        ["invalid attachment proof ID", "proofId"],
+      ].map(([name, field]) => ({
+        name,
+        transform: (binding) => ({
+          ...binding,
+          attachment: { ...binding.attachment, [field]: "" },
+        }),
+      })),
+      {
+        name: "relative attachment root",
+        transform: (binding) => ({
+          ...binding,
+          attachment: {
+            ...binding.attachment,
+            rootPath: "relative/session",
+          },
+        }),
+      },
+      {
+        name: "generation binding proxy",
+        transform: (binding) =>
+          new Proxy(binding, {
+            get(target, property, receiver) {
+              bindingProxyReads += 1;
+              return Reflect.get(target, property, receiver);
+            },
+          }),
+        assertAfter: () => assert.equal(bindingProxyReads, 0),
+      },
+      {
+        name: "nested attachment proxy",
+        transform: (binding) => ({
+          ...binding,
+          attachment: new Proxy(binding.attachment, {
+            get(target, property, receiver) {
+              nestedProxyReads += 1;
+              return Reflect.get(target, property, receiver);
+            },
+          }),
+        }),
+        assertAfter: () => assert.equal(nestedProxyReads, 0),
+      },
+      {
+        name: "generation accessor",
+        transform(binding) {
+          const withAccessor = { ...binding };
+          Object.defineProperty(withAccessor, "generationId", {
+            enumerable: true,
+            get() {
+              generationAccessorReads += 1;
+              return RESTORE_GENERATION_ID;
+            },
+          });
+          return withAccessor;
+        },
+        assertAfter: () => assert.equal(generationAccessorReads, 0),
+      },
+      {
+        name: "extra generation key",
+        transform: (binding) => ({ ...binding, unexpected: true }),
+      },
+      {
+        name: "extra nested request key",
+        transform: (binding) => ({
+          ...binding,
+          request: { ...binding.request, unexpected: true },
+        }),
+      },
+      {
+        name: "reduced generation binding",
+        transform: (binding) => ({
+          checkpoint: binding.checkpoint,
+          contractVersion: binding.contractVersion,
+          destinationIsolationProofId:
+            binding.destinationIsolationProofId,
+          reservationId: binding.reservationId,
+        }),
+      },
+      {
+        name: "null generation binding",
+        transform: () => null,
+      },
+      {
+        name: "invalid publication mode",
+        context: () => ({ publicationMode: "publish" }),
+      },
+      {
+        name: "extra production context key",
+        context: () => ({ unexpected: true }),
+      },
+    ];
+
+    for (const entry of cases) {
+      await t.test(entry.name, async (t) => {
+        let fixture;
+        fixture = await createFixture(t, {
+          restoreContext:
+            entry.context === undefined
+              ? undefined
+              : (admission) => entry.context(admission, fixture),
+          restoreContextContractVersion: 3,
+          restoreGenerationBinding: (binding) =>
+            entry.transform === undefined
+              ? binding
+              : entry.transform(binding, fixture),
+        });
+        fixture.artifactProof = Object.freeze({
+          artifactManifestDigest: "d".repeat(64),
+          captureOperationId: CAPTURE_OPERATION_ID,
+          modeledDigest: "e".repeat(64),
+        });
+        fixture.observation.events.length = 0;
+        const { backend, observation } =
+          await createObservedRestoreBackend(fixture);
+
+        await assert.rejects(
+          () =>
+            restoreCleanCheckpoint(
+              restoreCoreOptions(fixture, { backend }),
+            ),
+          (error) => assertCoreError(error, "restore_outcome_uncertain"),
+        );
+
+        entry.assertAfter?.();
+        assert.equal(fixture.mutation.state.restoreRuns, 1);
+        assert.equal(
+          fixture.mutation.state.restoreCallbackCompletions.length,
+          0,
+        );
+        assert.equal(fixture.mutation.state.restoreFinalizations.length, 0);
+        assert.deepEqual(observation.calls, []);
+        assert.deepEqual(observation.events, []);
+        assert.equal(
+          fixture.observation.events.some((event) =>
+            event.startsWith("publication:"),
+          ),
+          false,
+        );
+        assert.equal(await pathExists(fixture.destinationDirectory), false);
+        assert.equal(
+          (
+            await fixture.journal.read({ operationId: RESTORE_OPERATION_ID })
+          ).record,
+          null,
+        );
+      });
+    }
+  },
+);
 
 test("adapter v2 replays a committed v1 restore binding with legacy v2 materialization", async (t) => {
   const fixture = await createFixture(t);
