@@ -40,9 +40,13 @@ const POSITIVE_UINT64_PATTERN = /^[1-9][0-9]{0,19}$/u;
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 const MAX_BATCH_SIZE = 100;
 
-const OPTION_KEYS = objectFreeze([
+const LEGACY_OPTION_KEYS = objectFreeze([
   "listCandidates",
   "reconcileCheckpointCapture",
+]);
+const OPTION_KEYS = objectFreeze([
+  ...LEGACY_OPTION_KEYS,
+  "resumePreparedCheckpointCapture",
 ]);
 const RUN_BATCH_KEYS = objectFreeze([
   "afterSessionId",
@@ -53,7 +57,11 @@ const PAGE_KEYS = objectFreeze([
   "candidates",
   "nextAfterSessionId",
 ]);
-const CANDIDATE_KEYS = objectFreeze(["checkpoint", "request"]);
+const CANDIDATE_KEYS = objectFreeze([
+  "checkpoint",
+  "request",
+  "state",
+]);
 const CHECKPOINT_KEYS = objectFreeze([
   "artifactId",
   "backendId",
@@ -191,6 +199,54 @@ function exactDataObject(value, expectedKeys, code) {
     ensure(objectHasOwn(normalized, expectedKeys[index]), code);
   }
   return normalized;
+}
+
+function exactDataObjectVariant(value, expectedKeySets, code) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
+    code,
+  );
+  let prototype;
+  let keys;
+  try {
+    prototype = objectGetPrototypeOf(value);
+    keys = reflectOwnKeys(value);
+  } catch {
+    fail(code);
+  }
+  ensure(prototype === objectPrototype || prototype === null, code);
+  let expectedKeys = null;
+  for (let variant = 0; variant < expectedKeySets.length; variant += 1) {
+    const candidate = expectedKeySets[variant];
+    if (keys.length !== candidate.length) continue;
+    let matches = true;
+    for (let index = 0; matches && index < keys.length; index += 1) {
+      const key = keys[index];
+      let found = false;
+      if (typeof key === "string") {
+        for (
+          let expectedIndex = 0;
+          expectedIndex < candidate.length;
+          expectedIndex += 1
+        ) {
+          if (key === candidate[expectedIndex]) {
+            found = true;
+            break;
+          }
+        }
+      }
+      matches = found;
+    }
+    if (matches) {
+      expectedKeys = candidate;
+      break;
+    }
+  }
+  ensure(expectedKeys !== null, code);
+  return exactDataObject(value, expectedKeys, code);
 }
 
 function exactFrozenRecord(value) {
@@ -394,6 +450,12 @@ function normalizeCandidate(value, code) {
       checkpoint.codexSessionId === checkpoint.codexThreadId,
     code,
   );
+  ensure(
+    candidate.state === "prepared" ||
+      candidate.state === "starting" ||
+      candidate.state === "uncertain",
+    code,
+  );
   opaqueId(checkpoint.artifactId, code);
   opaqueId(checkpoint.backendId, code);
   opaqueId(checkpoint.checkpointId, code);
@@ -418,8 +480,15 @@ function normalizeCandidate(value, code) {
   opaqueId(target.artifactId, code);
   opaqueId(target.checkpointId, code);
   return exactFrozenRecord({
-    candidate: value,
+    callbackInput: exactFrozenRecord({
+      checkpoint: candidate.checkpoint,
+      request: candidate.request,
+    }),
     operationId: request.operationId,
+    route:
+      candidate.state === "prepared"
+        ? "prepared-publish"
+        : "committed-verify",
     sessionId: request.sessionId,
   });
 }
@@ -542,7 +611,11 @@ export function createPostgresCheckpointRecoveryService(...args) {
   const optionCode =
     "invalid_postgres_checkpoint_recovery_service_options";
   ensure(args.length === 1, optionCode);
-  const options = exactDataObject(args[0], OPTION_KEYS, optionCode);
+  const options = exactDataObjectVariant(
+    args[0],
+    [LEGACY_OPTION_KEYS, OPTION_KEYS],
+    optionCode,
+  );
   const listCandidates = normalizeCallback(
     options.listCandidates,
     optionCode,
@@ -551,6 +624,15 @@ export function createPostgresCheckpointRecoveryService(...args) {
     options.reconcileCheckpointCapture,
     optionCode,
   );
+  const resumePreparedCheckpointCapture = objectHasOwn(
+    options,
+    "resumePreparedCheckpointCapture",
+  )
+    ? normalizeCallback(
+        options.resumePreparedCheckpointCapture,
+        optionCode,
+      )
+    : null;
 
   const requestCode =
     "invalid_postgres_checkpoint_recovery_service_request";
@@ -588,10 +670,17 @@ export function createPostgresCheckpointRecoveryService(...args) {
           return batchResult(settledCursor, results, "aborted");
         }
         const candidate = page.candidates[index];
-        const status = await reconcileCandidate(
-          reconcileCheckpointCapture,
-          candidate.candidate,
-        );
+        const callback =
+          candidate.route === "prepared-publish"
+            ? resumePreparedCheckpointCapture
+            : reconcileCheckpointCapture;
+        const status =
+          callback === null
+            ? "pending"
+            : await reconcileCandidate(
+                callback,
+                candidate.callbackInput,
+              );
         appendFrozenResult(
           results,
           exactFrozenRecord({

@@ -9,7 +9,8 @@ interrupted-turn recovery with an offline, pinned-runtime rollout-tail repair
 primitive, the storage contracts, journal, local stopped-directory
 publication, same-process stopped-writer authority, and a composed
 stopped-directory backend for guarded clean capture, committed-result
-reconciliation, and restore.
+reconciliation, durable stopped-writer-to-prepared-capture handoff, and
+restore.
 It also includes source-free committed restore-destination verification, a
 versioned provider attachment proof, atomic detached activation into a
 prepared launch, and four bounded no-relaunch recovery lanes.
@@ -133,7 +134,8 @@ acknowledgement loss replays only the same finalizer. Manual fencing records
 `fence-unavailable` without calling the provider. This facade is not yet wired
 into the production checkpoint adapter and does not enable `runRestore()`.
 
-Production clean-capture authority adds no capture-specific DDL. It binds one
+The original production clean-capture authority reuses the operation,
+reservation, attempt, tombstone, and catalogue schema. It binds one
 exact session-wide operation and reservation to one globally unique
 capture-attempt claim, holds a per-operation PostgreSQL session advisory guard
 while local publication runs outside database transactions, and atomically
@@ -145,21 +147,39 @@ journal record and artefact for that durable attempt, including after lease
 expiry or fence turnover. It cannot consume another stopped-writer capability
 or advance `prepared` or `materialized` publication.
 
+Migration `006-writer-stop-capture-handoff.sql` adds the durable V3 bridge from
+writer stop to that capture authority. A version 3 `writer-launch-stop-v1`
+request embeds the complete canonical capture intent, including its fixed
+capture operation and attempt identities and predetermined result. Its typed
+stop dispatch transaction permanently preclaims the capture operation ID
+before physical stop can begin. After exact `complete-stopped` evidence, one
+`SERIALIZABLE` finalizer commits the stop, materializes that same claim,
+creates the exact `checkpoint-capture-v1` operation and reservation as
+`prepared`, and makes it the session's active operation. Rollback exposes none
+of the handoff writes.
+
 `PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()` adds a
 bounded read-only recovery page over retained `starting` or `uncertain`
-captures. It uses immutable `session_id` keyset order, the existing active-row
-index, a hard `limit + 1` query, and one serializable snapshot to cross-check
-the session pointer, reservation, attempt binding, tombstone absence, and
-catalogue absence. Each frozen candidate contains only the exact durable
-`{checkpoint, request}` admission; current lease, attachment, stopped writer,
-and mutable source state are never reconstructed.
+captures and V3 handoff captures that are still exactly `prepared`. It uses
+immutable `session_id` keyset order, the existing active-row index, a hard
+`limit + 1` query, and one serializable snapshot to cross-check the session
+pointer, reservation, attempt or materialized handoff binding, tombstone
+absence, and catalogue absence. Each frozen candidate contains only the exact
+durable `{checkpoint, request}` admission plus its state; current writer
+authority is never reconstructed.
 
 `createPostgresCheckpointRecoveryService()` exposes
 `runBatch({afterSessionId, limit, signal})`, which processes one bounded page
 sequentially against one backend and stable artefact-root configuration.
 One service instance admits at most one batch at a time; an overlapping valid
 call fails closed before it can enumerate or reconcile another candidate.
-Per-candidate receipts are `reconciled` or `pending`; the batch is
+An optional prepared-capture callback routes only an exact `prepared`
+candidate through its one `prepared -> starting` dispatch grant and the
+backend's fresh-only `resumePreparedCheckpointCapture()` entry point.
+`starting` and `uncertain` candidates stay source-free and may only verify an
+already committed publication. Once the prepared dispatch grant may have
+committed, ambiguity never authorizes a second publication. Per-candidate
+receipts are `reconciled` or `pending`; the batch is
 `sweep-complete`, `limit-reached`, or `aborted`, and the cursor advances only
 after the current attempt settles. A completed sweep wraps to a null cursor for
 later replay. Abort signals stop only new admission and drain any in-flight
@@ -238,6 +258,17 @@ committed operation identity while allowing a strictly newer, validated lease
 snapshot to replace a pre-reserve input only after the authority proves the
 operation absent.
 
+Stop request contract version 3 extends that same operation kind with the
+exact capture intent. Fresh V3 reservation is default-closed unless startup
+sets `writerLaunchStopV3FleetCompatible: true`; exact replay and recovery of
+already durable V3 work remain available when the creation gate is closed.
+Legacy V1/V2 stop and same-process capability capture retain their existing
+contracts. The new prepared path revokes the transient stop capability after
+the atomic handoff, then lets the stopped-directory backend claim only the
+pre-created capture and publish fresh once. The launcher's local writer
+exclusion is retired only after the returned committed capture result exactly
+matches the predetermined result embedded in the V3 stop request.
+
 Detached restore activation now composes the next authority boundary after the
 predecessor is stopped, cleanly captured, fenced, and canonically detached.
 `verifyCommittedRestoreDestination()` is source-free and read-only: it
@@ -285,13 +316,14 @@ or reconcile stopped-only supervisor evidence. It never republishes, reserves
 or consumes an image, invokes the launch callback, reconstructs an opaque
 writer capability, or treats current-launch inventory as adoptable work.
 
-Production restore therefore remains fail-closed. The next serial slice is
-the cross-process foreground/recovery lifecycle guard and production recovery
-scheduler. Later adapter wiring must still sit behind a separate
-detached-production fleet capability and connect committed publication,
-durable stop and clean capture, canonical detach, capture-bound activation,
-prepared launch, and bounded no-relaunch recovery to the checkpoint adapter
-before enabling `runRestore()`.
+Production restore therefore remains fail-closed. The remaining serial
+prerequisites are a cross-process shared/exclusive foreground/recovery
+lifecycle guard, the production recovery scheduler, an invocation-time
+detached-production compatibility gate, and final adapter wiring. That wiring
+must connect committed publication, durable stop and prepared clean capture,
+canonical detach, capture-bound activation, prepared launch, and bounded
+no-relaunch recovery. `runRestore()` remains disabled until all four
+prerequisites are composed.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -403,8 +435,12 @@ The v3 stopped-directory backend composes the same-process capability, a
 durable mutation-authority and catalogue seam, and local publication into the
 snapshot core's storage-backend contract. It owns only `captureCheckpoint`
 and `restoreCheckpoint` in the base contract, and exposes the optional v1
-`reconcileCheckpointCapture` extension. When the validated lifecycle backend
-declares matching support, it also delegates the optional version 1
+`reconcileCheckpointCapture` extension. When its mutation authority exposes
+the matching optional contract, it also advertises
+`preparedCheckpointCaptureContractVersion: 1` and provides fresh-only
+`resumePreparedCheckpointCapture()` for a capture that the V3 stop handoff
+already created as `prepared`. When the validated lifecycle backend declares
+matching support, it delegates the optional version 1
 `prepareRestoreAttachment` provider extension with the same backend ID.
 Provision, writable attachment preparation, detach, force-fence, and destroy
 operations remain delegated lifecycle work.
@@ -460,8 +496,8 @@ no-relaunch recovery. The backend's version 3 restore callback
 can now carry the complete authority-issued generation binding to either fresh
 publication or committed-only verification without changing the legacy version
 2 callback. Production restore remains fail-closed until later slices add the
-cross-process lifecycle guard and recovery scheduler, then connect those
-boundaries through the separately gated `runRestore()` adapter;
+cross-process lifecycle guard, recovery scheduler, invocation-time detached-
+production gate, and adapter wiring;
 filesystem-image execution
 and differential backup remain later work. See
 `docs/architecture/stopped-directory-backend.md`.

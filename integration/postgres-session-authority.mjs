@@ -49,6 +49,7 @@ import {
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
+  assertWriterLaunchStopCaptureHandoffProof,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -109,6 +110,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 5,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/006-writer-stop-capture-handoff.sql",
+      import.meta.url,
+    ),
+    version: 6,
   }),
 ]);
 
@@ -409,7 +417,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 5,
+    version: 6,
   });
   const registry = await pool.query(
     [
@@ -615,6 +623,58 @@ async function assertOperationIdRegistryConcurrency(pool) {
       [firstSessionId, secondSessionId],
     );
   }
+}
+
+async function assertWriterStopCaptureHandoffSchema(pool) {
+  const constraints = await pool.query(
+    [
+      "SELECT conname, pg_catalog.pg_get_constraintdef(oid) AS definition",
+      "FROM pg_catalog.pg_constraint",
+      "WHERE conrelid =",
+      "'session_authority.operation_id_registry'::pg_catalog.regclass",
+      "AND conname IN (",
+      "'operation_id_registry_claim_type_allowed',",
+      "'operation_id_registry_claim_shape')",
+      "ORDER BY conname",
+    ].join(" "),
+  );
+  assert.deepEqual(
+    constraints.rows.map(({ conname }) => conname),
+    [
+      "operation_id_registry_claim_shape",
+      "operation_id_registry_claim_type_allowed",
+    ],
+  );
+  for (const constraint of constraints.rows) {
+    assert.match(
+      constraint.definition,
+      /writer-stop-capture-intent-v3/u,
+    );
+  }
+
+  const triggers = await pool.query(
+    [
+      "SELECT tgname",
+      "FROM pg_catalog.pg_trigger",
+      "WHERE tgrelid =",
+      "'session_authority.operation_claims'::pg_catalog.regclass",
+      "AND NOT tgisinternal",
+      "AND tgname IN (",
+      "'operation_claims_enforce_writer_stop_capture_id_claim',",
+      "'operation_claims_enforce_writer_stop_capture_materialization')",
+      "ORDER BY tgname",
+    ].join(" "),
+  );
+  assert.deepEqual(triggers.rows, [
+    {
+      tgname:
+        "operation_claims_enforce_writer_stop_capture_id_claim",
+    },
+    {
+      tgname:
+        "operation_claims_enforce_writer_stop_capture_materialization",
+    },
+  ]);
 }
 
 async function assertRestoreGenerationConstraints(pool) {
@@ -2370,6 +2430,46 @@ function writerLaunchStopInput(
   };
 }
 
+function writerLaunchStopCaptureInput(
+  expectedSession,
+  {
+    captureOperationId = `checkpoint-operation-${randomUUID()}`,
+    stopOperationId = `writer-launch-stop-${randomUUID()}`,
+  } = {},
+) {
+  const launch = expectedSession.document.launch;
+  assert.notEqual(launch, null);
+  const captureAdmission = checkpointCaptureAdmission(
+    { session: expectedSession },
+    {
+      operationId: captureOperationId,
+      processIncarnationId: launch.processIncarnationId,
+      stopOperationId,
+      writerIncarnationId: launch.writerIncarnationId,
+    },
+  );
+  const captureInput = checkpointOperationInput(
+    expectedSession,
+    captureAdmission,
+  );
+  const claimToken = randomUUID();
+  return {
+    captureAdmission,
+    captureInput,
+    claimToken,
+    input: {
+      expectedSession,
+      kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+      operationId: stopOperationId,
+      request: createWriterLaunchStopOperationRequest({
+        captureIntent: captureInput.request,
+        claimToken,
+        expectedSession,
+      }),
+    },
+  };
+}
+
 function writerLaunchStopEvidence(input) {
   const launch = input.request.launch;
   return {
@@ -2784,10 +2884,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 5);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 6);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5],
+      [1, 2, 3, 4, 5, 6],
     );
 
     await pool.query(
@@ -2797,7 +2897,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 5,
+      version: 6,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -2810,7 +2910,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 5,
+      version: 6,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -2825,7 +2925,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 5,
+      version: 6,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -2837,7 +2937,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 5,
+      version: 6,
     });
     await assertLegacyRestoreV2MigrationGate(
       pool,
@@ -2845,6 +2945,7 @@ test(
       trackedMigrations,
     );
     await assertOperationIdRegistryConcurrency(pool);
+    await assertWriterStopCaptureHandoffSchema(pool);
     await assertRestoreGenerationConstraints(pool);
     await assertRestoreRecoveryCursorSchemaAndStore(pool, store);
 
@@ -3326,7 +3427,8 @@ test(
               "WHERE session_id = ANY($1::uuid[])",
               "AND claim_type IN (",
               "'restore-launch-intent-v2',",
-              "'restore-activation-launch-intent-v1'",
+              "'restore-activation-launch-intent-v1',",
+              "'writer-stop-capture-intent-v3'",
               ")",
               ")",
             ].join(" "),
@@ -3338,7 +3440,8 @@ test(
               "WHERE session_id = ANY($1::uuid[])",
               "AND claim_type IN (",
               "'restore-launch-intent-v2',",
-              "'restore-activation-launch-intent-v1'",
+              "'restore-activation-launch-intent-v1',",
+              "'writer-stop-capture-intent-v3'",
               ")",
             ].join(" "),
             [sessionIds],
@@ -3384,6 +3487,7 @@ test(
         true,
       restoreGenerationV2FleetCompatible: true,
       store,
+      writerLaunchStopV3FleetCompatible: true,
     });
     const operationGuard = new PostgresOperationGuard({
       dedicatedPool: guardPool,
@@ -6295,6 +6399,7 @@ test(
               checkpoint:
                 startingInput.request.admission.checkpoint,
               request: startingInput.request.admission.request,
+              state: "starting",
             },
           ],
           nextAfterSessionId: orderedSessionIds[0],
@@ -6321,6 +6426,7 @@ test(
               checkpoint:
                 uncertainInput.request.admission.checkpoint,
               request: uncertainInput.request.admission.request,
+              state: "uncertain",
             },
           ],
           nextAfterSessionId: null,
@@ -9333,7 +9439,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5],
+          [1, 2, 3, 4, 5, 6],
         );
 
         const input = writerLaunchAttemptInput(
@@ -10119,6 +10225,198 @@ test(
           sessionId: launchedSessionId,
         });
         assert.equal(restored.document.launch, null);
+      },
+    );
+
+    await t.test(
+      "writer stop V3 atomically hands off one prepared checkpoint capture",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+        );
+        const launchInput = writerLaunchAttemptInput(
+          fixture.finalized.session,
+          fixture.finalized.generation,
+        );
+        await authority.reserveOperation(launchInput);
+        await authority.claimWriterLaunchAttemptDispatch({
+          ...structuredClone(launchInput),
+          expectedOperationRevision: "0",
+        });
+        const launched =
+          await authority.finalizeWriterLaunchAttemptStarted({
+            ...structuredClone(launchInput),
+            evidence: writerLaunchEvidence(launchInput, "started"),
+            expectedOperationRevision: "1",
+          });
+
+        const handoff = writerLaunchStopCaptureInput(launched.session);
+        const preparedStop = await authority.reserveOperation(
+          handoff.input,
+        );
+        assertOperationReceipt(preparedStop, "prepared");
+        const claimedStop =
+          await authority.claimWriterLaunchStopDispatch({
+            ...structuredClone(handoff.input),
+            claimToken: handoff.claimToken,
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(claimedStop, "starting");
+        assert.equal(claimedStop.dispatchGranted, true);
+
+        const finalization = {
+          ...structuredClone(handoff.input),
+          evidence: writerLaunchStopEvidence(handoff.input),
+          expectedOperationRevision: "1",
+        };
+        const acknowledgementLossAuthority =
+          new PostgresSessionAuthority({
+            store: new PostgresSerializableStore({
+              dedicatedPool: firstCommitAcknowledgementLossPool(pool),
+            }),
+          });
+        await assert.rejects(
+          acknowledgementLossAuthority
+            .finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+              finalization,
+            ),
+          assertCommitOutcomeUncertain,
+        );
+
+        const reconciled =
+          await authority.reconcileWriterLaunchStopOperation({
+            ...structuredClone(handoff.input),
+            claimToken: handoff.claimToken,
+          });
+        assert.equal(reconciled.status, "prepared");
+        assert.equal(reconciled.claimTokenMatched, true);
+        assert.equal(reconciled.stop.finalized, false);
+        assert.equal(reconciled.stop.operation.state, "committed");
+        assert.equal(reconciled.capture.operation.state, "prepared");
+        assert.equal(
+          reconciled.session.document.activeOperation.operationId,
+          handoff.captureInput.operationId,
+        );
+        assert.equal(reconciled.session.document.launch, null);
+        assertWriterLaunchStopCaptureHandoffProof({
+          before: handoff.input.expectedSession,
+          capture: reconciled.capture,
+          session: reconciled.session,
+          stop: {
+            operation: reconciled.stop.operation,
+            reservation: reconciled.stop.reservation,
+          },
+        });
+
+        const replay =
+          await authority
+            .finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+              structuredClone(finalization),
+            );
+        assert.equal(replay.status, "prepared");
+        assert.equal(replay.stop.finalized, false);
+        assert.deepEqual(replay.capture, reconciled.capture);
+
+        const transactionEvidence = await pool.query(
+          [
+            "SELECT transaction_id FROM (",
+            "SELECT xmin::text AS transaction_id",
+            "FROM session_authority.sessions WHERE session_id = $1",
+            "UNION ALL SELECT xmin::text",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = ANY($2::character varying[])",
+            "UNION ALL SELECT xmin::text",
+            "FROM session_authority.reservations",
+            "WHERE operation_id = ANY($2::character varying[])",
+            "UNION ALL SELECT xmin::text",
+            "FROM session_authority.operation_id_registry",
+            "WHERE operation_id = $3",
+            ") AS evidence",
+          ].join(" "),
+          [
+            sessionId,
+            [handoff.input.operationId, handoff.captureInput.operationId],
+            handoff.captureInput.operationId,
+          ],
+        );
+        assert.equal(transactionEvidence.rows.length, 6);
+        assert.equal(
+          new Set(
+            transactionEvidence.rows.map(
+              ({ transaction_id: transactionId }) => transactionId,
+            ),
+          ).size,
+          1,
+        );
+
+        const predecessor = await pool.query(
+          [
+            "SELECT session_id::text AS session_id",
+            "FROM session_authority.sessions",
+            "WHERE session_id < $1",
+            "ORDER BY session_id DESC LIMIT 1",
+          ].join(" "),
+          [sessionId],
+        );
+        const recoveryCursor =
+          predecessor.rows[0]?.session_id ?? null;
+        const preparedPage =
+          await authority.listCheckpointCaptureRecoveryCandidates({
+            afterSessionId: recoveryCursor,
+            limit: 1,
+          });
+        assert.deepEqual(preparedPage.candidates, [
+          {
+            checkpoint: handoff.captureAdmission.checkpoint,
+            request: handoff.captureAdmission.request,
+            state: "prepared",
+          },
+        ]);
+        const preparedRead =
+          await authority.readCheckpointCaptureAttempt({
+            checkpoint: handoff.captureAdmission.checkpoint,
+            request: handoff.captureAdmission.request,
+          });
+        assert.equal(preparedRead.status, "prepared");
+        assert.equal(preparedRead.attempt, null);
+        assert.equal(preparedRead.catalogue, null);
+
+        const captureDispatchInput = {
+          expectedSession:
+            reconciled.capture.operation.expectedSession,
+          expectedOperationRevision: "0",
+          kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+          operationId: handoff.captureInput.operationId,
+          request: handoff.captureInput.request,
+        };
+        const claimedCapture =
+          await authority.claimCheckpointCaptureDispatch(
+            captureDispatchInput,
+          );
+        assert.equal(claimedCapture.dispatchGranted, true);
+        assert.equal(claimedCapture.operation.state, "starting");
+        const claimReplay =
+          await authority.claimCheckpointCaptureDispatch(
+            structuredClone(captureDispatchInput),
+          );
+        assert.equal(claimReplay.dispatchGranted, false);
+        assert.equal(claimReplay.operation.state, "starting");
+
+        const startingPage =
+          await authority.listCheckpointCaptureRecoveryCandidates({
+            afterSessionId: recoveryCursor,
+            limit: 1,
+          });
+        assert.equal(startingPage.candidates.length, 1);
+        assert.equal(startingPage.candidates[0].state, "starting");
+        assert.equal(
+          startingPage.candidates.some(({ state }) => state === "prepared"),
+          false,
+        );
       },
     );
 

@@ -10,6 +10,7 @@ import {
   MAX_AGENT_DEPTH,
   MAX_SUBAGENTS,
   PLATFORM_IMAGE_MEDIA_TYPES,
+  PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   SESSION_AUTH_MODE,
   SESSION_WORKER_LAYOUT,
@@ -21,6 +22,7 @@ import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
   assertLeaseRenewal,
+  assertPreparedCheckpointCaptureBackend,
   assertResolvedPlatformImageMatchesManifest,
   assertRestoreAttachmentActivationBackend,
   assertRestoreAttachmentActivationRequest,
@@ -1040,6 +1042,63 @@ test("checkpoint capture reconciliation is an optional versioned backend extensi
       assertCode("invalid_storage_backend"),
     );
   }
+});
+
+test("prepared checkpoint capture is an optional versioned backend extension", () => {
+  const base = storageBackend();
+  assert.equal(PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION, 1);
+  assert.equal(assertStorageBackend(base), base);
+  assert.throws(
+    () => assertPreparedCheckpointCaptureBackend(base),
+    assertCode("invalid_storage_backend"),
+  );
+
+  const extended = {
+    ...base,
+    preparedCheckpointCaptureContractVersion:
+      PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+    resumePreparedCheckpointCapture: async () => {},
+  };
+  assert.equal(assertStorageBackend(extended), extended);
+  assert.equal(assertPreparedCheckpointCaptureBackend(extended), extended);
+
+  for (const invalid of [
+    { ...extended, preparedCheckpointCaptureContractVersion: 2 },
+    { ...extended, resumePreparedCheckpointCapture: undefined },
+  ]) {
+    assert.throws(
+      () => assertPreparedCheckpointCaptureBackend(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+
+  let reads = 0;
+  const accessor = { ...extended };
+  Object.defineProperty(accessor, "resumePreparedCheckpointCapture", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return async () => {};
+    },
+  });
+  assert.throws(
+    () => assertPreparedCheckpointCaptureBackend(accessor),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(reads, 0);
+
+  let traps = 0;
+  const hostile = new Proxy(extended, {
+    get() {
+      traps += 1;
+      throw new Error("proxy trap must not run");
+    },
+  });
+  assert.throws(
+    () => assertPreparedCheckpointCaptureBackend(hostile),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
 });
 
 test("restore attachment activation is an optional versioned backend extension", () => {

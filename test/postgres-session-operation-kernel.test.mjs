@@ -22,6 +22,7 @@ import {
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
   assertCommittedWriterLaunchStopTransitionProof,
+  assertWriterLaunchStopCaptureHandoffProof,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
   MAX_WRITER_LEASE_DURATION_MILLISECONDS,
@@ -117,6 +118,9 @@ const LAUNCH_STOP_PREPARED_NOW = "2026-07-29T12:36:00.000Z";
 const LAUNCH_STOP_DISPATCH_NOW = "2026-07-29T12:36:01.000Z";
 const LAUNCH_STOP_UNCERTAIN_NOW = "2026-07-29T12:36:02.000Z";
 const LAUNCH_STOP_FINALIZE_NOW = "2026-07-29T12:36:03.000Z";
+const LAUNCH_STOP_CAPTURE_DISPATCH_NOW = "2026-07-29T12:36:04.000Z";
+const LAUNCH_STOP_CAPTURE_UNCERTAIN_NOW = "2026-07-29T12:36:05.000Z";
+const LAUNCH_STOP_CAPTURE_FINALIZE_NOW = "2026-07-29T12:36:06.000Z";
 const RESTORE_ACTIVATION_CAPTURE_PREPARED_NOW =
   "2026-07-29T12:36:04.000Z";
 const RESTORE_ACTIVATION_CAPTURE_DISPATCH_NOW =
@@ -220,21 +224,33 @@ const READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY =
   `${READ_OPERATION_ID_CLAIM_QUERY} FOR UPDATE`;
 const LIST_CHECKPOINT_CAPTURE_RECOVERY_FIRST_PAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
-  "FROM session_authority.operation_claims",
-  "WHERE kind = 'checkpoint-capture-v1'",
-  "AND state IN ('starting', 'uncertain')",
-  "AND retired_at IS NULL",
-  "ORDER BY session_id ASC",
+  "FROM session_authority.operation_claims AS capture",
+  "WHERE capture.kind = 'checkpoint-capture-v1'",
+  "AND (capture.state IN ('starting', 'uncertain') OR (",
+  "capture.state = 'prepared' AND EXISTS (",
+  "SELECT 1 FROM session_authority.operation_id_registry AS registry",
+  "WHERE registry.operation_id = capture.operation_id",
+  "AND registry.session_id = capture.session_id",
+  "AND registry.claim_type = 'writer-stop-capture-intent-v3'",
+  "AND registry.materialized_at IS NOT NULL)))",
+  "AND capture.retired_at IS NULL",
+  "ORDER BY capture.session_id ASC",
   "LIMIT $1::integer",
 ].join(" ");
 const LIST_CHECKPOINT_CAPTURE_RECOVERY_AFTER_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
-  "FROM session_authority.operation_claims",
-  "WHERE kind = 'checkpoint-capture-v1'",
-  "AND state IN ('starting', 'uncertain')",
-  "AND retired_at IS NULL",
-  "AND session_id > $1::uuid",
-  "ORDER BY session_id ASC",
+  "FROM session_authority.operation_claims AS capture",
+  "WHERE capture.kind = 'checkpoint-capture-v1'",
+  "AND (capture.state IN ('starting', 'uncertain') OR (",
+  "capture.state = 'prepared' AND EXISTS (",
+  "SELECT 1 FROM session_authority.operation_id_registry AS registry",
+  "WHERE registry.operation_id = capture.operation_id",
+  "AND registry.session_id = capture.session_id",
+  "AND registry.claim_type = 'writer-stop-capture-intent-v3'",
+  "AND registry.materialized_at IS NOT NULL)))",
+  "AND capture.retired_at IS NULL",
+  "AND capture.session_id > $1::uuid",
+  "ORDER BY capture.session_id ASC",
   "LIMIT $2::integer",
 ].join(" ");
 const LIST_RESTORE_GENERATION_RECOVERY_FIRST_PAGE_QUERY = [
@@ -1827,12 +1843,15 @@ function checkpointCaptureBinding(fixture) {
 
 function checkpointCaptureAttemptRow(
   fixture,
-  { binding = checkpointCaptureBinding(fixture) } = {},
+  {
+    binding = checkpointCaptureBinding(fixture),
+    claimedAt = CAPTURE_DISPATCH_NOW,
+  } = {},
 ) {
   return {
     binding: structuredClone(binding),
     capture_attempt_id: fixture.request.admission.captureAttemptId,
-    claimed_at: new Date(CAPTURE_DISPATCH_NOW),
+    claimed_at: new Date(claimedAt),
     operation_id: fixture.options.operationId,
     session_id: fixture.options.expectedSession.sessionId,
   };
@@ -1853,12 +1872,15 @@ function checkpointCaptureTombstoneRow(fixture) {
 
 function checkpointCatalogueRow(
   fixture,
-  { document: catalogueDocument = checkpointCatalogueDocument(fixture) } = {},
+  {
+    committedAt = CAPTURE_FINALIZE_NOW,
+    document: catalogueDocument = checkpointCatalogueDocument(fixture),
+  } = {},
 ) {
   return {
     capture_attempt_id: fixture.request.admission.captureAttemptId,
     checkpoint_id: fixture.checkpoint.checkpointId,
-    committed_at: new Date(CAPTURE_FINALIZE_NOW),
+    committed_at: new Date(committedAt),
     document: structuredClone(catalogueDocument),
     session_id: fixture.options.expectedSession.sessionId,
   };
@@ -1881,6 +1903,7 @@ function checkpointCaptureOperationRow(
   fixture,
   state,
   {
+    createdAt = CAPTURE_PREPARED_NOW,
     result =
       state === "committed"
         ? checkpointCaptureTerminalResult(fixture)
@@ -1906,7 +1929,7 @@ function checkpointCaptureOperationRow(
   return operationRow(state, {
     options: fixture.options,
     revision,
-    createdAt: CAPTURE_PREPARED_NOW,
+    createdAt,
     updatedAt,
     result,
     retiredAt: state === "committed" ? updatedAt : null,
@@ -1917,6 +1940,7 @@ function checkpointCaptureReservationRow(
   fixture,
   state,
   {
+    createdAt = CAPTURE_PREPARED_NOW,
     updatedAt =
       state === "prepared"
         ? CAPTURE_PREPARED_NOW
@@ -1929,21 +1953,26 @@ function checkpointCaptureReservationRow(
 ) {
   return reservationRow(state, {
     options: fixture.options,
-    createdAt: CAPTURE_PREPARED_NOW,
+    createdAt,
     updatedAt,
     releasedAt: state === "released" ? updatedAt : null,
   });
 }
 
-function checkpointCapturePhaseSessionRow(fixture, state) {
+function checkpointCapturePhaseSessionRow(
+  fixture,
+  state,
+  { updatedAt: suppliedUpdatedAt } = {},
+) {
   const operationRevision =
     state === "prepared" ? "0" : state === "starting" ? "1" : "2";
   const updatedAt =
-    state === "prepared"
+    suppliedUpdatedAt ??
+    (state === "prepared"
       ? CAPTURE_PREPARED_NOW
       : state === "starting"
         ? CAPTURE_DISPATCH_NOW
-        : CAPTURE_UNCERTAIN_NOW;
+        : CAPTURE_UNCERTAIN_NOW);
   return sessionRow({
     sessionId: fixture.options.expectedSession.sessionId,
     revision: (
@@ -1965,7 +1994,10 @@ function checkpointCapturePhaseSessionRow(fixture, state) {
 
 function checkpointCaptureCommittedSessionRow(
   fixture,
-  { operationRevision = "3" } = {},
+  {
+    operationRevision = "3",
+    updatedAt = CAPTURE_FINALIZE_NOW,
+  } = {},
 ) {
   const result = checkpointCaptureTerminalResult(fixture);
   return sessionRow({
@@ -1985,7 +2017,7 @@ function checkpointCaptureCommittedSessionRow(
       }),
     }),
     createdAt: fixture.options.expectedSession.createdAt,
-    updatedAt: CAPTURE_FINALIZE_NOW,
+    updatedAt,
   });
 }
 
@@ -3280,10 +3312,30 @@ function writerLaunchStopFixture({
   const expectedSession = snapshotFromSessionRow(
     writerLaunchCommittedSessionRow(launch, { result: launchResult }),
   );
+  const captureIntent =
+    contractVersion === 3
+      ? checkpointCaptureFixture({
+          processIncarnationId:
+            expectedSession.document.launch.processIncarnationId,
+          stopOperationId,
+          writer: {
+            expectedSession,
+            lease: expectedSession.document.lease,
+          },
+          writerIncarnationId:
+            expectedSession.document.launch.writerIncarnationId,
+        })
+      : null;
   const request = createWriterLaunchStopOperationRequest(
     contractVersion === 1
       ? { expectedSession }
-      : { claimToken, expectedSession },
+      : contractVersion === 2
+        ? { claimToken, expectedSession }
+        : {
+            captureIntent: captureIntent.request,
+            claimToken,
+            expectedSession,
+          },
   );
   const options = {
     expectedSession,
@@ -3306,6 +3358,7 @@ function writerLaunchStopFixture({
     resultVersion: 1,
   };
   return {
+    captureIntent,
     claimToken: contractVersion === 1 ? null : claimToken,
     evidence,
     launch,
@@ -3314,6 +3367,39 @@ function writerLaunchStopFixture({
     request,
     result,
   };
+}
+
+function writerLaunchStopCaptureFixture(fixture) {
+  assert.equal(fixture.request.contractVersion, 3);
+  const expectedSession = snapshotFromSessionRow(
+    writerLaunchStopCommittedSessionRow(fixture),
+  );
+  const request = fixture.request.captureIntent;
+  return {
+    ...fixture.captureIntent,
+    options: {
+      expectedSession,
+      kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+      operationId: request.admission.request.operationId,
+      request,
+    },
+    request,
+  };
+}
+
+function writerLaunchStopCaptureIdClaimRow(
+  fixture,
+  { materializedAt = null } = {},
+) {
+  return operationIdRegistryRow({
+    binding: fixture.request.captureIntent,
+    claimType: "writer-stop-capture-intent-v3",
+    claimedAt: LAUNCH_STOP_DISPATCH_NOW,
+    claimantOperationId: fixture.options.operationId,
+    materializedAt,
+    operationId: fixture.request.captureIntent.admission.request.operationId,
+    sessionId: fixture.options.expectedSession.sessionId,
+  });
 }
 
 function writerLaunchStopOperationRow(
@@ -3433,19 +3519,91 @@ function writerLaunchStopCommittedSessionRow(
 }
 
 function writerLaunchStopActiveSteps(fixture, state, timing = {}) {
+  const firstLaunchRelation = writerLaunchCommittedRelationSteps(
+    fixture.launch,
+    { result: fixture.launchResult },
+  );
   return [
     rows(writerLaunchStopPhaseSessionRow(fixture, state, timing)),
     rows(writerLaunchStopOperationRow(fixture, state, timing)),
     rows(writerLaunchStopReservationRow(fixture, state, timing)),
+    ...firstLaunchRelation,
+    ...(fixture.request.contractVersion === 3
+      ? [
+          state === "prepared"
+            ? rows()
+            : rows(writerLaunchStopCaptureIdClaimRow(fixture)),
+        ]
+      : []),
     ...writerLaunchCommittedRelationSteps(fixture.launch, {
       result: fixture.launchResult,
     }),
     ...writerLaunchCommittedRelationSteps(fixture.launch, {
       result: fixture.launchResult,
     }),
+  ];
+}
+
+function writerLaunchStopCaptureActiveSteps(
+  fixture,
+  capture,
+  state = "prepared",
+) {
+  const timing = {
+    createdAt: LAUNCH_STOP_FINALIZE_NOW,
+    updatedAt:
+      state === "prepared"
+        ? LAUNCH_STOP_FINALIZE_NOW
+        : state === "starting"
+          ? LAUNCH_STOP_CAPTURE_DISPATCH_NOW
+          : LAUNCH_STOP_CAPTURE_UNCERTAIN_NOW,
+  };
+  return [
+    rows(checkpointCapturePhaseSessionRow(capture, state, timing)),
+    ...writerLaunchStopCaptureRelationSteps(
+      fixture,
+      capture,
+      state,
+    ),
+  ];
+}
+
+function writerLaunchStopCaptureRelationSteps(
+  fixture,
+  capture,
+  state = "prepared",
+) {
+  const timing = {
+    createdAt: LAUNCH_STOP_FINALIZE_NOW,
+    updatedAt:
+      state === "prepared"
+        ? LAUNCH_STOP_FINALIZE_NOW
+        : state === "starting"
+          ? LAUNCH_STOP_CAPTURE_DISPATCH_NOW
+          : LAUNCH_STOP_CAPTURE_UNCERTAIN_NOW,
+  };
+  return [
+    rows(checkpointCaptureOperationRow(capture, state, timing)),
+    rows(checkpointCaptureReservationRow(capture, state, timing)),
+    state === "prepared"
+      ? rows()
+      : rows(
+          checkpointCaptureAttemptRow(capture, {
+            claimedAt: LAUNCH_STOP_CAPTURE_DISPATCH_NOW,
+          }),
+        ),
+    rows(),
+    ...(state === "prepared" ? [] : [rows()]),
+    rows(writerLaunchStopOperationRow(fixture, "committed")),
+    rows(writerLaunchStopReservationRow(fixture, "released")),
     ...writerLaunchCommittedRelationSteps(fixture.launch, {
       result: fixture.launchResult,
     }),
+    rows(
+      writerLaunchStopCaptureIdClaimRow(fixture, {
+        materializedAt: LAUNCH_STOP_FINALIZE_NOW,
+      }),
+    ),
   ];
 }
 
@@ -4599,6 +4757,7 @@ function authorityWithScripts(...scripts) {
         true,
       restoreGenerationV2FleetCompatible: true,
       store,
+      writerLaunchStopV3FleetCompatible: true,
     }),
     clients,
     pool,
@@ -10795,6 +10954,518 @@ test("writer launch stop request owns the exact current launch pointer", async (
   }
 });
 
+test("writer launch stop V3 freezes the exact checkpoint capture intent", () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  assert.deepEqual(
+    fixture.request,
+    canonicalPayload({
+      captureIntent: fixture.captureIntent.request,
+      contractVersion: 3,
+      dispatchClaimSha256: writerLaunchStopClaimSha256(
+        fixture.claimToken,
+      ),
+      launch: fixture.options.expectedSession.document.launch,
+    }),
+  );
+  assert.equal(
+    fixture.request.captureIntent.admission.stopOperationId,
+    fixture.options.operationId,
+  );
+  assert.notEqual(
+    fixture.request.captureIntent.admission.request.operationId,
+    fixture.options.operationId,
+  );
+  assert.equal(JSON.stringify(fixture.request).includes(fixture.claimToken), false);
+  assertDeepFrozen(fixture.request);
+
+  const wrongProcess = structuredClone(fixture.captureIntent.request);
+  wrongProcess.admission.processIncarnationId =
+    "process-incarnation-mismatch";
+  assert.throws(
+    () =>
+      createWriterLaunchStopOperationRequest({
+        captureIntent: wrongProcess,
+        claimToken: fixture.claimToken,
+        expectedSession: fixture.options.expectedSession,
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
+});
+
+test("writer launch stop V3 fresh reservation is default-closed while replay remains readable", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const freshSteps = [
+    ...writerLaunchCommittedSteps(fixture.launch, {
+      result: fixture.launchResult,
+    }),
+    rows(),
+  ];
+  const deniedClient = new ScriptedClient(freshSteps);
+  const replayClient = new ScriptedClient(
+    writerLaunchStopActiveSteps(fixture, "prepared"),
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new ScriptedPool([deniedClient, replayClient]),
+    maxTransactionAttempts: 1,
+  });
+  const authority = new PostgresSessionAuthority({ store });
+
+  await assertAuthorityError(authority.reserveOperation(fixture.options), {
+    code: "writer_launch_stop_v3_fleet_capability_required",
+  });
+  const replay = await authority.reserveOperation(fixture.options);
+
+  assert.equal(replay.acquired, false);
+  assert.equal(replay.operation.state, "prepared");
+  assert.equal(
+    authorityQueries(deniedClient).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  deniedClient.assertExhausted();
+  replayClient.assertExhausted();
+});
+
+test("writer launch stop V3 claim durably preclaims the capture operation ID and conflicts fail closed", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const claim = {
+    ...fixture.options,
+    claimToken: fixture.claimToken,
+    expectedOperationRevision: "0",
+  };
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: LAUNCH_STOP_DISPATCH_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "prepared"),
+        rows(writerLaunchStopCaptureIdClaimRow(fixture)),
+        rows(writerLaunchStopOperationRow(fixture, "starting")),
+        rows(writerLaunchStopReservationRow(fixture, "starting")),
+        rows(writerLaunchStopPhaseSessionRow(fixture, "starting")),
+      ],
+    },
+    {
+      options: { now: LAUNCH_STOP_DISPATCH_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "prepared"),
+        rows(),
+      ],
+    },
+  );
+
+  const granted = await authority.claimWriterLaunchStopDispatch(claim);
+  await assertAuthorityError(
+    authority.claimWriterLaunchStopDispatch(claim),
+    { code: "operation_identity_conflict" },
+  );
+
+  assert.equal(granted.dispatchGranted, true);
+  assert.equal(granted.claimTokenMatched, true);
+  assert.equal(granted.operation.state, "starting");
+  const firstQueries = authorityQueries(clients[0]);
+  const claimIndex = firstQueries.findIndex((args) =>
+    queryText(args).includes("'writer-stop-capture-intent-v3'"),
+  );
+  const startIndex = firstQueries.findIndex(
+    (args) => queryText(args) === START_OPERATION_QUERY,
+  );
+  assert.equal(claimIndex >= 0, true);
+  assert.equal(startIndex > claimIndex, true);
+  clients[0].assertExhausted();
+  clients[1].assertExhausted();
+});
+
+test("writer launch stop V3 claim acknowledgement loss reconciles the reserved capture ID", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("stop V3 claim acknowledgement lost"),
+        now: LAUNCH_STOP_DISPATCH_NOW,
+      },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "prepared"),
+        rows(writerLaunchStopCaptureIdClaimRow(fixture)),
+        rows(writerLaunchStopOperationRow(fixture, "starting")),
+        rows(writerLaunchStopReservationRow(fixture, "starting")),
+        rows(writerLaunchStopPhaseSessionRow(fixture, "starting")),
+      ],
+    },
+    writerLaunchStopActiveSteps(fixture, "starting"),
+  );
+
+  await assert.rejects(
+    authority.claimWriterLaunchStopDispatch({
+      ...fixture.options,
+      claimToken: fixture.claimToken,
+      expectedOperationRevision: "0",
+    }),
+    assertStoreCommitUncertain,
+  );
+  const reconciled =
+    await authority.reconcileWriterLaunchStopOperation({
+      ...fixture.options,
+      claimToken: fixture.claimToken,
+    });
+
+  assert.equal(reconciled.status, "starting");
+  assert.equal(reconciled.claimTokenMatched, true);
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+});
+
+test("writer launch stop V3 atomically finalizes stop and prepares capture", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const capture = writerLaunchStopCaptureFixture(fixture);
+  const terminalSession = writerLaunchStopCommittedSessionRow(fixture);
+  const captureOperation = checkpointCaptureOperationRow(
+    capture,
+    "prepared",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: LAUNCH_STOP_FINALIZE_NOW,
+    },
+  );
+  const captureReservation = checkpointCaptureReservationRow(
+    capture,
+    "prepared",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: LAUNCH_STOP_FINALIZE_NOW,
+    },
+  );
+  const captureSession = checkpointCapturePhaseSessionRow(
+    capture,
+    "prepared",
+    { updatedAt: LAUNCH_STOP_FINALIZE_NOW },
+  );
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: LAUNCH_STOP_FINALIZE_NOW },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "starting"),
+        rows(
+          writerLaunchStopCaptureIdClaimRow(fixture, {
+            materializedAt: LAUNCH_STOP_FINALIZE_NOW,
+          }),
+        ),
+        rows(writerLaunchStopOperationRow(fixture, "committed")),
+        rows(writerLaunchStopReservationRow(fixture, "released")),
+        rows(terminalSession),
+        rows(captureOperation),
+        rows(captureReservation),
+        rows(captureSession),
+      ],
+    },
+    [
+      ...writerLaunchStopCaptureActiveSteps(fixture, capture),
+      ...writerLaunchStopCaptureRelationSteps(fixture, capture),
+    ],
+    [
+      ...writerLaunchStopCaptureActiveSteps(fixture, capture),
+      ...writerLaunchStopCaptureRelationSteps(fixture, capture),
+    ],
+  );
+  const finalization = {
+    ...fixture.options,
+    evidence: fixture.evidence,
+    expectedOperationRevision: "1",
+  };
+
+  await assertAuthorityError(
+    authority.finalizeWriterLaunchStopped(finalization),
+    { code: "invalid_operation_request" },
+  );
+  const receipt =
+    await authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+      finalization,
+    );
+  const replay =
+    await authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+      finalization,
+    );
+  await assertAuthorityError(
+    authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture({
+      ...finalization,
+      evidence: {
+        ...finalization.evidence,
+        proofId: "supervisor-stop-proof-mismatch",
+      },
+    }),
+    { code: "operation_result_conflict" },
+  );
+
+  assert.equal(receipt.status, "prepared");
+  assert.equal(receipt.stop.finalized, true);
+  assert.equal(replay.stop.finalized, false);
+  assert.deepEqual(replay.capture, receipt.capture);
+  assert.equal(receipt.stop.operation.state, "committed");
+  assert.equal(receipt.capture.operation.state, "prepared");
+  assert.equal(receipt.session.document.launch, null);
+  assert.equal(
+    receipt.session.document.activeOperation.operationId,
+    capture.options.operationId,
+  );
+  assert.equal(
+    receipt.capture.operation.createdAt,
+    receipt.stop.operation.updatedAt,
+  );
+  const proof = assertWriterLaunchStopCaptureHandoffProof({
+    before: fixture.options.expectedSession,
+    capture: receipt.capture,
+    session: receipt.session,
+    stop: {
+      operation: receipt.stop.operation,
+      reservation: receipt.stop.reservation,
+    },
+  });
+  assert.deepEqual(proof.capture, receipt.capture);
+  assert.deepEqual(proof.stop, {
+    operation: receipt.stop.operation,
+    reservation: receipt.stop.reservation,
+  });
+  const delayedPrepared = structuredClone({
+    before: fixture.options.expectedSession,
+    capture: receipt.capture,
+    session: receipt.session,
+    stop: {
+      operation: receipt.stop.operation,
+      reservation: receipt.stop.reservation,
+    },
+  });
+  delayedPrepared.capture.operation.updatedAt =
+    LAUNCH_STOP_CAPTURE_DISPATCH_NOW;
+  delayedPrepared.capture.reservation.updatedAt =
+    LAUNCH_STOP_CAPTURE_DISPATCH_NOW;
+  delayedPrepared.session.updatedAt = LAUNCH_STOP_CAPTURE_DISPATCH_NOW;
+  assert.throws(
+    () => assertWriterLaunchStopCaptureHandoffProof(delayedPrepared),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
+  assertDeepFrozen(receipt);
+  assertDeepFrozen(proof);
+  clients[0].assertExhausted();
+});
+
+test("writer launch stop V3 finalization acknowledgement loss reconciles the prepared capture tuple", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const capture = writerLaunchStopCaptureFixture(fixture);
+  const terminalSession = writerLaunchStopCommittedSessionRow(fixture);
+  const captureOperation = checkpointCaptureOperationRow(
+    capture,
+    "prepared",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: LAUNCH_STOP_FINALIZE_NOW,
+    },
+  );
+  const captureReservation = checkpointCaptureReservationRow(
+    capture,
+    "prepared",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: LAUNCH_STOP_FINALIZE_NOW,
+    },
+  );
+  const captureSession = checkpointCapturePhaseSessionRow(
+    capture,
+    "prepared",
+    { updatedAt: LAUNCH_STOP_FINALIZE_NOW },
+  );
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("stop-capture handoff acknowledgement lost"),
+        now: LAUNCH_STOP_FINALIZE_NOW,
+      },
+      steps: [
+        ...writerLaunchStopActiveSteps(fixture, "starting"),
+        rows(
+          writerLaunchStopCaptureIdClaimRow(fixture, {
+            materializedAt: LAUNCH_STOP_FINALIZE_NOW,
+          }),
+        ),
+        rows(writerLaunchStopOperationRow(fixture, "committed")),
+        rows(writerLaunchStopReservationRow(fixture, "released")),
+        rows(terminalSession),
+        rows(captureOperation),
+        rows(captureReservation),
+        rows(captureSession),
+      ],
+    },
+    [
+      ...writerLaunchStopCaptureActiveSteps(fixture, capture),
+      ...writerLaunchStopCaptureRelationSteps(fixture, capture),
+    ],
+  );
+  const finalization = {
+    ...fixture.options,
+    evidence: fixture.evidence,
+    expectedOperationRevision: "1",
+  };
+
+  await assert.rejects(
+    authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+      finalization,
+    ),
+    assertStoreCommitUncertain,
+  );
+  const reconciled =
+    await authority.reconcileWriterLaunchStopOperation({
+      ...fixture.options,
+      claimToken: fixture.claimToken,
+    });
+
+  assert.equal(reconciled.status, "prepared");
+  assert.equal(reconciled.claimTokenMatched, true);
+  assert.equal(reconciled.stop.finalized, false);
+  assert.equal(
+    reconciled.capture.operation.operationId,
+    capture.options.operationId,
+  );
+  assert.equal(reconciled.capture.operation.state, "prepared");
+  assert.equal(reconciled.capture.reservation.state, "prepared");
+  assert.equal(
+    reconciled.capture.operation.createdAt,
+    LAUNCH_STOP_FINALIZE_NOW,
+  );
+  assert.equal(
+    reconciled.session.document.activeOperation.operationId,
+    capture.options.operationId,
+  );
+  assertDeepFrozen(reconciled);
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+});
+
+test("writer launch stop V3 reconcile returns advanced starting and uncertain capture tuples", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const capture = writerLaunchStopCaptureFixture(fixture);
+  const states = ["starting", "uncertain"];
+  const { authority, clients } = authorityWithScripts(
+    ...states.map((state) => [
+      ...writerLaunchStopCaptureActiveSteps(fixture, capture, state),
+      ...writerLaunchStopCaptureRelationSteps(fixture, capture, state),
+    ]),
+  );
+
+  for (const state of states) {
+    const reconciled =
+      await authority.reconcileWriterLaunchStopOperation({
+        ...fixture.options,
+        claimToken: fixture.claimToken,
+      });
+    assert.equal(reconciled.status, state);
+    assert.equal(reconciled.claimTokenMatched, true);
+    assert.equal(reconciled.capture.operation.state, state);
+    assert.equal(reconciled.stop.finalized, false);
+    assertWriterLaunchStopCaptureHandoffProof({
+      before: fixture.options.expectedSession,
+      capture: reconciled.capture,
+      session: reconciled.session,
+      stop: {
+        operation: reconciled.stop.operation,
+        reservation: reconciled.stop.reservation,
+      },
+    });
+  }
+  for (const client of clients) {
+    assert.equal(
+      authorityQueries(client).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    client.assertExhausted();
+  }
+});
+
+test("writer launch stop V3 reconcile returns a committed capture tuple", async () => {
+  const fixture = writerLaunchStopFixture({ contractVersion: 3 });
+  const capture = writerLaunchStopCaptureFixture(fixture);
+  const operation = checkpointCaptureOperationRow(capture, "committed", {
+    createdAt: LAUNCH_STOP_FINALIZE_NOW,
+    updatedAt: LAUNCH_STOP_CAPTURE_FINALIZE_NOW,
+  });
+  const reservation = checkpointCaptureReservationRow(
+    capture,
+    "released",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: LAUNCH_STOP_CAPTURE_FINALIZE_NOW,
+    },
+  );
+  const catalogue = checkpointCatalogueRow(capture, {
+    committedAt: LAUNCH_STOP_CAPTURE_FINALIZE_NOW,
+  });
+  const committedRelationSteps = () => [
+    rows({ operation_count: 0, reservation_count: 0 }),
+    rows(operation),
+    rows(reservation),
+    rows(
+      checkpointCaptureAttemptRow(capture, {
+        claimedAt: LAUNCH_STOP_CAPTURE_DISPATCH_NOW,
+      }),
+    ),
+    rows(),
+    rows(catalogue),
+  ];
+  const { authority, clients } = authorityWithScripts([
+    rows(
+      checkpointCaptureCommittedSessionRow(capture, {
+        updatedAt: LAUNCH_STOP_CAPTURE_FINALIZE_NOW,
+      }),
+    ),
+    ...committedRelationSteps(),
+    rows(writerLaunchStopOperationRow(fixture, "committed")),
+    rows(writerLaunchStopReservationRow(fixture, "released")),
+    ...writerLaunchCommittedRelationSteps(fixture.launch, {
+      result: fixture.launchResult,
+    }),
+    rows(
+      writerLaunchStopCaptureIdClaimRow(fixture, {
+        materializedAt: LAUNCH_STOP_FINALIZE_NOW,
+      }),
+    ),
+    ...committedRelationSteps(),
+  ]);
+
+  const reconciled =
+    await authority.reconcileWriterLaunchStopOperation({
+      ...fixture.options,
+      claimToken: fixture.claimToken,
+    });
+
+  assert.equal(reconciled.status, "committed");
+  assert.equal(reconciled.claimTokenMatched, true);
+  assert.equal(reconciled.capture.operation.state, "committed");
+  assert.equal(
+    reconciled.capture.operation.result.outcome,
+    "checkpoint-captured",
+  );
+  assertWriterLaunchStopCaptureHandoffProof({
+    before: fixture.options.expectedSession,
+    capture: reconciled.capture,
+    session: reconciled.session,
+    stop: {
+      operation: reconciled.stop.operation,
+      reservation: reconciled.stop.reservation,
+    },
+  });
+  clients[0].assertExhausted();
+});
+
 test("writer launch stop reconcile distinguishes exact and superseded absent preconditions", async () => {
   const fixture = writerLaunchStopFixture();
   const renewalOptions = renewOptions(fixture.options.expectedSession);
@@ -14775,10 +15446,12 @@ test("checkpoint recovery enumeration returns exact frozen starting and uncertai
       {
         checkpoint: starting.request.admission.checkpoint,
         request: starting.request.admission.request,
+        state: "starting",
       },
       {
         checkpoint: uncertain.request.admission.checkpoint,
         request: uncertain.request.admission.request,
+        state: "uncertain",
       },
     ],
     nextAfterSessionId: null,
@@ -14788,7 +15461,11 @@ test("checkpoint recovery enumeration returns exact frozen starting and uncertai
     "nextAfterSessionId",
   ]);
   for (const candidate of page.candidates) {
-    assert.deepEqual(Reflect.ownKeys(candidate), ["checkpoint", "request"]);
+    assert.deepEqual(Reflect.ownKeys(candidate), [
+      "checkpoint",
+      "request",
+      "state",
+    ]);
   }
   assertDeepFrozen(page);
   assert.deepEqual(
@@ -14832,6 +15509,7 @@ test("checkpoint recovery enumeration validates the limit plus one row and advan
       {
         checkpoint: second.request.admission.checkpoint,
         request: second.request.admission.request,
+        state: "starting",
       },
     ],
     nextAfterSessionId: OTHER_SESSION_ID,
@@ -14841,6 +15519,7 @@ test("checkpoint recovery enumeration validates the limit plus one row and advan
       {
         checkpoint: third.request.admission.checkpoint,
         request: third.request.admission.request,
+        state: "uncertain",
       },
     ],
     nextAfterSessionId: null,
@@ -14866,20 +15545,45 @@ test("checkpoint recovery enumeration validates the limit plus one row and advan
   for (const client of clients) client.assertExhausted();
 });
 
-test("checkpoint recovery SQL excludes prepared, committed, and foreign claims and fails closed if they appear", async () => {
-  const fixture = checkpointCaptureFixture();
+test("checkpoint recovery accepts only handoff prepared rows and rejects committed or foreign claims", async () => {
+  const stop = writerLaunchStopFixture({ contractVersion: 3 });
+  const fixture = writerLaunchStopCaptureFixture(stop);
   const foreign = operationRow("starting", {
     options: reserveOptions(),
     revision: "1",
     updatedAt: LATEST,
   });
   const { authority, clients } = authorityWithScripts(
-    [rows(checkpointCaptureOperationRow(fixture, "prepared"))],
+    [
+      rows(
+        checkpointCaptureOperationRow(fixture, "prepared", {
+          createdAt: LAUNCH_STOP_FINALIZE_NOW,
+          updatedAt: LAUNCH_STOP_FINALIZE_NOW,
+        }),
+      ),
+      ...writerLaunchStopCaptureActiveSteps(stop, fixture),
+    ],
     [rows(checkpointCaptureOperationRow(fixture, "committed"))],
     [rows(foreign)],
   );
 
-  for (let index = 0; index < clients.length; index += 1) {
+  const page = await authority.listCheckpointCaptureRecoveryCandidates({
+    afterSessionId: null,
+    limit: 1,
+  });
+  assert.deepEqual(page, {
+    candidates: [
+      {
+        checkpoint: fixture.request.admission.checkpoint,
+        request: fixture.request.admission.request,
+        state: "prepared",
+      },
+    ],
+    nextAfterSessionId: null,
+  });
+  clients[0].assertExhausted();
+
+  for (let index = 1; index < clients.length; index += 1) {
     await assertAuthorityError(
       authority.listCheckpointCaptureRecoveryCandidates({
         afterSessionId: null,
@@ -14893,6 +15597,86 @@ test("checkpoint recovery SQL excludes prepared, committed, and foreign claims a
     assert.equal(queryTexts(clients[index]).includes("ROLLBACK"), true);
     clients[index].assertExhausted();
   }
+});
+
+test("prepared stop-capture handoff supports cold read and one fresh dispatch after lease expiry", async () => {
+  const stop = writerLaunchStopFixture({ contractVersion: 3 });
+  const fixture = writerLaunchStopCaptureFixture(stop);
+  const preparedOperation = checkpointCaptureOperationRow(
+    fixture,
+    "prepared",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: LAUNCH_STOP_FINALIZE_NOW,
+    },
+  );
+  const startingOperation = checkpointCaptureOperationRow(
+    fixture,
+    "starting",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: EXPIRED_FINALIZE_NOW,
+    },
+  );
+  const startingReservation = checkpointCaptureReservationRow(
+    fixture,
+    "starting",
+    {
+      createdAt: LAUNCH_STOP_FINALIZE_NOW,
+      updatedAt: EXPIRED_FINALIZE_NOW,
+    },
+  );
+  const startingSession = checkpointCapturePhaseSessionRow(
+    fixture,
+    "starting",
+    { updatedAt: EXPIRED_FINALIZE_NOW },
+  );
+  const { authority, clients } = authorityWithScripts(
+    [
+      rows(preparedOperation),
+      ...writerLaunchStopCaptureActiveSteps(stop, fixture),
+    ],
+    {
+      options: {
+        authorityNow: EXPIRED_FINALIZE_NOW,
+        now: EXPIRED_FINALIZE_NOW,
+      },
+      steps: [
+        ...writerLaunchStopCaptureActiveSteps(stop, fixture),
+        rows(
+          checkpointCaptureAttemptRow(fixture, {
+            claimedAt: EXPIRED_FINALIZE_NOW,
+          }),
+        ),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+  );
+
+  const read = await authority.readCheckpointCaptureAttempt({
+    checkpoint: fixture.checkpoint,
+    request: fixture.mutationRequest,
+  });
+  const claimed = await authority.claimCheckpointCaptureDispatch({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(read.status, "prepared");
+  assert.equal(read.attempt, null);
+  assert.equal(read.catalogue, null);
+  assert.equal(read.operation.state, "prepared");
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(claimed.authorityNow, EXPIRED_FINALIZE_NOW);
+  assert.equal(claimed.operation.state, "starting");
+  assert.equal(
+    Date.parse(fixture.options.expectedSession.document.lease.expiresAt) <
+      Date.parse(claimed.authorityNow),
+    true,
+  );
+  for (const client of clients) client.assertExhausted();
 });
 
 test("checkpoint recovery enumeration rejects active-pointer, tombstone, and catalogue corruption", async () => {

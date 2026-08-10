@@ -15,6 +15,8 @@ import {
   WRITER_RELEASE_OPERATION_KIND,
   assertCommittedWriterLaunchStopTransitionProof,
   assertSessionAuthoritySnapshot,
+  assertWriterLaunchStopCaptureHandoffProof,
+  createCheckpointCaptureOperationRequest,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
 } from "./postgres-session-authority.mjs";
@@ -24,6 +26,7 @@ import {
   assertSessionAttachment,
   assertSessionManifest,
   assertStorageMutationRequest,
+  assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
@@ -77,6 +80,8 @@ const stoppedAssertWriterLaunchAvailableIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.assertWriterLaunchAvailable;
 const stoppedRegisterWriterIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.registerWriter;
+const stoppedRevokeWriterIntrinsic =
+  StoppedWriterCapabilityCoordinator.prototype.revokeWriter;
 const stoppedRetireWriterIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.retireWriter;
 const stoppedStopAndIssueCapabilityIntrinsic =
@@ -136,6 +141,7 @@ const AUTHORITY_METHODS = objectFreeze([
   "finalizeWriterLaunchAttemptStarted",
   "finalizeWriterLaunchAttemptStopped",
   "finalizeWriterLaunchStopped",
+  "finalizeWriterLaunchStoppedAndReserveCheckpointCapture",
   "markOperationUncertain",
   "readSession",
   "readWriterLaunchAttempt",
@@ -172,12 +178,21 @@ const STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
 const STOP_FINALIZATION_MAX_ATTEMPTS = 3;
 const STOP_RESERVATION_MAX_ATTEMPTS = 3;
 const WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION = 2;
+const WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION = 3;
 const STOP_RESOLUTION_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
   "processIncarnationId",
   "stopOperationId",
   "writer",
   "writerIncarnationId",
+]);
+const PREPARED_CAPTURE_RETIREMENT_KEYS = objectFreeze([
+  "resolution",
+  "result",
+]);
+const PREPARED_CAPTURE_RESULT_KEYS = objectFreeze([
+  "checkpoint",
+  "mutation",
 ]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 const SESSION_KEYS = objectFreeze([
@@ -410,6 +425,29 @@ const STOP_FINALIZE_RECEIPT_KEYS = objectFreeze([
   "status",
   "stop",
 ]);
+const STOP_CAPTURE_HANDOFF_RECEIPT_KEYS = objectFreeze([
+  "capture",
+  "session",
+  "status",
+  "stop",
+]);
+const STOP_CAPTURE_HANDOFF_RECONCILE_RECEIPT_KEYS = objectFreeze([
+  "capture",
+  "claimTokenMatched",
+  "session",
+  "status",
+  "stop",
+]);
+const STOP_CAPTURE_HANDOFF_RELATION_KEYS = objectFreeze([
+  "operation",
+  "reservation",
+]);
+const STOP_CAPTURE_HANDOFF_STOP_KEYS = objectFreeze([
+  "finalized",
+  "operation",
+  "record",
+  "reservation",
+]);
 const STOP_RECORD_KEYS = objectFreeze([
   "contractVersion",
   "launchAttemptId",
@@ -418,7 +456,13 @@ const STOP_RECORD_KEYS = objectFreeze([
   "state",
   "stopOperationId",
 ]);
-const STOP_REQUEST_KEYS = objectFreeze([
+const STOP_REQUEST_V2_KEYS = objectFreeze([
+  "contractVersion",
+  "dispatchClaimSha256",
+  "launch",
+]);
+const STOP_REQUEST_V3_KEYS = objectFreeze([
+  "captureIntent",
   "contractVersion",
   "dispatchClaimSha256",
   "launch",
@@ -2522,9 +2566,15 @@ function createStopClaimToken(code) {
 }
 
 function stopClaimTokenMatchesRequest(claimToken, requestValue, code) {
-  const request = exactDataObject(requestValue, STOP_REQUEST_KEYS, code);
+  const request = exactDataObjectVariant(
+    requestValue,
+    [STOP_REQUEST_V2_KEYS, STOP_REQUEST_V3_KEYS],
+    code,
+  );
   ensure(
-    request.contractVersion === WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+    request.contractVersion === WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION ||
+      request.contractVersion ===
+        WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
     code,
   );
   return (
@@ -3155,6 +3205,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
     const record = {
       attachment: claim.attempt.request.attachment,
       authorizedCapture: null,
+      authorizedCaptureAttemptId: null,
       authorizedStopOperationId: null,
       canonicalLease: claim.attempt.request.lease,
       codexSessionId:
@@ -3173,6 +3224,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       stopBaseInput: null,
       stopClaimAttemptedFor: null,
       stopClaimToken: null,
+      stopContractVersion: null,
       stopEvidence: null,
       stopReceipt: null,
       stopWriter: callbackReceipt.stopWriter,
@@ -3227,11 +3279,19 @@ export function createPostgresLogicalWriterLauncher(...args) {
           supervisorId: record.supervisorId,
           writerIncarnationId: record.writerIncarnationId,
         });
-        const stopReceipt = await finalizeStopWithReadback(
-          record.pendingStop.baseInput,
-          record.stopClaimToken,
-          stopEvidence,
-        );
+        const stopReceipt =
+          record.pendingStop.baseInput.request.contractVersion ===
+          WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION
+            ? await finalizeStopCaptureWithReadback(
+                record.pendingStop.baseInput,
+                record.stopClaimToken,
+                stopEvidence,
+              )
+            : await finalizeStopWithReadback(
+                record.pendingStop.baseInput,
+                record.stopClaimToken,
+                stopEvidence,
+              );
         await assertGuardHeld(record.pendingStop.probe, outcomeCode);
         record.stopEvidence = stopEvidence;
         record.stopReceipt = stopReceipt;
@@ -3811,7 +3871,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
     }
   }
 
-  function captureRecord(capture, states, code) {
+  function captureRecord(
+    capture,
+    states,
+    code,
+    stopContractVersion = WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+  ) {
     const record = mapGet(
       recordsByAttachmentId,
       capture.attachment.attachmentId,
@@ -3830,6 +3895,23 @@ export function createPostgresLogicalWriterLauncher(...args) {
         sameContent(record.authorizedCapture, capture, code),
       code,
     );
+    ensure(
+      stopContractVersion === WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION ||
+        stopContractVersion ===
+          WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
+      code,
+    );
+    if (record.stopContractVersion === null) {
+      record.stopContractVersion = stopContractVersion;
+    }
+    ensure(record.stopContractVersion === stopContractVersion, code);
+    if (
+      stopContractVersion ===
+        WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION &&
+      record.authorizedCaptureAttemptId === null
+    ) {
+      record.authorizedCaptureAttemptId = createStopClaimToken(code);
+    }
     const derivedStopOperationId = stopOperationId(
       capture,
       record.launchAttemptId,
@@ -3918,6 +4000,185 @@ export function createPostgresLogicalWriterLauncher(...args) {
     );
   }
 
+  function normalizeStopCaptureHandoffReceipt(
+    value,
+    baseInput,
+    claimToken,
+    expectedEvidence,
+    reconcile,
+  ) {
+    const receipt = exactDataObject(
+      value,
+      reconcile
+        ? STOP_CAPTURE_HANDOFF_RECONCILE_RECEIPT_KEYS
+        : STOP_CAPTURE_HANDOFF_RECEIPT_KEYS,
+      outcomeCode,
+    );
+    if (reconcile) {
+      ensure(
+        receipt.claimTokenMatched === true &&
+          stopClaimTokenMatchesRequest(
+            claimToken,
+            baseInput.request,
+            outcomeCode,
+          ),
+        outcomeCode,
+      );
+    }
+    const capture = exactDataObject(
+      receipt.capture,
+      STOP_CAPTURE_HANDOFF_RELATION_KEYS,
+      outcomeCode,
+    );
+    const stop = exactDataObject(
+      receipt.stop,
+      STOP_CAPTURE_HANDOFF_STOP_KEYS,
+      outcomeCode,
+    );
+    ensure(typeof stop.finalized === "boolean", outcomeCode);
+    let proof;
+    try {
+      proof = assertWriterLaunchStopCaptureHandoffProof({
+        before: baseInput.expectedSession,
+        capture,
+        session: receipt.session,
+        stop: exactFrozenRecord({
+          operation: stop.operation,
+          reservation: stop.reservation,
+        }),
+      });
+    } catch {
+      fail(outcomeCode);
+    }
+    ensure(
+      receipt.status === proof.capture.operation.state &&
+        proof.stop.operation.operationId === baseInput.operationId &&
+        sameContent(
+          proof.stop.operation.request,
+          baseInput.request,
+          outcomeCode,
+        ) &&
+        proof.capture.operation.operationId ===
+          baseInput.request.captureIntent.admission.request.operationId &&
+        sameContent(
+          proof.capture.operation.request,
+          baseInput.request.captureIntent,
+          outcomeCode,
+        ),
+      outcomeCode,
+    );
+    const result = exactDataObject(
+      proof.stop.operation.result,
+      TERMINAL_RESULT_KEYS,
+      outcomeCode,
+    );
+    ensure(
+      result.resultVersion === 1 &&
+        result.outcome === "writer-launch-stopped" &&
+        sameContent(result.evidence, expectedEvidence, outcomeCode),
+      outcomeCode,
+    );
+    const record = normalizeStopRecord(
+      stop.record,
+      proof.stop.operation,
+      baseInput,
+      outcomeCode,
+    );
+    return exactFrozenRecord({
+      capture: proof.capture,
+      session: proof.session,
+      status: proof.capture.operation.state,
+      stop: exactFrozenRecord({
+        finalized: stop.finalized,
+        operation: proof.stop.operation,
+        record,
+        reservation: proof.stop.reservation,
+      }),
+    });
+  }
+
+  async function finalizeStopCaptureWithReadback(
+    baseInput,
+    claimToken,
+    evidence,
+  ) {
+    let expectedOperationRevision = "1";
+    for (
+      let attempt = 0;
+      attempt < STOP_FINALIZATION_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      const finalizationInput = exactFrozenRecord({
+        ...baseInput,
+        evidence,
+        expectedOperationRevision,
+      });
+      try {
+        return normalizeStopCaptureHandoffReceipt(
+          await invokeAsync(
+            authority,
+            "finalizeWriterLaunchStoppedAndReserveCheckpointCapture",
+            [finalizationInput],
+            outcomeCode,
+          ),
+          baseInput,
+          claimToken,
+          evidence,
+          false,
+        );
+      } catch {
+        let readback;
+        try {
+          readback = snapshotData(
+            await readStopOperationReceipt(baseInput, claimToken),
+            outcomeCode,
+          );
+          try {
+            return normalizeStopCaptureHandoffReceipt(
+              readback,
+              baseInput,
+              claimToken,
+              evidence,
+              true,
+            );
+          } catch {
+            const phase = normalizeStopReconcileReceipt(
+              readback,
+              baseInput,
+              outcomeCode,
+            );
+            ensure(
+              phase.claimTokenMatched === true &&
+                (phase.status === "starting" ||
+                  phase.status === "uncertain"),
+              outcomeCode,
+            );
+            expectedOperationRevision =
+              phase.status === "uncertain" ? "2" : "1";
+          }
+        } catch {
+          // A later retry may still observe the exact committed handoff.
+        }
+      }
+    }
+    let terminalReadback;
+    try {
+      terminalReadback = snapshotData(
+        await readStopOperationReceipt(baseInput, claimToken),
+        outcomeCode,
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    return normalizeStopCaptureHandoffReceipt(
+      terminalReadback,
+      baseInput,
+      claimToken,
+      evidence,
+      true,
+    );
+  }
+
   async function finalizeStopWithReadback(
     baseInput,
     claimToken,
@@ -3998,10 +4259,27 @@ export function createPostgresLogicalWriterLauncher(...args) {
   ) {
     let typedRequest;
     try {
-      typedRequest = createWriterLaunchStopOperationRequest({
-        claimToken,
-        expectedSession,
-      });
+      const captureIntent =
+        record.stopContractVersion ===
+        WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION
+          ? createCheckpointCaptureOperationRequest({
+              admission: exactFrozenRecord({
+                attachment: record.authorizedCapture.attachment,
+                captureAttemptId: record.authorizedCaptureAttemptId,
+                checkpoint: record.authorizedCapture.checkpoint,
+                processIncarnationId: record.processIncarnationId,
+                request: record.authorizedCapture.request,
+                stopOperationId: stopOperation,
+                writerIncarnationId: record.writerIncarnationId,
+              }),
+              expectedSession,
+            })
+          : null;
+      typedRequest = createWriterLaunchStopOperationRequest(
+        captureIntent === null
+          ? { claimToken, expectedSession }
+          : { captureIntent, claimToken, expectedSession },
+      );
     } catch {
       fail(code);
     }
@@ -4046,10 +4324,18 @@ export function createPostgresLogicalWriterLauncher(...args) {
     }
   }
 
-  async function stopWriterForCaptureInternal(...stopArgs) {
+  async function stopWriterForCaptureInternal(
+    stopContractVersion,
+    ...stopArgs
+  ) {
     ensure(stopArgs.length === 1, optionCode);
     const capture = normalizeCaptureTuple(stopArgs[0], optionCode);
-    const initialRecord = captureRecord(capture, ["ready"], optionCode);
+    const initialRecord = captureRecord(
+      capture,
+      ["ready"],
+      optionCode,
+      stopContractVersion,
+    );
     const stopOperation = initialRecord.authorizedStopOperationId;
     const claimToken = initialRecord.stopClaimToken;
     ensure(
@@ -4064,7 +4350,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
           stopOperation,
           async (probeValue) => {
             const probe = normalizeProbe(probeValue, outcomeCode);
-            const record = captureRecord(capture, ["ready"], optionCode);
+            const record = captureRecord(
+              capture,
+              ["ready"],
+              optionCode,
+              stopContractVersion,
+            );
             ensure(record === initialRecord, optionCode);
             await assertGuardHeld(probe, outcomeCode);
             let baseInput = record.stopBaseInput;
@@ -4252,6 +4543,29 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 record.stopReceipt !== null,
               outcomeCode,
             );
+            if (
+              stopContractVersion ===
+              WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION
+            ) {
+              invokeStoppedCoordinatorSync(
+                stoppedWriterCoordinator,
+                stoppedRevokeWriterIntrinsic,
+                exactFrozenRecord({
+                  processIncarnationId: record.processIncarnationId,
+                  writer: record.writer,
+                  writerIncarnationId: record.writerIncarnationId,
+                }),
+                outcomeCode,
+              );
+              return exactFrozenRecord({
+                capture: record.stopReceipt.capture,
+                evidence: record.stopEvidence,
+                resolution: resolutionForRecord(record),
+                session: record.stopReceipt.session,
+                status: record.stopReceipt.status,
+                stop: record.stopReceipt.stop,
+              });
+            }
             return exactFrozenRecord({
               capability,
               evidence: record.stopEvidence,
@@ -4281,14 +4595,13 @@ export function createPostgresLogicalWriterLauncher(...args) {
     }
   }
 
-  function retireStoppedWriter(...retireArgs) {
-    ensure(retireArgs.length === 1, optionCode);
+  function normalizeStopResolution(value, code) {
     let resolution;
     try {
       const input = exactDataObject(
-        retireArgs[0],
+        value,
         STOP_RESOLUTION_KEYS,
-        optionCode,
+        code,
       );
       resolution = exactFrozenRecord({
         canonicalLeaseAtRegistration: assertLeaseGrant(
@@ -4296,34 +4609,23 @@ export function createPostgresLogicalWriterLauncher(...args) {
         ),
         processIncarnationId: assertOpaqueId(
           input.processIncarnationId,
-          optionCode,
+          code,
         ),
-        stopOperationId: assertOpaqueId(input.stopOperationId, optionCode),
-        writer: assertOpaqueWriterHandle(input.writer, optionCode),
+        stopOperationId: assertOpaqueId(input.stopOperationId, code),
+        writer: assertOpaqueWriterHandle(input.writer, code),
         writerIncarnationId: assertOpaqueId(
           input.writerIncarnationId,
-          optionCode,
+          code,
         ),
       });
     } catch (error) {
-      if (isInternalError(error, optionCode)) throw error;
-      fail(optionCode);
+      if (isInternalError(error, code)) throw error;
+      fail(code);
     }
-    const record = weakMapGet(recordsByWriter, resolution.writer);
-    ensure(
-      record !== undefined &&
-        record.state === "stopped" &&
-        record.stopReceipt !== null &&
-        resolution.processIncarnationId === record.processIncarnationId &&
-        resolution.writerIncarnationId === record.writerIncarnationId &&
-        resolution.stopOperationId === record.authorizedStopOperationId &&
-        sameContent(
-          resolution.canonicalLeaseAtRegistration,
-          record.canonicalLease,
-          optionCode,
-        ),
-      optionCode,
-    );
+    return resolution;
+  }
+
+  function retireRecord(record) {
     invokeStoppedCoordinatorSync(
       stoppedWriterCoordinator,
       stoppedRetireWriterIntrinsic,
@@ -4335,6 +4637,90 @@ export function createPostgresLogicalWriterLauncher(...args) {
       outcomeCode,
     );
     releaseStoppedRecord(record);
+  }
+
+  function stoppedRecordForResolution(
+    resolution,
+    expectedContractVersion,
+    code,
+  ) {
+    const record = weakMapGet(recordsByWriter, resolution.writer);
+    ensure(
+      record !== undefined &&
+        record.state === "stopped" &&
+        record.stopReceipt !== null &&
+        record.stopContractVersion === expectedContractVersion &&
+        resolution.processIncarnationId === record.processIncarnationId &&
+        resolution.writerIncarnationId === record.writerIncarnationId &&
+        resolution.stopOperationId === record.authorizedStopOperationId &&
+        sameContent(
+          resolution.canonicalLeaseAtRegistration,
+          record.canonicalLease,
+          code,
+        ),
+      code,
+    );
+    return record;
+  }
+
+  function retireStoppedWriter(...retireArgs) {
+    ensure(retireArgs.length === 1, optionCode);
+    const resolution = normalizeStopResolution(retireArgs[0], optionCode);
+    const record = stoppedRecordForResolution(
+      resolution,
+      WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+      optionCode,
+    );
+    retireRecord(record);
+  }
+
+  function retirePreparedCapture(...retireArgs) {
+    ensure(retireArgs.length === 1, optionCode);
+    let input;
+    let resolution;
+    let result;
+    try {
+      input = exactDataObject(
+        retireArgs[0],
+        PREPARED_CAPTURE_RETIREMENT_KEYS,
+        optionCode,
+      );
+      resolution = normalizeStopResolution(input.resolution, optionCode);
+      const record = stoppedRecordForResolution(
+        resolution,
+        WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
+        optionCode,
+      );
+      ensure(record.authorizedCapture !== null, optionCode);
+      const rawResult = exactDataObject(
+        input.result,
+        PREPARED_CAPTURE_RESULT_KEYS,
+        optionCode,
+      );
+      const checkpoint = assertCheckpointDescriptor(rawResult.checkpoint);
+      const mutation = assertStorageMutationResult(rawResult.mutation, {
+        request: record.authorizedCapture.request,
+      });
+      ensure(
+        sameContent(
+          checkpoint,
+          record.authorizedCapture.checkpoint,
+          optionCode,
+        ) &&
+          sameContent(
+            exactFrozenRecord({ checkpoint, mutation }),
+            record.stopBaseInput.request.captureIntent.predeterminedResult,
+            optionCode,
+          ),
+        optionCode,
+      );
+      result = exactFrozenRecord({ checkpoint, mutation });
+      retireRecord(record);
+    } catch (error) {
+      if (isInternalError(error, optionCode)) throw error;
+      fail(optionCode);
+    }
+    return result;
   }
 
   const prepareLaunchIntent = function prepareLaunchIntent(...prepareArgs) {
@@ -4352,23 +4738,41 @@ export function createPostgresLogicalWriterLauncher(...args) {
     return protectPromise(runPreparedLaunchInternal(...runArgs));
   };
   const stopWriterForCapture = function stopWriterForCapture(...stopArgs) {
-    return protectPromise(stopWriterForCaptureInternal(...stopArgs));
+    return protectPromise(
+      stopWriterForCaptureInternal(
+        WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+        ...stopArgs,
+      ),
+    );
+  };
+  const stopWriterForPreparedCapture =
+    function stopWriterForPreparedCapture(...stopArgs) {
+      return protectPromise(
+        stopWriterForCaptureInternal(
+          WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
+          ...stopArgs,
+        ),
+      );
   };
   objectFreeze(prepareLaunchIntent);
   objectFreeze(reconcileLaunchAttempt);
+  objectFreeze(retirePreparedCapture);
   objectFreeze(retireStoppedWriter);
   objectFreeze(resolveStoppedWriter);
   objectFreeze(runLaunch);
   objectFreeze(runPreparedLaunch);
   objectFreeze(stopWriterForCapture);
+  objectFreeze(stopWriterForPreparedCapture);
   return exactFrozenRecord({
     prepareLaunchIntent,
     reconcileLaunchAttempt,
+    retirePreparedCapture,
     retireStoppedWriter,
     resolveStoppedWriter,
     runLaunch,
     runPreparedLaunch,
     stopWriterForCapture,
+    stopWriterForPreparedCapture,
   });
 }
 

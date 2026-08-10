@@ -528,9 +528,10 @@ class FakeAuthority {
     return deepFreeze(receipt);
   }
 
-  async claimCheckpointCaptureDispatch() {
+  async claimCheckpointCaptureDispatch(options) {
     this.state.trace.push("authority:claim");
     this.state.claimCalls += 1;
+    this.state.claimInputs.push(options);
     if (this.state.claimMode.startsWith("throw")) {
       this.state.reconcilePhase =
         this.state.claimMode === "throw-starting" ? "starting" : "prepared";
@@ -545,6 +546,9 @@ class FakeAuthority {
       session: authoritySession(this.state, "starting", "1"),
       status: "starting",
     };
+    if (this.state.claimMode === "nonfresh") {
+      receipt.dispatchGranted = false;
+    }
     if (this.state.claimMode === "crossed-reservation") {
       this.state.reconcilePhase = "starting";
       receipt.reservation = structuredClone(receipt.reservation);
@@ -608,6 +612,12 @@ class FakeAuthority {
     if (this.state.finalizeMode === "throw") {
       throw new Error("/private/database finalize acknowledgement lost");
     }
+    if (this.state.finalizeMode === "throw-after-commit") {
+      this.state.attemptPhase = "committed";
+      this.state.committedRevision =
+        options.expectedOperationRevision === "1" ? "2" : "3";
+      throw new Error("/private/database finalize acknowledgement lost");
+    }
     if (this.state.finalizeMode === "malformed") {
       return deepFreeze({
         attempt: attemptView(this.state),
@@ -669,6 +679,16 @@ class FakeAuthority {
     this.state.trace.push("authority:read-attempt");
     await this.state.readAttemptGate;
     const phase = this.state.attemptPhase;
+    if (phase === "prepared") {
+      return deepFreeze({
+        attempt: null,
+        catalogue: null,
+        operation: operationView(this.state, "prepared", "0"),
+        reservation: reservationView(this.state, "prepared"),
+        session: authoritySession(this.state, "prepared", "0"),
+        status: "prepared",
+      });
+    }
     const revision =
       phase === "committed"
         ? this.state.committedRevision
@@ -758,6 +778,7 @@ function fixture(overrides = {}) {
     authorizedRevision: "1",
     cancelCalls: 0,
     claimCalls: 0,
+    claimInputs: [],
     claimMode: "success",
     committedRevision: "2",
     distinctAttemptData: false,
@@ -853,11 +874,13 @@ test("factory returns an exact frozen stopped-directory authority facade", () =>
   exactKeys(adapter, [
     "runCapture",
     "runCaptureReconciliation",
+    "runPreparedCapture",
     "runRestore",
   ]);
   assert.equal(Object.isFrozen(adapter), true);
   assert.equal(typeof adapter.runCapture, "function");
   assert.equal(typeof adapter.runCaptureReconciliation, "function");
+  assert.equal(typeof adapter.runPreparedCapture, "function");
   assert.equal(typeof adapter.runRestore, "function");
 });
 
@@ -1314,6 +1337,152 @@ test("claim rejects a crossed reservation tuple before publication", async () =>
   assert.equal(value.state.reconcileCalls, 1);
   assert.equal(value.state.cancelCalls, 0);
   assert.equal(value.state.uncertainCalls, 0);
+});
+
+test("prepared capture claims under the guard before exposing one fresh publication context", async () => {
+  const value = fixture({ attemptPhase: "prepared" });
+  const callbackCompletion = completion(value.state, false);
+  let observedContext;
+
+  const result = await value.adapter.runPreparedCapture(
+    reconciliationAdmission(),
+    async (context) => {
+      value.state.trace.push("callback:publish-prepared");
+      observedContext = context;
+      return callbackCompletion;
+    },
+  );
+
+  assert.strictEqual(result, callbackCompletion);
+  exactKeys(observedContext, [
+    "artifactDirectory",
+    "artifactOwnedRoot",
+    "canonicalAttachment",
+    "canonicalLease",
+    "captureAttempt",
+    "contractVersion",
+    "now",
+    "sourceDirectory",
+    "sourceOwnedRoot",
+    "storageRef",
+  ]);
+  assert.equal(Object.isFrozen(observedContext), true);
+  assert.equal(observedContext.contractVersion, 1);
+  assert.equal(observedContext.captureAttempt.state, "authorized");
+  assert.equal(
+    observedContext.captureAttempt.operationId,
+    OPERATION_ID,
+  );
+  assert.equal(value.state.claimInputs.length, 1);
+  exactKeys(value.state.claimInputs[0], [
+    "expectedOperationRevision",
+    "expectedSession",
+    "kind",
+    "operationId",
+    "request",
+  ]);
+  assert.equal(value.state.claimInputs[0].expectedOperationRevision, "0");
+  assert.deepEqual(value.state.trace, [
+    "guard:start",
+    "authority:read-attempt",
+    "planner:artifact",
+    "planner:source",
+    "guard:probe:1",
+    "authority:claim",
+    "guard:probe:2",
+    "callback:publish-prepared",
+    "guard:probe:3",
+    "authority:finalize",
+    "guard:end",
+  ]);
+});
+
+test("prepared capture never publishes when its claim is ambiguous, non-fresh, or stale", async (t) => {
+  for (const scenario of [
+    { attemptPhase: "prepared", claimMode: "throw-starting" },
+    { attemptPhase: "prepared", claimMode: "nonfresh" },
+    { attemptPhase: "authorized", claimMode: "success" },
+  ]) {
+    await t.test(`${scenario.attemptPhase}-${scenario.claimMode}`, async () => {
+      const value = fixture(scenario);
+      let callbackCalls = 0;
+
+      await assertAuthorityError(
+        value.adapter.runPreparedCapture(
+          reconciliationAdmission(),
+          async () => {
+            callbackCalls += 1;
+            return completion(value.state, false);
+          },
+        ),
+        "postgres_checkpoint_mutation_authority_outcome_uncertain",
+      );
+
+      assert.equal(callbackCalls, 0);
+      assert.equal(value.state.uncertainCalls, 0);
+      assert.equal(
+        value.state.claimCalls,
+        scenario.attemptPhase === "prepared" ? 1 : 0,
+      );
+    });
+  }
+});
+
+test("prepared capture marks a definitely dispatched publication failure uncertain", async () => {
+  const value = fixture({ attemptPhase: "prepared" });
+
+  await assertAuthorityError(
+    value.adapter.runPreparedCapture(
+      reconciliationAdmission(),
+      async () => {
+        throw new Error("private prepared publication failed");
+      },
+    ),
+    "postgres_checkpoint_mutation_authority_outcome_uncertain",
+  );
+
+  assert.equal(value.state.claimCalls, 1);
+  assert.equal(value.state.uncertainCalls, 1);
+});
+
+test("prepared capture finalize acknowledgement loss returns exact committed readback", async () => {
+  const value = fixture({
+    attemptPhase: "prepared",
+    finalizeMode: "throw-after-commit",
+  });
+  const published = completion(value.state, false);
+  let callbackCalls = 0;
+
+  const result = await value.adapter.runPreparedCapture(
+    reconciliationAdmission(),
+    async () => {
+      callbackCalls += 1;
+      return published;
+    },
+  );
+
+  assert.equal(callbackCalls, 1);
+  assert.strictEqual(result, published);
+  assert.equal(result.replayed, false);
+  assert.deepEqual(
+    structuredClone(result.artifactProof),
+    structuredClone(published.artifactProof),
+  );
+  assert.deepEqual(
+    structuredClone(result.materialization),
+    structuredClone(published.materialization),
+  );
+  assert.deepEqual(
+    structuredClone(result.result),
+    structuredClone(published.result),
+  );
+  assert.equal(value.state.uncertainCalls, 0);
+  assert.deepEqual(value.state.trace.slice(-4), [
+    "authority:finalize",
+    "guard:probe:4",
+    "authority:read-attempt",
+    "guard:end",
+  ]);
 });
 
 test("authorized and committed reconciliation are source-free and return verifier completion by identity", async (t) => {

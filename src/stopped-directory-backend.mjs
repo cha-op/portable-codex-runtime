@@ -10,6 +10,7 @@ import { types as utilTypes } from "node:util";
 
 import {
   CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
+  PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
   assertCanonicalFenceMatch,
@@ -228,6 +229,18 @@ const CAPTURE_RECONCILIATION_CONTEXT_KEYS = objectFreeze([
   "artifactDirectory",
   "artifactOwnedRoot",
   "captureAttempt",
+]);
+const PREPARED_CAPTURE_CONTEXT_KEYS = objectFreeze([
+  "artifactDirectory",
+  "artifactOwnedRoot",
+  "canonicalAttachment",
+  "canonicalLease",
+  "captureAttempt",
+  "contractVersion",
+  "now",
+  "sourceDirectory",
+  "sourceOwnedRoot",
+  "storageRef",
 ]);
 const CAPTURE_ATTEMPT_RECORD_KEYS = objectFreeze([
   "binding",
@@ -1540,6 +1553,87 @@ function normalizeCaptureContext(
   });
 }
 
+function normalizePreparedCaptureContext(value, request) {
+  const context = assertExactDataObject(
+    value,
+    PREPARED_CAPTURE_CONTEXT_KEYS,
+    failUncertain,
+  );
+  ensureUncertain(
+    context.contractVersion ===
+      PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+  );
+  const canonicalAttachment = runRuntimeValidator(() =>
+    assertSessionAttachment(context.canonicalAttachment),
+  );
+  assertRobustAttachment(canonicalAttachment, failUncertain);
+  const canonicalLease = runRuntimeValidator(() =>
+    assertLeaseGrant(context.canonicalLease),
+  );
+  const storageRef = runRuntimeValidator(() =>
+    assertSessionStorageRef(context.storageRef),
+  );
+  // The protected property here is the immutable stopped-writer fence tuple,
+  // not a new writer-access grant. The durable prepared->starting claim is the
+  // publication authority, so an expired historical lease remains valid
+  // identity for copying the already-stopped source.
+  assertRobustLease(canonicalLease, failUncertain);
+  assertRobustStorageRef(storageRef, failUncertain);
+  assertRobustMutationRequest(request.request, failUncertain);
+  ensureUncertain(
+    numberIsFinite(context.now) &&
+      request.request.sessionId === canonicalLease.sessionId &&
+      request.request.leaseId === canonicalLease.leaseId &&
+      request.request.holderId === canonicalLease.holderId &&
+      request.request.fencingEpoch === canonicalLease.fencingEpoch &&
+      request.request.sessionId === storageRef.sessionId &&
+      request.request.backendId === storageRef.backendId &&
+      request.request.storageId === storageRef.storageId,
+  );
+  const captureAttempt = normalizeCaptureAttempt(
+    context.captureAttempt,
+    request,
+  );
+  ensureUncertain(
+    captureAttempt.state === "authorized" &&
+      canonicalAttachment.backendId === request.checkpoint.backendId &&
+      canonicalAttachment.storageId === request.checkpoint.storageId &&
+      canonicalAttachment.sessionId === request.checkpoint.sessionId &&
+      canonicalAttachment.leaseId === canonicalLease.leaseId &&
+      canonicalAttachment.holderId === canonicalLease.holderId &&
+      canonicalAttachment.fencingEpoch === canonicalLease.fencingEpoch &&
+      canonicalAttachment.attachmentId ===
+        captureAttempt.binding.attachmentId &&
+      canonicalAttachment.operationId ===
+        captureAttempt.binding.attachmentOperationId &&
+      canonicalAttachment.proofId ===
+        captureAttempt.binding.attachmentProofId,
+  );
+  const source = assertDirectPathPlan(
+    context.sourceDirectory,
+    context.sourceOwnedRoot,
+    failUncertain,
+  );
+  const artifact = assertDirectPathPlan(
+    context.artifactDirectory,
+    context.artifactOwnedRoot,
+    failUncertain,
+  );
+  ensureUncertain(
+    source.directory === canonicalAttachment.rootPath &&
+      pathsAreDisjoint(source.ownedRoot, artifact.ownedRoot),
+  );
+  return exactFrozenRecord({
+    artifact,
+    canonicalAttachment,
+    canonicalLease,
+    captureAttempt,
+    now: context.now,
+    source,
+    storageRef,
+  });
+}
+
 function normalizeCaptureReconciliationContext(value, request) {
   const context = assertExactDataObject(
     value,
@@ -1693,12 +1787,29 @@ export class StoppedDirectoryBackend {
       [
         ["runCapture", "runCaptureReconciliation", "runRestore"],
         [
+          "runCapture",
+          "runCaptureReconciliation",
+          "runPreparedCapture",
+          "runRestore",
+        ],
+        [
           "restoreContextContractVersion",
           "runCapture",
           "runCaptureReconciliation",
           "runRestore",
         ],
+        [
+          "restoreContextContractVersion",
+          "runCapture",
+          "runCaptureReconciliation",
+          "runPreparedCapture",
+          "runRestore",
+        ],
       ],
+    );
+    const supportsPreparedCapture = objectHasOwn(
+      authorityOptions,
+      "runPreparedCapture",
     );
     const restoreContextContractVersion = objectHasOwn(
       authorityOptions,
@@ -1716,6 +1827,9 @@ export class StoppedDirectoryBackend {
       runCaptureReconciliation: assertTrustedFunction(
         authorityOptions.runCaptureReconciliation,
       ),
+      runPreparedCapture: supportsPreparedCapture
+        ? assertTrustedFunction(authorityOptions.runPreparedCapture)
+        : null,
       runRestore: assertTrustedFunction(authorityOptions.runRestore),
     });
     const lifecycleMethods = objectCreate(null);
@@ -1775,6 +1889,23 @@ export class StoppedDirectoryBackend {
       enumerable: true,
       value: CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
     });
+    if (supportsPreparedCapture) {
+      const resumePreparedCheckpointCapture = (...methodArgs) =>
+        this.#resumePreparedCheckpointCapture(methodArgs);
+      objectFreeze(resumePreparedCheckpointCapture);
+      objectDefineProperty(this, "resumePreparedCheckpointCapture", {
+        enumerable: true,
+        value: resumePreparedCheckpointCapture,
+      });
+      objectDefineProperty(
+        this,
+        "preparedCheckpointCaptureContractVersion",
+        {
+          enumerable: true,
+          value: PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+        },
+      );
+    }
     if (supportsRestoreActivation) {
       const prepareRestoreAttachment = (...methodArgs) =>
         this.#delegateLifecycle("prepareRestoreAttachment", methodArgs);
@@ -1932,6 +2063,72 @@ export class StoppedDirectoryBackend {
           typeof completion === "object" &&
           !isProxyValue(completion) &&
           objectHasOwn(completion, "result"),
+      );
+      return completion.result;
+    } catch {
+      failUncertain();
+    }
+  }
+
+  async #resumePreparedCheckpointCapture(args) {
+    ensureInvalid(args.length === 1);
+    const request = normalizeCaptureReconciliationRequest(
+      args[0],
+      this.backendId,
+    );
+    const admission = exactFrozenRecord({
+      checkpoint: request.checkpoint,
+      request: request.request,
+    });
+
+    try {
+      ensureUncertain(this.#authority.runPreparedCapture !== null);
+      const completion = await runAuthorityMethod(
+        this.#authority,
+        this.#authority.runPreparedCapture,
+        admission,
+        async (rawContext) => {
+          const context = normalizePreparedCaptureContext(
+            rawContext,
+            request,
+          );
+          const captureAttempt = context.captureAttempt;
+          const publicationOutcome = await callIntrinsic(
+            publishFreshCheckpointArtifactIntrinsic,
+            this.#publication,
+            [
+              exactFrozenRecord({
+                artifactDirectory: context.artifact.directory,
+                artifactOwnedRoot: context.artifact.ownedRoot,
+                binding: captureAttempt.binding,
+                operationId: captureAttempt.operationId,
+                request: captureAttempt.request,
+                result: captureAttempt.result,
+                sourceDirectory: context.source.directory,
+                sourceOwnedRoot: context.source.ownedRoot,
+              }),
+            ],
+          );
+          const outcome = normalizePublicationOutcome(
+            publicationOutcome,
+            captureAttempt.result,
+            captureAttempt.request,
+            "checkpoint-artifact",
+          );
+          ensureUncertain(outcome.replayed === false);
+          const artifactProof = exactFrozenRecord({
+            artifactManifestDigest:
+              outcome.materialization.artifactManifestDigest,
+            captureOperationId: captureAttempt.operationId,
+            modeledDigest: outcome.materialization.modeledDigest,
+          });
+          return exactFrozenRecord({
+            artifactProof,
+            materialization: outcome.materialization,
+            replayed: outcome.replayed,
+            result: captureAttempt.result,
+          });
+        },
       );
       return completion.result;
     } catch {

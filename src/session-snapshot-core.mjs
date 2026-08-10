@@ -448,6 +448,46 @@ export async function capturePreparedCleanCheckpoint(options) {
 }
 
 /**
+ * Validates the result of a durable prepared-capture resume without treating
+ * the process-local preparation token as publication authority. The durable
+ * PostgreSQL dispatch grant owns that decision; this helper only preserves
+ * the exact checkpoint/result binding established before the writer stop.
+ */
+export function assertPreparedCleanCheckpointResult(options) {
+  const { preparedCapture, result } = assertExactOptions(
+    options,
+    ["preparedCapture", "result"],
+    "prepared checkpoint capture result options",
+  );
+  ensureContract(
+    preparedCapture !== null &&
+      typeof preparedCapture === "object" &&
+      !isProxyValue(preparedCapture) &&
+      !arrayIsArray(preparedCapture) &&
+      objectIsFrozen(preparedCapture) &&
+      weakMapHas(preparedCleanCheckpointCaptures, preparedCapture),
+    "invalid_checkpoint",
+    "prepared checkpoint capture is invalid",
+  );
+  const preparedState = weakMapGet(
+    preparedCleanCheckpointCaptures,
+    preparedCapture,
+  );
+  ensureContract(
+    preparedState.state === "prepared",
+    "invalid_checkpoint",
+    "prepared checkpoint capture was already dispatched",
+  );
+  const { checkpoint, manifest, request, storageRef } = preparedCapture;
+  return assertBackendCheckpointResult(result, {
+    expectedCheckpoint: checkpoint,
+    manifest,
+    request,
+    storageRef,
+  });
+}
+
+/**
  * Structural orchestration only. The backend must atomically recheck the
  * canonical writer fence while capturing the checkpoint.
  */

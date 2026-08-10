@@ -127,9 +127,11 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
      later slice binds one canonical detached destination generation to
      launcher admission.
 6. **Bounded checkpoint recovery service (complete)**
-   - Enumerate only retained `starting` or `uncertain` capture operations in
-     bounded `session_id` keyset pages, reconstruct their exact durable
-     admissions, and invoke only committed, source-free reconciliation.
+   - Enumerate retained `starting` or `uncertain` capture operations, plus only
+     the exact materialized V3 handoff operations still in `prepared`, in
+     bounded `session_id` keyset pages and reconstruct their durable
+     admissions. Prepared work may take its one fresh dispatch; active work
+     invokes only committed, source-free reconciliation.
    - Process one page sequentially, advance the cursor only after each item
      settles, drain in-flight work on abort, and leave guard-busy or
      unverifiable operations durably blocked for a later pass.
@@ -283,14 +285,37 @@ Restore and launcher authority are now split into eight serial pull requests:
      backend contract version 3 carries the complete authority-issued
      generation binding to fresh publication or committed-only verification,
      while the legacy callback retains its historical reduced binding.
-   - Capture-bound activation-to-launch execution is complete. A cross-process
-     foreground/recovery lifecycle guard and a production recovery scheduler
-     remain separate serial prerequisites; `runRestore()` stays fail-closed
-     until they land.
-   - Wire publication, durable stop and clean capture, canonical detach,
-     capture-bound activation, prepared launch, no-relaunch recovery, and
-     the durable recovery runner through the production checkpoint adapter
-     behind a separate detached-production fleet capability.
+   - Capture-bound activation-to-launch execution is complete.
+   - The durable stop-to-prepared-capture handoff is complete. Migration 006
+     adds the permanent `writer-stop-capture-intent-v3` operation-ID claim and
+     database triggers that require the claim before a V3 stop can progress
+     and require its materialized stop relation before the capture operation
+     can exist. A V3 stop request embeds the exact capture intent; its dispatch
+     transaction preclaims the capture operation ID before physical stop, and
+     one `SERIALIZABLE` finalizer commits the stop while materializing the
+     exact capture operation, reservation, and session active pointer as
+     `prepared`.
+   - Fresh V3 creation is default-closed by
+     `writerLaunchStopV3FleetCompatible`, while exact replay and recovery of
+     existing V3 work remain available. Legacy V1/V2 stop behavior and the
+     same-process stopped-writer capability path are unchanged.
+   - Cold capture recovery is complete for the durable handoff. Only an exact
+     `prepared` candidate may obtain the single `prepared -> starting`
+     dispatch grant and call fresh-only
+     `resumePreparedCheckpointCapture()`. A `starting` or `uncertain`
+     candidate is source-free and committed-only, and ambiguity after a grant
+     never permits a second publication. The V3 local writer exclusion is
+     retired only after the exact predetermined committed result returns.
+   - Add the cross-process shared/exclusive lifecycle guard so foreground
+     prepared dispatch cannot race recovery.
+   - Start and schedule the durable recovery runner with fixed scope and
+     limits.
+   - Enforce the detached-production compatibility decision at invocation
+     time, not only while constructing startup collaborators.
+   - Wire publication, durable stop and prepared clean capture, canonical
+     detach, capture-bound activation, prepared launch, no-relaunch recovery,
+     and the durable recovery runner through the production checkpoint
+     adapter.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

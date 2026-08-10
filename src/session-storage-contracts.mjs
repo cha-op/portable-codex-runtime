@@ -24,6 +24,7 @@ export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
 export const STORAGE_CONTRACT_VERSION = 1;
 export const CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION = 1;
+export const PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION = 1;
 export const RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION = 1;
 export const SESSION_WORKER_ROOT = "/session";
 export const SESSION_WORKER_LAYOUT = deepFreeze({
@@ -1088,6 +1089,39 @@ export function assertCheckpointCaptureReconciliationBackend(value) {
       typeof backend.reconcileCheckpointCapture === "function",
     "invalid_storage_backend",
     "storage backend does not support checkpoint capture reconciliation",
+  );
+  return backend;
+}
+
+/**
+ * Optional operator-plane extension for resuming one exact checkpoint capture
+ * that was durably prepared by the stop-to-capture handoff. This is not part
+ * of the base storage backend method set.
+ */
+export function assertPreparedCheckpointCaptureBackend(value) {
+  ensure(
+    !isProxyValue(value),
+    "invalid_storage_backend",
+    "storage backend must not be a proxy",
+  );
+  const backend = assertStorageBackend(value);
+  const version = plainDataDescriptor(
+    backend,
+    "preparedCheckpointCaptureContractVersion",
+    "invalid_storage_backend",
+    "prepared checkpoint capture backend",
+  ).value;
+  const resume = plainDataDescriptor(
+    backend,
+    "resumePreparedCheckpointCapture",
+    "invalid_storage_backend",
+    "prepared checkpoint capture backend",
+  ).value;
+  ensure(
+    version === PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION &&
+      typeof resume === "function",
+    "invalid_storage_backend",
+    "storage backend does not support prepared checkpoint capture",
   );
   return backend;
 }

@@ -95,6 +95,12 @@
   the old durable topology, and let the real launcher prepare and consume an
   activation-materialized prepared launch without a second reservation or
   physical launch on replay.
+- [done] Close the stop-to-capture restart gap with writer-stop request V3:
+  preclaim the capture operation ID before physical stop, atomically commit the
+  stop and materialize its exact prepared capture, permit fresh publication
+  only after one definite cold dispatch grant, and keep starting or uncertain
+  recovery committed-only. Preserve the legacy same-process capability path
+  and keep fresh V3 reservation default-denied by its own fleet decision.
 - [pending] Add a cross-process shared/exclusive restore lifecycle guard and a
   bounded production recovery scheduler so foreground prepared launch cannot
   race recovery cancellation.

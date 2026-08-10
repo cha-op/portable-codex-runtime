@@ -26,7 +26,11 @@ function deepFreeze(value) {
   return value;
 }
 
-function candidate(sessionId, suffix = sessionId.slice(-3)) {
+function candidate(
+  sessionId,
+  suffix = sessionId.slice(-3),
+  state = "starting",
+) {
   return deepFreeze({
     checkpoint: {
       artifactId: `artifact-${suffix}`,
@@ -58,6 +62,7 @@ function candidate(sessionId, suffix = sessionId.slice(-3)) {
         kind: "checkpoint",
       },
     },
+    state,
   });
 }
 
@@ -162,9 +167,13 @@ test("captures exact callbacks once and returns exact frozen receipts", async ()
   assertFrozenRecord(listInputs[0], ["afterSessionId", "limit"]);
   assert.equal(listInputs[0].afterSessionId, null);
   assert.equal(listInputs[0].limit, 2);
-  assert.deepEqual(reconciliationInputs, [first, second]);
-  assert.strictEqual(reconciliationInputs[0], first);
-  assert.strictEqual(reconciliationInputs[1], second);
+  assert.equal(reconciliationInputs.length, 2);
+  for (let index = 0; index < reconciliationInputs.length; index += 1) {
+    assertFrozenRecord(reconciliationInputs[index], ["checkpoint", "request"]);
+    const source = index === 0 ? first : second;
+    assert.strictEqual(reconciliationInputs[index].checkpoint, source.checkpoint);
+    assert.strictEqual(reconciliationInputs[index].request, source.request);
+  }
 
   assertFrozenRecord(result, ["nextAfterSessionId", "results", "status"]);
   assert.equal(result.nextAfterSessionId, SESSION_ID_2);
@@ -179,6 +188,62 @@ test("captures exact callbacks once and returns exact frozen receipts", async ()
     ]);
     assert.equal(result.results[index].status, "reconciled");
   }
+});
+
+test("routes prepared candidates to fresh resume and active candidates to committed verification", async () => {
+  const prepared = candidate(SESSION_ID_1, "001", "prepared");
+  const starting = candidate(SESSION_ID_2, "002", "starting");
+  const uncertain = candidate(SESSION_ID_3, "003", "uncertain");
+  const preparedCalls = [];
+  const reconciliationCalls = [];
+  const service = createPostgresCheckpointRecoveryService({
+    async listCandidates() {
+      return page([prepared, starting, uncertain]);
+    },
+    async reconcileCheckpointCapture(input) {
+      reconciliationCalls.push(input);
+    },
+    async resumePreparedCheckpointCapture(input) {
+      preparedCalls.push(input);
+    },
+  });
+
+  const result = await service.runBatch(request({ limit: 3 }));
+
+  assert.deepEqual(
+    preparedCalls.map((input) => input.request.operationId),
+    [prepared.request.operationId],
+  );
+  assert.deepEqual(
+    reconciliationCalls.map((input) => input.request.operationId),
+    [starting.request.operationId, uncertain.request.operationId],
+  );
+  for (const input of [...preparedCalls, ...reconciliationCalls]) {
+    assertFrozenRecord(input, ["checkpoint", "request"]);
+    assert.equal(Object.hasOwn(input, "state"), false);
+  }
+  assert.deepEqual(
+    result.results.map((item) => item.status),
+    ["reconciled", "reconciled", "reconciled"],
+  );
+});
+
+test("leaves a prepared candidate pending when the optional resume extension is absent", async () => {
+  const prepared = candidate(SESSION_ID_1, "001", "prepared");
+  let reconciliationCalls = 0;
+  const service = createPostgresCheckpointRecoveryService({
+    async listCandidates() {
+      return page([prepared]);
+    },
+    async reconcileCheckpointCapture() {
+      reconciliationCalls += 1;
+    },
+  });
+
+  const result = await service.runBatch(request({ limit: 1 }));
+
+  assert.equal(reconciliationCalls, 0);
+  assert.equal(result.results[0].status, "pending");
 });
 
 test("uses a settled session cursor across two bounded pages", async () => {
@@ -249,7 +314,7 @@ test("marks rejected candidates pending and continues sequentially", async () =>
     },
     async reconcileCheckpointCapture(value) {
       calls.push(value.request.sessionId);
-      if (value === candidates[1]) {
+      if (value.request.sessionId === SESSION_ID_2) {
         throw new Error("private backend uncertainty");
       }
     },
@@ -332,10 +397,10 @@ test("never starts a second candidate while the first is in flight", async () =>
       return page([first, second]);
     },
     async reconcileCheckpointCapture(value) {
-      calls.push(value);
+      calls.push(value.request.sessionId);
       active += 1;
       maximumActive = Math.max(maximumActive, active);
-      if (value === first) {
+      if (value.request.sessionId === SESSION_ID_1) {
         firstStarted.resolve();
         await firstSettles.promise;
       }
@@ -345,12 +410,12 @@ test("never starts a second candidate while the first is in flight", async () =>
 
   const running = service.runBatch(request({ limit: 2 }));
   await firstStarted.promise;
-  assert.deepEqual(calls, [first]);
+  assert.deepEqual(calls, [SESSION_ID_1]);
   assert.equal(active, 1);
   firstSettles.resolve();
   const result = await running;
 
-  assert.deepEqual(calls, [first, second]);
+  assert.deepEqual(calls, [SESSION_ID_1, SESSION_ID_2]);
   assert.equal(maximumActive, 1);
   assert.equal(result.results.length, 2);
 });
@@ -502,7 +567,7 @@ test("waits for an in-flight candidate before returning an abort", async () => {
     },
     async reconcileCheckpointCapture(value) {
       calls.push(value);
-      if (value === first) {
+      if (value.request.sessionId === SESSION_ID_1) {
         reconciliationStarted.resolve();
         await reconciliationSettles.promise;
       }
@@ -523,7 +588,10 @@ test("waits for an in-flight candidate before returning an abort", async () => {
   reconciliationSettles.resolve();
   const result = await running;
 
-  assert.deepEqual(calls, [first]);
+  assert.deepEqual(
+    calls.map((input) => input.request.sessionId),
+    [SESSION_ID_1],
+  );
   assert.equal(result.status, "aborted");
   assert.equal(result.nextAfterSessionId, SESSION_ID_1);
   assert.equal(result.results.length, 1);
@@ -815,7 +883,14 @@ test("uses captured intrinsics instead of mutable iterator and promise helpers",
       return expectedPage;
     },
     async reconcileCheckpointCapture(input) {
-      assert.strictEqual(input, value);
+      assert.equal(Object.getPrototypeOf(input), null);
+      assert.equal(Object.isFrozen(input), true);
+      const keys = Reflect.ownKeys(input);
+      assert.equal(keys.length, 2);
+      assert.equal(keys[0], "checkpoint");
+      assert.equal(keys[1], "request");
+      assert.strictEqual(input.checkpoint, value.checkpoint);
+      assert.strictEqual(input.request, value.request);
     },
   });
   const arrayIteratorDescriptor = Object.getOwnPropertyDescriptor(

@@ -13,6 +13,9 @@ import {
   SESSION_OPERATION_CONFLICT_CLASS,
   createCheckpointCaptureOperationRequest,
 } from "./postgres-session-authority.mjs";
+import {
+  PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+} from "./session-storage-contracts.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -1861,6 +1864,70 @@ function normalizeReconciliationReadReceipt(value, admission, code) {
   });
 }
 
+function normalizePreparedCaptureReadReceipt(value, admission, code) {
+  const receipt = exactDataObject(
+    value,
+    ATTEMPT_READ_RECEIPT_KEYS,
+    code,
+  );
+  ensure(
+    receipt.status === "prepared" &&
+      receipt.attempt === null &&
+      receipt.catalogue === null,
+    code,
+  );
+  const operation = normalizeOperation(receipt.operation, code);
+  const typedRequest = canonicalTypedCaptureRequest(
+    operation.request,
+    operation.expectedSession,
+    admission,
+    code,
+  );
+  validateOperationCommon(
+    operation,
+    {
+      expectedSession: operation.expectedSession,
+      operationId: admission.request.operationId,
+      typedRequest,
+    },
+    code,
+  );
+  ensure(
+    operation.state === "prepared" &&
+      operation.revision === "0" &&
+      operation.result === null &&
+      operation.retiredAt === null &&
+      operation.createdAt === operation.updatedAt,
+    code,
+  );
+  const reservation = normalizeReservation(
+    receipt.reservation,
+    {
+      expectedReservation: null,
+      expectedSession: operation.expectedSession,
+      operation,
+      state: "prepared",
+    },
+    code,
+  );
+  validateSessionTuple(
+    receipt.session,
+    {
+      expectedSession: operation.expectedSession,
+      operation,
+      reservation,
+      terminal: false,
+    },
+    code,
+  );
+  return exactFrozenRecord({
+    operation,
+    reservation: receipt.reservation,
+    session: receipt.session,
+    typedRequest,
+  });
+}
+
 function normalizeFinalizationReceipt(
   value,
   {
@@ -2457,6 +2524,309 @@ export function createPostgresCheckpointMutationAuthority(...args) {
     }
   };
 
+  const runPreparedCapture =
+    async function runPreparedCapture(admissionValue, publishValue) {
+      const admission = normalizeAdmission(
+        admissionValue,
+        RECONCILIATION_ADMISSION_KEYS,
+        requestCode,
+      );
+      const publish = assertCallback(publishValue, requestCode);
+      const operationId = admission.request.operationId;
+      let dispatchDefinitelyBegan = false;
+      let uncertaintyInput = null;
+      let uncertaintyAttempted = false;
+
+      const markUncertain = async () => {
+        if (
+          !dispatchDefinitelyBegan ||
+          uncertaintyInput === null ||
+          uncertaintyAttempted
+        ) {
+          return;
+        }
+        uncertaintyAttempted = true;
+        await bestEffortMarkUncertain(
+          authority,
+          uncertaintyInput,
+          outcomeCode,
+        );
+      };
+
+      try {
+        return await invokeAsync(
+          operationGuard,
+          "runExclusive",
+          [
+            operationId,
+            async (probeValue) => {
+              const probe = normalizeProbe(probeValue, outcomeCode);
+              try {
+                const read = normalizePreparedCaptureReadReceipt(
+                  await invokeAsync(
+                    authority,
+                    "readCheckpointCaptureAttempt",
+                    [
+                      exactFrozenRecord({
+                        checkpoint: admission.checkpoint,
+                        request: admission.request,
+                      }),
+                    ],
+                    outcomeCode,
+                  ),
+                  admission,
+                  outcomeCode,
+                );
+                const expectedSession = read.operation.expectedSession;
+                const typedRequest = read.typedRequest;
+                const canonicalAdmission = typedRequest.admission;
+                const canonicalAttachment = sessionAttachment(
+                  read.session,
+                  outcomeCode,
+                );
+                const artifact = planArtifact(
+                  resolveArtifactPaths,
+                  canonicalAdmission,
+                  outcomeCode,
+                );
+                const source = planSource(
+                  resolveSourceOwnedRoot,
+                  canonicalAdmission,
+                  canonicalAttachment,
+                  outcomeCode,
+                );
+                ensure(
+                  pathsAreDisjoint(source.ownedRoot, artifact.ownedRoot),
+                  outcomeCode,
+                );
+
+                await assertGuardHeld(probe, outcomeCode);
+                let claimReceipt;
+                try {
+                  claimReceipt = await invokeAsync(
+                    authority,
+                    "claimCheckpointCaptureDispatch",
+                    [
+                      transitionInput(
+                        expectedSession,
+                        operationId,
+                        typedRequest,
+                        "0",
+                      ),
+                    ],
+                    outcomeCode,
+                  );
+                } catch {
+                  fail(outcomeCode);
+                }
+                const claim = exactDataObject(
+                  claimReceipt,
+                  CLAIM_RECEIPT_KEYS,
+                  outcomeCode,
+                );
+                ensure(
+                  typeof claim.dispatchGranted === "boolean",
+                  outcomeCode,
+                );
+                if (!claim.dispatchGranted) fail(outcomeCode);
+                ensure(claim.status === "starting", outcomeCode);
+                const claimOperation = normalizeOperation(
+                  claim.operation,
+                  outcomeCode,
+                );
+                const canonicalClaimRequest = canonicalTypedCaptureRequest(
+                  claimOperation.request,
+                  claimOperation.expectedSession,
+                  canonicalAdmission,
+                  outcomeCode,
+                );
+                validateOperationCommon(
+                  claimOperation,
+                  {
+                    expectedSession,
+                    operationId,
+                    typedRequest,
+                  },
+                  outcomeCode,
+                );
+                ensure(
+                  claimOperation.state === "starting" &&
+                    claimOperation.revision === "1" &&
+                    claimOperation.result === null &&
+                    claimOperation.retiredAt === null &&
+                    sameContent(
+                      canonicalClaimRequest,
+                      typedRequest,
+                      outcomeCode,
+                    ),
+                  outcomeCode,
+                );
+                const reservation = normalizeReservation(
+                  claim.reservation,
+                  {
+                    expectedReservation: read.reservation,
+                    expectedSession,
+                    operation: claimOperation,
+                    state: "starting",
+                  },
+                  outcomeCode,
+                );
+                const attemptRecord = normalizeCaptureAttempt(
+                  claim.attempt,
+                  {
+                    expectedAttempt: null,
+                    operation: claimOperation,
+                    reservation,
+                    state: "authorized",
+                    typedRequest,
+                  },
+                  outcomeCode,
+                );
+                validateSessionTuple(
+                  claim.session,
+                  {
+                    expectedSession,
+                    operation: claimOperation,
+                    reservation,
+                    terminal: false,
+                  },
+                  outcomeCode,
+                );
+                const claimDocument = sessionDocument(
+                  claim.session,
+                  outcomeCode,
+                );
+                const claimAttachment = sessionAttachment(
+                  claim.session,
+                  outcomeCode,
+                );
+                ensure(
+                  claimAttachment.rootPath === source.directory,
+                  outcomeCode,
+                );
+                dispatchDefinitelyBegan = true;
+                uncertaintyInput = operationInput(
+                  claimOperation.expectedSession,
+                  operationId,
+                  claimOperation.request,
+                );
+
+                await assertGuardHeld(probe, outcomeCode);
+                const context = exactFrozenRecord({
+                  artifactDirectory: artifact.directory,
+                  artifactOwnedRoot: artifact.ownedRoot,
+                  canonicalAttachment: claimAttachment,
+                  canonicalLease: claimDocument.lease,
+                  captureAttempt: claim.attempt,
+                  contractVersion:
+                    PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+                  now: canonicalTimestampMilliseconds(
+                    claim.authorityNow,
+                    outcomeCode,
+                  ),
+                  sourceDirectory: source.directory,
+                  sourceOwnedRoot: source.ownedRoot,
+                  storageRef: claimDocument.storageRef,
+                });
+                const completion = normalizeCompletion(
+                  await invokeCallback(publish, context, outcomeCode),
+                  false,
+                  outcomeCode,
+                );
+                await assertGuardHeld(probe, outcomeCode);
+                try {
+                  normalizeFinalizationReceipt(
+                    await invokeAsync(
+                      authority,
+                      "finalizeCheckpointCapture",
+                      [
+                        exactFrozenRecord({
+                          completion,
+                          expectedOperationRevision: "1",
+                          expectedSession: claimOperation.expectedSession,
+                          kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+                          operationId,
+                          request: claimOperation.request,
+                        }),
+                      ],
+                      outcomeCode,
+                    ),
+                    {
+                      completion,
+                      expectedAttempt: claim.attempt,
+                      expectedOperationRevision: "1",
+                      expectedReservation: claim.reservation,
+                      expectedSession,
+                      operationId,
+                      typedRequest,
+                    },
+                    outcomeCode,
+                  );
+                  return completion;
+                } catch {
+                  await assertGuardHeld(probe, outcomeCode);
+                  const readback = normalizeReconciliationReadReceipt(
+                    await invokeAsync(
+                      authority,
+                      "readCheckpointCaptureAttempt",
+                      [
+                        exactFrozenRecord({
+                          checkpoint: admission.checkpoint,
+                          request: admission.request,
+                        }),
+                      ],
+                      outcomeCode,
+                    ),
+                    admission,
+                    outcomeCode,
+                  );
+                  ensure(
+                    readback.operation.state === "committed" &&
+                      readback.catalogue !== null,
+                    outcomeCode,
+                  );
+                  const recovered = exactFrozenRecord({
+                    artifactProof:
+                      readback.catalogue.document.artifactProof,
+                    materialization:
+                      readback.catalogue.document.materialization,
+                    replayed: true,
+                    result: readback.catalogue.document.result,
+                  });
+                  ensure(
+                    sameContent(
+                      recovered.artifactProof,
+                      completion.artifactProof,
+                      outcomeCode,
+                    ) &&
+                      sameContent(
+                        recovered.materialization,
+                        completion.materialization,
+                        outcomeCode,
+                      ) &&
+                      sameContent(
+                        recovered.result,
+                        completion.result,
+                        outcomeCode,
+                      ),
+                    outcomeCode,
+                  );
+                  return completion;
+                }
+              } catch {
+                await markUncertain();
+                fail(outcomeCode);
+              }
+            },
+          ],
+          outcomeCode,
+        );
+      } catch {
+        await markUncertain();
+        fail(outcomeCode);
+      }
+    };
+
   const runCaptureReconciliation =
     async function runCaptureReconciliation(admissionValue, verifyValue) {
       const admission = normalizeAdmission(
@@ -2601,6 +2971,7 @@ export function createPostgresCheckpointMutationAuthority(...args) {
 
   return exactFrozenRecord({
     runCapture,
+    runPreparedCapture,
     runCaptureReconciliation,
     runRestore,
   });
