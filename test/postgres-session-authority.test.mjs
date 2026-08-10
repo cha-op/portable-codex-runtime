@@ -746,6 +746,49 @@ test("readSession fails closed on malformed and corrupt rows", async () => {
   }
 });
 
+test("constructor rejects proxy options without invoking hostile traps", () => {
+  const { store } = authorityWithScripts();
+  let trapCalls = 0;
+  const hostileOptions = new Proxy(
+    { store },
+    {
+      get() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getOwnPropertyDescriptor() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getPrototypeOf() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      ownKeys() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+    },
+  );
+
+  assert.throws(
+    () => new PostgresSessionAuthority(hostileOptions),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_authority_options",
+  );
+  assert.equal(trapCalls, 0);
+
+  const { proxy: revokedOptions, revoke } = Proxy.revocable({ store }, {});
+  revoke();
+  assert.throws(
+    () => new PostgresSessionAuthority(revokedOptions),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_authority_options",
+  );
+});
+
 test("registration and read input validation happen before PostgreSQL access", async () => {
   const { authority, pool, store } = authorityWithScripts();
   assert.throws(

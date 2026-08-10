@@ -32,6 +32,8 @@ read, replay, and recovery. Production `runRestore()` remains fail-closed.
 - Fresh restore-generation-v2 and activation-v2 reservation have independent
   default-deny startup backstops. Exact existing operation replay precedes
   both checks.
+- Authority construction rejects proxied option envelopes before reflective
+  key discovery, so hostile traps cannot run ahead of fail-closed validation.
 - The recovery coordinator reconstructs either activation request version
   without changing service candidates, cursor shapes, destination
   verification, provider activation, or atomic activation-to-launch

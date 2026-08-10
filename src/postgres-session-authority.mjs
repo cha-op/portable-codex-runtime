@@ -10499,6 +10499,14 @@ export class PostgresSessionAuthority {
   #store;
 
   constructor(options) {
+    if (
+      options === null ||
+      typeof options !== "object" ||
+      isProxyValue(options) ||
+      arrayIsArray(options)
+    ) {
+      fail("invalid_authority_options");
+    }
     let optionKeys;
     try {
       optionKeys = reflectOwnKeys(options);
