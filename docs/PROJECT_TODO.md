@@ -74,11 +74,16 @@
   evidence without treating pathname equality as authority, atomically install
   the canonical attachment plus prepared launch, and sweep four bounded
   generation/activation/launch/current-inventory lanes without relaunching.
-- [pending] After a fleet-wide version 2 capability gate, wire committed
-  restore publication, detached-destination activation, prepared launch, and
-  bounded no-relaunch recovery through the production checkpoint adapter.
-  Keep `runRestore()` fail-closed until that adapter composition and its
-  ambiguous-outcome coverage are complete.
+- [done] Add a fleet-gated capture-bound activation request that proves
+  the exact current-writer stop, clean checkpoint capture, and subsequent
+  release or force-fence before a distinct target restore generation can
+  activate its detached destination. Preserve existing activation v1 replay.
+- [pending] Behind a separate detached-production fleet capability, wire
+  committed restore publication, durable stop and clean capture, canonical
+  detach, capture-bound activation, prepared launch, independent recovery
+  cursors, and bounded no-relaunch recovery through the production checkpoint
+  adapter. Keep `runRestore()` fail-closed until that adapter composition and
+  its ambiguous-outcome coverage are complete.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

@@ -13,6 +13,7 @@ import {
   assertSessionAuthoritySnapshot,
   assertSessionOperationBinding,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
   createWriterLaunchAttemptOperationRequest,
 } from "./postgres-session-authority.mjs";
@@ -2300,9 +2301,17 @@ function normalizeActivationOperationRequest(
     ACTIVATION_OPERATION_REQUEST_KEYS,
     code,
   );
+  let createRequest;
+  if (request.contractVersion === 1) {
+    createRequest = createRestoreAttachmentActivationOperationRequest;
+  } else if (request.contractVersion === 2) {
+    createRequest = createRestoreAttachmentActivationOperationRequestV2;
+  } else {
+    fail(code);
+  }
   let canonical;
   try {
-    canonical = createRestoreAttachmentActivationOperationRequest({
+    canonical = createRequest({
       destinationRootPath: request.destinationRootPath,
       expectedSession,
       generation,

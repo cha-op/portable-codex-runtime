@@ -31,6 +31,7 @@ import {
   assertSessionAuthoritySnapshot,
   assertSessionOperationBinding,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
   createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
@@ -1055,8 +1056,13 @@ function activationMeasuredImage() {
   };
 }
 
-function activationOperationRequest(fixture) {
-  return createRestoreAttachmentActivationOperationRequest({
+function activationOperationRequest(fixture, contractVersion = 1) {
+  const createRequest =
+    contractVersion === 1
+      ? createRestoreAttachmentActivationOperationRequest
+      : createRestoreAttachmentActivationOperationRequestV2;
+  assert(contractVersion === 1 || contractVersion === 2);
+  return createRequest({
     destinationRootPath: fixture.destinationDirectory,
     expectedSession: authoritySnapshot(),
     generation: committedGeneration(fixture),
@@ -1072,6 +1078,9 @@ function activationOperationRequest(fixture) {
     leaseDurationMilliseconds: 600_000,
     predecessor: {
       attachmentId: "old-attachment-001",
+      ...(contractVersion === 2
+        ? { captureOperationId: CAPTURE_OPERATION_ID }
+        : {}),
       detachOperationId: "detach-operation-001",
       stopOperationId: "stop-operation-001",
     },
@@ -1084,8 +1093,12 @@ function activationRead(
   request,
   resultOverride = null,
   operationRevision = null,
+  requestContractVersion = 1,
 ) {
-  const operationRequest = activationOperationRequest(fixture);
+  const operationRequest = activationOperationRequest(
+    fixture,
+    requestContractVersion,
+  );
   const providerResult = resultOverride ?? activationResult(request);
   const storedActivationRequest = canonicalJsonFixture(request);
   const storedProviderResult = canonicalJsonFixture(providerResult);
@@ -1171,13 +1184,19 @@ function activationRead(
   };
 }
 
-function activationHandoff(fixture, request, operationRevision = "3") {
+function activationHandoff(
+  fixture,
+  request,
+  operationRevision = "3",
+  requestContractVersion = 1,
+) {
   const activation = activationRead(
     fixture,
     "committed",
     request,
     null,
     operationRevision,
+    requestContractVersion,
   );
   const prepared = activationResult(request);
   const terminalSession = structuredClone(assertSessionAuthoritySnapshot({
@@ -1203,7 +1222,10 @@ function activationHandoff(fixture, request, operationRevision = "3") {
     createdAt: activation.operation.expectedSession.createdAt,
     updatedAt: activation.operation.updatedAt,
   }));
-  const launchIntent = activationOperationRequest(fixture).launchIntent;
+  const launchIntent = activationOperationRequest(
+    fixture,
+    requestContractVersion,
+  ).launchIntent;
   const launchRequest = createWriterLaunchAttemptOperationRequest({
     expectedSession: terminalSession,
     generation: committedGeneration(fixture),
@@ -1483,10 +1505,14 @@ function advanceCommittedGenerationCurrentSession(receipt) {
   return receipt;
 }
 
-function activationCandidate(fixture, state = "uncertain") {
+function activationCandidate(
+  fixture,
+  state = "uncertain",
+  requestContractVersion = 1,
+) {
   return {
     activationOperationId: ACTIVATION_OPERATION_ID,
-    request: activationOperationRequest(fixture),
+    request: activationOperationRequest(fixture, requestContractVersion),
     state,
   };
 }
@@ -2094,12 +2120,19 @@ test("rejects a conflicting committed generation readback after lost finalizatio
   assert.deepEqual(fixture.transitionGuard.calls, []);
 });
 
-test("verifies, prepares, and atomically finalizes one restore attachment activation", async (t) => {
+test("retains version 1 restore attachment activation recovery", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
   const request = activationRequest(fixture);
   const prepared = activationResult(request);
   const committed = activationHandoff(fixture, request);
+  const candidate = activationCandidate(fixture);
+  assert.equal(candidate.request.contractVersion, 1);
+  assert.deepEqual(Reflect.ownKeys(candidate.request.predecessor).sort(), [
+    "attachmentId",
+    "detachOperationId",
+    "stopOperationId",
+  ]);
   const authority = authorityHarness({
     "finalize-activation": async (input) => {
       assert.equal(input.expectedOperationRevision, "2");
@@ -2131,7 +2164,7 @@ test("verifies, prepares, and atomically finalizes one restore attachment activa
   );
 
   const result = await coordinator.reconcileRestoreAttachmentActivation(
-    activationCandidate(fixture),
+    candidate,
   );
 
   assert.equal(result.activation.operation.state, "committed");
@@ -2145,6 +2178,164 @@ test("verifies, prepares, and atomically finalizes one restore attachment activa
   assert.equal(destinations[0].kind, "activation");
   assert.deepEqual(storage.forbiddenCalls, []);
   assert.deepEqual(fixture.transitionGuard.calls, []);
+});
+
+test("reconstructs and recovers an exact version 2 activation candidate", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  const candidate = activationCandidate(fixture, "uncertain", 2);
+  const authority = authorityHarness({
+    "finalize-activation": async (input) => {
+      assert.deepEqual(input.request, candidate.request);
+      return activationHandoff(fixture, request, "3", 2);
+    },
+    "read-activation": async () =>
+      activationRead(fixture, "uncertain", request, null, null, 2),
+  });
+  const storage = storageBackendHarness(async (input) => {
+    assert.deepEqual(input, request);
+    return prepared;
+  });
+  const { coordinator, destinations } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  const result = await coordinator.reconcileRestoreAttachmentActivation(
+    candidate,
+  );
+
+  assert.equal(candidate.request.contractVersion, 2);
+  assert.deepEqual({ ...candidate.request.predecessor }, {
+    attachmentId: "old-attachment-001",
+    captureOperationId: CAPTURE_OPERATION_ID,
+    detachOperationId: "detach-operation-001",
+    stopOperationId: "stop-operation-001",
+  });
+  assert.equal(result.activation.operation.request.contractVersion, 2);
+  assert.equal(result.activation.operation.state, "committed");
+  assert.equal(result.launch.operation.state, "prepared");
+  assert.deepEqual(
+    authority.calls.map(([name]) => name),
+    ["read-activation", "finalize-activation"],
+  );
+  assert.equal(destinations.length, 1);
+  assert.equal(storage.providerCalls.length, 1);
+  assert.deepEqual(storage.forbiddenCalls, []);
+  assert.deepEqual(fixture.transitionGuard.calls, []);
+});
+
+test("rejects hostile or mutated version 2 activation predecessors before provider work", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const mutations = [
+    ["attachment", (receipt) => {
+      receipt.operation.request.predecessor.attachmentId =
+        "forged-attachment-001";
+      synchronizeForgedOperationDigest(receipt);
+    }],
+    ["stop", (receipt) => {
+      receipt.operation.request.predecessor.stopOperationId =
+        "forged-stop-operation-001";
+      synchronizeForgedOperationDigest(receipt);
+    }],
+    ["capture", (receipt) => {
+      receipt.operation.request.predecessor.captureOperationId =
+        "forged-capture-operation-001";
+      synchronizeForgedOperationDigest(receipt);
+    }],
+    ["detach", (receipt) => {
+      receipt.operation.request.predecessor.detachOperationId =
+        "forged-detach-operation-001";
+      synchronizeForgedOperationDigest(receipt);
+    }],
+  ];
+
+  for (const [scenario, mutate] of mutations) {
+    const forged = structuredClone(
+      activationRead(
+        fixture,
+        "uncertain",
+        request,
+        null,
+        null,
+        2,
+      ),
+    );
+    mutate(forged);
+    const authority = authorityHarness({
+      "read-activation": async () => forged,
+    });
+    const storage = storageBackendHarness(async () =>
+      activationResult(request));
+    const { coordinator, destinations } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture, "uncertain", 2),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario,
+    );
+
+    assert.equal(storage.providerCalls.length, 0, scenario);
+    assert.equal(destinations.length, 0, scenario);
+  }
+
+  const hostile = structuredClone(
+    activationRead(
+      fixture,
+      "uncertain",
+      request,
+      null,
+      null,
+      2,
+    ),
+  );
+  let getterCalls = 0;
+  Object.defineProperty(
+    hostile.operation.request.predecessor,
+    "captureOperationId",
+    {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("hostile predecessor getter must not run");
+      },
+    },
+  );
+  const authority = authorityHarness({
+    "read-activation": async () => hostile,
+  });
+  const storage = storageBackendHarness(async () => activationResult(request));
+  const { coordinator, destinations } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture, "uncertain", 2),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(getterCalls, 0);
+  assert.equal(storage.providerCalls.length, 0);
+  assert.equal(destinations.length, 0);
 });
 
 test("accepts a reordered valid activation provider result with a canonical authority handoff", async (t) => {

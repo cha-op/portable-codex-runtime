@@ -220,8 +220,16 @@
   published object and materialization digest to new attachment evidence.
   Typed `restore-attachment-activation-v1` authority then serializably installs
   the exact attachment and materializes its predeclared prepared launch as one
-  atomic canonical transition after the predecessor is stopped, fenced, and
-  detached.
+  atomic canonical transition. Historical activation request version 1 keeps
+  its direct stop-to-detach replay relation. Request version 2 instead binds
+  the actual production predecessor chain—committed current-writer stop,
+  committed clean capture, then release or force-fence of the same old
+  attachment—without requiring the stopped launch generation to equal the
+  target restore generation.
+- Fresh restore-generation-v2 and capture-bound activation-v2 reservation are
+  independently default-denied at the PostgreSQL authority boundary. Explicit
+  startup compatibility decisions permit only their matching request version,
+  while exact existing replay remains available after a gate closes.
 - A bounded restore recovery coordinator and service now cover retained
   destination generations, attachment activations, prepared or active launch
   attempts, and current-launch inventory through four independent keyset
@@ -292,6 +300,8 @@
   `docs/project_journal/2026/08/2026-08-05-restore-publication-attachment-contract-4c7a91.md`
 - Detached restore activation and recovery composition:
   `docs/project_journal/2026/08/2026-08-05-detached-restore-activation-3f91c2.md`
+- Capture-bound restore activation compatibility:
+  `docs/project_journal/2026/08/2026-08-06-capture-bound-restore-activation-c4a2d8.md`
 - Durable stop-to-clean-capture composition:
   `docs/project_journal/2026/08/2026-08-05-durable-stop-capture-composition-7e3a91.md`
 - External-auth probe workstream:
@@ -306,7 +316,7 @@
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
-  adapter. The detached-destination activation and bounded no-relaunch
-  recovery protocol now exist, but production still requires an explicit fleet
-  capability gate, adapter composition, and end-to-end fail-closed validation
-  before `runRestore()` may be enabled.
+  adapter. Capture-bound detached activation and bounded no-relaunch recovery
+  now exist, but production still requires a separate explicit fleet
+  capability, adapter composition, durable cursor scheduling, and end-to-end
+  fail-closed validation before `runRestore()` may be enabled.

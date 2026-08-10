@@ -14,6 +14,7 @@ import {
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
   createRestoreDestinationGenerationOperationRequestV2,
 } from "../src/postgres-session-authority.mjs";
@@ -380,7 +381,11 @@ function authorityWithScripts(...scripts) {
     maxTransactionAttempts: 1,
   });
   return {
-    authority: new PostgresSessionAuthority({ store }),
+    authority: new PostgresSessionAuthority({
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreGenerationV2FleetCompatible: true,
+      store,
+    }),
     clients,
     pool,
     store,
@@ -741,6 +746,49 @@ test("readSession fails closed on malformed and corrupt rows", async () => {
   }
 });
 
+test("constructor rejects proxy options without invoking hostile traps", () => {
+  const { store } = authorityWithScripts();
+  let trapCalls = 0;
+  const hostileOptions = new Proxy(
+    { store },
+    {
+      get() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getOwnPropertyDescriptor() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getPrototypeOf() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+      ownKeys() {
+        trapCalls += 1;
+        throw new Error("proxy trap must not run");
+      },
+    },
+  );
+
+  assert.throws(
+    () => new PostgresSessionAuthority(hostileOptions),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_authority_options",
+  );
+  assert.equal(trapCalls, 0);
+
+  const { proxy: revokedOptions, revoke } = Proxy.revocable({ store }, {});
+  revoke();
+  assert.throws(
+    () => new PostgresSessionAuthority(revokedOptions),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_authority_options",
+  );
+});
+
 test("registration and read input validation happen before PostgreSQL access", async () => {
   const { authority, pool, store } = authorityWithScripts();
   assert.throws(
@@ -758,6 +806,34 @@ test("registration and read input validation happen before PostgreSQL access", a
       error instanceof PostgresSessionAuthorityError &&
       error.code === "invalid_authority_options",
   );
+  for (const options of [
+    { restoreGenerationV2FleetCompatible: "true", store },
+    { restoreAttachmentActivationV2FleetCompatible: 1, store },
+    {
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreGenerationV2FleetCompatible: null,
+      store,
+    },
+  ]) {
+    assert.throws(
+      () => new PostgresSessionAuthority(options),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_authority_options",
+    );
+  }
+  for (const options of [
+    { store },
+    { restoreGenerationV2FleetCompatible: false, store },
+    { restoreAttachmentActivationV2FleetCompatible: true, store },
+    {
+      restoreAttachmentActivationV2FleetCompatible: false,
+      restoreGenerationV2FleetCompatible: true,
+      store,
+    },
+  ]) {
+    assert.doesNotThrow(() => new PostgresSessionAuthority(options));
+  }
 
   await assertAuthorityError(
     authority.registerSession({
@@ -1078,6 +1154,79 @@ test("restore attachment activation requests bind one detached predecessor, gene
   fixture.launchIntent.supervisor.supervisorId = "mutated-supervisor";
   assert.equal(request.predecessor.attachmentId, "attachment-001");
   assert.equal(request.launchIntent.supervisor.supervisorId, "supervisor-001");
+});
+
+test("restore attachment activation V2 requests add one exact capture predecessor while preserving V1", () => {
+  const fixture = detachedRestoreActivationFixture();
+  const v1 = createRestoreAttachmentActivationOperationRequest(fixture);
+  const v2Fixture = {
+    ...fixture,
+    predecessor: {
+      ...fixture.predecessor,
+      captureOperationId: "checkpoint-capture-operation-001",
+    },
+  };
+  const request = createRestoreAttachmentActivationOperationRequestV2(
+    v2Fixture,
+  );
+  const reordered = createRestoreAttachmentActivationOperationRequestV2(
+    reversePlainData(v2Fixture),
+  );
+
+  assert.equal(v1.contractVersion, 1);
+  assert.deepEqual(Reflect.ownKeys(v1.predecessor), [
+    "attachmentId",
+    "detachOperationId",
+    "stopOperationId",
+  ]);
+  assert.equal(request.contractVersion, 2);
+  assert.equal(JSON.stringify(request), JSON.stringify(reordered));
+  assert.deepEqual(Reflect.ownKeys(request.predecessor), [
+    "attachmentId",
+    "captureOperationId",
+    "detachOperationId",
+    "stopOperationId",
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(request.predecessor)),
+    v2Fixture.predecessor,
+  );
+  assert.equal(Object.isFrozen(request), true);
+  assert.equal(Object.isFrozen(request.predecessor), true);
+
+  for (const predecessor of [
+    fixture.predecessor,
+    { ...v2Fixture.predecessor, extra: true },
+    {
+      ...v2Fixture.predecessor,
+      captureOperationId: v2Fixture.predecessor.stopOperationId,
+    },
+    {
+      ...v2Fixture.predecessor,
+      captureOperationId: v2Fixture.predecessor.detachOperationId,
+    },
+  ]) {
+    assert.throws(
+      () =>
+        createRestoreAttachmentActivationOperationRequestV2({
+          ...v2Fixture,
+          predecessor,
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+  assert.throws(
+    () =>
+      createRestoreAttachmentActivationOperationRequest({
+        ...fixture,
+        predecessor: v2Fixture.predecessor,
+      }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
 });
 
 test("restore attachment activation rejects non-detached and ambiguous predecessor authority before PostgreSQL", async () => {

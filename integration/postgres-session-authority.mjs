@@ -40,6 +40,7 @@ import {
   WRITER_RELEASE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   createRestoreAttachmentActivationOperationRequest,
+  createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
@@ -1620,6 +1621,7 @@ function checkpointCaptureAdmission(
     checkpointId = `checkpoint-${randomUUID()}`,
     operationId = `checkpoint-operation-${randomUUID()}`,
     processIncarnationId = `process-${randomUUID()}`,
+    stopOperationId = `stop-${randomUUID()}`,
     writerIncarnationId = `writer-${randomUUID()}`,
   } = {},
 ) {
@@ -1661,7 +1663,7 @@ function checkpointCaptureAdmission(
     checkpoint,
     processIncarnationId,
     request,
-    stopOperationId: `stop-${randomUUID()}`,
+    stopOperationId,
     writerIncarnationId,
   };
 }
@@ -2875,7 +2877,11 @@ test(
       maxTransactionAttempts: 3,
     });
     await store.migrate();
-    const authority = new PostgresSessionAuthority({ store });
+    const authority = new PostgresSessionAuthority({
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreGenerationV2FleetCompatible: true,
+      store,
+    });
     const operationGuard = new PostgresOperationGuard({
       dedicatedPool: guardPool,
     });
@@ -6726,6 +6732,368 @@ test(
     );
 
     await t.test(
+      "capture-bound restore activation accepts a different target generation and atomically prepares its launch",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const targetFixture =
+          await prepareCommittedRestoreGenerationFixture(
+            authority,
+            checkpointAuthority,
+            sessionId,
+          );
+        const targetGeneration = targetFixture.finalized.generation;
+        const oldAttachment =
+          targetFixture.finalized.session.document.attachment;
+        assert.notEqual(oldAttachment, null);
+        assert.equal(
+          targetGeneration.binding.attachment.attachmentId,
+          oldAttachment.attachmentId,
+        );
+
+        const currentGenerationAdmission = restoreGenerationAdmission(
+          { session: targetFixture.finalized.session },
+          targetFixture.checkpoint,
+        );
+        const currentGenerationInput = restoreGenerationOperationInput(
+          targetFixture.finalized.session,
+          currentGenerationAdmission,
+        );
+        await authority.reserveOperation(currentGenerationInput);
+        const currentGenerationClaimed =
+          await authority.claimRestoreDestinationGenerationDispatch({
+            ...structuredClone(currentGenerationInput),
+            destinationIsolationProofId:
+              `restore-isolation-proof-${randomUUID()}`,
+            expectedOperationRevision: "0",
+            generationId: `restore-generation-${randomUUID()}`,
+          });
+        const currentGenerationFinalized =
+          await authority.finalizeRestoreDestinationGeneration({
+            ...structuredClone(currentGenerationInput),
+            completion: restoreGenerationCompletion(
+              currentGenerationInput,
+              currentGenerationClaimed,
+              false,
+            ),
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(currentGenerationFinalized, "committed");
+        const currentWriterGeneration =
+          currentGenerationFinalized.generation;
+        assert.notEqual(
+          currentWriterGeneration.generationId,
+          targetGeneration.generationId,
+        );
+        assert.equal(
+          currentWriterGeneration.binding.attachment.attachmentId,
+          oldAttachment.attachmentId,
+        );
+
+        const currentLaunchInput = writerLaunchAttemptInput(
+          currentGenerationFinalized.session,
+          currentWriterGeneration,
+        );
+        await authority.reserveOperation(currentLaunchInput);
+        await authority.claimWriterLaunchAttemptDispatch({
+          ...structuredClone(currentLaunchInput),
+          expectedOperationRevision: "0",
+        });
+        const currentLaunchEvidence = writerLaunchEvidence(
+          currentLaunchInput,
+          "started",
+        );
+        const currentWriterStarted =
+          await authority.finalizeWriterLaunchAttemptStarted({
+            ...structuredClone(currentLaunchInput),
+            evidence: currentLaunchEvidence,
+            expectedOperationRevision: "1",
+          });
+        assertOperationReceipt(currentWriterStarted, "committed");
+        assert.equal(
+          currentWriterStarted.session.document.launch.generation
+            .generationId,
+          currentWriterGeneration.generationId,
+        );
+
+        const stop = writerLaunchStopInput(currentWriterStarted.session);
+        await authority.reserveOperation(stop.input);
+        await authority.claimWriterLaunchStopDispatch({
+          ...structuredClone(stop.input),
+          claimToken: stop.claimToken,
+          expectedOperationRevision: "0",
+        });
+        const stopped = await authority.finalizeWriterLaunchStopped({
+          ...structuredClone(stop.input),
+          evidence: writerLaunchStopEvidence(stop.input),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(stopped, "committed");
+        assert.equal(
+          stop.input.request.launch.generation.generationId,
+          currentWriterGeneration.generationId,
+        );
+
+        const captureAdmission = checkpointCaptureAdmission(
+          { session: stopped.session },
+          {
+            processIncarnationId:
+              currentLaunchEvidence.processIncarnationId,
+            stopOperationId: stopped.operation.operationId,
+            writerIncarnationId:
+              currentLaunchEvidence.writerIncarnationId,
+          },
+        );
+        await checkpointAuthority.runCapture(
+          captureAdmission,
+          async (context) => checkpointCompletion(context, false),
+        );
+        const captured = await authority.reconcileOperation(
+          checkpointOperationInput(stopped.session, captureAdmission),
+        );
+        assertOperationReceipt(captured, "committed");
+        assert.equal(
+          captured.operation.result.checkpointId,
+          captureAdmission.checkpoint.checkpointId,
+        );
+        const catalogue = await authority.readCheckpointCatalogue({
+          checkpoint: captureAdmission.checkpoint,
+        });
+        assert.equal(catalogue.attempt.state, "committed");
+        assert.equal(
+          catalogue.attempt.binding.attachmentId,
+          oldAttachment.attachmentId,
+        );
+        assert.equal(
+          catalogue.attempt.binding.stopOperationId,
+          stopped.operation.operationId,
+        );
+        assert.equal(
+          catalogue.attempt.binding.processIncarnationId,
+          currentLaunchEvidence.processIncarnationId,
+        );
+        assert.equal(
+          catalogue.attempt.binding.writerIncarnationId,
+          currentLaunchEvidence.writerIncarnationId,
+        );
+
+        const released = await releaseWriter(authority, captured);
+        assertOperationReceipt(released, "committed");
+        assert.equal(released.session.document.lifecycle, "DETACHED");
+        assert.equal(
+          released.operation.expectedSession.document.lastOperation
+            .operationId,
+          captured.operation.operationId,
+        );
+
+        const launchIntent = restoreGenerationLaunchIntent(
+          released.session,
+        );
+        const activationInput = {
+          expectedSession: released.session,
+          kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+          operationId: `restore-activation-${randomUUID()}`,
+          request: createRestoreAttachmentActivationOperationRequestV2({
+            destinationRootPath:
+              `/var/lib/portable-codex/restores/${sessionId}`,
+            expectedSession: released.session,
+            generation: targetGeneration,
+            holderId: `restore-host-${randomUUID()}`,
+            launchIntent,
+            leaseDurationMilliseconds: 300_000,
+            predecessor: {
+              attachmentId: oldAttachment.attachmentId,
+              captureOperationId: captured.operation.operationId,
+              detachOperationId: released.operation.operationId,
+              stopOperationId: stopped.operation.operationId,
+            },
+          }),
+        };
+        assert.equal(activationInput.request.contractVersion, 2);
+        const fleetIncompatibleAuthority =
+          new PostgresSessionAuthority({
+            restoreAttachmentActivationV2FleetCompatible: false,
+            restoreGenerationV2FleetCompatible: true,
+            store,
+          });
+        await assert.rejects(
+          fleetIncompatibleAuthority.reserveOperation(
+            structuredClone(activationInput),
+          ),
+          assertAuthorityCode(
+            "restore_attachment_activation_v2_fleet_capability_required",
+          ),
+        );
+        const deniedState = await pool.query(
+          [
+            "SELECT",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = $1) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations",
+            "WHERE operation_id = $1) AS reservation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_id_registry",
+            "WHERE operation_id IN ($1, $2)) AS registry_count",
+          ].join(" "),
+          [
+            activationInput.operationId,
+            activationInput.request.launchIntent.launchAttemptId,
+          ],
+        );
+        assert.deepEqual(deniedState.rows, [
+          {
+            operation_count: 0,
+            registry_count: 0,
+            reservation_count: 0,
+          },
+        ]);
+
+        const reserved = await authority.reserveOperation(activationInput);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
+        const gateClosedReplay =
+          await fleetIncompatibleAuthority.reserveOperation(
+            structuredClone(activationInput),
+          );
+        assertOperationReceipt(gateClosedReplay, "prepared");
+        assert.equal(gateClosedReplay.acquired, false);
+        assert.deepEqual(gateClosedReplay.operation, reserved.operation);
+        assert.deepEqual(
+          gateClosedReplay.reservation,
+          reserved.reservation,
+        );
+        assert.deepEqual(gateClosedReplay.session, reserved.session);
+        const claimed =
+          await authority.claimRestoreAttachmentActivationDispatch({
+            ...structuredClone(activationInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(claimed, "starting");
+        assert.equal(claimed.dispatchGranted, true);
+        assert.deepEqual(
+          structuredClone(
+            claimed.operation.request.predecessor,
+          ),
+          structuredClone(activationInput.request.predecessor),
+        );
+
+        const proofId = `restore-attachment-proof-${randomUUID()}`;
+        const mutationRequest = claimed.activationRequest.mutationRequest;
+        const activationResult = {
+          attachment: {
+            backendId: mutationRequest.backendId,
+            contractVersion: mutationRequest.contractVersion,
+            storageId: mutationRequest.storageId,
+            sessionId: mutationRequest.sessionId,
+            attachmentId: mutationRequest.target.attachmentId,
+            leaseId: mutationRequest.leaseId,
+            holderId: mutationRequest.holderId,
+            fencingEpoch: mutationRequest.fencingEpoch,
+            operationId: mutationRequest.operationId,
+            proofId,
+            kind: "directory",
+            rootPath: activationInput.request.destinationRootPath,
+            mode: "read-write",
+          },
+          contractVersion: 1,
+          mutationResult: {
+            ...structuredClone(mutationRequest),
+            proofId,
+            status: "attached",
+          },
+          publication: structuredClone(
+            claimed.activationRequest.publication,
+          ),
+        };
+        const finalization = {
+          ...structuredClone(activationInput),
+          activationResult,
+          expectedOperationRevision: "1",
+        };
+        const finalized =
+          await authority.finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt(
+            structuredClone(finalization),
+          );
+        assert.equal(finalized.status, "prepared");
+        assert.equal(finalized.activation.finalized, true);
+        assert.equal(
+          finalized.activation.operation.result.outcome,
+          "restore-attachment-activated",
+        );
+        assert.equal(
+          finalized.session.document.activeOperation.operationId,
+          launchIntent.launchAttemptId,
+        );
+        assert.equal(
+          finalized.session.document.lastOperation.operationId,
+          activationInput.operationId,
+        );
+        assert.equal(
+          finalized.launch.attempt.request.generation.generationId,
+          targetGeneration.generationId,
+        );
+        assert.equal(
+          finalized.launch.attempt.request.attachment.attachmentId,
+          activationResult.attachment.attachmentId,
+        );
+        assert.notEqual(
+          finalized.launch.attempt.request.attachment.attachmentId,
+          oldAttachment.attachmentId,
+        );
+
+        const oldAttachmentLaunches = await pool.query(
+          [
+            "SELECT",
+            "count(*) FILTER (WHERE",
+            "request #>> '{payload,generation,generationId}' = $3",
+            "AND request #>> '{payload,attachment,attachmentId}' = $4)",
+            "::integer AS current_generation_launch_count,",
+            "count(*) FILTER (WHERE",
+            "request #>> '{payload,generation,generationId}' = $5",
+            "AND request #>> '{payload,attachment,attachmentId}' = $4)",
+            "::integer AS target_generation_launch_count",
+            "FROM session_authority.operation_claims",
+            "WHERE session_id = $1 AND kind = $2",
+          ].join(" "),
+          [
+            sessionId,
+            WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+            currentWriterGeneration.generationId,
+            oldAttachment.attachmentId,
+            targetGeneration.generationId,
+          ],
+        );
+        assert.deepEqual(oldAttachmentLaunches.rows, [
+          {
+            current_generation_launch_count: 1,
+            target_generation_launch_count: 0,
+          },
+        ]);
+
+        const read = await authority.readRestoreAttachmentActivation({
+          operationId: activationInput.operationId,
+        });
+        assertOperationReceipt(read, "committed", {
+          activeOperationId: launchIntent.launchAttemptId,
+          currentTerminal: false,
+        });
+        assert.deepEqual(
+          structuredClone(read.activationRequest),
+          structuredClone(claimed.activationRequest),
+        );
+        const replay =
+          await authority.finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt(
+            structuredClone(finalization),
+          );
+        assert.equal(replay.activation.finalized, false);
+        assert.deepEqual(replay.launch, finalized.launch);
+        assert.deepEqual(replay.session, finalized.session);
+      },
+    );
+
+    await t.test(
       "writer launch claim rechecks the authority clock after a blocking generation lock",
       async () => {
         const sessionId = randomUUID();
@@ -7119,7 +7487,57 @@ test(
           admission,
           launchIntent,
         );
-        await authority.reserveOperation(input);
+        const fleetIncompatibleAuthority =
+          new PostgresSessionAuthority({
+            restoreAttachmentActivationV2FleetCompatible: true,
+            restoreGenerationV2FleetCompatible: false,
+            store,
+          });
+        await assert.rejects(
+          fleetIncompatibleAuthority.reserveOperation(
+            structuredClone(input),
+          ),
+          assertAuthorityCode(
+            "restore_generation_v2_fleet_capability_required",
+          ),
+        );
+        const deniedState = await pool.query(
+          [
+            "SELECT",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = $1) AS operation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.reservations",
+            "WHERE operation_id = $1) AS reservation_count,",
+            "(SELECT count(*)::integer",
+            "FROM session_authority.operation_id_registry",
+            "WHERE operation_id IN ($1, $2)) AS registry_count",
+          ].join(" "),
+          [input.operationId, input.request.launchIntent.launchAttemptId],
+        );
+        assert.deepEqual(deniedState.rows, [
+          {
+            operation_count: 0,
+            registry_count: 0,
+            reservation_count: 0,
+          },
+        ]);
+        const reserved = await authority.reserveOperation(input);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
+        const gateClosedReplay =
+          await fleetIncompatibleAuthority.reserveOperation(
+            structuredClone(input),
+          );
+        assertOperationReceipt(gateClosedReplay, "prepared");
+        assert.equal(gateClosedReplay.acquired, false);
+        assert.deepEqual(gateClosedReplay.operation, reserved.operation);
+        assert.deepEqual(
+          gateClosedReplay.reservation,
+          reserved.reservation,
+        );
+        assert.deepEqual(gateClosedReplay.session, reserved.session);
         const claimed =
           await authority.claimRestoreDestinationGenerationDispatch({
             ...structuredClone(input),
@@ -7169,6 +7587,7 @@ test(
           );
 
           const rollbackAuthority = new PostgresSessionAuthority({
+            restoreGenerationV2FleetCompatible: true,
             store: new PostgresSerializableStore({
               dedicatedPool: firstMatchingQueryResultFailurePool(
                 pool,
@@ -7355,6 +7774,7 @@ test(
         };
         const acknowledgementLossAuthority =
           new PostgresSessionAuthority({
+            restoreGenerationV2FleetCompatible: true,
             store: new PostgresSerializableStore({
               dedicatedPool: firstCommitAcknowledgementLossPool(pool),
             }),
