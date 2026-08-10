@@ -5,12 +5,16 @@ import {
   PlatformImageReservationCoordinator,
 } from "./platform-image-reservation.mjs";
 import {
+  RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_OPERATION_CONFLICT_CLASS,
+  WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
+  WRITER_RELEASE_OPERATION_KIND,
   assertCommittedWriterLaunchStopTransitionProof,
+  assertSessionAuthoritySnapshot,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
 } from "./postgres-session-authority.mjs";
@@ -1295,13 +1299,45 @@ async function assertGuardHeld(probe, code) {
   }
 }
 
-function normalizeSession(value, code) {
+function normalizeSession(value, code, allowCleanDetached = false) {
   const session = exactDataObject(value, SESSION_KEYS, code);
   const document = exactDataObject(
     session.document,
     SESSION_DOCUMENT_KEYS,
     code,
   );
+  if (allowCleanDetached && document.lifecycle === "DETACHED") {
+    let canonicalSession;
+    try {
+      canonicalSession = assertSessionAuthoritySnapshot(value);
+    } catch {
+      fail(code);
+    }
+    const canonicalDocument = canonicalSession.document;
+    const lastOperation = exactDataObject(
+      canonicalDocument.lastOperation,
+      LAST_OPERATION_KEYS,
+      code,
+    );
+    ensure(
+      canonicalDocument.documentVersion === 3 &&
+        canonicalDocument.recovery === null &&
+        canonicalDocument.activeOperation === null &&
+        canonicalDocument.launch === null &&
+        canonicalDocument.attachment === null &&
+        canonicalDocument.lease === null &&
+        lastOperation.state === "committed" &&
+        arrayIncludes(
+          [
+            WRITER_RELEASE_OPERATION_KIND,
+            WRITER_FORCE_FENCE_OPERATION_KIND,
+          ],
+          lastOperation.kind,
+        ),
+      code,
+    );
+    return snapshotData(canonicalSession, code);
+  }
   ensure(
     (document.documentVersion === 2 || document.documentVersion === 3) &&
       document.recovery === null &&
@@ -2604,13 +2640,19 @@ function ensureMeasuredImageMatchesSession(
 
 function normalizePrepareInput(value, code) {
   const input = exactDataObject(value, PREPARE_INPUT_KEYS, code);
-  const expectedSession = normalizeSession(input.expectedSession, code);
+  const expectedSession = normalizeSession(
+    input.expectedSession,
+    code,
+    true,
+  );
+  const document = expectedSession.document;
   ensure(
-    expectedSession.document.lifecycle === "ATTACHED" &&
-      expectedSession.document.activeOperation === null &&
-      expectedSession.document.launch === null &&
-      expectedSession.document.attachment !== null &&
-      expectedSession.document.lease !== null,
+    (document.lifecycle === "ATTACHED" &&
+      document.activeOperation === null &&
+      document.launch === null &&
+      document.attachment !== null &&
+      document.lease !== null) ||
+      document.lifecycle === "DETACHED",
     code,
   );
   return exactFrozenRecord({
@@ -2905,6 +2947,27 @@ export function createPostgresLogicalWriterLauncher(...args) {
       LAST_OPERATION_KEYS,
       outcomeCode,
     );
+    const generationProducer =
+      expectedLastOperation.kind ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+      expectedLastOperation.operationId === request.generation.operationId &&
+      request.generation.committedAt === expectedSession.updatedAt;
+    const activationProducer =
+      expectedLastOperation.kind ===
+        RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
+      expectedLastOperation.operationId === request.attachment.operationId &&
+      canonicalTimestampMilliseconds(
+        request.generation.committedAt,
+        outcomeCode,
+      ) <=
+        canonicalTimestampMilliseconds(
+          expectedSession.updatedAt,
+          outcomeCode,
+        ) &&
+      read.operation.createdAt === expectedSession.updatedAt &&
+      read.operation.updatedAt === expectedSession.updatedAt &&
+      read.reservation.createdAt === expectedSession.updatedAt &&
+      read.reservation.updatedAt === expectedSession.updatedAt;
     ensure(
       expectedDocument.lifecycle === "ATTACHED" &&
         expectedDocument.activeOperation === null &&
@@ -2912,11 +2975,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
         expectedDocument.attachment !== null &&
         expectedDocument.lease !== null &&
         expectedDocument.writerEpoch === request.fencingEpoch &&
-        expectedLastOperation.kind ===
-          RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
-        expectedLastOperation.operationId === request.generation.operationId &&
         expectedLastOperation.state === "committed" &&
-        request.generation.committedAt === expectedSession.updatedAt &&
+        (generationProducer || activationProducer) &&
         currentDocument.lifecycle === "ATTACHED" &&
         currentDocument.launch === null &&
         currentDocument.writerEpoch === request.fencingEpoch &&

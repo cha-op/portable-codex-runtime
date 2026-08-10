@@ -235,6 +235,11 @@ Restore and launcher authority are now split into eight serial pull requests:
      and later detach without equating the stopped writer's generation with the
      target restore generation. Pathname equality is correlation only and never
      proves attachment authority or filesystem object identity.
+   - Preserve the historical activation-v2 backward topology from detach to
+     capture to stop. Also admit a fresh topology from detach to a committed
+     version 1 target generation, then capture and stop, so generation creation
+     may occur after clean capture and before detach without rewriting old
+     durable work.
    - Verify committed restore publication against the detached destination
      and activated attachment before any prepared launch can proceed.
    - Add source-free committed-only destination verification and the optional
@@ -243,11 +248,20 @@ Restore and launcher authority are now split into eight serial pull requests:
      treating path equality as attachment authority.
    - Independently default-deny fresh restore-generation-v2 and capture-bound
      activation-v2 creation until startup confirms matching fleet
-     compatibility. Exact durable replay bypasses the fresh-work backstop.
+     compatibility. Keep the generation-predecessor activation-v2 topology
+     behind its own default-closed
+     `restoreAttachmentActivationV2GenerationPredecessorFleetCompatible`
+     decision; the old topology and exact durable replay bypass only that
+     fresh-topology backstop.
    - Claim and finalize versioned `restore-attachment-activation-v1` requests
      through serializable authority transitions. The final transition installs
      the exact canonical attachment and materializes its predetermined prepared
      launch atomically; acknowledgement loss replays the same durable result.
+   - Let the logical launcher prepare an intent from the exact clean `DETACHED`
+     release or force-fence snapshot without reserving or consuming an image,
+     then validate and run the activation-materialized prepared attempt exactly
+     once after the atomic handoff. Replay performs no second reservation or
+     physical launch.
    - Compose four independently cursor-bounded lanes for retained generation,
      attachment activation, prepared or active launch attempt, and current
      launch inventory. The service is sequential and no-relaunch: it never
@@ -269,9 +283,10 @@ Restore and launcher authority are now split into eight serial pull requests:
      backend contract version 3 carries the complete authority-issued
      generation binding to fresh publication or committed-only verification,
      while the legacy callback retains its historical reduced binding.
-   - Capture-bound activation-to-launch provenance and a cross-process
-     foreground/recovery lifecycle guard remain separate serial prerequisites;
-     `runRestore()` stays fail-closed until both land.
+   - Capture-bound activation-to-launch execution is complete. A cross-process
+     foreground/recovery lifecycle guard and a production recovery scheduler
+     remain separate serial prerequisites; `runRestore()` stays fail-closed
+     until they land.
    - Wire publication, durable stop and clean capture, canonical detach,
      capture-bound activation, prepared launch, no-relaunch recovery, and
      the durable recovery runner through the production checkpoint adapter

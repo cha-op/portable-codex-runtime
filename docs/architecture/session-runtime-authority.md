@@ -32,7 +32,10 @@ The implemented authority provides:
   discovery; and
 - a same-process durable stop-to-clean-capture composition that joins the
   complete prepared tuple, exact supervisor stop evidence, committed stop
-  transition, and one opaque stopped-writer capability.
+  transition, and one opaque stopped-writer capability;
+- capture-bound detached activation with atomic prepared-launch
+  materialization; and
+- bounded no-relaunch restore recovery with durable cursor primitives.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
@@ -55,8 +58,10 @@ writer registration. Typed stop state preserves that original launch until
 exact complete-stopped proof. The same-process stop-to-capture composition now
 persists and validates that proof before clean-capture admission and retains
 the local writer identity until capture succeeds. Detached-destination
-activation, bounded no-relaunch recovery, and production `runRestore()`
-integration remain later serial slices.
+activation can now materialize an executable prepared launch from a clean
+detached intent, and bounded no-relaunch recovery is implemented. Production
+`runRestore()` integration, its cross-process lifecycle guard, and its recovery
+scheduler remain later serial slices.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -1362,6 +1367,13 @@ the definite claim, consumes the reservation only after durable `starting`,
 and then reuses the same at-most-once launch, registration, finalisation, and
 no-relaunch reconciliation rules as `runLaunch()`.
 
+The same preparation boundary also accepts an exact clean canonical version 3
+`DETACHED` snapshot only when attachment, lease, launch, recovery, and active
+operation are absent and the committed terminal operation is release or
+force-fence. That path likewise performs no authority read, reservation, image
+consumption, or launch. It exists so detached activation can bind the intent
+before attaching the published destination.
+
 A granted claim receipt must preserve the previously read expected-session
 content. Its active session may differ only by the version-3 authority-state
 projection, the exact starting pointer, the prescribed revision advance, and
@@ -1442,6 +1454,15 @@ writer's launch generation. Durable last-operation pointers and complete
 operation/reservation relations prove ordering; timestamps and path equality
 do not. Version 1 remains readable and recoverable without reinterpretation.
 
+The historical version 2 relation is the capture-predecessor topology: reading
+durable `lastOperation` pointers backward yields detach, capture, and stop. It
+remains accepted for old work and fresh compatible work. A generation-
+predecessor topology additionally allows a committed version 1 target
+generation after capture and before detach, so the backward chain is detach,
+generation, capture, and stop. The generation row must preserve the captured
+session pointer and old-attachment binding; the detach operation must preserve
+that generation as its expected last pointer.
+
 Fresh activation request version 2 reservation is separately default-denied
 unless startup supplies
 `restoreAttachmentActivationV2FleetCompatible: true` after confirming all
@@ -1450,6 +1471,13 @@ request. The check runs only after exact lookup proves the operation absent
 and before any write. The existing operation kind, JSON envelope, migration-4
 launch-intent registry claim, and recovery candidate shape are unchanged, so
 no schema migration is required.
+
+Fresh generation-predecessor topology is independently default-denied unless
+startup also supplies
+`restoreAttachmentActivationV2GenerationPredecessorFleetCompatible: true`.
+This second gate is evaluated only after the ordinary activation-v2 gate and
+exact durable relation lookup identify the topology. Closing it leaves the
+historical capture-predecessor topology and exact replay/recovery available.
 
 Migration version 4 extends the permanent operation-ID registry with the
 `restore-activation-launch-intent-v1` claim. Activation dispatch locks and
@@ -1483,6 +1511,15 @@ activation result, launch operation, reservation, registry claim, generation,
 and session revisions. A lost finalization acknowledgement is accepted only
 when readback proves the same provider result; a conflicting committed result
 remains uncertain and never invokes a second provider attachment.
+
+After this atomic transition, `runPreparedLaunch()` recognizes the activation
+terminal operation as the producer of the prepared attempt, requires the
+generation commit not to follow activation, and binds the launch operation and
+reservation creation time to the activation handoff snapshot. It claims the
+existing attempt without calling `reserveOperation()`, consumes the opaque
+image only after definite `starting`, and invokes the physical launcher once.
+Exact replay adopts the same local writer and performs neither a second reserve
+nor a second physical launch.
 
 `PostgresRestoreActivationRecoveryCoordinator` supplies the source-free
 physical reconciliation boundary. For a retained version 1 generation it
@@ -1542,7 +1579,11 @@ a production restore entry point. Later serial pull requests must:
   attachment can become launch authority;
 - dispatch the already-reserved launch with the original image reservation, or
   with a newly minted exact-match reservation while it is still durably
-  `prepared`, and route every active attempt without another launch;
+  `prepared`, through the implemented clean-detached intent and
+  activation-materialized launch path, while routing every active attempt
+  without another launch;
+- hold a cross-process foreground/recovery lifecycle guard around prepared
+  launch so scheduled cancellation cannot race foreground dispatch;
 - start and schedule the durable four-lane recovery runner with an explicit
   recovery scope and fixed per-lane limits;
 - wire the whole protocol into `runRestore()` only after every uncertain

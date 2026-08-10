@@ -90,9 +90,11 @@
 - [done] Add a version 3 stopped-directory restore callback that passes the
   complete authority-issued generation binding to fresh publication or
   committed-only verification while preserving the legacy version 2 callback.
-- [pending] Admit capture-bound activation through the exact
-  detach-to-generation-to-capture-to-stop predecessor chain, and let the real
-  launcher prepare and consume an activation-materialized prepared launch.
+- [done] Admit capture-bound activation through the separately fleet-gated
+  detach-to-generation-to-capture-to-stop predecessor chain while preserving
+  the old durable topology, and let the real launcher prepare and consume an
+  activation-materialized prepared launch without a second reservation or
+  physical launch on replay.
 - [pending] Add a cross-process shared/exclusive restore lifecycle guard and a
   bounded production recovery scheduler so foreground prepared launch cannot
   race recovery cancellation.

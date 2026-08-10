@@ -808,6 +808,8 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore attachment activation is not actively authorized",
   restore_attachment_activation_v2_fleet_capability_required:
     "Restore attachment activation version 2 requires confirmed fleet compatibility",
+  restore_attachment_activation_v2_generation_predecessor_fleet_capability_required:
+    "Restore attachment activation version 2 generation predecessors require confirmed fleet compatibility",
   restore_generation_v2_fleet_capability_required:
     "Restore destination generation version 2 requires confirmed fleet compatibility",
   writer_launch_attempt_not_authorized:
@@ -9260,6 +9262,7 @@ async function readRestoreAttachmentActivationPredecessorV1(
 async function readRestoreAttachmentActivationPredecessorV2(
   transaction,
   input,
+  generation,
   currentSession,
   forUpdate,
 ) {
@@ -9292,16 +9295,42 @@ async function readRestoreAttachmentActivationPredecessorV2(
   );
   validateCommittedOperationHistory(detachOperation, currentSession);
 
-  const capturePointer =
+  const detachPointer =
     detachOperation.expectedSession.document.lastOperation;
+  let captureBase = detachOperation.expectedSession;
+  let topology = "capture-predecessor";
+  if (
+    detachPointer?.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+    detachPointer.operationId === input.request.generation.operationId
+  ) {
+    ensure(
+      generation.operation.operationId ===
+          input.request.generation.operationId &&
+        generation.input.request.contractVersion ===
+          RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION &&
+        generation.operation.state === "committed" &&
+        generation.operation.result?.outcome ===
+          "restore-generation-committed",
+      "operation_state_invalid",
+    );
+    validateLastOperationPointer(
+      detachOperation.expectedSession,
+      generation.operation,
+      generation.reservation,
+    );
+    captureBase = generation.operation.expectedSession;
+    topology = "generation-predecessor";
+  }
+
+  const capturePointer = captureBase.document.lastOperation;
   ensure(
     capturePointer !== null &&
       capturePointer.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
       capturePointer.operationId === predecessor.captureOperationId &&
-      detachOperation.expectedSession.document.lifecycle === "ATTACHED" &&
-      detachOperation.expectedSession.document.launch === null &&
-      detachOperation.expectedSession.document.attachment !== null &&
-      detachOperation.expectedSession.document.attachment.attachmentId ===
+      captureBase.document.lifecycle === "ATTACHED" &&
+      captureBase.document.launch === null &&
+      captureBase.document.attachment !== null &&
+      captureBase.document.attachment.attachmentId ===
         predecessor.attachmentId,
     "operation_state_invalid",
   );
@@ -9324,7 +9353,7 @@ async function readRestoreAttachmentActivationPredecessorV2(
   );
   ensure(captureReservation !== null, "operation_state_invalid");
   validateLastOperationPointer(
-    detachOperation.expectedSession,
+    captureBase,
     captureOperation,
     captureReservation,
   );
@@ -9354,7 +9383,7 @@ async function readRestoreAttachmentActivationPredecessorV2(
       ) ===
         canonicalSerialize(
           canonicalJsonObject(
-            detachOperation.expectedSession.document.attachment,
+            captureBase.document.attachment,
             "operation_state_invalid",
           ),
         ),
@@ -9451,12 +9480,14 @@ async function readRestoreAttachmentActivationPredecessorV2(
     stopOperation,
     stopRelation,
     stopReservation,
+    topology,
   });
 }
 
 async function readRestoreAttachmentActivationPredecessor(
   transaction,
   input,
+  generation,
   currentSession,
   forUpdate,
 ) {
@@ -9471,6 +9502,7 @@ async function readRestoreAttachmentActivationPredecessor(
     : readRestoreAttachmentActivationPredecessorV2(
         transaction,
         input,
+        generation,
         currentSession,
         forUpdate,
       );
@@ -9491,6 +9523,7 @@ async function readRestoreAttachmentActivationCoreRelations(
   const predecessor = await readRestoreAttachmentActivationPredecessor(
     transaction,
     input,
+    generation,
     currentSession,
     forUpdate,
   );
@@ -10628,6 +10661,8 @@ async function finalizeWriterLaunchStop(store, options) {
 export class PostgresSessionAuthority {
   #restoreAttachmentActivationV2FleetCompatible;
 
+  #restoreAttachmentActivationV2GenerationPredecessorFleetCompatible;
+
   #restoreGenerationV2FleetCompatible;
 
   #store;
@@ -10657,18 +10692,50 @@ export class PostgresSessionAuthority {
       optionKeys,
       ["restoreGenerationV2FleetCompatible"],
     );
+    const hasRestoreAttachmentActivationV2GenerationPredecessorFleetCompatible =
+      reflectApply(
+        arrayIncludesIntrinsic,
+        optionKeys,
+        [
+          "restoreAttachmentActivationV2GenerationPredecessorFleetCompatible",
+        ],
+      );
     const expectedOptionKeys =
       hasRestoreAttachmentActivationV2FleetCompatible
-        ? hasRestoreGenerationV2FleetCompatible
-          ? [
-              "restoreAttachmentActivationV2FleetCompatible",
-              "restoreGenerationV2FleetCompatible",
-              "store",
-            ]
-          : ["restoreAttachmentActivationV2FleetCompatible", "store"]
-        : hasRestoreGenerationV2FleetCompatible
-          ? ["restoreGenerationV2FleetCompatible", "store"]
-          : ["store"];
+        ? hasRestoreAttachmentActivationV2GenerationPredecessorFleetCompatible
+          ? hasRestoreGenerationV2FleetCompatible
+            ? [
+                "restoreAttachmentActivationV2FleetCompatible",
+                "restoreAttachmentActivationV2GenerationPredecessorFleetCompatible",
+                "restoreGenerationV2FleetCompatible",
+                "store",
+              ]
+            : [
+                "restoreAttachmentActivationV2FleetCompatible",
+                "restoreAttachmentActivationV2GenerationPredecessorFleetCompatible",
+                "store",
+              ]
+          : hasRestoreGenerationV2FleetCompatible
+            ? [
+                "restoreAttachmentActivationV2FleetCompatible",
+                "restoreGenerationV2FleetCompatible",
+                "store",
+              ]
+            : ["restoreAttachmentActivationV2FleetCompatible", "store"]
+        : hasRestoreAttachmentActivationV2GenerationPredecessorFleetCompatible
+          ? hasRestoreGenerationV2FleetCompatible
+            ? [
+                "restoreAttachmentActivationV2GenerationPredecessorFleetCompatible",
+                "restoreGenerationV2FleetCompatible",
+                "store",
+              ]
+            : [
+                "restoreAttachmentActivationV2GenerationPredecessorFleetCompatible",
+                "store",
+              ]
+          : hasRestoreGenerationV2FleetCompatible
+            ? ["restoreGenerationV2FleetCompatible", "store"]
+            : ["store"];
     const normalized = exactPlainObject(
       options,
       expectedOptionKeys,
@@ -10695,6 +10762,9 @@ export class PostgresSessionAuthority {
       (!hasRestoreAttachmentActivationV2FleetCompatible ||
         typeof normalized.restoreAttachmentActivationV2FleetCompatible ===
           "boolean") &&
+        (!hasRestoreAttachmentActivationV2GenerationPredecessorFleetCompatible ||
+          typeof normalized.restoreAttachmentActivationV2GenerationPredecessorFleetCompatible ===
+            "boolean") &&
         (!hasRestoreGenerationV2FleetCompatible ||
           typeof normalized.restoreGenerationV2FleetCompatible ===
             "boolean"),
@@ -10702,6 +10772,9 @@ export class PostgresSessionAuthority {
     );
     this.#restoreAttachmentActivationV2FleetCompatible =
       normalized.restoreAttachmentActivationV2FleetCompatible === true;
+    this.#restoreAttachmentActivationV2GenerationPredecessorFleetCompatible =
+      normalized.restoreAttachmentActivationV2GenerationPredecessorFleetCompatible ===
+      true;
     this.#restoreGenerationV2FleetCompatible =
       normalized.restoreGenerationV2FleetCompatible === true;
     this.#store = normalized.store;
@@ -11322,11 +11395,18 @@ export class PostgresSessionAuthority {
           input.request.contractVersion ===
             RESTORE_ATTACHMENT_ACTIVATION_OPERATION_CONTRACT_VERSION_V2
         ) {
-          await readRestoreAttachmentActivationCoreRelations(
+          const relations = await readRestoreAttachmentActivationCoreRelations(
             transaction,
             input,
             session,
             true,
+          );
+          ensure(
+            relations.predecessor.topology !==
+                "generation-predecessor" ||
+              this
+                .#restoreAttachmentActivationV2GenerationPredecessorFleetCompatible,
+            "restore_attachment_activation_v2_generation_predecessor_fleet_capability_required",
           );
         }
         // Preserve operation recoverability: a prepared operation must retain
@@ -13188,6 +13268,7 @@ export class PostgresSessionAuthority {
           observed.launchAttempt !== null,
         "operation_transition_conflict",
       );
+      isAtomicRestoreAttachmentActivationLaunchHandoff(session, observed);
       if (observed.operation.state !== "prepared") {
         return operationReceipt({
           attempt: writerLaunchAttemptRecord(input, observed.operation),
@@ -13447,6 +13528,7 @@ export class PostgresSessionAuthority {
           observed.launchAttempt !== null,
         "writer_launch_attempt_not_authorized",
       );
+      isAtomicRestoreAttachmentActivationLaunchHandoff(session, observed);
       const launch =
         session.document.launch?.launchAttemptId === input.operationId
           ? session.document.launch
