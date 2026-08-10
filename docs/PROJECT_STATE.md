@@ -202,6 +202,11 @@
   After one confirmed physical stop, exact reconciliation selects revision 2
   only for an authority-proven `uncertain` stop and otherwise retains revision 1
   for terminal replay; neither path repeats the physical callback.
+  Intent preparation now also accepts an exact clean version 3 `DETACHED`
+  session after release or force-fence without reserving an operation or
+  consuming the image. An activation-materialized prepared attempt then runs
+  through the existing launcher exactly once; replay neither reserves nor
+  physically launches again.
 - Typed `writer-launch-stop-v1` authority preserves the original started
   attempt and clears the current-launch relation only for exact
   `complete-stopped` evidence from the bound supervisor. Historical stop or
@@ -236,11 +241,16 @@
   the actual production predecessor chain—committed current-writer stop,
   committed clean capture, then release or force-fence of the same old
   attachment—without requiring the stopped launch generation to equal the
-  target restore generation.
+  target restore generation. Its historical backward topology remains
+  detach-to-capture-to-stop compatible. Fresh work may now use the separately
+  gated detach-to-generation-to-capture-to-stop topology, with a committed
+  version 1 target generation between capture and detach.
 - Fresh restore-generation-v2 and capture-bound activation-v2 reservation are
   independently default-denied at the PostgreSQL authority boundary. Explicit
-  startup compatibility decisions permit only their matching request version,
-  while exact existing replay remains available after a gate closes.
+  startup compatibility decisions permit only their matching request version.
+  The generation-predecessor activation-v2 topology has its own independent
+  default-closed fleet gate, while old topology and exact existing replay remain
+  available after that gate closes.
 - A bounded restore recovery coordinator and service now cover retained
   destination generations, attachment activations, prepared or active launch
   attempts, and current-launch inventory through four independent keyset
@@ -257,10 +267,10 @@
   source-free committed verification. Version 2 callback behavior remains
   compatible, and the new transport seam does not enable `runRestore()`.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until later serial slices close activation/launch provenance, add the
-  cross-process fleet and recovery-scheduler guard, and wire committed
+  until later serial slices add the cross-process lifecycle guard and recovery
+  scheduler, then wire committed
   publication, detached activation, prepared launch, and no-relaunch recovery
-  into `runRestore()`.
+  into `runRestore()` behind the detached-production fleet gate.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -325,6 +335,8 @@
   `docs/project_journal/2026/08/2026-08-05-detached-restore-activation-3f91c2.md`
 - Capture-bound restore activation compatibility:
   `docs/project_journal/2026/08/2026-08-06-capture-bound-restore-activation-c4a2d8.md`
+- Activation launch compatibility:
+  `docs/project_journal/2026/08/2026-08-10-activation-launch-compatibility-a6e4c2.md`
 - Durable restore recovery cursors and bounded runner:
   `docs/project_journal/2026/08/2026-08-10-restore-recovery-cursors-5d82a1.md`
 - Durable stop-to-clean-capture composition:

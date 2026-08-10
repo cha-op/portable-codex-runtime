@@ -6,13 +6,16 @@ import {
   PlatformImageReservationCoordinator,
 } from "../src/platform-image-reservation.mjs";
 import {
+  RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   SESSION_OPERATION_CONFLICT_CLASS,
+  WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
+  WRITER_RELEASE_OPERATION_KIND,
   assertCommittedWriterLaunchStopTransitionProof,
   createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
@@ -39,6 +42,7 @@ const SESSION_ID = "019f3d80-0000-7000-8000-000000000001";
 const THREAD_ID = "019f3d80-0000-7000-8000-000000000002";
 const LAUNCH_ATTEMPT_ID = "writer-launch-attempt-001";
 const RESTORE_OPERATION_ID = "restore-generation-operation-001";
+const RESTORE_ACTIVATION_OPERATION_ID = "restore-activation-operation-001";
 const GENERATION_ID = "restore-generation-001";
 const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
@@ -1447,6 +1451,34 @@ function prepareIntentInput(value, overrides = {}) {
   };
 }
 
+function cleanDetachedPrepareSession(value, overrides = {}) {
+  const expectedSession = clone(value.expectedSession);
+  expectedSession.revision = "10";
+  expectedSession.document = {
+    ...expectedSession.document,
+    activeOperation: null,
+    attachment: null,
+    documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
+    lastOperation: {
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      expectedSessionRevision: "7",
+      kind: WRITER_RELEASE_OPERATION_KIND,
+      operationId: "writer-release-operation-001",
+      operationRevision: "2",
+      requestSha256: "6".repeat(64),
+      reservationId: "reservation-writer-release-operation-001",
+      resultSha256: "7".repeat(64),
+      state: "committed",
+    },
+    launch: null,
+    lease: null,
+    lifecycle: "DETACHED",
+    recovery: null,
+    ...overrides,
+  };
+  return expectedSession;
+}
+
 function preparedRunInput(value, overrides = {}) {
   return {
     imageReservation: value.imageReservation,
@@ -1495,6 +1527,48 @@ function seedPreparedLaunchHandoff(
     committedAt: PREPARED_TIME,
   };
   const expectedSession = preparedLaunchExpectedSession(value, generation);
+  value.authority.beginNextAttempt({ expectedSession, generation });
+  value.authority.behaviour.cancelPreparedHandoffConflict = true;
+  const request = createWriterLaunchAttemptOperationRequest({
+    expectedSession,
+    generation,
+    measuredImage,
+    supervisor,
+  });
+  value.authority.seed(request, state, launchEvidence);
+  return { expectedSession, generation, request };
+}
+
+function seedPreparedActivationLaunchHandoff(
+  value,
+  {
+    generationCommittedAt = BASE_TIME,
+    launchEvidence = null,
+    measuredImage = {
+      projection: value.reserved.projection,
+      runtimeIdentity: value.reserved.runtimeIdentity,
+    },
+    state = "prepared",
+    supervisor = {
+      contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+      supervisorId: SUPERVISOR_ID,
+    },
+  } = {},
+) {
+  const generation = {
+    ...clone(value.generation),
+    claimedAt: "2026-08-04T11:59:58.000Z",
+    committedAt: generationCommittedAt,
+  };
+  const expectedSession = preparedLaunchExpectedSession(value, generation);
+  expectedSession.updatedAt = PREPARED_TIME;
+  expectedSession.document.attachment.operationId =
+    RESTORE_ACTIVATION_OPERATION_ID;
+  expectedSession.document.lastOperation = {
+    ...expectedSession.document.lastOperation,
+    kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+    operationId: RESTORE_ACTIVATION_OPERATION_ID,
+  };
   value.authority.beginNextAttempt({ expectedSession, generation });
   value.authority.behaviour.cancelPreparedHandoffConflict = true;
   const request = createWriterLaunchAttemptOperationRequest({
@@ -2312,7 +2386,219 @@ test("prepares one exact durable launch seed without consuming or reserving", as
   assert.equal(value.launchCalls, 1);
 });
 
-test("runs an atomically prepared launch without reserving a second attempt", async () => {
+for (const terminalKind of [
+  WRITER_RELEASE_OPERATION_KIND,
+  WRITER_FORCE_FENCE_OPERATION_KIND,
+]) {
+  test(`prepares from a clean detached ${terminalKind} session without side effects`, async () => {
+    const value = await fixture();
+    const expectedSession = cleanDetachedPrepareSession(value);
+    expectedSession.document.lastOperation.kind = terminalKind;
+
+    const intent = await value.facade.prepareLaunchIntent(
+      prepareIntentInput(value, { expectedSession }),
+    );
+
+    assert.equal(intent.launchAttemptId, LAUNCH_ATTEMPT_ID);
+    assert.equal(value.authority.calls.read, 0);
+    assert.equal(value.authority.calls.reserve, 0);
+    assert.equal(value.authority.calls.claim, 0);
+    assert.equal(value.launchCalls, 0);
+    assert.equal(value.inspectionCount, 2);
+
+    const stillIssued = await value.imageReservations.revalidateReservation(
+      value.imageReservation,
+    );
+    assert.equal(Object.isFrozen(stillIssued), true);
+    assert.equal(value.inspectionCount, 3);
+  });
+}
+
+for (const [name, mutate] of [
+  [
+    "document version 2",
+    (document) => {
+      document.documentVersion = 2;
+    },
+  ],
+  [
+    "recovery state",
+    (document) => {
+      document.recovery = { phase: "restoring" };
+    },
+  ],
+  [
+    "active operation",
+    (document) => {
+      const { resultSha256, ...activeOperation } = document.lastOperation;
+      void resultSha256;
+      document.activeOperation = {
+        ...activeOperation,
+        state: "prepared",
+      };
+    },
+  ],
+  [
+    "launch pointer",
+    (document) => {
+      document.launch = { launchAttemptId: LAUNCH_ATTEMPT_ID };
+    },
+  ],
+  [
+    "attachment",
+    (document) => {
+      document.attachment = attachment();
+    },
+  ],
+  [
+    "lease",
+    (document) => {
+      document.lease = lease();
+    },
+  ],
+  [
+    "missing terminal operation",
+    (document) => {
+      document.lastOperation = null;
+    },
+  ],
+  [
+    "non-committed terminal operation",
+    (document) => {
+      document.lastOperation.state = "uncertain";
+    },
+  ],
+  [
+    "unrelated terminal operation",
+    (document) => {
+      document.lastOperation.kind =
+        RESTORE_DESTINATION_GENERATION_OPERATION_KIND;
+    },
+  ],
+  ...["ATTACHED", "ATTACHING", "BLOCKED", "FENCING", "RELEASING"].map(
+    (lifecycle) => [
+      `${lifecycle} lifecycle with detached fields`,
+      (document) => {
+        document.lifecycle = lifecycle;
+      },
+    ],
+  ),
+]) {
+  test(`rejects dirty or mixed detached prepare input with ${name}`, async () => {
+    const value = await fixture();
+    const expectedSession = cleanDetachedPrepareSession(value);
+    mutate(expectedSession.document);
+
+    await assert.rejects(
+      value.facade.prepareLaunchIntent(
+        prepareIntentInput(value, { expectedSession }),
+      ),
+      assertLauncherError("invalid_logical_writer_launch_request"),
+    );
+    assert.equal(value.authority.calls.read, 0);
+    assert.equal(value.authority.calls.reserve, 0);
+    assert.equal(value.authority.calls.claim, 0);
+    assert.equal(value.launchCalls, 0);
+    assert.equal(value.inspectionCount, 1);
+    assert.deepEqual(value.events, []);
+  });
+}
+
+for (const [name, mutate] of [
+  [
+    "terminal revision mismatch",
+    (expectedSession) => {
+      expectedSession.revision = "9";
+    },
+  ],
+  [
+    "malformed terminal hash",
+    (expectedSession) => {
+      expectedSession.document.lastOperation.requestSha256 =
+        "not-a-sha256";
+    },
+  ],
+  [
+    "malformed terminal operation id",
+    (expectedSession) => {
+      expectedSession.document.lastOperation.operationId =
+        "not an opaque id";
+    },
+  ],
+  [
+    "authority time rollback",
+    (expectedSession) => {
+      expectedSession.updatedAt = "2026-08-04T11:59:59.000Z";
+    },
+  ],
+  [
+    "storage identity mismatch",
+    (expectedSession) => {
+      expectedSession.document.storageRef.sessionId =
+        "019f3d80-0000-7000-8000-000000000003";
+    },
+  ],
+]) {
+  test(`rejects malformed detached authority snapshot with ${name}`, async () => {
+    const value = await fixture();
+    const expectedSession = cleanDetachedPrepareSession(value);
+    mutate(expectedSession);
+
+    await assert.rejects(
+      value.facade.prepareLaunchIntent(
+        prepareIntentInput(value, { expectedSession }),
+      ),
+      assertLauncherError("invalid_logical_writer_launch_request"),
+    );
+    assert.equal(value.authority.calls.read, 0);
+    assert.equal(value.authority.calls.reserve, 0);
+    assert.equal(value.authority.calls.claim, 0);
+    assert.equal(value.launchCalls, 0);
+    assert.equal(value.inspectionCount, 1);
+    assert.deepEqual(value.events, []);
+  });
+}
+
+test("runs an activation-materialized prepared launch once without reserving", async () => {
+  const value = await fixture();
+  const detachedSession = cleanDetachedPrepareSession(value);
+  const intent = await value.facade.prepareLaunchIntent(
+    prepareIntentInput(value, { expectedSession: detachedSession }),
+  );
+  const seeded = seedPreparedActivationLaunchHandoff(value, {
+    measuredImage: intent.measuredImage,
+    supervisor: intent.supervisor,
+  });
+
+  const started = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+  const replayed = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+
+  assert.equal(started.status, "started");
+  assert.strictEqual(replayed.writer, started.writer);
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.authority.calls.claim, 1);
+  assert.equal(value.authority.calls.finalizeStarted, 1);
+  assert.equal(value.launchCalls, 1);
+  assert.equal(value.reconcileCalls, 0);
+  assert.deepEqual(
+    JSON.parse(jsonStringify(value.authority.lastClaimInput)),
+    JSON.parse(
+      jsonStringify({
+        expectedOperationRevision: "0",
+        expectedSession: seeded.expectedSession,
+        kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+        operationId: LAUNCH_ATTEMPT_ID,
+        request: seeded.request,
+      }),
+    ),
+  );
+});
+
+test("retains the legacy generation-materialized prepared launch handoff", async () => {
   const value = await fixture();
   const intent = await value.facade.prepareLaunchIntent(
     prepareIntentInput(value),
@@ -2382,6 +2668,93 @@ test("runs an atomically prepared launch without reserving a second attempt", as
     "authority.finalize-started",
     `guard.exit:${LAUNCH_ATTEMPT_ID}`,
   ]);
+});
+
+for (const [name, mutateReceipt] of [
+  [
+    "hostile producer kind",
+    (receipt) => {
+      receipt.operation.expectedSession.document.lastOperation.kind =
+        WRITER_RELEASE_OPERATION_KIND;
+      receipt.session.document.lastOperation.kind =
+        WRITER_RELEASE_OPERATION_KIND;
+    },
+  ],
+  [
+    "hostile producer operation id",
+    (receipt) => {
+      receipt.operation.expectedSession.document.lastOperation.operationId =
+        "different-activation-operation-001";
+      receipt.session.document.lastOperation.operationId =
+        "different-activation-operation-001";
+    },
+  ],
+  [
+    "hostile atomic creation timestamps",
+    (receipt) => {
+      receipt.operation.createdAt = BASE_TIME;
+      receipt.reservation.createdAt = BASE_TIME;
+    },
+  ],
+  [
+    "hostile co-mutated atomic update timestamps",
+    (receipt) => {
+      receipt.operation.updatedAt = STARTING_TIME;
+      receipt.reservation.updatedAt = STARTING_TIME;
+      receipt.session.updatedAt = STARTING_TIME;
+    },
+  ],
+  [
+    "generation committed after activation",
+    (receipt) => {
+      receipt.operation.request.generation.committedAt = STARTING_TIME;
+      receipt.attempt.request.generation.committedAt = STARTING_TIME;
+    },
+  ],
+]) {
+  test(`rejects activation prepared relation with ${name} before image or provider use`, async () => {
+    const value = await fixture();
+    seedPreparedActivationLaunchHandoff(value);
+    value.authority.readReceiptMutation = (receipt) => {
+      mutateReceipt(receipt);
+      return receipt;
+    };
+
+    await assert.rejects(
+      value.facade.runPreparedLaunch(preparedRunInput(value)),
+      assertLauncherError("logical_writer_launch_outcome_uncertain"),
+    );
+    assert.equal(value.authority.state, "prepared");
+    assert.equal(value.authority.calls.reserve, 0);
+    assert.equal(value.authority.calls.claim, 0);
+    assert.equal(value.authority.calls.cancel, 0);
+    assert.equal(value.launchCalls, 0);
+    assert.equal(value.reconcileCalls, 0);
+    assert.equal(value.inspectionCount, 1);
+  });
+}
+
+test("activation claim acknowledgement loss reconciles without image consumption or relaunch", async () => {
+  const value = await fixture({ reconcileStatus: "not-started" });
+  seedPreparedActivationLaunchHandoff(value);
+  value.authority.behaviour.claimThrowAfterCommit = true;
+
+  const result = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+  const replay = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+
+  assert.equal(result.status, "not-started");
+  assert.equal(replay.status, "not-started");
+  assert.equal(value.authority.calls.reserve, 0);
+  assert.equal(value.authority.calls.claim, 1);
+  assert.equal(value.authority.calls.markUncertain, 1);
+  assert.equal(value.authority.calls.finalizeStopped, 1);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 1);
+  assert.equal(value.inspectionCount, 2);
 });
 
 test("cold launcher resumes a prepared attempt with a fresh equivalent image reservation", async () => {
