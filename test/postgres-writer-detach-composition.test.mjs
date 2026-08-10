@@ -261,6 +261,15 @@ function sha256Json(value) {
     .digest("hex");
 }
 
+function driftTerminalProof(receipt, proofKey) {
+  const drifted = structuredClone(receipt);
+  drifted.operation.result[proofKey].proofId = "proof-drifted-readback";
+  drifted.session.document.lastOperation.resultSha256 = sha256Json(
+    drifted.operation.result,
+  );
+  return deepFreeze(drifted);
+}
+
 class DetachGuardLockManager {
   constructor() {
     this.holders = new Map();
@@ -2171,6 +2180,92 @@ test("committed finalizer acknowledgement loss returns readback without provider
   assert.equal(
     fixture.calls.filter(([name]) => name === "reconcileOperation").length,
     1,
+  );
+});
+
+for (const lane of [
+  {
+    finalizer: "finalizeWriterRelease",
+    method: "detachWriter",
+    operationId: RELEASE_OPERATION_ID,
+    proofKey: "mutationResult",
+    provider: "detachAttachment",
+  },
+  {
+    finalizer: "finalizeWriterForceFence",
+    method: "forceFenceWriter",
+    operationId: FENCE_OPERATION_ID,
+    proofKey: "fenceResult",
+    provider: "forceFence",
+  },
+]) {
+  test(`${lane.method} rejects a committed ACK-loss readback with a different provider proof`, async () => {
+    const fixture = createHarness();
+    const expectedSession = fixture.state.session;
+    fixture.enqueue(lane.finalizer, {
+      error: new Error("finalizer acknowledgement lost"),
+      timing: "after",
+    });
+    fixture.enqueue("reconcileOperation", {
+      transform: (receipt) => driftTerminalProof(receipt, lane.proofKey),
+    });
+
+    await assert.rejects(
+      fixture.composition[lane.method](
+        request(expectedSession, lane.operationId),
+      ),
+      assertCode("postgres_writer_detach_composition_outcome_uncertain"),
+    );
+
+    assert.equal(
+      fixture.calls.filter(([name]) => name === lane.provider).length,
+      1,
+    );
+    assert.equal(
+      fixture.calls.filter(([name]) => name === lane.finalizer).length,
+      1,
+    );
+    assert.equal(
+      fixture.calls.filter(([name]) => name === "reconcileOperation").length,
+      1,
+    );
+  });
+}
+
+test("second finalizer ACK loss rejects a drifted committed readback proof", async () => {
+  const fixture = createHarness();
+  const expectedSession = fixture.state.session;
+  fixture.enqueue("finalizeWriterRelease", {
+    error: new Error("finalizer transaction rolled back"),
+    timing: "before",
+  });
+  fixture.enqueue("finalizeWriterRelease", {
+    error: new Error("finalizer acknowledgement lost"),
+    timing: "after",
+  });
+  fixture.enqueue("reconcileOperation", {});
+  fixture.enqueue("reconcileOperation", {
+    transform: (receipt) => driftTerminalProof(receipt, "mutationResult"),
+  });
+
+  await assert.rejects(
+    fixture.composition.detachWriter(
+      request(expectedSession, RELEASE_OPERATION_ID),
+    ),
+    assertCode("postgres_writer_detach_composition_outcome_uncertain"),
+  );
+
+  assert.equal(
+    fixture.calls.filter(([name]) => name === "detachAttachment").length,
+    1,
+  );
+  assert.equal(
+    fixture.calls.filter(([name]) => name === "finalizeWriterRelease").length,
+    2,
+  );
+  assert.equal(
+    fixture.calls.filter(([name]) => name === "reconcileOperation").length,
+    2,
   );
 });
 

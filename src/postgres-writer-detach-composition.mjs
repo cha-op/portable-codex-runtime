@@ -1118,19 +1118,30 @@ async function finalizeBlocked(authority, base, receipt, reason) {
   fail(code);
 }
 
-async function finalizeSuccess(authority, base, receipt, mode, proof) {
+async function finalizeSuccess(
+  authority,
+  base,
+  receipt,
+  mode,
+  providerRequest,
+  proof,
+) {
   const code = "postgres_writer_detach_composition_outcome_uncertain";
   const method =
     mode === "release"
       ? "finalizeWriterRelease"
       : "finalizeWriterForceFence";
   const proofKey = mode === "release" ? "mutationResult" : "fenceResult";
-  const expectedOutcome =
-    mode === "release" ? "writer-released" : "writer-fenced";
   let observed = receiptState(receipt, base, code);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (observed.state === "committed") {
-      return terminalResult(observed, base, expectedOutcome);
+      return terminalSuccessResult(
+        observed,
+        base,
+        mode,
+        providerRequest,
+        proof,
+      );
     }
     ensure(
       observed.state === "starting" || observed.state === "uncertain",
@@ -1142,17 +1153,25 @@ async function finalizeSuccess(authority, base, receipt, mode, proof) {
       [proofKey]: proof,
     });
     try {
-      return terminalResult(
+      return terminalSuccessResult(
         await protectPromise(invokeAsync(authority, method, [transition])),
         base,
-        expectedOutcome,
+        mode,
+        providerRequest,
+        proof,
       );
     } catch {
       observed = await protectPromise(reconcile(authority, base));
     }
   }
   if (observed.state === "committed") {
-    return terminalResult(observed, base, expectedOutcome);
+    return terminalSuccessResult(
+      observed,
+      base,
+      mode,
+      providerRequest,
+      proof,
+    );
   }
   fail(code);
 }
@@ -1356,6 +1375,38 @@ function validateProviderResult(value, request, mode) {
   }
 }
 
+function terminalSuccessResult(
+  receipt,
+  base,
+  mode,
+  providerRequest,
+  proof,
+) {
+  const code = "postgres_writer_detach_composition_outcome_uncertain";
+  const expectedOutcome =
+    mode === "release" ? "writer-released" : "writer-fenced";
+  const proofKey = mode === "release" ? "mutationResult" : "fenceResult";
+  const terminal = terminalResult(receipt, base, expectedOutcome);
+  const result = ownDataValue(terminal.operation, "result", code);
+  const storedProof = ownDataValue(result, proofKey, code);
+  const expectedProof = validateProviderResult(
+    proof,
+    providerRequest,
+    mode,
+  );
+  const actualProof = validateProviderResult(
+    storedProof,
+    providerRequest,
+    mode,
+  );
+  ensure(
+    ownDataValue(actualProof, "proofId", code) ===
+      ownDataValue(expectedProof, "proofId", code),
+    code,
+  );
+  return terminal;
+}
+
 async function executeDetach(
   authority,
   operationGuard,
@@ -1482,7 +1533,14 @@ async function executeDetach(
       );
     }
     return await protectPromise(
-      finalizeSuccess(authority, base, observed, mode, proof),
+      finalizeSuccess(
+        authority,
+        base,
+        observed,
+        mode,
+        providerRequest,
+        proof,
+      ),
     );
     }),
   );

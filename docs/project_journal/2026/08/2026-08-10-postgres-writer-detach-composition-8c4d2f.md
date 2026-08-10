@@ -90,6 +90,9 @@ fence proof.
 - The operation guard spans durable admission, provider execution, and
   terminal finalization. The provider receives only the authority-generated
   mutation or fence envelope.
+- A committed readback after finalizer acknowledgement loss is accepted only
+  when its persisted provider result validates against the original claim
+  envelope and carries the exact proof ID returned by this invocation.
 - Stable public completion omits replay-sensitive flags such as `acquired`,
   `dispatchGranted`, and `finalized`; it returns only the durable operation,
   reservation, and session.
