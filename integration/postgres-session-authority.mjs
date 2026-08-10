@@ -8288,6 +8288,13 @@ test(
           async finalizeWriterLaunchStopped(options) {
             return authority.finalizeWriterLaunchStopped(options);
           },
+          async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+              options,
+            );
+          },
           async markOperationUncertain(options) {
             return authority.markOperationUncertain(options);
           },
@@ -8754,6 +8761,13 @@ test(
           },
           async finalizeWriterLaunchStopped(options) {
             return authority.finalizeWriterLaunchStopped(options);
+          },
+          async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+              options,
+            );
           },
           async markOperationUncertain(options) {
             return authority.markOperationUncertain(options);
@@ -10369,13 +10383,16 @@ test(
             afterSessionId: recoveryCursor,
             limit: 1,
           });
-        assert.deepEqual(preparedPage.candidates, [
-          {
-            checkpoint: handoff.captureAdmission.checkpoint,
-            request: handoff.captureAdmission.request,
-            state: "prepared",
-          },
-        ]);
+        assert.deepEqual(
+          structuredClone(preparedPage.candidates),
+          structuredClone([
+            {
+              checkpoint: handoff.captureAdmission.checkpoint,
+              request: handoff.captureAdmission.request,
+              state: "prepared",
+            },
+          ]),
+        );
         const preparedRead =
           await authority.readCheckpointCaptureAttempt({
             checkpoint: handoff.captureAdmission.checkpoint,
