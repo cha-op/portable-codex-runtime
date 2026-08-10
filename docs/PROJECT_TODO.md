@@ -87,6 +87,15 @@
   current-launch recovery cursor per configured scope, and add a bounded
   single-flight runner that durably advances each settled lane before admitting
   the next. Keep the runner unscheduled and production restore fail-closed.
+- [done] Add a version 3 stopped-directory restore callback that passes the
+  complete authority-issued generation binding to fresh publication or
+  committed-only verification while preserving the legacy version 2 callback.
+- [pending] Admit capture-bound activation through the exact
+  detach-to-generation-to-capture-to-stop predecessor chain, and let the real
+  launcher prepare and consume an activation-materialized prepared launch.
+- [pending] Add a cross-process shared/exclusive restore lifecycle guard and a
+  bounded production recovery scheduler so foreground prepared launch cannot
+  race recovery cancellation.
 - [pending] Behind a separate detached-production fleet capability, wire
   committed restore publication, durable stop and clean capture, canonical
   detach, capture-bound activation, prepared launch, and the durable bounded

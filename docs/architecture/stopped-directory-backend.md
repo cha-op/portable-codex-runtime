@@ -17,7 +17,7 @@ prevents the adapter from inventing attachment or lease authority.
 
 The module exports:
 
-- `STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION`, with value `2`;
+- `STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION`, with value `3`;
 - `StoppedDirectoryBackendError`; and
 - `StoppedDirectoryBackend`.
 
@@ -55,6 +55,12 @@ The adapter separately advertises
 `captureReconciliationContractVersion: 1` and implements the optional
 `reconcileCheckpointCapture()` extension. The extension does not change the v1
 base storage-backend method set.
+
+The mutation authority may additionally expose the exact own-data field
+`restoreContextContractVersion`. Omitting it, or setting it to `2`, preserves
+the legacy restore callback contract. Version `3` selects the full typed
+generation-binding contract described below. Every other value, accessor, or
+extra authority field fails construction before a collaboration is invoked.
 
 When the lifecycle backend exposes both
 `restoreAttachmentActivationContractVersion: 1` and
@@ -224,7 +230,8 @@ request, backend-generated capture-attempt UUID, process and writer incarnation
 IDs, and stop operation ID. It does not contain the writer handle or the
 stopped-writer capability.
 
-The authority invokes `publish(context)` exactly once with:
+For the omitted or explicit version 2 authority contract, the authority invokes
+`publish(context)` exactly once with the historical context:
 
 ```js
 {
@@ -340,24 +347,54 @@ The authority invokes `publish(context)` exactly once with:
 the newer current fence, storage binding, predetermined result, trusted
 artefact proof, destination isolation proof, detached state, and complete path
 plan before calling `publishRestoreDestination()`. The restore publication
-binding remains at v1 independently of the v2 adapter and v2 capture binding,
-so an upgraded backend can still replay an exact committed restore started by
-the previous adapter version.
+binding remains the historical four-field v1 projection independently of the
+version 3 adapter and v2 capture binding, so an upgraded backend can still run
+a fresh legacy publication or replay an exact legacy journal state.
+
+Version 3 requires the same context plus exact own-data `generationBinding` and
+`publicationMode` fields. `generationBinding` is the complete eleven-field
+binding issued by the PostgreSQL generation claim: the old source attachment,
+capture attempt and operation IDs, catalogue digest, checkpoint, binding
+contract version, destination isolation proof, detached destination state,
+generation ID, restore request, and operation reservation ID. The backend
+rebuilds a defensive deeply frozen copy and binds every independently provable
+field before publication. In particular, it binds the checkpoint and restore
+request, capture operation and artefact proof, reservation and isolation proof,
+and the old attachment's session, backend, storage, lease, holder, and fence.
+The old attachment root must be a canonical absolute path disjoint from both
+the checkpoint artefact and the new detached destination. It is not the new
+destination root and path comparison does not claim filesystem-object identity.
+The capture-attempt ID, catalogue digest, generation ID, and attachment proof
+identifiers have no second callback authority source; they are strictly
+validated and retained in the exact whole binding rather than reconstructed.
+
+`publicationMode` is closed to two values. `fresh-or-exact-replay` invokes
+`publishRestoreDestination()` and may create an absent destination or replay an
+exact journal state. `committed-only` invokes only
+`verifyCommittedRestoreDestination()` without a source artefact path; it cannot
+prepare, copy, rename, or commit publication state. Both modes pass the full
+generation binding as the publication coordinator binding and accept only a
+contract v3 materialisation carrying its coordinator digest. Committed-only
+verification additionally requires `replayed: true`. A reduced, null,
+accessor-backed, proxied, mismatched, or legacy-materialisation version 3
+completion fails closed.
 
 The frozen restore completion contains `materialization`, `replayed`, and
-`result`. A fresh restore materialisation is contract v3 and carries the
-publication journal's digest of this adapter's exact v1 coordinator binding.
-For upgrade recovery, a completion with `replayed: true` may instead retain an
-exact historical contract v2 materialisation without that digest; the backend
-rejects the same v2 shape on a non-replayed outcome. This read-only physical
+`result`. A version 3 restore materialisation carries the publication journal's
+digest of the exact full coordinator binding. Only the legacy version 2
+callback may accept an exact historical contract v2 materialisation without
+that digest, and only when `replayed: true`; the backend rejects that shape for
+fresh legacy output and for every version 3 callback. This read-only physical
 replay does not make the legacy result admissible to a typed generation
 authority. The adapter's v1 coordinator projection is sufficient only for
 legacy adapter replay; it is not the complete typed generation binding required
-by PostgreSQL generation document v2. A later production composition must pass
-the exact claimed generation binding to the publisher. The authority must
-durably finalize launcher-visible destination state and return that same
-completion object before the backend reports success. A published path or
-journal record alone is not writable-launch authority.
+by PostgreSQL generation document v2. Version 3 now transports that complete
+binding without enabling production restore by itself. The production mutation
+authority still fails closed until the remaining stop, detach, activation,
+launch, fleet-gate, and recovery-scheduler composition lands. Once enabled, the
+authority must durably finalize launcher-visible destination state and return
+the same completion object before the backend reports success. A published path
+or journal record alone is not writable-launch authority.
 
 ## Detached Restore Attachment Activation
 

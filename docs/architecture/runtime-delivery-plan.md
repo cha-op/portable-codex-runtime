@@ -265,6 +265,13 @@ Restore and launcher authority are now split into eight serial pull requests:
      finalization. Retained ambiguous dispatch cannot replay a storage call,
      while a valid proof can replay only its database finalizer after
      acknowledgement loss. The facade is not scheduled yet.
+   - The full publication-binding transport prerequisite is complete: stopped
+     backend contract version 3 carries the complete authority-issued
+     generation binding to fresh publication or committed-only verification,
+     while the legacy callback retains its historical reduced binding.
+   - Capture-bound activation-to-launch provenance and a cross-process
+     foreground/recovery lifecycle guard remain separate serial prerequisites;
+     `runRestore()` stays fail-closed until both land.
    - Wire publication, durable stop and clean capture, canonical detach,
      capture-bound activation, prepared launch, no-relaunch recovery, and
      the durable recovery runner through the production checkpoint adapter
