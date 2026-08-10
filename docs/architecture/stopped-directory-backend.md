@@ -300,11 +300,14 @@ new writer-access grant, so expiry alone does not invalidate this continuation.
 The callback calls `publishFreshCheckpointArtifact()` and requires
 `replayed: false`. It never adopts an existing journal record. After the
 dispatch grant may have committed, any publication or finalization ambiguity
-leaves the durable operation active or uncertain and fails closed; this method
-is never invoked again for `starting` or `uncertain` state. Those states route
-only through `reconcileCheckpointCapture()`, whose verifier has no source path
-and accepts only an already committed journal publication. Thus an ambiguous
-grant cannot produce a second fresh publication.
+leaves the durable operation active or uncertain and fails closed. A caller
+retry may present a cached `prepared` handoff receipt and invoke this method
+again, but the mutation authority re-reads the durable operation and rejects
+an already `starting`, `uncertain`, or `committed` state before the fresh
+publication callback. The caller then routes through
+`reconcileCheckpointCapture()`, whose verifier has no source path and accepts
+only an already committed journal publication. Thus an ambiguous grant cannot
+produce a second fresh publication.
 
 ## Committed Capture Reconciliation
 

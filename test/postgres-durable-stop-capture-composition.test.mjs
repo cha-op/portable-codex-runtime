@@ -121,9 +121,10 @@ function mutationResult(request) {
   };
 }
 
-function createBackend({ capture, resumePrepared } = {}) {
+function createBackend({ capture, reconcile, resumePrepared } = {}) {
   const calls = [];
   const preparedCalls = [];
+  const reconciliationCalls = [];
   const operation = async () => {};
   const backend = {
     contractVersion: 1,
@@ -137,6 +138,15 @@ function createBackend({ capture, resumePrepared } = {}) {
     async captureCheckpoint(input) {
       calls.push(input);
       if (capture) return capture.call(this, input);
+      return {
+        checkpoint: input.checkpoint,
+        mutation: mutationResult(input.request),
+      };
+    },
+    captureReconciliationContractVersion: 1,
+    async reconcileCheckpointCapture(input) {
+      reconciliationCalls.push(input);
+      if (reconcile) return reconcile.call(this, input);
       return {
         checkpoint: input.checkpoint,
         mutation: mutationResult(input.request),
@@ -158,7 +168,7 @@ function createBackend({ capture, resumePrepared } = {}) {
     },
     restoreCheckpoint: operation,
   };
-  return { backend, calls, preparedCalls };
+  return { backend, calls, preparedCalls, reconciliationCalls };
 }
 
 function captureOptions(backend) {
@@ -299,7 +309,7 @@ function captureExpectedSession(stopOperationId) {
   });
 }
 
-function preparedStoppedCaptureResult(capture) {
+function preparedStoppedCaptureResult(capture, status = "prepared") {
   const stopOperationId = derivePostgresLogicalWriterStopOperationId({
     ...capture,
     launchAttemptId: LAUNCH_ATTEMPT_ID,
@@ -327,12 +337,12 @@ function preparedStoppedCaptureResult(capture) {
     operationId: capture.request.operationId,
     request: captureIntent,
     sessionId: SESSION_ID,
-    state: "prepared",
+    state: status,
   });
   const captureReservation = deepFreeze({
     operationId: capture.request.operationId,
     sessionId: SESSION_ID,
-    state: "prepared",
+    state: status === "committed" ? "released" : status,
   });
   return deepFreeze({
     capture: {
@@ -342,7 +352,7 @@ function preparedStoppedCaptureResult(capture) {
     evidence: stopped.evidence,
     resolution: stopped.resolution,
     session: stopped.stop.session,
-    status: "prepared",
+    status,
     stop: {
       finalized: stopped.stop.finalized,
       operation: stopped.stop.operation,
@@ -354,6 +364,7 @@ function preparedStoppedCaptureResult(capture) {
 
 function createLauncher({
   preparedRetire,
+  preparedStatus = "prepared",
   preparedStop,
   retire,
   stop,
@@ -380,7 +391,11 @@ function createLauncher({
   };
   const stopWriterForPreparedCapture = async function (input) {
     calls.preparedStop.push(input);
-    const defaultStopped = preparedStoppedCaptureResult(input);
+    const status =
+      typeof preparedStatus === "function"
+        ? preparedStatus(input, calls.preparedStop.length)
+        : preparedStatus;
+    const defaultStopped = preparedStoppedCaptureResult(input, status);
     fixture.defaultStopped = defaultStopped;
     if (preparedStop) return preparedStop(input, defaultStopped);
     return defaultStopped;
@@ -556,10 +571,8 @@ test("prepared capture path publishes only after one atomic stop handoff", async
       order.push("prepared-capture");
       assert.strictEqual(input.checkpoint, stopInput.checkpoint);
       assert.strictEqual(input.request, stopInput.request);
-      return {
-        checkpoint: input.checkpoint,
-        mutation: mutationResult(input.request),
-      };
+      return launcherFixture.defaultStopped.capture.operation.request
+        .predeterminedResult;
     },
   });
   const launcherFixture = createLauncher({
@@ -595,10 +608,226 @@ test("prepared capture path publishes only after one atomic stop handoff", async
   assert.equal(preparedCalls.length, 1);
   assert.equal(launcherFixture.calls.preparedRetire.length, 1);
   assert.equal(launcherFixture.calls.retire.length, 0);
-  assert.deepEqual(result, {
-    checkpoint: stopInput.checkpoint,
-    mutation: mutationResult(stopInput.request),
+  assert.deepEqual(
+    result,
+    structuredClone(
+      launcherFixture.defaultStopped.capture.operation.request
+        .predeterminedResult,
+    ),
+  );
+});
+
+test("prepared capture requires committed reconciliation support before stopping", async () => {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend();
+  delete backend.captureReconciliationContractVersion;
+  delete backend.reconcileCheckpointCapture;
+  const launcherFixture = createLauncher();
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
   });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "invalid_postgres_durable_stop_capture_composition_request",
+    ),
+  );
+  assert.equal(launcherFixture.calls.preparedStop.length, 0);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(reconciliationCalls.length, 0);
+});
+
+test("recovery-advanced prepared captures use committed-only reconciliation", async (t) => {
+  for (const status of ["starting", "uncertain", "committed"]) {
+    await t.test(status, async () => {
+      const order = [];
+      const {
+        backend,
+        calls: legacyCaptureCalls,
+        preparedCalls,
+        reconciliationCalls,
+      } = createBackend({
+        reconcile(input) {
+          order.push("reconcile");
+          assert.equal(input.request.operationId, "operation-checkpoint-001");
+          return launcherFixture.defaultStopped.capture.operation.request
+            .predeterminedResult;
+        },
+        resumePrepared() {
+          assert.fail("advanced capture state must not fresh-publish");
+        },
+      });
+      const launcherFixture = createLauncher({
+        preparedRetire(input) {
+          order.push("retire");
+          return input.result;
+        },
+        preparedStatus: status,
+        preparedStop(_input, stopped) {
+          order.push("atomic-stop");
+          assert.equal(stopped.status, status);
+          return stopped;
+        },
+      });
+      const composition = createPostgresDurableStopCaptureComposition({
+        launcher: launcherFixture.launcher,
+      });
+
+      const result = await composition.runPreparedCapture(
+        captureOptions(backend),
+      );
+
+      assert.deepEqual(order, ["atomic-stop", "reconcile", "retire"]);
+      assert.deepEqual(
+        result,
+        structuredClone(
+          launcherFixture.defaultStopped.capture.operation.request
+            .predeterminedResult,
+        ),
+      );
+      assert.equal(legacyCaptureCalls.length, 0);
+      assert.equal(preparedCalls.length, 0);
+      assert.equal(reconciliationCalls.length, 1);
+      assert.equal(launcherFixture.calls.preparedRetire.length, 1);
+      assert.equal(launcherFixture.calls.retire.length, 0);
+    });
+  }
+});
+
+test("advanced prepared capture rejects a non-predetermined committed result before retirement", async () => {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend({
+    reconcile(input) {
+      return {
+        checkpoint: input.checkpoint,
+        mutation: mutationResult(input.request),
+      };
+    },
+    resumePrepared() {
+      assert.fail("advanced capture state must not fresh-publish");
+    },
+  });
+  const launcherFixture = createLauncher({ preparedStatus: "committed" });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(reconciliationCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+});
+
+test("advanced prepared capture reconciliation failure preserves the stopped record", async () => {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend({
+    reconcile() {
+      throw new Error("committed verification unavailable");
+    },
+    resumePrepared() {
+      assert.fail("advanced capture state must not fresh-publish");
+    },
+  });
+  const launcherFixture = createLauncher({ preparedStatus: "uncertain" });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(reconciliationCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+});
+
+test("prepared capture acknowledgement loss replays through committed verification without republishing", async () => {
+  let freshPublications = 0;
+  let resumeInvocations = 0;
+  let reconciliationInvocations = 0;
+  let committedResult = null;
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend({
+    reconcile() {
+      reconciliationInvocations += 1;
+      assert.notEqual(committedResult, null);
+      if (reconciliationInvocations === 1) {
+        throw new Error("committed verification not yet observable");
+      }
+      return committedResult;
+    },
+    resumePrepared() {
+      resumeInvocations += 1;
+      if (resumeInvocations === 1) {
+        freshPublications += 1;
+        committedResult =
+          launcherFixture.defaultStopped.capture.operation.request
+            .predeterminedResult;
+        throw new Error("publication acknowledgement lost");
+      }
+      throw new Error("capture is no longer prepared");
+    },
+  });
+  const launcherFixture = createLauncher();
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(freshPublications, 1);
+  assert.equal(preparedCalls.length, 1);
+  assert.equal(reconciliationCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+
+  const result = await composition.runPreparedCapture(
+    captureOptions(backend),
+  );
+
+  assert.equal(freshPublications, 1);
+  assert.equal(resumeInvocations, 2);
+  assert.equal(preparedCalls.length, 2);
+  assert.equal(reconciliationCalls.length, 2);
+  assert.equal(launcherFixture.calls.preparedStop.length, 2);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 1);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.deepEqual(result, structuredClone(committedResult));
 });
 
 test("prepared capture binds every durable intent field before publication", async (t) => {

@@ -194,6 +194,14 @@ const PREPARED_CAPTURE_RESULT_KEYS = objectFreeze([
   "checkpoint",
   "mutation",
 ]);
+const PREPARED_CAPTURE_HANDOFF_RECEIPT_KEYS = objectFreeze([
+  "capture",
+  "evidence",
+  "resolution",
+  "session",
+  "status",
+  "stop",
+]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 const SESSION_KEYS = objectFreeze([
   "createdAt",
@@ -3218,6 +3226,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       launch: null,
       launchAttemptId: claim.attempt.launchAttemptId,
       pendingStop: null,
+      preparedCaptureHandoffReceipt: null,
       processIncarnationId: evidence.processIncarnationId,
       request: claim.attempt.request,
       state: "registering",
@@ -3947,6 +3956,88 @@ export function createPostgresLogicalWriterLauncher(...args) {
     });
   }
 
+  function validatePreparedCaptureHandoffState(record, capture) {
+    ensure(
+      record.state === "stopped" &&
+        record.stopContractVersion ===
+          WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION &&
+        record.authorizedCapture !== null &&
+        sameContent(record.authorizedCapture, capture, outcomeCode) &&
+        record.authorizedStopOperationId ===
+          stopOperationId(capture, record.launchAttemptId, outcomeCode) &&
+        record.stopBaseInput !== null &&
+        record.stopBaseInput.operationId ===
+          record.authorizedStopOperationId &&
+        record.stopBaseInput.request.contractVersion ===
+          WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION &&
+        typeof record.stopClaimToken === "string" &&
+        regexpTest(UUID_PATTERN, record.stopClaimToken) &&
+        stopClaimTokenMatchesRequest(
+          record.stopClaimToken,
+          record.stopBaseInput.request,
+          outcomeCode,
+        ) &&
+        record.stopEvidence !== null &&
+        record.stopReceipt !== null,
+      outcomeCode,
+    );
+    const normalizedStopReceipt = normalizeStopCaptureHandoffReceipt(
+      record.stopReceipt,
+      record.stopBaseInput,
+      record.stopClaimToken,
+      record.stopEvidence,
+      false,
+    );
+    ensure(
+      sameContent(normalizedStopReceipt, record.stopReceipt, outcomeCode),
+      outcomeCode,
+    );
+  }
+
+  function replayPreparedCaptureHandoff(record, capture) {
+    validatePreparedCaptureHandoffState(record, capture);
+    const receipt = record.preparedCaptureHandoffReceipt;
+    ensure(receipt !== null && objectIsFrozen(receipt), outcomeCode);
+    const stored = exactDataObject(
+      receipt,
+      PREPARED_CAPTURE_HANDOFF_RECEIPT_KEYS,
+      outcomeCode,
+    );
+    const resolution = normalizeStopResolution(
+      stored.resolution,
+      outcomeCode,
+    );
+    ensure(
+      stored.capture === record.stopReceipt.capture &&
+        stored.evidence === record.stopEvidence &&
+        stored.session === record.stopReceipt.session &&
+        stored.status === record.stopReceipt.status &&
+        stored.stop === record.stopReceipt.stop &&
+        resolution.writer === record.writer &&
+        sameContent(
+          resolution,
+          resolutionForRecord(record),
+          outcomeCode,
+        ),
+      outcomeCode,
+    );
+    return receipt;
+  }
+
+  function storePreparedCaptureHandoff(record, capture) {
+    ensure(record.preparedCaptureHandoffReceipt === null, outcomeCode);
+    validatePreparedCaptureHandoffState(record, capture);
+    record.preparedCaptureHandoffReceipt = exactFrozenRecord({
+      capture: record.stopReceipt.capture,
+      evidence: record.stopEvidence,
+      resolution: resolutionForRecord(record),
+      session: record.stopReceipt.session,
+      status: record.stopReceipt.status,
+      stop: record.stopReceipt.stop,
+    });
+    return replayPreparedCaptureHandoff(record, capture);
+  }
+
   function validateCurrentStopSession(session, record, code) {
     let manifest;
     let currentLease;
@@ -4330,9 +4421,14 @@ export function createPostgresLogicalWriterLauncher(...args) {
   ) {
     ensure(stopArgs.length === 1, optionCode);
     const capture = normalizeCaptureTuple(stopArgs[0], optionCode);
+    const acceptedRecordStates =
+      stopContractVersion ===
+      WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION
+        ? ["ready", "stopped"]
+        : ["ready"];
     const initialRecord = captureRecord(
       capture,
-      ["ready"],
+      acceptedRecordStates,
       optionCode,
       stopContractVersion,
     );
@@ -4352,12 +4448,20 @@ export function createPostgresLogicalWriterLauncher(...args) {
             const probe = normalizeProbe(probeValue, outcomeCode);
             const record = captureRecord(
               capture,
-              ["ready"],
+              acceptedRecordStates,
               optionCode,
               stopContractVersion,
             );
             ensure(record === initialRecord, optionCode);
             await assertGuardHeld(probe, outcomeCode);
+            if (record.state === "stopped") {
+              ensure(
+                stopContractVersion ===
+                  WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
+                outcomeCode,
+              );
+              return replayPreparedCaptureHandoff(record, capture);
+            }
             let baseInput = record.stopBaseInput;
             const retainedBaseInput = baseInput !== null;
             if (baseInput === null) {
@@ -4557,14 +4661,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 }),
                 outcomeCode,
               );
-              return exactFrozenRecord({
-                capture: record.stopReceipt.capture,
-                evidence: record.stopEvidence,
-                resolution: resolutionForRecord(record),
-                session: record.stopReceipt.session,
-                status: record.stopReceipt.status,
-                stop: record.stopReceipt.stop,
-              });
+              return storePreparedCaptureHandoff(record, capture);
             }
             return exactFrozenRecord({
               capability,

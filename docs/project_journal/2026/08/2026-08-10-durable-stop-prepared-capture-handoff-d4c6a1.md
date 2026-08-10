@@ -70,6 +70,13 @@ fail-closed.
 - A committed capture finalizer whose acknowledgement is lost is recovered by
   exact committed readback and returns the original fresh completion by
   identity. It does not publish again or weaken the backend callback contract.
+- A retained V3 stopped record caches the exact frozen atomic handoff receipt.
+  An exact retry replays that receipt under the same operation guard without a
+  second authority transition or physical stop. Only a truly `prepared`
+  operation may reach the fresh publication callback; a stale prepared receipt
+  is rejected by authority before that callback and falls back to source-free
+  committed verification. The exact predetermined result is revalidated before
+  local retirement.
 - If capture claim commits but the process dies before publication, or if the
   filesystem journal is noncommitted after publication begins, recovery stays
   pending. Reacquiring an advisory guard does not prove the old callback

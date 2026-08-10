@@ -4,8 +4,10 @@ import {
   assertPreparedCleanCheckpointResult,
   capturePreparedCleanCheckpoint,
   prepareCleanCheckpointCapture,
+  reconcileCleanCheckpointCapture,
 } from "./session-snapshot-core.mjs";
 import {
+  assertCheckpointCaptureReconciliationBackend,
   assertPreparedCheckpointCaptureBackend,
 } from "./session-storage-contracts.mjs";
 import {
@@ -1038,6 +1040,7 @@ export function createPostgresDurableStopCaptureComposition(options) {
       backend = assertPreparedCheckpointCaptureBackend(
         preparedCapture.backend,
       );
+      assertCheckpointCaptureReconciliationBackend(backend);
       resumePreparedCheckpointCapture =
         backend.resumePreparedCheckpointCapture;
     } catch {
@@ -1077,25 +1080,66 @@ export function createPostgresDurableStopCaptureComposition(options) {
       fail(outcomeCode);
     }
 
-    let pendingCapture;
+    let predeterminedResult;
     try {
-      pendingCapture = reflectApply(resumePreparedCheckpointCapture, backend, [
-        objectFreeze({
-          checkpoint: preparedCapture.checkpoint,
-          request: preparedCapture.request,
-        }),
-      ]);
+      predeterminedResult = assertPreparedCleanCheckpointResult({
+        preparedCapture,
+        result: stopped.capture.operation.request.predeterminedResult,
+      });
     } catch {
       fail(outcomeCode);
     }
-    pendingCapture = normalizeSafeNativePromise(pendingCapture);
-    ensure(pendingCapture !== null, outcomeCode);
 
     let resultValue;
-    try {
-      resultValue = await pendingCapture;
-    } catch {
-      fail(outcomeCode);
+    let requiresCommittedReconciliation = stopped.status !== "prepared";
+    if (!requiresCommittedReconciliation) {
+      try {
+        let pendingCapture = reflectApply(
+          resumePreparedCheckpointCapture,
+          backend,
+          [
+            objectFreeze({
+              checkpoint: preparedCapture.checkpoint,
+              request: preparedCapture.request,
+            }),
+          ],
+        );
+        pendingCapture = normalizeSafeNativePromise(pendingCapture);
+        ensure(pendingCapture !== null, outcomeCode);
+        resultValue = await pendingCapture;
+      } catch {
+        // A recovery worker may have claimed the prepared handoff after the
+        // stop receipt was read. From this point forward only source-free
+        // committed verification may settle the retained local record.
+        requiresCommittedReconciliation = true;
+      }
+    }
+    if (requiresCommittedReconciliation) {
+      let pendingCapture;
+      try {
+        pendingCapture = reflectApply(
+          reconcileCleanCheckpointCapture,
+          undefined,
+          [
+            objectFreeze({
+              backend,
+              checkpoint: preparedCapture.checkpoint,
+              manifest: preparedCapture.manifest,
+              request: preparedCapture.request,
+              storageRef: preparedCapture.storageRef,
+            }),
+          ],
+        );
+      } catch {
+        fail(outcomeCode);
+      }
+      pendingCapture = normalizeSafeNativePromise(pendingCapture);
+      ensure(pendingCapture !== null, outcomeCode);
+      try {
+        resultValue = await pendingCapture;
+      } catch {
+        fail(outcomeCode);
+      }
     }
     let result;
     try {
@@ -1103,11 +1147,13 @@ export function createPostgresDurableStopCaptureComposition(options) {
         preparedCapture,
         result: resultValue,
       });
+      ensure(sameFrozenData(result, predeterminedResult), outcomeCode);
     } catch {
       fail(outcomeCode);
     }
 
     let retirement;
+    let normalizedRetirement;
     try {
       retirement = reflectApply(retirePreparedCapture, launcher, [
         objectFreeze({
@@ -1115,10 +1161,15 @@ export function createPostgresDurableStopCaptureComposition(options) {
           result,
         }),
       ]);
+      normalizedRetirement = assertPreparedCleanCheckpointResult({
+        preparedCapture,
+        result: retirement,
+      });
     } catch {
+      drainRetirementPromise(retirement);
       fail(retirementCode);
     }
-    if (!sameFrozenData(retirement, result)) {
+    if (!sameFrozenData(normalizedRetirement, result)) {
       drainRetirementPromise(retirement);
       fail(retirementCode);
     }

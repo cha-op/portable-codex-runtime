@@ -2063,6 +2063,146 @@ test("prepared capture stop atomically materializes one durable capture handoff"
   );
 });
 
+test("prepared capture stop replays only the exact retained handoff", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const capture = resolverInput(value);
+
+  const stopped = await value.facade.stopWriterForPreparedCapture(capture);
+  const authorityCallsAfterStop = clone(value.authority.calls);
+  const guardCallsAfterStop = value.operationGuard.calls;
+
+  const replayed = await value.facade.stopWriterForPreparedCapture(capture);
+
+  assert.strictEqual(replayed, stopped);
+  assert.equal(Object.isFrozen(replayed), true);
+  assert.equal(value.operationGuard.calls, guardCallsAfterStop + 1);
+  assert.deepEqual(value.authority.calls, authorityCallsAfterStop);
+  assert.equal(value.supervisorStopCalls, 1);
+
+  const mismatchedCapture = clone(capture);
+  mismatchedCapture.request.operationId =
+    "checkpoint-capture-operation-mismatch";
+  await assert.rejects(
+    value.facade.stopWriterForPreparedCapture(mismatchedCapture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  await assert.rejects(
+    value.facade.stopWriterForCapture(capture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.deepEqual(value.authority.calls, authorityCallsAfterStop);
+  assert.equal(value.supervisorStopCalls, 1);
+
+  value.facade.retirePreparedCapture({
+    resolution: stopped.resolution,
+    result: stopped.stop.operation.request.captureIntent.predeterminedResult,
+  });
+  await assert.rejects(
+    value.facade.stopWriterForPreparedCapture(capture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.deepEqual(value.authority.calls, authorityCallsAfterStop);
+  assert.equal(value.supervisorStopCalls, 1);
+});
+
+test("real launcher retry reconciles a retained prepared capture without republishing", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const capture = resolverInput(value);
+  let stoppedReceipt = null;
+  let resumeInvocations = 0;
+  let reconciliationInvocations = 0;
+  let physicalPublications = 0;
+  let committedResult = null;
+
+  const stopWriterForPreparedCapture = async function (input) {
+    stoppedReceipt = await value.facade.stopWriterForPreparedCapture(input);
+    return stoppedReceipt;
+  };
+  Object.freeze(stopWriterForPreparedCapture);
+  const launcher = Object.freeze({
+    retirePreparedCapture: value.facade.retirePreparedCapture,
+    retireStoppedWriter: value.facade.retireStoppedWriter,
+    stopWriterForCapture: value.facade.stopWriterForCapture,
+    stopWriterForPreparedCapture,
+  });
+
+  const operation = async () => undefined;
+  const backend = {
+    backendId: BACKEND_ID,
+    capabilities: backendCapabilities(),
+    captureReconciliationContractVersion: 1,
+    contractVersion: 1,
+    destroySession: operation,
+    detachAttachment: operation,
+    forceFence: operation,
+    prepareWritableAttachment: operation,
+    preparedCheckpointCaptureContractVersion: 1,
+    provisionSession: operation,
+    async reconcileCheckpointCapture() {
+      reconciliationInvocations += 1;
+      assert.notEqual(committedResult, null);
+      if (reconciliationInvocations === 1) {
+        throw new Error("committed publication is not visible yet");
+      }
+      return committedResult;
+    },
+    async resumePreparedCheckpointCapture() {
+      resumeInvocations += 1;
+      if (resumeInvocations === 1) {
+        physicalPublications += 1;
+        committedResult =
+          stoppedReceipt.capture.operation.request.predeterminedResult;
+        throw new Error("publication acknowledgement lost");
+      }
+      throw new Error("durable capture is no longer prepared");
+    },
+    restoreCheckpoint: operation,
+    captureCheckpoint: operation,
+  };
+  const composition = createPostgresDurableStopCaptureComposition({ launcher });
+  const options = {
+    attachment: capture.attachment,
+    backend,
+    canonicalLease: lease(),
+    checkpointClass: capture.checkpoint.checkpointClass,
+    createdAt: capture.checkpoint.createdAt,
+    manifest: value.image.manifest,
+    now: Date.parse(BASE_TIME),
+    request: capture.request,
+    storageRef: storageRef(),
+  };
+
+  await assert.rejects(
+    composition.runPreparedCapture(options),
+    (error) => {
+      assert.equal(
+        error?.code,
+        "postgres_durable_stop_capture_composition_outcome_uncertain",
+      );
+      return true;
+    },
+  );
+  assert.equal(physicalPublications, 1);
+  assert.equal(resumeInvocations, 1);
+  assert.equal(reconciliationInvocations, 1);
+  assert.equal(value.supervisorStopCalls, 1);
+
+  const result = await composition.runPreparedCapture(options);
+
+  assert.deepEqual(result, structuredClone(committedResult));
+  assert.equal(physicalPublications, 1);
+  assert.equal(resumeInvocations, 2);
+  assert.equal(reconciliationInvocations, 2);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.throws(
+    () => value.facade.resolveStoppedWriter(capture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.stoppedWriterCoordinator.dispose(), undefined);
+});
+
 test("prepared capture handoff acknowledgement loss uses exact atomic readback", async () => {
   const value = await fixture();
   await value.facade.runLaunch(runInput(value));
