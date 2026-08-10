@@ -22,6 +22,10 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
+  PostgresWriterDetachCompositionError,
+  createPostgresWriterDetachComposition,
+} from "../src/postgres-writer-detach-composition.mjs";
+import {
   PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
 } from "../src/postgres-logical-writer-launcher.mjs";
@@ -1746,6 +1750,9 @@ function commitAcknowledgementLossAfterQueryPool(
         },
       };
     },
+    didLoseAcknowledgement() {
+      return acknowledgementLost;
+    },
   });
 }
 
@@ -1854,6 +1861,17 @@ function assertLauncherCode(code) {
   };
 }
 
+function assertWriterDetachCompositionCode(code) {
+  return (error) => {
+    assert.ok(error instanceof PostgresWriterDetachCompositionError);
+    assert.equal(error.name, "PostgresWriterDetachCompositionError");
+    assert.equal(error.code, code);
+    assert.equal(error.retryable, false);
+    assert.equal(Object.hasOwn(error, "cause"), false);
+    return true;
+  };
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -1862,6 +1880,22 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
+}
+
+async function settleWithin(promise, label, timeoutMs = 10_000) {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out`)),
+      timeoutMs,
+    );
+    timer.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function operationInput(
@@ -2033,6 +2067,50 @@ function forceFenceEvidence(fenceRequest) {
     proofId: `proof-${randomUUID()}`,
     status: "fenced",
   };
+}
+
+function writerDetachCompositionRequest(
+  expectedSession,
+  {
+    operationId = `operation-${randomUUID()}`,
+    target = {
+      attachmentId:
+        expectedSession.document.attachment?.attachmentId ??
+        expectedSession.document.lastOperation?.result?.fenceTarget
+          ?.attachmentId,
+      kind: "attachment",
+    },
+  } = {},
+) {
+  return { expectedSession, operationId, target };
+}
+
+function writerDetachIntegrationBackend({
+  backendId = "postgres-authority-integration",
+  capabilities = {
+    atomicPointInTimeCheckpoint: true,
+    exclusiveWriterAttachment: true,
+    fencing: "epoch-enforced",
+    normalDirectoryAttachment: true,
+  },
+  detachAttachment,
+  forceFence,
+}) {
+  const unsupported = async () => {
+    throw new Error("unexpected storage backend operation");
+  };
+  return Object.freeze({
+    backendId,
+    capabilities: Object.freeze({ ...capabilities }),
+    captureCheckpoint: unsupported,
+    contractVersion: 1,
+    destroySession: unsupported,
+    detachAttachment,
+    forceFence,
+    prepareWritableAttachment: unsupported,
+    provisionSession: unsupported,
+    restoreCheckpoint: unsupported,
+  });
 }
 
 function checkpointCaptureAdmission(
@@ -5597,6 +5675,387 @@ test(
           finalizeReplay.session,
           finalizeReconciled.session,
         );
+      },
+    );
+
+    await t.test(
+      "writer detach composition holds the real guard and replays release without provider work",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        let detachCalls = 0;
+        const backend = writerDetachIntegrationBackend({
+          async detachAttachment(request) {
+            detachCalls += 1;
+            const held = await pool.query(
+              [
+                "SELECT count(*)::integer AS held",
+                "FROM pg_catalog.pg_locks l",
+                "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
+                "WHERE l.locktype = 'advisory' AND l.granted",
+                "AND a.application_name = $1",
+              ].join(" "),
+              [CHECKPOINT_GUARD_APPLICATION_NAME],
+            );
+            assert.equal(held.rows[0].held, 1);
+            return detachEvidence(request);
+          },
+          async forceFence() {
+            throw new Error("unexpected force fence");
+          },
+        });
+        const composition = createPostgresWriterDetachComposition({
+          authority,
+          operationGuard,
+          storageBackend: backend,
+        });
+        const request = writerDetachCompositionRequest(
+          attached.session,
+        );
+
+        const terminal = await composition.detachWriter(request);
+        assert.equal(detachCalls, 1);
+        assert.equal(
+          terminal.operation.result.outcome,
+          "writer-released",
+        );
+        assert.equal(terminal.session.document.lifecycle, "DETACHED");
+        assert.equal(terminal.session.document.lease, null);
+        assert.equal(terminal.session.document.attachment, null);
+        assert.equal(
+          terminal.session.document.writerEpoch,
+          attached.session.document.writerEpoch,
+        );
+
+        const replayed = await composition.detachWriter(
+          structuredClone(request),
+        );
+        assert.equal(detachCalls, 1);
+        assert.deepEqual(replayed, terminal);
+
+        const heldAfter = await pool.query(
+          [
+            "SELECT count(*)::integer AS held",
+            "FROM pg_catalog.pg_locks l",
+            "JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid",
+            "WHERE l.locktype = 'advisory' AND l.granted",
+            "AND a.application_name = $1",
+          ].join(" "),
+          [CHECKPOINT_GUARD_APPLICATION_NAME],
+        );
+        assert.equal(heldAfter.rows[0].held, 0);
+      },
+    );
+
+    await t.test(
+      "writer detach composition blocks ambiguous release then force-fences explicitly",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        let detachCalls = 0;
+        let fenceCalls = 0;
+        const backend = writerDetachIntegrationBackend({
+          async detachAttachment() {
+            detachCalls += 1;
+            return Object.freeze({ malformed: true });
+          },
+          async forceFence(request) {
+            fenceCalls += 1;
+            return forceFenceEvidence(request);
+          },
+        });
+        const composition = createPostgresWriterDetachComposition({
+          authority,
+          operationGuard,
+          storageBackend: backend,
+        });
+        const releaseRequest = writerDetachCompositionRequest(
+          attached.session,
+        );
+
+        const blocked = await composition.detachWriter(releaseRequest);
+        assert.equal(detachCalls, 1);
+        assert.equal(fenceCalls, 0);
+        assert.equal(
+          blocked.operation.result.outcome,
+          "writer-blocked",
+        );
+        assert.equal(
+          blocked.operation.result.reason,
+          "provider-outcome-unresolved",
+        );
+        assert.equal(blocked.session.document.lifecycle, "BLOCKED");
+        assert.deepEqual(
+          blocked.session.document.lease,
+          attached.session.document.lease,
+        );
+        assert.deepEqual(
+          blocked.session.document.attachment,
+          attached.session.document.attachment,
+        );
+
+        const fenceRequest = writerDetachCompositionRequest(
+          blocked.session,
+          { target: releaseRequest.target },
+        );
+        const fenced = await composition.forceFenceWriter(
+          fenceRequest,
+        );
+        assert.equal(detachCalls, 1);
+        assert.equal(fenceCalls, 1);
+        assert.equal(
+          fenced.operation.result.outcome,
+          "writer-fenced",
+        );
+        assert.equal(fenced.session.document.lifecycle, "DETACHED");
+        assert.equal(
+          BigInt(fenced.session.document.writerEpoch),
+          BigInt(attached.session.document.writerEpoch) + 1n,
+        );
+
+        const manualSessionId = randomUUID();
+        sessionIds.push(manualSessionId);
+        const manualRegistration = registrationInput(manualSessionId);
+        manualRegistration.backendCapabilities = {
+          ...manualRegistration.backendCapabilities,
+          fencing: "manual",
+        };
+        const manualRegistered = await authority.registerSession(
+          manualRegistration,
+        );
+        const manualAttached = await attachWriter(
+          authority,
+          manualRegistered,
+        );
+        let manualFenceCalls = 0;
+        const manualBackend = writerDetachIntegrationBackend({
+          capabilities: manualRegistration.backendCapabilities,
+          async detachAttachment(request) {
+            return detachEvidence(request);
+          },
+          async forceFence(request) {
+            manualFenceCalls += 1;
+            return forceFenceEvidence(request);
+          },
+        });
+        const manualComposition =
+          createPostgresWriterDetachComposition({
+            authority,
+            operationGuard,
+            storageBackend: manualBackend,
+          });
+        const manualBlocked =
+          await manualComposition.forceFenceWriter(
+            writerDetachCompositionRequest(manualAttached.session),
+          );
+        assert.equal(manualFenceCalls, 0);
+        assert.equal(
+          manualBlocked.operation.result.outcome,
+          "writer-blocked",
+        );
+        assert.equal(
+          manualBlocked.operation.result.reason,
+          "fence-unavailable",
+        );
+        assert.equal(
+          BigInt(manualBlocked.session.document.writerEpoch),
+          BigInt(manualAttached.session.document.writerEpoch) + 1n,
+        );
+      },
+    );
+
+    await t.test(
+      "writer detach composition resolves claim and finalize acknowledgement loss without duplicate provider work",
+      async () => {
+        const claimLossSessionId = randomUUID();
+        sessionIds.push(claimLossSessionId);
+        const claimLossRegistered = await authority.registerSession(
+          registrationInput(claimLossSessionId),
+        );
+        const claimLossAttached = await attachWriter(
+          authority,
+          claimLossRegistered,
+        );
+        let claimLossProviderCalls = 0;
+        const claimLossBackend = writerDetachIntegrationBackend({
+          async detachAttachment(request) {
+            claimLossProviderCalls += 1;
+            return detachEvidence(request);
+          },
+          async forceFence(request) {
+            return forceFenceEvidence(request);
+          },
+        });
+        const claimLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: commitAcknowledgementLossAfterQueryPool(
+              pool,
+              "writer detach claim",
+              (text) =>
+                text.includes(
+                  "SET state = 'starting', revision = revision + 1",
+                ),
+            ),
+          }),
+        });
+        const claimLossComposition =
+          createPostgresWriterDetachComposition({
+            authority: claimLossAuthority,
+            operationGuard,
+            storageBackend: claimLossBackend,
+          });
+
+        const claimLossTerminal =
+          await claimLossComposition.detachWriter(
+            writerDetachCompositionRequest(claimLossAttached.session),
+          );
+        assert.equal(claimLossProviderCalls, 0);
+        assert.equal(
+          claimLossTerminal.operation.result.outcome,
+          "writer-blocked",
+        );
+        assert.equal(
+          claimLossTerminal.operation.result.reason,
+          "provider-outcome-unresolved",
+        );
+
+        const finalizeLossSessionId = randomUUID();
+        sessionIds.push(finalizeLossSessionId);
+        const finalizeLossRegistered = await authority.registerSession(
+          registrationInput(finalizeLossSessionId),
+        );
+        const finalizeLossAttached = await attachWriter(
+          authority,
+          finalizeLossRegistered,
+        );
+        let finalizeLossProviderCalls = 0;
+        const finalizeLossBackend = writerDetachIntegrationBackend({
+          async detachAttachment(request) {
+            finalizeLossProviderCalls += 1;
+            return detachEvidence(request);
+          },
+          async forceFence(request) {
+            return forceFenceEvidence(request);
+          },
+        });
+        const finalizeLossPool = commitAcknowledgementLossAfterQueryPool(
+          pool,
+          "writer detach finalize",
+          (text) =>
+            text.includes(
+              "SET state = 'committed', result = $3::jsonb",
+            ),
+        );
+        const finalizeLossAuthority = new PostgresSessionAuthority({
+          store: new PostgresSerializableStore({
+            dedicatedPool: finalizeLossPool,
+          }),
+        });
+        const finalizeLossComposition =
+          createPostgresWriterDetachComposition({
+            authority: finalizeLossAuthority,
+            operationGuard,
+            storageBackend: finalizeLossBackend,
+          });
+
+        const finalizeLossTerminal =
+          await finalizeLossComposition.detachWriter(
+            writerDetachCompositionRequest(
+              finalizeLossAttached.session,
+            ),
+        );
+        assert.equal(finalizeLossProviderCalls, 1);
+        assert.equal(finalizeLossPool.didLoseAcknowledgement(), true);
+        assert.equal(
+          finalizeLossTerminal.operation.result.outcome,
+          "writer-released",
+        );
+        assert.equal(
+          finalizeLossTerminal.session.document.lifecycle,
+          "DETACHED",
+        );
+      },
+    );
+
+    await t.test(
+      "writer detach composition serializes one real-provider invocation per operation",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const entered = deferred();
+        const releaseProvider = deferred();
+        let providerCalls = 0;
+        const backend = writerDetachIntegrationBackend({
+          async detachAttachment(request) {
+            providerCalls += 1;
+            entered.resolve();
+            await releaseProvider.promise;
+            return detachEvidence(request);
+          },
+          async forceFence(request) {
+            return forceFenceEvidence(request);
+          },
+        });
+        const composition = createPostgresWriterDetachComposition({
+          authority,
+          operationGuard,
+          storageBackend: backend,
+        });
+        const request = writerDetachCompositionRequest(
+          attached.session,
+        );
+        const first = composition.detachWriter(request);
+        let terminal;
+        let firstFailure;
+        try {
+          await settleWithin(
+            entered.promise,
+            "writer detach provider entry",
+          );
+          await assert.rejects(
+            settleWithin(
+              composition.detachWriter(structuredClone(request)),
+              "writer detach competing invocation",
+            ),
+            assertWriterDetachCompositionCode(
+              "postgres_writer_detach_composition_outcome_uncertain",
+            ),
+          );
+          assert.equal(providerCalls, 1);
+        } finally {
+          releaseProvider.resolve();
+          try {
+            terminal = await settleWithin(
+              first,
+              "writer detach primary invocation",
+            );
+          } catch (error) {
+            firstFailure = error;
+          }
+        }
+        if (firstFailure !== undefined) throw firstFailure;
+        assert.equal(
+          terminal.operation.result.outcome,
+          "writer-released",
+        );
+
+        const replayed = await composition.detachWriter(
+          structuredClone(request),
+        );
+        assert.deepEqual(replayed, terminal);
+        assert.equal(providerCalls, 1);
       },
     );
 

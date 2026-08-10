@@ -259,6 +259,12 @@ Restore and launcher authority are now split into eight serial pull requests:
      cycle, revision, and exact transition replay evidence. A bounded runner
      processes the lanes in order and commits each settled continuation before
      admitting the next lane, but no production scheduler invokes it yet.
+   - The canonical detach prerequisite is complete: one provider-neutral
+     facade holds the per-operation advisory guard across typed release or
+     force-fence admission, provider execution, proof validation, and durable
+     finalization. Retained ambiguous dispatch cannot replay a storage call,
+     while a valid proof can replay only its database finalizer after
+     acknowledgement loss. The facade is not scheduled yet.
    - Wire publication, durable stop and clean capture, canonical detach,
      capture-bound activation, prepared launch, no-relaunch recovery, and
      the durable recovery runner through the production checkpoint adapter

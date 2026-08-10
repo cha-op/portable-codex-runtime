@@ -88,9 +88,22 @@ const objectPrototype = Object.prototype;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpTestIntrinsic = RegExp.prototype.test;
 const TypeErrorConstructor = TypeError;
+const WeakSetConstructor = WeakSet;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+
+const operationGuards = new WeakSetConstructor();
 
 function callIntrinsic(intrinsic, receiver, args) {
   return functionApplyIntrinsic(intrinsic, receiver, args);
+}
+
+function weakSetAdd(set, value) {
+  callIntrinsic(weakSetAddIntrinsic, set, [value]);
+}
+
+function weakSetHas(set, value) {
+  return callIntrinsic(weakSetHasIntrinsic, set, [value]);
 }
 
 function arrayEvery(value, callback) {
@@ -504,6 +517,7 @@ export class PostgresOperationGuard {
       "invalid_postgres_operation_guard_options",
     );
     this.#poolBinding = trustedPool(inspectExactOptions(args[0]));
+    weakSetAdd(operationGuards, this);
     objectFreeze(this);
   }
 
@@ -641,6 +655,15 @@ export class PostgresOperationGuard {
     if (callbackFailed) throw callbackError;
     return callbackResult;
   }
+}
+
+export function isPostgresOperationGuard(value) {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    !isProxyValue(value) &&
+    weakSetHas(operationGuards, value)
+  );
 }
 
 objectFreeze(PostgresOperationGuard.prototype);

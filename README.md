@@ -119,6 +119,20 @@ Unit and real-PostgreSQL coverage exercise exact replay, expiry, ambiguity,
 manual-backend rejection, epoch retention, and explicit
 `BLOCKED -> FENCING` recovery.
 
+A provider-neutral PostgreSQL writer-detach composition now owns the complete
+live release or force-fence invocation. It accepts one branded per-operation
+advisory guard across reserve, typed dispatch, provider execution, and
+exact-proof finalization; validates every authority receipt as one canonical
+operation/reservation/session transition; validates backend identity and
+capabilities before durable work; and invokes a provider only after a definite
+dispatch grant. A retained
+`starting` or `uncertain` operation never authorizes provider replay. Because
+storage contract v1 has no provider-outcome query, that state is finalized as
+`BLOCKED`; by contrast, a valid proof followed by database finalization
+acknowledgement loss replays only the same finalizer. Manual fencing records
+`fence-unavailable` without calling the provider. This facade is not yet wired
+into the production checkpoint adapter and does not enable `runRestore()`.
+
 Production clean-capture authority adds no capture-specific DDL. It binds one
 exact session-wide operation and reservation to one globally unique
 capture-attempt claim, holds a per-operation PostgreSQL session advisory guard

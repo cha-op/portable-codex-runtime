@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 
@@ -12,7 +13,10 @@ import {
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
+  WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
+  assertSessionOperationBinding,
+  assertSessionOperationTransitionProof,
   createRestoreAttachmentActivationOperationRequest,
   createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
@@ -27,6 +31,9 @@ const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const NOW = "2026-07-29T12:34:56.789Z";
+const OPERATION_CREATED_AT = "2026-07-29T12:35:01.000Z";
+const OPERATION_STARTED_AT = "2026-07-29T12:35:02.000Z";
+const OPERATION_RETIRED_AT = "2026-07-29T12:35:03.000Z";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_ID_QUERY =
@@ -234,6 +241,170 @@ function attachedSnapshot() {
   };
 }
 
+function sha256Json(value) {
+  return createHash("sha256")
+    .update(JSON.stringify(value), "utf8")
+    .digest("hex");
+}
+
+function writerOperationTransitionFixture({ kind, outcome, state }) {
+  const operationId =
+    kind === WRITER_RELEASE_OPERATION_KIND
+      ? "writer-release-transition-001"
+      : "writer-force-fence-transition-001";
+  const base = attachedSnapshot();
+  const binding = assertSessionOperationBinding({
+    expectedSession: base,
+    kind,
+    operationId,
+    request: {
+      contractVersion: 1,
+      target: {
+        attachmentId: base.document.attachment.attachmentId,
+        kind: "attachment",
+      },
+    },
+  });
+  const expectedSession = binding.expectedSession;
+  const revision =
+    state === "prepared"
+      ? "0"
+      : state === "starting"
+        ? "1"
+        : outcome === "writer-blocked"
+          ? "3"
+          : "2";
+  const updatedAt =
+    state === "prepared"
+      ? OPERATION_CREATED_AT
+      : state === "starting"
+        ? OPERATION_STARTED_AT
+        : OPERATION_RETIRED_AT;
+  const nextWriterEpoch = String(
+    BigInt(expectedSession.document.writerEpoch) + 1n,
+  );
+  let result = null;
+  if (outcome === "writer-released") {
+    const lease = expectedSession.document.lease;
+    result = {
+      resultVersion: 1,
+      outcome,
+      lease,
+      attachment: expectedSession.document.attachment,
+      mutationResult: {
+        contractVersion: 1,
+        backendId: expectedSession.document.storageRef.backendId,
+        storageId: expectedSession.document.storageRef.storageId,
+        sessionId: expectedSession.sessionId,
+        leaseId: lease.leaseId,
+        holderId: lease.holderId,
+        fencingEpoch: lease.fencingEpoch,
+        operation: "detach",
+        operationId,
+        target: binding.request.target,
+        proofId: "writer-release-proof-001",
+        status: "detached",
+      },
+    };
+  } else if (outcome === "writer-blocked") {
+    result = {
+      resultVersion: 1,
+      outcome,
+      reason: "provider-outcome-unresolved",
+      writerEpoch: nextWriterEpoch,
+      lease: expectedSession.document.lease,
+      attachment: expectedSession.document.attachment,
+      fenceTarget: binding.request.target,
+    };
+  }
+  const operation = {
+    operationId,
+    sessionId: expectedSession.sessionId,
+    kind,
+    conflictClass: "session-mutation",
+    expectedSession,
+    request: binding.request,
+    requestSha256: binding.requestSha256,
+    state,
+    revision,
+    result,
+    createdAt: OPERATION_CREATED_AT,
+    updatedAt,
+    retiredAt: state === "committed" ? updatedAt : null,
+  };
+  const reservation = {
+    reservationId: binding.reservationId,
+    operationId,
+    sessionId: expectedSession.sessionId,
+    kind,
+    expectedSessionRevision: expectedSession.revision,
+    state: state === "committed" ? "released" : state,
+    conflictClass: "session-mutation",
+    requestSha256: binding.requestSha256,
+    createdAt: OPERATION_CREATED_AT,
+    updatedAt,
+    expiresAt: null,
+    releasedAt: state === "committed" ? updatedAt : null,
+  };
+  const pointer = {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: expectedSession.revision,
+    kind,
+    operationId,
+    operationRevision: revision,
+    requestSha256: binding.requestSha256,
+    reservationId: binding.reservationId,
+    state,
+    ...(state === "committed"
+      ? { resultSha256: sha256Json(result) }
+      : {}),
+  };
+  let nextDocument = {
+    ...expectedSession.document,
+    activeOperation: pointer,
+  };
+  if (state === "starting") {
+    nextDocument = {
+      ...nextDocument,
+      lifecycle:
+        kind === WRITER_RELEASE_OPERATION_KIND
+          ? "RELEASING"
+          : "FENCING",
+      writerEpoch:
+        kind === WRITER_FORCE_FENCE_OPERATION_KIND
+          ? nextWriterEpoch
+          : expectedSession.document.writerEpoch,
+    };
+  } else if (state === "committed") {
+    nextDocument = {
+      ...nextDocument,
+      activeOperation: null,
+      lastOperation: pointer,
+      ...(outcome === "writer-released"
+        ? {
+            attachment: null,
+            launch: null,
+            lease: null,
+            lifecycle: "DETACHED",
+          }
+        : {
+            lifecycle: "BLOCKED",
+            writerEpoch: nextWriterEpoch,
+          }),
+    };
+  }
+  const session = {
+    sessionId: expectedSession.sessionId,
+    revision: String(
+      BigInt(expectedSession.revision) + BigInt(revision) + 1n,
+    ),
+    document: nextDocument,
+    createdAt: expectedSession.createdAt,
+    updatedAt,
+  };
+  return { operation, reservation, session };
+}
+
 function restoreGenerationAdmissionFixture(
   expectedSession = attachedSnapshot(),
 ) {
@@ -426,6 +597,107 @@ async function assertAuthorityError(promise, code) {
     return true;
   });
 }
+
+function assertOperationTransitionProofInvalid(proof) {
+  assert.throws(
+    () => assertSessionOperationTransitionProof(proof),
+    (error) => {
+      assert.ok(error instanceof PostgresSessionAuthorityError);
+      assert.equal(error.name, "PostgresSessionAuthorityError");
+      assert.equal(error.code, "operation_state_invalid");
+      assert.equal(error.retryable, false);
+      assert.equal(Object.isFrozen(error), true);
+      assert.equal("cause" in error, false);
+      return true;
+    },
+  );
+}
+
+test("assertSessionOperationTransitionProof validates active and committed writer detach receipts", () => {
+  const fixtures = [
+    writerOperationTransitionFixture({
+      kind: WRITER_RELEASE_OPERATION_KIND,
+      outcome: null,
+      state: "prepared",
+    }),
+    writerOperationTransitionFixture({
+      kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+      outcome: null,
+      state: "starting",
+    }),
+    writerOperationTransitionFixture({
+      kind: WRITER_RELEASE_OPERATION_KIND,
+      outcome: "writer-released",
+      state: "committed",
+    }),
+    writerOperationTransitionFixture({
+      kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+      outcome: "writer-blocked",
+      state: "committed",
+    }),
+  ];
+
+  for (const fixture of fixtures) {
+    const proof = assertSessionOperationTransitionProof(fixture);
+    assert.equal(proof.operation.operationId, fixture.operation.operationId);
+    assert.equal(proof.operation.state, fixture.operation.state);
+    assert.equal(
+      proof.reservation.reservationId,
+      fixture.reservation.reservationId,
+    );
+    assert.equal(proof.session.revision, fixture.session.revision);
+    assert.equal(Object.isFrozen(proof), true);
+    assert.equal(Object.isFrozen(proof.operation), true);
+    assert.equal(Object.isFrozen(proof.reservation), true);
+    assert.equal(Object.isFrozen(proof.session), true);
+  }
+});
+
+test("assertSessionOperationTransitionProof rejects crossed receipt relations", () => {
+  const activeRelease = writerOperationTransitionFixture({
+    kind: WRITER_RELEASE_OPERATION_KIND,
+    outcome: null,
+    state: "prepared",
+  });
+  const activeForceFence = writerOperationTransitionFixture({
+    kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+    outcome: null,
+    state: "starting",
+  });
+  const committedRelease = writerOperationTransitionFixture({
+    kind: WRITER_RELEASE_OPERATION_KIND,
+    outcome: "writer-released",
+    state: "committed",
+  });
+
+  const wrongPointer = structuredClone(activeRelease);
+  wrongPointer.session.document.activeOperation.reservationId =
+    "reservation-crossed";
+  assertOperationTransitionProofInvalid(wrongPointer);
+
+  const wrongResult = structuredClone(committedRelease);
+  wrongResult.operation.result.outcome = "writer-fenced";
+  assertOperationTransitionProofInvalid(wrongResult);
+
+  const wrongProviderProof = structuredClone(committedRelease);
+  wrongProviderProof.operation.result.mutationResult.operationId =
+    "writer-release-transition-crossed";
+  assertOperationTransitionProofInvalid(wrongProviderProof);
+
+  const wrongRevision = structuredClone(activeForceFence);
+  wrongRevision.operation.revision = "2";
+  assertOperationTransitionProofInvalid(wrongRevision);
+
+  const prematurelyReleasedReservation = structuredClone(activeRelease);
+  prematurelyReleasedReservation.reservation.state = "released";
+  prematurelyReleasedReservation.reservation.releasedAt =
+    prematurelyReleasedReservation.reservation.updatedAt;
+  assertOperationTransitionProofInvalid(prematurelyReleasedReservation);
+
+  const wrongRequestSha256 = structuredClone(activeRelease);
+  wrongRequestSha256.operation.requestSha256 = "0".repeat(64);
+  assertOperationTransitionProofInvalid(wrongRequestSha256);
+});
 
 test("registerSession inserts one canonical detached document with database time", async () => {
   const insertedRow = row();

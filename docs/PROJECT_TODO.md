@@ -37,6 +37,11 @@
 - [done] Implement release, force-fence, `FENCING`, and `BLOCKED`
   reconciliation without treating database epoch allocation as a physical
   fence.
+- [done] Compose provider-backed canonical writer detach behind one
+  per-operation PostgreSQL advisory guard. Invoke storage only from a definite
+  typed dispatch grant, validate exact detach or force-fence proof, preserve
+  finalizer acknowledgement-loss replay, and fail retained ambiguous dispatch
+  state closed to `BLOCKED` without replaying the provider.
 - [done] Implement the production clean-capture mutation authority and
   checkpoint catalogue on the existing PostgreSQL schema, including
   source-free committed reconciliation and permanent attempt claims.

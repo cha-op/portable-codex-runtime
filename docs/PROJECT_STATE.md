@@ -95,6 +95,17 @@
   epoch, and explicit recovery dispatch is required for
   `BLOCKED -> FENCING`. Manual backends cannot complete automatic fencing, and
   database expiry or epoch state is never physical fence evidence.
+- A provider-neutral PostgreSQL writer-detach composition now binds one exact
+  release or force-fence request to the per-operation advisory guard, typed
+  authority dispatch, backend-generated proof, and durable terminal state.
+  Provider invocation occurs only after a definite dispatch grant and outside
+  every database transaction. Replayed `starting` or `uncertain` state is never
+  a second dispatch grant: storage contract v1 has no provider reconciliation
+  operation, so the facade records a durable `BLOCKED` result instead. A valid
+  proof survives database finalization acknowledgement loss through exact
+  readback/finalizer replay, and manual fencing records `fence-unavailable`
+  without invoking the provider. The facade remains unscheduled and production
+  restore remains fail-closed.
 - Production clean-checkpoint capture authority now reuses the version 1
   PostgreSQL schema without DDL. One exact durable operation and reservation
   binds the canonical stopped-writer admission, globally unique capture
