@@ -78,10 +78,14 @@
   the exact current-writer stop, clean checkpoint capture, and subsequent
   release or force-fence before a distinct target restore generation can
   activate its detached destination. Preserve existing activation v1 replay.
+- [done] Persist one independent generation, activation, launch-attempt, and
+  current-launch recovery cursor per configured scope, and add a bounded
+  single-flight runner that durably advances each settled lane before admitting
+  the next. Keep the runner unscheduled and production restore fail-closed.
 - [pending] Behind a separate detached-production fleet capability, wire
   committed restore publication, durable stop and clean capture, canonical
-  detach, capture-bound activation, prepared launch, independent recovery
-  cursors, and bounded no-relaunch recovery through the production checkpoint
+  detach, capture-bound activation, prepared launch, and the durable bounded
+  no-relaunch recovery runner through the production checkpoint
   adapter. Keep `runRestore()` fail-closed until that adapter composition and
   its ambiguous-outcome coverage are complete.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by

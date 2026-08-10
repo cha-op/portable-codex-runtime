@@ -31,7 +31,6 @@ const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectIsFrozen = Object.isFrozen;
-const objectIsPrototypeOfIntrinsic = Object.prototype.isPrototypeOf;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
@@ -41,11 +40,20 @@ const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const TypeErrorConstructor = TypeError;
+const WeakMapConstructor = WeakMap;
+const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakSetConstructor = WeakSet;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+
+const recoveryServiceBrands = new WeakSetConstructor();
+const recoveryBatchReceiptMetadata = new WeakMapConstructor();
 
 const AbortSignalConstructor = globalThis.AbortSignal;
-const abortSignalPrototype = AbortSignalConstructor.prototype;
 const abortSignalAbortedGetter = objectGetOwnPropertyDescriptor(
-  abortSignalPrototype,
+  AbortSignalConstructor.prototype,
   "aborted",
 ).get;
 
@@ -205,6 +213,78 @@ function arrayPush(value, candidate) {
 
 function arrayEvery(value, callback) {
   return callIntrinsic(arrayEveryIntrinsic, value, [callback]);
+}
+
+/**
+ * Reports whether `value` is the exact object returned by this module's
+ * recovery-service factory. The check reads no properties from `value`, so a
+ * Proxy (including a revoked Proxy) cannot run a user trap during the probe.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isPostgresRestoreActivationRecoveryService(value) {
+  if (
+    arguments.length !== 1 ||
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return false;
+  }
+  return callIntrinsic(weakSetHasIntrinsic, recoveryServiceBrands, [value]);
+}
+
+/**
+ * Consumes one authentic batch receipt exactly once. Success proves only that
+ * `receipt` is the exact object minted by `service` after the named lane had
+ * drained one invocation with the exact `{afterSessionId, limit}` input. It is
+ * an in-process provenance check, not persistent authority or a database CAS.
+ *
+ * Failed checks return `false` without consuming an otherwise-valid receipt.
+ * The function reads no properties from either public object, so rejected
+ * Proxies cannot run user traps.
+ *
+ * @param {unknown} service
+ * @param {unknown} lane One of generation, activation, launchAttempt, or currentLaunch.
+ * @param {unknown} afterSessionId
+ * @param {unknown} limit
+ * @param {unknown} receipt
+ * @returns {boolean} `true` for the first exact match; otherwise `false`.
+ */
+export function consumePostgresRestoreActivationRecoveryBatchReceipt(
+  service,
+  lane,
+  afterSessionId,
+  limit,
+  receipt,
+) {
+  if (
+    arguments.length !== 5 ||
+    !isPostgresRestoreActivationRecoveryService(service) ||
+    receipt === null ||
+    (typeof receipt !== "object" && typeof receipt !== "function")
+  ) {
+    return false;
+  }
+  const metadata = callIntrinsic(
+    weakMapGetIntrinsic,
+    recoveryBatchReceiptMetadata,
+    [receipt],
+  );
+  if (
+    metadata === undefined ||
+    metadata.service !== service ||
+    metadata.lane !== lane ||
+    metadata.afterSessionId !== afterSessionId ||
+    metadata.limit !== limit
+  ) {
+    return false;
+  }
+  return callIntrinsic(
+    weakMapDeleteIntrinsic,
+    recoveryBatchReceiptMetadata,
+    [receipt],
+  );
 }
 
 function fail(code) {
@@ -612,10 +692,7 @@ function signalIsAborted(signal, code) {
   ensure(
     signal !== null &&
       typeof signal === "object" &&
-      !isProxyValue(signal) &&
-      callIntrinsic(objectIsPrototypeOfIntrinsic, abortSignalPrototype, [
-        signal,
-      ]),
+      !isProxyValue(signal),
     code,
   );
   try {
@@ -938,22 +1015,31 @@ async function callList(callback, request, kind, code) {
   return normalizePage(value, request, kind, code);
 }
 
-async function reconcileCandidate(callback, candidate) {
+async function reconcileCandidate(callback, candidate, code) {
+  let pending;
   try {
-    let pending = callIntrinsic(callback, undefined, [candidate]);
-    if (isGeneratorObjectValue(pending)) return "pending";
-    if (isPromiseValue(pending)) {
-      pending = normalizeSafeNativePromise(pending);
-      if (pending === null) return "pending";
-    } else if (hasUntrustedThenableShape(pending)) {
-      return "pending";
-    }
-    const value = isPromiseValue(pending) ? await pending : pending;
-    if (isGeneratorObjectValue(value)) return "pending";
-    return "reconciled";
+    pending = callIntrinsic(callback, undefined, [candidate]);
   } catch {
     return "pending";
   }
+  if (isGeneratorObjectValue(pending)) return "pending";
+  if (isPromiseValue(pending)) {
+    pending = normalizeSafeNativePromise(pending);
+    // A real but untrusted Promise may already have asynchronous work in
+    // flight. Returning a settled batch before it drains would let the durable
+    // runner skip that work, so fail the whole batch without invoking an
+    // overridden then/species path or minting a receipt.
+    ensure(pending !== null, code);
+    try {
+      pending = await pending;
+    } catch {
+      return "pending";
+    }
+  } else if (hasUntrustedThenableShape(pending)) {
+    return "pending";
+  }
+  if (isGeneratorObjectValue(pending)) return "pending";
+  return "reconciled";
 }
 
 function batchResult(afterSessionId, nextAfterSessionId, results, status) {
@@ -963,15 +1049,6 @@ function batchResult(afterSessionId, nextAfterSessionId, results, status) {
     results: frozenArray(results),
     status,
   });
-}
-
-function emptyAbortedBatch(request) {
-  return batchResult(
-    request.afterSessionId,
-    request.afterSessionId,
-    [],
-    "aborted",
-  );
 }
 
 export class PostgresRestoreActivationRecoveryServiceError extends ErrorConstructor {
@@ -1050,10 +1127,47 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   const outcomeCode =
     "postgres_restore_activation_recovery_service_outcome_uncertain";
   let inFlight = false;
+  let serviceInstance = null;
+
+  function mintBatchReceipt(
+    kind,
+    request,
+    nextAfterSessionId,
+    results,
+    status,
+  ) {
+    ensure(serviceInstance !== null, outcomeCode);
+    const receipt = batchResult(
+      request.afterSessionId,
+      nextAfterSessionId,
+      results,
+      status,
+    );
+    callIntrinsic(weakMapSetIntrinsic, recoveryBatchReceiptMetadata, [
+      receipt,
+      exactFrozenRecord({
+        afterSessionId: request.afterSessionId,
+        lane: kind,
+        limit: request.limit,
+        service: serviceInstance,
+      }),
+    ]);
+    return receipt;
+  }
+
+  function emptyAbortedBatch(kind, request) {
+    return mintBatchReceipt(
+      kind,
+      request,
+      request.afterSessionId,
+      [],
+      "aborted",
+    );
+  }
 
   async function runLane(kind, request) {
     if (signalIsAborted(request.signal, requestCode)) {
-      return emptyAbortedBatch(request);
+      return emptyAbortedBatch(kind, request);
     }
     const lane = callbacks[kind];
     const page = await callList(
@@ -1063,14 +1177,15 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
       outcomeCode,
     );
     if (signalIsAborted(request.signal, requestCode)) {
-      return emptyAbortedBatch(request);
+      return emptyAbortedBatch(kind, request);
     }
     const results = [];
     let settledCursor = request.afterSessionId;
     for (let index = 0; index < page.candidates.length; index += 1) {
       if (signalIsAborted(request.signal, requestCode)) {
-        return batchResult(
-          request.afterSessionId,
+        return mintBatchReceipt(
+          kind,
+          request,
           settledCursor,
           results,
           "aborted",
@@ -1080,7 +1195,11 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
       const status =
         kind === "currentLaunch"
           ? "requires-stop-or-fence"
-          : await reconcileCandidate(lane.reconcile, normalized.candidate);
+          : await reconcileCandidate(
+              lane.reconcile,
+              normalized.candidate,
+              outcomeCode,
+            );
       arrayPush(
         results,
         exactFrozenRecord({
@@ -1091,16 +1210,18 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
       );
       settledCursor = normalized.sessionId;
       if (signalIsAborted(request.signal, requestCode)) {
-        return batchResult(
-          request.afterSessionId,
+        return mintBatchReceipt(
+          kind,
+          request,
           settledCursor,
           results,
           "aborted",
         );
       }
     }
-    return batchResult(
-      request.afterSessionId,
+    return mintBatchReceipt(
+      kind,
+      request,
       page.nextAfterSessionId,
       results,
       page.nextAfterSessionId === null
@@ -1190,11 +1311,13 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   objectFreeze(runLaunchAttemptBatch);
   objectFreeze(scanCurrentLaunchBatch);
   objectFreeze(runSweep);
-  return exactFrozenRecord({
+  serviceInstance = exactFrozenRecord({
     runActivationBatch,
     runGenerationBatch,
     runLaunchAttemptBatch,
     runSweep,
     scanCurrentLaunchBatch,
   });
+  callIntrinsic(weakSetAddIntrinsic, recoveryServiceBrands, [serviceInstance]);
+  return serviceInstance;
 }

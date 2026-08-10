@@ -1464,6 +1464,23 @@ failures remain `pending`; current launches are reported only as
 callback, writer handle, publication callback, or opaque capability and can
 neither relaunch nor adopt a running process.
 
+`PostgresRestoreRecoveryCursorStore` persists each lane outside session
+storage under a startup-selected recovery scope. Revision, cycle, and prior
+keyset cursor form one serializable compare-and-swap; the committed row also
+binds the transition UUID and canonical request digest so exact replay after a
+lost commit acknowledgement cannot advance twice. Null continuation wraps the
+lane to a new cycle. `PostgresRestoreRecoveryRunner` reads, reconciles, and
+immediately persists generation, activation, launch-attempt, and current-launch
+in that fixed order. Before each compare-and-swap, it consumes an authentic,
+one-use service receipt bound to that lane's exact input cursor and limit. The
+store is only cursor concurrency and replay authority; it cannot independently
+prove candidate settlement. “Settled” here means that reconciliation attempt
+has drained even when its business result remains `pending`, which the next
+cursor cycle revisits. A later failure preserves already-settled lanes, while
+an abort with no cursor progress performs no cursor transition. The runner is
+a bounded orchestration primitive only and is not scheduled by the production
+adapter yet.
+
 ## Remaining Production Restore Composition
 
 The launcher foundation plus capture-bound detached activation now close the
@@ -1478,7 +1495,8 @@ a production restore entry point. Later serial pull requests must:
 - dispatch the already-reserved launch with the original image reservation, or
   with a newly minted exact-match reservation while it is still durably
   `prepared`, and route every active attempt without another launch;
-- schedule and persist the four-lane recovery service's independent cursors;
+- start and schedule the durable four-lane recovery runner with an explicit
+  recovery scope and fixed per-lane limits;
 - wire the whole protocol into `runRestore()` only after every uncertain
   publication, launch, registration, stop, and finalisation boundary remains
   fail-closed.

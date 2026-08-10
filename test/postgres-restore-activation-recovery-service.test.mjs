@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   PostgresRestoreActivationRecoveryServiceError,
+  consumePostgresRestoreActivationRecoveryBatchReceipt,
   createPostgresRestoreActivationRecoveryService,
+  isPostgresRestoreActivationRecoveryService,
 } from "../src/postgres-restore-activation-recovery-service.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
@@ -324,6 +326,189 @@ test("runs four bounded recovery lanes without treating current launches as adop
   assertDeepFrozen(service);
 });
 
+test("brands only exact recovery service instances without invoking Proxy traps", () => {
+  const service = createPostgresRestoreActivationRecoveryService(
+    callbacks().options,
+  );
+  const clone = Object.freeze(Object.assign(Object.create(null), service));
+  let traps = 0;
+  const proxy = new Proxy(service, {
+    get() {
+      traps += 1;
+      throw new Error("must not read service properties");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error("must not inspect service descriptors");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("must not inspect the service prototype");
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("must not enumerate service keys");
+    },
+  });
+  const revoked = Proxy.revocable(service, {});
+  revoked.revoke();
+
+  assert.equal(isPostgresRestoreActivationRecoveryService(service), true);
+  assert.equal(isPostgresRestoreActivationRecoveryService(clone), false);
+  assert.equal(isPostgresRestoreActivationRecoveryService(proxy), false);
+  assert.equal(
+    isPostgresRestoreActivationRecoveryService(revoked.proxy),
+    false,
+  );
+  assert.equal(isPostgresRestoreActivationRecoveryService(), false);
+  assert.equal(
+    isPostgresRestoreActivationRecoveryService(service, "extra"),
+    false,
+  );
+  assert.equal(traps, 0);
+});
+
+test("authentic sweep-complete receipts bind issuer, lane, input, and identity once", async () => {
+  const service = createPostgresRestoreActivationRecoveryService(
+    callbacks().options,
+  );
+  const otherService = createPostgresRestoreActivationRecoveryService(
+    callbacks().options,
+  );
+  const receipt = await service.runGenerationBatch(request());
+  const clone = Object.freeze(Object.assign(Object.create(null), receipt));
+
+  assert.equal(receipt.status, "sweep-complete");
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      10,
+      clone,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      otherService,
+      "generation",
+      null,
+      10,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "activation",
+      null,
+      10,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      OTHER_SESSION_ID,
+      10,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      9,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      10,
+      receipt,
+    ),
+    true,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      10,
+      receipt,
+    ),
+    false,
+  );
+});
+
+test("receipt verification rejects Proxy wrappers without traps or consumption", async () => {
+  const service = createPostgresRestoreActivationRecoveryService(
+    callbacks().options,
+  );
+  const receipt = await service.runGenerationBatch(request());
+  let traps = 0;
+  const handler = {
+    get() {
+      traps += 1;
+      throw new Error("must not read wrapped properties");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error("must not inspect wrapped descriptors");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("must not inspect wrapped prototypes");
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("must not enumerate wrapped keys");
+    },
+  };
+
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      new Proxy(service, handler),
+      "generation",
+      null,
+      10,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      10,
+      new Proxy(receipt, handler),
+    ),
+    false,
+  );
+  assert.equal(traps, 0);
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      10,
+      receipt,
+    ),
+    true,
+  );
+});
+
 test("activation batches admit exact v1 and capture-bound v2 predecessors", async () => {
   const observed = [];
   const fixture = callbacks({
@@ -417,6 +602,46 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
   assert.equal(result.launchAttempt.nextAfterSessionId, THIRD_SESSION_ID);
   assert.equal(result.currentLaunch.nextAfterSessionId, null);
   assert.equal(result.status, "limit-reached");
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      1,
+      result.generation,
+    ),
+    true,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "activation",
+      SESSION_ID,
+      1,
+      result.activation,
+    ),
+    true,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "launchAttempt",
+      OTHER_SESSION_ID,
+      1,
+      result.launchAttempt,
+    ),
+    true,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "currentLaunch",
+      THIRD_SESSION_ID,
+      4,
+      result.currentLaunch,
+    ),
+    true,
+  );
   assertDeepFrozen(result);
 });
 
@@ -486,6 +711,16 @@ test("abort drains one in-flight reconciliation and retains its settled cursor",
   assert.equal(result.nextAfterSessionId, SESSION_ID);
   assert.equal(result.results.length, 1);
   assert.equal(result.results[0].status, "reconciled");
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "generation",
+      null,
+      10,
+      result,
+    ),
+    true,
+  );
 });
 
 test("one service admits only one batch at a time", async () => {
@@ -584,9 +819,12 @@ test("Promise subclasses cannot spoof list or reconciliation results", async () 
   const reconcileService = createPostgresRestoreActivationRecoveryService(
     reconcileFixture.options,
   );
-  const result = await reconcileService.runGenerationBatch(request());
-
-  assert.equal(result.results[0].status, "pending");
+  await assert.rejects(
+    reconcileService.runGenerationBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
   assert.equal(thenCalls, 0);
 });
 
@@ -875,6 +1113,23 @@ test("constructor and requests reject non-exact or executable expansion", async 
       ),
     );
   }
+
+  let signalPrototypeTrapCalls = 0;
+  const hostileSignal = Object.create(
+    new Proxy(Object.create(null), {
+      getPrototypeOf() {
+        signalPrototypeTrapCalls += 1;
+        throw new Error("signal prototype trap must not run");
+      },
+    }),
+  );
+  await assert.rejects(
+    service.runGenerationBatch(request({ signal: hostileSignal })),
+    assertCode(
+      "invalid_postgres_restore_activation_recovery_service_request",
+    ),
+  );
+  assert.equal(signalPrototypeTrapCalls, 0);
 });
 
 test("accepted generation v2 and current launch inputs are defensively frozen", async () => {
