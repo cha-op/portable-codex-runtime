@@ -107,6 +107,7 @@ function createCursorStore({
   cursors = {},
   onAdvance = null,
   onRead = null,
+  recordCalls = true,
 } = {}) {
   const calls = [];
   const state = new Map();
@@ -116,12 +117,12 @@ function createCursorStore({
 
   const store = freezeRecord({
     async readLane(input) {
-      calls.push(["read", input]);
+      if (recordCalls) calls.push(["read", input]);
       onRead?.(input);
       return state.get(input.lane);
     },
     async advanceLane(input) {
-      calls.push(["advance", input]);
+      if (recordCalls) calls.push(["advance", input]);
       onAdvance?.(input);
       const before = state.get(input.lane);
       const advancedCursor = cursor(input.lane, {
@@ -147,12 +148,13 @@ function createRecoveryService({
   onList = null,
   onReconcileGeneration = null,
   pages = {},
+  recordCalls = true,
 } = {}) {
   const calls = [];
   const reconcileCalls = [];
 
   function list(field, input) {
-    calls.push([field, input]);
+    if (recordCalls) calls.push([field, input]);
     onList?.(field, input);
     if (listOverrides[field]) return listOverrides[field](input);
     return pages[field] ?? page();
@@ -172,14 +174,14 @@ function createRecoveryService({
       return list("launchAttempt", input);
     },
     reconcileRestoreAttachmentActivation(candidate) {
-      reconcileCalls.push(["activation", candidate]);
+      if (recordCalls) reconcileCalls.push(["activation", candidate]);
     },
     reconcileRestoreGeneration(candidate) {
-      reconcileCalls.push(["generation", candidate]);
+      if (recordCalls) reconcileCalls.push(["generation", candidate]);
       return onReconcileGeneration?.(candidate);
     },
     reconcileWriterLaunchAttempt(candidate) {
-      reconcileCalls.push(["launchAttempt", candidate]);
+      if (recordCalls) reconcileCalls.push(["launchAttempt", candidate]);
     },
   });
   assert.equal(isPostgresRestoreActivationRecoveryService(service), true);
@@ -208,16 +210,20 @@ function createRunner({ cursorFixture, limitValues, serviceFixture } = {}) {
   return { cursorFixture: cursorValue, runner, serviceFixture: serviceValue };
 }
 
-async function runGenerationDigest(status) {
+async function runGenerationDigest(status, { onReconcile = null } = {}) {
   const serviceFixture = createRecoveryService({
     pages: {
       generation: page([generationCandidate()], SESSION_ID_1),
     },
-    onReconcileGeneration() {
+    onReconcileGeneration(candidate) {
+      onReconcile?.(candidate);
       if (status === "pending") throw new Error("remains pending");
     },
+    recordCalls: false,
   });
+  const cursorFixture = createCursorStore({ recordCalls: false });
   const { runner } = createRunner({
+    cursorFixture,
     limitValues: limits({ generation: 1 }),
     serviceFixture,
   });
@@ -227,6 +233,14 @@ async function runGenerationDigest(status) {
 function assertCode(code) {
   return (error) =>
     error instanceof PostgresRestoreRecoveryRunnerError && error.code === code;
+}
+
+function restoreOwnProperty(target, key, descriptor) {
+  if (descriptor === undefined) {
+    delete target[key];
+  } else {
+    Object.defineProperty(target, key, descriptor);
+  }
 }
 
 function assertDeepFrozen(value, seen = new Set()) {
@@ -297,6 +311,217 @@ test("runs and durably advances four recovery lanes in fixed order", async () =>
   assertDeepFrozen(runner);
   assert.deepEqual(Reflect.ownKeys(runner), ["runOnce"]);
 });
+
+test(
+  "callback-time iterator pollution cannot reroute durable lanes",
+  { concurrency: false },
+  async () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const originalIterator = Array.prototype[Symbol.iterator];
+    const forgedActivationLane = [
+      "activation",
+      "generation",
+      "runActivationBatch",
+    ];
+    let poisonedLaneReads = 0;
+    let pollutionInstalled = false;
+    const serviceFixture = createRecoveryService({
+      pages: {
+        generation: page([generationCandidate()]),
+      },
+      onReconcileGeneration() {
+        pollutionInstalled = true;
+        Object.defineProperty(Array.prototype, Symbol.iterator, {
+          configurable: true,
+          value() {
+            if (
+              this.length === 3 &&
+              this[0] === "activation" &&
+              this[1] === "activation" &&
+              this[2] === "runActivationBatch"
+            ) {
+              poisonedLaneReads += 1;
+              return Reflect.apply(
+                originalIterator,
+                forgedActivationLane,
+                [],
+              );
+            }
+            return Reflect.apply(originalIterator, this, []);
+          },
+          writable: true,
+        });
+      },
+    });
+    const { cursorFixture, runner } = createRunner({ serviceFixture });
+    let observedError = null;
+    let result;
+
+    try {
+      result = await runner.runOnce({ signal: null });
+    } catch (error) {
+      observedError = error;
+    } finally {
+      restoreOwnProperty(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.equal(observedError, null);
+    assert.equal(pollutionInstalled, true);
+    assert.equal(poisonedLaneReads, 0);
+    assert.equal(result.activation.cursorBefore.lane, "activation");
+    assert.equal(cursorFixture.state.get("generation").revision, "1");
+    assert.equal(cursorFixture.state.get("activation").revision, "1");
+    assert.equal(cursorFixture.state.get("launch-attempt").revision, "1");
+    assert.equal(cursorFixture.state.get("current-launch").revision, "1");
+  },
+);
+
+test(
+  "invalid pages cannot inject candidates through inherited numeric setters",
+  { concurrency: false },
+  async () => {
+    async function runWithPrototype(prototype) {
+      const numericDescriptor = Object.getOwnPropertyDescriptor(prototype, "0");
+      const injectedCandidate = generationCandidate();
+      let setterCalls = 0;
+      let advanceCalls = 0;
+      const cursorFixture = createCursorStore({
+        onAdvance() {
+          advanceCalls += 1;
+        },
+        recordCalls: false,
+      });
+      const serviceFixture = createRecoveryService({
+        listOverrides: {
+          generation() {
+            Object.defineProperty(prototype, "0", {
+              configurable: true,
+              set(value) {
+                if (Array.isArray(this) && value === null) {
+                  setterCalls += 1;
+                  restoreOwnProperty(prototype, "0", numericDescriptor);
+                  Object.defineProperty(this, "0", {
+                    configurable: true,
+                    enumerable: true,
+                    value: injectedCandidate,
+                    writable: true,
+                  });
+                  return;
+                }
+                Object.defineProperty(this, "0", {
+                  configurable: true,
+                  enumerable: true,
+                  value,
+                  writable: true,
+                });
+              },
+            });
+            return page([null]);
+          },
+        },
+        recordCalls: false,
+      });
+      const { runner } = createRunner({ cursorFixture, serviceFixture });
+      let observedError = null;
+
+      try {
+        await runner.runOnce({ signal: null });
+      } catch (error) {
+        observedError = error;
+      } finally {
+        restoreOwnProperty(prototype, "0", numericDescriptor);
+      }
+
+      return { advanceCalls, cursorFixture, observedError, setterCalls };
+    }
+
+    for (const prototype of [Array.prototype, Object.prototype]) {
+      const observed = await runWithPrototype(prototype);
+      assert.equal(
+        assertCode("postgres_restore_recovery_runner_outcome_uncertain")(
+          observed.observedError,
+        ),
+        true,
+      );
+      assert.equal(observed.setterCalls, 0);
+      assert.equal(observed.advanceCalls, 0);
+      assert.equal(observed.cursorFixture.state.get("generation").revision, "0");
+      assert.equal(observed.cursorFixture.state.get("generation").cycle, "0");
+      assert.equal(
+        observed.cursorFixture.state.get("generation").afterSessionId,
+        null,
+      );
+    }
+  },
+);
+
+test(
+  "inherited non-writable numeric properties cannot block settled batches",
+  { concurrency: false },
+  async () => {
+    const protectedIndex = "99";
+    const numericDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      protectedIndex,
+    );
+    const candidates = Array.from({ length: 100 }, (_, index) =>
+      generationCandidate(
+        `019f2600-0000-7000-8000-${`${index + 1}`.padStart(12, "0")}`,
+      ),
+    );
+    let pollutionInstalled = false;
+    const cursorFixture = createCursorStore({ recordCalls: false });
+    const serviceFixture = createRecoveryService({
+      listOverrides: {
+        generation() {
+          pollutionInstalled = true;
+          Object.defineProperty(Array.prototype, protectedIndex, {
+            configurable: true,
+            value: null,
+            writable: false,
+          });
+          return page(candidates);
+        },
+      },
+      recordCalls: false,
+    });
+    const { runner } = createRunner({
+      cursorFixture,
+      limitValues: limits({ generation: 100 }),
+      serviceFixture,
+    });
+    let observedError = null;
+    let result;
+
+    try {
+      result = await runner.runOnce({ signal: null });
+    } catch (error) {
+      observedError = error;
+    } finally {
+      restoreOwnProperty(Array.prototype, protectedIndex, numericDescriptor);
+    }
+
+    assert.equal(observedError, null);
+    assert.equal(pollutionInstalled, true);
+    assert.equal(result.generation.batch.results.length, 100);
+    assert.equal(
+      result.generation.batch.results[99].sessionId,
+      "019f2600-0000-7000-8000-000000000100",
+    );
+    assert.equal(
+      Object.getPrototypeOf(result.generation.batch.results),
+      Array.prototype,
+    );
+    assert.equal(cursorFixture.state.get("generation").revision, "1");
+  },
+);
 
 test("passes startup-fixed lane limits and persists each settled continuation", async () => {
   const serviceFixture = createRecoveryService({
@@ -429,6 +654,72 @@ test(
       assert.notEqual(
         pollution.pending.generation.requestSha256,
         pollution.reconciled.generation.requestSha256,
+      );
+    }
+  },
+);
+
+test(
+  "request hashes ignore callback-time inherited numeric setters",
+  { concurrency: false },
+  async () => {
+    async function runWithPollution(prototype, status) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "0");
+      let pollutionInstalled = false;
+      let setterCalls = 0;
+      let observedError = null;
+      let result;
+
+      try {
+        result = await runGenerationDigest(status, {
+          onReconcile() {
+            pollutionInstalled = true;
+            Object.defineProperty(prototype, "0", {
+              configurable: true,
+              set(value) {
+                if (
+                  value !== null &&
+                  typeof value === "object" &&
+                  Object.hasOwn(value, "operationId") &&
+                  Object.hasOwn(value, "sessionId") &&
+                  Object.hasOwn(value, "status")
+                ) {
+                  setterCalls += 1;
+                }
+                Object.defineProperty(this, "0", {
+                  configurable: true,
+                  enumerable: true,
+                  value,
+                  writable: true,
+                });
+              },
+            });
+          },
+        });
+      } catch (error) {
+        observedError = error;
+      } finally {
+        restoreOwnProperty(prototype, "0", descriptor);
+      }
+
+      assert.equal(observedError, null);
+      assert.equal(pollutionInstalled, true);
+      assert.equal(setterCalls, 0);
+      assert.equal(
+        Object.getPrototypeOf(result.generation.batch.results),
+        Array.prototype,
+      );
+      return result.generation.requestSha256;
+    }
+
+    for (const prototype of [Array.prototype, Object.prototype]) {
+      assert.equal(
+        await runWithPollution(prototype, "pending"),
+        "e9ae895a920e0540006f2e33e935e1ec146870504412d9378d225ed39ef4b0e1",
+      );
+      assert.equal(
+        await runWithPollution(prototype, "reconciled"),
+        "b2fcc93c8f30a210bfb83386eb8bf70324b2abad3c2ecea56a791f2c66de3233",
       );
     }
   },

@@ -33,7 +33,10 @@ committed transition binds one transition ID and request digest. A stale
 runner, commit acknowledgement loss, abort, or process restart may repeat
 existing idempotent recovery work, but must not forge a batch, overwrite a
 newer cursor, move another lane, or create restore/publication/launch
-authority.
+authority. Callback-reachable prototype mutation also cannot redirect a lane
+or intercept the construction of a private dense result array: control tuples
+are read through their own numeric properties, and every private numeric slot
+is created with the captured data-property intrinsic before it is trusted.
 
 ## Scope
 
@@ -96,9 +99,11 @@ authority.
   scope, lane, expected cursor, limit, and the complete normalized batch. It
   hashes a private null-prototype batch array so post-import prototype
   `toJSON` hooks cannot alter that binding while clean-runtime digest bytes
-  remain compatible. The runner processes generation, activation,
-  launch-attempt, and current-launch in order, preserving earlier durable
-  progress on later failure.
+  remain compatible. Service and runner array copies use captured own-property
+  definition rather than assignment or `push`, and the lane table is read by
+  own numeric index instead of an inherited iterator. The runner processes
+  generation, activation, launch-attempt, and current-launch in order,
+  preserving earlier durable progress on later failure.
 
 ## Validation
 
@@ -108,8 +113,9 @@ authority.
 - Recovery-service and runner unit coverage exercises authentic one-use receipt
   provenance, fixed lane order, abort before work, drained partial abort,
   partial failure, deterministic request binding, post-import Array/Object
-  prototype pollution, single-flight admission, and malformed collaborator
-  boundaries.
+  prototype pollution, callback-time iterator and numeric-property pollution,
+  inherited non-writable numeric properties, single-flight admission, and
+  malformed collaborator boundaries.
 - Migration executor coverage verifies the checksum-bound version 5 chain and
   upgrade/future-ledger behavior. The PostgreSQL integration gate additionally
   covers the real schema, constraint inventory, four-lane initialization,

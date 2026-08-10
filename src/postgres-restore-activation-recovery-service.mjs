@@ -11,7 +11,6 @@ import {
 const arrayIsArray = Array.isArray;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
-const arrayPushIntrinsic = Array.prototype.push;
 const arrayPrototype = Array.prototype;
 const bufferByteLength = Buffer.byteLength;
 const DateConstructor = Date;
@@ -207,8 +206,13 @@ function arrayIncludes(value, candidate) {
   return callIntrinsic(arrayIncludesIntrinsic, value, [candidate]);
 }
 
-function arrayPush(value, candidate) {
-  return callIntrinsic(arrayPushIntrinsic, value, [candidate]);
+function defineArrayElement(value, index, candidate) {
+  objectDefineProperty(value, index, {
+    configurable: true,
+    enumerable: true,
+    value: candidate,
+    writable: true,
+  });
 }
 
 function arrayEvery(value, callback) {
@@ -354,7 +358,7 @@ function exactFrozenRecord(value) {
 function frozenArray(values) {
   const result = [];
   for (let index = 0; index < values.length; index += 1) {
-    result[index] = values[index];
+    defineArrayElement(result, index, values[index]);
   }
   return objectFreeze(result);
 }
@@ -562,7 +566,11 @@ function clonePlainJson(value, code) {
             objectHasOwn(descriptor, "value"),
           code,
         );
-        result[index] = visit(descriptor.value, depth + 1);
+        defineArrayElement(
+          result,
+          index,
+          visit(descriptor.value, depth + 1),
+        );
       }
       return objectFreeze(result);
     }
@@ -956,7 +964,7 @@ function normalizePage(value, request, kind, code) {
       previousSessionId === null || normalized.sessionId > previousSessionId,
       code,
     );
-    arrayPush(candidates, normalized);
+    defineArrayElement(candidates, candidates.length, normalized);
     previousSessionId = normalized.sessionId;
   }
   const nextAfterSessionId =
@@ -1200,8 +1208,9 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
               normalized.candidate,
               outcomeCode,
             );
-      arrayPush(
+      defineArrayElement(
         results,
+        results.length,
         exactFrozenRecord({
           operationId: normalized.operationId,
           sessionId: normalized.sessionId,
@@ -1274,7 +1283,9 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         ["currentLaunch", "currentLaunch"],
       ];
       for (let index = 0; index < laneOrder.length; index += 1) {
-        const [field, kind] = laneOrder[index];
+        const laneEntry = laneOrder[index];
+        const field = laneEntry[0];
+        const kind = laneEntry[1];
         const lane = request[field];
         results[field] = await runLane(
           kind,

@@ -208,20 +208,29 @@ function exactFrozenRecord(value) {
   return objectFreeze(result);
 }
 
+function defineArrayElement(value, index, candidate) {
+  objectDefineProperty(value, `${index}`, {
+    configurable: true,
+    enumerable: true,
+    value: candidate,
+    writable: true,
+  });
+}
+
 function frozenArray(values) {
   const result = [];
   for (let index = 0; index < values.length; index += 1) {
-    result[index] = values[index];
+    defineArrayElement(result, index, values[index]);
   }
   return objectFreeze(result);
 }
 
 function frozenNullPrototypeArray(values) {
   const result = [];
-  for (let index = 0; index < values.length; index += 1) {
-    result[index] = values[index];
-  }
   callIntrinsic(objectSetPrototypeOfIntrinsic, Object, [result, null]);
+  for (let index = 0; index < values.length; index += 1) {
+    defineArrayElement(result, index, values[index]);
+  }
   return objectFreeze(result);
 }
 
@@ -556,7 +565,7 @@ function normalizeFrozenArray(value, code) {
       descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
       code,
     );
-    result[index] = descriptor.value;
+    defineArrayElement(result, index, descriptor.value);
   }
   return result;
 }
@@ -597,11 +606,15 @@ function normalizeBatch(value, cursor, field, limit, code) {
         code,
       );
     }
-    results[index] = exactFrozenRecord({
-      operationId,
-      sessionId,
-      status: normalized.status,
-    });
+    defineArrayElement(
+      results,
+      index,
+      exactFrozenRecord({
+        operationId,
+        sessionId,
+        status: normalized.status,
+      }),
+    );
     previousSessionId = sessionId;
   }
 
@@ -791,7 +804,9 @@ export function createPostgresRestoreRecoveryRunner(...args) {
   );
   const recoveryMethods = objectCreate(null);
   for (let index = 0; index < LANE_ORDER.length; index += 1) {
-    const [field, , methodName] = LANE_ORDER[index];
+    const laneSpecification = LANE_ORDER[index];
+    const field = laneSpecification[0];
+    const methodName = laneSpecification[2];
     recoveryMethods[field] = collaboratorMethod(
       recoveryService,
       methodName,
@@ -824,7 +839,9 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       }
       let status = "limit-reached";
       for (let index = 0; index < LANE_ORDER.length; index += 1) {
-        const [field, lane] = LANE_ORDER[index];
+        const laneSpecification = LANE_ORDER[index];
+        const field = laneSpecification[0];
+        const lane = laneSpecification[1];
         if (signalIsAborted(request.signal, requestCode)) {
           status = "aborted";
           break;

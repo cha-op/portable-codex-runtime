@@ -271,6 +271,93 @@ function plainBatch(value) {
   };
 }
 
+function definePassThroughArrayElement(receiver, key, value) {
+  Object.defineProperty(receiver, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function restoreOwnPropertyDescriptor(target, key, descriptor) {
+  if (descriptor === undefined) {
+    if (!Reflect.deleteProperty(target, key)) {
+      throw new Error("Failed to restore polluted prototype property");
+    }
+    return;
+  }
+  Object.defineProperty(target, key, descriptor);
+}
+
+function createNumericPrototypeTrap(shouldTrap, injectedValues) {
+  const entries = [
+    {
+      descriptor: Object.getOwnPropertyDescriptor(Array.prototype, "0"),
+      injected: injectedValues[0],
+      key: "0",
+      minimumLength: 1,
+      prototype: Array.prototype,
+      receivers: new WeakSet(),
+    },
+    {
+      descriptor: Object.getOwnPropertyDescriptor(Object.prototype, "1"),
+      injected: injectedValues[1],
+      key: "1",
+      minimumLength: 2,
+      prototype: Object.prototype,
+      receivers: new WeakSet(),
+    },
+  ];
+  const calls = { get: 0, set: 0 };
+
+  return {
+    calls,
+    install() {
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        Object.defineProperty(entry.prototype, entry.key, {
+          configurable: true,
+          get() {
+            if (entry.receivers.has(this)) {
+              calls.get += 1;
+              return entry.injected;
+            }
+            return undefined;
+          },
+          set(value) {
+            if (Array.isArray(this) && shouldTrap(value)) {
+              calls.set += 1;
+              entry.receivers.add(this);
+              if (this.length < entry.minimumLength) {
+                this.length = entry.minimumLength;
+              }
+              return;
+            }
+            definePassThroughArrayElement(this, entry.key, value);
+          },
+        });
+      }
+    },
+    restore() {
+      let restorationError;
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        try {
+          restoreOwnPropertyDescriptor(
+            entry.prototype,
+            entry.key,
+            entry.descriptor,
+          );
+        } catch (error) {
+          restorationError ??= error;
+        }
+      }
+      if (restorationError !== undefined) throw restorationError;
+    },
+  };
+}
+
 test("runs four bounded recovery lanes without treating current launches as adoptable", async () => {
   const fixture = callbacks({
     async reconcileRestoreAttachmentActivation(candidate) {
@@ -325,6 +412,166 @@ test("runs four bounded recovery lanes without treating current launches as adop
   ]);
   assertDeepFrozen(service);
 });
+
+test(
+  "list-time numeric prototype accessors cannot inject or erase candidates",
+  { concurrency: false },
+  async () => {
+    const sourcePage = page([
+      generationCandidate(SESSION_ID),
+      generationCandidate(OTHER_SESSION_ID),
+    ]);
+    const injectedFirst = generationCandidate(SESSION_ID);
+    const injectedSecond = generationCandidate(OTHER_SESSION_ID);
+    injectedFirst.request.operationId = `injected-${SESSION_ID}`;
+    injectedSecond.request.operationId = `injected-${OTHER_SESSION_ID}`;
+    const prototypeTrap = createNumericPrototypeTrap(
+      (value) =>
+        value !== null &&
+        typeof value === "object" &&
+        (Object.hasOwn(value, "checkpoint") ||
+          Object.hasOwn(value, "candidate")),
+      [injectedFirst, injectedSecond],
+    );
+    let reconciled = 0;
+
+    const fixture = callbacks({
+      listRestoreGenerationCandidates() {
+        prototypeTrap.install();
+        return sourcePage;
+      },
+      reconcileRestoreGeneration() {
+        reconciled += 1;
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    let result;
+    let runError;
+
+    try {
+      result = await service.runGenerationBatch(request());
+    } catch (error) {
+      runError = error;
+    } finally {
+      prototypeTrap.restore();
+    }
+
+    assert.ifError(runError);
+    assert.deepEqual(prototypeTrap.calls, { get: 0, set: 0 });
+    assert.equal(reconciled, 2);
+    assert.deepEqual(
+      result.results.map((entry) => entry.operationId),
+      [`restore-${SESSION_ID}`, `restore-${OTHER_SESSION_ID}`],
+    );
+  },
+);
+
+test(
+  "reconcile-time numeric accessors and inherited non-writable entries preserve results",
+  { concurrency: false },
+  async () => {
+    const candidates = Array.from({ length: 100 }, (_, index) =>
+      generationCandidate(
+        `019f2100-0000-7000-8000-${String(index + 1).padStart(12, "0")}`,
+      ),
+    );
+    const sourcePage = page(candidates);
+    const injectedFirst = {
+      operationId: `injected-${SESSION_ID}`,
+      sessionId: SESSION_ID,
+      status: "pending",
+    };
+    const injectedSecond = {
+      operationId: `injected-${OTHER_SESSION_ID}`,
+      sessionId: OTHER_SESSION_ID,
+      status: "pending",
+    };
+    const prototypeTrap = createNumericPrototypeTrap(
+      (value) =>
+        value !== null &&
+        typeof value === "object" &&
+        Object.hasOwn(value, "status") &&
+        value !== injectedFirst &&
+        value !== injectedSecond,
+      [injectedFirst, injectedSecond],
+    );
+    const nonWritableDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "99",
+    );
+    let installed = false;
+    let reconciled = 0;
+    let lastReconciledCandidate;
+
+    const fixture = callbacks({
+      listRestoreGenerationCandidates() {
+        Object.defineProperty(Array.prototype, "99", {
+          configurable: true,
+          enumerable: false,
+          value: "inherited-non-writable",
+          writable: false,
+        });
+        return sourcePage;
+      },
+      reconcileRestoreGeneration(candidate) {
+        reconciled += 1;
+        lastReconciledCandidate = candidate;
+        if (!installed) {
+          installed = true;
+          prototypeTrap.install();
+        }
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    let result;
+    let runError;
+
+    try {
+      result = await service.runGenerationBatch(request({ limit: 100 }));
+    } catch (error) {
+      runError = error;
+    } finally {
+      try {
+        prototypeTrap.restore();
+      } finally {
+        restoreOwnPropertyDescriptor(
+          Array.prototype,
+          "99",
+          nonWritableDescriptor,
+        );
+      }
+    }
+
+    assert.ifError(runError);
+    assert.deepEqual(prototypeTrap.calls, { get: 0, set: 0 });
+    assert.equal(reconciled, 100);
+    assert.equal(Object.getPrototypeOf(result.results), Array.prototype);
+    assert.equal(result.results.length, 100);
+    assert.equal(Reflect.ownKeys(result.results).length, 101);
+    assert.deepEqual({ ...result.results[0] }, {
+      operationId: `restore-${SESSION_ID}`,
+      sessionId: SESSION_ID,
+      status: "reconciled",
+    });
+    assert.deepEqual({ ...result.results[99] }, {
+      operationId:
+        "restore-019f2100-0000-7000-8000-000000000100",
+      sessionId: "019f2100-0000-7000-8000-000000000100",
+      status: "reconciled",
+    });
+    assert.equal(
+      lastReconciledCandidate.checkpoint.imageDigest,
+      IMAGE_DIGEST,
+    );
+    assert.equal(result.afterSessionId, null);
+    assert.equal(result.nextAfterSessionId, null);
+    assert.equal(result.status, "sweep-complete");
+  },
+);
 
 test("brands only exact recovery service instances without invoking Proxy traps", () => {
   const service = createPostgresRestoreActivationRecoveryService(
@@ -644,6 +891,147 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
   );
   assertDeepFrozen(result);
 });
+
+test(
+  "runSweep ignores callback-time iterator replacement",
+  { concurrency: false },
+  async () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const originalIterator = iteratorDescriptor.value;
+    let iteratorCalls = 0;
+    let order = "";
+
+    function recordOrder(value) {
+      order = order === "" ? value : `${order},${value}`;
+    }
+
+    function pollutedArrayIterator() {
+      const field = this[0];
+      const isLaneEntry =
+        this.length === 2 &&
+        field === this[1] &&
+        (field === "generation" ||
+          field === "activation" ||
+          field === "launchAttempt" ||
+          field === "currentLaunch");
+      if (!isLaneEntry) {
+        return Reflect.apply(originalIterator, this, []);
+      }
+      iteratorCalls += 1;
+      let position = 0;
+      return {
+        next() {
+          position += 1;
+          if (position === 1) {
+            return { done: false, value: "currentLaunch" };
+          }
+          if (position === 2) {
+            return { done: false, value: "generation" };
+          }
+          return { done: true, value: undefined };
+        },
+        return() {
+          return { done: true, value: undefined };
+        },
+      };
+    }
+
+    const fixture = callbacks({
+      listCurrentWriterLaunchCandidates() {
+        recordOrder("current");
+        return page([]);
+      },
+      listRestoreAttachmentActivationCandidates() {
+        recordOrder("activation");
+        return page([]);
+      },
+      listRestoreGenerationCandidates() {
+        recordOrder("generation");
+        Object.defineProperty(Array.prototype, Symbol.iterator, {
+          ...iteratorDescriptor,
+          value: pollutedArrayIterator,
+        });
+        return page([]);
+      },
+      listWriterLaunchAttemptCandidates() {
+        recordOrder("launch");
+        return page([]);
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    const sweepRequest = {
+      activation: lane(SESSION_ID, 2),
+      currentLaunch: lane(THIRD_SESSION_ID, 4),
+      generation: lane(null, 1),
+      launchAttempt: lane(OTHER_SESSION_ID, 3),
+      signal: null,
+    };
+    let result;
+    let runError;
+
+    try {
+      result = await service.runSweep(sweepRequest);
+    } catch (error) {
+      runError = error;
+    } finally {
+      restoreOwnPropertyDescriptor(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.ifError(runError);
+    assert.equal(iteratorCalls, 0);
+    assert.equal(order, "generation,activation,launch,current");
+    assert.equal(result.status, "sweep-complete");
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        1,
+        result.generation,
+      ),
+      true,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "activation",
+        SESSION_ID,
+        2,
+        result.activation,
+      ),
+      true,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "launchAttempt",
+        OTHER_SESSION_ID,
+        3,
+        result.launchAttempt,
+      ),
+      true,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "currentLaunch",
+        THIRD_SESSION_ID,
+        4,
+        result.currentLaunch,
+      ),
+      true,
+    );
+  },
+);
 
 test("sparse current-launch pages advance the scanned authority cursor", async () => {
   const fixture = callbacks({
