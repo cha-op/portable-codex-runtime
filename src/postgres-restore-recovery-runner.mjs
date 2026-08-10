@@ -29,6 +29,7 @@ const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
+const objectSetPrototypeOfIntrinsic = Object.setPrototypeOf;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
 const promiseSpeciesSymbol = Symbol.species;
@@ -212,6 +213,15 @@ function frozenArray(values) {
   for (let index = 0; index < values.length; index += 1) {
     result[index] = values[index];
   }
+  return objectFreeze(result);
+}
+
+function frozenNullPrototypeArray(values) {
+  const result = [];
+  for (let index = 0; index < values.length; index += 1) {
+    result[index] = values[index];
+  }
+  callIntrinsic(objectSetPrototypeOfIntrinsic, Object, [result, null]);
   return objectFreeze(result);
 }
 
@@ -641,20 +651,32 @@ function canonicalRequestSha256({
   // distinguishes attempts, while the cursor CAS decides durability: after an
   // ambiguous advance, a restarted runner reads the row instead of trusting
   // process-local state or replaying from an in-memory transition identifier.
-  const payload = exactFrozenRecord({
-    contractVersion: 1,
-    recoveryScopeId,
-    lane,
-    expectedRevision: cursor.revision,
-    expectedCycle: cursor.cycle,
-    expectedAfterSessionId: cursor.afterSessionId,
-    nextAfterSessionId: batch.nextAfterSessionId,
-    limit,
-    batch,
-  });
   let serialized;
   let hash;
   try {
+    // JSON.stringify performs inherited toJSON lookups for object values.
+    // Keep the public batch array conventional, but hash a private Array whose
+    // prototype is null. The payload, batch, and result records already have
+    // null prototypes, so no inherited hook can rewrite or collapse the
+    // durable request identity. Array classification and key order remain
+    // unchanged, preserving the unpolluted JSON bytes.
+    const digestBatch = exactFrozenRecord({
+      afterSessionId: batch.afterSessionId,
+      nextAfterSessionId: batch.nextAfterSessionId,
+      results: frozenNullPrototypeArray(batch.results),
+      status: batch.status,
+    });
+    const payload = exactFrozenRecord({
+      contractVersion: 1,
+      recoveryScopeId,
+      lane,
+      expectedRevision: cursor.revision,
+      expectedCycle: cursor.cycle,
+      expectedAfterSessionId: cursor.afterSessionId,
+      nextAfterSessionId: batch.nextAfterSessionId,
+      limit,
+      batch: digestBatch,
+    });
     serialized = callIntrinsic(jsonStringifyIntrinsic, JSON, [payload]);
     hash = callIntrinsic(createHash, undefined, ["sha256"]);
     callIntrinsic(hashUpdateIntrinsic, hash, [serialized, "utf8"]);

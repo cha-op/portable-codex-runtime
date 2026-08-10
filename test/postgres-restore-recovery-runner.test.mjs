@@ -208,6 +208,22 @@ function createRunner({ cursorFixture, limitValues, serviceFixture } = {}) {
   return { cursorFixture: cursorValue, runner, serviceFixture: serviceValue };
 }
 
+async function runGenerationDigest(status) {
+  const serviceFixture = createRecoveryService({
+    pages: {
+      generation: page([generationCandidate()], SESSION_ID_1),
+    },
+    onReconcileGeneration() {
+      if (status === "pending") throw new Error("remains pending");
+    },
+  });
+  const { runner } = createRunner({
+    limitValues: limits({ generation: 1 }),
+    serviceFixture,
+  });
+  return runner.runOnce({ signal: null });
+}
+
 function assertCode(code) {
   return (error) =>
     error instanceof PostgresRestoreRecoveryRunnerError && error.code === code;
@@ -332,25 +348,9 @@ test("passes startup-fixed lane limits and persists each settled continuation", 
 });
 
 test("request hashes are deterministic over cursor state, limit, and full batch", async () => {
-  async function runWith(status) {
-    const serviceFixture = createRecoveryService({
-      pages: {
-        generation: page([generationCandidate()], SESSION_ID_1),
-      },
-      onReconcileGeneration() {
-        if (status === "pending") throw new Error("remains pending");
-      },
-    });
-    const { runner } = createRunner({
-      limitValues: limits({ generation: 1 }),
-      serviceFixture,
-    });
-    return runner.runOnce({ signal: null });
-  }
-
-  const first = await runWith("pending");
-  const replay = await runWith("pending");
-  const changed = await runWith("reconciled");
+  const first = await runGenerationDigest("pending");
+  const replay = await runGenerationDigest("pending");
+  const changed = await runGenerationDigest("reconciled");
 
   assert.equal(first.generation.requestSha256, replay.generation.requestSha256);
   assert.notEqual(first.generation.transitionId, replay.generation.transitionId);
@@ -367,6 +367,72 @@ test("request hashes are deterministic over cursor state, limit, and full batch"
     wide.generation.requestSha256,
   );
 });
+
+test(
+  "request hashes ignore post-import prototype toJSON pollution",
+  { concurrency: false },
+  async () => {
+    const baselinePending = await runGenerationDigest("pending");
+    const baselineReconciled = await runGenerationDigest("reconciled");
+    assert.equal(
+      baselinePending.generation.requestSha256,
+      "e9ae895a920e0540006f2e33e935e1ec146870504412d9378d225ed39ef4b0e1",
+    );
+    assert.equal(
+      baselineReconciled.generation.requestSha256,
+      "b2fcc93c8f30a210bfb83386eb8bf70324b2abad3c2ecea56a791f2c66de3233",
+    );
+    async function runWithPollution(prototype, label) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "toJSON");
+      let calls = 0;
+      let pending;
+      let reconciled;
+      try {
+        Object.defineProperty(prototype, "toJSON", {
+          configurable: true,
+          value() {
+            calls += 1;
+            return `polluted-${label}`;
+          },
+        });
+        pending = await runGenerationDigest("pending");
+        reconciled = await runGenerationDigest("reconciled");
+      } finally {
+        if (descriptor === undefined) {
+          delete prototype.toJSON;
+        } else {
+          Object.defineProperty(prototype, "toJSON", descriptor);
+        }
+      }
+      return { calls, pending, reconciled };
+    }
+
+    const arrayPollution = await runWithPollution(
+      Array.prototype,
+      "array",
+    );
+    const objectPollution = await runWithPollution(
+      Object.prototype,
+      "object",
+    );
+
+    for (const pollution of [arrayPollution, objectPollution]) {
+      assert.equal(pollution.calls, 0);
+      assert.equal(
+        pollution.pending.generation.requestSha256,
+        baselinePending.generation.requestSha256,
+      );
+      assert.equal(
+        pollution.reconciled.generation.requestSha256,
+        baselineReconciled.generation.requestSha256,
+      );
+      assert.notEqual(
+        pollution.pending.generation.requestSha256,
+        pollution.reconciled.generation.requestSha256,
+      );
+    }
+  },
+);
 
 test("abort before the first read performs no cursor initialization or recovery work", async () => {
   const controller = new AbortController();
