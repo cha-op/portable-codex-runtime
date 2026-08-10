@@ -51,6 +51,10 @@ import {
   PostgresSerializableStoreError,
   SESSION_AUTHORITY_MIGRATION_VERSION,
 } from "../src/postgres-serializable-store.mjs";
+import {
+  PostgresRestoreRecoveryCursorStoreError,
+  createPostgresRestoreRecoveryCursorStore,
+} from "../src/postgres-restore-recovery-cursor-store.mjs";
 import { createSessionManifest } from "../src/session-storage-contracts.mjs";
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
@@ -94,6 +98,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 4,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/005-restore-recovery-cursors.sql",
+      import.meta.url,
+    ),
+    version: 5,
   }),
 ]);
 
@@ -394,7 +405,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 4,
+    version: 5,
   });
   const registry = await pool.query(
     [
@@ -999,6 +1010,417 @@ async function assertRestoreGenerationConstraints(pool) {
   } finally {
     if (transactionOpen) await client.query("ROLLBACK");
     client.release();
+  }
+}
+
+async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
+  const columns = await pool.query(
+    [
+      "SELECT column_name, data_type, is_nullable, character_maximum_length",
+      "FROM information_schema.columns",
+      "WHERE table_schema = 'session_authority'",
+      "AND table_name = 'restore_recovery_cursors'",
+      "ORDER BY ordinal_position",
+    ].join(" "),
+  );
+  assert.deepEqual(columns.rows, [
+    {
+      character_maximum_length: 128,
+      column_name: "recovery_scope_id",
+      data_type: "character varying",
+      is_nullable: "NO",
+    },
+    {
+      character_maximum_length: 32,
+      column_name: "lane",
+      data_type: "character varying",
+      is_nullable: "NO",
+    },
+    {
+      character_maximum_length: null,
+      column_name: "after_session_id",
+      data_type: "uuid",
+      is_nullable: "YES",
+    },
+    {
+      character_maximum_length: null,
+      column_name: "cycle",
+      data_type: "bigint",
+      is_nullable: "NO",
+    },
+    {
+      character_maximum_length: null,
+      column_name: "revision",
+      data_type: "bigint",
+      is_nullable: "NO",
+    },
+    {
+      character_maximum_length: null,
+      column_name: "last_transition_id",
+      data_type: "uuid",
+      is_nullable: "YES",
+    },
+    {
+      character_maximum_length: 64,
+      column_name: "last_request_sha256",
+      data_type: "character",
+      is_nullable: "YES",
+    },
+    {
+      character_maximum_length: null,
+      column_name: "updated_at",
+      data_type: "timestamp with time zone",
+      is_nullable: "NO",
+    },
+  ]);
+
+  const constraints = await pool.query(
+    [
+      "SELECT constraint_name",
+      "FROM (",
+      "SELECT constraint_record.conname AS constraint_name",
+      "FROM pg_catalog.pg_constraint AS constraint_record",
+      "WHERE constraint_record.conrelid =",
+      "'session_authority.restore_recovery_cursors'::pg_catalog.regclass",
+      "AND constraint_record.contype IN ('p', 'c')",
+      ") AS named_constraints",
+      "ORDER BY constraint_name",
+    ].join(" "),
+  );
+  assert.deepEqual(
+    constraints.rows.map(({ constraint_name: name }) => name),
+    [
+      "restore_recovery_cursors_cycle_nonnegative",
+      "restore_recovery_cursors_cycle_within_revision",
+      "restore_recovery_cursors_initial_shape",
+      "restore_recovery_cursors_lane_allowed",
+      "restore_recovery_cursors_pkey",
+      "restore_recovery_cursors_progressed_shape",
+      "restore_recovery_cursors_request_sha256_format",
+      "restore_recovery_cursors_revision_nonnegative",
+      "restore_recovery_cursors_scope_id_length",
+      "restore_recovery_cursors_transition_digest_pair",
+    ],
+  );
+
+  const constraintClient = await pool.connect();
+  let constraintTransactionOpen = false;
+  try {
+    await constraintClient.query("BEGIN");
+    constraintTransactionOpen = true;
+    const timestamp = await constraintClient.query(
+      "SELECT pg_catalog.transaction_timestamp() AS value",
+    );
+    const now = timestamp.rows[0].value;
+    const transitionId = randomUUID();
+    const requestSha256 = "a".repeat(64);
+    const scenarios = [
+      {
+        constraint: "restore_recovery_cursors_scope_id_length",
+        values: ["", "generation", null, 0, 0, null, null, now],
+      },
+      {
+        constraint: "restore_recovery_cursors_lane_allowed",
+        values: [
+          `constraint-${randomUUID()}`,
+          "invalid",
+          null,
+          0,
+          0,
+          null,
+          null,
+          now,
+        ],
+      },
+      {
+        constraint: "restore_recovery_cursors_cycle_nonnegative",
+        values: [
+          `constraint-${randomUUID()}`,
+          "generation",
+          null,
+          -1,
+          1,
+          transitionId,
+          requestSha256,
+          now,
+        ],
+      },
+      {
+        constraint: "restore_recovery_cursors_cycle_within_revision",
+        values: [
+          `constraint-${randomUUID()}`,
+          "generation",
+          null,
+          2,
+          1,
+          transitionId,
+          requestSha256,
+          now,
+        ],
+      },
+      {
+        constraint: "restore_recovery_cursors_request_sha256_format",
+        values: [
+          `constraint-${randomUUID()}`,
+          "generation",
+          null,
+          0,
+          1,
+          transitionId,
+          "invalid",
+          now,
+        ],
+      },
+      {
+        constraint: "restore_recovery_cursors_initial_shape",
+        values: [
+          `constraint-${randomUUID()}`,
+          "generation",
+          randomUUID(),
+          0,
+          0,
+          null,
+          null,
+          now,
+        ],
+      },
+      {
+        constraint: "restore_recovery_cursors_progressed_shape",
+        values: [
+          `constraint-${randomUUID()}`,
+          "generation",
+          null,
+          0,
+          1,
+          null,
+          null,
+          now,
+        ],
+      },
+    ];
+    for (const scenario of scenarios) {
+      await constraintClient.query("SAVEPOINT cursor_constraint_check");
+      await assert.rejects(
+        constraintClient.query(
+          [
+            "INSERT INTO session_authority.restore_recovery_cursors",
+            "(recovery_scope_id, lane, after_session_id, cycle, revision,",
+            "last_transition_id, last_request_sha256, updated_at)",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          ].join(" "),
+          scenario.values,
+        ),
+        (error) => {
+          assert.equal(error.code, "23514");
+          assert.equal(error.constraint, scenario.constraint);
+          return true;
+        },
+      );
+      await constraintClient.query(
+        "ROLLBACK TO SAVEPOINT cursor_constraint_check",
+      );
+      await constraintClient.query(
+        "RELEASE SAVEPOINT cursor_constraint_check",
+      );
+    }
+    await constraintClient.query("ROLLBACK");
+    constraintTransactionOpen = false;
+  } finally {
+    if (constraintTransactionOpen) {
+      await constraintClient.query("ROLLBACK");
+    }
+    constraintClient.release();
+  }
+
+  const lanes = [
+    "generation",
+    "activation",
+    "launch-attempt",
+    "current-launch",
+  ];
+  const lazyScopeId = `lazy-${randomUUID()}`;
+  const concurrentScopeId = `concurrent-${randomUUID()}`;
+  const acknowledgementLossScopeId = `ack-loss-${randomUUID()}`;
+  const scopeIds = [
+    lazyScopeId,
+    concurrentScopeId,
+    acknowledgementLossScopeId,
+  ];
+  const cursorStore = createPostgresRestoreRecoveryCursorStore({ store });
+  try {
+    const initialized = [];
+    for (const lane of lanes) {
+      const cursor = await cursorStore.readLane({
+        lane,
+        recoveryScopeId: lazyScopeId,
+      });
+      assert.equal(Object.isFrozen(cursor), true);
+      assert.deepEqual(
+        {
+          afterSessionId: cursor.afterSessionId,
+          cycle: cursor.cycle,
+          lane: cursor.lane,
+          lastRequestSha256: cursor.lastRequestSha256,
+          lastTransitionId: cursor.lastTransitionId,
+          recoveryScopeId: cursor.recoveryScopeId,
+          revision: cursor.revision,
+        },
+        {
+          afterSessionId: null,
+          cycle: "0",
+          lane,
+          lastRequestSha256: null,
+          lastTransitionId: null,
+          recoveryScopeId: lazyScopeId,
+          revision: "0",
+        },
+      );
+      assert.match(
+        cursor.updatedAt,
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u,
+      );
+      initialized.push(cursor);
+    }
+    assert.deepEqual(
+      await cursorStore.readLane({
+        lane: "generation",
+        recoveryScopeId: lazyScopeId,
+      }),
+      initialized[0],
+    );
+    const initializedRows = await pool.query(
+      [
+        "SELECT lane, revision::text AS revision",
+        "FROM session_authority.restore_recovery_cursors",
+        "WHERE recovery_scope_id = $1",
+        "ORDER BY lane",
+      ].join(" "),
+      [lazyScopeId],
+    );
+    assert.deepEqual(initializedRows.rows, [
+      { lane: "activation", revision: "0" },
+      { lane: "current-launch", revision: "0" },
+      { lane: "generation", revision: "0" },
+      { lane: "launch-attempt", revision: "0" },
+    ]);
+
+    const initial = await cursorStore.readLane({
+      lane: "generation",
+      recoveryScopeId: concurrentScopeId,
+    });
+    const attempts = [0, 1].map((index) => ({
+      expectedAfterSessionId: initial.afterSessionId,
+      expectedCycle: initial.cycle,
+      expectedRevision: initial.revision,
+      lane: initial.lane,
+      nextAfterSessionId: randomUUID(),
+      recoveryScopeId: initial.recoveryScopeId,
+      requestSha256: String(index + 1).repeat(64),
+      transitionId: randomUUID(),
+    }));
+    const outcomes = await Promise.allSettled(
+      attempts.map((input) => cursorStore.advanceLane(input)),
+    );
+    const successful = outcomes.filter(
+      ({ status }) => status === "fulfilled",
+    );
+    const rejected = outcomes.filter(({ status }) => status === "rejected");
+    assert.equal(successful.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(successful[0].value.advanced, true);
+    assert.ok(
+      rejected[0].reason instanceof PostgresRestoreRecoveryCursorStoreError,
+    );
+    assert.equal(
+      rejected[0].reason.code,
+      "postgres_restore_recovery_cursor_conflict",
+    );
+    assert.deepEqual(
+      await cursorStore.readLane({
+        lane: "generation",
+        recoveryScopeId: concurrentScopeId,
+      }),
+      successful[0].value.cursor,
+    );
+
+    const acknowledgementLossStore =
+      createPostgresRestoreRecoveryCursorStore({
+        store: new PostgresSerializableStore({
+          dedicatedPool: commitAcknowledgementLossAfterQueryPool(
+            pool,
+            "restore recovery cursor",
+            (text) =>
+              text.startsWith(
+                "UPDATE session_authority.restore_recovery_cursors",
+              ),
+          ),
+          maxTransactionAttempts: 2,
+        }),
+      });
+    const acknowledgementLossInput = {
+      expectedAfterSessionId: null,
+      expectedCycle: "0",
+      expectedRevision: "0",
+      lane: "current-launch",
+      nextAfterSessionId: randomUUID(),
+      recoveryScopeId: acknowledgementLossScopeId,
+      requestSha256: "f".repeat(64),
+      transitionId: randomUUID(),
+    };
+    const recovered = await acknowledgementLossStore.advanceLane(
+      acknowledgementLossInput,
+    );
+    assert.equal(recovered.advanced, false);
+    assert.deepEqual(
+      {
+        afterSessionId: recovered.cursor.afterSessionId,
+        cycle: recovered.cursor.cycle,
+        lastRequestSha256: recovered.cursor.lastRequestSha256,
+        lastTransitionId: recovered.cursor.lastTransitionId,
+        revision: recovered.cursor.revision,
+      },
+      {
+        afterSessionId: acknowledgementLossInput.nextAfterSessionId,
+        cycle: "0",
+        lastRequestSha256: acknowledgementLossInput.requestSha256,
+        lastTransitionId: acknowledgementLossInput.transitionId,
+        revision: "1",
+      },
+    );
+    assert.deepEqual(
+      await acknowledgementLossStore.advanceLane(
+        acknowledgementLossInput,
+      ),
+      recovered,
+    );
+    const durableReplay = await pool.query(
+      [
+        "SELECT revision::text AS revision, cycle::text AS cycle,",
+        "after_session_id::text AS after_session_id,",
+        "last_transition_id::text AS last_transition_id,",
+        "last_request_sha256",
+        "FROM session_authority.restore_recovery_cursors",
+        "WHERE recovery_scope_id = $1 AND lane = $2",
+      ].join(" "),
+      [acknowledgementLossScopeId, acknowledgementLossInput.lane],
+    );
+    assert.deepEqual(durableReplay.rows, [
+      {
+        after_session_id: acknowledgementLossInput.nextAfterSessionId,
+        cycle: "0",
+        last_request_sha256: acknowledgementLossInput.requestSha256,
+        last_transition_id: acknowledgementLossInput.transitionId,
+        revision: "1",
+      },
+    ]);
+  } finally {
+    await pool.query(
+      [
+        "DELETE FROM session_authority.restore_recovery_cursors",
+        "WHERE recovery_scope_id = ANY($1::text[])",
+      ].join(" "),
+      [scopeIds],
+    );
   }
 }
 
@@ -2284,10 +2706,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 4);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 5);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4],
+      [1, 2, 3, 4, 5],
     );
 
     await pool.query(
@@ -2297,7 +2719,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 4,
+      version: 5,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -2310,7 +2732,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 4,
+      version: 5,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -2325,7 +2747,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 4,
+      version: 5,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -2337,7 +2759,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 4,
+      version: 5,
     });
     await assertLegacyRestoreV2MigrationGate(
       pool,
@@ -2346,6 +2768,7 @@ test(
     );
     await assertOperationIdRegistryConcurrency(pool);
     await assertRestoreGenerationConstraints(pool);
+    await assertRestoreRecoveryCursorSchemaAndStore(pool, store);
 
     const baselineWorkMem = await resetStore.runSerializable(
       async (transaction) => {
@@ -7961,7 +8384,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4],
+          [1, 2, 3, 4, 5],
         );
 
         const input = writerLaunchAttemptInput(

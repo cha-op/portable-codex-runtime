@@ -236,6 +236,11 @@
   cursors. Recovery is source-free and no-relaunch: it never republishes,
   reserves or consumes an image, invokes a launcher, or reconstructs an opaque
   writer capability. Current-launch handling is inventory only.
+- PostgreSQL now persists those four cursors independently for each configured
+  recovery scope. A bounded single-flight runner advances each settled lane by
+  revision/cycle compare-and-swap, survives restart and commit-acknowledgement
+  loss, and preserves earlier lane progress when a later lane fails. It remains
+  an unscheduled primitive and does not enable production restore.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   until a separate production-adapter slice passes its fleet capability gate
   and wires committed publication, detached activation, prepared launch, and
@@ -302,6 +307,8 @@
   `docs/project_journal/2026/08/2026-08-05-detached-restore-activation-3f91c2.md`
 - Capture-bound restore activation compatibility:
   `docs/project_journal/2026/08/2026-08-06-capture-bound-restore-activation-c4a2d8.md`
+- Durable restore recovery cursors and bounded runner:
+  `docs/project_journal/2026/08/2026-08-10-restore-recovery-cursors-5d82a1.md`
 - Durable stop-to-clean-capture composition:
   `docs/project_journal/2026/08/2026-08-05-durable-stop-capture-composition-7e3a91.md`
 - External-auth probe workstream:

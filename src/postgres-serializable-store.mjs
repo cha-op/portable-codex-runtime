@@ -5,7 +5,7 @@ import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 4;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 5;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
@@ -110,6 +110,13 @@ const MIGRATION_SOURCES = objectFreeze([
       import.meta.url,
     ),
     version: 4,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/005-restore-recovery-cursors.sql",
+      import.meta.url,
+    ),
+    version: 5,
   }),
 ]);
 
