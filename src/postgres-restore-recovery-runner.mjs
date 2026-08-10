@@ -150,7 +150,7 @@ function exactDataObject(
   value,
   expectedKeys,
   code,
-  { frozen = false } = {},
+  frozen = false,
 ) {
   ensure(
     value !== null &&
@@ -489,7 +489,7 @@ async function callCollaborator(method, receiver, input, code) {
 }
 
 function normalizeCursor(value, recoveryScopeId, lane, code) {
-  const cursor = exactDataObject(value, CURSOR_KEYS, code, { frozen: true });
+  const cursor = exactDataObject(value, CURSOR_KEYS, code, true);
   const afterSessionId =
     cursor.afterSessionId === null
       ? null
@@ -571,7 +571,7 @@ function normalizeFrozenArray(value, code) {
 }
 
 function normalizeBatch(value, cursor, field, limit, code) {
-  const batch = exactDataObject(value, BATCH_KEYS, code, { frozen: true });
+  const batch = exactDataObject(value, BATCH_KEYS, code, true);
   const afterSessionId =
     batch.afterSessionId === null
       ? null
@@ -592,9 +592,12 @@ function normalizeBatch(value, cursor, field, limit, code) {
   const results = [];
   let previousSessionId = afterSessionId;
   for (let index = 0; index < values.length; index += 1) {
-    const normalized = exactDataObject(values[index], BATCH_RESULT_KEYS, code, {
-      frozen: true,
-    });
+    const normalized = exactDataObject(
+      values[index],
+      BATCH_RESULT_KEYS,
+      code,
+      true,
+    );
     const operationId = canonicalOpaqueId(normalized.operationId, code);
     const sessionId = canonicalSessionId(normalized.sessionId, code);
     ensure(previousSessionId === null || sessionId > previousSessionId, code);
@@ -720,9 +723,7 @@ function normalizeAdvance(
   },
   code,
 ) {
-  const advance = exactDataObject(value, ADVANCE_RESULT_KEYS, code, {
-    frozen: true,
-  });
+  const advance = exactDataObject(value, ADVANCE_RESULT_KEYS, code, true);
   ensure(typeof advance.advanced === "boolean", code);
   const cursor = normalizeCursor(
     advance.cursor,

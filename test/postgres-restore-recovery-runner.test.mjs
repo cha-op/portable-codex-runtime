@@ -384,6 +384,58 @@ test(
 );
 
 test(
+  "callback-time inherited frozen options cannot block a later run",
+  { concurrency: false },
+  async () => {
+    const frozenDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      "frozen",
+    );
+    let getterCalls = 0;
+    let pollutionInstalled = false;
+    const serviceFixture = createRecoveryService({
+      pages: {
+        generation: page([generationCandidate()]),
+      },
+      onReconcileGeneration() {
+        if (pollutionInstalled) return;
+        pollutionInstalled = true;
+        Object.defineProperty(Object.prototype, "frozen", {
+          configurable: true,
+          get() {
+            getterCalls += 1;
+            throw new Error("inherited frozen getter must not run");
+          },
+        });
+      },
+      recordCalls: false,
+    });
+    const cursorFixture = createCursorStore({ recordCalls: false });
+    const { runner } = createRunner({ cursorFixture, serviceFixture });
+    let first;
+    let observedError = null;
+    let second;
+
+    try {
+      first = await runner.runOnce({ signal: null });
+      second = await runner.runOnce({ signal: null });
+    } catch (error) {
+      observedError = error;
+    } finally {
+      restoreOwnProperty(Object.prototype, "frozen", frozenDescriptor);
+    }
+
+    assert.equal(observedError, null);
+    assert.equal(pollutionInstalled, true);
+    assert.equal(getterCalls, 0);
+    assert.equal(first.generation.advance.cursor.revision, "1");
+    assert.equal(second.generation.cursorBefore.revision, "1");
+    assert.equal(second.generation.advance.cursor.revision, "2");
+    assert.equal(cursorFixture.state.get("generation").revision, "2");
+  },
+);
+
+test(
   "invalid pages cannot inject candidates through inherited numeric setters",
   { concurrency: false },
   async () => {

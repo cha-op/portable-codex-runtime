@@ -37,6 +37,8 @@ authority. Callback-reachable prototype mutation also cannot redirect a lane
 or intercept the construction of a private dense result array: control tuples
 are read through their own numeric properties, and every private numeric slot
 is created with the captured data-property intrinsic before it is trusted.
+Runtime validation modes are primitive booleans rather than option bags, so a
+callback cannot inject a later-run policy through `Object.prototype`.
 
 ## Scope
 
@@ -101,9 +103,11 @@ is created with the captured data-property intrinsic before it is trusted.
   `toJSON` hooks cannot alter that binding while clean-runtime digest bytes
   remain compatible. Service and runner array copies use captured own-property
   definition rather than assignment or `push`, and the lane table is read by
-  own numeric index instead of an inherited iterator. The runner processes
-  generation, activation, launch-attempt, and current-launch in order,
-  preserving earlier durable progress on later failure.
+  own numeric index instead of an inherited iterator. Frozen-record validation
+  receives a primitive boolean instead of destructuring an ordinary default
+  object. The runner processes generation, activation, launch-attempt, and
+  current-launch in order, preserving earlier durable progress on later
+  failure.
 
 ## Validation
 
@@ -114,8 +118,9 @@ is created with the captured data-property intrinsic before it is trusted.
   provenance, fixed lane order, abort before work, drained partial abort,
   partial failure, deterministic request binding, post-import Array/Object
   prototype pollution, callback-time iterator and numeric-property pollution,
-  inherited non-writable numeric properties, single-flight admission, and
-  malformed collaborator boundaries.
+  inherited non-writable numeric properties, inherited option getters across
+  successive runs, single-flight admission, and malformed collaborator
+  boundaries.
 - Migration executor coverage verifies the checksum-bound version 5 chain and
   upgrade/future-ledger behavior. The PostgreSQL integration gate additionally
   covers the real schema, constraint inventory, four-lane initialization,
