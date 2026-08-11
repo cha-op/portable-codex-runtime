@@ -11119,7 +11119,7 @@ test(
     assert.equal(afterSession.document.lastOperation?.state, "committed");
     const stopContract = await authorityPool.query(
       [
-        "SELECT request ->> 'contractVersion' AS contract_version",
+        "SELECT request #>> '{payload,contractVersion}' AS contract_version",
         "FROM session_authority.operation_claims",
         "WHERE operation_id = $1",
       ].join(" "),
