@@ -1773,6 +1773,30 @@ entire sequence:
    capture-bound activation request version 2; and
 6. consume only the activation-materialized prepared launch attempt.
 
+One narrow pre-dispatch retry cut is reconstructable without a new saga row.
+The current session must expose the exact revision-zero `prepared` generation
+active pointer, request and reservation identities derived from the stable
+plan, the expected revision derived from its direct predecessor, and one exact
+database timestamp shared by the reconstructed operation, reservation, and
+current session. Its `lastOperation` must be the immediately preceding
+committed safety-capture terminal. That complete transition witness permits
+retry of the same claim without a second reserve or publication; the sole
+publication remains gated on a definite claim grant. A missing, crossed,
+unproved, or non-direct predecessor, including any request, pointer, revision,
+timestamp, or reservation mismatch, remains outcome-uncertain and fails
+closed.
+
+Launch recovery separates preparation from reconciliation. Only a `prepared`
+attempt may mint the image reservation and enter prepared-launch dispatch.
+`starting`, `uncertain`, and `committed` attempts instead use no-relaunch
+supervisor reconciliation and do not prepare another image. A committed
+launch remains adoptable after a later active or terminal operation replaces
+the session anchors only when its immutable operation and reservation rebuild
+the original committed transition, the current `document.launch` pointer
+matches it exactly, and the current session is proved to be the same identity
+and a valid descendant. Missing or crossed launch pointers, results, requests,
+reservations, or session identity fail closed.
+
 Before it acquires any connection, the facade requires its nested per-
 operation guard pool to be distinct from both the foreground-shared and
 recovery-exclusive lifecycle pools. This protects callback-bound lock lifetime

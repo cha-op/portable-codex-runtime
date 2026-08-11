@@ -29,6 +29,7 @@ import {
   PostgresSessionAuthorityError,
   assertSessionAuthoritySnapshot,
   assertSessionOperationBinding,
+  assertSessionOperationTransitionProof,
   createCheckpointCaptureOperationRequest,
   createRestoreDestinationGenerationOperationRequest,
   createWriterLaunchAttemptOperationRequest,
@@ -779,6 +780,9 @@ function facadeFixture({
       async prepareLaunchIntent() {
         throw new Error("unexpected launch intent");
       },
+      async reconcileLaunchAttempt() {
+        throw new Error("unexpected launch reconciliation");
+      },
       async runPreparedLaunch() {
         throw new Error("unexpected launch");
       },
@@ -815,12 +819,16 @@ function facadeFixture({
 function happyFacadeFixture({
   beforeLaunchReturn = null,
   captureColdState = null,
+  crossedPreparedGeneration = null,
   crossedGeneration = false,
   crossedGenerationClaim = false,
+  crossedLaunchRunProgress = null,
   crossedLaunchRunRequest = false,
   crossedLaunchRunReservation = false,
   crossedPreparedCapture = null,
   crossedRenewalReservation = false,
+  generationClaimAckLoss = null,
+  preparedGenerationReservation = false,
 } = {}) {
   const plan = fixturePlan();
   const events = [];
@@ -925,7 +933,7 @@ function happyFacadeFixture({
   const catalogue = deepFreeze({
     document: { artifactProof: { proofId: "source-artifact-proof-001" } },
   });
-  const captureReceipt = deepFreeze({
+  let captureReceipt = deepFreeze({
     attempt: null,
     catalogue: deepFreeze({ document: { artifactProof: null } }),
     operation: captureOperation,
@@ -933,6 +941,62 @@ function happyFacadeFixture({
     session: captured,
     status: "committed",
   });
+  let preparedGenerationSession = null;
+  if (preparedGenerationReservation) {
+    const preparedRequest = createRestoreDestinationGenerationOperationRequest({
+      admission: admission(),
+      expectedSession: captured,
+    });
+    const preparedOperation = authorityOperation({
+      expectedSession: captured,
+      kind: "restore-destination-generation-v1",
+      operationId: plan.request.operationId,
+      request: preparedRequest,
+      revision: "0",
+      state: "prepared",
+      updatedAt: "2026-08-11T09:00:03.000Z",
+    });
+    preparedGenerationSession = sessionDuringOperation(
+      captured,
+      preparedOperation,
+      revisionAfterOperation(preparedOperation),
+    );
+    if (crossedPreparedGeneration === "request") {
+      preparedGenerationSession = assertSessionAuthoritySnapshot(
+        deepFreeze({
+          ...preparedGenerationSession,
+          document: {
+            ...preparedGenerationSession.document,
+            activeOperation: {
+              ...preparedGenerationSession.document.activeOperation,
+              requestSha256: "f".repeat(64),
+            },
+          },
+        }),
+      );
+    } else if (crossedPreparedGeneration === "capture-pointer") {
+      preparedGenerationSession = assertSessionAuthoritySnapshot(
+        deepFreeze({
+          ...preparedGenerationSession,
+          document: {
+            ...preparedGenerationSession.document,
+            lastOperation: {
+              ...preparedGenerationSession.document.lastOperation,
+              reservationId: "crossed-capture-reservation-001",
+            },
+          },
+        }),
+      );
+    } else {
+      assert.equal(crossedPreparedGeneration, null);
+    }
+    captureReceipt = deepFreeze({
+      ...captureReceipt,
+      session: preparedGenerationSession,
+    });
+  } else {
+    assert.equal(crossedPreparedGeneration, null);
+  }
   let coldCaptureReceipt = null;
   if (captureColdState !== null) {
     const revision = {
@@ -1030,6 +1094,16 @@ function happyFacadeFixture({
       sessionId: SESSION_ID,
       state,
     });
+  const restoredWriterLease = deepFreeze({
+    contractVersion: 1,
+    sessionId: SESSION_ID,
+    leaseId: `lease-${sha256Text(
+      `writer-lease:${plan.activationOperationId}`,
+    )}`,
+    holderId: plan.holderId,
+    fencingEpoch: "43",
+    expiresAt: "2027-08-11T09:00:06.000Z",
+  });
 
   if (crossedGeneration) {
     const crossedCaptureTerminal = assertSessionAuthoritySnapshot(
@@ -1084,12 +1158,26 @@ function happyFacadeFixture({
         generation: generationReceipt.generation,
         operation,
         reservation: operationReservation(operation, "starting"),
-        session: input.expectedSession,
+        session: sessionDuringOperation(
+          input.expectedSession,
+          operation,
+          revisionAfterOperation(operation),
+          {
+            attachment: null,
+            launch: null,
+            lease: restoredWriterLease,
+            lifecycle: "ATTACHING",
+            writerEpoch: restoredWriterLease.fencingEpoch,
+          },
+        ),
       });
       return activationReceipt;
     },
     async claimRestoreDestinationGenerationDispatch(input) {
       events.push("generation-claim");
+      if (generationClaimAckLoss === "missing") {
+        throw new Error("generation claim acknowledgement lost before commit");
+      }
       const operation = authorityOperation({
         expectedSession: input.expectedSession,
         kind: input.kind,
@@ -1126,6 +1214,10 @@ function happyFacadeFixture({
         reservation: operationReservation(operation, "starting"),
         session: claimSession,
       });
+      if (generationClaimAckLoss === "persisted") {
+        throw new Error("generation claim acknowledgement lost after persist");
+      }
+      assert.equal(generationClaimAckLoss, null);
       return generationReceipt;
     },
     async finalizeRestoreDestinationGeneration(input) {
@@ -1168,6 +1260,7 @@ function happyFacadeFixture({
       }
       if (
         crossedGeneration ||
+        preparedGenerationReservation ||
         captureColdState !== null ||
         captureDurable
       ) {
@@ -1184,7 +1277,7 @@ function happyFacadeFixture({
       return absent("restore_generation_not_authorized");
     },
     async readSession() {
-      return initial;
+      return preparedGenerationSession ?? initial;
     },
     async readWriterLaunchAttempt() {
       if (launchReceipt !== null) return launchReceipt;
@@ -1220,7 +1313,11 @@ function happyFacadeFixture({
         generationPrepared = deepFreeze({
           operation,
           reservation: operationReservation(operation, "prepared"),
-          session: captured,
+          session: sessionDuringOperation(
+            captured,
+            operation,
+            revisionAfterOperation(operation),
+          ),
         });
         return generationPrepared;
       }
@@ -1237,7 +1334,11 @@ function happyFacadeFixture({
       activationPrepared = deepFreeze({
         operation,
         reservation: operationReservation(operation, "prepared"),
-        session: input.expectedSession,
+        session: sessionDuringOperation(
+          input.expectedSession,
+          operation,
+          revisionAfterOperation(operation),
+        ),
       });
       return activationPrepared;
     },
@@ -1255,6 +1356,135 @@ function happyFacadeFixture({
     measuredImage: measuredImage(),
     supervisor: { contractVersion: 1, supervisorId: "supervisor-001" },
   });
+  function completeLaunchAttempt(input, prepared) {
+    assert.notEqual(launchReceipt, null);
+    if (launchReceipt.operation.state !== "committed") {
+      const expectedLaunchOperation = launchReceipt.operation;
+      const expectedSession = expectedLaunchOperation.expectedSession;
+      const requestValue = crossedLaunchRunRequest
+        ? deepFreeze({
+            ...expectedLaunchOperation.request,
+            supervisor: {
+              ...expectedLaunchOperation.request.supervisor,
+              supervisorId: "crossed-terminal-supervisor-001",
+            },
+          })
+        : expectedLaunchOperation.request;
+      const evidence = deepFreeze({
+        contractVersion: 1,
+        launchAttemptId: plan.launchAttemptId,
+        processIncarnationId: "restore-process-001",
+        proofId: "restore-supervisor-proof-001",
+        status: "started",
+        supervisorId: requestValue.supervisor.supervisorId,
+        writerIncarnationId: "restore-writer-incarnation-001",
+      });
+      let terminalRevision =
+        expectedLaunchOperation.state === "uncertain" ? "3" : "2";
+      let terminalUpdatedAt = "2026-08-11T09:00:07.000Z";
+      assert.equal(
+        crossedLaunchRunProgress === null ||
+          crossedLaunchRunProgress === "revision" ||
+          crossedLaunchRunProgress === "updated-at",
+        true,
+      );
+      if (expectedLaunchOperation.state === "uncertain") {
+        if (crossedLaunchRunProgress === "revision") {
+          terminalRevision = expectedLaunchOperation.revision;
+        } else if (crossedLaunchRunProgress === "updated-at") {
+          terminalUpdatedAt = expectedLaunchOperation.createdAt;
+        }
+      }
+      const operation = authorityOperation({
+        createdAt: expectedLaunchOperation.createdAt,
+        expectedSession,
+        kind: "writer-launch-attempt-v1",
+        operationId: plan.launchAttemptId,
+        request: requestValue,
+        result: {
+          evidence,
+          outcome: "writer-launch-started",
+          resultVersion: 1,
+        },
+        revision: terminalRevision,
+        state: "committed",
+        updatedAt: terminalUpdatedAt,
+      });
+      const launchPointer = {
+        attachmentId: requestValue.attachment.attachmentId,
+        attachmentSha256: sha256Json(requestValue.attachment),
+        contractVersion: 1,
+        fencingEpoch: requestValue.fencingEpoch,
+        generation: requestValue.generation,
+        launchAttemptId: plan.launchAttemptId,
+        launchResultSha256: sha256Json(operation.result),
+        leaseId: requestValue.lease.leaseId,
+        leaseSha256: sha256Json(requestValue.lease),
+        measuredImageSha256: sha256Json(requestValue.measuredImage),
+        processIncarnationId: evidence.processIncarnationId,
+        startedAt: operation.updatedAt,
+        supervisorId: evidence.supervisorId,
+        supervisorProofId: evidence.proofId,
+        writerIncarnationId: evidence.writerIncarnationId,
+      };
+      const session = sessionAfterOperation(
+        expectedSession,
+        operation,
+        revisionAfterOperation(operation),
+        { launch: launchPointer },
+      );
+      let terminalReservation = operationReservation(operation, "released");
+      let terminalSession = session;
+      if (crossedLaunchRunReservation) {
+        terminalReservation = deepFreeze({
+          ...terminalReservation,
+          reservationId: "crossed-terminal-reservation-001",
+        });
+        terminalSession = assertSessionAuthoritySnapshot(
+          deepFreeze({
+            ...session,
+            document: {
+              ...session.document,
+              lastOperation: {
+                ...session.document.lastOperation,
+                reservationId: terminalReservation.reservationId,
+              },
+            },
+          }),
+        );
+      }
+      launchReceipt = deepFreeze({
+        attempt: {
+          launchAttemptId: plan.launchAttemptId,
+          request: operation.request,
+          result: operation.result,
+          state: "committed",
+        },
+        launch: terminalSession.document.launch,
+        operation,
+        reservation: terminalReservation,
+        session: terminalSession,
+      });
+    }
+    if (prepared) {
+      assert.equal(
+        input.imageReservation.reservation,
+        imageReservation.reservation,
+      );
+      if (beforeLaunchReturn !== null) beforeLaunchReturn();
+    }
+    return deepFreeze({
+      attempt: launchReceipt.attempt,
+      contractVersion: 1,
+      evidence: launchReceipt.operation.result.evidence,
+      launch: launchReceipt.launch,
+      operation: launchReceipt.operation,
+      reservation: launchReceipt.reservation,
+      session: launchReceipt.session,
+      status: "started",
+      writer: deepFreeze(Object.create(null)),
+    });
+  }
   let detached = null;
   const facade = createPostgresDetachedRestoreForegroundComposition({
     authority,
@@ -1288,114 +1518,14 @@ function happyFacadeFixture({
         assert.equal(input.launchAttemptId, plan.launchAttemptId);
         return launchIntent;
       },
+      async reconcileLaunchAttempt(input) {
+        events.push("launch-reconcile");
+        assert.equal(input.launchAttemptId, plan.launchAttemptId);
+        return completeLaunchAttempt(input, false);
+      },
       async runPreparedLaunch(input) {
         events.push("launch");
-        assert.notEqual(launchReceipt, null);
-        const expectedLaunchOperation = launchReceipt.operation;
-        const expectedSession = expectedLaunchOperation.expectedSession;
-        const requestValue = crossedLaunchRunRequest
-          ? deepFreeze({
-              ...expectedLaunchOperation.request,
-              supervisor: {
-                ...expectedLaunchOperation.request.supervisor,
-                supervisorId: "crossed-terminal-supervisor-001",
-              },
-            })
-          : expectedLaunchOperation.request;
-        const evidence = deepFreeze({
-          contractVersion: 1,
-          launchAttemptId: plan.launchAttemptId,
-          processIncarnationId: "restore-process-001",
-          proofId: "restore-supervisor-proof-001",
-          status: "started",
-          supervisorId: requestValue.supervisor.supervisorId,
-          writerIncarnationId: "restore-writer-incarnation-001",
-        });
-        const terminalRevision =
-          expectedLaunchOperation.state === "uncertain" ? "3" : "2";
-        const operation = authorityOperation({
-          createdAt: expectedLaunchOperation.createdAt,
-          expectedSession,
-          kind: "writer-launch-attempt-v1",
-          operationId: plan.launchAttemptId,
-          request: requestValue,
-          result: {
-            evidence,
-            outcome: "writer-launch-started",
-            resultVersion: 1,
-          },
-          revision: terminalRevision,
-          state: "committed",
-          updatedAt: "2026-08-11T09:00:07.000Z",
-        });
-        const launchPointer = {
-          attachmentId: requestValue.attachment.attachmentId,
-          attachmentSha256: sha256Json(requestValue.attachment),
-          contractVersion: 1,
-          fencingEpoch: requestValue.fencingEpoch,
-          generation: requestValue.generation,
-          launchAttemptId: plan.launchAttemptId,
-          launchResultSha256: sha256Json(operation.result),
-          leaseId: requestValue.lease.leaseId,
-          leaseSha256: sha256Json(requestValue.lease),
-          measuredImageSha256: sha256Json(requestValue.measuredImage),
-          processIncarnationId: evidence.processIncarnationId,
-          startedAt: operation.updatedAt,
-          supervisorId: evidence.supervisorId,
-          supervisorProofId: evidence.proofId,
-          writerIncarnationId: evidence.writerIncarnationId,
-        };
-        const session = sessionAfterOperation(
-          expectedSession,
-          operation,
-          revisionAfterOperation(operation),
-          { launch: launchPointer },
-        );
-        let terminalReservation = operationReservation(operation, "released");
-        let terminalSession = session;
-        if (crossedLaunchRunReservation) {
-          terminalReservation = deepFreeze({
-            ...terminalReservation,
-            reservationId: "crossed-terminal-reservation-001",
-          });
-          terminalSession = assertSessionAuthoritySnapshot(
-            deepFreeze({
-              ...session,
-              document: {
-                ...session.document,
-                lastOperation: {
-                  ...session.document.lastOperation,
-                  reservationId: terminalReservation.reservationId,
-                },
-              },
-            }),
-          );
-        }
-        launchReceipt = deepFreeze({
-          attempt: {
-            launchAttemptId: plan.launchAttemptId,
-            request: operation.request,
-            result: operation.result,
-            state: "committed",
-          },
-          launch: terminalSession.document.launch,
-          operation,
-          reservation: terminalReservation,
-          session: terminalSession,
-        });
-        assert.equal(input.imageReservation.reservation, imageReservation.reservation);
-        if (beforeLaunchReturn !== null) beforeLaunchReturn();
-        return deepFreeze({
-          attempt: launchReceipt.attempt,
-          contractVersion: 1,
-          evidence,
-          launch: launchReceipt.launch,
-          operation,
-          reservation: launchReceipt.reservation,
-          session: launchReceipt.session,
-          status: "started",
-          writer: deepFreeze(Object.create(null)),
-        });
+        return completeLaunchAttempt(input, true);
       },
     },
     operationGuard: guardFixture.operationGuard,
@@ -1411,14 +1541,7 @@ function happyFacadeFixture({
         events.push("activation-coordinator");
         assert.equal(candidate.request, activationReceipt.operation.request);
         const operationId = plan.activationOperationId;
-        const writerLease = deepFreeze({
-          contractVersion: 1,
-          sessionId: SESSION_ID,
-          leaseId: `lease-${sha256Text(`writer-lease:${operationId}`)}`,
-          holderId: plan.holderId,
-          fencingEpoch: "43",
-          expiresAt: "2027-08-11T09:00:06.000Z",
-        });
+        const writerLease = restoredWriterLease;
         const attachmentId =
           `attachment-${sha256Text(`writer-attachment:${operationId}`)}`;
         const materialization = generationReceipt.generation.document.materialization;
@@ -1638,6 +1761,71 @@ function happyFacadeFixture({
     },
   });
   return {
+    advanceCommittedLaunchHistory({ active = false } = {}) {
+      assert.equal(launchReceipt?.operation.state, "committed");
+      const laterLease = deepFreeze({
+        ...launchReceipt.session.document.lease,
+        expiresAt: "2027-08-11T09:00:08.000Z",
+      });
+      const laterOperation = authorityOperation({
+        expectedSession: launchReceipt.session,
+        kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+        operationId: "later-renewal-001",
+        request: deepFreeze({
+          contractVersion: 1,
+          leaseDurationMilliseconds: plan.leaseDurationMilliseconds,
+        }),
+        result: deepFreeze({
+          resultVersion: 1,
+          outcome: "writer-lease-renewed",
+          lease: laterLease,
+          attachment: launchReceipt.session.document.attachment,
+        }),
+        revision: "0",
+        state: "committed",
+        updatedAt: "2026-08-11T09:00:08.000Z",
+      });
+      let current = sessionAfterOperation(
+        launchReceipt.session,
+        laterOperation,
+        revisionAfterOperation(laterOperation),
+        { lease: laterLease },
+      );
+      assertSessionOperationTransitionProof({
+        operation: laterOperation,
+        reservation: operationReservation(laterOperation, "released"),
+        session: current,
+      });
+      if (active) {
+        const activeOperation = authorityOperation({
+          expectedSession: current,
+          kind: WRITER_LEASE_RENEW_OPERATION_KIND,
+          operationId: "later-active-renewal-001",
+          request: deepFreeze({
+            contractVersion: 1,
+            leaseDurationMilliseconds: plan.leaseDurationMilliseconds,
+          }),
+          revision: "0",
+          state: "prepared",
+          updatedAt: "2026-08-11T09:00:09.000Z",
+        });
+        current = sessionDuringOperation(
+          current,
+          activeOperation,
+          revisionAfterOperation(activeOperation),
+        );
+        assertSessionOperationTransitionProof({
+          operation: activeOperation,
+          reservation: operationReservation(activeOperation, "prepared"),
+          session: current,
+        });
+      }
+      launchReceipt = deepFreeze({
+        ...launchReceipt,
+        launch: current.document.launch,
+        session: current,
+      });
+    },
     corruptReplayReceipt(kind) {
       if (kind === "activation-generation") {
         activationReceipt = deepFreeze({
@@ -1661,6 +1849,55 @@ function happyFacadeFixture({
           ...launchReceipt,
           attempt: { ...launchReceipt.attempt, request },
           operation: { ...launchReceipt.operation, request },
+        });
+        return;
+      }
+      if (kind === "launch-null") {
+        launchReceipt = deepFreeze({ ...launchReceipt, launch: null });
+        return;
+      }
+      if (kind === "launch-attempt-result") {
+        launchReceipt = deepFreeze({
+          ...launchReceipt,
+          attempt: {
+            ...launchReceipt.attempt,
+            result: {
+              ...launchReceipt.attempt.result,
+              outcome: "writer-launch-complete-stopped",
+            },
+          },
+        });
+        return;
+      }
+      if (kind === "launch-result") {
+        const result = deepFreeze({
+          ...launchReceipt.operation.result,
+          evidence: {
+            ...launchReceipt.operation.result.evidence,
+            proofId: "crossed-launch-result-proof-001",
+          },
+        });
+        launchReceipt = deepFreeze({
+          ...launchReceipt,
+          attempt: { ...launchReceipt.attempt, result },
+          operation: { ...launchReceipt.operation, result },
+        });
+        return;
+      }
+      if (kind === "launch-digest") {
+        const launch = deepFreeze({
+          ...launchReceipt.launch,
+          launchResultSha256: "f".repeat(64),
+        });
+        launchReceipt = deepFreeze({
+          ...launchReceipt,
+          launch,
+          session: assertSessionAuthoritySnapshot(
+            deepFreeze({
+              ...launchReceipt.session,
+              document: { ...launchReceipt.session.document, launch },
+            }),
+          ),
         });
         return;
       }
@@ -2191,8 +2428,37 @@ test("gate-closed committed replay verifies publication and adopts the durable l
   });
 
   assert.equal(result, replayCompletion);
-  assert.deepEqual(fixture.events, ["publish", "image", "launch"]);
+  assert.deepEqual(fixture.events, ["publish", "launch-reconcile"]);
 });
+
+for (const active of [false, true]) {
+  test(`committed launch replay accepts later ${
+    active ? "active" : "committed"
+  } session history without relaunch`, async () => {
+    const fixture = happyFacadeFixture();
+    const seed = await seedCommittedRestore(
+      fixture,
+      `later-launch-history-${active}`,
+    );
+    fixture.advanceCommittedLaunchHistory({ active });
+    fixture.events.length = 0;
+    let completion;
+    const result = await fixture.facade.runRestore(
+      admission(),
+      async (context) => {
+        fixture.events.push("publish");
+        completion = deepFreeze({
+          materialization: seed.materialization,
+          replayed: true,
+          result: context.result,
+        });
+        return completion;
+      },
+    );
+    assert.equal(result, completion);
+    assert.deepEqual(fixture.events, ["publish", "launch-reconcile"]);
+  });
+}
 
 for (const state of ["starting", "uncertain", "committed"]) {
   test(`existing generation ${state} uses committed-only publication routing`, async () => {
@@ -2282,7 +2548,7 @@ for (const state of ["prepared", "starting", "uncertain", "committed"]) {
 }
 
 for (const state of ["starting", "uncertain"]) {
-  test(`existing launch ${state} runs the prepared-launch continuation once`, async () => {
+  test(`existing launch ${state} reconciles without image preparation`, async () => {
     const fixture = happyFacadeFixture();
     const seed = await seedCommittedRestore(
       fixture,
@@ -2305,14 +2571,47 @@ for (const state of ["starting", "uncertain"]) {
       },
     );
     assert.equal(result, completion);
-    assert.deepEqual(fixture.events, ["publish", "image", "launch"]);
+    assert.deepEqual(fixture.events, ["publish", "launch-reconcile"]);
+  });
+}
+
+for (const [corruption, label] of [
+  ["revision", "same-revision terminal"],
+  ["updated-at", "updatedAt rollback"],
+]) {
+  test(`uncertain launch reconciliation rejects ${label}`, async () => {
+    const fixture = happyFacadeFixture({
+      crossedLaunchRunProgress: corruption,
+    });
+    const seed = await seedCommittedRestore(
+      fixture,
+      `launch-progress-seed-${corruption}`,
+    );
+    fixture.setLaunchReplayState("uncertain");
+    fixture.events.length = 0;
+    await rejectsWithCode(
+      fixture.facade.runRestore(admission(), async (context) => {
+        fixture.events.push("publish");
+        return deepFreeze({
+          materialization: seed.materialization,
+          replayed: true,
+          result: context.result,
+        });
+      }),
+      "postgres_detached_restore_foreground_composition_outcome_uncertain",
+    );
+    assert.deepEqual(fixture.events, ["publish", "launch-reconcile"]);
   });
 }
 
 for (const corruption of [
   "activation-generation",
+  "launch-attempt-result",
+  "launch-digest",
+  "launch-null",
   "launch-request",
   "launch-reservation",
+  "launch-result",
 ]) {
   test(`committed replay rejects crossed ${corruption} before image preparation`, async () => {
     const fixture = happyFacadeFixture();
@@ -2380,6 +2679,113 @@ test("fresh generation dispatch requires the exact active authority pointer", as
     "generation-claim",
   ]);
 });
+
+test("prepared generation reservation resumes the exact claim without repeating prior effects", async () => {
+  const fixture = happyFacadeFixture({ preparedGenerationReservation: true });
+  let completion;
+  const result = await fixture.facade.runRestore(
+    admission(),
+    async (context) => {
+      fixture.events.push("publish");
+      completion = deepFreeze({
+        materialization: restoreMaterialization(
+          "prepared-generation-resume-001",
+        ),
+        replayed: false,
+        result: context.result,
+      });
+      fixture.publishCompletion = completion;
+      return completion;
+    },
+  );
+  assert.equal(result, completion);
+  assert.equal(
+    fixture.events.filter((entry) => entry === "generation-claim").length,
+    1,
+  );
+  assert.equal(
+    fixture.events.filter((entry) => entry === "publish").length,
+    1,
+  );
+  for (const forbidden of ["gate", "renew", "stop", "generation-reserve"]) {
+    assert.equal(fixture.events.includes(forbidden), false);
+  }
+});
+
+test("prepared generation claim acknowledgement loss uses typed committed-only readback", async () => {
+  const fixture = happyFacadeFixture({
+    generationClaimAckLoss: "persisted",
+    preparedGenerationReservation: true,
+  });
+  let completion;
+  const result = await fixture.facade.runRestore(
+    admission(),
+    async (context) => {
+      fixture.events.push("publish");
+      assert.equal(context.publicationMode, "committed-only");
+      completion = deepFreeze({
+        materialization: restoreMaterialization(
+          "prepared-generation-claim-ack-loss-001",
+        ),
+        replayed: true,
+        result: context.result,
+      });
+      fixture.publishCompletion = completion;
+      return completion;
+    },
+  );
+  assert.equal(result, completion);
+  assert.equal(
+    fixture.events.filter((entry) => entry === "generation-claim").length,
+    1,
+  );
+  assert.equal(
+    fixture.events.filter((entry) => entry === "publish").length,
+    1,
+  );
+  assert.equal(fixture.events.includes("generation-reserve"), false);
+});
+
+test("prepared generation claim acknowledgement loss without typed readback fails before publication", async () => {
+  const fixture = happyFacadeFixture({
+    generationClaimAckLoss: "missing",
+    preparedGenerationReservation: true,
+  });
+  let publishCalls = 0;
+  await rejectsWithCode(
+    fixture.facade.runRestore(admission(), async () => {
+      publishCalls += 1;
+      assert.fail("missing generation readback must not publish");
+    }),
+    "postgres_detached_restore_foreground_composition_outcome_uncertain",
+  );
+  assert.equal(publishCalls, 0);
+  assert.equal(
+    fixture.events.filter((entry) => entry === "generation-claim").length,
+    1,
+  );
+  assert.equal(fixture.events.includes("generation-reserve"), false);
+});
+
+for (const corruption of ["request", "capture-pointer"]) {
+  test(`prepared generation reservation rejects crossed ${corruption} before claim`, async () => {
+    const fixture = happyFacadeFixture({
+      crossedPreparedGeneration: corruption,
+      preparedGenerationReservation: true,
+    });
+    let publishCalls = 0;
+    await rejectsWithCode(
+      fixture.facade.runRestore(admission(), async () => {
+        publishCalls += 1;
+        assert.fail("crossed prepared generation must not publish");
+      }),
+      "postgres_detached_restore_foreground_composition_outcome_uncertain",
+    );
+    assert.equal(publishCalls, 0);
+    assert.equal(fixture.events.includes("generation-claim"), false);
+    assert.equal(fixture.events.includes("generation-reserve"), false);
+  });
+}
 
 for (const state of ["prepared", "starting", "uncertain", "committed"]) {
   test(`cold capture ${state} uses the typed continuation without fresh stop`, async () => {

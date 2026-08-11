@@ -19,6 +19,7 @@ import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+  SESSION_OPERATION_CONFLICT_CLASS,
   WRITER_FORCE_FENCE_OPERATION_KIND,
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_LAUNCH_STOP_OPERATION_KIND,
@@ -26,6 +27,7 @@ import {
   WRITER_RELEASE_OPERATION_KIND,
   PostgresSessionAuthorityError,
   assertSessionAuthoritySnapshot,
+  assertSessionOperationBinding,
   assertSessionOperationTransitionProof,
   createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
@@ -42,6 +44,7 @@ import {
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arraySortIntrinsic = Array.prototype.sort;
+const BigIntConstructor = BigInt;
 const DateConstructor = Date;
 const dateNowIntrinsic = Date.now;
 const dateParseIntrinsic = Date.parse;
@@ -129,6 +132,7 @@ const CAPTURE_BACKEND_DATA_KEYS = objectFreeze([
 const DURABLE_CAPTURE_METHODS = objectFreeze(["runPreparedCapture"]);
 const LAUNCHER_METHODS = objectFreeze([
   "prepareLaunchIntent",
+  "reconcileLaunchAttempt",
   "runPreparedLaunch",
 ]);
 const ACTIVATION_COORDINATOR_METHODS = objectFreeze([
@@ -1292,19 +1296,20 @@ function normalizeLaunchReceipt(value, plan, code) {
         ownDataValue(attempt, "request", code),
         ownDataValue(operation, "request", code),
         code,
+      ) &&
+      sameData(
+        ownDataValue(attempt, "result", code),
+        ownDataValue(operation, "result", code),
+        code,
       ),
     code,
   );
   const session = sessionSnapshot(ownDataValue(receipt, "session", code), code);
+  const launch = ownDataValue(receipt, "launch", code);
+  ensure(sameData(launch, session.document.launch, code), code);
   if (state === "committed") {
     ensure(
-      session.document.activeOperation === null &&
-        pointerMatches(
-          session.document.lastOperation,
-          plan.launchAttemptId,
-          WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
-        ) &&
-        session.document.launch !== null &&
+      session.document.launch !== null &&
         ownDataValue(session.document.launch, "launchAttemptId", code) ===
           plan.launchAttemptId,
       code,
@@ -1321,7 +1326,7 @@ function normalizeLaunchReceipt(value, plan, code) {
   }
   return exactFrozenRecord({
     attempt,
-    launch: ownDataValue(receipt, "launch", code),
+    launch,
     operation,
     reservation: ownDataValue(receipt, "reservation", code),
     session,
@@ -1675,11 +1680,78 @@ function normalizeReservedOperation(value, base, code) {
       sameData(ownDataValue(operation, "request", code), base.request, code),
     code,
   );
+  const reservation = ownDataValue(receipt, "reservation", code);
+  const session = sessionSnapshot(ownDataValue(receipt, "session", code), code);
+  try {
+    assertSessionOperationTransitionProof({
+      operation,
+      reservation,
+      session,
+    });
+  } catch {
+    fail(code);
+  }
   return exactFrozenRecord({
     operation,
-    reservation: ownDataValue(receipt, "reservation", code),
-    session: sessionSnapshot(ownDataValue(receipt, "session", code), code),
+    reservation,
+    session,
   });
+}
+
+function reconstructPreparedGenerationReservation(session, base, code) {
+  let binding;
+  try {
+    binding = assertSessionOperationBinding(base);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    sameData(
+      session.document.lastOperation,
+      base.expectedSession.document.lastOperation,
+      code,
+    ),
+    code,
+  );
+  const updatedAt = session.updatedAt;
+  const operation = exactFrozenRecord({
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    createdAt: updatedAt,
+    expectedSession: base.expectedSession,
+    kind: base.kind,
+    operationId: base.operationId,
+    request: base.request,
+    requestSha256: binding.requestSha256,
+    result: null,
+    retiredAt: null,
+    revision: "0",
+    sessionId: base.expectedSession.sessionId,
+    state: "prepared",
+    updatedAt,
+  });
+  const reservation = exactFrozenRecord({
+    conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+    createdAt: updatedAt,
+    expectedSessionRevision: base.expectedSession.revision,
+    expiresAt: null,
+    kind: base.kind,
+    operationId: base.operationId,
+    releasedAt: null,
+    requestSha256: binding.requestSha256,
+    reservationId: binding.reservationId,
+    sessionId: base.expectedSession.sessionId,
+    state: "prepared",
+    updatedAt,
+  });
+  try {
+    return assertSessionOperationTransitionProof({
+      operation,
+      reservation,
+      session,
+    });
+  } catch {
+    fail(code);
+  }
 }
 
 function generationPublicationContext(read, plan, publicationMode, code) {
@@ -1756,19 +1828,69 @@ function validateCommittedGeneration(read, completion, code) {
   return read;
 }
 
+function reconstructCaptureTerminalForPreparedGeneration(
+  capture,
+  preparedSession,
+  code,
+) {
+  const operation = capture.operation;
+  const reservation = capture.reservation;
+  const expectedSession = sessionSnapshot(
+    ownDataValue(operation, "expectedSession", code),
+    code,
+  );
+  const lastOperation = preparedSession.document.lastOperation;
+  ensure(
+    capture.state === "committed" &&
+      pointerMatches(
+        lastOperation,
+        ownDataValue(operation, "operationId", code),
+        CHECKPOINT_CAPTURE_OPERATION_KIND,
+      ),
+    code,
+  );
+  const terminalSession = exactFrozenRecord({
+    createdAt: expectedSession.createdAt,
+    document: exactFrozenRecord({
+      ...expectedSession.document,
+      activeOperation: null,
+      lastOperation,
+    }),
+    revision: committedOperationTerminalRevision(operation, code),
+    sessionId: expectedSession.sessionId,
+    updatedAt: ownDataValue(operation, "updatedAt", code),
+  });
+  try {
+    return assertSessionOperationTransitionProof({
+      operation,
+      reservation,
+      session: terminalSession,
+    }).session;
+  } catch {
+    fail(code);
+  }
+}
+
 async function runGeneration(
   bindings,
   plan,
   admission,
   capture,
   existing,
+  preparedSession,
   publish,
   lease,
   code,
 ) {
   const expectedSession =
     existing === null
-      ? capture.session
+      ? preparedSession === null
+        ? capture.session
+        : reconstructCaptureTerminalForPreparedGeneration(
+            capture,
+            preparedSession,
+            code,
+          )
       : ownDataValue(existing.operation, "expectedSession", code);
   let typedRequest;
   try {
@@ -1791,14 +1913,27 @@ async function runGeneration(
     async (assertOperationHeld) => {
       let read = existing;
       let dispatchGranted = false;
+      let transitionProven = false;
       if (read === null) {
         await assertOperationHeld();
         await assertLifecycleHeld(lease, code);
-        const reserved = normalizeReservedOperation(
-          await invoke(bindings.authority, "reserveOperation", [base], code),
-          base,
-          code,
-        );
+        const reserved =
+          preparedSession === null
+            ? normalizeReservedOperation(
+                await invoke(
+                  bindings.authority,
+                  "reserveOperation",
+                  [base],
+                  code,
+                ),
+                base,
+                code,
+              )
+            : reconstructPreparedGenerationReservation(
+                preparedSession,
+                base,
+                code,
+              );
         const claimInput = exactFrozenRecord({
           ...base,
           destinationIsolationProofId: plan.destinationIsolationProofId,
@@ -1829,7 +1964,31 @@ async function runGeneration(
           );
           ensure(read !== null, code);
         }
-        ensure(reserved.operation.operationId === read.operation.operationId, code);
+        ensure(
+          reserved.operation.operationId === read.operation.operationId &&
+            sameData(
+              ownDataValue(read.operation, "expectedSession", code),
+              base.expectedSession,
+              code,
+            ) &&
+            sameData(
+              ownDataValue(read.operation, "request", code),
+              base.request,
+              code,
+            ),
+          code,
+        );
+        reservationIdentityMatches(read.reservation, reserved.reservation, code);
+        try {
+          assertSessionOperationTransitionProof({
+            operation: read.operation,
+            reservation: read.reservation,
+            session: read.session,
+          });
+        } catch {
+          fail(code);
+        }
+        transitionProven = true;
       }
       ensure(
         sameData(ownDataValue(read.operation, "expectedSession", code), base.expectedSession, code) &&
@@ -1842,6 +2001,8 @@ async function runGeneration(
             ownDataValue(read.generation, "state", code) === "authorized",
           code,
         );
+      }
+      if (read.state !== "committed" && !transitionProven) {
         try {
           assertSessionOperationTransitionProof({
             operation: read.operation,
@@ -2202,6 +2363,114 @@ function normalizeActivationClaim(value, plan, code) {
   return exactFrozenRecord({ dispatchGranted, read });
 }
 
+function committedOperationTerminalRevision(operation, code) {
+  try {
+    return StringConstructor(
+      BigIntConstructor(
+        ownDataValue(
+          ownDataValue(operation, "expectedSession", code),
+          "revision",
+          code,
+        ),
+      ) +
+        BigIntConstructor(ownDataValue(operation, "revision", code)) +
+        1n,
+    );
+  } catch {
+    fail(code);
+  }
+}
+
+function validateCommittedLaunchHistory(
+  currentSession,
+  launchOperation,
+  launchReservation,
+  code,
+) {
+  const expectedSession = sessionSnapshot(
+    ownDataValue(launchOperation, "expectedSession", code),
+    code,
+  );
+  const currentLaunch = ownDataValue(currentSession.document, "launch", code);
+  ensure(
+    ownDataValue(launchOperation, "state", code) === "committed" &&
+      currentLaunch !== null &&
+      ownDataValue(currentLaunch, "launchAttemptId", code) ===
+        ownDataValue(launchOperation, "operationId", code),
+    code,
+  );
+  const terminalRevision = committedOperationTerminalRevision(
+    launchOperation,
+    code,
+  );
+  const terminalDocument = exactFrozenRecord({
+    ...expectedSession.document,
+    activeOperation: null,
+    lastOperation: exactFrozenRecord({
+      conflictClass: ownDataValue(launchOperation, "conflictClass", code),
+      expectedSessionRevision: expectedSession.revision,
+      kind: ownDataValue(launchOperation, "kind", code),
+      operationId: ownDataValue(launchOperation, "operationId", code),
+      operationRevision: ownDataValue(launchOperation, "revision", code),
+      requestSha256: ownDataValue(launchOperation, "requestSha256", code),
+      reservationId: ownDataValue(launchReservation, "reservationId", code),
+      resultSha256: ownDataValue(currentLaunch, "launchResultSha256", code),
+      state: "committed",
+    }),
+    launch: currentLaunch,
+  });
+  const terminalSession = exactFrozenRecord({
+    createdAt: expectedSession.createdAt,
+    document: terminalDocument,
+    revision: terminalRevision,
+    sessionId: expectedSession.sessionId,
+    updatedAt: ownDataValue(launchOperation, "updatedAt", code),
+  });
+  try {
+    assertSessionOperationTransitionProof({
+      operation: launchOperation,
+      reservation: launchReservation,
+      session: terminalSession,
+    });
+  } catch {
+    fail(code);
+  }
+  let currentRevision;
+  let requiredRevision;
+  try {
+    currentRevision = BigIntConstructor(currentSession.revision);
+    requiredRevision = BigIntConstructor(terminalRevision);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    currentSession.sessionId === expectedSession.sessionId &&
+      currentSession.createdAt === expectedSession.createdAt &&
+      currentRevision >= requiredRevision &&
+      parseTimestamp(currentSession.updatedAt, code) >=
+        parseTimestamp(terminalSession.updatedAt, code) &&
+      sameData(
+        currentSession.document.manifest,
+        expectedSession.document.manifest,
+        code,
+      ) &&
+      sameData(
+        currentSession.document.storageRef,
+        expectedSession.document.storageRef,
+        code,
+      ) &&
+      sameData(
+        currentSession.document.backendCapabilities,
+        expectedSession.document.backendCapabilities,
+        code,
+      ) &&
+      (currentRevision !== requiredRevision ||
+        (currentSession.updatedAt === terminalSession.updatedAt &&
+          sameData(currentSession.document, terminalDocument, code))),
+    code,
+  );
+}
+
 function validateActivationLaunchTransitionChain(
   activationOperation,
   activationReservation,
@@ -2236,11 +2505,20 @@ function validateActivationLaunchTransitionChain(
       reservation: activationReservation,
       session: launchExpectedSession,
     });
-    assertSessionOperationTransitionProof({
-      operation: launchOperation,
-      reservation: launchReservation,
-      session: launchSession,
-    });
+    if (ownDataValue(launchOperation, "state", code) === "committed") {
+      validateCommittedLaunchHistory(
+        launchSession,
+        launchOperation,
+        launchReservation,
+        code,
+      );
+    } else {
+      assertSessionOperationTransitionProof({
+        operation: launchOperation,
+        reservation: launchReservation,
+        session: launchSession,
+      });
+    }
   } catch {
     fail(code);
   }
@@ -2298,6 +2576,12 @@ function normalizeActivationHandoff(
     arrayIncludes(["prepared", "starting", "uncertain", "committed"], launchState) &&
       ownDataValue(launchAttempt, "launchAttemptId", code) ===
         plan.launchAttemptId &&
+      ownDataValue(launchAttempt, "state", code) === launchState &&
+      sameData(
+        ownDataValue(launchAttempt, "result", code),
+        ownDataValue(launchOperation, "result", code),
+        code,
+      ) &&
       ownDataValue(receipt, "status", code) === launchState,
     code,
   );
@@ -2318,6 +2602,7 @@ function normalizeActivationHandoff(
   );
   return exactFrozenRecord({
     attempt: launchAttempt,
+    launch: launchSession.document.launch,
     operation: launchOperation,
     reservation: ownDataValue(launchPart, "reservation", code),
     session: launchSession,
@@ -2355,6 +2640,25 @@ function normalizeLaunchRunResult(value, expected, plan, code) {
   const attempt = ownDataValue(result, "attempt", code);
   const reservation = ownDataValue(result, "reservation", code);
   const session = sessionSnapshot(ownDataValue(result, "session", code), code);
+  const launch = ownDataValue(result, "launch", code);
+  const expectedCommitted = expected.state === "committed";
+  let observedProgress = true;
+  if (!expectedCommitted) {
+    try {
+      observedProgress =
+        BigIntConstructor(ownDataValue(operation, "revision", code)) >
+        BigIntConstructor(ownDataValue(expectedOperation, "revision", code));
+    } catch {
+      fail(code);
+    }
+    observedProgress =
+      observedProgress &&
+      parseTimestamp(ownDataValue(operation, "updatedAt", code), code) >=
+        parseTimestamp(
+          ownDataValue(expectedOperation, "updatedAt", code),
+          code,
+        );
+  }
   ensure(
     ownDataValue(result, "contractVersion", code) === 1 &&
       ownDataValue(operation, "state", code) === "committed" &&
@@ -2390,32 +2694,20 @@ function normalizeLaunchRunResult(value, expected, plan, code) {
         ownDataValue(ownDataValue(operation, "result", code), "evidence", code),
         code,
       ) &&
-      session.document.activeOperation === null &&
-      pointerMatches(
-        session.document.lastOperation,
-        plan.launchAttemptId,
-        WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
-      ) &&
       session.document.launch !== null &&
       ownDataValue(session.document.launch, "launchAttemptId", code) ===
         plan.launchAttemptId &&
-      sameData(
-        ownDataValue(result, "launch", code),
-        session.document.launch,
-        code,
-      ),
+      sameData(launch, session.document.launch, code) &&
+      observedProgress &&
+      (!expectedCommitted ||
+        (sameData(operation, expectedOperation, code) &&
+          sameData(attempt, expected.attempt, code) &&
+          sameData(reservation, expected.reservation, code) &&
+          sameData(launch, expected.launch, code))),
     code,
   );
   reservationIdentityMatches(reservation, expected.reservation, code);
-  try {
-    assertSessionOperationTransitionProof({
-      operation,
-      reservation,
-      session,
-    });
-  } catch {
-    fail(code);
-  }
+  validateCommittedLaunchHistory(session, operation, reservation, code);
   return result;
 }
 
@@ -2475,6 +2767,50 @@ async function claimActivation(
     code,
   );
   return assertThenFreeValue(claimed, code);
+}
+
+async function continuePreparedLaunch(
+  bindings,
+  expected,
+  plan,
+  launchIntent,
+  imageReservation,
+  lease,
+  code,
+) {
+  let result;
+  if (expected.state === "prepared") {
+    const preparedImage =
+      imageReservation === null
+        ? await prepareImage(bindings, plan, launchIntent, lease, code)
+        : imageReservation;
+    await assertLifecycleHeld(lease, code);
+    result = await invoke(
+      bindings.launcher,
+      "runPreparedLaunch",
+      [
+        exactFrozenRecord({
+          imageReservation: preparedImage,
+          launchAttemptId: plan.launchAttemptId,
+        }),
+      ],
+      code,
+    );
+  } else {
+    ensure(
+      arrayIncludes(["starting", "uncertain", "committed"], expected.state),
+      code,
+    );
+    await assertLifecycleHeld(lease, code);
+    result = await invoke(
+      bindings.launcher,
+      "reconcileLaunchAttempt",
+      [exactFrozenRecord({ launchAttemptId: plan.launchAttemptId })],
+      code,
+    );
+  }
+  await assertLifecycleHeld(lease, code);
+  normalizeLaunchRunResult(result, expected, plan, code);
 }
 
 async function runActivationAndLaunch(
@@ -2564,22 +2900,13 @@ async function runActivationAndLaunch(
       launchRead.session,
       code,
     );
-    imageReservation = await prepareImage(
+    await continuePreparedLaunch(
       bindings,
-      plan,
-      launchIntent,
-      lease,
-      code,
-    );
-    normalizeLaunchRunResult(
-      await invoke(
-        bindings.launcher,
-        "runPreparedLaunch",
-        [exactFrozenRecord({ imageReservation, launchAttemptId: plan.launchAttemptId })],
-        code,
-      ),
       launchRead,
       plan,
+      launchIntent,
+      imageReservation,
+      lease,
       code,
     );
     return;
@@ -2636,24 +2963,13 @@ async function runActivationAndLaunch(
     code,
   );
   await assertLifecycleHeld(lease, code);
-  if (imageReservation === null) {
-    imageReservation = await prepareImage(
-      bindings,
-      plan,
-      launchIntent,
-      lease,
-      code,
-    );
-  }
-  normalizeLaunchRunResult(
-    await invoke(
-      bindings.launcher,
-      "runPreparedLaunch",
-      [exactFrozenRecord({ imageReservation, launchAttemptId: plan.launchAttemptId })],
-      code,
-    ),
+  await continuePreparedLaunch(
+    bindings,
     handoff,
     plan,
+    launchIntent,
+    imageReservation,
+    lease,
     code,
   );
 }
@@ -2693,6 +3009,7 @@ async function executeForegroundRestore(
   let stopOperationId = capture?.stopOperationId ?? null;
   const active = current.document.activeOperation;
   const last = current.document.lastOperation;
+  let preparedGenerationSession = null;
   if (
     capture === null &&
     current.document.lifecycle === "ATTACHED" &&
@@ -2717,8 +3034,10 @@ async function executeForegroundRestore(
       RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
     )
   ) {
-    // V1 typed generation reads deliberately reject prepared operations.
-    fail(code);
+    // The typed generation read deliberately excludes prepared operations.
+    // Preserve the post-reserve session only as a proof witness; the claim
+    // remains bound to the committed capture terminal used by the reserve.
+    preparedGenerationSession = current;
   }
 
   const existingWorkflow =
@@ -2780,6 +3099,7 @@ async function executeForegroundRestore(
     admission,
     capture,
     generation,
+    preparedGenerationSession,
     publish,
     lease,
     code,

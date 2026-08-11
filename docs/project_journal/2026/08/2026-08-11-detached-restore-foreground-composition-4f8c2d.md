@@ -48,6 +48,21 @@ runtime assembly and end-to-end coverage land.
   renewal-before-stop -> V3 stop/prepared capture -> generation V1 publication
   -> selected release or force-fence detach -> activation V2 -> prepared
   launch. Detach mode never falls back automatically.
+- A cold retry can reconstruct one already-reserved generation cut only when
+  the current active pointer is the exact revision-zero `prepared` generation
+  operation, its request and reservation identities match the stable plan,
+  its session revision follows the direct predecessor, its operation and
+  reservation share the current session's database timestamp, and its
+  `lastOperation` is the immediately preceding committed safety-capture
+  terminal. The facade then retries the same claim without a second reserve
+  or publication. An unproved or non-direct predecessor remains fail-closed.
+- Only a `prepared` launch attempt may mint an image reservation and enter the
+  prepared-launch dispatch path. `starting`, `uncertain`, and `committed`
+  attempts use no-relaunch reconciliation and never prepare another image.
+  A historical committed launch may remain authoritative after a later active
+  or terminal operation replaces the session anchors only when the immutable
+  launch operation, reservation, current `document.launch` pointer, and
+  descendant session identity together prove the original transition.
 - Factory admission requires the nested per-operation guard pool to be
   distinct from both lifecycle pools before any connection is acquired. This
   prevents a max-one foreground pool from self-deadlocking while its shared
@@ -78,12 +93,17 @@ runtime assembly and end-to-end coverage land.
 - A V3 stop retained as `starting` or `uncertain` cannot be physically stopped
   again. A capture whose fresh dispatch may have committed cannot republish;
   `starting` or `uncertain` capture recovery is source-free and committed-only.
-  Generation acknowledgement loss may replay exact finalization, but not a
-  second publication.
+  An exact prepared generation reserve whose direct safety-capture predecessor
+  is still proved retries the same claim without another reserve; the sole
+  publication remains gated on a definite claim grant. Claim or publication
+  acknowledgement loss may replay exact committed readback or finalization,
+  but never a second publication. Any crossed request, active pointer,
+  revision, timestamp, reservation, or predecessor fails closed.
 - Detach ambiguity follows the selected writer-detach contract and cannot
   switch from release to force-fence. Activation ambiguity uses the existing
-  typed recovery coordinator. A launch attempt that may have reached
-  `starting` is reconciled from supervisor evidence and is never relaunched.
+  typed recovery coordinator. Only a `prepared` launch mints an image;
+  `starting`, `uncertain`, and `committed` attempts reconcile from supervisor
+  evidence without image preparation or relaunch.
 - A blocked earlier stage may therefore keep the caller-driven workflow
   blocked. The facade does not infer success from a path, journal record,
   generation row, attachment, measurement, or process inventory alone.
