@@ -754,6 +754,57 @@ function nativePromiseConstructorIsSafe(value) {
   );
 }
 
+function isSafePromiseSpeciesHolder(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    isProxyValue(value) ||
+    !objectIsFrozen(value)
+  ) {
+    return false;
+  }
+  let prototype;
+  let keys;
+  try {
+    prototype = objectGetPrototypeOf(value);
+    keys = reflectOwnKeys(value);
+  } catch {
+    return false;
+  }
+  if (
+    prototype !== null ||
+    keys.length !== 1 ||
+    keys[0] !== promiseSpeciesSymbol
+  ) {
+    return false;
+  }
+  const descriptor = objectGetOwnPropertyDescriptor(
+    value,
+    promiseSpeciesSymbol,
+  );
+  return (
+    descriptor?.configurable === false &&
+    descriptor.enumerable === false &&
+    objectHasOwn(descriptor, "value") &&
+    descriptor.value === PromiseConstructor &&
+    descriptor.writable === false
+  );
+}
+
+function nativePromiseConstructorIsProtected(value) {
+  let descriptor;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(value, "constructor");
+  } catch {
+    return false;
+  }
+  return (
+    descriptor !== undefined &&
+    objectHasOwn(descriptor, "value") &&
+    isSafePromiseSpeciesHolder(descriptor.value)
+  );
+}
+
 function normalizeNativePromise(value) {
   if (
     !isPromiseValue(value) ||
@@ -771,6 +822,20 @@ function normalizeNativePromise(value) {
   } catch {
     if (accepted && nativePromiseConstructorIsSafe(value)) {
       return exactFrozenRecord({ accepted, promise: value });
+    }
+    if (accepted && nativePromiseConstructorIsProtected(value)) {
+      try {
+        const normalized = callIntrinsic(promiseThenIntrinsic, value, [
+          undefined,
+          undefined,
+        ]);
+        return exactFrozenRecord({
+          accepted,
+          promise: protectPromise(normalized),
+        });
+      } catch {
+        return null;
+      }
     }
     return null;
   }

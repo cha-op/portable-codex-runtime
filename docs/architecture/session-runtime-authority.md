@@ -67,9 +67,9 @@ turns a committed stop into the prepared capture that holds the session active
 pointer. Both paths retain local writer exclusion until exact capture success.
 Detached-destination activation can now materialize an executable prepared
 launch from a clean detached intent, and bounded no-relaunch recovery is
-implemented. Production `runRestore()` integration still requires the
-cross-process shared/exclusive lifecycle guard, recovery scheduler,
-invocation-time detached-production gate, and adapter wiring.
+implemented under the database-global shared/exclusive lifecycle guard and
+bounded recovery scheduler. Production `runRestore()` integration still
+requires the invocation-time detached-production gate and adapter wiring.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -1654,8 +1654,38 @@ prove candidate settlement. “Settled” here means that reconciliation attempt
 has drained even when its business result remains `pending`, which the next
 cursor cycle revisits. A later failure preserves already-settled lanes, while
 an abort with no cursor progress performs no cursor transition. The runner is
-a bounded orchestration primitive only and is not scheduled by the production
-adapter yet.
+a bounded orchestration primitive only and does not enable the production
+adapter.
+
+`PostgresRestoreLifecycleGuard` fixes one versioned advisory-lock identity for
+the full authority candidate universe in an authoritative database. It wraps a
+dedicated `PostgresOperationGuard`: foreground composition receives a shared
+lease, while recovery receives the matching exclusive lease. Cursor
+`recoveryScopeId` is deliberately absent from this key because the authority
+candidate queries are database-global; two cursor scopes can enumerate the
+same durable operation.
+
+The runner acquires the exclusive recovery lease for its complete four-lane
+pass and revalidates it before and after cursor reads, service batches, and
+cursor compare-and-swap. Guarded service calls revalidate the exact same lease
+around list operations and every admitted candidate reconciliation. The batch
+receipt is bound to that lease as well as its service, lane, cursor, and limit,
+so an unguarded or cross-lease result cannot advance a durable cursor.
+
+`PostgresRestoreRecoveryScheduler` starts with one immediate bounded pass and
+then uses serial fixed-delay ticks. Concurrent explicit kicks coalesce with the
+one active pass; a foreground shared lease yields a normal busy tick without
+calling recovery. An uncertain pass is reported to the observer and a later
+tick may retry. `stop()` prevents later admission, aborts the active runner at
+its cooperative boundaries, and waits for an admitted candidate plus any
+settled cursor transition to drain before the exclusive lease is released.
+
+Session advisory-lock loss is detected by the same checked dedicated-client
+probe used by the operation guard. Those probes are cooperative fail-closed
+boundaries, not durable provider fencing: they cannot prove that no instruction
+executes in the interval between a successful probe and a later external side
+effect. Typed authority transitions, exact provider idempotency, and the
+per-operation guard remain the physical-dispatch safety boundary.
 
 ## Remaining Production Restore Composition
 
@@ -1664,18 +1694,14 @@ capture-bound detached activation now close the committed publication,
 old-writer stop/capture/detach, provider-backed attachment, atomic prepared-
 launch reservation, and bounded no-relaunch recovery boundaries. They remain
 independent protocol components rather than a production restore entry point.
-Later serial pull requests must:
+The remaining serial integration must:
 
-- add the cross-process shared/exclusive lifecycle guard so foreground
-  admission and scheduled recovery cannot concurrently dispatch or retire the
-  same prepared lifecycle work;
-- start and schedule the durable recovery runner with an explicit recovery
-  scope and fixed per-lane limits;
 - enforce the detached-production fleet decision at each invocation, rather
   than treating startup construction as a lasting grant; and
 - wire committed publication, durable stop and prepared capture, canonical
-  detach, capture-bound activation, prepared launch, and bounded no-relaunch
-  recovery through the production checkpoint adapter.
+  detach, capture-bound activation, and prepared launch under the shared lease,
+  while the bounded exclusive scheduler supplies no-relaunch recovery through
+  the production checkpoint adapter.
 
 That final wiring may enable `runRestore()` only after every uncertain
 publication, launch, registration, stop, capture, and finalisation boundary
@@ -1705,6 +1731,9 @@ Production deployment requires:
   checked-out connection can hold its PostgreSQL session advisory lock across
   out-of-transaction publication without sharing connection state with the
   serializable executor;
+- a separate operation-guard instance and dedicated pool for the database-
+  global restore lifecycle lease, so a long-lived shared or exclusive lease
+  cannot starve or self-deadlock a nested per-operation guard;
 - both pools connected directly to the same authoritative database and primary;
   the guard connection requires backend-session affinity and cannot use
   PgBouncer transaction or statement pooling;
@@ -1786,7 +1815,7 @@ preclaim before stop, atomic committed-stop-to-prepared-capture handoff,
 prepared-only fresh dispatch, source-free active recovery, no second
 publication after ambiguity, and retained local identity until the exact
 predetermined committed result. The next integration slices must add the
-cross-process lifecycle guard, scheduler, invocation-time production gate, and
-adapter wiring before production `runRestore()` can open.
+invocation-time production gate and adapter wiring before production
+`runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

@@ -1,18 +1,138 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
 import {
   PostgresRestoreActivationRecoveryServiceError,
   consumePostgresRestoreActivationRecoveryBatchReceipt,
   createPostgresRestoreActivationRecoveryService,
   isPostgresRestoreActivationRecoveryService,
 } from "../src/postgres-restore-activation-recovery-service.mjs";
+import {
+  PostgresRestoreLifecycleGuardError,
+  createPostgresRestoreLifecycleGuard,
+} from "../src/postgres-restore-lifecycle-guard.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 const THIRD_SESSION_ID = "019f2100-0000-7000-8000-000000000004";
 const CODEX_ID = "019f2100-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+
+class ServiceRecoveryLockManager {
+  constructor() {
+    this.holder = null;
+  }
+
+  tryAcquire(client) {
+    if (this.holder !== null && this.holder !== client) return false;
+    this.holder = client;
+    return true;
+  }
+
+  isHeld(client) {
+    return this.holder === client;
+  }
+
+  unlock(client) {
+    if (!this.isHeld(client)) return false;
+    this.holder = null;
+    return true;
+  }
+
+  releaseAll(client) {
+    if (this.holder === client) this.holder = null;
+  }
+}
+
+class ServiceRecoveryGuardClient {
+  constructor({ events, loseWhen, manager, pid }) {
+    this.events = events;
+    this.loseWhen = loseWhen;
+    this.manager = manager;
+    this.pid = pid;
+  }
+
+  async query(...args) {
+    const query = args[0];
+    const text = typeof query === "string" ? query : query.text;
+    if (text === "DISCARD ALL") {
+      this.manager.releaseAll(this);
+      return { command: "DISCARD", rows: [] };
+    }
+    if (text.includes("pg_try_advisory_lock")) {
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            acquired: this.manager.tryAcquire(this),
+            backend_pid: this.pid,
+          },
+        ],
+      };
+    }
+    if (text.includes("FROM pg_catalog.pg_locks")) {
+      this.events?.push("probe");
+      if (this.loseWhen?.()) this.manager.releaseAll(this);
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            backend_pid: this.pid,
+            lock_held: this.manager.isHeld(this),
+          },
+        ],
+      };
+    }
+    if (text.includes("pg_advisory_unlock")) {
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            backend_pid: this.pid,
+            unlocked: this.manager.unlock(this),
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected query: ${text}`);
+  }
+
+  async release(...args) {
+    if (args.length === 1) this.manager.releaseAll(this);
+  }
+}
+
+class ServiceRecoveryGuardPool {
+  constructor({ events = null, loseWhen = null, manager = null } = {}) {
+    this.events = events;
+    this.loseWhen = loseWhen;
+    this.manager = manager ?? new ServiceRecoveryLockManager();
+    this.nextPid = 5_001;
+  }
+
+  async connect() {
+    const client = new ServiceRecoveryGuardClient({
+      events: this.events,
+      loseWhen: this.loseWhen,
+      manager: this.manager,
+      pid: this.nextPid,
+    });
+    this.nextPid += 1;
+    return client;
+  }
+}
+
+function createLifecycleFixture(options = {}) {
+  const pool = new ServiceRecoveryGuardPool(options);
+  const operationGuard = new PostgresOperationGuard({
+    dedicatedPool: pool,
+  });
+  return {
+    guard: createPostgresRestoreLifecycleGuard({ operationGuard }),
+    manager: pool.manager,
+  };
+}
 
 function checkpoint(sessionId = SESSION_ID) {
   return {
@@ -572,6 +692,496 @@ test(
     assert.equal(result.status, "sweep-complete");
   },
 );
+
+test("guarded sweep probes around every list and candidate action", async () => {
+  const events = [];
+  const lifecycleFixture = createLifecycleFixture({ events });
+  const fixture = callbacks({
+    async listCurrentWriterLaunchCandidates(input) {
+      events.push("list:currentLaunch");
+      assert.deepEqual(Reflect.ownKeys(input), [
+        "afterSessionId",
+        "limit",
+      ]);
+      return page([currentLaunchCandidate()]);
+    },
+    async listRestoreAttachmentActivationCandidates() {
+      events.push("list:activation");
+      return page([activationCandidate()]);
+    },
+    async listRestoreGenerationCandidates() {
+      events.push("list:generation");
+      return page([generationCandidate()]);
+    },
+    async listWriterLaunchAttemptCandidates() {
+      events.push("list:launchAttempt");
+      return page([launchCandidate()]);
+    },
+    async reconcileRestoreAttachmentActivation() {
+      events.push("reconcile:activation");
+    },
+    async reconcileRestoreGeneration() {
+      events.push("reconcile:generation");
+    },
+    async reconcileWriterLaunchAttempt() {
+      events.push("reconcile:launchAttempt");
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+
+  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+    const result = await service.runSweep({
+      activation: lane(),
+      currentLaunch: lane(),
+      generation: lane(),
+      launchAttempt: lane(),
+      lifecycleLease,
+      signal: null,
+    });
+    for (const laneReceipt of [
+      ["generation", result.generation],
+      ["activation", result.activation],
+      ["launchAttempt", result.launchAttempt],
+      ["currentLaunch", result.currentLaunch],
+    ]) {
+      assert.equal(
+        consumePostgresRestoreActivationRecoveryBatchReceipt(
+          service,
+          laneReceipt[0],
+          null,
+          10,
+          lifecycleLease,
+          laneReceipt[1],
+        ),
+        true,
+      );
+    }
+  });
+
+  assert.deepEqual(events, [
+    "probe",
+    "probe",
+    "list:generation",
+    "probe",
+    "probe",
+    "reconcile:generation",
+    "probe",
+    "probe",
+    "list:activation",
+    "probe",
+    "probe",
+    "reconcile:activation",
+    "probe",
+    "probe",
+    "list:launchAttempt",
+    "probe",
+    "probe",
+    "reconcile:launchAttempt",
+    "probe",
+    "probe",
+    "list:currentLaunch",
+    "probe",
+    "probe",
+    "probe",
+    "probe",
+  ]);
+  assert.equal(lifecycleFixture.manager.holder, null);
+});
+
+test("guarded receipts reject legacy arity, cross-lease use, and replay", async () => {
+  const lifecycleFixture = createLifecycleFixture();
+  const otherLifecycleFixture = createLifecycleFixture();
+  const service = createPostgresRestoreActivationRecoveryService(
+    callbacks().options,
+  );
+  let firstLease;
+  let staleReceipt;
+
+  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+    firstLease = lifecycleLease;
+    const crossLeaseReceipt = await service.runGenerationBatch(
+      request({ lifecycleLease }),
+    );
+    await otherLifecycleFixture.guard.runRecovery(async (otherLease) => {
+      assert.notEqual(otherLease, lifecycleLease);
+      assert.equal(
+        consumePostgresRestoreActivationRecoveryBatchReceipt(
+          service,
+          "generation",
+          null,
+          10,
+          otherLease,
+          crossLeaseReceipt,
+        ),
+        false,
+      );
+    });
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        crossLeaseReceipt,
+      ),
+      true,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        crossLeaseReceipt,
+      ),
+      false,
+    );
+    staleReceipt = await service.runGenerationBatch(
+      request({ lifecycleLease }),
+    );
+    const arityReceipt = await service.runGenerationBatch(
+      request({ lifecycleLease }),
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        arityReceipt,
+      ),
+      false,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        arityReceipt,
+      ),
+      true,
+    );
+  });
+
+  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+    assert.notEqual(lifecycleLease, firstLease);
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        staleReceipt,
+      ),
+      false,
+    );
+    const currentReceipt = await service.runGenerationBatch(
+      request({ lifecycleLease }),
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        firstLease,
+        currentReceipt,
+      ),
+      false,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        currentReceipt,
+      ),
+      true,
+    );
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        currentReceipt,
+      ),
+      false,
+    );
+  });
+});
+
+test("lease loss after a reconcile prevents later candidates and receipts", async () => {
+  let reconcileCalls = 0;
+  let lost = false;
+  const lifecycleFixture = createLifecycleFixture({
+    loseWhen() {
+      if (!lost && reconcileCalls === 1) {
+        lost = true;
+        return true;
+      }
+      return false;
+    },
+  });
+  const fixture = callbacks({
+    async listRestoreGenerationCandidates() {
+      return page([
+        generationCandidate(SESSION_ID),
+        generationCandidate(OTHER_SESSION_ID),
+      ]);
+    },
+    async reconcileRestoreGeneration() {
+      reconcileCalls += 1;
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+  let receipt;
+  let serviceError;
+
+  await assert.rejects(
+    lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+      try {
+        receipt = await service.runGenerationBatch(
+          request({ lifecycleLease }),
+        );
+      } catch (error) {
+        serviceError = error;
+        throw error;
+      }
+    }),
+    (error) =>
+      error instanceof PostgresRestoreLifecycleGuardError &&
+      error.code ===
+        "postgres_restore_lifecycle_guard_outcome_uncertain",
+  );
+  assert.equal(
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    )(serviceError),
+    true,
+  );
+  assert.equal(lost, true);
+  assert.equal(reconcileCalls, 1);
+  assert.equal(receipt, undefined);
+  assert.equal(lifecycleFixture.manager.holder, null);
+});
+
+test("guarded receipt is minted only after reconciliation drains", async () => {
+  const entered = (() => {
+    let resolve;
+    const promise = new Promise((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    return { promise, resolve };
+  })();
+  const finish = (() => {
+    let resolve;
+    const promise = new Promise((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    return { promise, resolve };
+  })();
+  let reconcilerExited = false;
+  let receipt;
+  const lifecycleFixture = createLifecycleFixture();
+  const fixture = callbacks({
+    async listRestoreGenerationCandidates() {
+      return page([generationCandidate()]);
+    },
+    async reconcileRestoreGeneration() {
+      entered.resolve();
+      await finish.promise;
+      reconcilerExited = true;
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+
+  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+    const pending = service.runGenerationBatch(
+      request({ lifecycleLease }),
+    );
+    await entered.promise;
+    assert.equal(reconcilerExited, false);
+    assert.equal(receipt, undefined);
+
+    finish.resolve();
+    receipt = await pending;
+    assert.equal(reconcilerExited, true);
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        lifecycleLease,
+        receipt,
+      ),
+      true,
+    );
+  });
+});
+
+test(
+  "callback-time Promise prototype pollution cannot settle a batch early",
+  { concurrency: false },
+  async () => {
+    const constructorDescriptor = Object.getOwnPropertyDescriptor(
+      Promise.prototype,
+      "constructor",
+    );
+    const thenDescriptor = Object.getOwnPropertyDescriptor(
+      Promise.prototype,
+      "then",
+    );
+    const speciesHolder = Object.freeze(
+      Object.create(null, {
+        [Symbol.species]: {
+          configurable: false,
+          enumerable: false,
+          value: Promise,
+          writable: false,
+        },
+      }),
+    );
+    let finishReconciliation;
+    const reconciliation = new Promise((resolve) => {
+      finishReconciliation = resolve;
+    });
+    let finishRestoration;
+    const restoration = new Promise((resolve) => {
+      finishRestoration = resolve;
+    });
+    Object.defineProperty(restoration, "constructor", {
+      configurable: false,
+      enumerable: false,
+      value: Promise,
+      writable: false,
+    });
+    let poisonedThenCalls = 0;
+    let restored = false;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      Object.defineProperty(
+        Promise.prototype,
+        "constructor",
+        constructorDescriptor,
+      );
+      Object.defineProperty(Promise.prototype, "then", thenDescriptor);
+      finishRestoration();
+    };
+    const fixture = callbacks({
+      listRestoreGenerationCandidates() {
+        return page([generationCandidate()]);
+      },
+      reconcileRestoreGeneration() {
+        Object.defineProperty(Promise.prototype, "constructor", {
+          ...constructorDescriptor,
+          value: speciesHolder,
+        });
+        Object.defineProperty(Promise.prototype, "then", {
+          ...thenDescriptor,
+          value(onFulfilled) {
+            poisonedThenCalls += 1;
+            if (typeof onFulfilled === "function") {
+              onFulfilled("reconciled");
+            }
+          },
+        });
+        queueMicrotask(restore);
+        return reconciliation;
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    let settled = false;
+    let pending;
+    try {
+      pending = service.runGenerationBatch(request());
+      pending.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await restoration;
+    } finally {
+      restore();
+    }
+    assert.equal(poisonedThenCalls, 0);
+    assert.equal(settled, false);
+
+    finishReconciliation();
+    const result = await pending;
+    assert.equal(result.status, "sweep-complete");
+    assert.equal(result.results[0].status, "reconciled");
+  },
+);
+
+test("guarded requests reject fake leases without reading their properties", async () => {
+  const fixture = callbacks();
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+  let traps = 0;
+  const fakeLease = new Proxy(Object.freeze({ mode: "recovery" }), {
+    get() {
+      traps += 1;
+      throw new Error("lease properties must not be read");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error("lease descriptors must not be read");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("lease prototype must not be read");
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("lease keys must not be read");
+    },
+  });
+
+  await assert.rejects(
+    service.runGenerationBatch(request({ lifecycleLease: fakeLease })),
+    assertCode(
+      "invalid_postgres_restore_activation_recovery_service_request",
+    ),
+  );
+  await assert.rejects(
+    service.runSweep({
+      activation: lane(),
+      currentLaunch: lane(),
+      generation: lane(),
+      launchAttempt: lane(),
+      lifecycleLease: fakeLease,
+      signal: null,
+    }),
+    assertCode(
+      "invalid_postgres_restore_activation_recovery_service_request",
+    ),
+  );
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(traps, 0);
+});
 
 test("brands only exact recovery service instances without invoking Proxy traps", () => {
   const service = createPostgresRestoreActivationRecoveryService(
@@ -1460,6 +2070,91 @@ test("proxy, accessor, and list exceptions do not cross the recovery boundary", 
     },
   );
   assert.equal(observed.message.includes("database details"), false);
+});
+
+test("callback-time Symbol.hasInstance pollution cannot leak raw errors", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    PostgresRestoreActivationRecoveryServiceError,
+    Symbol.hasInstance,
+  );
+  const fixture = callbacks({
+    listRestoreGenerationCandidates() {
+      Object.defineProperty(
+        PostgresRestoreActivationRecoveryServiceError,
+        Symbol.hasInstance,
+        {
+          configurable: true,
+          value() {
+            return true;
+          },
+        },
+      );
+      throw new Error("raw callback error must not escape");
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+  try {
+    await assert.rejects(
+      service.runGenerationBatch(request()),
+      assertCode(
+        "postgres_restore_activation_recovery_service_outcome_uncertain",
+      ),
+    );
+  } finally {
+    restoreOwnPropertyDescriptor(
+      PostgresRestoreActivationRecoveryServiceError,
+      Symbol.hasInstance,
+      descriptor,
+    );
+  }
+});
+
+test("callbacks cannot forge or replay module service errors", async () => {
+  let replayedError = null;
+  const fixture = callbacks({
+    listRestoreGenerationCandidates() {
+      if (replayedError !== null) throw replayedError;
+      throw new PostgresRestoreActivationRecoveryServiceError(
+        "invalid_postgres_restore_activation_recovery_service_request",
+      );
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+  await assert.rejects(
+    service.runGenerationBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
+
+  const replayFixture = callbacks({
+    listRestoreGenerationCandidates() {
+      if (replayedError !== null) throw replayedError;
+      return page();
+    },
+  });
+  const replayService = createPostgresRestoreActivationRecoveryService(
+    replayFixture.options,
+  );
+  try {
+    await replayService.runGenerationBatch({ ...request(), limit: 0 });
+  } catch (error) {
+    replayedError = error;
+  }
+  assert.equal(
+    replayedError instanceof PostgresRestoreActivationRecoveryServiceError,
+    true,
+  );
+  await assert.rejects(
+    replayService.runGenerationBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
 });
 
 test("constructor and requests reject non-exact or executable expansion", async () => {

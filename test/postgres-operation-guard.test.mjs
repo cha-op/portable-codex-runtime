@@ -8,31 +8,71 @@ import {
   PostgresOperationGuardError,
 } from "../src/postgres-operation-guard.mjs";
 
+const setSizeGetter = Object.getOwnPropertyDescriptor(
+  Set.prototype,
+  "size",
+).get;
+const PromiseConstructor = Promise;
+const promiseThenIntrinsic = Promise.prototype.then;
+
+function setSize(value) {
+  return Reflect.apply(setSizeGetter, value, []);
+}
+
 class AdvisoryLockManager {
   constructor() {
     this.holders = new Map();
   }
 
-  tryAcquire(key, client) {
-    const holder = this.holders.get(key);
-    if (holder !== undefined && holder !== client) return false;
-    this.holders.set(key, client);
+  tryAcquire(key, client, mode = "exclusive") {
+    let holders = this.holders.get(key);
+    if (holders === undefined) {
+      holders = {
+        exclusive: new Set(),
+        shared: new Set(),
+      };
+      this.holders.set(key, holders);
+    }
+    if (mode === "shared") {
+      for (const holder of holders.exclusive) {
+        if (holder !== client) return false;
+      }
+      holders.shared.add(client);
+      return true;
+    }
+    for (const holder of holders.exclusive) {
+      if (holder !== client) return false;
+    }
+    for (const holder of holders.shared) {
+      if (holder !== client) return false;
+    }
+    holders.exclusive.add(client);
     return true;
   }
 
-  isHeld(key, client) {
-    return this.holders.get(key) === client;
+  isHeld(key, client, mode = "exclusive") {
+    return this.holders.get(key)?.[mode]?.has(client) === true;
   }
 
-  unlock(key, client) {
-    if (!this.isHeld(key, client)) return false;
-    this.holders.delete(key);
+  unlock(key, client, mode = "exclusive") {
+    const holders = this.holders.get(key);
+    if (holders?.[mode]?.delete(client) !== true) return false;
+    if (setSize(holders.exclusive) === 0 && setSize(holders.shared) === 0) {
+      this.holders.delete(key);
+    }
     return true;
   }
 
   releaseAll(client) {
-    for (const [key, holder] of this.holders) {
-      if (holder === client) this.holders.delete(key);
+    for (const [key, holders] of this.holders) {
+      holders.exclusive.delete(client);
+      holders.shared.delete(client);
+      if (
+        setSize(holders.exclusive) === 0 &&
+        setSize(holders.shared) === 0
+      ) {
+        this.holders.delete(key);
+      }
     }
   }
 }
@@ -91,7 +131,10 @@ class FakeClient {
       typeof query === "string" ? args[1] : query.values;
     const key = values[0];
     if (text.includes("pg_try_advisory_lock")) {
-      const acquired = this.manager.tryAcquire(key, this);
+      const mode = text.includes("pg_try_advisory_lock_shared")
+        ? "shared"
+        : "exclusive";
+      const acquired = this.manager.tryAcquire(key, this, mode);
       if (this.loseTryLockResponse) {
         throw new Error("try-lock response lost");
       }
@@ -106,6 +149,9 @@ class FakeClient {
       };
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
+      const mode = text.includes("mode = 'ShareLock'")
+        ? "shared"
+        : "exclusive";
       this.heldProbeCount += 1;
       const heldProbeGate =
         this.heldProbeGates?.get(this.heldProbeCount) ??
@@ -120,19 +166,22 @@ class FakeClient {
         rows: [
           {
             backend_pid: this.pid,
-            lock_held: this.manager.isHeld(key, this),
+            lock_held: this.manager.isHeld(key, this, mode),
           },
         ],
       };
     }
     if (text.includes("pg_advisory_unlock")) {
+      const mode = text.includes("pg_advisory_unlock_shared")
+        ? "shared"
+        : "exclusive";
       if (this.failUnlock) throw new Error("unlock failed");
       return {
         command: "SELECT",
         rows: [
           {
             backend_pid: this.pid,
-            unlocked: this.manager.unlock(key, this),
+            unlocked: this.manager.unlock(key, this, mode),
           },
         ],
       };
@@ -157,6 +206,89 @@ class FakePool {
     this.connectCalls += 1;
     assert.notEqual(this.clients.length, 0, "unexpected pool.connect()");
     return this.clients.shift();
+  }
+}
+
+class SynchronousFinalProbeClient {
+  constructor({ finalProbe, finalProbeStarted, manager, pid }) {
+    this.finalProbe = finalProbe;
+    this.finalProbeStarted = finalProbeStarted;
+    this.manager = manager;
+    this.pid = pid;
+    this.queries = [];
+    this.releaseCalls = [];
+    this.resetCount = 0;
+    this.heldProbeCount = 0;
+    this.finalProbeResult = undefined;
+  }
+
+  query(...args) {
+    this.queries.push(args);
+    const query = args[0];
+    const text = typeof query === "string" ? query : query.text;
+    if (text === "DISCARD ALL") {
+      this.resetCount += 1;
+      this.manager.releaseAll(this);
+      return { command: "DISCARD", rows: [] };
+    }
+
+    const values = typeof query === "string" ? args[1] : query.values;
+    const key = values[0];
+    if (text.includes("pg_try_advisory_lock")) {
+      const mode = text.includes("pg_try_advisory_lock_shared")
+        ? "shared"
+        : "exclusive";
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            acquired: this.manager.tryAcquire(key, this, mode),
+            backend_pid: this.pid,
+          },
+        ],
+      };
+    }
+    if (text.includes("FROM pg_catalog.pg_locks")) {
+      const mode = text.includes("mode = 'ShareLock'")
+        ? "shared"
+        : "exclusive";
+      this.heldProbeCount += 1;
+      const result = {
+        command: "SELECT",
+        rows: [
+          {
+            backend_pid: this.pid,
+            lock_held: this.manager.isHeld(key, this, mode),
+          },
+        ],
+      };
+      if (this.heldProbeCount === 2) {
+        this.finalProbeResult = result;
+        this.finalProbeStarted.resolve();
+        return this.finalProbe.promise;
+      }
+      return result;
+    }
+    if (text.includes("pg_advisory_unlock")) {
+      const mode = text.includes("pg_advisory_unlock_shared")
+        ? "shared"
+        : "exclusive";
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            backend_pid: this.pid,
+            unlocked: this.manager.unlock(key, this, mode),
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected query: ${text}`);
+  }
+
+  release(...args) {
+    this.releaseCalls.push(args);
+    if (args.length === 1) this.manager.releaseAll(this);
   }
 }
 
@@ -196,6 +328,93 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
+}
+
+function installPromisePrototypePoisoning(targetValues, forgedValue) {
+  const constructorDescriptor = Object.getOwnPropertyDescriptor(
+    Promise.prototype,
+    "constructor",
+  );
+  const thenDescriptor = Object.getOwnPropertyDescriptor(
+    Promise.prototype,
+    "then",
+  );
+  const speciesHolder = Object.freeze(
+    Object.create(null, {
+      [Symbol.species]: {
+        configurable: false,
+        enumerable: false,
+        value: PromiseConstructor,
+        writable: false,
+      },
+    }),
+  );
+  const targets = new WeakSet();
+  for (let index = 0; index < targetValues.length; index += 1) {
+    targets.add(targetValues[index]);
+  }
+  const calls = { otherThen: 0, targetThen: 0 };
+  Object.defineProperty(Promise.prototype, "constructor", {
+    configurable: true,
+    enumerable: false,
+    value: speciesHolder,
+    writable: true,
+  });
+  Object.defineProperty(Promise.prototype, "then", {
+    configurable: true,
+    enumerable: false,
+    value(onFulfilled, onRejected) {
+      if (targets.has(this)) {
+        calls.targetThen += 1;
+        if (typeof onFulfilled === "function") {
+          queueMicrotask(() => onFulfilled(forgedValue()));
+        }
+        return undefined;
+      }
+      calls.otherThen += 1;
+      return Reflect.apply(promiseThenIntrinsic, this, [
+        onFulfilled,
+        onRejected,
+      ]);
+    },
+    writable: true,
+  });
+  let restored = false;
+  return {
+    calls,
+    restore() {
+      if (restored) return;
+      restored = true;
+      Object.defineProperty(
+        Promise.prototype,
+        "constructor",
+        constructorDescriptor,
+      );
+      Object.defineProperty(Promise.prototype, "then", thenDescriptor);
+    },
+  };
+}
+
+function observePromise(promise, onFulfilled, onRejected) {
+  Reflect.apply(promiseThenIntrinsic, promise, [onFulfilled, onRejected]);
+}
+
+function protectTestPromise(promise) {
+  Object.defineProperties(promise, {
+    constructor: {
+      configurable: false,
+      enumerable: false,
+      value: PromiseConstructor,
+      writable: false,
+    },
+    then: {
+      configurable: false,
+      enumerable: false,
+      value: promiseThenIntrinsic,
+      writable: false,
+    },
+  });
+  return promise;
 }
 
 async function assertGuardError(promise, code) {
@@ -317,6 +536,312 @@ test("returns callback result identity and exposes only a frozen lock probe", as
     ),
     false,
   );
+});
+
+test("runShared uses the same key derivation with shared lock SQL", async () => {
+  const manager = new AdvisoryLockManager();
+  const client = new FakeClient(clientOptions(manager, 116));
+  const { guard } = makeGuard(client);
+
+  assert.equal(
+    await guard.runShared("checkpoint:operation-001", async (probe) => {
+      await probe.assertHeld();
+      return "shared";
+    }),
+    "shared",
+  );
+
+  const tryLock = client.queries.find(([query]) =>
+    query?.text?.includes("pg_try_advisory_lock_shared"),
+  );
+  const probeQueries = client.queries.filter(([query]) =>
+    query?.text?.includes("FROM pg_catalog.pg_locks"),
+  );
+  const unlock = client.queries.find(([query]) =>
+    query?.text?.includes("pg_advisory_unlock_shared"),
+  );
+  assert.deepEqual(tryLock[0].values, [
+    lockKeyFor("checkpoint:operation-001"),
+  ]);
+  assert.equal(
+    probeQueries.every(([query]) => query.text.includes("mode = 'ShareLock'")),
+    true,
+  );
+  assert.deepEqual(unlock[0].values, tryLock[0].values);
+  assert.equal(manager.holders.size, 0);
+});
+
+test("callback Promise prototype poisoning cannot forge shared cleanup", () =>
+  protectTestPromise((async () => {
+  const manager = new AdvisoryLockManager();
+  const finalProbe = deferred();
+  const finalProbeStarted = deferred();
+  const client = new SynchronousFinalProbeClient({
+    finalProbe,
+    finalProbeStarted,
+    manager,
+    pid: 117,
+  });
+  const { guard } = makeGuard(client);
+  const expected = Object.freeze({ status: "completed" });
+  let poisoning;
+  let runSettled = false;
+  let runError;
+
+  try {
+    const run = guard.runShared("prototype-poisoned-shared", () => {
+      poisoning = installPromisePrototypePoisoning(
+        [finalProbe.promise],
+        () => client.finalProbeResult,
+      );
+      return expected;
+    });
+    observePromise(
+      run,
+      () => {
+        runSettled = true;
+      },
+      (error) => {
+        runSettled = true;
+        runError = error;
+      },
+    );
+
+    await finalProbeStarted.promise;
+    assert.equal(runSettled, false);
+    assert.equal(manager.holders.size, 1);
+    assert.deepEqual(client.releaseCalls, []);
+    assert.equal(poisoning.calls.targetThen, 0);
+
+    finalProbe.resolve(client.finalProbeResult);
+    const result = await run;
+    const poisonedThenCalls = poisoning.calls.targetThen;
+    poisoning.restore();
+
+    assert.ifError(runError);
+    assert.strictEqual(result, expected);
+    assert.equal(runSettled, true);
+    assert.equal(poisonedThenCalls, 0);
+    assert.equal(client.resetCount, 2);
+    assert.deepEqual(client.releaseCalls, [[]]);
+    assert.equal(manager.holders.size, 0);
+  } finally {
+    poisoning?.restore();
+    if (client.finalProbeResult !== undefined) {
+      finalProbe.resolve(client.finalProbeResult);
+    }
+  }
+  })()));
+
+test("connect-time Promise prototype poisoning cannot forge exclusive awaits", () =>
+  protectTestPromise((async () => {
+  const manager = new AdvisoryLockManager();
+  const client = new FakeClient(clientOptions(manager, 118));
+  const connection = PromiseConstructor.resolve(client);
+  let poisoning;
+  const pool = {
+    connect() {
+      poisoning = installPromisePrototypePoisoning(
+        [connection],
+        () => client,
+      );
+      return connection;
+    },
+  };
+  const guard = new PostgresOperationGuard({ dedicatedPool: pool });
+  let result;
+
+  try {
+    result = await guard.runExclusive(
+      "prototype-poisoned-connect",
+      () => "connected",
+    );
+    const poisonedThenCalls = poisoning.calls.targetThen;
+    poisoning.restore();
+
+    assert.equal(result, "connected");
+    assert.equal(poisonedThenCalls, 0);
+    assert.equal(client.resetCount, 2);
+    assert.deepEqual(client.releaseCalls, [[]]);
+    assert.equal(manager.holders.size, 0);
+  } finally {
+    poisoning?.restore();
+  }
+  })()));
+
+test("poisoned callback Promise drains before exclusive unlock and release", () =>
+  protectTestPromise((async () => {
+  const manager = new AdvisoryLockManager();
+  const client = new FakeClient(clientOptions(manager, 119));
+  const { guard } = makeGuard(client);
+  const callbackEntered = deferred();
+  const callbackCompletion = deferred();
+  let poisoning;
+  let runSettled = false;
+
+  try {
+    const run = guard.runExclusive("prototype-poisoned-callback", () => {
+      callbackEntered.resolve();
+      poisoning = installPromisePrototypePoisoning(
+        [callbackCompletion.promise],
+        () => "forged",
+      );
+      return callbackCompletion.promise;
+    });
+    observePromise(
+      run,
+      () => {
+        runSettled = true;
+      },
+      () => {
+        runSettled = true;
+      },
+    );
+
+    await callbackEntered.promise;
+    assert.equal(runSettled, false);
+    assert.equal(manager.holders.size, 1);
+    assert.deepEqual(client.releaseCalls, []);
+    assert.equal(poisoning.calls.targetThen, 0);
+
+    callbackCompletion.resolve("drained");
+    const result = await run;
+    const poisonedThenCalls = poisoning.calls.targetThen;
+    poisoning.restore();
+
+    assert.equal(result, "drained");
+    assert.equal(runSettled, true);
+    assert.equal(poisonedThenCalls, 0);
+    assert.deepEqual(client.releaseCalls, [[]]);
+    assert.equal(manager.holders.size, 0);
+  } finally {
+    poisoning?.restore();
+    callbackCompletion.resolve("drained");
+  }
+  })()));
+
+test("exposed run and probe reactions ignore callback-time Promise poison", () =>
+  protectTestPromise((async () => {
+    const manager = new AdvisoryLockManager();
+    const probeGate = deferred();
+    const callbackCompletion = deferred();
+    const callbackEntered = deferred();
+    const client = new FakeClient(
+      clientOptions(manager, 120, {
+        heldProbeGates: new Map([[2, probeGate]]),
+      }),
+    );
+    const { guard } = makeGuard(client);
+    let poisoning;
+    let probeReaction;
+    let run;
+    let runReaction;
+    let probeReactionValue;
+    let runReactionValue;
+
+    try {
+      run = guard.runExclusive("prototype-poisoned-reactions", (probe) => {
+        const probePromise = probe.assertHeld();
+        poisoning = installPromisePrototypePoisoning(
+          [run, probePromise, callbackCompletion.promise],
+          () => "spoofed-before-cleanup",
+        );
+        probeReaction = probePromise.then((value) => {
+          probeReactionValue = value;
+          return "probe-complete";
+        });
+        runReaction = run.then((value) => {
+          runReactionValue = value;
+          return value;
+        });
+        callbackEntered.resolve();
+        return callbackCompletion.promise;
+      });
+
+      await callbackEntered.promise;
+      await PromiseConstructor.resolve();
+      assert.equal(probeReactionValue, undefined);
+      assert.equal(runReactionValue, undefined);
+      assert.equal(manager.holders.size, 1);
+      assert.deepEqual(client.releaseCalls, []);
+      assert.equal(poisoning.calls.targetThen, 0);
+
+      probeGate.resolve();
+      assert.equal(await probeReaction, "probe-complete");
+      assert.equal(probeReactionValue, undefined);
+      assert.equal(runReactionValue, undefined);
+      assert.equal(manager.holders.size, 1);
+      assert.deepEqual(client.releaseCalls, []);
+
+      callbackCompletion.resolve("genuine-completion");
+      assert.equal(await runReaction, "genuine-completion");
+      const poisonedThenCalls = poisoning.calls.targetThen;
+      poisoning.restore();
+
+      assert.equal(runReactionValue, "genuine-completion");
+      assert.equal(poisonedThenCalls, 0);
+      assert.deepEqual(client.releaseCalls, [[]]);
+      assert.equal(manager.holders.size, 0);
+    } finally {
+      poisoning?.restore();
+      probeGate.resolve();
+      callbackCompletion.resolve("genuine-completion");
+    }
+  })()));
+
+test("unsafe callback values fail closed without executable protocol access", async () => {
+  let proxyTraps = 0;
+  let thenGets = 0;
+  const callbackProxyResult = new Proxy(Object.create(null), {
+    get() {
+      proxyTraps += 1;
+      throw new Error("must not read proxy result");
+    },
+    getOwnPropertyDescriptor() {
+      proxyTraps += 1;
+      throw new Error("must not inspect proxy result");
+    },
+    getPrototypeOf() {
+      proxyTraps += 1;
+      throw new Error("must not inspect proxy result");
+    },
+    ownKeys() {
+      proxyTraps += 1;
+      throw new Error("must not enumerate proxy result");
+    },
+  });
+  const accessorThenable = Object.create(null);
+  Object.defineProperty(accessorThenable, "then", {
+    configurable: false,
+    enumerable: true,
+    get() {
+      thenGets += 1;
+      throw new Error("must not invoke then accessor");
+    },
+  });
+  class UnsafePromise extends PromiseConstructor {}
+  const unsafePromise = new UnsafePromise((resolve) => resolve("unsafe"));
+  const cases = [
+    callbackProxyResult,
+    accessorThenable,
+    (function* generatorResult() {})(),
+    unsafePromise,
+  ];
+
+  for (let index = 0; index < cases.length; index += 1) {
+    const manager = new AdvisoryLockManager();
+    const client = new FakeClient(clientOptions(manager, 121 + index));
+    const { guard } = makeGuard(client);
+    await assertGuardError(
+      guard.runExclusive(`unsafe-callback-${index}`, () => cases[index]),
+      "postgres_operation_guard_outcome_uncertain",
+    );
+    assert.deepEqual(client.releaseCalls, [[]]);
+    assert.equal(manager.holders.size, 0);
+  }
+
+  assert.equal(proxyTraps, 0);
+  assert.equal(thenGets, 0);
 });
 
 test(

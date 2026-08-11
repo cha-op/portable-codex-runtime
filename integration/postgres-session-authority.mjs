@@ -22,6 +22,18 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
+  createPostgresRestoreActivationRecoveryService,
+} from "../src/postgres-restore-activation-recovery-service.mjs";
+import {
+  createPostgresRestoreLifecycleGuard,
+} from "../src/postgres-restore-lifecycle-guard.mjs";
+import {
+  createPostgresRestoreRecoveryRunner,
+} from "../src/postgres-restore-recovery-runner.mjs";
+import {
+  createPostgresRestoreRecoveryScheduler,
+} from "../src/postgres-restore-recovery-scheduler.mjs";
+import {
   PostgresWriterDetachCompositionError,
   createPostgresWriterDetachComposition,
 } from "../src/postgres-writer-detach-composition.mjs";
@@ -10580,5 +10592,172 @@ test(
         );
       },
     );
+  },
+);
+
+test(
+  "restore lifecycle guard schedules one exclusive database-global recovery pass",
+  { timeout: 30_000 },
+  async (t) => {
+    const pool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-scheduler-integration-test",
+      connectionString: databaseUrl,
+      max: 2,
+    });
+    const lifecyclePool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-lifecycle-guard-integration-test",
+      connectionString: databaseUrl,
+      max: 4,
+    });
+    const recoveryScopeId = `integration-restore-${randomUUID()}`;
+    t.after(async () => {
+      try {
+        await pool.query(
+          [
+            "DELETE FROM session_authority.restore_recovery_cursors",
+            "WHERE recovery_scope_id = $1",
+          ].join(" "),
+          [recoveryScopeId],
+        );
+      } finally {
+        try {
+          await lifecyclePool.end();
+        } finally {
+          await pool.end();
+        }
+      }
+    });
+
+    const store = new PostgresSerializableStore({ dedicatedPool: pool });
+    await store.migrate();
+    const authority = new PostgresSessionAuthority({
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
+        true,
+      restoreGenerationV2FleetCompatible: true,
+      store,
+      writerLaunchStopV3FleetCompatible: true,
+    });
+    const lifecycleGuard = createPostgresRestoreLifecycleGuard({
+      operationGuard: new PostgresOperationGuard({
+        dedicatedPool: lifecyclePool,
+      }),
+    });
+    let unexpectedReconciliations = 0;
+    const recoveryService =
+      createPostgresRestoreActivationRecoveryService({
+        listCurrentWriterLaunchCandidates: (input) =>
+          authority.listCurrentWriterLaunchRecoveryCandidates(input),
+        listRestoreAttachmentActivationCandidates: (input) =>
+          authority.listRestoreAttachmentActivationRecoveryCandidates(input),
+        listRestoreGenerationCandidates: (input) =>
+          authority.listRestoreDestinationGenerationRecoveryCandidates(input),
+        listWriterLaunchAttemptCandidates: (input) =>
+          authority.listWriterLaunchAttemptRecoveryCandidates(input),
+        reconcileRestoreAttachmentActivation() {
+          unexpectedReconciliations += 1;
+        },
+        reconcileRestoreGeneration() {
+          unexpectedReconciliations += 1;
+        },
+        reconcileWriterLaunchAttempt() {
+          unexpectedReconciliations += 1;
+        },
+      });
+    const runner = createPostgresRestoreRecoveryRunner({
+      cursorStore: createPostgresRestoreRecoveryCursorStore({ store }),
+      lifecycleGuard,
+      limits: {
+        activation: 10,
+        currentLaunch: 10,
+        generation: 10,
+        launchAttempt: 10,
+      },
+      recoveryScopeId,
+      recoveryService,
+    });
+
+    const firstStep = deferred();
+    const steps = [];
+    const scheduler = createPostgresRestoreRecoveryScheduler({
+      intervalMilliseconds: 60_000,
+      onStep(receipt) {
+        steps.push(receipt);
+        if (steps.length === 1) firstStep.resolve(receipt);
+      },
+      runner,
+    });
+    const completion = scheduler.start();
+    const first = await firstStep.promise;
+    assert.equal(first.status, "completed");
+    assert.equal(first.recovery.status, "sweep-complete");
+    assert.equal(unexpectedReconciliations, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const releaseForeground = deferred();
+    const firstForegroundEntered = deferred();
+    const secondForegroundEntered = deferred();
+    const firstForeground = lifecycleGuard.runForeground(async () => {
+      firstForegroundEntered.resolve();
+      await releaseForeground.promise;
+    });
+    await firstForegroundEntered.promise;
+    const secondForeground = lifecycleGuard.runForeground(async () => {
+      secondForegroundEntered.resolve();
+      await releaseForeground.promise;
+    });
+    await secondForegroundEntered.promise;
+
+    const busy = await scheduler.runStep({ signal: null });
+    assert.deepEqual(structuredClone(busy), {
+      errorCode: null,
+      recovery: null,
+      status: "busy",
+    });
+    releaseForeground.resolve();
+    await Promise.all([firstForeground, secondForeground]);
+
+    assert.strictEqual(scheduler.stop(), completion);
+    assert.deepEqual(structuredClone(await completion), { status: "stopped" });
+    assert.equal(steps.length, 2);
+    assert.equal(steps[1].status, "busy");
+
+    const stored = await pool.query(
+      [
+        "SELECT lane, cycle::text, revision::text, after_session_id",
+        "FROM session_authority.restore_recovery_cursors",
+        "WHERE recovery_scope_id = $1",
+        "ORDER BY lane",
+      ].join(" "),
+      [recoveryScopeId],
+    );
+    assert.deepEqual(stored.rows, [
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "activation",
+        revision: "1",
+      },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "current-launch",
+        revision: "1",
+      },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "generation",
+        revision: "1",
+      },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "launch-attempt",
+        revision: "1",
+      },
+    ]);
   },
 );

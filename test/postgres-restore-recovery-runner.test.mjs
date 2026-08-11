@@ -3,14 +3,19 @@ import crypto from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 
+import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
 import {
   PostgresRestoreRecoveryRunnerError,
   createPostgresRestoreRecoveryRunner,
+  isPostgresRestoreRecoveryRunner,
 } from "../src/postgres-restore-recovery-runner.mjs";
 import {
   createPostgresRestoreActivationRecoveryService,
   isPostgresRestoreActivationRecoveryService,
 } from "../src/postgres-restore-activation-recovery-service.mjs";
+import {
+  createPostgresRestoreLifecycleGuard,
+} from "../src/postgres-restore-lifecycle-guard.mjs";
 
 const RECOVERY_SCOPE_ID = "restore-recovery-scope-001";
 const SESSION_ID_1 = "019f2600-0000-7000-8000-000000000001";
@@ -24,6 +29,128 @@ const LANE_SPECS = [
   { field: "launchAttempt", lane: "launch-attempt" },
   { field: "currentLaunch", lane: "current-launch" },
 ];
+
+class RecoveryLockManager {
+  constructor() {
+    this.holder = null;
+  }
+
+  tryAcquire(client) {
+    if (this.holder !== null && this.holder !== client) return false;
+    this.holder = client;
+    return true;
+  }
+
+  isHeld(client) {
+    return this.holder === client;
+  }
+
+  unlock(client) {
+    if (!this.isHeld(client)) return false;
+    this.holder = null;
+    return true;
+  }
+
+  releaseAll(client) {
+    if (this.holder === client) this.holder = null;
+  }
+}
+
+class RecoveryGuardClient {
+  constructor({ events, loseWhen, manager, pid }) {
+    this.events = events;
+    this.loseWhen = loseWhen;
+    this.manager = manager;
+    this.pid = pid;
+    this.probeCount = 0;
+    this.releaseCalls = [];
+  }
+
+  async query(...args) {
+    const query = args[0];
+    const text = typeof query === "string" ? query : query.text;
+    if (text === "DISCARD ALL") {
+      this.manager.releaseAll(this);
+      return { command: "DISCARD", rows: [] };
+    }
+    if (text.includes("pg_try_advisory_lock")) {
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            acquired: this.manager.tryAcquire(this),
+            backend_pid: this.pid,
+          },
+        ],
+      };
+    }
+    if (text.includes("FROM pg_catalog.pg_locks")) {
+      this.probeCount += 1;
+      this.events?.push("probe");
+      if (this.loseWhen?.()) this.manager.releaseAll(this);
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            backend_pid: this.pid,
+            lock_held: this.manager.isHeld(this),
+          },
+        ],
+      };
+    }
+    if (text.includes("pg_advisory_unlock")) {
+      return {
+        command: "SELECT",
+        rows: [
+          {
+            backend_pid: this.pid,
+            unlocked: this.manager.unlock(this),
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected query: ${text}`);
+  }
+
+  async release(...args) {
+    this.releaseCalls.push(args);
+    if (args.length === 1) this.manager.releaseAll(this);
+  }
+}
+
+class RecoveryGuardPool {
+  constructor({ events = null, loseWhen = null, manager = null } = {}) {
+    this.clients = [];
+    this.events = events;
+    this.loseWhen = loseWhen;
+    this.manager = manager ?? new RecoveryLockManager();
+    this.nextPid = 4_001;
+  }
+
+  async connect() {
+    const client = new RecoveryGuardClient({
+      events: this.events,
+      loseWhen: this.loseWhen,
+      manager: this.manager,
+      pid: this.nextPid,
+    });
+    this.nextPid += 1;
+    this.clients.push(client);
+    return client;
+  }
+}
+
+function createLifecycleFixture(options = {}) {
+  const pool = new RecoveryGuardPool(options);
+  const operationGuard = new PostgresOperationGuard({
+    dedicatedPool: pool,
+  });
+  return {
+    guard: createPostgresRestoreLifecycleGuard({ operationGuard }),
+    manager: pool.manager,
+    pool,
+  };
+}
 
 function freezeRecord(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -102,6 +229,16 @@ function cursor(
 
 function increment(value) {
   return `${BigInt(value) + 1n}`;
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 function createCursorStore({
@@ -200,16 +337,28 @@ function limits(overrides = {}) {
   };
 }
 
-function createRunner({ cursorFixture, limitValues, serviceFixture } = {}) {
+function createRunner({
+  cursorFixture,
+  lifecycleFixture,
+  limitValues,
+  serviceFixture,
+} = {}) {
   const cursorValue = cursorFixture ?? createCursorStore();
+  const lifecycleValue = lifecycleFixture ?? createLifecycleFixture();
   const serviceValue = serviceFixture ?? createRecoveryService();
   const runner = createPostgresRestoreRecoveryRunner({
     cursorStore: cursorValue.store,
+    lifecycleGuard: lifecycleValue.guard,
     recoveryService: serviceValue.service,
     recoveryScopeId: RECOVERY_SCOPE_ID,
     limits: limitValues ?? limits(),
   });
-  return { cursorFixture: cursorValue, runner, serviceFixture: serviceValue };
+  return {
+    cursorFixture: cursorValue,
+    lifecycleFixture: lifecycleValue,
+    runner,
+    serviceFixture: serviceValue,
+  };
 }
 
 async function runGenerationDigest(status, { onReconcile = null } = {}) {
@@ -236,6 +385,38 @@ function assertCode(code) {
   return (error) =>
     error instanceof PostgresRestoreRecoveryRunnerError && error.code === code;
 }
+
+test("protected public promises adopt cross-module protected promises", async () => {
+  const service = createRecoveryService({ recordCalls: false }).service;
+  const batchRequest = {
+    afterSessionId: null,
+    limit: 1,
+    signal: null,
+  };
+
+  const thenRunner = createRunner();
+  const thenResult = await service.runGenerationBatch(batchRequest).then(
+    () => thenRunner.runner.runOnce({ signal: null }),
+  );
+  assert.equal(thenResult.recoveryScopeId, RECOVERY_SCOPE_ID);
+
+  const catchRunner = createRunner();
+  const catchResult = await service.runGenerationBatch({
+    ...batchRequest,
+    limit: 0,
+  }).catch(() => catchRunner.runner.runOnce({ signal: null }));
+  assert.equal(catchResult.recoveryScopeId, RECOVERY_SCOPE_ID);
+
+  const finallyRunner = createRunner();
+  const finallyResult = await service.runGenerationBatch(batchRequest).finally(
+    () => finallyRunner.runner.runOnce({ signal: null }),
+  );
+  assert.equal(finallyResult.status, "sweep-complete");
+  assert.equal(
+    finallyRunner.cursorFixture.state.get("generation").revision,
+    "1",
+  );
+});
 
 function restoreOwnProperty(target, key, descriptor) {
   if (descriptor === undefined) {
@@ -312,6 +493,372 @@ test("runs and durably advances four recovery lanes in fixed order", async () =>
   assertDeepFrozen(result);
   assertDeepFrozen(runner);
   assert.deepEqual(Reflect.ownKeys(runner), ["runOnce"]);
+});
+
+test("holds one authentic recovery lease across every guarded action", async () => {
+  const events = [];
+  const lifecycleFixture = createLifecycleFixture({ events });
+  const cursorFixture = createCursorStore({
+    onAdvance(input) {
+      events.push(`advance:${input.lane}`);
+    },
+    onRead(input) {
+      events.push(`read:${input.lane}`);
+    },
+    recordCalls: false,
+  });
+  const serviceFixture = createRecoveryService({
+    onList(field) {
+      events.push(`list:${field}`);
+    },
+    onReconcileGeneration() {
+      events.push("reconcile:generation");
+    },
+    pages: {
+      generation: page([generationCandidate()]),
+    },
+    recordCalls: false,
+  });
+  const { runner } = createRunner({
+    cursorFixture,
+    lifecycleFixture,
+    serviceFixture,
+  });
+
+  await runner.runOnce({ signal: null });
+
+  const expected = ["probe"];
+  for (const { field, lane } of LANE_SPECS) {
+    expected.push(
+      "probe",
+      `read:${lane}`,
+      "probe",
+      "probe",
+      "probe",
+      `list:${field}`,
+      "probe",
+    );
+    if (field === "generation") {
+      expected.push(
+        "probe",
+        "reconcile:generation",
+        "probe",
+      );
+    }
+    expected.push(
+      "probe",
+      "probe",
+      `advance:${lane}`,
+      "probe",
+    );
+  }
+  expected.push("probe");
+  assert.deepEqual(events, expected);
+  assert.equal(lifecycleFixture.manager.holder, null);
+});
+
+test("maps an outer lifecycle conflict to the stable runner busy code", async () => {
+  const manager = new RecoveryLockManager();
+  const firstLifecycle = createLifecycleFixture({ manager });
+  const secondLifecycle = createLifecycleFixture({ manager });
+  const entered = deferred();
+  const finish = deferred();
+  const firstCursorFixture = createCursorStore({ recordCalls: false });
+  const originalStore = firstCursorFixture.store;
+  let blocked = false;
+  const blockingStore = freezeRecord({
+    advanceLane: originalStore.advanceLane,
+    async readLane(input) {
+      if (!blocked) {
+        blocked = true;
+        entered.resolve();
+        await finish.promise;
+      }
+      return originalStore.readLane(input);
+    },
+  });
+  const first = createRunner({
+    cursorFixture: { ...firstCursorFixture, store: blockingStore },
+    lifecycleFixture: firstLifecycle,
+  });
+  const second = createRunner({ lifecycleFixture: secondLifecycle });
+
+  const firstRun = first.runner.runOnce({ signal: null });
+  await entered.promise;
+  await assert.rejects(
+    second.runner.runOnce({ signal: null }),
+    assertCode("postgres_restore_recovery_runner_busy"),
+  );
+  assert.deepEqual(second.cursorFixture.calls, []);
+  assert.deepEqual(second.serviceFixture.calls, []);
+
+  finish.resolve();
+  await firstRun;
+  assert.equal(manager.holder, null);
+});
+
+test("lease loss after one reconcile stops later candidates and cursor CAS", async () => {
+  let reconcileCalls = 0;
+  let lost = false;
+  const lifecycleFixture = createLifecycleFixture({
+    loseWhen() {
+      if (!lost && reconcileCalls === 1) {
+        lost = true;
+        return true;
+      }
+      return false;
+    },
+  });
+  const cursorFixture = createCursorStore({ recordCalls: false });
+  let advanceCalls = 0;
+  const originalStore = cursorFixture.store;
+  const observingStore = freezeRecord({
+    async advanceLane(input) {
+      advanceCalls += 1;
+      return originalStore.advanceLane(input);
+    },
+    readLane: originalStore.readLane,
+  });
+  const serviceFixture = createRecoveryService({
+    onReconcileGeneration() {
+      reconcileCalls += 1;
+    },
+    pages: {
+      generation: page([
+        generationCandidate(SESSION_ID_1),
+        generationCandidate(SESSION_ID_2),
+      ]),
+    },
+    recordCalls: false,
+  });
+  const { runner } = createRunner({
+    cursorFixture: { ...cursorFixture, store: observingStore },
+    lifecycleFixture,
+    limitValues: limits({ generation: 2 }),
+    serviceFixture,
+  });
+
+  await assert.rejects(
+    runner.runOnce({ signal: null }),
+    assertCode("postgres_restore_recovery_runner_outcome_uncertain"),
+  );
+  assert.equal(lost, true);
+  assert.equal(reconcileCalls, 1);
+  assert.equal(advanceCalls, 0);
+  assert.equal(cursorFixture.state.get("generation").revision, "0");
+  assert.equal(cursorFixture.state.get("activation").revision, "0");
+  assert.equal(lifecycleFixture.manager.holder, null);
+});
+
+test("waits for reconciliation to drain before advancing the cursor", async () => {
+  const entered = deferred();
+  const finish = deferred();
+  let advanceCalls = 0;
+  let reconcilerExited = false;
+  const cursorFixture = createCursorStore({ recordCalls: false });
+  const originalStore = cursorFixture.store;
+  const observingStore = freezeRecord({
+    async advanceLane(input) {
+      advanceCalls += 1;
+      return originalStore.advanceLane(input);
+    },
+    readLane: originalStore.readLane,
+  });
+  const serviceFixture = createRecoveryService({
+    async onReconcileGeneration() {
+      entered.resolve();
+      await finish.promise;
+      reconcilerExited = true;
+    },
+    pages: {
+      generation: page([generationCandidate()]),
+    },
+    recordCalls: false,
+  });
+  const { runner } = createRunner({
+    cursorFixture: { ...cursorFixture, store: observingStore },
+    serviceFixture,
+  });
+
+  const pending = runner.runOnce({ signal: null });
+  await entered.promise;
+  assert.equal(reconcilerExited, false);
+  assert.equal(advanceCalls, 0);
+  assert.equal(cursorFixture.state.get("generation").revision, "0");
+
+  finish.resolve();
+  await pending;
+  assert.equal(reconcilerExited, true);
+  assert.equal(advanceCalls, 4);
+  assert.equal(cursorFixture.state.get("generation").revision, "1");
+});
+
+test(
+  "callback-time Promise pollution cannot advance cursors or release recovery",
+  { concurrency: false },
+  async () => {
+    const constructorDescriptor = Object.getOwnPropertyDescriptor(
+      Promise.prototype,
+      "constructor",
+    );
+    const thenDescriptor = Object.getOwnPropertyDescriptor(
+      Promise.prototype,
+      "then",
+    );
+    const speciesHolder = Object.freeze(
+      Object.create(null, {
+        [Symbol.species]: {
+          configurable: false,
+          enumerable: false,
+          value: Promise,
+          writable: false,
+        },
+      }),
+    );
+    const reconciliation = deferred();
+    const restoration = deferred();
+    Object.defineProperty(restoration.promise, "constructor", {
+      configurable: false,
+      enumerable: false,
+      value: Promise,
+      writable: false,
+    });
+    let restored = false;
+    let poisonedThenCalls = 0;
+    const restore = () => {
+      if (restored) return;
+      restored = true;
+      restoreOwnProperty(
+        Promise.prototype,
+        "constructor",
+        constructorDescriptor,
+      );
+      restoreOwnProperty(Promise.prototype, "then", thenDescriptor);
+      restoration.resolve();
+    };
+    let advanceCalls = 0;
+    const cursorFixture = createCursorStore({ recordCalls: false });
+    const observingStore = freezeRecord({
+      async advanceLane(input) {
+        advanceCalls += 1;
+        return cursorFixture.store.advanceLane(input);
+      },
+      readLane: cursorFixture.store.readLane,
+    });
+    const serviceFixture = createRecoveryService({
+      onReconcileGeneration() {
+        Object.defineProperty(Promise.prototype, "constructor", {
+          ...constructorDescriptor,
+          value: speciesHolder,
+        });
+        Object.defineProperty(Promise.prototype, "then", {
+          ...thenDescriptor,
+          value(onFulfilled) {
+            poisonedThenCalls += 1;
+            if (typeof onFulfilled === "function") onFulfilled("reconciled");
+          },
+        });
+        queueMicrotask(restore);
+        return reconciliation.promise;
+      },
+      pages: {
+        generation: page([generationCandidate()]),
+      },
+      recordCalls: false,
+    });
+    const fixture = createRunner({
+      cursorFixture: { ...cursorFixture, store: observingStore },
+      serviceFixture,
+    });
+    const pending = fixture.runner.runOnce({ signal: null });
+    let settled = false;
+    pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    try {
+      await restoration.promise;
+    } finally {
+      restore();
+    }
+
+    assert.equal(poisonedThenCalls, 0);
+    assert.equal(settled, false);
+    assert.equal(advanceCalls, 0);
+    assert.notEqual(fixture.lifecycleFixture.manager.holder, null);
+
+    reconciliation.resolve();
+    await pending;
+    assert.equal(advanceCalls, 4);
+    assert.equal(cursorFixture.state.get("generation").revision, "1");
+    assert.equal(fixture.lifecycleFixture.manager.holder, null);
+  },
+);
+
+test("a proxied reconciliation Promise cannot advance the cursor", async () => {
+  const work = deferred();
+  let workSettled = false;
+  work.promise.then(() => {
+    workSettled = true;
+  });
+  let proxyTraps = 0;
+  const proxiedWork = new Proxy(work.promise, {
+    get() {
+      proxyTraps += 1;
+      throw new Error("reconciliation Promise proxy must not be inspected");
+    },
+    getOwnPropertyDescriptor() {
+      proxyTraps += 1;
+      throw new Error("reconciliation Promise proxy must not be inspected");
+    },
+    getPrototypeOf() {
+      proxyTraps += 1;
+      throw new Error("reconciliation Promise proxy must not be inspected");
+    },
+    ownKeys() {
+      proxyTraps += 1;
+      throw new Error("reconciliation Promise proxy must not be inspected");
+    },
+  });
+  let advanceCalls = 0;
+  const cursorFixture = createCursorStore({ recordCalls: false });
+  const serviceFixture = createRecoveryService({
+    onReconcileGeneration() {
+      return proxiedWork;
+    },
+    pages: {
+      generation: page([generationCandidate()]),
+    },
+    recordCalls: false,
+  });
+  const observingStore = freezeRecord({
+    async advanceLane(input) {
+      advanceCalls += 1;
+      return cursorFixture.store.advanceLane(input);
+    },
+    readLane: cursorFixture.store.readLane,
+  });
+  const fixture = createRunner({
+    cursorFixture: { ...cursorFixture, store: observingStore },
+    serviceFixture,
+  });
+
+  await assert.rejects(
+    fixture.runner.runOnce({ signal: null }),
+    assertCode("postgres_restore_recovery_runner_outcome_uncertain"),
+  );
+  assert.equal(proxyTraps, 0);
+  assert.equal(workSettled, false);
+  assert.equal(advanceCalls, 0);
+  assert.equal(cursorFixture.state.get("generation").revision, "0");
+  assert.equal(fixture.lifecycleFixture.manager.holder, null);
+
+  work.resolve();
+  await work.promise;
 });
 
 test(
@@ -1043,6 +1590,7 @@ test("rejects a frozen recovery-service lookalike before any method call", () =>
     () =>
       createPostgresRestoreRecoveryRunner({
         cursorStore: createCursorStore().store,
+        lifecycleGuard: createLifecycleFixture().guard,
         recoveryService: forgedService,
         recoveryScopeId: RECOVERY_SCOPE_ID,
         limits: limits(),
@@ -1052,11 +1600,93 @@ test("rejects a frozen recovery-service lookalike before any method call", () =>
   assert.equal(methodCalls, 0);
 });
 
+test("rejects lifecycle-guard lookalikes without methods or Proxy traps", () => {
+  let methodCalls = 0;
+  let proxyTrapCalls = 0;
+  function forgedMethod() {
+    methodCalls += 1;
+  }
+  const forgedGuard = freezeRecord({
+    runForeground: forgedMethod,
+    runRecovery: forgedMethod,
+  });
+  const proxiedGuard = new Proxy(forgedGuard, {
+    get() {
+      proxyTrapCalls += 1;
+      throw new Error("guard properties must not be read");
+    },
+    getOwnPropertyDescriptor() {
+      proxyTrapCalls += 1;
+      throw new Error("guard descriptors must not be inspected");
+    },
+    getPrototypeOf() {
+      proxyTrapCalls += 1;
+      throw new Error("guard prototype must not be inspected");
+    },
+    ownKeys() {
+      proxyTrapCalls += 1;
+      throw new Error("guard keys must not be enumerated");
+    },
+  });
+
+  for (const lifecycleGuard of [forgedGuard, proxiedGuard]) {
+    assert.throws(
+      () =>
+        createPostgresRestoreRecoveryRunner({
+          cursorStore: createCursorStore().store,
+          lifecycleGuard,
+          recoveryService: createRecoveryService().service,
+          recoveryScopeId: RECOVERY_SCOPE_ID,
+          limits: limits(),
+        }),
+      assertCode("invalid_postgres_restore_recovery_runner_options"),
+    );
+  }
+  assert.equal(methodCalls, 0);
+  assert.equal(proxyTrapCalls, 0);
+});
+
+test("brands only exact runner instances without invoking Proxy traps", () => {
+  const { runner } = createRunner();
+  const clone = freezeRecord({ runOnce: runner.runOnce });
+  let traps = 0;
+  const handler = {
+    get() {
+      traps += 1;
+      throw new Error("runner properties must not be read");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error("runner descriptors must not be inspected");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("runner prototype must not be inspected");
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("runner keys must not be enumerated");
+    },
+  };
+  const proxy = new Proxy(runner, handler);
+  const revoked = Proxy.revocable(runner, handler);
+  revoked.revoke();
+
+  assert.equal(isPostgresRestoreRecoveryRunner(runner), true);
+  assert.equal(isPostgresRestoreRecoveryRunner(clone), false);
+  assert.equal(isPostgresRestoreRecoveryRunner(proxy), false);
+  assert.equal(isPostgresRestoreRecoveryRunner(revoked.proxy), false);
+  assert.equal(isPostgresRestoreRecoveryRunner(), false);
+  assert.equal(isPostgresRestoreRecoveryRunner(runner, "extra"), false);
+  assert.equal(traps, 0);
+});
+
 test("rejects proxy, accessor, generator, and thenable expansion without traps", async () => {
   let proxyTrapCalls = 0;
   const proxiedOptions = new Proxy(
     {
       cursorStore: createCursorStore().store,
+      lifecycleGuard: createLifecycleFixture().guard,
       recoveryService: createRecoveryService().service,
       recoveryScopeId: RECOVERY_SCOPE_ID,
       limits: limits(),
@@ -1099,6 +1729,7 @@ test("rejects proxy, accessor, generator, and thenable expansion without traps",
     () =>
       createPostgresRestoreRecoveryRunner({
         cursorStore: createCursorStore().store,
+        lifecycleGuard: createLifecycleFixture().guard,
         recoveryService: createRecoveryService().service,
         recoveryScopeId: RECOVERY_SCOPE_ID,
         limits: accessorLimits,
@@ -1117,6 +1748,7 @@ test("rejects proxy, accessor, generator, and thenable expansion without traps",
     () =>
       createPostgresRestoreRecoveryRunner({
         cursorStore: generatorStore,
+        lifecycleGuard: createLifecycleFixture().guard,
         recoveryService: createRecoveryService().service,
         recoveryScopeId: RECOVERY_SCOPE_ID,
         limits: limits(),
@@ -1137,6 +1769,7 @@ test("rejects proxy, accessor, generator, and thenable expansion without traps",
   });
   const thenableRunner = createPostgresRestoreRecoveryRunner({
     cursorStore: thenableStore,
+    lifecycleGuard: createLifecycleFixture().guard,
     recoveryService: createRecoveryService().service,
     recoveryScopeId: RECOVERY_SCOPE_ID,
     limits: limits(),
@@ -1168,6 +1801,7 @@ test("rejects Promise subclasses without invoking an overridden then", async () 
   });
   const runner = createPostgresRestoreRecoveryRunner({
     cursorStore: store,
+    lifecycleGuard: createLifecycleFixture().guard,
     recoveryService: createRecoveryService().service,
     recoveryScopeId: RECOVERY_SCOPE_ID,
     limits: limits(),
@@ -1208,6 +1842,7 @@ test("rejects proxied and accessor collaborator records without traps", async ()
   });
   const proxyRunner = createPostgresRestoreRecoveryRunner({
     cursorStore: proxyStore,
+    lifecycleGuard: createLifecycleFixture().guard,
     recoveryService: createRecoveryService().service,
     recoveryScopeId: RECOVERY_SCOPE_ID,
     limits: limits(),
@@ -1236,6 +1871,7 @@ test("rejects proxied and accessor collaborator records without traps", async ()
   });
   const accessorRunner = createPostgresRestoreRecoveryRunner({
     cursorStore: accessorStore,
+    lifecycleGuard: createLifecycleFixture().guard,
     recoveryService: createRecoveryService().service,
     recoveryScopeId: RECOVERY_SCOPE_ID,
     limits: limits(),
@@ -1253,6 +1889,7 @@ test("constructor and run request require exact plain data", async () => {
     undefined,
     {
       cursorStore: valid.cursorFixture.store,
+      lifecycleGuard: valid.lifecycleFixture.guard,
       recoveryService: valid.serviceFixture.service,
       recoveryScopeId: RECOVERY_SCOPE_ID,
       limits: limits(),
@@ -1260,12 +1897,14 @@ test("constructor and run request require exact plain data", async () => {
     },
     {
       cursorStore: valid.cursorFixture.store,
+      lifecycleGuard: valid.lifecycleFixture.guard,
       recoveryService: valid.serviceFixture.service,
       recoveryScopeId: "invalid scope",
       limits: limits(),
     },
     {
       cursorStore: valid.cursorFixture.store,
+      lifecycleGuard: valid.lifecycleFixture.guard,
       recoveryService: valid.serviceFixture.service,
       recoveryScopeId: RECOVERY_SCOPE_ID,
       limits: limits({ generation: 0 }),

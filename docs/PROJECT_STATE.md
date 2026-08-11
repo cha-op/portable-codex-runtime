@@ -274,17 +274,23 @@
 - PostgreSQL now persists those four cursors independently for each configured
   recovery scope. A bounded single-flight runner advances each settled lane by
   revision/cycle compare-and-swap, survives restart and commit-acknowledgement
-  loss, and preserves earlier lane progress when a later lane fails. It remains
-  an unscheduled primitive and does not enable production restore.
+  loss, and preserves earlier lane progress when a later lane fails.
+- One database-global versioned restore lifecycle lock now gives foreground
+  composition a shared lease and the recovery runner an exclusive lease. The
+  runner and service revalidate the lease around lane, candidate, and cursor
+  boundaries. A fixed-delay scheduler starts with one immediate bounded
+  pass, prevents overlapping passes, coalesces concurrent kicks, reports busy
+  or uncertain ticks, and drains admitted work during shutdown. Cursor scopes
+  do not partition this lock, and these components do not enable production
+  restore.
 - Stopped-directory backend contract version 3 can transport the complete
   authority-issued restore-generation binding to fresh publication or to
   source-free committed verification. Version 2 callback behavior remains
   compatible, and the new transport seam does not enable `runRestore()`.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until later serial slices add the cross-process lifecycle guard and recovery
-  scheduler, then wire committed
-  publication, detached activation, prepared launch, and no-relaunch recovery
-  into `runRestore()` behind the detached-production fleet gate.
+  until a later serial slice wires committed publication, detached activation,
+  prepared launch, and scheduled no-relaunch recovery into `runRestore()`
+  behind the detached-production fleet gate and shared lifecycle lease.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -370,8 +376,8 @@
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
   adapter. Capture-bound detached activation and bounded no-relaunch recovery
-  now exist, and the stop-to-prepared-capture handoff is durable. Production
-  still requires the cross-process foreground/recovery lifecycle guard, a
-  recovery scheduler, a separate explicit invocation fleet capability,
+  now exist, the stop-to-prepared-capture handoff is durable, and the cross-
+  process foreground/recovery lifecycle guard plus scheduler are implemented.
+  Production still requires a separate explicit invocation fleet capability,
   adapter composition, and end-to-end fail-closed validation before
   `runRestore()` may be enabled.

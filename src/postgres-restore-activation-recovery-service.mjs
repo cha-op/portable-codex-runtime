@@ -7,6 +7,10 @@ import {
   assertSessionAttachment,
   assertStorageMutationRequest,
 } from "./session-storage-contracts.mjs";
+import {
+  assertPostgresRestoreLifecycleLeaseHeld,
+  isPostgresRestoreLifecycleLease,
+} from "./postgres-restore-lifecycle-guard.mjs";
 
 const arrayIsArray = Array.isArray;
 const arrayEveryIntrinsic = Array.prototype.every;
@@ -24,6 +28,7 @@ const isProxyValue = utilTypes.isProxy;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
+const objectDefineProperties = Object.defineProperties;
 const objectDefineProperty = Object.defineProperty;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
@@ -33,6 +38,7 @@ const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
+const promiseResolveIntrinsic = Promise.resolve;
 const promiseSpeciesSymbol = Symbol.species;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApply = Reflect.apply;
@@ -49,6 +55,14 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 
 const recoveryServiceBrands = new WeakSetConstructor();
 const recoveryBatchReceiptMetadata = new WeakMapConstructor();
+const promiseSpeciesHolder = objectCreate(null);
+objectDefineProperty(promiseSpeciesHolder, promiseSpeciesSymbol, {
+  configurable: false,
+  enumerable: false,
+  value: PromiseConstructor,
+  writable: false,
+});
+objectFreeze(promiseSpeciesHolder);
 
 const AbortSignalConstructor = globalThis.AbortSignal;
 const abortSignalAbortedGetter = objectGetOwnPropertyDescriptor(
@@ -82,11 +96,25 @@ const BATCH_REQUEST_KEYS = objectFreeze([
   "limit",
   "signal",
 ]);
+const GUARDED_BATCH_REQUEST_KEYS = objectFreeze([
+  "afterSessionId",
+  "lifecycleLease",
+  "limit",
+  "signal",
+]);
 const SWEEP_REQUEST_KEYS = objectFreeze([
   "activation",
   "currentLaunch",
   "generation",
   "launchAttempt",
+  "signal",
+]);
+const GUARDED_SWEEP_REQUEST_KEYS = objectFreeze([
+  "activation",
+  "currentLaunch",
+  "generation",
+  "launchAttempt",
+  "lifecycleLease",
   "signal",
 ]);
 const SWEEP_LANE_KEYS = objectFreeze(["afterSessionId", "limit"]);
@@ -241,8 +269,11 @@ export function isPostgresRestoreActivationRecoveryService(value) {
 /**
  * Consumes one authentic batch receipt exactly once. Success proves only that
  * `receipt` is the exact object minted by `service` after the named lane had
- * drained one invocation with the exact `{afterSessionId, limit}` input. It is
- * an in-process provenance check, not persistent authority or a database CAS.
+ * drained one invocation with the exact `{afterSessionId, limit}` input. The
+ * legacy five-argument form consumes only an unguarded receipt. The guarded
+ * six-argument form additionally requires the exact active recovery lease
+ * that minted the receipt. It is an in-process provenance check, not
+ * persistent authority or a database CAS.
  *
  * Failed checks return `false` without consuming an otherwise-valid receipt.
  * The function reads no properties from either public object, so rejected
@@ -252,7 +283,8 @@ export function isPostgresRestoreActivationRecoveryService(value) {
  * @param {unknown} lane One of generation, activation, launchAttempt, or currentLaunch.
  * @param {unknown} afterSessionId
  * @param {unknown} limit
- * @param {unknown} receipt
+ * @param {unknown} lifecycleLeaseOrReceipt Legacy receipt or guarded recovery lease.
+ * @param {unknown} [guardedReceipt] Guarded receipt when the lease is supplied.
  * @returns {boolean} `true` for the first exact match; otherwise `false`.
  */
 export function consumePostgresRestoreActivationRecoveryBatchReceipt(
@@ -260,11 +292,20 @@ export function consumePostgresRestoreActivationRecoveryBatchReceipt(
   lane,
   afterSessionId,
   limit,
-  receipt,
+  lifecycleLeaseOrReceipt,
+  guardedReceipt,
 ) {
+  const guarded = arguments.length === 6;
+  const receipt = guarded ? guardedReceipt : lifecycleLeaseOrReceipt;
+  const lifecycleLease = guarded ? lifecycleLeaseOrReceipt : null;
   if (
-    arguments.length !== 5 ||
+    (arguments.length !== 5 && !guarded) ||
     !isPostgresRestoreActivationRecoveryService(service) ||
+    (guarded &&
+      !callIntrinsic(isPostgresRestoreLifecycleLease, undefined, [
+        lifecycleLease,
+        "recovery",
+      ])) ||
     receipt === null ||
     (typeof receipt !== "object" && typeof receipt !== "function")
   ) {
@@ -280,7 +321,8 @@ export function consumePostgresRestoreActivationRecoveryBatchReceipt(
     metadata.service !== service ||
     metadata.lane !== lane ||
     metadata.afterSessionId !== afterSessionId ||
-    metadata.limit !== limit
+    metadata.limit !== limit ||
+    metadata.lifecycleLease !== lifecycleLease
   ) {
     return false;
   }
@@ -610,6 +652,106 @@ function normalizeCallback(value, code) {
   return value;
 }
 
+function protectPromiseReaction(callback) {
+  if (typeof callback !== "function") return callback;
+  return (value) =>
+    protectPromise(callIntrinsic(callback, undefined, [value]));
+}
+
+function protectedPromiseThen(onFulfilled, onRejected) {
+  return protectPromise(
+    callIntrinsic(promiseThenIntrinsic, this, [
+      protectPromiseReaction(onFulfilled),
+      protectPromiseReaction(onRejected),
+    ]),
+  );
+}
+
+function protectedPromiseCatch(onRejected) {
+  return callIntrinsic(protectedPromiseThen, this, [
+    undefined,
+    onRejected,
+  ]);
+}
+
+function resolveProtectedPromise(value) {
+  return protectPromise(
+    callIntrinsic(promiseResolveIntrinsic, PromiseConstructor, [
+      protectPromise(value),
+    ]),
+  );
+}
+
+function protectedPromiseFinally(onFinally) {
+  if (typeof onFinally !== "function") {
+    return callIntrinsic(protectedPromiseThen, this, [
+      onFinally,
+      onFinally,
+    ]);
+  }
+  const runFinally = () =>
+    resolveProtectedPromise(callIntrinsic(onFinally, undefined, []));
+  return callIntrinsic(protectedPromiseThen, this, [
+    (value) =>
+      callIntrinsic(protectedPromiseThen, runFinally(), [
+        () => value,
+        undefined,
+      ]),
+    (reason) =>
+      callIntrinsic(protectedPromiseThen, runFinally(), [
+        () => {
+          throw reason;
+        },
+        undefined,
+      ]),
+  ]);
+}
+
+function protectPromise(value) {
+  if (!isPromiseValue(value)) return value;
+  const constructorDescriptor = objectGetOwnPropertyDescriptor(
+    value,
+    "constructor",
+  );
+  if (
+    constructorDescriptor !== undefined &&
+    objectHasOwn(constructorDescriptor, "value") &&
+    constructorDescriptor.value !== promiseSpeciesHolder &&
+    isSafePromiseSpeciesHolder(constructorDescriptor.value)
+  ) {
+    return protectPromise(
+      callIntrinsic(promiseThenIntrinsic, value, [undefined, undefined]),
+    );
+  }
+  objectDefineProperties(value, {
+    catch: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseCatch,
+      writable: false,
+    },
+    constructor: {
+      configurable: false,
+      enumerable: false,
+      value: promiseSpeciesHolder,
+      writable: false,
+    },
+    finally: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseFinally,
+      writable: false,
+    },
+    then: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseThen,
+      writable: false,
+    },
+  });
+  return value;
+}
+
 function isSafePromiseSpeciesHolder(value) {
   if (
     value === null ||
@@ -725,8 +867,30 @@ function normalizeLaneRequest(value, code) {
   return exactFrozenRecord({ afterSessionId, limit: normalized.limit });
 }
 
+function hasOwnLifecycleLease(value, code) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
+    code,
+  );
+  let descriptor;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(value, "lifecycleLease");
+  } catch {
+    fail(code);
+  }
+  return descriptor !== undefined;
+}
+
 function normalizeBatchRequest(value, code) {
-  const normalized = exactDataObject(value, BATCH_REQUEST_KEYS, code);
+  const guarded = hasOwnLifecycleLease(value, code);
+  const normalized = exactDataObject(
+    value,
+    guarded ? GUARDED_BATCH_REQUEST_KEYS : BATCH_REQUEST_KEYS,
+    code,
+  );
   const lane = normalizeLaneRequest(
     {
       afterSessionId: normalized.afterSessionId,
@@ -735,21 +899,46 @@ function normalizeBatchRequest(value, code) {
     code,
   );
   signalIsAborted(normalized.signal, code);
+  const lifecycleLease = guarded ? normalized.lifecycleLease : null;
+  ensure(
+    !guarded ||
+      callIntrinsic(isPostgresRestoreLifecycleLease, undefined, [
+        lifecycleLease,
+        "recovery",
+      ]),
+    code,
+  );
   return exactFrozenRecord({
     afterSessionId: lane.afterSessionId,
+    lifecycleLease,
     limit: lane.limit,
     signal: normalized.signal,
   });
 }
 
 function normalizeSweepRequest(value, code) {
-  const normalized = exactDataObject(value, SWEEP_REQUEST_KEYS, code);
+  const guarded = hasOwnLifecycleLease(value, code);
+  const normalized = exactDataObject(
+    value,
+    guarded ? GUARDED_SWEEP_REQUEST_KEYS : SWEEP_REQUEST_KEYS,
+    code,
+  );
   signalIsAborted(normalized.signal, code);
+  const lifecycleLease = guarded ? normalized.lifecycleLease : null;
+  ensure(
+    !guarded ||
+      callIntrinsic(isPostgresRestoreLifecycleLease, undefined, [
+        lifecycleLease,
+        "recovery",
+      ]),
+    code,
+  );
   return exactFrozenRecord({
     activation: normalizeLaneRequest(normalized.activation, code),
     currentLaunch: normalizeLaneRequest(normalized.currentLaunch, code),
     generation: normalizeLaneRequest(normalized.generation, code),
     launchAttempt: normalizeLaneRequest(normalized.launchAttempt, code),
+    lifecycleLease,
     signal: normalized.signal,
   });
 }
@@ -998,7 +1187,7 @@ function normalizePage(value, request, kind, code) {
   });
 }
 
-async function callList(callback, request, kind, code) {
+async function callListInternal(callback, request, kind, code) {
   let value;
   try {
     value = callIntrinsic(callback, undefined, [
@@ -1014,22 +1203,24 @@ async function callList(callback, request, kind, code) {
       value = await value;
     }
     if (isGeneratorObjectValue(value)) fail(code);
-  } catch (error) {
-    if (error instanceof PostgresRestoreActivationRecoveryServiceError) {
-      throw error;
-    }
+  } catch {
     fail(code);
   }
   return normalizePage(value, request, kind, code);
 }
 
-async function reconcileCandidate(callback, candidate, code) {
+function callList(...args) {
+  return protectPromise(callListInternal(...args));
+}
+
+async function reconcileCandidateInternal(callback, candidate, code) {
   let pending;
   try {
     pending = callIntrinsic(callback, undefined, [candidate]);
   } catch {
     return "pending";
   }
+  if (isProxyValue(pending)) fail(code);
   if (isGeneratorObjectValue(pending)) return "pending";
   if (isPromiseValue(pending)) {
     pending = normalizeSafeNativePromise(pending);
@@ -1048,6 +1239,41 @@ async function reconcileCandidate(callback, candidate, code) {
   }
   if (isGeneratorObjectValue(pending)) return "pending";
   return "reconciled";
+}
+
+function reconcileCandidate(...args) {
+  return protectPromise(reconcileCandidateInternal(...args));
+}
+
+async function assertRecoveryLeaseHeldInternal(lifecycleLease, code) {
+  if (lifecycleLease === null) return;
+  let pending;
+  try {
+    pending = callIntrinsic(
+      assertPostgresRestoreLifecycleLeaseHeld,
+      undefined,
+      [lifecycleLease, "recovery"],
+    );
+    if (isGeneratorObjectValue(pending)) fail(code);
+    if (isPromiseValue(pending)) {
+      pending = normalizeSafeNativePromise(pending);
+      ensure(pending !== null, code);
+      pending = await pending;
+    } else {
+      ensure(!hasUntrustedThenableShape(pending), code);
+    }
+    ensure(
+      !isGeneratorObjectValue(pending) &&
+        !hasUntrustedThenableShape(pending),
+      code,
+    );
+  } catch {
+    fail(code);
+  }
+}
+
+function assertRecoveryLeaseHeld(...args) {
+  return protectPromise(assertRecoveryLeaseHeldInternal(...args));
 }
 
 function batchResult(afterSessionId, nextAfterSessionId, results, status) {
@@ -1156,6 +1382,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
       exactFrozenRecord({
         afterSessionId: request.afterSessionId,
         lane: kind,
+        lifecycleLease: request.lifecycleLease,
         limit: request.limit,
         service: serviceInstance,
       }),
@@ -1173,17 +1400,19 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
     );
   }
 
-  async function runLane(kind, request) {
+  async function runLaneInternal(kind, request) {
     if (signalIsAborted(request.signal, requestCode)) {
       return emptyAbortedBatch(kind, request);
     }
     const lane = callbacks[kind];
+    await assertRecoveryLeaseHeld(request.lifecycleLease, outcomeCode);
     const page = await callList(
       lane.list,
       request,
       kind,
       outcomeCode,
     );
+    await assertRecoveryLeaseHeld(request.lifecycleLease, outcomeCode);
     if (signalIsAborted(request.signal, requestCode)) {
       return emptyAbortedBatch(kind, request);
     }
@@ -1200,6 +1429,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         );
       }
       const normalized = page.candidates[index];
+      await assertRecoveryLeaseHeld(request.lifecycleLease, outcomeCode);
       const status =
         kind === "currentLaunch"
           ? "requires-stop-or-fence"
@@ -1208,6 +1438,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
               normalized.candidate,
               outcomeCode,
             );
+      await assertRecoveryLeaseHeld(request.lifecycleLease, outcomeCode);
       defineArrayElement(
         results,
         results.length,
@@ -1239,42 +1470,54 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
     );
   }
 
-  async function withFlight(callback) {
+  function runLane(...laneArgs) {
+    return protectPromise(runLaneInternal(...laneArgs));
+  }
+
+  async function withFlightInternal(callback) {
     ensure(!inFlight, outcomeCode);
     inFlight = true;
     try {
-      return await callback();
+      return await protectPromise(callback());
     } finally {
       inFlight = false;
     }
   }
 
-  function publicBatch(kind, argsValue) {
-    ensure(argsValue.length === 1, requestCode);
-    const request = normalizeBatchRequest(argsValue[0], requestCode);
-    return withFlight(() => runLane(kind, request));
+  function withFlight(callback) {
+    return protectPromise(withFlightInternal(callback));
   }
 
-  const runGenerationBatch = async function runGenerationBatch(...runArgs) {
+  async function publicBatchInternal(kind, argsValue) {
+    ensure(argsValue.length === 1, requestCode);
+    const request = normalizeBatchRequest(argsValue[0], requestCode);
+    return await withFlight(() => runLane(kind, request));
+  }
+
+  function publicBatch(kind, argsValue) {
+    return protectPromise(publicBatchInternal(kind, argsValue));
+  }
+
+  const runGenerationBatch = function runGenerationBatch(...runArgs) {
     return publicBatch("generation", runArgs);
   };
-  const runActivationBatch = async function runActivationBatch(...runArgs) {
+  const runActivationBatch = function runActivationBatch(...runArgs) {
     return publicBatch("activation", runArgs);
   };
-  const runLaunchAttemptBatch = async function runLaunchAttemptBatch(
+  const runLaunchAttemptBatch = function runLaunchAttemptBatch(
     ...runArgs
   ) {
     return publicBatch("launchAttempt", runArgs);
   };
-  const scanCurrentLaunchBatch = async function scanCurrentLaunchBatch(
+  const scanCurrentLaunchBatch = function scanCurrentLaunchBatch(
     ...runArgs
   ) {
     return publicBatch("currentLaunch", runArgs);
   };
-  const runSweep = async function runSweep(...runArgs) {
+  const runSweepInternal = async function runSweepInternal(runArgs) {
     ensure(runArgs.length === 1, requestCode);
     const request = normalizeSweepRequest(runArgs[0], requestCode);
-    return withFlight(async () => {
+    return await withFlight(async () => {
       const results = objectCreate(null);
       const laneOrder = [
         ["generation", "generation"],
@@ -1291,6 +1534,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
           kind,
           exactFrozenRecord({
             afterSessionId: lane.afterSessionId,
+            lifecycleLease: request.lifecycleLease,
             limit: lane.limit,
             signal: request.signal,
           }),
@@ -1316,6 +1560,9 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
       });
     });
   };
+  const runSweep = function runSweep(...runArgs) {
+    return protectPromise(runSweepInternal(runArgs));
+  };
 
   objectFreeze(runGenerationBatch);
   objectFreeze(runActivationBatch);
@@ -1332,3 +1579,5 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   callIntrinsic(weakSetAddIntrinsic, recoveryServiceBrands, [serviceInstance]);
   return serviceInstance;
 }
+
+objectFreeze(PostgresRestoreActivationRecoveryServiceError.prototype);
