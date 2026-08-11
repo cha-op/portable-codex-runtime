@@ -73,6 +73,29 @@ const PLAN_KEYS = objectFreeze([
   "sourceArtifactDirectory",
   "sourceArtifactOwnedRoot",
 ]);
+const PERSISTED_PLAN_KEYS = objectFreeze([
+  "contractVersion",
+  "request",
+  "captureCreatedAt",
+  "destinationDirectory",
+  "destinationOwnedRoot",
+  "detachMode",
+  "holderId",
+  "imagePlanId",
+  "leaseDurationMilliseconds",
+  "sourceArtifactDirectory",
+  "sourceArtifactOwnedRoot",
+  "renewalOperationId",
+  "captureOperationId",
+  "captureArtifactId",
+  "captureCheckpointId",
+  "generationId",
+  "destinationIsolationProofId",
+  "detachOperationId",
+  "activationOperationId",
+  "launchAttemptId",
+  "planSha256",
+]);
 const REQUEST_KEYS = objectFreeze([
   "backendId",
   "contractVersion",
@@ -531,5 +554,48 @@ export function createPostgresDetachedRestorePlan(options) {
   }
 }
 
+/**
+ * Rebuilds the authentic in-process plan capability from one complete durable
+ * document. Persisted derived identities are evidence to compare, never a
+ * substitute for recomputing the contract from its canonical inputs.
+ */
+export function rehydratePostgresDetachedRestorePlan(document) {
+  if (arguments.length !== 1) fail();
+  try {
+    const persisted = exactDataObject(document, PERSISTED_PLAN_KEYS);
+    const rebuilt = createPostgresDetachedRestorePlan({
+      plan: {
+        captureCreatedAt: persisted.captureCreatedAt,
+        destinationDirectory: persisted.destinationDirectory,
+        destinationOwnedRoot: persisted.destinationOwnedRoot,
+        detachMode: persisted.detachMode,
+        holderId: persisted.holderId,
+        imagePlanId: persisted.imagePlanId,
+        leaseDurationMilliseconds: persisted.leaseDurationMilliseconds,
+        sourceArtifactDirectory: persisted.sourceArtifactDirectory,
+        sourceArtifactOwnedRoot: persisted.sourceArtifactOwnedRoot,
+      },
+      request: persisted.request,
+    });
+    ensure(persisted.contractVersion === rebuilt.contractVersion);
+    for (let index = 2; index < PERSISTED_PLAN_KEYS.length; index += 1) {
+      const key = PERSISTED_PLAN_KEYS[index];
+      ensure(persisted[key] === rebuilt[key]);
+    }
+    return rebuilt;
+  } catch (error) {
+    if (
+      error !== null &&
+      (typeof error === "object" || typeof error === "function") &&
+      !isProxyValue(error) &&
+      callIntrinsic(weakSetHasIntrinsic, errorBrands, [error])
+    ) {
+      throw error;
+    }
+    fail();
+  }
+}
+
 objectFreeze(PostgresDetachedRestorePlanError.prototype);
 objectFreeze(PostgresDetachedRestorePlanError);
+objectFreeze(rehydratePostgresDetachedRestorePlan);

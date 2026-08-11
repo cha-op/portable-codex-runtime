@@ -1435,6 +1435,52 @@ export function assertStorageMutationRequest(value) {
 }
 
 /**
+ * Canonicalizes the exact clean-checkpoint admission shared by detached
+ * restore planning and foreground execution. The checkpoint may name source
+ * storage distinct from the request's destination storage, but both records
+ * must bind the same backend, session, artifact, and checkpoint identities.
+ */
+export function assertRestoreCheckpointAdmission(value) {
+  assertExactObject(
+    value,
+    ["checkpoint", "request"],
+    "invalid_restore_checkpoint_admission",
+    "restore checkpoint admission",
+  );
+  let checkpoint;
+  let request;
+  try {
+    checkpoint = assertCheckpointDescriptor(value.checkpoint);
+    request = assertStorageMutationRequest(value.request);
+  } catch {
+    fail(
+      "invalid_restore_checkpoint_admission",
+      "restore checkpoint admission is invalid",
+    );
+  }
+  ensure(
+    checkpoint.checkpointClass === "clean" &&
+      request.operation === "restore" &&
+      request.backendId === checkpoint.backendId &&
+      request.sessionId === checkpoint.sessionId &&
+      request.target.kind === "checkpoint" &&
+      request.target.artifactId === checkpoint.artifactId &&
+      request.target.checkpointId === checkpoint.checkpointId &&
+      parseFencingEpochForRecord(
+        request.fencingEpoch,
+        "invalid_restore_checkpoint_admission",
+      ) >
+        parseFencingEpochForRecord(
+          checkpoint.sourceFencingEpoch,
+          "invalid_restore_checkpoint_admission",
+        ),
+    "invalid_restore_checkpoint_admission",
+    "restore checkpoint admission identity does not match",
+  );
+  return deepFreeze({ checkpoint, request });
+}
+
+/**
  * Structural snapshot comparison only. A backend must repeat this comparison
  * atomically with the mutation against its authoritative state.
  */

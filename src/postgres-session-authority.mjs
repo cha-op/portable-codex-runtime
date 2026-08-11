@@ -6,6 +6,9 @@ import {
   PostgresSerializableStore,
 } from "./postgres-serializable-store.mjs";
 import {
+  isPostgresDetachedRestorePlan,
+} from "./postgres-detached-restore-plan.mjs";
+import {
   MAX_IMAGE_CONFIG_BYTES,
   MAX_PLATFORM_MANIFEST_BYTES,
 } from "./platform-image-reservation.mjs";
@@ -86,6 +89,8 @@ const RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-activation-launch-intent-v1";
 const WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE =
   "writer-stop-capture-intent-v3";
+const DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE =
+  "detached-restore-stable-plan-v1";
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2 = 2;
@@ -318,6 +323,10 @@ const RESTORE_GENERATION_CLAIM_INPUT_KEYS = Object.freeze([
   "kind",
   "operationId",
   "request",
+]);
+const RESTORE_GENERATION_STABLE_CLAIM_INPUT_KEYS = Object.freeze([
+  ...RESTORE_GENERATION_CLAIM_INPUT_KEYS,
+  "stablePlan",
 ]);
 const RESTORE_GENERATION_RESULT_KEYS = Object.freeze([
   "checkpoint",
@@ -643,6 +652,12 @@ const OPERATION_ID_CLAIM_ROW_KEYS = Object.freeze([
   "materialized_at",
   "operation_id",
   "session_id",
+]);
+const DETACHED_RESTORE_STABLE_PLAN_CLAIM_BINDING_KEYS = Object.freeze([
+  "bindingSha256",
+  "contractVersion",
+  "planSha256",
+  "request",
 ]);
 const RESERVATION_PAYLOAD_KEYS = Object.freeze([
   "conflictClass",
@@ -970,6 +985,15 @@ const OPERATION_ID_CLAIM_RETURNING_COLUMNS = [
   "claimed_at",
   "materialized_at",
 ].join(", ");
+const QUALIFIED_OPERATION_ID_CLAIM_RETURNING_COLUMNS = [
+  "registry.operation_id AS operation_id",
+  "registry.session_id AS session_id",
+  "registry.claim_type AS claim_type",
+  "registry.claimant_operation_id AS claimant_operation_id",
+  "registry.binding AS binding",
+  "registry.claimed_at AS claimed_at",
+  "registry.materialized_at AS materialized_at",
+].join(", ");
 const RESERVATION_RETURNING_COLUMNS = [
   "reservation_id",
   "operation_id",
@@ -1167,6 +1191,42 @@ const INSERT_OPERATION_QUERY = Object.freeze({
     `RETURNING ${OPERATION_RETURNING_COLUMNS}`,
   ].join(" "),
 });
+const MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY =
+  Object.freeze({
+    queryMode: "extended",
+    text: [
+      "UPDATE session_authority.operation_id_registry AS registry",
+      "SET materialized_at = $3",
+      "FROM session_authority.detached_restore_stable_plans AS stable",
+      "WHERE registry.operation_id = $1",
+      "AND registry.session_id = $2::uuid",
+      `AND registry.claim_type = '${DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE}'`,
+      "AND registry.claimant_operation_id IS NULL",
+      "AND registry.materialized_at IS NULL",
+      "AND stable.operation_id = registry.operation_id",
+      "AND stable.session_id = registry.session_id",
+      "AND stable.admission = $4::jsonb",
+      "AND stable.provisioned_at = registry.claimed_at",
+      "AND registry.binding = pg_catalog.jsonb_build_object(",
+      "'bindingSha256', stable.binding_sha256,",
+      "'contractVersion', stable.plan_contract_version,",
+      "'planSha256', stable.plan_sha256,",
+      "'request', stable.admission #> '{request}')",
+      `RETURNING ${QUALIFIED_OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+    ].join(" "),
+  });
+const INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY =
+  Object.freeze({
+    queryMode: "extended",
+    text: [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, result, state, revision,",
+      "created_at, updated_at, retired_at)",
+      "VALUES ($1, $2::uuid, $3, $4::jsonb, NULL, 'prepared', 0, $5, $5, NULL)",
+      "ON CONFLICT (operation_id) DO NOTHING",
+      `RETURNING ${OPERATION_RETURNING_COLUMNS}`,
+    ].join(" "),
+  });
 const INSERT_RESTORE_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
@@ -4946,14 +5006,28 @@ function restoreGenerationInput(
   return deepFreeze({ ...input, request });
 }
 
+function hasRestoreGenerationStablePlan(options) {
+  return (
+    options !== null &&
+    typeof options === "object" &&
+    !arrayIsArray(options) &&
+    !isProxyValue(options) &&
+    objectHasOwn(options, "stablePlan")
+  );
+}
+
 function restoreGenerationTransitionInput(options) {
+  const hasStablePlan = hasRestoreGenerationStablePlan(options);
+  const keys = hasStablePlan
+    ? RESTORE_GENERATION_STABLE_CLAIM_INPUT_KEYS
+    : RESTORE_GENERATION_CLAIM_INPUT_KEYS;
   const input = restoreGenerationInput(
     options,
-    RESTORE_GENERATION_CLAIM_INPUT_KEYS,
+    keys,
   );
   const normalized = exactPlainObject(
     options,
-    RESTORE_GENERATION_CLAIM_INPUT_KEYS,
+    keys,
     "invalid_operation_request",
   );
   const expectedOperationRevision = canonicalRevisionForCode(
@@ -4971,11 +5045,20 @@ function restoreGenerationTransitionInput(options) {
     128,
     "invalid_operation_request",
   );
+  const stablePlan = hasStablePlan ? normalized.stablePlan : null;
+  ensure(
+    !hasStablePlan ||
+      (input.request.contractVersion ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION &&
+        isPostgresDetachedRestorePlan(stablePlan)),
+    "invalid_operation_request",
+  );
   return deepFreeze({
     ...input,
     destinationIsolationProofId,
     expectedOperationRevision,
     generationId,
+    stablePlan,
   });
 }
 
@@ -7061,6 +7144,28 @@ function operationSnapshotFromRow(row) {
   });
 }
 
+function canonicalDetachedRestoreStablePlanClaimBinding(value, code) {
+  const binding = exactPlainObject(
+    value,
+    DETACHED_RESTORE_STABLE_PLAN_CLAIM_BINDING_KEYS,
+    code,
+  );
+  ensure(
+    binding.contractVersion === 1 &&
+      typeof binding.bindingSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, binding.bindingSha256) &&
+      typeof binding.planSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, binding.planSha256),
+    code,
+  );
+  return deepFreeze({
+    bindingSha256: binding.bindingSha256,
+    contractVersion: 1,
+    planSha256: binding.planSha256,
+    request: canonicalJsonObject(binding.request, code),
+  });
+}
+
 function operationIdClaimSnapshotFromRow(row) {
   const code = "operation_state_invalid";
   const normalized = exactPlainObject(
@@ -7083,7 +7188,7 @@ function operationIdClaimSnapshotFromRow(row) {
           128,
           code,
         );
-  const binding =
+  let binding =
     normalized.binding === null
       ? null
       : canonicalJsonObject(normalized.binding, code);
@@ -7099,6 +7204,18 @@ function operationIdClaimSnapshotFromRow(row) {
         materializedAt === claimedAt,
       code,
     );
+  } else if (
+    claimType === DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE
+  ) {
+    ensure(
+      claimantOperationId === null &&
+        binding !== null &&
+        (materializedAt === null ||
+          timestampMilliseconds(materializedAt) >=
+            timestampMilliseconds(claimedAt)),
+      code,
+    );
+    binding = canonicalDetachedRestoreStablePlanClaimBinding(binding, code);
   } else {
     ensure(
       (claimType === RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE ||
@@ -7124,6 +7241,89 @@ function operationIdClaimSnapshotFromRow(row) {
     operationId,
     sessionId,
   });
+}
+
+function validateDetachedRestoreStablePlanIdClaim(
+  claim,
+  input,
+  materialization,
+  code,
+) {
+  ensure(
+    input.kind === RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
+      input.request.contractVersion ===
+        RESTORE_DESTINATION_GENERATION_OPERATION_CONTRACT_VERSION &&
+      claim.operationId === input.operationId &&
+      claim.sessionId === input.expectedSession.sessionId &&
+      claim.claimType ===
+        DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE &&
+      claim.claimantOperationId === null &&
+      claim.binding !== null &&
+      canonicalSerialize(claim.binding.request) ===
+        canonicalSerialize(input.request.admission.request) &&
+      (materialization === "either" ||
+        (materialization === "reserved" &&
+          claim.materializedAt === null) ||
+        (materialization === "materialized" &&
+          claim.materializedAt !== null)),
+    code,
+  );
+  return claim;
+}
+
+function validateRestoreGenerationOperationIdClaim(
+  claim,
+  input,
+  operation,
+  code,
+) {
+  ensure(
+    claim !== null &&
+      claim.operationId === input.operationId &&
+      claim.sessionId === input.expectedSession.sessionId &&
+      claim.materializedAt === operation.createdAt,
+    code,
+  );
+  if (
+    claim.claimType ===
+    DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE
+  ) {
+    return validateDetachedRestoreStablePlanIdClaim(
+      claim,
+      input,
+      "materialized",
+      code,
+    );
+  }
+  ensure(claim.claimType === DIRECT_OPERATION_ID_CLAIM_TYPE, code);
+  return claim;
+}
+
+function validateRestoreGenerationDispatchStablePlan(claim, input) {
+  if (claim.claimType === DIRECT_OPERATION_ID_CLAIM_TYPE) {
+    ensure(input.stablePlan === null, "operation_identity_conflict");
+    return;
+  }
+  validateDetachedRestoreStablePlanIdClaim(
+    claim,
+    input,
+    "materialized",
+    "operation_identity_conflict",
+  );
+  const plan = input.stablePlan;
+  ensure(
+    plan !== null &&
+      isPostgresDetachedRestorePlan(plan) &&
+      claim.binding.planSha256 === plan.planSha256 &&
+      canonicalSerialize(claim.binding.request) ===
+        canonicalSerialize(input.request.admission.request) &&
+      canonicalSerialize(plan.request) ===
+        canonicalSerialize(input.request.admission.request) &&
+      plan.generationId === input.generationId &&
+      plan.destinationIsolationProofId ===
+        input.destinationIsolationProofId,
+    "operation_identity_conflict",
+  );
 }
 
 function validateRestoreLaunchIdClaim(claim, input, materialization) {
@@ -9297,6 +9497,62 @@ async function readOperationIdClaim(transaction, operationId, forUpdate) {
   return rows.length === 0
     ? null
     : operationIdClaimSnapshotFromRow(rows[0]);
+}
+
+async function materializeDetachedRestoreStablePlanOperation(
+  transaction,
+  input,
+  session,
+  claim,
+) {
+  validateDetachedRestoreStablePlanIdClaim(
+    claim,
+    input,
+    "reserved",
+    "operation_identity_conflict",
+  );
+  const claimRows = rowsFromResult(
+    await transaction.query(
+      MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY.text,
+      [
+        input.operationId,
+        session.sessionId,
+        transaction.now,
+        canonicalSerialize(input.request.admission),
+      ],
+    ),
+    "operation_state_invalid",
+  );
+  ensure(claimRows.length === 1, "operation_identity_conflict");
+  const materializedClaim = operationIdClaimSnapshotFromRow(claimRows[0]);
+  validateDetachedRestoreStablePlanIdClaim(
+    materializedClaim,
+    input,
+    "materialized",
+    "operation_state_invalid",
+  );
+  ensure(
+    materializedClaim.claimedAt === claim.claimedAt &&
+      materializedClaim.materializedAt === transaction.now &&
+      canonicalSerialize(materializedClaim.binding) ===
+        canonicalSerialize(claim.binding),
+    "operation_state_invalid",
+  );
+  const operationRows = rowsFromResult(
+    await transaction.query(
+      INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY.text,
+      [
+        input.operationId,
+        session.sessionId,
+        input.kind,
+        input.serializedEnvelope,
+        transaction.now,
+      ],
+    ),
+    "operation_state_invalid",
+  );
+  ensure(operationRows.length === 1, "operation_state_invalid");
+  return operationRows;
 }
 
 async function readReservationSnapshot(
@@ -12237,7 +12493,7 @@ export class PostgresSessionAuthority {
             : 2,
         );
 
-        const operationRows = rowsFromResult(
+        let operationRows = rowsFromResult(
           await transaction.query(INSERT_OPERATION_QUERY.text, [
             input.operationId,
             session.sessionId,
@@ -12257,15 +12513,29 @@ export class PostgresSessionAuthority {
             const conflictingClaim = await readOperationIdClaim(
               transaction,
               input.operationId,
-              false,
+              true,
             );
             if (conflictingClaim === null) {
               throw OPERATION_VISIBILITY_RETRY;
             }
-            fail("operation_identity_conflict");
+            if (
+              conflictingClaim.claimType ===
+              DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE
+            ) {
+              operationRows =
+                await materializeDetachedRestoreStablePlanOperation(
+                  transaction,
+                  input,
+                  session,
+                  conflictingClaim,
+                );
+            } else {
+              fail("operation_identity_conflict");
+            }
+          } else {
+            validateOperationIdentity(existing, input);
+            fail("operation_state_invalid");
           }
-          validateOperationIdentity(existing, input);
-          fail("operation_state_invalid");
         }
         const operation = operationSnapshotFromRow(operationRows[0]);
         validateOperationIdentity(operation, input);
@@ -12971,8 +13241,25 @@ export class PostgresSessionAuthority {
         true,
       );
       ensure(
-        observed.operation !== null && observed.reservation !== null,
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.generation !== null,
         "operation_transition_conflict",
+      );
+      const operationIdClaim = await readOperationIdClaim(
+        transaction,
+        input.operationId,
+        true,
+      );
+      validateRestoreGenerationOperationIdClaim(
+        operationIdClaim,
+        input,
+        observed.operation,
+        "operation_identity_conflict",
+      );
+      validateRestoreGenerationDispatchStablePlan(
+        operationIdClaim,
+        input,
       );
       if (observed.operation.state !== "prepared") {
         const relation = observed.generation;

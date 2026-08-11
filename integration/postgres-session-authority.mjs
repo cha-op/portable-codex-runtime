@@ -32,6 +32,11 @@ import {
   createPostgresDetachedRestoreRuntimeComposition,
 } from "../src/postgres-detached-restore-runtime-composition.mjs";
 import {
+  POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED,
+  PostgresDetachedRestoreStablePlanRegistryError,
+  createPostgresDetachedRestoreStablePlanRegistry,
+} from "../src/postgres-detached-restore-stable-plan-registry.mjs";
+import {
   PostgresWriterDetachCompositionError,
   createPostgresWriterDetachComposition,
 } from "../src/postgres-writer-detach-composition.mjs";
@@ -134,6 +139,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
     ),
     version: 6,
   }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/007-detached-restore-stable-plans.sql",
+      import.meta.url,
+    ),
+    version: 7,
+  }),
 ]);
 
 if (!databaseConfigured) {
@@ -166,6 +178,36 @@ async function readMigrationLedger(pool) {
     ].join(" "),
   );
   return result.rows;
+}
+
+async function readSessionAuthorityMutationSnapshot(pool, sessionId) {
+  const relations = [
+    "sessions",
+    "operation_claims",
+    "operation_id_registry",
+    "reservations",
+    "capture_attempt_claims",
+    "capture_attempt_tombstones",
+    "checkpoint_catalogue",
+    "restore_destination_generations",
+    "detached_restore_stable_plans",
+  ];
+  const snapshot = Object.create(null);
+  for (const relation of relations) {
+    const result = await pool.query(
+      [
+        "SELECT COALESCE(",
+        "jsonb_agg(to_jsonb(authority_row)",
+        "ORDER BY to_jsonb(authority_row)::text),",
+        "'[]'::jsonb) AS rows",
+        `FROM session_authority.${relation} AS authority_row`,
+        "WHERE session_id = $1::uuid",
+      ].join(" "),
+      [sessionId],
+    );
+    snapshot[relation] = result.rows[0].rows;
+  }
+  return snapshot;
 }
 
 async function installAuthorityMigrations(pool, migrations) {
@@ -433,7 +475,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 6,
+    version: 7,
   });
   const registry = await pool.query(
     [
@@ -2953,10 +2995,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 6);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 7);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6],
+      [1, 2, 3, 4, 5, 6, 7],
     );
 
     await pool.query(
@@ -2966,7 +3008,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 6,
+      version: 7,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -2979,7 +3021,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 6,
+      version: 7,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -2994,7 +3036,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 6,
+      version: 7,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -3006,7 +3048,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 6,
+      version: 7,
     });
     await assertLegacyRestoreV2MigrationGate(
       pool,
@@ -9523,7 +9565,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6],
+          [1, 2, 3, 4, 5, 6, 7],
         );
 
         const input = writerLaunchAttemptInput(
@@ -10703,97 +10745,118 @@ test(
         await Promise.allSettled([teardownToAwait]);
       }
       try {
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.restore_recovery_cursors",
-            "WHERE recovery_scope_id = $1",
-          ].join(" "),
-          [recoveryScopeId],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.restore_destination_generations",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.checkpoint_catalogue",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.capture_attempt_tombstones",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.capture_attempt_claims",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.reservations",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.operation_claims",
-            "WHERE operation_id IN (",
-            "SELECT operation_id",
-            "FROM session_authority.operation_id_registry",
-            "WHERE session_id = ANY($1::uuid[])",
-            "AND claim_type IN (",
-            "'restore-launch-intent-v2',",
-            "'restore-activation-launch-intent-v1',",
-            "'writer-stop-capture-intent-v3'",
-            ")",
-            ")",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.operation_id_registry",
-            "WHERE session_id = ANY($1::uuid[])",
-            "AND claim_type IN (",
-            "'restore-launch-intent-v2',",
-            "'restore-activation-launch-intent-v1',",
-            "'writer-stop-capture-intent-v3'",
-            ")",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.operation_claims",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.operation_id_registry",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
-        await authorityPool.query(
-          [
-            "DELETE FROM session_authority.sessions",
-            "WHERE session_id = ANY($1::uuid[])",
-          ].join(" "),
-          [sessionIds],
-        );
+        const cleanupClient = await authorityPool.connect();
+        try {
+          await cleanupClient.query("BEGIN");
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.restore_recovery_cursors",
+              "WHERE recovery_scope_id = $1",
+            ].join(" "),
+            [recoveryScopeId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.detached_restore_stable_plans",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.restore_destination_generations",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.checkpoint_catalogue",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.capture_attempt_tombstones",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.capture_attempt_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.reservations",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.operation_claims",
+              "WHERE operation_id IN (",
+              "SELECT operation_id",
+              "FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+              "AND claim_type IN (",
+              "'restore-launch-intent-v2',",
+              "'restore-activation-launch-intent-v1',",
+              "'writer-stop-capture-intent-v3'",
+              ")",
+              ")",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+              "AND claim_type IN (",
+              "'restore-launch-intent-v2',",
+              "'restore-activation-launch-intent-v1',",
+              "'writer-stop-capture-intent-v3'",
+              ")",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.operation_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.sessions",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query("COMMIT");
+        } catch (error) {
+          try {
+            await cleanupClient.query("ROLLBACK");
+          } catch {
+            // Pool shutdown below destroys any connection that cannot reset.
+          }
+          throw error;
+        } finally {
+          cleanupClient.release();
+        }
       } finally {
         try {
           await operationPool.end();
@@ -10834,15 +10897,15 @@ test(
     });
 
     const firstStep = deferred();
-    const planResolverEntered = deferred();
-    const releasePlanResolver = deferred();
+    const foregroundGateEntered = deferred();
+    const releaseForegroundGate = deferred();
     const steps = [];
     const calls = {
       artifactResolver: 0,
       destinationResolver: 0,
       fleetGate: 0,
       image: 0,
-      plan: 0,
+      planProvisioningGate: 0,
       provider: 0,
       publication: 0,
       publish: 0,
@@ -10851,6 +10914,8 @@ test(
       supervisorReconcile: 0,
       supervisorStop: 0,
     };
+    let foregroundAllowed = false;
+    let holdForegroundGate = false;
     let stablePlan = null;
     runtime = createPostgresDetachedRestoreRuntimeComposition({
       authority: {
@@ -10862,20 +10927,16 @@ test(
         writerLaunchStopV3FleetCompatible: true,
       },
       foreground: {
-        fleetCapabilityGate({ admission, plan }) {
+        async fleetCapabilityGate({ admission, plan }) {
           calls.fleetGate += 1;
           assert.equal(admission.request.sessionId, sessionId);
-          assert.strictEqual(plan, stablePlan);
+          assert.equal(plan.planSha256, stablePlan?.planSha256);
+          if (!foregroundAllowed) return null;
+          if (holdForegroundGate) {
+            foregroundGateEntered.resolve();
+            await releaseForegroundGate.promise;
+          }
           return POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED;
-        },
-        async resolveStablePlan({ admission, expectedSession }) {
-          calls.plan += 1;
-          assert.equal(admission.request.sessionId, sessionId);
-          assert.equal(expectedSession.sessionId, sessionId);
-          planResolverEntered.resolve();
-          await releasePlanResolver.promise;
-          assert.notEqual(stablePlan, null);
-          return stablePlan;
         },
       },
       launch: {
@@ -10923,6 +10984,14 @@ test(
         foregroundLifecycle: foregroundLifecyclePool,
         operation: operationPool,
         recoveryLifecycle: recoveryLifecyclePool,
+      },
+      planRegistry: {
+        provisioningFleetCapabilityGate({ admission, plan }) {
+          calls.planProvisioningGate += 1;
+          assert.equal(admission.request.sessionId, sessionId);
+          assert.equal(plan.planSha256, stablePlan?.planSha256);
+          return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
+        },
       },
       recovery: {
         intervalMilliseconds: 60_000,
@@ -11040,6 +11109,265 @@ test(
       },
     });
 
+    const provisionedStablePlan =
+      await runtime.stablePlanProvisioning.provisionStablePlan({
+        admission,
+        plan: stablePlan,
+      });
+    assert.notStrictEqual(provisionedStablePlan, stablePlan);
+    assert.equal(provisionedStablePlan.planSha256, stablePlan.planSha256);
+    assert.equal(calls.planProvisioningGate, 1);
+
+    const crossedStableClaimPlanSha256 =
+      stablePlan.planSha256 === "0".repeat(64)
+        ? "1".repeat(64)
+        : "0".repeat(64);
+    const stableClaimUpdateAttempts = [
+      {
+        code: "55000",
+        constraint:
+          "operation_id_registry_detached_restore_stable_plan_immutable",
+        text: [
+          "UPDATE session_authority.operation_id_registry",
+          "SET binding = pg_catalog.jsonb_set(",
+          "binding, '{planSha256}', pg_catalog.to_jsonb($2::text), false)",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        values: [
+          admission.request.operationId,
+          crossedStableClaimPlanSha256,
+        ],
+      },
+      {
+        code: "55000",
+        constraint:
+          "operation_id_registry_detached_restore_stable_plan_immutable",
+        text: [
+          "UPDATE session_authority.operation_id_registry",
+          "SET claim_type = 'direct-operation', binding = NULL,",
+          "materialized_at = claimed_at",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        values: [admission.request.operationId],
+      },
+      {
+        code: "23514",
+        constraint:
+          "detached_restore_stable_plan_claim_materialization",
+        text: [
+          "UPDATE session_authority.operation_id_registry",
+          "SET materialized_at = pg_catalog.transaction_timestamp()",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        values: [admission.request.operationId],
+      },
+    ];
+    for (const attempt of stableClaimUpdateAttempts) {
+      await assert.rejects(
+        authorityPool.query(attempt.text, attempt.values),
+        (error) => {
+          assert.equal(error.code, attempt.code);
+          assert.equal(error.constraint, attempt.constraint);
+          return true;
+        },
+      );
+    }
+    const stableClaimAfterRejectedUpdates = await authorityPool.query(
+      [
+        "SELECT claim_type, binding ->> 'planSha256' AS plan_sha256,",
+        "materialized_at",
+        "FROM session_authority.operation_id_registry",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [admission.request.operationId],
+    );
+    assert.deepEqual(stableClaimAfterRejectedUpdates.rows, [
+      {
+        claim_type: "detached-restore-stable-plan-v1",
+        materialized_at: null,
+        plan_sha256: stablePlan.planSha256,
+      },
+    ]);
+
+    let restartedRegistryGateCalls = 0;
+    const restartedRegistry =
+      createPostgresDetachedRestoreStablePlanRegistry({
+        provisioningFleetCapabilityGate() {
+          restartedRegistryGateCalls += 1;
+          return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
+        },
+        store: new PostgresSerializableStore({
+          dedicatedPool: authorityPool,
+          maxTransactionAttempts: 3,
+        }),
+      });
+    const restartedPlan = await restartedRegistry.resolveStablePlan({
+      admission,
+      expectedSession: launched,
+    });
+    assert.notStrictEqual(restartedPlan, stablePlan);
+    assert.equal(restartedPlan.planSha256, stablePlan.planSha256);
+    assert.equal(restartedRegistryGateCalls, 0);
+
+    await restartedRegistry.provisionStablePlan({
+      admission,
+      plan: stablePlan,
+    });
+    assert.equal(restartedRegistryGateCalls, 1);
+
+    const crossedPlan = createPostgresDetachedRestorePlan({
+      request: admission.request,
+      plan: {
+        captureCreatedAt: stablePlan.captureCreatedAt,
+        destinationDirectory: stablePlan.destinationDirectory,
+        destinationOwnedRoot: stablePlan.destinationOwnedRoot,
+        detachMode: stablePlan.detachMode,
+        holderId: stablePlan.holderId,
+        imagePlanId: `${stablePlan.imagePlanId}-crossed`,
+        leaseDurationMilliseconds:
+          stablePlan.leaseDurationMilliseconds,
+        sourceArtifactDirectory: stablePlan.sourceArtifactDirectory,
+        sourceArtifactOwnedRoot: stablePlan.sourceArtifactOwnedRoot,
+      },
+    });
+    await assert.rejects(
+      restartedRegistry.provisionStablePlan({
+        admission,
+        plan: crossedPlan,
+      }),
+      (error) => {
+        assert(
+          error instanceof PostgresDetachedRestoreStablePlanRegistryError,
+        );
+        assert.equal(
+          error.code,
+          "postgres_detached_restore_stable_plan_registry_identity_conflict",
+        );
+        return true;
+      },
+    );
+    assert.equal(restartedRegistryGateCalls, 2);
+
+    const acknowledgementLossAdmission = structuredClone(admission);
+    acknowledgementLossAdmission.request.operationId =
+      `restore-plan-ack-loss-${randomUUID()}`;
+    const acknowledgementLossPlan = createPostgresDetachedRestorePlan({
+      request: acknowledgementLossAdmission.request,
+      plan: {
+        captureCreatedAt: stablePlan.captureCreatedAt,
+        destinationDirectory: `${stablePlan.destinationDirectory}-ack-loss`,
+        destinationOwnedRoot: stablePlan.destinationOwnedRoot,
+        detachMode: stablePlan.detachMode,
+        holderId: `${stablePlan.holderId}-ack-loss`,
+        imagePlanId: `${stablePlan.imagePlanId}-ack-loss`,
+        leaseDurationMilliseconds:
+          stablePlan.leaseDurationMilliseconds,
+        sourceArtifactDirectory: stablePlan.sourceArtifactDirectory,
+        sourceArtifactOwnedRoot: stablePlan.sourceArtifactOwnedRoot,
+      },
+    });
+    let acknowledgementLossGateCalls = 0;
+    const acknowledgementLossRegistry =
+      createPostgresDetachedRestoreStablePlanRegistry({
+        provisioningFleetCapabilityGate() {
+          acknowledgementLossGateCalls += 1;
+          return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
+        },
+        store: new PostgresSerializableStore({
+          dedicatedPool: firstCommitAcknowledgementLossPool(authorityPool),
+          maxTransactionAttempts: 3,
+        }),
+      });
+    const acknowledgedByReadback =
+      await acknowledgementLossRegistry.provisionStablePlan({
+        admission: acknowledgementLossAdmission,
+        plan: acknowledgementLossPlan,
+      });
+    assert.equal(
+      acknowledgedByReadback.planSha256,
+      acknowledgementLossPlan.planSha256,
+    );
+    assert.equal(acknowledgementLossGateCalls, 1);
+    const recoveredAcknowledgementLossPlan =
+      await restartedRegistry.resolveStablePlan({
+        admission: acknowledgementLossAdmission,
+        expectedSession: launched,
+      });
+    assert.equal(
+      recoveredAcknowledgementLossPlan.planSha256,
+      acknowledgementLossPlan.planSha256,
+    );
+    const stablePlanRows = await authorityPool.query(
+      [
+        "SELECT operation_id",
+        "FROM session_authority.detached_restore_stable_plans",
+        "WHERE session_id = $1::uuid",
+        "ORDER BY operation_id",
+      ].join(" "),
+      [sessionId],
+    );
+    assert.deepEqual(
+      stablePlanRows.rows.map(({ operation_id: operationId }) => operationId),
+      [
+        acknowledgementLossAdmission.request.operationId,
+        admission.request.operationId,
+      ].sort(),
+    );
+    await assert.rejects(
+      authorityPool.query(
+        [
+          "DELETE FROM session_authority.detached_restore_stable_plans",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        [admission.request.operationId],
+      ),
+      (error) => {
+        assert.equal(error.code, "23503");
+        assert.equal(
+          error.constraint,
+          "detached_restore_stable_plans_delete_requires_claim_teardown",
+        );
+        return true;
+      },
+    );
+    const planAfterRejectedDelete =
+      await restartedRegistry.resolveStablePlan({
+        admission,
+        expectedSession: launched,
+      });
+    assert.equal(planAfterRejectedDelete.planSha256, stablePlan.planSha256);
+
+    const beforeGateReject = await readSessionAuthorityMutationSnapshot(
+      authorityPool,
+      sessionId,
+    );
+    await assert.rejects(
+      runtime.foreground.runRestore(
+        admission,
+        async () => {
+          calls.publish += 1;
+          throw new Error("default-deny restore must not publish");
+        },
+      ),
+      (error) => {
+        assert.equal(
+          error.code,
+          "postgres_detached_restore_fleet_capability_required",
+        );
+        return true;
+      },
+    );
+    assert.deepEqual(
+      await readSessionAuthorityMutationSnapshot(authorityPool, sessionId),
+      beforeGateReject,
+    );
+    assert.equal(calls.fleetGate, 1);
+    assert.equal(calls.provider, 0);
+    assert.equal(calls.publish, 0);
+
+    foregroundAllowed = true;
+    holdForegroundGate = true;
+
     const beforeSession = await authority.readSession({ sessionId });
     const foreground = runtime.foreground.runRestore(
       admission,
@@ -11052,7 +11380,7 @@ test(
     let primaryFailure = null;
     try {
       await settleWithin(
-        planResolverEntered.promise,
+        foregroundGateEntered.promise,
         "restore runtime foreground lifecycle lease",
       );
       busyStep = runtime.scheduler.runStep({ signal: null });
@@ -11068,7 +11396,7 @@ test(
     } catch (error) {
       primaryFailure = error;
     } finally {
-      releasePlanResolver.resolve();
+      releaseForegroundGate.resolve();
       foregroundTeardown = (async () => {
         const stoppedCompletion = runtime.scheduler.stop();
         const effects =
@@ -11151,9 +11479,9 @@ test(
     ]);
     assert.equal(calls.artifactResolver > 0, true);
     assert.equal(calls.destinationResolver, 0);
-    assert.equal(calls.fleetGate, 1);
+    assert.equal(calls.fleetGate, 2);
     assert.equal(calls.image, 0);
-    assert.equal(calls.plan, 1);
+    assert.equal(calls.planProvisioningGate, 1);
     assert.equal(calls.provider, 0);
     assert.equal(calls.publish, 0);
     assert.equal(calls.sourceResolver > 0, true);

@@ -333,10 +333,11 @@ Restore and launcher authority are now split into eight serial pull requests:
      launch. A stop that may have started before the atomic handoff remains
      blocked. The factory requires the nested per-operation guard pool to be
      distinct from both lifecycle pools before any connection is acquired.
-   - Phase A is caller-driven retry, not an autonomous durable saga. The caller
-     must retain and resubmit the exact stable plan. Retained or ambiguous
-     subordinate state is interpreted only by the existing typed authorities;
-     the facade does not infer completion or repeat a physical side effect.
+   - The standalone phase-A facade is caller-driven retry, not an autonomous
+     durable saga. Its stable-plan resolver must return the exact plan.
+     Retained or ambiguous subordinate state is interpreted only by the
+     existing typed authorities; the facade does not infer completion or
+     repeat a physical side effect.
    - The production-neutral phase-B assembly foundation is complete. One
      strict factory constructs the capture-only backend, standalone foreground
      facade, idle scheduler, and narrow writer-launch ingress from a single
@@ -346,10 +347,21 @@ Restore and launcher authority are now split into eight serial pull requests:
      launcher used by capture and foreground restore. Construction performs no
      migration, scheduler lifecycle action, provider action, pool close, or
      production restore routing.
-   - The next phase-B slice is a PostgreSQL durable stable-plan registry. Plan
-     provisioning must be a separately gated immutable insert-or-compare
-     operation; the foreground `resolveStablePlan` binding remains read-only
-     and must never write a new plan before its fresh-work fleet gate.
+   - The PostgreSQL durable stable-plan registry slice is complete. Migration
+     7 adds immutable canonical admission and plan storage plus a permanent
+     operation-ID claim. Separately gated provisioning performs insert or
+     exact replay and accepts a lost commit acknowledgement only after exact
+     durable readback; crossed identity fails closed. Resolution verifies the
+     expected canonical session and remains read-only, so foreground lookup
+     cannot write a new plan before its fresh-work fleet gate. The subsequent
+     generation dispatch must present the complete rehydrated plan and match
+     its digest, generation ID, and destination-isolation proof ID to the
+     permanent preclaim before publication authority can be granted.
+   - The runtime constructs that registry with its existing internal store,
+     exposes only a frozen null-prototype `stablePlanProvisioning` facet, and
+     passes a private receiver-preserving resolver to foreground execution.
+     The runtime surface is exactly `backend`, `foreground`, `scheduler`,
+     `stablePlanProvisioning`, and `writerLaunch`.
    - Remaining deployment assembly then owns physical provider/image and
      PostgreSQL bootstrap bindings, lease budgets and admission/drain
      ownership, complete assembled restart/ambiguity validation, and

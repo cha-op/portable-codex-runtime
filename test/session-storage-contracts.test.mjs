@@ -24,6 +24,7 @@ import {
   assertLeaseRenewal,
   assertPreparedCheckpointCaptureBackend,
   assertResolvedPlatformImageMatchesManifest,
+  assertRestoreCheckpointAdmission,
   assertRestoreAttachmentActivationBackend,
   assertRestoreAttachmentActivationRequest,
   assertRestoreAttachmentActivationResult,
@@ -217,6 +218,21 @@ function mutationRequest(overrides = {}) {
     operationId: `operation-${operation}-001`,
     target: targets[operation],
     ...overrides,
+  };
+}
+
+function restoreAdmission({ checkpointOverrides = {}, requestOverrides = {} } = {}) {
+  return {
+    checkpoint: checkpoint({
+      checkpointClass: "clean",
+      ...checkpointOverrides,
+    }),
+    request: mutationRequest({
+      fencingEpoch: "9007199254740994",
+      operation: "restore",
+      storageId: "destination-volume-001",
+      ...requestOverrides,
+    }),
   };
 }
 
@@ -2109,6 +2125,60 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
       }),
     assertCode("invalid_storage_mutation"),
   );
+});
+
+test("restore checkpoint admission binds the complete source descriptor to the restore request", () => {
+  const value = restoreAdmission();
+  const admitted = assertRestoreCheckpointAdmission(value);
+
+  assert.deepEqual(admitted, value);
+  assert.equal(admitted.checkpoint.storageId, "volume-001");
+  assert.equal(admitted.request.storageId, "destination-volume-001");
+  assert.equal(Object.isFrozen(admitted), true);
+  assert.equal(Object.isFrozen(admitted.checkpoint), true);
+  assert.equal(Object.isFrozen(admitted.request), true);
+
+  for (const candidate of [
+    restoreAdmission({ checkpointOverrides: { checkpointClass: "crash-prefix" } }),
+    restoreAdmission({ checkpointOverrides: { backendId: "other-backend" } }),
+    restoreAdmission({ checkpointOverrides: { sessionId: OTHER_RUNTIME_SESSION_ID } }),
+    restoreAdmission({ checkpointOverrides: { artifactId: "other-artifact" } }),
+    restoreAdmission({ checkpointOverrides: { checkpointId: "other-checkpoint" } }),
+    restoreAdmission({ requestOverrides: { operation: "checkpoint" } }),
+    restoreAdmission({ requestOverrides: { fencingEpoch: "9007199254740993" } }),
+    restoreAdmission({ requestOverrides: { fencingEpoch: "9007199254740992" } }),
+  ]) {
+    assert.throws(
+      () => assertRestoreCheckpointAdmission(candidate),
+      assertCode("invalid_restore_checkpoint_admission"),
+    );
+  }
+});
+
+test("restore checkpoint admission rejects hostile and inexact data shapes", () => {
+  assert.throws(
+    () => assertRestoreCheckpointAdmission({ ...restoreAdmission(), extra: true }),
+    assertCode("invalid_restore_checkpoint_admission"),
+  );
+  assert.throws(
+    () => assertRestoreCheckpointAdmission(new Proxy(restoreAdmission(), {})),
+    assertCode("invalid_restore_checkpoint_admission"),
+  );
+
+  const value = restoreAdmission();
+  let getterCalls = 0;
+  Object.defineProperty(value, "request", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error("restore admission getter must not run");
+    },
+  });
+  assert.throws(
+    () => assertRestoreCheckpointAdmission(value),
+    assertCode("invalid_restore_checkpoint_admission"),
+  );
+  assert.equal(getterCalls, 0);
 });
 
 test("checkpoint classes preserve graceful versus crash recovery semantics", () => {

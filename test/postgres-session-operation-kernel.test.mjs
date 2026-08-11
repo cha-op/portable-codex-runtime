@@ -9,6 +9,10 @@ import {
   operationJournalBindingSha256,
 } from "../src/filesystem-operation-journal.mjs";
 import {
+  createPostgresDetachedRestorePlan,
+  rehydratePostgresDetachedRestorePlan,
+} from "../src/postgres-detached-restore-plan.mjs";
+import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
@@ -330,6 +334,40 @@ const INSERT_OPERATION_QUERY = [
   "created_at, updated_at, retired_at)",
   "SELECT $1, $2::uuid, $3, $4::jsonb, NULL, 'prepared', 0, $5, $5, NULL",
   "FROM claimed_id",
+  "ON CONFLICT (operation_id) DO NOTHING",
+  `RETURNING ${OPERATION_COLUMNS}`,
+].join(" ");
+const MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY = [
+  "UPDATE session_authority.operation_id_registry AS registry",
+  "SET materialized_at = $3",
+  "FROM session_authority.detached_restore_stable_plans AS stable",
+  "WHERE registry.operation_id = $1",
+  "AND registry.session_id = $2::uuid",
+  "AND registry.claim_type = 'detached-restore-stable-plan-v1'",
+  "AND registry.claimant_operation_id IS NULL",
+  "AND registry.materialized_at IS NULL",
+  "AND stable.operation_id = registry.operation_id",
+  "AND stable.session_id = registry.session_id",
+  "AND stable.admission = $4::jsonb",
+  "AND stable.provisioned_at = registry.claimed_at",
+  "AND registry.binding = pg_catalog.jsonb_build_object(",
+  "'bindingSha256', stable.binding_sha256,",
+  "'contractVersion', stable.plan_contract_version,",
+  "'planSha256', stable.plan_sha256,",
+  "'request', stable.admission #> '{request}')",
+  "RETURNING registry.operation_id AS operation_id,",
+  "registry.session_id AS session_id,",
+  "registry.claim_type AS claim_type,",
+  "registry.claimant_operation_id AS claimant_operation_id,",
+  "registry.binding AS binding,",
+  "registry.claimed_at AS claimed_at,",
+  "registry.materialized_at AS materialized_at",
+].join(" ");
+const INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY = [
+  "INSERT INTO session_authority.operation_claims",
+  "(operation_id, session_id, kind, request, result, state, revision,",
+  "created_at, updated_at, retired_at)",
+  "VALUES ($1, $2::uuid, $3, $4::jsonb, NULL, 'prepared', 0, $5, $5, NULL)",
   "ON CONFLICT (operation_id) DO NOTHING",
   `RETURNING ${OPERATION_COLUMNS}`,
 ].join(" ");
@@ -2305,6 +2343,40 @@ function restoreGenerationFixture({
   return { ...fixture, completion };
 }
 
+function detachedRestoreStablePlanForFixture(
+  fixture,
+  { imagePlanId = "restore-image-plan-001" } = {},
+) {
+  return createPostgresDetachedRestorePlan({
+    plan: {
+      captureCreatedAt: fixture.source.checkpoint.createdAt,
+      destinationDirectory: "/var/lib/portable-codex-restores/session-001",
+      destinationOwnedRoot: "/var/lib/portable-codex-restores",
+      detachMode: "release",
+      holderId: fixture.mutationRequest.holderId,
+      imagePlanId,
+      leaseDurationMilliseconds: 300_000,
+      sourceArtifactDirectory: "/var/lib/portable-codex-artifacts/checkpoint-001",
+      sourceArtifactOwnedRoot: "/var/lib/portable-codex-artifacts",
+    },
+    request: fixture.mutationRequest,
+  });
+}
+
+function stableRestoreGenerationFixture() {
+  const seed = restoreGenerationFixture();
+  const stablePlan = detachedRestoreStablePlanForFixture(seed);
+  const fixture = restoreGenerationFixture({
+    destinationIsolationProofId: stablePlan.destinationIsolationProofId,
+    generationId: stablePlan.generationId,
+  });
+  assert.deepEqual(
+    canonicalPayload(stablePlan.request),
+    canonicalPayload(fixture.mutationRequest),
+  );
+  return { ...fixture, stablePlan };
+}
+
 function restoreGenerationBinding(fixture) {
   return {
     attachment: structuredClone(
@@ -2399,6 +2471,48 @@ function restoreLaunchIdClaimRow(
     materializedAt,
     operationId: operationId ?? restore.launchIntent.launchAttemptId,
     sessionId: sessionId ?? restore.options.expectedSession.sessionId,
+  });
+}
+
+function detachedRestoreStablePlanIdClaimRow(
+  fixture,
+  {
+    binding = undefined,
+    claimedAt = undefined,
+    materializedAt = null,
+  } = {},
+) {
+  return operationIdRegistryRow({
+    binding:
+      binding === undefined
+        ? {
+            bindingSha256: "b".repeat(64),
+            contractVersion: 1,
+            planSha256: fixture.stablePlan?.planSha256 ?? "a".repeat(64),
+            request: fixture.request.admission.request,
+          }
+        : binding,
+    claimType: "detached-restore-stable-plan-v1",
+    claimedAt: claimedAt ?? fixture.preparedAt,
+    claimantOperationId: null,
+    materializedAt,
+    operationId: fixture.options.operationId,
+    sessionId: fixture.options.expectedSession.sessionId,
+  });
+}
+
+function restoreGenerationOperationIdClaimRow(fixture) {
+  if (fixture.stablePlan !== undefined) {
+    return detachedRestoreStablePlanIdClaimRow(fixture, {
+      materializedAt: fixture.preparedAt,
+    });
+  }
+  return operationIdRegistryRow({
+    claimedAt: fixture.preparedAt,
+    claimantOperationId: null,
+    materializedAt: fixture.preparedAt,
+    operationId: fixture.options.operationId,
+    sessionId: fixture.options.expectedSession.sessionId,
   });
 }
 
@@ -2589,6 +2703,23 @@ function restoreGenerationActiveSteps(
   return steps;
 }
 
+function restoreGenerationDispatchReadSteps(
+  fixture,
+  state,
+  { operationIdClaim = undefined, ...relationOptions } = {},
+) {
+  const durableOperationIdClaim =
+    operationIdClaim === undefined
+      ? restoreGenerationOperationIdClaimRow(fixture)
+      : operationIdClaim;
+  return [
+    ...restoreGenerationActiveSteps(fixture, state, relationOptions),
+    durableOperationIdClaim === null
+      ? rows()
+      : rows(durableOperationIdClaim),
+  ];
+}
+
 function restoreGenerationCommittedSteps(
   fixture,
   {
@@ -2633,6 +2764,16 @@ function restoreGenerationCommittedSteps(
   return steps;
 }
 
+function restoreGenerationCommittedDispatchReadSteps(
+  fixture,
+  options = {},
+) {
+  return [
+    ...restoreGenerationCommittedSteps(fixture, options),
+    rows(restoreGenerationOperationIdClaimRow(fixture)),
+  ];
+}
+
 function restoreGenerationCancelledFixture(fixture) {
   const reason = "caller-abandoned-before-restore-dispatch";
   const result = cancellationResult(reason);
@@ -2669,6 +2810,7 @@ function restoreGenerationCancelledSteps(fixture, cancelled) {
     rows(cancelled.operation),
     rows(cancelled.reservation),
     rows(),
+    rows(restoreGenerationOperationIdClaimRow(fixture)),
   ];
 }
 
@@ -5675,7 +5817,7 @@ test("invisible INSERT conflict retries in a fresh transaction to exact replay",
     READ_OPERATION_QUERY,
     INSERT_OPERATION_QUERY,
     `${READ_OPERATION_QUERY} FOR UPDATE`,
-    READ_OPERATION_ID_CLAIM_QUERY,
+    READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY,
   ]);
   assert.deepEqual(queryTexts(clients[0]).slice(-3), [
     TRANSACTION_ID_QUERY,
@@ -5770,7 +5912,7 @@ test("a durable restore launch preclaim blocks generic reuse of its global opera
     READ_OPERATION_QUERY,
     INSERT_OPERATION_QUERY,
     `${READ_OPERATION_QUERY} FOR UPDATE`,
-    READ_OPERATION_ID_CLAIM_QUERY,
+    READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY,
   ]);
   assert.equal(
     queryTexts(clients[0]).includes(INSERT_RESERVATION_QUERY),
@@ -12710,6 +12852,430 @@ test("restore generation v2 request durably binds an exact launch intent without
   }
 });
 
+test("an exact detached restore stable-plan preclaim materializes one V1 generation reservation", async () => {
+  const fixture = restoreGenerationFixture();
+  const preparedOperation = restoreGenerationOperationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedReservation = restoreGenerationReservationRow(
+    fixture,
+    "prepared",
+  );
+  const preparedSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "prepared",
+  );
+  const stableClaim = detachedRestoreStablePlanIdClaimRow(fixture);
+  const materializedClaim = detachedRestoreStablePlanIdClaimRow(fixture, {
+    materializedAt: fixture.preparedAt,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: fixture.preparedAt },
+    steps: [
+      rows(fixture.writer.session),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(fixture.writer.committedOperation),
+      rows(fixture.writer.releasedReservation),
+      rows(),
+      rows(),
+      rows(),
+      rows(stableClaim),
+      rows(materializedClaim),
+      rows(preparedOperation),
+      rows(preparedReservation),
+      rows(preparedSession),
+    ],
+  });
+
+  const receipt = await authority.reserveOperation(fixture.options);
+
+  assert.equal(receipt.acquired, true);
+  assert.equal(receipt.operation.state, "prepared");
+  assert.deepEqual(
+    authorityQueries(clients[0]).map(queryText).slice(4),
+    [
+      READ_OPERATION_QUERY,
+      INSERT_OPERATION_QUERY,
+      `${READ_OPERATION_QUERY} FOR UPDATE`,
+      READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY,
+      MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY,
+      INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY,
+      INSERT_RESERVATION_QUERY,
+      UPDATE_SESSION_QUERY,
+    ],
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) =>
+        queryText(args) ===
+        MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY,
+    ),
+    extendedQuery(MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY, [
+      fixture.options.operationId,
+      fixture.options.expectedSession.sessionId,
+      fixture.preparedAt,
+      JSON.stringify(canonicalPayload(fixture.request.admission)),
+    ]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[0]).find(
+      (args) =>
+        queryText(args) ===
+        INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY,
+    ),
+    extendedQuery(
+      INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY,
+      [
+        fixture.options.operationId,
+        fixture.options.expectedSession.sessionId,
+        fixture.options.kind,
+        operationBinding(fixture.options).serializedEnvelope,
+        fixture.preparedAt,
+      ],
+    ),
+  );
+  clients[0].assertExhausted();
+});
+
+test("a detached restore stable-plan preclaim cannot adopt V2 or an already materialized ID", async (t) => {
+  const scenarios = [
+    {
+      name: "contract v2",
+      fixture: restoreGenerationFixture({
+        launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+      }),
+      materializedAt: null,
+    },
+    {
+      name: "already materialized",
+      fixture: restoreGenerationFixture(),
+      materializedAt: RESTORE_PREPARED_NOW,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const { fixture } = scenario;
+      const { authority, clients } = authorityWithScripts({
+        options: { now: fixture.preparedAt },
+        steps: [
+          rows(fixture.writer.session),
+          rows({ operation_count: 0, reservation_count: 0 }),
+          rows(fixture.writer.committedOperation),
+          rows(fixture.writer.releasedReservation),
+          rows(),
+          rows(),
+          rows(),
+          rows(
+            detachedRestoreStablePlanIdClaimRow(fixture, {
+              materializedAt: scenario.materializedAt,
+            }),
+          ),
+        ],
+      });
+
+      await assertAuthorityError(
+        authority.reserveOperation(fixture.options),
+        { code: "operation_identity_conflict" },
+      );
+      assert.equal(
+        queryTexts(clients[0]).includes(
+          MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY,
+        ),
+        false,
+      );
+      assert.equal(
+        queryTexts(clients[0]).includes(
+          INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY,
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+});
+
+test("a detached restore stable-plan preclaim rejects other operation kinds", async () => {
+  const options = reserveOptions();
+  const stableClaim = operationIdRegistryRow({
+    binding: {
+      bindingSha256: "b".repeat(64),
+      contractVersion: 1,
+      planSha256: "a".repeat(64),
+      request: options.request,
+    },
+    claimType: "detached-restore-stable-plan-v1",
+    claimedAt: LATER,
+    claimantOperationId: null,
+    materializedAt: null,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: LATER },
+    steps: [
+      rows(sessionRow()),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(),
+      rows(),
+      rows(),
+      rows(stableClaim),
+    ],
+  });
+
+  await assertAuthorityError(authority.reserveOperation(options), {
+    code: "operation_identity_conflict",
+  });
+  assert.equal(
+    queryTexts(clients[0]).includes(
+      MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY,
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("crossed stable-plan admission cannot materialize an operation", async () => {
+  const fixture = restoreGenerationFixture();
+  const { authority, clients } = authorityWithScripts({
+    options: { now: fixture.preparedAt },
+    steps: [
+      rows(fixture.writer.session),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(fixture.writer.committedOperation),
+      rows(fixture.writer.releasedReservation),
+      rows(),
+      rows(),
+      rows(),
+      rows(detachedRestoreStablePlanIdClaimRow(fixture)),
+      rows(),
+    ],
+  });
+
+  await assertAuthorityError(authority.reserveOperation(fixture.options), {
+    code: "operation_identity_conflict",
+  });
+  assert.equal(
+    queryTexts(clients[0]).includes(
+      MATERIALIZE_DETACHED_RESTORE_STABLE_PLAN_ID_CLAIM_QUERY,
+    ),
+    true,
+  );
+  assert.equal(
+    queryTexts(clients[0]).includes(
+      INSERT_MATERIALIZED_DETACHED_RESTORE_STABLE_PLAN_OPERATION_QUERY,
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("restore generation stable preclaim dispatch binds one rehydrated plan and exact replay", async () => {
+  const fixture = stableRestoreGenerationFixture();
+  const stablePlan = rehydratePostgresDetachedRestorePlan(
+    structuredClone(fixture.stablePlan),
+  );
+  const startingOperation = restoreGenerationOperationRow(
+    fixture,
+    "starting",
+  );
+  const startingReservation = restoreGenerationReservationRow(
+    fixture,
+    "starting",
+  );
+  const startingSession = restoreGenerationPhaseSessionRow(
+    fixture,
+    "starting",
+  );
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        authorityNow: RESTORE_AUTHORITY_NOW,
+        now: RESTORE_DISPATCH_NOW,
+      },
+      steps: [
+        ...restoreGenerationDispatchReadSteps(fixture, "prepared"),
+        ...restoreCheckpointSourceSteps(fixture),
+        rows(restoreGenerationRow(fixture)),
+        rows(startingOperation),
+        rows(startingReservation),
+        rows(startingSession),
+      ],
+    },
+    restoreGenerationDispatchReadSteps(fixture, "starting"),
+  );
+  const input = {
+    ...fixture.options,
+    destinationIsolationProofId: stablePlan.destinationIsolationProofId,
+    expectedOperationRevision: "0",
+    generationId: stablePlan.generationId,
+    stablePlan,
+  };
+
+  const claimed =
+    await authority.claimRestoreDestinationGenerationDispatch(input);
+  const replayed =
+    await authority.claimRestoreDestinationGenerationDispatch(input);
+
+  assert.notStrictEqual(stablePlan, fixture.stablePlan);
+  assert.equal(claimed.dispatchGranted, true);
+  assert.equal(claimed.generation.generationId, stablePlan.generationId);
+  assert.equal(
+    claimed.generation.binding.destinationIsolationProofId,
+    stablePlan.destinationIsolationProofId,
+  );
+  assert.equal(replayed.dispatchGranted, false);
+  assert.deepEqual(replayed.generation, claimed.generation);
+  const firstQueries = queryTexts(clients[0]);
+  assert.ok(
+    firstQueries.indexOf(READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY) <
+      firstQueries.indexOf(
+        `${READ_CHECKPOINT_CATALOGUE_BY_ID_QUERY} FOR UPDATE`,
+      ),
+  );
+  assert.ok(
+    firstQueries.indexOf(READ_OPERATION_ID_CLAIM_FOR_UPDATE_QUERY) <
+      firstQueries.indexOf(INSERT_RESTORE_GENERATION_QUERY),
+  );
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("restore generation stable preclaim rejects missing or crossed plan bindings before dispatch", async (t) => {
+  const fixture = stableRestoreGenerationFixture();
+  const crossedPlan = detachedRestoreStablePlanForFixture(fixture, {
+    imagePlanId: "restore-image-plan-crossed",
+  });
+  const crossedAdmissionClaim = detachedRestoreStablePlanIdClaimRow(fixture);
+  crossedAdmissionClaim.materialized_at = new Date(fixture.preparedAt);
+  crossedAdmissionClaim.binding.request.holderId = "restore-holder-crossed";
+  const scenarios = [
+    {
+      name: "missing plan",
+      input: {},
+      state: "prepared",
+    },
+    {
+      name: "crossed plan digest",
+      input: { stablePlan: crossedPlan },
+      state: "prepared",
+    },
+    {
+      name: "crossed admission request",
+      input: { stablePlan: fixture.stablePlan },
+      operationIdClaim: crossedAdmissionClaim,
+      state: "prepared",
+    },
+    {
+      name: "crossed generation id",
+      input: {
+        generationId: "restore-generation-crossed",
+        stablePlan: fixture.stablePlan,
+      },
+      state: "prepared",
+    },
+    {
+      name: "crossed destination isolation proof",
+      input: {
+        destinationIsolationProofId: "destination-proof-crossed",
+        stablePlan: fixture.stablePlan,
+      },
+      state: "prepared",
+    },
+    {
+      name: "replay missing plan",
+      input: {},
+      state: "starting",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const { authority, clients } = authorityWithScripts(
+        restoreGenerationDispatchReadSteps(fixture, scenario.state, {
+          operationIdClaim: scenario.operationIdClaim,
+        }),
+      );
+      await assertAuthorityError(
+        authority.claimRestoreDestinationGenerationDispatch({
+          ...fixture.options,
+          destinationIsolationProofId:
+            scenario.input.destinationIsolationProofId ??
+            fixture.destinationIsolationProofId,
+          expectedOperationRevision: "0",
+          generationId:
+            scenario.input.generationId ?? fixture.generationId,
+          ...(scenario.input.stablePlan === undefined
+            ? {}
+            : { stablePlan: scenario.input.stablePlan }),
+        }),
+        { code: "operation_identity_conflict" },
+      );
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      assert.equal(
+        queryTexts(clients[0]).includes(INSERT_RESTORE_GENERATION_QUERY),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+});
+
+test("restore generation direct claims reject an unnecessary stable plan", async (t) => {
+  await t.test("direct V1", async () => {
+    const fixture = restoreGenerationFixture();
+    const stablePlan = detachedRestoreStablePlanForFixture(fixture);
+    const { authority, clients } = authorityWithScripts(
+      restoreGenerationDispatchReadSteps(fixture, "prepared"),
+    );
+    await assertAuthorityError(
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: fixture.generationId,
+        stablePlan,
+      }),
+      { code: "operation_identity_conflict" },
+    );
+    assert.equal(
+      authorityQueries(clients[0]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[0].assertExhausted();
+  });
+
+  await t.test("direct V2", async () => {
+    const fixture = restoreGenerationFixture({
+      launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
+    });
+    const stablePlan = detachedRestoreStablePlanForFixture(fixture);
+    const { authority, pool } = authorityWithScripts();
+    await assertAuthorityError(
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: fixture.generationId,
+        stablePlan,
+      }),
+      { code: "invalid_operation_request" },
+    );
+    assert.equal(pool.connectCalls, 0);
+  });
+});
+
 test("restore generation V2 fleet gate is independent, zero-write for fresh work, and replay-transparent", async () => {
   const fixture = restoreGenerationFixture({
     launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
@@ -12797,7 +13363,7 @@ test("restore generation claim accepts an exact checkpoint from replacement dest
       now: RESTORE_DISPATCH_NOW,
     },
     steps: [
-      ...restoreGenerationActiveSteps(fixture, "prepared"),
+      ...restoreGenerationDispatchReadSteps(fixture, "prepared"),
       ...restoreCheckpointSourceSteps(fixture),
       rows(restoreGenerationRow(fixture)),
       rows(startingOperation),
@@ -12870,7 +13436,7 @@ test("restore generation claim rejects non-storage source identity drift before 
         },
         steps: [
           ...restoreGenerationActiveSteps(fixture, "prepared"),
-          ...sourceSteps.slice(0, 3),
+          ...sourceSteps.slice(0, 1),
         ],
       });
 
@@ -12964,7 +13530,7 @@ test("restore generation dispatch grants once, starting finalization commits onc
         now: RESTORE_DISPATCH_NOW,
       },
       steps: [
-        ...restoreGenerationActiveSteps(fixture, "prepared"),
+        ...restoreGenerationDispatchReadSteps(fixture, "prepared"),
         ...restoreCheckpointSourceSteps(fixture),
         (args) => {
           assert.equal(queryText(args), INSERT_RESTORE_GENERATION_QUERY);
@@ -12980,7 +13546,7 @@ test("restore generation dispatch grants once, starting finalization commits onc
         rows(startingSession),
       ],
     },
-    restoreGenerationActiveSteps(fixture, "starting"),
+    restoreGenerationDispatchReadSteps(fixture, "starting"),
     {
       options: { now: RESTORE_FINALIZE_NOW },
       steps: [
@@ -13954,9 +14520,9 @@ test("restore generation V1 claim keeps the exact three-revision boundary", asyn
         options: {
           authorityNow: RESTORE_AUTHORITY_NOW,
           now: RESTORE_DISPATCH_NOW,
-        },
-        steps: [
-          ...restoreGenerationActiveSteps(fixture, "prepared"),
+      },
+      steps: [
+          ...restoreGenerationDispatchReadSteps(fixture, "prepared"),
           ...restoreCheckpointSourceSteps(fixture),
           rows(restoreGenerationRow(fixture)),
           rows(startingOperation),
@@ -14031,7 +14597,7 @@ test("restore generation V1 claim keeps the exact three-revision boundary", asyn
       expectedSessionRevision: (preparedRevision - 1n).toString(),
     });
     const { authority, clients } = authorityWithScripts(
-      restoreGenerationActiveSteps(fixture, "prepared"),
+      restoreGenerationDispatchReadSteps(fixture, "prepared"),
     );
 
     await assertAuthorityError(
@@ -14070,7 +14636,7 @@ test("restore generation V2 claim rejects bigint max-6 before external publicati
   });
   const restore = fixture.restore;
   const { authority, clients } = authorityWithScripts(
-    restoreGenerationActiveSteps(restore, "prepared"),
+    restoreGenerationDispatchReadSteps(restore, "prepared"),
   );
 
   await assertAuthorityError(
@@ -14111,7 +14677,7 @@ test("restore generation V2 rejects a pre-existing global launch ID before publi
       now: RESTORE_DISPATCH_NOW,
     },
     steps: [
-      ...restoreGenerationActiveSteps(fixture, "prepared"),
+      ...restoreGenerationDispatchReadSteps(fixture, "prepared"),
       ...restoreCheckpointSourceSteps(fixture),
       rows(),
     ],
@@ -14160,7 +14726,7 @@ test("restore generation V2 launch ID preclaim survives acknowledgement loss and
         now: RESTORE_DISPATCH_NOW,
       },
       steps: [
-        ...restoreGenerationActiveSteps(fixture, "prepared"),
+        ...restoreGenerationDispatchReadSteps(fixture, "prepared"),
         ...restoreCheckpointSourceSteps(fixture),
         rows(restoreLaunchIdClaimRow(fixture)),
         rows(restoreGenerationRow(fixture)),
@@ -14169,7 +14735,7 @@ test("restore generation V2 launch ID preclaim survives acknowledgement loss and
         rows(startingSession),
       ],
     },
-    restoreGenerationActiveSteps(fixture, "starting"),
+    restoreGenerationDispatchReadSteps(fixture, "starting"),
   );
   const input = {
     ...fixture.options,
@@ -14319,7 +14885,7 @@ test("restore generation V2 claim at bigint max-7 covers both handoff routes", a
             now: RESTORE_DISPATCH_NOW,
           },
           steps: [
-            ...restoreGenerationActiveSteps(restore, "prepared"),
+            ...restoreGenerationDispatchReadSteps(restore, "prepared"),
             ...restoreCheckpointSourceSteps(restore),
             rows(restoreLaunchIdClaimRow(restore)),
             rows(restoreGenerationRow(restore)),
@@ -14468,7 +15034,7 @@ test("restore generation V2 committed replay remains available at bigint max", a
     launchAttemptId: LAUNCH_ATTEMPT_OPERATION_ID,
   });
   const { authority, clients } = authorityWithScripts(
-    restoreGenerationCommittedSteps(fixture, {
+    restoreGenerationCommittedDispatchReadSteps(fixture, {
       launchIdClaim: restoreLaunchIdClaimRow(fixture, {
         materializedAt: RESTORE_FINALIZE_NOW,
       }),
@@ -14914,8 +15480,8 @@ test("restore generation starting and committed replays reject mismatched genera
   const { authority, clients } = authorityWithScripts(
     ...cases.map(({ state }) =>
       state === "starting"
-        ? restoreGenerationActiveSteps(fixture, state)
-        : restoreGenerationCommittedSteps(fixture),
+        ? restoreGenerationDispatchReadSteps(fixture, state)
+        : restoreGenerationCommittedDispatchReadSteps(fixture),
     ),
   );
 
@@ -15375,6 +15941,14 @@ test("restore generation typed APIs reject non-exact contracts before PostgreSQL
         expectedOperationRevision: "0",
         generationId: fixture.generationId,
         extra: true,
+      }),
+    () =>
+      authority.claimRestoreDestinationGenerationDispatch({
+        ...fixture.options,
+        destinationIsolationProofId: fixture.destinationIsolationProofId,
+        expectedOperationRevision: "0",
+        generationId: fixture.generationId,
+        stablePlan: null,
       }),
     () =>
       authority.finalizeRestoreDestinationGeneration({
