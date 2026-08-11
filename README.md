@@ -14,7 +14,8 @@ restore.
 It also includes source-free committed restore-destination verification, a
 versioned provider attachment proof, atomic detached activation into a
 prepared launch, four bounded no-relaunch recovery lanes, and a
-production-neutral detached-restore foreground composition seam.
+production-neutral detached-restore foreground composition seam and runtime
+assembly with a narrow same-launcher writer-start ingress.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -375,11 +376,16 @@ checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
 must supply the deployment-owned bindings and final public backend, then add
 end-to-end ambiguous-outcome coverage before enabling that entry point. A
 production-neutral runtime factory now constructs the capture-only backend,
-standalone foreground facade, and idle scheduler from one internally consistent graph
-and four caller-owned pool objects that must be pairwise distinct. It does not
-migrate, start, stop, or close pools, replace the capture-only backend's fixed
-restore route, or wire foreground restore into the production adapter. The
-exclusive scheduler continues bounded no-relaunch recovery.
+standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
+facet from one internally consistent graph and four caller-owned pool objects
+that must be pairwise distinct. The facet exposes only `runLaunch()` and
+`reconcileLaunchAttempt()` from the same process-local logical launcher used by
+the backend and foreground composition. This makes the original opaque writer
+handle reachable by later stop/capture without making a committed database row
+or another launcher authoritative. The factory does not migrate, start, stop,
+or close pools, replace the capture-only backend's fixed restore route, or wire
+foreground restore into the production adapter. The exclusive scheduler
+continues bounded no-relaunch recovery.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -553,7 +559,8 @@ can now carry the complete authority-issued generation binding to either fresh
 publication or committed-only verification without changing the legacy version
 2 callback. The database-global shared/exclusive lifecycle guard, bounded
 recovery scheduler, invocation-time detached-production gate, foreground
-composition, and production-neutral runtime assembly are now complete.
+composition, production-neutral runtime assembly, and same-launcher writer-
+start ingress are now complete.
 Production restore remains fail-closed until later slices supply deployment-
 owned bindings, assembled restart/ambiguity validation, and final adapter
 wiring. Filesystem-image execution and differential backup remain later work.

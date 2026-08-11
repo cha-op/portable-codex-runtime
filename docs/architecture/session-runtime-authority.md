@@ -1832,15 +1832,25 @@ before the launch claim also fails closed and never authorizes relaunch. The
 phase-B budget must cover long capture and activation windows.
 
 The production-neutral phase-B assembly foundation now constructs one
-capture-only backend, standalone foreground facade, and idle scheduler from
-one internally consistent authority graph and four pairwise-distinct borrowed
-pool objects. It does not migrate the store, own scheduler or pool lifecycle,
-resolve deployment configuration, inject foreground restore into the backend,
-or construct the final public restore-capable backend. The production
-checkpoint adapter therefore still rejects restore through its fixed fail-
-closed `runRestore()` implementation. Deployment assembly must supply the
-stable-plan/provider/bootstrap bindings and validate the complete assembled
-ambiguous-outcome matrix before enabling that entry point.
+capture-only backend, standalone foreground facade, idle scheduler, and narrow
+writer-launch facet from one internally consistent authority graph and four
+pairwise-distinct borrowed pool objects. The facet exposes only `runLaunch()`
+and `reconcileLaunchAttempt()` through receiver-preserving wrappers bound to
+the same internal logical launcher. A successful same-process start therefore
+registers the opaque writer handle that the capture backend later resolves;
+another launcher or a durable committed-started row cannot reconstruct that
+handle. Stop, retire, prepared-launch, handle-resolution, and internal map
+capabilities remain private.
+
+The assembly still does not migrate the store, own scheduler or pool
+lifecycle, resolve deployment configuration, inject foreground restore into
+the backend, or construct the final public restore-capable backend. The
+production checkpoint adapter therefore still rejects restore through its
+fixed fail-closed `runRestore()` implementation. Deployment assembly must next
+supply a durable plan registry whose provisioning is separately gated and
+whose foreground resolver is read-only, then the remaining provider/bootstrap
+bindings and complete assembled ambiguous-outcome matrix before enabling that
+entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -1947,9 +1957,11 @@ stop identity, one physical stop, unchanged V1/V2 capability behavior, V3
 preclaim before stop, atomic committed-stop-to-prepared-capture handoff,
 prepared-only fresh dispatch, source-free active recovery, no second
 publication after ambiguity, and retained local identity until the exact
-predetermined committed result. The invocation-time gate and production-
-neutral object graph now exist. The next integration slices must add
-deployment-owned bindings, whole-graph restart/ambiguity validation, and final
-adapter wiring before production `runRestore()` can open.
+predetermined committed result. The invocation-time gate, production-neutral
+object graph, and same-launcher writer-start ingress now exist. The next
+integration slices must add the gated-provision/read-only-resolver durable plan
+registry, remaining deployment-owned bindings, whole-graph restart/ambiguity
+validation, and final adapter wiring before production `runRestore()` can
+open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

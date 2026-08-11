@@ -490,6 +490,23 @@ function createResolveStoppedWriter(launcher) {
   return objectFreeze(resolveStoppedWriter);
 }
 
+function createWriterLaunchFacet(launcher) {
+  const reconcileLaunchAttemptMethod = ownFrozenDataFunction(
+    launcher,
+    "reconcileLaunchAttempt",
+  );
+  const runLaunchMethod = ownFrozenDataFunction(launcher, "runLaunch");
+  const reconcileLaunchAttempt = function reconcileLaunchAttempt(...args) {
+    return callIntrinsic(reconcileLaunchAttemptMethod, launcher, args);
+  };
+  const runLaunch = function runLaunch(...args) {
+    return callIntrinsic(runLaunchMethod, launcher, args);
+  };
+  objectFreeze(reconcileLaunchAttempt);
+  objectFreeze(runLaunch);
+  return exactFrozenRecord({ reconcileLaunchAttempt, runLaunch });
+}
+
 function receiverCallback(method, receiver) {
   trustedFunction(method);
   const callback = function receiverCallback(...args) {
@@ -679,6 +696,7 @@ function assemble(options) {
       supervisor: options.launch.supervisor,
     }),
   );
+  const writerLaunch = createWriterLaunchFacet(launcher);
   const checkpointMutationAuthority = callFactory(
     createCheckpointMutationAuthorityIntrinsic,
     exactFrozenRecord({
@@ -766,7 +784,12 @@ function assemble(options) {
     }),
   );
 
-  const runtime = exactFrozenRecord({ backend, foreground, scheduler });
+  const runtime = exactFrozenRecord({
+    backend,
+    foreground,
+    scheduler,
+    writerLaunch,
+  });
   weakSetAdd(runtimeCompositions, runtime);
   return runtime;
 }

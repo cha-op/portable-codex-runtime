@@ -110,11 +110,14 @@
   publication, durable stop/capture, canonical detach, activation, and
   prepared launch. The production-neutral assembly foundation now constructs
   that facade, its capture-only backend, three distinct lifecycle/operation
-  guard pools, authority/store pool, and idle bounded no-relaunch scheduler
-  without opening the adapter. Supply deployment-owned stable-plan, provider,
-  image, PostgreSQL bootstrap, lease-budget, and lifecycle bindings; run the
-  complete assembled restart/ambiguous-outcome matrix; then construct the
-  final public backend and replace the fixed fail-closed `runRestore()` stub.
+  guard pools, authority/store pool, idle bounded no-relaunch scheduler, and a
+  narrow same-launcher writer-start ingress without opening the adapter. Add a
+  PostgreSQL durable plan registry with gated provisioning and a read-only
+  foreground resolver; then supply the remaining provider, image, PostgreSQL
+  bootstrap, lease-budget, admission/drain, and lifecycle bindings. Run the
+  complete assembled restart/ambiguous-outcome matrix, construct the final
+  public backend, and only then replace the fixed fail-closed `runRestore()`
+  stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.
