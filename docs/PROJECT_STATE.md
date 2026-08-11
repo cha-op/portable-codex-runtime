@@ -311,6 +311,13 @@
   facade, and idle recovery scheduler from four pairwise-distinct borrowed
   pools. It performs no migration, start, stop, provider action, or pool close,
   and it does not inject foreground restore into the checkpoint backend.
+- The same factory now returns a narrow `writerLaunch` facet with only
+  `runLaunch()` and `reconcileLaunchAttempt()`. Those receiver-preserving
+  wrappers target the exact internal launcher already used by capture and
+  foreground restore, so a same-process started writer retains its original
+  opaque handle. Stop, retire, prepared-launch, handle-resolution, and internal
+  launcher maps remain private; a committed row alone still cannot recover a
+  cold handle.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
   requires deployment-owned stable-plan/provider/bootstrap bindings, full
@@ -392,6 +399,8 @@
   `docs/project_journal/2026/08/2026-08-11-detached-restore-foreground-composition-4f8c2d.md`
 - Production-neutral restore runtime assembly:
   `docs/project_journal/2026/08/2026-08-11-production-neutral-restore-runtime-assembly-8b42f1.md`
+- Restore runtime writer-launch ingress:
+  `docs/project_journal/2026/08/2026-08-11-restore-runtime-writer-launch-ingress-c83e71.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -407,7 +416,8 @@
   adapter. Capture-bound detached activation and bounded no-relaunch recovery
   now exist, the stop-to-prepared-capture handoff is durable, and the cross-
   process lifecycle guard, scheduler, stable root plan, invocation-time fleet
-  gate, foreground composition seam, and production-neutral runtime assembly
-  are implemented. Production still requires deployment-owned bindings, final
-  public-adapter assembly, and end-to-end fail-closed validation before
-  `runRestore()` may be enabled.
+  gate, foreground composition seam, production-neutral runtime assembly, and
+  same-launcher writer-start ingress are implemented. Production still
+  requires a durable stable-plan registry, the remaining deployment-owned
+  bindings, final public-adapter assembly, and end-to-end fail-closed
+  validation before `runRestore()` may be enabled.

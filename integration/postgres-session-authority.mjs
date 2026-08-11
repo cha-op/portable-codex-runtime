@@ -26,6 +26,9 @@ import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
+  POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED,
+} from "../src/postgres-detached-restore-foreground-composition.mjs";
+import {
   createPostgresDetachedRestoreRuntimeComposition,
 } from "../src/postgres-detached-restore-runtime-composition.mjs";
 import {
@@ -2214,28 +2217,28 @@ function restoreRuntimeIntegrationLifecycleBackend(calls) {
 }
 
 function restoreRuntimeIntegrationPublication(calls, recoveryScopeId) {
-  const unexpectedPublicationCall =
-    async function unexpectedPublicationCall() {
+  const controlledPublicationFailure =
+    async function controlledPublicationFailure() {
       calls.publication += 1;
-      throw new Error("restore runtime publication must not run");
+      throw new Error("controlled restore runtime publication failure");
     };
   const journal = new FilesystemOperationJournal({
-    acquireLock: unexpectedPublicationCall,
+    acquireLock: controlledPublicationFailure,
     directory:
       `/var/lib/portable-codex/runtime-${recoveryScopeId}-journal`,
-    inspectAncestorAcl: unexpectedPublicationCall,
-    inspectDirectoryAcl: unexpectedPublicationCall,
-    inspectTemporaryRecord: unexpectedPublicationCall,
-    syncDirectory: unexpectedPublicationCall,
+    inspectAncestorAcl: controlledPublicationFailure,
+    inspectDirectoryAcl: controlledPublicationFailure,
+    inspectTemporaryRecord: controlledPublicationFailure,
+    syncDirectory: controlledPublicationFailure,
   });
   return new StoppedDirectoryPublication({
-    acquireLock: unexpectedPublicationCall,
-    inspectFilesystem: unexpectedPublicationCall,
-    inspectOwnedRootAcl: unexpectedPublicationCall,
-    inspectOwnedRootAncestorAcl: unexpectedPublicationCall,
-    inspectPersistentObjectIdentity: unexpectedPublicationCall,
+    acquireLock: controlledPublicationFailure,
+    inspectFilesystem: controlledPublicationFailure,
+    inspectOwnedRootAcl: controlledPublicationFailure,
+    inspectOwnedRootAncestorAcl: controlledPublicationFailure,
+    inspectPersistentObjectIdentity: controlledPublicationFailure,
     journal,
-    listMountPoints: unexpectedPublicationCall,
+    listMountPoints: controlledPublicationFailure,
   });
 }
 
@@ -10651,7 +10654,7 @@ test(
 );
 
 test(
-  "production-neutral restore runtime assembles four PostgreSQL lanes and keeps gated foreground effects closed",
+  "production-neutral restore runtime shares one local writer handle with fresh V3 stop/capture",
   { timeout: 60_000 },
   async (t) => {
     const authorityPool = new Pool({
@@ -10681,6 +10684,10 @@ test(
     const recoveryScopeId = `integration-restore-${randomUUID()}`;
     const sessionId = randomUUID();
     const sessionIds = [sessionId];
+    const image = integrationPlatformImageFixture();
+    const imageReservations =
+      new PlatformImageReservationCoordinator();
+    const supervisorId = `runtime-supervisor-${randomUUID()}`;
     let runtime = null;
     let foregroundTeardown = null;
     t.after(async () => {
@@ -10831,14 +10838,18 @@ test(
     const releasePlanResolver = deferred();
     const steps = [];
     const calls = {
+      artifactResolver: 0,
+      destinationResolver: 0,
       fleetGate: 0,
       image: 0,
       plan: 0,
       provider: 0,
       publication: 0,
       publish: 0,
-      storageResolver: 0,
-      supervisor: 0,
+      sourceResolver: 0,
+      supervisorLaunch: 0,
+      supervisorReconcile: 0,
+      supervisorStop: 0,
     };
     let stablePlan = null;
     runtime = createPostgresDetachedRestoreRuntimeComposition({
@@ -10855,7 +10866,7 @@ test(
           calls.fleetGate += 1;
           assert.equal(admission.request.sessionId, sessionId);
           assert.strictEqual(plan, stablePlan);
-          return null;
+          return POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED;
         },
         async resolveStablePlan({ admission, expectedSession }) {
           calls.plan += 1;
@@ -10868,7 +10879,7 @@ test(
         },
       },
       launch: {
-        imageReservations: new PlatformImageReservationCoordinator(),
+        imageReservations,
         prepareImageReservation() {
           calls.image += 1;
           throw new Error("restore runtime image preparation must not run");
@@ -10877,15 +10888,34 @@ test(
           new StoppedWriterCapabilityCoordinator(),
         supervisor: Object.freeze({
           contractVersion: 1,
-          async launchWriter() {
-            calls.supervisor += 1;
-            throw new Error("restore runtime supervisor must not launch");
+          async launchWriter(context) {
+            calls.supervisorLaunch += 1;
+            assert.equal(
+              context.attempt.request.supervisor.supervisorId,
+              supervisorId,
+            );
+            return {
+              receiptVersion: 1,
+              evidence: writerLaunchEvidence(
+                {
+                  operationId: context.attempt.launchAttemptId,
+                  request: context.attempt.request,
+                },
+                "started",
+              ),
+              stopWriter: async function stopWriter() {
+                calls.supervisorStop += 1;
+                return STOPPED_WRITER_STOP_CONFIRMED;
+              },
+            };
           },
           async reconcileWriterLaunch() {
-            calls.supervisor += 1;
-            throw new Error("restore runtime supervisor must not reconcile");
+            calls.supervisorReconcile += 1;
+            throw new Error(
+              "same-process runtime launch must not reconcile",
+            );
           },
-          supervisorId: `runtime-supervisor-${randomUUID()}`,
+          supervisorId,
         }),
       },
       pools: {
@@ -10916,19 +10946,19 @@ test(
           calls,
           recoveryScopeId,
         ),
-        resolveArtifactPaths() {
-          calls.storageResolver += 1;
-          throw new Error("restore runtime artifact paths must not resolve");
+        resolveArtifactPaths(options) {
+          calls.artifactResolver += 1;
+          return integrationArtifactPaths(options);
         },
         resolveRestoreDestination() {
-          calls.storageResolver += 1;
+          calls.destinationResolver += 1;
           throw new Error(
             "restore runtime destination must not resolve",
           );
         },
-        resolveSourceOwnedRoot() {
-          calls.storageResolver += 1;
-          throw new Error("restore runtime source root must not resolve");
+        resolveSourceOwnedRoot(options) {
+          calls.sourceResolver += 1;
+          return integrationSourceOwnedRoot(options);
         },
       },
     });
@@ -10954,24 +10984,38 @@ test(
       authority,
       checkpointAuthority,
       sessionId,
+      { imageDigest: image.descriptor.digest },
     );
-    const launchInput = writerLaunchAttemptInput(
-      fixture.finalized.session,
-      fixture.finalized.generation,
-    );
-    await authority.reserveOperation(launchInput);
-    await authority.claimWriterLaunchAttemptDispatch({
-      ...structuredClone(launchInput),
-      expectedOperationRevision: "0",
+    const inspectCodex = async () => ({
+      codexBinaryPath: "/opt/portable-codex/bin/codex",
+      codexBinarySha256: "c".repeat(64),
+      codexVersion:
+        fixture.finalized.session.document.manifest.runtime.codexVersion,
     });
-    const launched = await authority.finalizeWriterLaunchAttemptStarted({
-      ...structuredClone(launchInput),
-      evidence: writerLaunchEvidence(launchInput, "started"),
-      expectedOperationRevision: "1",
+    const reservedImage = await imageReservations.reservePlatformImage({
+      configBytes: image.configBytes,
+      descriptor: image.descriptor,
+      inspectCodex,
+      sessionManifest: fixture.finalized.session.document.manifest,
     });
-    assertOperationReceipt(launched, "committed");
+    const launchAttemptId = `writer-launch-${randomUUID()}`;
+    const launched = await runtime.writerLaunch.runLaunch({
+      generation: fixture.finalized.generation,
+      imageReservation: {
+        configBytes: image.configBytes,
+        descriptor: image.descriptor,
+        inspectCodex,
+        reservation: reservedImage.reservation,
+      },
+      launchAttemptId,
+    });
+    assert.equal(launched.status, "started");
+    assert.notEqual(launched.writer, null);
     assert.equal(launched.session.document.lifecycle, "ATTACHED");
     assert.notEqual(launched.session.document.launch, null);
+    assert.equal(calls.supervisorLaunch, 1);
+    assert.equal(calls.supervisorReconcile, 0);
+    assert.equal(calls.supervisorStop, 0);
 
     const admission = restoreGenerationAdmission(
       launched,
@@ -10997,15 +11041,6 @@ test(
     });
 
     const beforeSession = await authority.readSession({ sessionId });
-    const beforeOperations = await authorityPool.query(
-      [
-        "SELECT operation_id, kind, state, revision::text AS revision",
-        "FROM session_authority.operation_claims",
-        "WHERE session_id = $1",
-        "ORDER BY operation_id",
-      ].join(" "),
-      [sessionId],
-    );
     const foreground = runtime.foreground.runRestore(
       admission,
       async () => {
@@ -11072,32 +11107,60 @@ test(
     assert.equal(teardown.foregroundSettlement.status, "rejected");
     assert.equal(
       teardown.foregroundSettlement.reason.code,
-      "postgres_detached_restore_fleet_capability_required",
+      "postgres_detached_restore_foreground_composition_outcome_uncertain",
     );
-    assert.deepEqual(
-      await authority.readSession({ sessionId }),
-      beforeSession,
+    const afterSession = await authority.readSession({ sessionId });
+    assert.notEqual(beforeSession.document.launch, null);
+    assert.equal(afterSession.document.launch, null);
+    assert.equal(
+      afterSession.document.lastOperation?.kind,
+      WRITER_LAUNCH_STOP_OPERATION_KIND,
     );
-    const afterOperations = await authorityPool.query(
+    assert.equal(afterSession.document.lastOperation?.state, "committed");
+    const stopContract = await authorityPool.query(
       [
-        "SELECT operation_id, kind, state, revision::text AS revision",
+        "SELECT request ->> 'contractVersion' AS contract_version",
         "FROM session_authority.operation_claims",
-        "WHERE session_id = $1",
-        "ORDER BY operation_id",
+        "WHERE operation_id = $1",
       ].join(" "),
-      [sessionId],
+      [afterSession.document.lastOperation.operationId],
     );
-    assert.deepEqual(afterOperations.rows, beforeOperations.rows);
-    assert.deepEqual(calls, {
-      fleetGate: 1,
-      image: 0,
-      plan: 1,
-      provider: 0,
-      publication: 0,
-      publish: 0,
-      storageResolver: 0,
-      supervisor: 0,
-    });
+    assert.deepEqual(stopContract.rows, [{ contract_version: "3" }]);
+    assert.equal(
+      afterSession.document.activeOperation?.kind,
+      CHECKPOINT_CAPTURE_OPERATION_KIND,
+    );
+    assert.equal(
+      afterSession.document.activeOperation?.operationId,
+      stablePlan.captureOperationId,
+    );
+    assert.equal(afterSession.document.activeOperation?.state, "uncertain");
+    const captureOperation = await authorityPool.query(
+      [
+        "SELECT kind, state",
+        "FROM session_authority.operation_claims",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [afterSession.document.activeOperation.operationId],
+    );
+    assert.deepEqual(captureOperation.rows, [
+      {
+        kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+        state: "uncertain",
+      },
+    ]);
+    assert.equal(calls.artifactResolver > 0, true);
+    assert.equal(calls.destinationResolver, 0);
+    assert.equal(calls.fleetGate, 1);
+    assert.equal(calls.image, 0);
+    assert.equal(calls.plan, 1);
+    assert.equal(calls.provider, 0);
+    assert.equal(calls.publication > 0, true);
+    assert.equal(calls.publish, 0);
+    assert.equal(calls.sourceResolver > 0, true);
+    assert.equal(calls.supervisorLaunch, 1);
+    assert.equal(calls.supervisorReconcile, 0);
+    assert.equal(calls.supervisorStop, 1);
 
     assert.strictEqual(teardown.stoppedCompletion, completion);
     assert.deepEqual(

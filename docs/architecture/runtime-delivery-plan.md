@@ -339,16 +339,21 @@ Restore and launcher authority are now split into eight serial pull requests:
      the facade does not infer completion or repeat a physical side effect.
    - The production-neutral phase-B assembly foundation is complete. One
      strict factory constructs the capture-only backend, standalone foreground
-     facade, and idle scheduler from a single internal authority graph, one
-     authority/store pool, and three pairwise-distinct nested/foreground/
-     recovery guard pools. Construction performs no migration, scheduler
-     lifecycle action, provider action, pool close, or production restore
-     routing.
-   - The remaining phase-B work belongs to deployment assembly: durable stable-
-     plan resolution, physical provider/image and PostgreSQL bootstrap
-     bindings, lease budgets and admission/drain ownership, complete assembled
-     restart/ambiguity validation, and construction of the final public
-     restore-capable backend.
+     facade, idle scheduler, and narrow writer-launch ingress from a single
+     internal authority graph, one authority/store pool, and three pairwise-
+     distinct nested/foreground/recovery guard pools. The ingress exposes only
+     `runLaunch()` and `reconcileLaunchAttempt()` from the same process-local
+     launcher used by capture and foreground restore. Construction performs no
+     migration, scheduler lifecycle action, provider action, pool close, or
+     production restore routing.
+   - The next phase-B slice is a PostgreSQL durable stable-plan registry. Plan
+     provisioning must be a separately gated immutable insert-or-compare
+     operation; the foreground `resolveStablePlan` binding remains read-only
+     and must never write a new plan before its fresh-work fleet gate.
+   - Remaining deployment assembly then owns physical provider/image and
+     PostgreSQL bootstrap bindings, lease budgets and admission/drain
+     ownership, complete assembled restart/ambiguity validation, and
+     construction of the final public restore-capable backend.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

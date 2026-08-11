@@ -37,15 +37,19 @@ superseded_by:
   writer.
 - The serial authority, durable stop/capture, detached activation, prepared
   launch, foreground composition, bounded recovery scheduler, and production-
-  neutral runtime assembly foundations are complete. The production adapter
-  remains fixed fail-closed.
+  neutral runtime assembly foundations are complete. The assembled runtime now
+  exposes the same internal launcher's narrow writer-start ingress, preserving
+  the process-local opaque handle required by later stop/capture. The
+  production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Supply deployment-owned stable-plan, physical provider/image, PostgreSQL
-  bootstrap, lease-budget, and lifecycle bindings for the assembled runtime.
+- Add a PostgreSQL durable stable-plan registry with separately gated
+  provisioning and a read-only foreground resolver.
+- Supply the remaining physical provider/image, PostgreSQL bootstrap, lease-
+  budget, admission/drain, and lifecycle bindings for the assembled runtime.
 - Validate the complete assembled restart and ambiguous-outcome matrix, then
   construct the final public restore-capable backend and enable the production
   adapter only if the no-second-writer boundary remains closed.

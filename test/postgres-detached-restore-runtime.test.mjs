@@ -5,6 +5,7 @@ import { FilesystemOperationJournal } from "../src/filesystem-operation-journal.
 import { PlatformImageReservationCoordinator } from "../src/platform-image-reservation.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+  PostgresLogicalWriterLauncherError,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   PostgresDetachedRestoreRuntimeCompositionError,
@@ -136,6 +137,14 @@ function schedulerRequestError(error) {
     error.code,
     "invalid_postgres_restore_recovery_scheduler_request",
   );
+  return true;
+}
+
+function launcherRequestError(error) {
+  assert(error instanceof PostgresLogicalWriterLauncherError);
+  assert.equal(error.code, "invalid_logical_writer_launch_request");
+  assert.equal(error.retryable, false);
+  assert.equal(Object.isFrozen(error), true);
   return true;
 }
 
@@ -384,7 +393,12 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     fixture.options,
   );
 
-  exactKeys(runtime, ["backend", "foreground", "scheduler"]);
+  exactKeys(runtime, [
+    "backend",
+    "foreground",
+    "scheduler",
+    "writerLaunch",
+  ]);
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(isPostgresDetachedRestoreRuntimeComposition(runtime), true);
   assert.equal(
@@ -393,6 +407,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
         backend: runtime.backend,
         foreground: runtime.foreground,
         scheduler: runtime.scheduler,
+        writerLaunch: runtime.writerLaunch,
       }),
     ),
     false,
@@ -432,6 +447,37 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   assert.equal(isPostgresRestoreRecoveryScheduler(runtime.scheduler), true);
   exactKeys(runtime.scheduler, ["runStep", "start", "stop"]);
   assert.equal(Object.isFrozen(runtime.scheduler), true);
+
+  exactKeys(runtime.writerLaunch, ["reconcileLaunchAttempt", "runLaunch"]);
+  assert.equal(Object.getPrototypeOf(runtime.writerLaunch), null);
+  assert.equal(Object.isFrozen(runtime.writerLaunch), true);
+  for (const name of ["reconcileLaunchAttempt", "runLaunch"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      runtime.writerLaunch,
+      name,
+    );
+    assert.deepEqual(descriptor, {
+      configurable: false,
+      enumerable: true,
+      value: runtime.writerLaunch[name],
+      writable: false,
+    });
+    assert.equal(typeof runtime.writerLaunch[name], "function");
+    assert.equal(Object.isFrozen(runtime.writerLaunch[name]), true);
+  }
+  for (const name of [
+    "launcher",
+    "prepareLaunchIntent",
+    "resolveStoppedWriter",
+    "retirePreparedCapture",
+    "retireStoppedWriter",
+    "runPreparedLaunch",
+    "stopWriterForCapture",
+    "stopWriterForPreparedCapture",
+  ]) {
+    assert.equal(name in runtime.writerLaunch, false);
+  }
+
   assert.throws(
     () =>
       runtime.scheduler.runStep({
@@ -440,6 +486,66 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     schedulerRequestError,
   );
   assertNoActivity(fixture);
+});
+
+test("writer-launch facet keeps per-runtime identity and its captured receiver", async () => {
+  const firstFixture = createRuntimeFixture();
+  const secondFixture = createRuntimeFixture();
+  const first = createPostgresDetachedRestoreRuntimeComposition(
+    firstFixture.options,
+  );
+  const second = createPostgresDetachedRestoreRuntimeComposition(
+    secondFixture.options,
+  );
+
+  assert.notStrictEqual(first.writerLaunch, second.writerLaunch);
+  assert.notStrictEqual(
+    first.writerLaunch.reconcileLaunchAttempt,
+    second.writerLaunch.reconcileLaunchAttempt,
+  );
+  assert.notStrictEqual(
+    first.writerLaunch.runLaunch,
+    second.writerLaunch.runLaunch,
+  );
+  assertNoActivity(firstFixture);
+  assertNoActivity(secondFixture);
+
+  const traps = {
+    get: 0,
+    getOwnPropertyDescriptor: 0,
+    getPrototypeOf: 0,
+  };
+  const hostileReceiver = new Proxy(Object.create(null), {
+    get() {
+      traps.get += 1;
+      throw new Error("caller receiver must not be read");
+    },
+    getOwnPropertyDescriptor() {
+      traps.getOwnPropertyDescriptor += 1;
+      throw new Error("caller receiver descriptor must not be read");
+    },
+    getPrototypeOf() {
+      traps.getPrototypeOf += 1;
+      throw new Error("caller receiver prototype must not be read");
+    },
+  });
+
+  for (const name of ["reconcileLaunchAttempt", "runLaunch"]) {
+    const pending = Reflect.apply(
+      first.writerLaunch[name],
+      hostileReceiver,
+      [],
+    );
+    assert(pending instanceof Promise);
+    await assert.rejects(pending, launcherRequestError);
+  }
+  assert.deepEqual(traps, {
+    get: 0,
+    getOwnPropertyDescriptor: 0,
+    getPrototypeOf: 0,
+  });
+  assertNoActivity(firstFixture);
+  assertNoActivity(secondFixture);
 });
 
 test("runtime composition rejects every pairwise pool alias before I/O", async (t) => {
