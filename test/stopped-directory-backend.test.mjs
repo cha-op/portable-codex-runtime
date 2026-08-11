@@ -30,7 +30,9 @@ import {
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
 import {
+  PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  assertPreparedCheckpointCaptureBackend,
   assertRestoreAttachmentActivationBackend,
   assertStorageBackend,
   createSessionManifest,
@@ -715,6 +717,12 @@ function createMutationAuthority(fixture, options = {}) {
     captureOperationClaims: new Map(),
     capturePublicationInvocations: 0,
     captureRuns: 0,
+    preparedAdmissions: [],
+    preparedCallbackCompletions: [],
+    preparedContexts: [],
+    preparedFinalizations: [],
+    preparedPublicationInvocations: 0,
+    preparedRuns: 0,
     reconciliationAdmissions: [],
     activeReconciliations: 0,
     maxActiveReconciliations: 0,
@@ -759,6 +767,25 @@ function createMutationAuthority(fixture, options = {}) {
       ...(typeof options.reconciliationContext === "function"
         ? options.reconciliationContext(admission, state)
         : options.reconciliationContext),
+    };
+    return Object.freeze(context);
+  };
+
+  const preparedContext = (admission, captureAttempt) => {
+    const context = {
+      artifactDirectory: fixture.artifactDirectory,
+      artifactOwnedRoot: fixture.artifactOwnedRoot,
+      canonicalAttachment: fixture.writerAttachment,
+      canonicalLease: fixture.writerLease,
+      captureAttempt,
+      contractVersion: PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+      now: NOW,
+      sourceDirectory: fixture.sourceDirectory,
+      sourceOwnedRoot: fixture.sourceOwnedRoot,
+      storageRef: storageRef(),
+      ...(typeof options.preparedContext === "function"
+        ? options.preparedContext(admission, captureAttempt)
+        : options.preparedContext),
     };
     return Object.freeze(context);
   };
@@ -974,6 +1001,94 @@ function createMutationAuthority(fixture, options = {}) {
       );
     },
 
+    async runPreparedCapture(admission, publish) {
+      state.preparedRuns += 1;
+      state.preparedAdmissions.push(admission);
+      return runCaptureOperationSerialized(
+        admission.request.operationId,
+        async () => {
+          fixture.observation.events.push("authority:prepared:start");
+          assert(Object.isFrozen(admission));
+          exactKeys(admission, ["checkpoint", "request"]);
+          assert.equal(Object.hasOwn(admission, "attachment"), false);
+          assert.equal(Object.hasOwn(admission, "capability"), false);
+          assert.equal(Object.hasOwn(admission, "writer"), false);
+          options.onPreparedAdmission?.(admission, state);
+          if (options.preparedMode === "claim-throw") {
+            throw new Error("prepared claim acknowledgement lost");
+          }
+          if (options.preparedMode === "claim-not-granted") {
+            return Object.freeze({ ignored: true });
+          }
+          let captureAttempt = state.captureAttempts.get(
+            admission.request.operationId,
+          );
+          if (captureAttempt === undefined) {
+            captureAttempt = captureAttemptRecord(fixture, admission);
+            activateCaptureAttemptClaims(state, captureAttempt);
+          }
+          const context = preparedContext(admission, captureAttempt);
+          state.preparedContexts.push(context);
+          fixture.observation.captureGuard = true;
+          try {
+            const invokePublish = (value) => {
+              state.preparedPublicationInvocations += 1;
+              return publish(value);
+            };
+            switch (options.preparedMode) {
+              case "zero":
+                return Object.freeze({ ignored: true });
+              case "multiple": {
+                const first = await invokePublish(context);
+                state.preparedCallbackCompletions.push(first);
+                const second = await invokePublish(context);
+                state.preparedCallbackCompletions.push(second);
+                return first;
+              }
+              case "early": {
+                const pending = invokePublish(context);
+                state.background.push(pending.catch(() => undefined));
+                return Object.freeze({ ignored: true });
+              }
+              case "late-unobserved": {
+                setImmediate(() => {
+                  void invokePublish(context);
+                  options.onPreparedLatePublishIssued?.();
+                });
+                return Object.freeze({ ignored: true });
+              }
+              case "substituted": {
+                const completion = await invokePublish(context);
+                state.preparedCallbackCompletions.push(completion);
+                return Object.freeze({ ...completion });
+              }
+              default: {
+                const completion = await invokePublish(context);
+                state.preparedCallbackCompletions.push(completion);
+                exactKeys(completion, [
+                  "artifactProof",
+                  "materialization",
+                  "replayed",
+                  "result",
+                ]);
+                assert.equal(completion.replayed, false);
+                finalizeCaptureAttempt(admission, completion, captureAttempt);
+                fixture.artifactProof = completion.artifactProof;
+                state.preparedFinalizations.push(completion);
+                fixture.observation.events.push(
+                  "authority:prepared:finalized",
+                );
+                return completion;
+              }
+            }
+          } finally {
+            fixture.observation.captureGuard = false;
+            fixture.observation.events.push("authority:prepared:end");
+          }
+        },
+      );
+    },
+
     async runCaptureReconciliation(admission, verify) {
       state.reconciliationRuns += 1;
       state.reconciliationAdmissions.push(admission);
@@ -1177,6 +1292,7 @@ function createMutationAuthority(fixture, options = {}) {
             });
           },
     runCaptureReconciliation: normalAuthority.runCaptureReconciliation,
+    runPreparedCapture: normalAuthority.runPreparedCapture,
     runRestore:
       options.restoreReturnFactory === undefined
         ? normalAuthority.runRestore
@@ -1543,8 +1659,17 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
   assert.equal(STOPPED_DIRECTORY_BACKEND_CONTRACT_VERSION, 3);
   assert.equal(CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION, 2);
   assert.strictEqual(assertStorageBackend(fixture.backend), fixture.backend);
+  assert.strictEqual(
+    assertPreparedCheckpointCaptureBackend(fixture.backend),
+    fixture.backend,
+  );
   assert.equal(fixture.backend.contractVersion, 1);
   assert.equal(fixture.backend.captureReconciliationContractVersion, 1);
+  assert.equal(
+    fixture.backend.preparedCheckpointCaptureContractVersion,
+    PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
+  );
+  assert.equal(typeof fixture.backend.resumePreparedCheckpointCapture, "function");
   assert.equal(fixture.backend.backendId, BACKEND_ID);
   assert.deepEqual(fixture.backend.capabilities, {
     atomicPointInTimeCheckpoint: false,
@@ -1554,6 +1679,30 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
   });
   assert(Object.isFrozen(fixture.backend));
   assert(Object.isFrozen(fixture.backend.capabilities));
+
+  const legacyAuthority = {
+    runCapture: fixture.mutation.authority.runCapture,
+    runCaptureReconciliation:
+      fixture.mutation.authority.runCaptureReconciliation,
+    runRestore: fixture.mutation.authority.runRestore,
+  };
+  const legacyBackend = new StoppedDirectoryBackend({
+    backendId: BACKEND_ID,
+    coordinator: fixture.coordinator,
+    lifecycleBackend: fixture.lifecycle.backend,
+    mutationAuthority: legacyAuthority,
+    publication: fixture.publication,
+    resolveStoppedWriter() {},
+  });
+  assert.equal("resumePreparedCheckpointCapture" in legacyBackend, false);
+  assert.equal(
+    "preparedCheckpointCaptureContractVersion" in legacyBackend,
+    false,
+  );
+  assert.throws(
+    () => assertPreparedCheckpointCaptureBackend(legacyBackend),
+    (error) => error?.code === "invalid_storage_backend",
+  );
 
   for (const method of [
     "provisionSession",
@@ -1592,6 +1741,23 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
         mutationAuthority: {
           runCapture: fixture.mutation.authority.runCapture,
           runRestore: fixture.mutation.authority.runRestore,
+        },
+        publication: fixture.publication,
+        resolveStoppedWriter() {},
+      }),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
+
+  assert.throws(
+    () =>
+      new StoppedDirectoryBackend({
+        backendId: BACKEND_ID,
+        coordinator: fixture.coordinator,
+        lifecycleBackend: fixture.lifecycle.backend,
+        mutationAuthority: {
+          ...fixture.mutation.authority,
+          runPreparedCapture: undefined,
         },
         publication: fixture.publication,
         resolveStoppedWriter() {},
@@ -1652,6 +1818,8 @@ test("restore context contract negotiation rejects invalid authority shapes with
         runCapture: fixture.mutation.authority.runCapture,
         runCaptureReconciliation:
           fixture.mutation.authority.runCaptureReconciliation,
+        runPreparedCapture:
+          fixture.mutation.authority.runPreparedCapture,
         runRestore: fixture.mutation.authority.runRestore,
       };
       const mutationAuthority = entry.createAuthority(methods, observation);
@@ -1894,6 +2062,208 @@ test("capture composes the real coordinator, publication, journal, and catalogue
   ]) {
     assert.equal(serializedAdmission.includes(forbidden), false);
     assert.equal(serializedCompletion.includes(forbidden), false);
+  }
+});
+
+test("prepared capture resumes from durable attempt authority without local writer capability", async (t) => {
+  const fixture = await createFixture(t);
+  fixture.observation.events.length = 0;
+  const input = captureReconciliationInput(fixture);
+
+  const result = await fixture.backend.resumePreparedCheckpointCapture(input);
+  const completion = fixture.mutation.state.preparedFinalizations[0];
+  const context = fixture.mutation.state.preparedContexts[0];
+
+  assert.deepEqual(result, fixedResult(checkpoint(), input.request));
+  assert.equal(fixture.stopCalls, 0);
+  assert.equal(fixture.resolverCalls, 0);
+  assert.equal(fixture.mutation.state.captureRuns, 0);
+  assert.equal(fixture.mutation.state.preparedRuns, 1);
+  assert.equal(
+    fixture.mutation.state.preparedPublicationInvocations,
+    1,
+  );
+  assert.strictEqual(
+    completion,
+    fixture.mutation.state.preparedCallbackCompletions[0],
+  );
+  assert.equal(completion.replayed, false);
+  exactKeys(context, [
+    "artifactDirectory",
+    "artifactOwnedRoot",
+    "canonicalAttachment",
+    "canonicalLease",
+    "captureAttempt",
+    "contractVersion",
+    "now",
+    "sourceDirectory",
+    "sourceOwnedRoot",
+    "storageRef",
+  ]);
+  assert.equal(context.contractVersion, 1);
+  assert.equal(context.captureAttempt.state, "authorized");
+  assert.strictEqual(
+    context.captureAttempt.binding,
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).binding,
+  );
+  assert.equal(
+    fixture.mutation.state.captureAttempts.get(CAPTURE_OPERATION_ID).state,
+    "committed",
+  );
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
+  assert.deepEqual(fixture.observation.events, [
+    "authority:prepared:start",
+    "publication:prepared",
+    "publication:copied",
+    "authority:prepared:finalized",
+    "authority:prepared:end",
+  ]);
+});
+
+test("prepared capture treats an expired stopped-writer lease as identity rather than new write authority", async (t) => {
+  const fixture = await createFixture(t, {
+    writerLease: lease({ expiresAt: "2026-07-02T11:59:59.000Z" }),
+  });
+  const input = captureReconciliationInput(fixture);
+
+  const result = await fixture.backend.resumePreparedCheckpointCapture(input);
+
+  assert.deepEqual(result, fixedResult(checkpoint(), input.request));
+  assert.equal(fixture.stopCalls, 0);
+  assert.equal(fixture.resolverCalls, 0);
+  assert.equal(fixture.mutation.state.preparedRuns, 1);
+  assert.equal(await pathExists(fixture.artifactDirectory), true);
+});
+
+test("prepared capture rejects tampered expired stopped-writer identity before publication", async (t) => {
+  const cases = [
+    {
+      name: "session ID mismatch",
+      preparedContext: ({ canonicalLease }) => ({
+        canonicalLease: Object.freeze({
+          ...canonicalLease,
+          sessionId: THREAD_ID,
+        }),
+      }),
+    },
+    {
+      name: "lease ID mismatch",
+      preparedContext: ({ canonicalLease }) => ({
+        canonicalLease: Object.freeze({
+          ...canonicalLease,
+          leaseId: "lease-substituted-001",
+        }),
+      }),
+    },
+    {
+      name: "holder ID mismatch",
+      preparedContext: ({ canonicalLease }) => ({
+        canonicalLease: Object.freeze({
+          ...canonicalLease,
+          holderId: "host-substituted-001",
+        }),
+      }),
+    },
+    {
+      name: "fencing epoch mismatch",
+      preparedContext: ({ canonicalLease }) => ({
+        canonicalLease: Object.freeze({
+          ...canonicalLease,
+          fencingEpoch: "12",
+        }),
+      }),
+    },
+    {
+      name: "storage binding mismatch",
+      preparedContext: () => ({
+        storageRef: Object.freeze(
+          storageRef({ storageId: RESTORE_STORAGE_ID }),
+        ),
+      }),
+    },
+    {
+      name: "attachment binding mismatch",
+      preparedContext: ({ captureAttempt }) => ({
+        captureAttempt: Object.freeze({
+          ...captureAttempt,
+          binding: Object.freeze({
+            ...captureAttempt.binding,
+            attachmentId: "attachment-substituted-001",
+          }),
+        }),
+      }),
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (t) => {
+      const writerLease = lease({
+        expiresAt: "2026-07-02T11:59:59.000Z",
+      });
+      const fixture = await createFixture(t, {
+        preparedContext: (_admission, captureAttempt) =>
+          entry.preparedContext({
+            canonicalLease: writerLease,
+            captureAttempt,
+          }),
+        writerLease,
+      });
+
+      await assert.rejects(
+        () =>
+          fixture.backend.resumePreparedCheckpointCapture(
+            captureReconciliationInput(fixture),
+          ),
+        assertBackendError,
+      );
+
+      assert.equal(fixture.mutation.state.preparedRuns, 1);
+      assert.equal(
+        fixture.mutation.state.preparedPublicationInvocations,
+        1,
+      );
+      assert.equal(
+        fixture.mutation.state.preparedCallbackCompletions.length,
+        0,
+      );
+      assert.equal(
+        fixture.mutation.state.preparedFinalizations.length,
+        0,
+      );
+      assert.equal(
+        fixture.observation.events.some((event) =>
+          event.startsWith("publication:"),
+        ),
+        false,
+      );
+      assert.equal(await pathExists(fixture.artifactDirectory), false);
+      assert.deepEqual(await readdir(fixture.journalDirectory), []);
+    });
+  }
+});
+
+test("prepared capture cannot publish when authority does not grant one callback", async (t) => {
+  for (const preparedMode of ["claim-throw", "claim-not-granted", "zero"]) {
+    await t.test(preparedMode, async (t) => {
+      const fixture = await createFixture(t, { preparedMode });
+
+      await assert.rejects(
+        () =>
+          fixture.backend.resumePreparedCheckpointCapture(
+            captureReconciliationInput(fixture),
+          ),
+        assertBackendError,
+      );
+
+      assert.equal(fixture.stopCalls, 0);
+      assert.equal(fixture.resolverCalls, 0);
+      assert.equal(
+        fixture.mutation.state.preparedPublicationInvocations,
+        0,
+      );
+      assert.equal(await pathExists(fixture.artifactDirectory), false);
+      assert.deepEqual(await readdir(fixture.journalDirectory), []);
+    });
   }
 });
 
@@ -4000,10 +4370,19 @@ test("deterministic invalid inputs fail before resolver, authority, publication,
     (error) =>
       assertBackendError(error, "invalid_stopped_directory_backend_request"),
   );
+  await assert.rejects(
+    () =>
+      fixture.backend.resumePreparedCheckpointCapture(
+        invalidReconciliation,
+      ),
+    (error) =>
+      assertBackendError(error, "invalid_stopped_directory_backend_request"),
+  );
   assert.equal(fixture.resolverCalls, 0);
   assert.equal(fixture.mutation.state.captureRuns, 0);
   assert.equal(fixture.mutation.state.restoreRuns, 0);
   assert.equal(fixture.mutation.state.reconciliationRuns, 0);
+  assert.equal(fixture.mutation.state.preparedRuns, 0);
   assert.equal(await pathExists(fixture.artifactDirectory), false);
   assert.equal(await pathExists(fixture.destinationDirectory), false);
 
@@ -4171,6 +4550,81 @@ test("capture reconciliation never adopts prepared or materialized publication s
         "authority:reconciliation:start",
         "authority:reconciliation:end",
       ]);
+    });
+  }
+});
+
+test("prepared capture fresh publication never adopts an existing journal phase", async (t) => {
+  for (const phase of ["prepared", "materialized", "committed"]) {
+    await t.test(phase, async (t) => {
+      let seedFaultEnabled = phase !== "committed";
+      const fixture = await createFixture(t, {
+        publicationFaults: {
+          async afterJournalPrepared() {
+            if (phase === "prepared" && seedFaultEnabled) {
+              throw new Error("prepared resume seed fault");
+            }
+          },
+          async afterMaterialized() {
+            if (phase === "materialized" && seedFaultEnabled) {
+              throw new Error("materialized resume seed fault");
+            }
+          },
+        },
+      });
+      const publicationOptions = capturePublicationOptions(fixture);
+      fixture.observation.preseeding = true;
+      try {
+        if (phase === "committed") {
+          await fixture.publication.publishCheckpointArtifact(
+            publicationOptions,
+          );
+        } else {
+          await assert.rejects(
+            fixture.publication.publishCheckpointArtifact(
+              publicationOptions,
+            ),
+            (error) =>
+              error?.code === "publication_io_failed" &&
+              error.commitState === "not-committed",
+          );
+        }
+      } finally {
+        fixture.observation.preseeding = false;
+      }
+      seedFaultEnabled = false;
+
+      const journalBefore = await fixture.journal.read({
+        operationId: CAPTURE_OPERATION_ID,
+      });
+      assert.equal(journalBefore.record.state, phase);
+      fixture.observation.events.length = 0;
+
+      await assert.rejects(
+        () =>
+          fixture.backend.resumePreparedCheckpointCapture(
+            captureReconciliationInput(fixture),
+          ),
+        assertBackendError,
+      );
+
+      assert.equal(fixture.stopCalls, 0);
+      assert.equal(fixture.resolverCalls, 0);
+      assert.equal(fixture.mutation.state.preparedRuns, 1);
+      assert.equal(
+        fixture.mutation.state.preparedPublicationInvocations,
+        1,
+      );
+      assert.equal(
+        fixture.mutation.state.preparedFinalizations.length,
+        0,
+      );
+      assert.deepEqual(
+        (await fixture.journal.read({
+          operationId: CAPTURE_OPERATION_ID,
+        })).record,
+        journalBefore.record,
+      );
     });
   }
 });

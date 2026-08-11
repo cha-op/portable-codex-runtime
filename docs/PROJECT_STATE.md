@@ -118,14 +118,22 @@
   until it verifies the exact committed journal state; it cannot advance
   `prepared` or `materialized` publication. Claims are retained permanently,
   and tombstones always reject reuse.
-- Bounded checkpoint recovery now enumerates retained `starting` or `uncertain`
-  capture operations through
+- Writer-stop request version 3 closes the durable gap before that capture
+  operation exists. Migration 006 preclaims the exact capture operation ID
+  before stop dispatch; one serializable finalizer commits the complete stop
+  and materializes the matching prepared capture and active session pointer.
+  Fresh V3 reservation is independently default-denied. Cold publication
+  requires a definite prepared-to-starting grant and uses only fresh journal
+  creation; starting or uncertain recovery stays committed-only.
+- Bounded checkpoint recovery now enumerates retained handoff `prepared`,
+  `starting`, or `uncertain` capture operations through
   `PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()`. It uses
   immutable `session_id` keyset order, the existing active-operation index, a
   hard `limit + 1` page query, and same-snapshot relational validation without
   schema DDL. The single-backend recovery service processes one page
-  sequentially from frozen startup configuration and passes only exact durable
-  `{checkpoint, request}` admissions to committed reconciliation. Its
+  sequentially from frozen startup configuration. It routes an exact handoff
+  `prepared` admission to the optional fresh-only resume callback, while
+  `starting` and `uncertain` admissions use committed-only reconciliation. Its
   `reconciled` and `pending` receipts advance the cursor only after settlement;
   sweep completion wraps to null for later replay. Abort signals stop new
   admission but drain the in-flight guard/reconciliation. A service instance
@@ -222,6 +230,12 @@
   committed transition validate. Capture success retires the retained local
   identity; ambiguity never reissues the capability, repeats physical stop, or
   reconstructs a handle.
+- A separate V3 path returns no opaque capture capability. It atomically
+  materializes the prepared capture with the stop, retains local launch
+  exclusion through publication, and permits retirement only after the exact
+  predetermined committed capture result validates. This preserves the legacy
+  V1/V2 capability path while making the new handoff discoverable after a
+  process restart.
 - Restore-generation request version 2 durably records the exact measured
   image, supervisor, and launch-attempt identity before publication begins.
   One serializable authority transition commits the generation, retires the
@@ -341,6 +355,8 @@
   `docs/project_journal/2026/08/2026-08-10-restore-recovery-cursors-5d82a1.md`
 - Durable stop-to-clean-capture composition:
   `docs/project_journal/2026/08/2026-08-05-durable-stop-capture-composition-7e3a91.md`
+- Durable stop-to-prepared-capture handoff:
+  `docs/project_journal/2026/08/2026-08-10-durable-stop-prepared-capture-handoff-d4c6a1.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -354,6 +370,8 @@
   capture, trusted OCI resolution, fencing, and launcher admission.
 - Restore remains intentionally unavailable in the production checkpoint
   adapter. Capture-bound detached activation and bounded no-relaunch recovery
-  now exist, but production still requires a separate explicit fleet
-  capability, adapter composition, durable cursor scheduling, and end-to-end
-  fail-closed validation before `runRestore()` may be enabled.
+  now exist, and the stop-to-prepared-capture handoff is durable. Production
+  still requires the cross-process foreground/recovery lifecycle guard, a
+  recovery scheduler, a separate explicit invocation fleet capability,
+  adapter composition, and end-to-end fail-closed validation before
+  `runRestore()` may be enabled.

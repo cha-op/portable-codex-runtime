@@ -84,9 +84,12 @@ const RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-launch-intent-v2";
 const RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-activation-launch-intent-v1";
+const WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE =
+  "writer-stop-capture-intent-v3";
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2 = 2;
+const WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 = 3;
 const WRITER_LAUNCH_SUPERVISOR_CONTRACT_VERSION = 1;
 const WRITER_LAUNCH_POINTER_CONTRACT_VERSION = 1;
 const LEGACY_SESSION_AUTHORITY_DOCUMENT_VERSION = 1;
@@ -427,6 +430,16 @@ const COMMITTED_WRITER_LAUNCH_STOP_PROOF_KEYS = Object.freeze([
   "operation",
   "reservation",
 ]);
+const WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_PROOF_KEYS = Object.freeze([
+  "before",
+  "capture",
+  "session",
+  "stop",
+]);
+const WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_RELATION_KEYS = Object.freeze([
+  "operation",
+  "reservation",
+]);
 const SESSION_OPERATION_TRANSITION_PROOF_KEYS = Object.freeze([
   "operation",
   "reservation",
@@ -475,6 +488,12 @@ const WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS = Object.freeze([
   "launch",
 ]);
 const WRITER_LAUNCH_STOP_OPERATION_REQUEST_V2_KEYS = Object.freeze([
+  "contractVersion",
+  "dispatchClaimSha256",
+  "launch",
+]);
+const WRITER_LAUNCH_STOP_OPERATION_REQUEST_V3_KEYS = Object.freeze([
+  "captureIntent",
   "contractVersion",
   "dispatchClaimSha256",
   "launch",
@@ -814,6 +833,8 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore destination generation version 2 requires confirmed fleet compatibility",
   writer_launch_attempt_not_authorized:
     "Writer launch attempt is not actively authorized",
+  writer_launch_stop_v3_fleet_capability_required:
+    "Writer launch stop version 3 requires confirmed fleet compatibility",
   session_identity_conflict:
     "Session ID is already bound to a different canonical document",
   session_not_found: "Session is not registered",
@@ -990,11 +1011,17 @@ const LIST_CHECKPOINT_CAPTURE_RECOVERY_FIRST_PAGE_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
     `SELECT ${OPERATION_RETURNING_COLUMNS}`,
-    "FROM session_authority.operation_claims",
-    "WHERE kind = 'checkpoint-capture-v1'",
-    "AND state IN ('starting', 'uncertain')",
-    "AND retired_at IS NULL",
-    "ORDER BY session_id ASC",
+    "FROM session_authority.operation_claims AS capture",
+    "WHERE capture.kind = 'checkpoint-capture-v1'",
+    "AND (capture.state IN ('starting', 'uncertain') OR (",
+    "capture.state = 'prepared' AND EXISTS (",
+    "SELECT 1 FROM session_authority.operation_id_registry AS registry",
+    "WHERE registry.operation_id = capture.operation_id",
+    "AND registry.session_id = capture.session_id",
+    `AND registry.claim_type = '${WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+    "AND registry.materialized_at IS NOT NULL)))",
+    "AND capture.retired_at IS NULL",
+    "ORDER BY capture.session_id ASC",
     "LIMIT $1::integer",
   ].join(" "),
 });
@@ -1002,12 +1029,18 @@ const LIST_CHECKPOINT_CAPTURE_RECOVERY_AFTER_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
     `SELECT ${OPERATION_RETURNING_COLUMNS}`,
-    "FROM session_authority.operation_claims",
-    "WHERE kind = 'checkpoint-capture-v1'",
-    "AND state IN ('starting', 'uncertain')",
-    "AND retired_at IS NULL",
-    "AND session_id > $1::uuid",
-    "ORDER BY session_id ASC",
+    "FROM session_authority.operation_claims AS capture",
+    "WHERE capture.kind = 'checkpoint-capture-v1'",
+    "AND (capture.state IN ('starting', 'uncertain') OR (",
+    "capture.state = 'prepared' AND EXISTS (",
+    "SELECT 1 FROM session_authority.operation_id_registry AS registry",
+    "WHERE registry.operation_id = capture.operation_id",
+    "AND registry.session_id = capture.session_id",
+    `AND registry.claim_type = '${WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+    "AND registry.materialized_at IS NOT NULL)))",
+    "AND capture.retired_at IS NULL",
+    "AND capture.session_id > $1::uuid",
+    "ORDER BY capture.session_id ASC",
     "LIMIT $2::integer",
   ].join(" "),
 });
@@ -1158,6 +1191,18 @@ const INSERT_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
     `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
   ].join(" "),
 });
+const INSERT_WRITER_STOP_CAPTURE_ID_CLAIM_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.operation_id_registry",
+    "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+    "claimed_at, materialized_at)",
+    `VALUES ($1, $2::uuid, '${WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}',`,
+    "$3, $4::jsonb, $5, NULL)",
+    "ON CONFLICT DO NOTHING",
+    `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
 const INSERT_PRECLAIMED_OPERATION_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
@@ -1213,6 +1258,36 @@ const MATERIALIZE_RESTORE_ACTIVATION_LAUNCH_ID_CLAIM_QUERY = Object.freeze({
     "SET materialized_at = $3",
     "WHERE operation_id = $1 AND session_id = $2::uuid",
     `AND claim_type = '${RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+    "AND claimant_operation_id = $4 AND binding = $5::jsonb",
+    "AND materialized_at IS NULL",
+    `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const INSERT_PRECLAIMED_WRITER_STOP_CAPTURE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.operation_claims",
+    "(operation_id, session_id, kind, request, result, state, revision,",
+    "created_at, updated_at, retired_at)",
+    "SELECT $1::character varying(128), $2::uuid, $3, $4::jsonb,",
+    "NULL, 'prepared', 0, $5, $5, NULL",
+    "FROM session_authority.operation_id_registry",
+    "WHERE operation_id = $1::character varying(128)",
+    "AND session_id = $2::uuid",
+    `AND claim_type = '${WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+    "AND claimant_operation_id = $6 AND binding = $7::jsonb",
+    "AND materialized_at = $5",
+    "ON CONFLICT (operation_id) DO NOTHING",
+    `RETURNING ${OPERATION_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const MATERIALIZE_WRITER_STOP_CAPTURE_ID_CLAIM_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "UPDATE session_authority.operation_id_registry",
+    "SET materialized_at = $3",
+    "WHERE operation_id = $1 AND session_id = $2::uuid",
+    `AND claim_type = '${WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
     "AND claimant_operation_id = $4 AND binding = $5::jsonb",
     "AND materialized_at IS NULL",
     `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
@@ -3740,14 +3815,19 @@ function writerLaunchStopOperationRequest(value, expectedSession, code) {
   ensure(
     contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION ||
       contractVersion ===
-        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2,
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2 ||
+      contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3,
     code,
   );
   const request = exactPlainObject(
     value,
     contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION
       ? WRITER_LAUNCH_STOP_OPERATION_REQUEST_KEYS
-      : WRITER_LAUNCH_STOP_OPERATION_REQUEST_V2_KEYS,
+      : contractVersion ===
+          WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+        ? WRITER_LAUNCH_STOP_OPERATION_REQUEST_V2_KEYS
+        : WRITER_LAUNCH_STOP_OPERATION_REQUEST_V3_KEYS,
     code,
   );
   const document = expectedSession.document;
@@ -3764,18 +3844,35 @@ function writerLaunchStopOperationRequest(value, expectedSession, code) {
       canonicalSerialize(launch) === canonicalSerialize(document.launch),
     code,
   );
-  if (contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2) {
+  if (contractVersion !== WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION) {
     ensure(
       typeof request.dispatchClaimSha256 === "string" &&
         regexpTest(SHA256_PATTERN, request.dispatchClaimSha256),
       code,
     );
   }
+  const captureIntent =
+    contractVersion === WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+      ? checkpointCaptureOperationRequest(
+          request.captureIntent,
+          expectedSession,
+          code,
+        )
+      : null;
+  if (captureIntent !== null) {
+    ensure(
+      captureIntent.admission.processIncarnationId ===
+          launch.processIncarnationId &&
+        captureIntent.admission.writerIncarnationId ===
+          launch.writerIncarnationId,
+      code,
+    );
+  }
   return canonicalJsonObject(
     {
+      ...(captureIntent === null ? {} : { captureIntent }),
       contractVersion,
-      ...(contractVersion ===
-      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+      ...(contractVersion !== WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION
         ? { dispatchClaimSha256: request.dispatchClaimSha256 }
         : {}),
       launch,
@@ -3786,13 +3883,17 @@ function writerLaunchStopOperationRequest(value, expectedSession, code) {
 
 export function createWriterLaunchStopOperationRequest(options) {
   const hasClaimToken = hasWriterLaunchStopClaimToken(options);
+  const hasCaptureIntent = hasWriterLaunchStopCaptureIntent(options);
   const normalized = exactPlainObject(
     options,
-    hasClaimToken
+    hasCaptureIntent
+      ? ["captureIntent", "claimToken", "expectedSession"]
+      : hasClaimToken
       ? ["claimToken", "expectedSession"]
       : ["expectedSession"],
     "invalid_operation_request",
   );
+  ensure(!hasCaptureIntent || hasClaimToken, "invalid_operation_request");
   const expectedSession = expectedSnapshotFromValue(
     normalized.expectedSession,
     "invalid_operation_request",
@@ -3800,8 +3901,13 @@ export function createWriterLaunchStopOperationRequest(options) {
   return writerLaunchStopOperationRequest(
     {
       contractVersion: hasClaimToken
-        ? WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+        ? hasCaptureIntent
+          ? WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+          : WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
         : WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION,
+      ...(hasCaptureIntent
+        ? { captureIntent: normalized.captureIntent }
+        : {}),
       ...(hasClaimToken
         ? {
             dispatchClaimSha256: writerLaunchStopClaimSha256(
@@ -4952,6 +5058,17 @@ function writerLaunchStopInput(
     input.expectedSession,
     code,
   );
+  if (
+    request.contractVersion ===
+    WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+  ) {
+    ensure(
+      request.captureIntent.admission.stopOperationId === input.operationId &&
+        request.captureIntent.admission.request.operationId !==
+          input.operationId,
+      code,
+    );
+  }
   return deepFreeze({ ...input, request });
 }
 
@@ -4973,6 +5090,25 @@ function hasWriterLaunchStopClaimToken(options) {
   );
 }
 
+function hasWriterLaunchStopCaptureIntent(options) {
+  return (
+    options !== null &&
+    typeof options === "object" &&
+    !arrayIsArray(options) &&
+    !isProxyValue(options) &&
+    objectHasOwn(options, "captureIntent")
+  );
+}
+
+function writerLaunchStopUsesClaimToken(input) {
+  return (
+    input.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2 ||
+    input.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+  );
+}
+
 function writerLaunchStopClaimSha256(value, code) {
   const claimToken = canonicalWriterLaunchStopClaimToken(value, code);
   return sha256(`${WRITER_LAUNCH_STOP_CLAIM_DOMAIN}\0${claimToken}`);
@@ -4987,8 +5123,7 @@ function writerLaunchStopReconcileInput(options) {
       : OPERATION_INPUT_KEYS,
   );
   ensure(
-    (input.request.contractVersion ===
-      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2) === hasClaimToken,
+    writerLaunchStopUsesClaimToken(input) === hasClaimToken,
     "invalid_operation_request",
   );
   if (!hasClaimToken) return input;
@@ -5027,8 +5162,7 @@ function writerLaunchStopTransitionInput(options) {
   );
   ensure(expectedOperationRevision === "0", "invalid_operation_request");
   ensure(
-    (input.request.contractVersion ===
-      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2) === hasClaimToken,
+    writerLaunchStopUsesClaimToken(input) === hasClaimToken,
     "invalid_operation_request",
   );
   return deepFreeze({
@@ -6969,7 +7103,9 @@ function operationIdClaimSnapshotFromRow(row) {
     ensure(
       (claimType === RESTORE_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE ||
         claimType ===
-          RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE) &&
+          RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE ||
+        claimType ===
+          WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE) &&
         claimantOperationId !== null &&
         claimantOperationId !== operationId &&
         binding !== null &&
@@ -7024,6 +7160,31 @@ function validateRestoreAttachmentActivationLaunchIdClaim(
       claim.claimantOperationId === input.operationId &&
       canonicalSerialize(claim.binding) ===
         canonicalSerialize(input.request.launchIntent) &&
+      (materialization === "either" ||
+        (materialization === "reserved" &&
+          claim.materializedAt === null) ||
+        (materialization === "materialized" &&
+          claim.materializedAt !== null)),
+    "operation_state_invalid",
+  );
+  return claim;
+}
+
+function validateWriterStopCaptureIdClaim(
+  claim,
+  input,
+  materialization,
+) {
+  ensure(
+    input.request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 &&
+      claim.operationId ===
+        input.request.captureIntent.admission.request.operationId &&
+      claim.sessionId === input.expectedSession.sessionId &&
+      claim.claimType === WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE &&
+      claim.claimantOperationId === input.operationId &&
+      canonicalSerialize(claim.binding) ===
+        canonicalSerialize(input.request.captureIntent) &&
       (materialization === "either" ||
         (materialization === "reserved" &&
           claim.materializedAt === null) ||
@@ -8120,6 +8281,124 @@ export function assertCommittedWriterLaunchStopTransitionProof(...args) {
   });
 }
 
+/**
+ * Validates one atomic writer-stop to checkpoint-capture handoff without
+ * depending on private PostgreSQL registry rows.
+ */
+export function assertWriterLaunchStopCaptureHandoffProof(...args) {
+  const code = "operation_state_invalid";
+  ensure(args.length === 1, code);
+  const proof = exactPlainObject(
+    args[0],
+    WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_PROOF_KEYS,
+    code,
+  );
+  const before = expectedSnapshotFromValue(proof.before, code);
+  const session = expectedSnapshotFromValue(proof.session, code);
+  const stopProof = exactPlainObject(
+    proof.stop,
+    WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_RELATION_KEYS,
+    code,
+  );
+  const captureProof = exactPlainObject(
+    proof.capture,
+    WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_RELATION_KEYS,
+    code,
+  );
+  const normalizedStop = canonicalCommittedWriterLaunchStopOperation(
+    stopProof.operation,
+    code,
+  );
+  const stopOperation = normalizedStop.operation;
+  const stopReservation = canonicalCommittedWriterLaunchStopReservation(
+    stopProof.reservation,
+    code,
+  );
+  ensure(
+    normalizedStop.input.request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 &&
+      canonicalSnapshotBytes(stopOperation.expectedSession) ===
+        canonicalSnapshotBytes(before),
+    code,
+  );
+  validateOperationReservation(
+    stopOperation,
+    stopReservation,
+    normalizedStop.input,
+  );
+  const terminalSession = writerLaunchStopTerminalSessionForCaptureHandoff(
+    normalizedStop.input,
+    stopOperation,
+    stopReservation,
+  );
+
+  const normalizedCapture = canonicalPublicOperationTransition(
+    captureProof.operation,
+    code,
+  );
+  const captureOperation = normalizedCapture.operation;
+  const captureReservation = canonicalPublicOperationReservation(
+    captureProof.reservation,
+    code,
+  );
+  const expectedCaptureInput =
+    checkpointCaptureInputForWriterStopHandoff(
+      normalizedStop.input,
+      terminalSession,
+    );
+  ensure(
+    canonicalSnapshotBytes(captureOperation.expectedSession) ===
+        canonicalSnapshotBytes(terminalSession) &&
+      captureOperation.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
+      captureOperation.operationId === expectedCaptureInput.operationId &&
+      canonicalSerialize(captureOperation.request) ===
+        canonicalSerialize(expectedCaptureInput.request) &&
+      captureOperation.createdAt === stopOperation.updatedAt &&
+      captureReservation.createdAt === stopOperation.updatedAt &&
+      (captureOperation.state !== "prepared" ||
+        (captureOperation.updatedAt === stopOperation.updatedAt &&
+          captureReservation.updatedAt === stopOperation.updatedAt)),
+    code,
+  );
+  validateOperationIdentity(captureOperation, expectedCaptureInput);
+  validateOperationReservation(
+    captureOperation,
+    captureReservation,
+    expectedCaptureInput,
+  );
+  if (captureOperation.state === "committed") {
+    canonicalCheckpointCaptureStoredResult(
+      captureOperation.result,
+      expectedCaptureInput,
+      code,
+    );
+    const last = documentLastOperation(session.document);
+    if (last?.operationId === captureOperation.operationId) {
+      validateLastOperationPointer(
+        session,
+        captureOperation,
+        captureReservation,
+      );
+    } else {
+      validateCommittedOperationHistory(captureOperation, session);
+    }
+  } else {
+    validateActivePointer(session, captureOperation, captureReservation);
+  }
+  return deepFreeze({
+    before,
+    capture: deepFreeze({
+      operation: captureOperation,
+      reservation: captureReservation,
+    }),
+    session,
+    stop: deepFreeze({
+      operation: stopOperation,
+      reservation: stopReservation,
+    }),
+  });
+}
+
 function activePointerFor(input, state, operationRevision) {
   return deepFreeze({
     conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
@@ -8336,6 +8615,115 @@ function writerLaunchAttemptInputForRestoreActivationHandoff(
     kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
     operationId: activationInput.request.launchIntent.launchAttemptId,
     request,
+  });
+}
+
+function writerLaunchStopTerminalSessionForCaptureHandoff(
+  input,
+  operation,
+  reservation,
+) {
+  ensure(
+    input.request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 &&
+      operation.state === "committed" &&
+      operation.result?.outcome === "writer-launch-stopped",
+    "operation_state_invalid",
+  );
+  const session = expectedSnapshotFromValue(
+    {
+      createdAt: input.expectedSession.createdAt,
+      document: documentWithAuthorityState(input.expectedSession.document, {
+        activeOperation: null,
+        lastOperation: lastPointerFor(operation, reservation),
+        launch: null,
+      }),
+      revision: revisionAfter(
+        input.expectedSession.revision,
+        BigIntConstructor(operation.revision) + 1n,
+        "operation_state_invalid",
+      ),
+      sessionId: input.expectedSession.sessionId,
+      updatedAt: operation.updatedAt,
+    },
+    "operation_state_invalid",
+  );
+  validateLastOperationPointer(session, operation, reservation);
+  return session;
+}
+
+function checkpointCaptureInputForWriterStopHandoff(
+  stopInput,
+  expectedSession,
+) {
+  ensure(
+    stopInput.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3,
+    "operation_state_invalid",
+  );
+  const request = stopInput.request.captureIntent;
+  return checkpointCaptureInput({
+    expectedSession,
+    kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+    operationId: request.admission.request.operationId,
+    request,
+  });
+}
+
+function writerStopCaptureHandoffReceipt({
+  captureInput,
+  captureOperation,
+  captureReservation,
+  session,
+  stopFinalized,
+  stopInput,
+  stopOperation,
+  stopReservation,
+}) {
+  ensure(
+    captureOperation.createdAt === stopOperation.updatedAt &&
+      captureReservation.createdAt === stopOperation.updatedAt &&
+      (captureOperation.state !== "prepared" ||
+        (captureOperation.updatedAt === stopOperation.updatedAt &&
+          captureReservation.updatedAt === stopOperation.updatedAt)),
+    "operation_state_invalid",
+  );
+  validateOperationIdentity(stopOperation, stopInput);
+  validateOperationReservation(stopOperation, stopReservation, stopInput);
+  validateOperationIdentity(captureOperation, captureInput);
+  validateOperationReservation(
+    captureOperation,
+    captureReservation,
+    captureInput,
+  );
+  validateLastOperationPointer(
+    captureInput.expectedSession,
+    stopOperation,
+    stopReservation,
+  );
+  if (captureOperation.state === "committed") {
+    canonicalCheckpointCaptureStoredResult(
+      captureOperation.result,
+      captureInput,
+      "operation_state_invalid",
+    );
+    validateCommittedOperationHistory(captureOperation, session);
+  } else {
+    validateActivePointer(session, captureOperation, captureReservation);
+  }
+  return deepFreeze({
+    capture: deepFreeze({
+      operation: captureOperation,
+      reservation: captureReservation,
+    }),
+    session,
+    status: captureOperation.state,
+    stop: deepFreeze({
+      finalized: stopFinalized,
+      operation: stopOperation,
+      record: writerLaunchStopRecord(stopInput, stopOperation),
+      reservation: stopReservation,
+    }),
   });
 }
 
@@ -8603,6 +8991,66 @@ function isAtomicRestoreAttachmentActivationLaunchHandoff(
   return true;
 }
 
+function isAtomicWriterStopCaptureHandoff(session, observed) {
+  const active = observed.active;
+  if (
+    active === null ||
+    active.operation.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND
+  ) {
+    return false;
+  }
+  const terminal = observed.terminal;
+  const launchStop = terminal?.launchStop;
+  if (
+    launchStop?.input.request.contractVersion !==
+    WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+  ) {
+    return false;
+  }
+  ensure(
+    terminal !== null &&
+      terminal.operation.state === "committed" &&
+      terminal.operation.result?.outcome === "writer-launch-stopped" &&
+      active.checkpoint !== null &&
+      launchStop.captureIdClaim !== null,
+    "operation_state_invalid",
+  );
+  const terminalSession = writerLaunchStopTerminalSessionForCaptureHandoff(
+    launchStop.input,
+    terminal.operation,
+    terminal.reservation,
+  );
+  const captureInput = checkpointCaptureInputForWriterStopHandoff(
+    launchStop.input,
+    terminalSession,
+  );
+  ensure(
+    canonicalSerialize(active.checkpoint.input) ===
+        canonicalSerialize(captureInput) &&
+      active.operation.createdAt === terminal.operation.updatedAt &&
+      active.reservation.createdAt === terminal.operation.updatedAt &&
+      (active.operation.state !== "prepared" ||
+        (active.operation.updatedAt === terminal.operation.updatedAt &&
+          active.reservation.updatedAt === terminal.operation.updatedAt)) &&
+      launchStop.captureIdClaim.materializedAt ===
+        active.operation.createdAt &&
+      launchStop.captureIdClaim.materializedAt ===
+        terminal.operation.updatedAt,
+    "operation_state_invalid",
+  );
+  writerStopCaptureHandoffReceipt({
+    captureInput,
+    captureOperation: active.operation,
+    captureReservation: active.reservation,
+    session,
+    stopFinalized: false,
+    stopInput: launchStop.input,
+    stopOperation: terminal.operation,
+    stopReservation: terminal.reservation,
+  });
+  return true;
+}
+
 async function readRestoreLaunchHandoffReplay(
   transaction,
   session,
@@ -8736,6 +9184,60 @@ async function readRestoreAttachmentActivationHandoffReplay(
     launchOperation: launchObserved.operation,
     launchReservation: launchObserved.reservation,
     session,
+  });
+}
+
+async function readWriterStopCaptureHandoffReplay(
+  transaction,
+  session,
+  input,
+  observed,
+) {
+  const stopOperation = observed.operation;
+  const stopReservation = observed.reservation;
+  const relation = observed.launchStop;
+  ensure(
+    stopOperation !== null &&
+      stopReservation !== null &&
+      relation !== null &&
+      relation.captureIdClaim !== null &&
+      stopOperation.state === "committed" &&
+      stopOperation.result?.outcome === "writer-launch-stopped",
+    "operation_transition_conflict",
+  );
+  const terminalSession = writerLaunchStopTerminalSessionForCaptureHandoff(
+    input,
+    stopOperation,
+    stopReservation,
+  );
+  const captureInput = checkpointCaptureInputForWriterStopHandoff(
+    input,
+    terminalSession,
+  );
+  const captureObserved = await readRequestedOperation(
+    transaction,
+    session,
+    captureInput,
+    true,
+  );
+  ensure(
+    captureObserved.operation !== null &&
+      captureObserved.reservation !== null &&
+      captureObserved.checkpoint !== null &&
+      relation.captureIdClaim.materializedAt ===
+        captureObserved.operation.createdAt &&
+      relation.captureIdClaim.materializedAt === stopOperation.updatedAt,
+    "operation_transition_conflict",
+  );
+  return writerStopCaptureHandoffReceipt({
+    captureInput,
+    captureOperation: captureObserved.operation,
+    captureReservation: captureObserved.reservation,
+    session,
+    stopFinalized: false,
+    stopInput: input,
+    stopOperation,
+    stopReservation,
   });
 }
 
@@ -9963,6 +10465,41 @@ async function validateWriterLaunchStopRelations(
     forUpdate,
   );
   ensure(originalLaunch !== null, "operation_state_invalid");
+  let captureIdClaim = null;
+  if (
+    input.request.contractVersion ===
+    WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+  ) {
+    captureIdClaim = await readOperationIdClaim(
+      transaction,
+      input.request.captureIntent.admission.request.operationId,
+      forUpdate,
+    );
+    if (
+      operation.state === "prepared" ||
+      operation.result?.outcome === "cancelled-before-dispatch"
+    ) {
+      ensure(captureIdClaim === null, "operation_state_invalid");
+    } else {
+      ensure(captureIdClaim !== null, "operation_state_invalid");
+      validateWriterStopCaptureIdClaim(
+        captureIdClaim,
+        input,
+        operation.state === "committed" ? "materialized" : "reserved",
+      );
+      ensure(
+        timestampMilliseconds(captureIdClaim.claimedAt) >=
+          timestampMilliseconds(operation.createdAt) &&
+          timestampMilliseconds(captureIdClaim.claimedAt) <=
+            timestampMilliseconds(operation.updatedAt) &&
+          (operation.state !== "starting" ||
+            captureIdClaim.claimedAt === operation.updatedAt) &&
+          (operation.state !== "committed" ||
+            captureIdClaim.materializedAt === operation.updatedAt),
+        "operation_state_invalid",
+      );
+    }
+  }
   if (operation.state === "committed") {
     ensure(
       operation.result?.outcome === "writer-launch-stopped" ||
@@ -9978,7 +10515,7 @@ async function validateWriterLaunchStopRelations(
       "operation_state_invalid",
     );
   }
-  return deepFreeze({ input, originalLaunch });
+  return deepFreeze({ captureIdClaim, input, originalLaunch });
 }
 
 async function validateCurrentWriterLaunchRelation(
@@ -10161,6 +10698,19 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       operation,
       reservation,
     });
+  }
+  if (
+    terminal?.launchStop?.input.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 &&
+    terminal.operation.result?.outcome === "writer-launch-stopped"
+  ) {
+    ensure(
+      isAtomicWriterStopCaptureHandoff(
+        session,
+        deepFreeze({ active, terminal }),
+      ),
+      "operation_state_invalid",
+    );
   }
   if (
     active?.operation.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
@@ -10548,6 +11098,11 @@ async function finalizeWriterLaunchAttempt(
 
 async function finalizeWriterLaunchStop(store, options) {
   const input = writerLaunchStopFinalizationInput(options);
+  ensure(
+    input.request.contractVersion !==
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3,
+    "invalid_operation_request",
+  );
   return runSerializable(store, async (transaction) => {
     const session = await readSessionSnapshot(
       transaction,
@@ -10658,12 +11213,228 @@ async function finalizeWriterLaunchStop(store, options) {
   });
 }
 
+async function finalizeWriterLaunchStopAndReserveCheckpointCapture(
+  store,
+  options,
+) {
+  const input = writerLaunchStopFinalizationInput(options);
+  ensure(
+    input.request.contractVersion ===
+      WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3,
+    "invalid_operation_request",
+  );
+  return runSerializable(store, async (transaction) => {
+    const session = await readSessionSnapshot(
+      transaction,
+      input.expectedSession.sessionId,
+      true,
+    );
+    const observed = await readRequestedOperation(
+      transaction,
+      session,
+      input,
+      true,
+    );
+    ensure(
+      observed.operation !== null &&
+        observed.reservation !== null &&
+        observed.launchStop !== null,
+      "operation_transition_conflict",
+    );
+    const result = writerLaunchStopTerminalResult(
+      input,
+      input.evidence,
+      "invalid_operation_request",
+    );
+    if (observed.operation.state === "committed") {
+      ensure(
+        observed.operation.result?.outcome === "writer-launch-stopped" &&
+          BigIntConstructor(input.expectedOperationRevision) + 1n ===
+            BigIntConstructor(observed.operation.revision),
+        "operation_transition_conflict",
+      );
+      ensure(
+        canonicalSerialize(observed.operation.result) ===
+          canonicalSerialize(result),
+        "operation_result_conflict",
+      );
+      return readWriterStopCaptureHandoffReplay(
+        transaction,
+        session,
+        input,
+        observed,
+      );
+    }
+    ensure(
+      (observed.operation.state === "starting" ||
+        observed.operation.state === "uncertain") &&
+        observed.operation.revision === input.expectedOperationRevision &&
+        observed.launchStop.captureIdClaim !== null &&
+        session.document.lifecycle === "ATTACHED" &&
+        session.document.launch !== null &&
+        canonicalSerialize(session.document.launch) ===
+          canonicalSerialize(input.request.launch),
+      "operation_transition_conflict",
+    );
+    revisionAfter(session.revision, 5);
+
+    const materializedRows = rowsFromResult(
+      await transaction.query(
+        MATERIALIZE_WRITER_STOP_CAPTURE_ID_CLAIM_QUERY.text,
+        [
+          input.request.captureIntent.admission.request.operationId,
+          session.sessionId,
+          transaction.now,
+          input.operationId,
+          canonicalSerialize(input.request.captureIntent),
+        ],
+      ),
+      "operation_state_invalid",
+    );
+    ensure(materializedRows.length === 1, "operation_transition_conflict");
+    const materializedClaim = operationIdClaimSnapshotFromRow(
+      materializedRows[0],
+    );
+    validateWriterStopCaptureIdClaim(
+      materializedClaim,
+      input,
+      "materialized",
+    );
+    ensure(
+      materializedClaim.claimedAt ===
+        observed.launchStop.captureIdClaim.claimedAt,
+      "operation_state_invalid",
+    );
+
+    const serializedResult = canonicalSerialize(result);
+    const predecessorState = observed.operation.state;
+    const operationRows = rowsFromResult(
+      await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+        input.operationId,
+        input.expectedOperationRevision,
+        serializedResult,
+        transaction.now,
+        predecessorState,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(operationRows.length === 1, "operation_transition_conflict");
+    const reservationRows = rowsFromResult(
+      await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+        input.operationId,
+        transaction.now,
+        predecessorState,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(reservationRows.length === 1, "operation_transition_conflict");
+    const operation = operationSnapshotFromRow(operationRows[0]);
+    const reservation = reservationSnapshotFromRow(reservationRows[0]);
+    validateOperationIdentity(operation, input);
+    validateOperationReservation(operation, reservation, input);
+    ensure(
+      canonicalSerialize(operation.result) === serializedResult &&
+        materializedClaim.materializedAt === operation.updatedAt,
+      "operation_result_conflict",
+    );
+
+    const terminalDocument = documentWithAuthorityState(session.document, {
+      activeOperation: null,
+      lastOperation: lastPointerFor(operation, reservation),
+      launch: null,
+    });
+    const terminalSession = await updateSessionDocument(
+      transaction,
+      session,
+      input,
+      terminalDocument,
+    );
+    validateLastOperationPointer(terminalSession, operation, reservation);
+
+    const captureInput = checkpointCaptureInputForWriterStopHandoff(
+      input,
+      terminalSession,
+    );
+    const captureOperationRows = rowsFromResult(
+      await transaction.query(
+        INSERT_PRECLAIMED_WRITER_STOP_CAPTURE_QUERY.text,
+        [
+          captureInput.operationId,
+          terminalSession.sessionId,
+          captureInput.kind,
+          captureInput.serializedEnvelope,
+          transaction.now,
+          input.operationId,
+          canonicalSerialize(input.request.captureIntent),
+        ],
+      ),
+      "operation_state_invalid",
+    );
+    ensure(captureOperationRows.length === 1, "operation_identity_conflict");
+    const captureOperation = operationSnapshotFromRow(
+      captureOperationRows[0],
+    );
+    validateOperationIdentity(captureOperation, captureInput);
+
+    const captureReservationRows = rowsFromResult(
+      await transaction.query(INSERT_RESERVATION_QUERY.text, [
+        captureInput.reservationId,
+        captureInput.operationId,
+        terminalSession.sessionId,
+        captureInput.kind,
+        terminalSession.revision,
+        canonicalSerialize(reservationPayload(captureInput)),
+        transaction.now,
+      ]),
+      "operation_state_invalid",
+    );
+    ensure(captureReservationRows.length === 1, "operation_state_invalid");
+    const captureReservation = reservationSnapshotFromRow(
+      captureReservationRows[0],
+    );
+    validateOperationReservation(
+      captureOperation,
+      captureReservation,
+      captureInput,
+    );
+    ensure(
+      captureOperation.createdAt === operation.updatedAt &&
+        captureReservation.createdAt === operation.updatedAt,
+      "operation_state_invalid",
+    );
+
+    const updatedSession = await updateSessionPhase(
+      transaction,
+      terminalSession,
+      captureInput,
+      activePointerFor(captureInput, "prepared", "0"),
+    );
+    validateActivePointer(
+      updatedSession,
+      captureOperation,
+      captureReservation,
+    );
+    return writerStopCaptureHandoffReceipt({
+      captureInput,
+      captureOperation,
+      captureReservation,
+      session: updatedSession,
+      stopFinalized: true,
+      stopInput: input,
+      stopOperation: operation,
+      stopReservation: reservation,
+    });
+  });
+}
+
 export class PostgresSessionAuthority {
   #restoreAttachmentActivationV2FleetCompatible;
 
   #restoreAttachmentActivationV2GenerationPredecessorFleetCompatible;
 
   #restoreGenerationV2FleetCompatible;
+
+  #writerLaunchStopV3FleetCompatible;
 
   #store;
 
@@ -10700,7 +11471,12 @@ export class PostgresSessionAuthority {
           "restoreAttachmentActivationV2GenerationPredecessorFleetCompatible",
         ],
       );
-    const expectedOptionKeys =
+    const hasWriterLaunchStopV3FleetCompatible = reflectApply(
+      arrayIncludesIntrinsic,
+      optionKeys,
+      ["writerLaunchStopV3FleetCompatible"],
+    );
+    const baseExpectedOptionKeys =
       hasRestoreAttachmentActivationV2FleetCompatible
         ? hasRestoreAttachmentActivationV2GenerationPredecessorFleetCompatible
           ? hasRestoreGenerationV2FleetCompatible
@@ -10736,6 +11512,21 @@ export class PostgresSessionAuthority {
           : hasRestoreGenerationV2FleetCompatible
             ? ["restoreGenerationV2FleetCompatible", "store"]
             : ["store"];
+    let expectedOptionKeys = baseExpectedOptionKeys;
+    if (hasWriterLaunchStopV3FleetCompatible) {
+      expectedOptionKeys = new ArrayConstructor(
+        baseExpectedOptionKeys.length + 1,
+      );
+      for (
+        let index = 0;
+        index < baseExpectedOptionKeys.length;
+        index += 1
+      ) {
+        expectedOptionKeys[index] = baseExpectedOptionKeys[index];
+      }
+      expectedOptionKeys[baseExpectedOptionKeys.length] =
+        "writerLaunchStopV3FleetCompatible";
+    }
     const normalized = exactPlainObject(
       options,
       expectedOptionKeys,
@@ -10767,6 +11558,9 @@ export class PostgresSessionAuthority {
             "boolean") &&
         (!hasRestoreGenerationV2FleetCompatible ||
           typeof normalized.restoreGenerationV2FleetCompatible ===
+            "boolean") &&
+        (!hasWriterLaunchStopV3FleetCompatible ||
+          typeof normalized.writerLaunchStopV3FleetCompatible ===
             "boolean"),
       "invalid_authority_options",
     );
@@ -10777,6 +11571,8 @@ export class PostgresSessionAuthority {
       true;
     this.#restoreGenerationV2FleetCompatible =
       normalized.restoreGenerationV2FleetCompatible === true;
+    this.#writerLaunchStopV3FleetCompatible =
+      normalized.writerLaunchStopV3FleetCompatible === true;
     this.#store = normalized.store;
     objectFreeze(this);
   }
@@ -10879,7 +11675,8 @@ export class PostgresSessionAuthority {
         );
         ensure(
           operation.kind === CHECKPOINT_CAPTURE_OPERATION_KIND &&
-            (operation.state === "starting" ||
+            (operation.state === "prepared" ||
+              operation.state === "starting" ||
               operation.state === "uncertain") &&
             operation.retiredAt === null &&
             (previousSessionId === null ||
@@ -10923,19 +11720,30 @@ export class PostgresSessionAuthority {
             observed.active.operation.operationId === operation.operationId &&
             observed.operation !== null &&
             observed.reservation !== null &&
-            observed.checkpoint?.attempt !== null &&
-            observed.checkpoint?.attempt !== undefined &&
+            observed.checkpoint !== null &&
             observed.checkpoint.catalogue === null &&
-            (observed.operation.state === "starting" ||
+            (observed.operation.state === "prepared" ||
+              observed.operation.state === "starting" ||
               observed.operation.state === "uncertain") &&
+            ((observed.operation.state === "prepared" &&
+              observed.checkpoint.attempt === null) ||
+              (observed.operation.state !== "prepared" &&
+                observed.checkpoint.attempt !== null)) &&
             canonicalSerialize(observed.operation) ===
               canonicalSerialize(operation),
           "operation_state_invalid",
         );
+        if (observed.operation.state === "prepared") {
+          ensure(
+            isAtomicWriterStopCaptureHandoff(session, observed),
+            "operation_state_invalid",
+          );
+        }
         if (index < candidateCount) {
           candidates[index] = deepFreeze({
             checkpoint: input.request.admission.checkpoint,
             request: durableRequest,
+            state: observed.operation.state,
           });
           lastCandidateSessionId = durableRequest.sessionId;
         }
@@ -11378,6 +12186,13 @@ export class PostgresSessionAuthority {
             this.#restoreAttachmentActivationV2FleetCompatible,
           "restore_attachment_activation_v2_fleet_capability_required",
         );
+        ensure(
+          input.kind !== WRITER_LAUNCH_STOP_OPERATION_KIND ||
+            input.request.contractVersion !==
+              WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 ||
+            this.#writerLaunchStopV3FleetCompatible,
+          "writer_launch_stop_v3_fleet_capability_required",
+        );
         if (
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
           input.expectedSession.document.attachment === null
@@ -11556,9 +12371,29 @@ export class PostgresSessionAuthority {
           observed.reservation !== null && observed.launchStop !== null,
           "operation_state_invalid",
         );
+        if (
+          input.request.contractVersion ===
+            WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 &&
+          observed.operation.state === "committed" &&
+          observed.operation.result?.outcome === "writer-launch-stopped"
+        ) {
+          const handoff = await readWriterStopCaptureHandoffReplay(
+            transaction,
+            session,
+            input,
+            observed,
+          );
+          return deepFreeze({
+            ...handoff,
+            claimTokenMatched:
+              writerLaunchStopClaimSha256(
+                input.claimToken,
+                "invalid_operation_request",
+              ) === input.request.dispatchClaimSha256,
+          });
+        }
         return operationReceipt({
-          ...(input.request.contractVersion ===
-          WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+          ...(writerLaunchStopUsesClaimToken(input)
             ? {
                 claimTokenMatched:
                   writerLaunchStopClaimSha256(
@@ -11594,8 +12429,7 @@ export class PostgresSessionAuthority {
         );
       }
       return operationReceipt({
-        ...(input.request.contractVersion ===
-        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2
+        ...(writerLaunchStopUsesClaimToken(input)
           ? { claimTokenMatched: false }
           : {}),
         expectedSessionMatched,
@@ -11740,6 +12574,8 @@ export class PostgresSessionAuthority {
             canonicalSerialize(input.request.admission.attachment),
         "operation_transition_conflict",
       );
+      const atomicWriterStopCaptureHandoff =
+        isAtomicWriterStopCaptureHandoff(session, observed);
       revisionAfter(session.revision, 3);
       const authorityNow = await readAuthorityClock(transaction);
       ensure(
@@ -11747,20 +12583,22 @@ export class PostgresSessionAuthority {
           timestampMilliseconds(transaction.now),
         "session_state_invalid",
       );
-      ensure(
-        timestampMilliseconds(session.document.lease.expiresAt) >
-          timestampMilliseconds(authorityNow),
-        "writer_lease_expired",
-      );
-      try {
-        assertStorageMutationMatchesLeaseSnapshot({
-          canonicalLease: session.document.lease,
-          now: timestampMilliseconds(authorityNow),
-          request: input.request.admission.request,
-          storageRef: session.document.storageRef,
-        });
-      } catch {
-        fail("operation_transition_conflict");
+      if (!atomicWriterStopCaptureHandoff) {
+        ensure(
+          timestampMilliseconds(session.document.lease.expiresAt) >
+            timestampMilliseconds(authorityNow),
+          "writer_lease_expired",
+        );
+        try {
+          assertStorageMutationMatchesLeaseSnapshot({
+            canonicalLease: session.document.lease,
+            now: timestampMilliseconds(authorityNow),
+            request: input.request.admission.request,
+            storageRef: session.document.storageRef,
+          });
+        } catch {
+          fail("operation_transition_conflict");
+        }
       }
 
       const binding = checkpointCaptureBinding(input);
@@ -11994,9 +12832,27 @@ export class PostgresSessionAuthority {
       ensure(
         observed.operation !== null &&
           observed.reservation !== null &&
-          observed.checkpoint?.attempt !== null &&
-          observed.checkpoint?.attempt !== undefined &&
-          observed.operation.state !== "prepared",
+          observed.checkpoint !== null,
+        "checkpoint_capture_not_authorized",
+      );
+      if (observed.operation.state === "prepared") {
+        ensure(
+          observed.checkpoint.attempt === null &&
+            observed.checkpoint.catalogue === null &&
+            isAtomicWriterStopCaptureHandoff(session, observed),
+          "checkpoint_capture_not_authorized",
+        );
+        return operationReceipt({
+          attempt: null,
+          catalogue: null,
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+          status: "prepared",
+        });
+      }
+      ensure(
+        observed.checkpoint.attempt !== null,
         "checkpoint_capture_not_authorized",
       );
       const attempt = checkpointCaptureAttemptRecord(
@@ -13406,9 +14262,7 @@ export class PostgresSessionAuthority {
           observed.launchStop !== null,
         "operation_transition_conflict",
       );
-      const usesClaimToken =
-        input.request.contractVersion ===
-        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V2;
+      const usesClaimToken = writerLaunchStopUsesClaimToken(input);
       const claimTokenMatched =
         usesClaimToken &&
         writerLaunchStopClaimSha256(
@@ -13448,7 +14302,39 @@ export class PostgresSessionAuthority {
           stop: writerLaunchStopRecord(input, observed.operation),
         });
       }
-      revisionAfter(session.revision, 3);
+      revisionAfter(
+        session.revision,
+        input.request.contractVersion ===
+          WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+          ? 7
+          : 3,
+      );
+      let captureIdClaim = null;
+      if (
+        input.request.contractVersion ===
+        WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3
+      ) {
+        const claimRows = rowsFromResult(
+          await transaction.query(
+            INSERT_WRITER_STOP_CAPTURE_ID_CLAIM_QUERY.text,
+            [
+              input.request.captureIntent.admission.request.operationId,
+              session.sessionId,
+              input.operationId,
+              canonicalSerialize(input.request.captureIntent),
+              transaction.now,
+            ],
+          ),
+          "operation_state_invalid",
+        );
+        ensure(claimRows.length === 1, "operation_identity_conflict");
+        captureIdClaim = operationIdClaimSnapshotFromRow(claimRows[0]);
+        validateWriterStopCaptureIdClaim(
+          captureIdClaim,
+          input,
+          "reserved",
+        );
+      }
       const operationRows = rowsFromResult(
         await transaction.query(START_OPERATION_QUERY.text, [
           input.operationId,
@@ -13470,6 +14356,12 @@ export class PostgresSessionAuthority {
       const reservation = reservationSnapshotFromRow(reservationRows[0]);
       validateOperationIdentity(operation, input);
       validateOperationReservation(operation, reservation, input);
+      if (captureIdClaim !== null) {
+        ensure(
+          captureIdClaim.claimedAt === operation.updatedAt,
+          "operation_state_invalid",
+        );
+      }
       const updatedSession = await updateSessionPhase(
         transaction,
         session,
@@ -13491,6 +14383,13 @@ export class PostgresSessionAuthority {
 
   async finalizeWriterLaunchStopped(options) {
     return finalizeWriterLaunchStop(this.#store, options);
+  }
+
+  async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(options) {
+    return finalizeWriterLaunchStopAndReserveCheckpointCapture(
+      this.#store,
+      options,
+    );
   }
 
   async readWriterLaunchAttempt(options) {
@@ -14719,6 +15618,10 @@ export class PostgresSessionAuthority {
       ensure(
         observed.operation.state === "prepared" &&
           observed.operation.revision === input.expectedOperationRevision,
+        "operation_transition_conflict",
+      );
+      ensure(
+        !isAtomicWriterStopCaptureHandoff(session, observed),
         "operation_transition_conflict",
       );
       const atomicRestoreLaunchHandoff =

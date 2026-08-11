@@ -382,6 +382,7 @@ class MemoryLaunchAuthority {
       finalizeStarted: 0,
       finalizeStopped: 0,
       finalizeWriterStopped: 0,
+      finalizeWriterStoppedAndCapture: 0,
       markUncertain: 0,
       read: 0,
       reserve: 0,
@@ -684,6 +685,93 @@ class MemoryLaunchAuthority {
     return session;
   }
 
+  stopTerminalSessionForCapture() {
+    const operation = this.stopOperation();
+    const reservation = this.stopReservation(operation);
+    const session = clone(this.stopBaseInput.expectedSession);
+    session.document.documentVersion = SESSION_AUTHORITY_DOCUMENT_VERSION;
+    session.document.activeOperation = null;
+    session.document.lastOperation = terminalPointer(operation, reservation);
+    session.document.launch = null;
+    session.revision = (
+      BigInt(this.stopBaseInput.expectedSession.revision) +
+      BigInt(operation.revision) +
+      1n
+    ).toString();
+    session.updatedAt = operation.updatedAt;
+    return session;
+  }
+
+  captureOperation() {
+    const expectedSession = this.stopTerminalSessionForCapture();
+    const request = clone(this.stopBaseInput.request.captureIntent);
+    return {
+      operationId: request.admission.request.operationId,
+      sessionId: expectedSession.sessionId,
+      kind: "checkpoint-capture-v1",
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      expectedSession,
+      request,
+      requestSha256: operationRequestSha256(expectedSession, request),
+      state: "prepared",
+      revision: "0",
+      result: null,
+      createdAt: STOP_COMMITTED_TIME,
+      updatedAt: STOP_COMMITTED_TIME,
+      retiredAt: null,
+    };
+  }
+
+  captureReservation(operation = this.captureOperation()) {
+    return {
+      reservationId: `reservation-${textSha256(operation.operationId)}`,
+      operationId: operation.operationId,
+      sessionId: operation.sessionId,
+      kind: operation.kind,
+      expectedSessionRevision: operation.expectedSession.revision,
+      state: "prepared",
+      conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+      requestSha256: operation.requestSha256,
+      createdAt: STOP_COMMITTED_TIME,
+      updatedAt: STOP_COMMITTED_TIME,
+      expiresAt: null,
+      releasedAt: null,
+    };
+  }
+
+  captureSession(
+    operation = this.captureOperation(),
+    reservation = this.captureReservation(operation),
+  ) {
+    const session = clone(operation.expectedSession);
+    session.document.activeOperation = activePointer(operation, reservation);
+    session.revision = (BigInt(operation.expectedSession.revision) + 1n).toString();
+    session.updatedAt = operation.updatedAt;
+    return session;
+  }
+
+  stopCaptureHandoffReceipt(finalized, claimTokenMatched) {
+    const stopOperation = this.stopOperation();
+    const stopReservation = this.stopReservation(stopOperation);
+    const captureOperation = this.captureOperation();
+    const captureReservation = this.captureReservation(captureOperation);
+    return {
+      ...(claimTokenMatched === undefined ? {} : { claimTokenMatched }),
+      capture: {
+        operation: captureOperation,
+        reservation: captureReservation,
+      },
+      session: this.captureSession(captureOperation, captureReservation),
+      status: "prepared",
+      stop: {
+        finalized,
+        operation: stopOperation,
+        record: this.stopRecord(stopOperation),
+        reservation: stopReservation,
+      },
+    };
+  }
+
   async readSession() {
     this.events.push("authority.read-session");
     if (this.behaviour.readSessionThrows) {
@@ -831,6 +919,12 @@ class MemoryLaunchAuthority {
       session: this.stopSession(operation, reservation),
       status: operation.state,
     };
+    if (
+      this.stopState === "committed" &&
+      this.stopBaseInput.request.contractVersion === 3
+    ) {
+      return this.stopCaptureHandoffReceipt(false, claimTokenMatched);
+    }
     return this.stopReconcileMutation === null
       ? receipt
       : this.stopReconcileMutation(clone(receipt));
@@ -1174,6 +1268,50 @@ class MemoryLaunchAuthority {
       ? receipt
       : this.stopFinalizationMutation(clone(receipt));
   }
+
+  async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(input) {
+    this.calls.finalizeWriterStoppedAndCapture += 1;
+    this.events.push("authority.finalize-writer-stopped-and-capture");
+    const expectedOperationRevision =
+      this.stopState === "uncertain" || this.stopTerminalRevision === "3"
+        ? "2"
+        : "1";
+    assert.deepEqual(
+      JSON.parse(jsonStringify(input)),
+      JSON.parse(
+        jsonStringify({
+          ...this.stopBaseInput,
+          evidence: input.evidence,
+          expectedOperationRevision,
+        }),
+      ),
+    );
+    if (this.stopState === "committed") {
+      return this.stopCaptureHandoffReceipt(false);
+    }
+    assert.ok(
+      this.stopState === "starting" || this.stopState === "uncertain",
+    );
+    if (this.behaviour.stopFinalizeThrowBeforeCommit) {
+      throw new Error("atomic stop-capture finalization unavailable");
+    }
+    const predecessor = this.stopState;
+    this.stopState = "committed";
+    this.stopTerminalRevision = predecessor === "starting" ? "2" : "3";
+    this.stopResult = {
+      evidence: clone(input.evidence),
+      outcome: "writer-launch-stopped",
+      resultVersion: 1,
+    };
+    if (
+      this.behaviour.stopFinalizeThrowAfterCommit ||
+      this.behaviour.stopFinalizeThrowAfterCommitAlways
+    ) {
+      this.behaviour.stopFinalizeThrowAfterCommit = false;
+      throw new Error("lost atomic stop-capture finalization acknowledgement");
+    }
+    return this.stopCaptureHandoffReceipt(true);
+  }
 }
 
 class MemoryOperationGuard {
@@ -1277,6 +1415,18 @@ function captureRequest() {
       artifactId: ARTIFACT_ID,
       checkpointId: CHECKPOINT_ID,
       kind: "checkpoint",
+    },
+  };
+}
+
+function captureResult(imageDigest) {
+  const request = captureRequest();
+  return {
+    checkpoint: checkpoint(imageDigest),
+    mutation: {
+      ...request,
+      proofId: "checkpoint-proof-001",
+      status: "checkpoint-created",
     },
   };
 }
@@ -1686,10 +1836,12 @@ test("exports one exact frozen facade and starts/registers before durable finali
     "prepareLaunchIntent",
     "reconcileLaunchAttempt",
     "resolveStoppedWriter",
+    "retirePreparedCapture",
     "retireStoppedWriter",
     "runLaunch",
     "runPreparedLaunch",
     "stopWriterForCapture",
+    "stopWriterForPreparedCapture",
   ]);
   assert.equal(Object.getPrototypeOf(value.facade), null);
   assert.equal(Object.isFrozen(value.facade), true);
@@ -1827,6 +1979,250 @@ test("stop finalization acknowledgement loss replays without a second physical s
   assert.equal(value.authority.calls.finalizeWriterStopped, 2);
   assert.equal(value.authority.calls.markUncertain, 0);
   assert.equal(value.authority.stopState, "committed");
+});
+
+test("prepared capture stop atomically materializes one durable capture handoff", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+
+  const stopped = await value.facade.stopWriterForPreparedCapture(
+    resolverInput(value),
+  );
+
+  assert.deepEqual(Reflect.ownKeys(stopped), [
+    "capture",
+    "evidence",
+    "resolution",
+    "session",
+    "status",
+    "stop",
+  ]);
+  assert.equal(Object.hasOwn(stopped, "capability"), false);
+  assert.equal(stopped.status, "prepared");
+  assert.equal(stopped.capture.operation.state, "prepared");
+  assert.equal(stopped.capture.reservation.state, "prepared");
+  assert.equal(stopped.stop.operation.request.contractVersion, 3);
+  assert.equal(
+    stopped.stop.operation.request.captureIntent.admission.request.operationId,
+    CAPTURE_OPERATION_ID,
+  );
+  assert.equal(
+    stopped.capture.operation.expectedSession.document.lastOperation.operationId,
+    stopped.stop.operation.operationId,
+  );
+  assert.equal(
+    stopped.session.document.activeOperation.operationId,
+    CAPTURE_OPERATION_ID,
+  );
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+  assert.equal(value.authority.calls.finalizeWriterStoppedAndCapture, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  assert.throws(
+    () => value.facade.retireStoppedWriter(stopped.resolution),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  const replacementLease = lease({
+    fencingEpoch: "12",
+    holderId: "host-002",
+    leaseId: "lease-002",
+  });
+  const replacementAdmission = {
+    attachment: attachment(replacementLease, {
+      attachmentId: "attachment-002",
+    }),
+    canonicalLease: replacementLease,
+  };
+  assert.throws(
+    () =>
+      value.stoppedWriterCoordinator.assertWriterLaunchAvailable(
+        replacementAdmission,
+      ),
+    (error) =>
+      error instanceof StoppedWriterCapabilityError &&
+      error.code === "writer_state_conflict",
+  );
+  assert.throws(
+    () =>
+      value.facade.retirePreparedCapture({
+        resolution: stopped.resolution,
+        result: captureResult(value.image.manifest.runtime.imageDigest),
+      }),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  const result = value.facade.retirePreparedCapture({
+    resolution: stopped.resolution,
+    result: stopped.stop.operation.request.captureIntent.predeterminedResult,
+  });
+  assert.equal(result.mutation.status, "checkpoint-created");
+  assert.equal(
+    value.stoppedWriterCoordinator.assertWriterLaunchAvailable(
+      replacementAdmission,
+    ),
+    undefined,
+  );
+});
+
+test("prepared capture stop replays only the exact retained handoff", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const capture = resolverInput(value);
+
+  const stopped = await value.facade.stopWriterForPreparedCapture(capture);
+  const authorityCallsAfterStop = clone(value.authority.calls);
+  const guardCallsAfterStop = value.operationGuard.calls;
+
+  const replayed = await value.facade.stopWriterForPreparedCapture(capture);
+
+  assert.strictEqual(replayed, stopped);
+  assert.equal(Object.isFrozen(replayed), true);
+  assert.equal(value.operationGuard.calls, guardCallsAfterStop + 1);
+  assert.deepEqual(value.authority.calls, authorityCallsAfterStop);
+  assert.equal(value.supervisorStopCalls, 1);
+
+  const mismatchedCapture = clone(capture);
+  mismatchedCapture.request.operationId =
+    "checkpoint-capture-operation-mismatch";
+  await assert.rejects(
+    value.facade.stopWriterForPreparedCapture(mismatchedCapture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  await assert.rejects(
+    value.facade.stopWriterForCapture(capture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.deepEqual(value.authority.calls, authorityCallsAfterStop);
+  assert.equal(value.supervisorStopCalls, 1);
+
+  value.facade.retirePreparedCapture({
+    resolution: stopped.resolution,
+    result: stopped.stop.operation.request.captureIntent.predeterminedResult,
+  });
+  await assert.rejects(
+    value.facade.stopWriterForPreparedCapture(capture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.deepEqual(value.authority.calls, authorityCallsAfterStop);
+  assert.equal(value.supervisorStopCalls, 1);
+});
+
+test("real launcher retry reconciles a retained prepared capture without republishing", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const capture = resolverInput(value);
+  let stoppedReceipt = null;
+  let resumeInvocations = 0;
+  let reconciliationInvocations = 0;
+  let physicalPublications = 0;
+  let committedResult = null;
+
+  const stopWriterForPreparedCapture = async function (input) {
+    stoppedReceipt = await value.facade.stopWriterForPreparedCapture(input);
+    return stoppedReceipt;
+  };
+  Object.freeze(stopWriterForPreparedCapture);
+  const launcher = Object.freeze({
+    retirePreparedCapture: value.facade.retirePreparedCapture,
+    retireStoppedWriter: value.facade.retireStoppedWriter,
+    stopWriterForCapture: value.facade.stopWriterForCapture,
+    stopWriterForPreparedCapture,
+  });
+
+  const operation = async () => undefined;
+  const backend = {
+    backendId: BACKEND_ID,
+    capabilities: backendCapabilities(),
+    captureReconciliationContractVersion: 1,
+    contractVersion: 1,
+    destroySession: operation,
+    detachAttachment: operation,
+    forceFence: operation,
+    prepareWritableAttachment: operation,
+    preparedCheckpointCaptureContractVersion: 1,
+    provisionSession: operation,
+    async reconcileCheckpointCapture() {
+      reconciliationInvocations += 1;
+      assert.notEqual(committedResult, null);
+      if (reconciliationInvocations === 1) {
+        throw new Error("committed publication is not visible yet");
+      }
+      return committedResult;
+    },
+    async resumePreparedCheckpointCapture() {
+      resumeInvocations += 1;
+      if (resumeInvocations === 1) {
+        physicalPublications += 1;
+        committedResult =
+          stoppedReceipt.capture.operation.request.predeterminedResult;
+        throw new Error("publication acknowledgement lost");
+      }
+      throw new Error("durable capture is no longer prepared");
+    },
+    restoreCheckpoint: operation,
+    captureCheckpoint: operation,
+  };
+  const composition = createPostgresDurableStopCaptureComposition({ launcher });
+  const options = {
+    attachment: capture.attachment,
+    backend,
+    canonicalLease: lease(),
+    checkpointClass: capture.checkpoint.checkpointClass,
+    createdAt: capture.checkpoint.createdAt,
+    manifest: value.image.manifest,
+    now: Date.parse(BASE_TIME),
+    request: capture.request,
+    storageRef: storageRef(),
+  };
+
+  await assert.rejects(
+    composition.runPreparedCapture(options),
+    (error) => {
+      assert.equal(
+        error?.code,
+        "postgres_durable_stop_capture_composition_outcome_uncertain",
+      );
+      return true;
+    },
+  );
+  assert.equal(physicalPublications, 1);
+  assert.equal(resumeInvocations, 1);
+  assert.equal(reconciliationInvocations, 1);
+  assert.equal(value.supervisorStopCalls, 1);
+
+  const result = await composition.runPreparedCapture(options);
+
+  assert.deepEqual(result, structuredClone(committedResult));
+  assert.equal(physicalPublications, 1);
+  assert.equal(resumeInvocations, 2);
+  assert.equal(reconciliationInvocations, 2);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.throws(
+    () => value.facade.resolveStoppedWriter(capture),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.stoppedWriterCoordinator.dispose(), undefined);
+});
+
+test("prepared capture handoff acknowledgement loss uses exact atomic readback", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  value.authority.behaviour.stopFinalizeThrowAfterCommit = true;
+
+  const stopped = await value.facade.stopWriterForPreparedCapture(
+    resolverInput(value),
+  );
+
+  assert.equal(stopped.status, "prepared");
+  assert.equal(stopped.stop.finalized, false);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(value.authority.calls.finalizeWriterStopped, 0);
+  assert.equal(value.authority.calls.finalizeWriterStoppedAndCapture, 1);
+  assert.equal(value.authority.calls.stopReconcile, 1);
+  assert.equal(value.authority.calls.markUncertain, 0);
+  value.facade.retirePreparedCapture({
+    resolution: stopped.resolution,
+    result: stopped.stop.operation.request.captureIntent.predeterminedResult,
+  });
 });
 
 test("persistent stop finalization acknowledgement loss uses exact terminal readback", async () => {

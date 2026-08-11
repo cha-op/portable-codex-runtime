@@ -5,7 +5,7 @@ import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 5;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 6;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
@@ -117,6 +117,13 @@ const MIGRATION_SOURCES = objectFreeze([
       import.meta.url,
     ),
     version: 5,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/006-writer-stop-capture-handoff.sql",
+      import.meta.url,
+    ),
+    version: 6,
   }),
 ]);
 

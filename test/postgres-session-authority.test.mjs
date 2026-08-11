@@ -556,6 +556,7 @@ function authorityWithScripts(...scripts) {
       restoreAttachmentActivationV2FleetCompatible: true,
       restoreGenerationV2FleetCompatible: true,
       store,
+      writerLaunchStopV3FleetCompatible: true,
     }),
     clients,
     pool,
@@ -1081,6 +1082,7 @@ test("registration and read input validation happen before PostgreSQL access", a
   for (const options of [
     { restoreGenerationV2FleetCompatible: "true", store },
     { restoreAttachmentActivationV2FleetCompatible: 1, store },
+    { store, writerLaunchStopV3FleetCompatible: "true" },
     {
       restoreAttachmentActivationV2FleetCompatible: true,
       restoreGenerationV2FleetCompatible: null,
@@ -1098,6 +1100,7 @@ test("registration and read input validation happen before PostgreSQL access", a
     { store },
     { restoreGenerationV2FleetCompatible: false, store },
     { restoreAttachmentActivationV2FleetCompatible: true, store },
+    { store, writerLaunchStopV3FleetCompatible: false },
     {
       restoreAttachmentActivationV2FleetCompatible: false,
       restoreGenerationV2FleetCompatible: true,

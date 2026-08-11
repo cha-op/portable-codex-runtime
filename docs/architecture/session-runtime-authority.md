@@ -8,8 +8,8 @@ The implemented authority provides:
 - database-authoritative transaction time;
 - bounded, provenance-aware serialization and deadlock retry;
 - an ordered, checksum-bound authority migration chain;
-- a permanent global operation-ID registry shared by direct operations and
-  restore-bound launch intents;
+- a permanent global operation-ID registry shared by direct operations,
+  restore-bound launch intents, and V3 writer-stop capture intents;
 - permanent relational and typed state-machine authority for restore
   destination generations;
 - real-PostgreSQL migration and concurrency tests;
@@ -22,17 +22,21 @@ The implemented authority provides:
   reconciliation;
 - production clean-checkpoint capture admission, durable attempt claims, and
   exact checkpoint-catalogue finalization;
-- committed-only, source-free capture reconciliation;
+- one fresh-only prepared-capture dispatch path plus committed-only,
+  source-free active-capture reconciliation;
 - typed durable writer-launch attempt reservation, single dispatch, exact
   started/stopped finalization, readback, and bounded recovery;
 - a hardened process-local logical-writer-launcher facade with exact image
   consumption, external launch, provisional writer registration, and
   no-relaunch reconciliation;
 - typed launch-stop authority plus bounded prepared/active/current-launch
-  discovery; and
-- a same-process durable stop-to-clean-capture composition that joins the
-  complete prepared tuple, exact supervisor stop evidence, committed stop
+  discovery;
+- a legacy same-process durable stop-to-clean-capture composition that joins
+  the complete prepared tuple, exact supervisor stop evidence, committed stop
   transition, and one opaque stopped-writer capability;
+- a V3 durable stop-to-prepared-capture handoff that preclaims the exact
+  capture operation before physical stop, commits stop and prepared capture
+  atomically, and resumes that fixed capture without a new capability;
 - capture-bound detached activation with atomic prepared-launch
   materialization; and
 - bounded no-relaunch restore recovery with durable cursor primitives.
@@ -55,13 +59,17 @@ exact current session, measured image, and trusted supervisor outcome without
 calling a launcher. The logical-launcher foundation now composes the original
 one-use image capability, external launch callback, and exact same-process
 writer registration. Typed stop state preserves that original launch until
-exact complete-stopped proof. The same-process stop-to-capture composition now
-persists and validates that proof before clean-capture admission and retains
-the local writer identity until capture succeeds. Detached-destination
-activation can now materialize an executable prepared launch from a clean
-detached intent, and bounded no-relaunch recovery is implemented. Production
-`runRestore()` integration, its cross-process lifecycle guard, and its recovery
-scheduler remain later serial slices.
+exact complete-stopped proof. The legacy same-process stop-to-capture
+composition persists and validates that proof before capability-based
+clean-capture admission. V3 instead embeds the complete capture intent in the
+stop request, preclaims its operation ID before physical stop, and atomically
+turns a committed stop into the prepared capture that holds the session active
+pointer. Both paths retain local writer exclusion until exact capture success.
+Detached-destination activation can now materialize an executable prepared
+launch from a clean detached intent, and bounded no-relaunch recovery is
+implemented. Production `runRestore()` integration still requires the
+cross-process shared/exclusive lifecycle guard, recovery scheduler,
+invocation-time detached-production gate, and adapter wiring.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -114,14 +122,16 @@ session pointer to its immutable launch operation. That durable pointer and its
 serialized IDs still do not authorize process creation. The process-local
 launcher facade consumes the exact opaque image reservation and registers the
 exact returned writer; neither step supplies physical exclusion evidence.
-The same-process stop-to-capture composition protects an additional joined
-property: only the current launch's exact attachment and fence, process and
-writer incarnations, supervisor identity, and `complete-stopped` evidence may
-cross one committed `writer-launch-stop-v1` transition into one opaque
-capability for the exact prepared capture. Ambiguity retains both durable and
-local blockers. Cross-host exclusion still must come from a capable storage
-backend or supervisor; detached restore activation and bounded recovery remain
-later slices.
+The stop-to-capture compositions protect an additional joined property: only
+the current launch's exact attachment and fence, process and writer
+incarnations, supervisor identity, and `complete-stopped` evidence may cross
+one committed `writer-launch-stop-v1` transition. Legacy V1/V2 crosses into
+one opaque same-process capability for the exact prepared tuple. V3 crosses
+instead into the exact durably prepared capture intent whose operation ID was
+claimed before stop; its local writer exclusion remains until the fixed
+committed capture result is returned. Ambiguity retains both durable and local
+blockers. Cross-host exclusion still must come from a capable storage backend
+or supervisor.
 
 ## Implemented Canonical Session Registry
 
@@ -587,9 +597,9 @@ an apparently safe state.
 
 ## Production Clean-Capture Mutation Authority
 
-The production checkpoint slice is deliberately capture-only. It reuses the
-version 1 authority schema without DDL and composes the existing session-wide
-operation/reservation kernel with `capture_attempt_claims`,
+The production checkpoint slice is deliberately capture-only. Its original
+capability-based path reuses the version 1 authority schema and composes the
+existing session-wide operation/reservation kernel with `capture_attempt_claims`,
 `capture_attempt_tombstones`, and `checkpoint_catalogue`. Restore is not
 admitted through this capture API. The separate typed restore-generation
 authority can name and finalise one canonical detached destination generation,
@@ -625,10 +635,33 @@ typed serializable exact-CAS catalogue finalize
 + operation commit + reservation release + terminal anchor
 ```
 
-Only a definitely committed typed dispatch may invoke publication. The
-capture-attempt UUID minted inside the one-use stopped-writer callback and the
-operation ID are globally non-reusable authority identities. Their single
-canonical claim binds the complete immutable capture attempt and predetermined
+The V3 stop handoff joins this state machine one phase earlier. Its immutable
+`writer-launch-stop-v1` request contains the exact canonical
+`checkpoint-capture-v1` request: attachment, checkpoint, mutation request,
+capture-attempt ID, process and writer incarnations, stop operation ID, and
+predetermined result. `claimWriterLaunchStopDispatch()` first inserts the
+permanent `writer-stop-capture-intent-v3` registry claim and only then commits
+the stop's `prepared -> starting` grant, so physical stop cannot precede
+capture-operation-ID ownership. After exact supervisor stop evidence,
+`finalizeWriterLaunchStoppedAndReserveCheckpointCapture()` uses one
+`SERIALIZABLE` transaction to materialize that claim, commit and release the
+stop, clear the launch, create the exact capture operation and reservation as
+`prepared`, and make that capture the session's active pointer. There is no
+observable state with a V3 stop committed as `writer-launch-stopped` but no
+durable capture continuation.
+
+The prepared capture keeps the stopped attachment and historical lease tuple
+as immutable source identity; it does not mint new writer authority or require
+that old lease to remain unexpired. Only
+`claimCheckpointCaptureDispatch()` may change that exact operation from
+`prepared` to `starting` and create its canonical authorized attempt. The
+fresh-only backend continuation may publish only after that definite grant.
+
+Only a definitely committed typed dispatch may invoke publication. On the
+legacy capability path, the capture-attempt UUID is minted inside the one-use
+stopped-writer callback. On V3, that ID is already embedded in the stop's exact
+capture intent and its operation ID has been preclaimed. In both paths, the
+typed capture claim binds the complete immutable attempt and predetermined
 result before physical publication begins. A collision or a matching retained
 tombstone rejects admission before publication. Production retains claims
 permanently; if a future retention workflow writes a tombstone, that tombstone
@@ -668,6 +701,13 @@ therefore leave an `authorized` attempt beside an already committed physical
 artefact, or may already have committed the matching catalogue and terminal
 anchor.
 
+For a V3 handoff that is still exactly `prepared`, cold recovery may retry the
+single dispatch claim and then call fresh-only
+`resumePreparedCheckpointCapture()`. Once that claim may have committed, the
+operation is `starting` or `uncertain`; recovery discards the source path and
+uses only committed-artifact verification. It never invokes the fresh
+publisher a second time after an ambiguous grant.
+
 Committed capture reconciliation accepts only the original checkpoint
 descriptor and mutation request. It takes the same per-operation advisory
 guard, loads the exact non-tombstoned durable attempt by its original
@@ -697,23 +737,24 @@ historical operation's attempt or catalogue.
 
 `PostgresSessionAuthority.listCheckpointCaptureRecoveryCandidates()` exposes
 one read-only operational page with exact `{afterSessionId, limit}` input. The
-limit is an integer from 1 through 100. Its SQL selects only unretired
-`checkpoint-capture-v1` operations in `starting` or `uncertain`, orders by the
-immutable `session_id`, and requests at most `limit + 1` rows. The extra row
-determines whether the page has a continuation without admitting extra work.
-The existing unique active-operation partial index is already ordered by
-`session_id`, so this slice requires no DDL or migration-runner change.
+limit is an integer from 1 through 100. Its SQL selects unretired
+`checkpoint-capture-v1` operations in `starting` or `uncertain`, plus
+`prepared` operations only when migration 6's materialized V3 handoff claim
+exists, orders by immutable `session_id`, and requests at most `limit + 1`
+rows. The extra row determines whether the page has a continuation without
+admitting extra work.
 
 Enumeration does not trust the selection query as an authorization join. In
 the same `SERIALIZABLE` snapshot it parses each complete canonical operation
 envelope and revalidates the current session active pointer, matching
-reservation, exact capture-attempt binding, tombstone absence, and catalogue
-absence. A missing, malformed, tombstoned, catalogued, or crossed
+reservation, exact authorized attempt for active work or exact atomic handoff
+relation for prepared work, tombstone absence, and catalogue absence. A
+missing, malformed, tombstoned, catalogued, or crossed
 relation fails the page closed instead of being hidden by SQL. A successful
 entry is a frozen object containing only the exact durable
-`{checkpoint, request}` reconciliation admission. The enumerator does not
-accept or reconstruct a current session, attachment, lease, source path,
-stopped-writer capability, publication plan, or replacement attempt.
+`{checkpoint, request}` admission plus its state. The enumerator does not
+accept or reconstruct a writer handle, stopped-writer capability, publication
+plan, or replacement attempt.
 
 A non-null continuation cursor is the last settled candidate's session ID. It
 is a progress and fairness hint, not an authority token, durable worker claim,
@@ -726,11 +767,15 @@ start. This deliberate wrap makes retained work replayable and eventually
 revisits candidates that appeared behind an earlier cursor.
 
 `createPostgresCheckpointRecoveryService()` installs fixed candidate-list and
-committed-reconciliation collaborators for one backend. The backend identity
-and artefact-root resolver must be constructed once from copied, frozen startup
-configuration; the same backend ID cannot silently resolve to a different root
-between passes. `runBatch({afterSessionId, limit, signal})` reads one page and
-processes candidates sequentially with concurrency one. The service also admits
+committed-reconciliation collaborators for one backend, plus an optional
+prepared-capture continuation. The backend identity and artefact-root resolver
+must be constructed once from copied, frozen startup configuration; the same
+backend ID cannot silently resolve to a different root between passes.
+`runBatch({afterSessionId, limit, signal})` reads one page and processes
+candidates sequentially with concurrency one. It routes only `prepared` to
+the fresh continuation; `starting` and `uncertain` always use source-free
+committed reconciliation. If no prepared continuation was configured, a
+prepared candidate remains `pending`. The service also admits
 at most one batch invocation at a time; an overlapping valid invocation fails
 closed before candidate enumeration or reconciliation and can retry after the
 in-flight batch drains. Each settled candidate produces an operation/session
@@ -748,11 +793,11 @@ promise, abandon a guard, or report cancellation while provider work is still
 live.
 
 The page size and sequential batch give a hard count bound of 100 candidate
-attempts. They do not create a worst-case wall-clock bound: the current
-committed verifier has no cooperative cancellation seam, and the active-row
-index may still inspect other active operation kinds before filling a sparse
-checkpoint page. Production therefore retains statement, request, and
-scheduler deadlines outside this module. Guard-busy and physically
+attempts. They do not create a worst-case wall-clock bound: the prepared
+publisher and committed verifier have no cooperative cancellation seam, and
+the active-row index may still inspect other active operation kinds before
+filling a sparse checkpoint page. Production therefore retains statement,
+request, and scheduler deadlines outside this module. Guard-busy and physically
 unverifiable attempts report `pending` and preserve their durable operation,
 reservation, and capture claim for another pass. Under the existing exact
 reconciliation path, an unresolved `starting` attempt may durably advance to
@@ -805,8 +850,9 @@ identities rather than session-volume data:
   committed result;
 - `operation_id_registry` permanently assigns every operation ID to exactly
   one session and claim provenance before any external effect;
-- a registry claim is either a materialized `direct-operation`, or a
-  `restore-launch-intent-v2` owned by one claimant restore operation;
+- a registry claim is a materialized `direct-operation`, a restore or
+  activation launch intent owned by its claimant operation, or a V3 capture
+  intent owned by its writer-stop operation;
 - reusing an operation ID with a different session, claim type, claimant,
   binding, kind, or request fails closed;
 - an active reservation is unique for the operation and session conflict
@@ -827,17 +873,20 @@ relational columns. Business transitions remain in the authority code so a
 database migration cannot silently invent a new lifecycle.
 
 `session_authority.operation_id_registry` is the one global namespace shared
-by every direct operation and every pre-publication version 2 launch intent.
+by every direct operation, pre-publication restore/activation launch intent,
+and pre-stop V3 capture intent.
 Its relational fields retain the operation ID, session ID, `claim_type`,
 optional `claimant_operation_id`, `claimed_at`, and optional
-`materialized_at`. A direct claim has no separate `binding`; a version 2
-restore claim stores the exact canonical launch-intent binding. A direct
-operation is claimed and materialized in the same transaction. A version 2
-restore launch intent is claimed before publication dispatch and remains
+`materialized_at`. A direct claim has no separate `binding`; intent claims
+store their exact canonical launch or capture binding. A direct operation is
+claimed and materialized in the same transaction. Restore and activation
+launch intents are claimed before their external effect and remain
 unmaterialized until the atomic handoff creates the matching launch operation.
-The primary key prevents cross-type ID reuse; the unique claimant and
-same-session foreign key let one restore operation own only its one bound
-launch intent. Registry rows are never deleted or released.
+A V3 writer-stop claim is created in the stop dispatch transaction before
+physical stop and remains unmaterialized until the atomic stop finalizer
+creates the matching capture operation. The primary key prevents cross-type
+ID reuse, and same-session claimant relations prevent an intent from escaping
+its owning operation. Registry rows are never deleted or released.
 
 Writer acquisition, renewal, release, force-fence, blocked finalization, and
 checkpoint capture use those existing structures without DDL. The canonical
@@ -891,6 +940,21 @@ is 2 is already `starting`, `uncertain`, or `committed`. Such state cannot
 prove that the launch-attempt ID was reserved before publication, and neither
 a completed handoff nor later readback may manufacture that missing
 provenance. Operators must drain or quarantine those rows before upgrade.
+
+Migration version 6 adds the
+`writer-stop-capture-intent-v3` claim type and relational enforcement for the
+durable stop-to-capture handoff. It locks `sessions` before
+`operation_claims` and `operation_id_registry`, preserving runtime lock order,
+and fails with SQLSTATE `55000` if any legacy V3 stop row already exists
+without the new provenance. A V3 stop may leave `prepared` only with the exact
+same-session capture-operation claim bound to its complete `captureIntent`;
+the claim stays unmaterialized in `starting` or `uncertain` and must be
+materialized when the stop commits as `writer-launch-stopped`. The only
+claim-free exception is exact pre-dispatch cancellation. A claimed
+`checkpoint-capture-v1` row may then exist only when that materialized claim,
+its committed claimant stop, and the byte-equivalent capture request all
+agree. These triggers constrain old or direct SQL writers as well as the
+runtime finalizer.
 
 These constraints are necessary but not sufficient authority. The typed
 restore-generation layer now retains the backend's exact
@@ -1045,8 +1109,9 @@ the process-local launch boundary without enabling restore.
 stopped-writer coordinators with the PostgreSQL launch-attempt authority and
 the external `launchWriter` and `reconcileWriterLaunch` callbacks. It returns
 the exact frozen `prepareLaunchIntent`, `runLaunch`, `runPreparedLaunch`,
-`reconcileLaunchAttempt`, `resolveStoppedWriter`, `stopWriterForCapture`, and
-`retireStoppedWriter` facade. The facade owns callback ordering and local
+`reconcileLaunchAttempt`, `resolveStoppedWriter`, `stopWriterForCapture`,
+`stopWriterForPreparedCapture`, `retireStoppedWriter`, and
+`retirePreparedCapture` facade. The facade owns callback ordering and local
 object capabilities; it does not turn their serialized projections into
 authority.
 
@@ -1163,9 +1228,11 @@ The PostgreSQL authority separately adds typed `writer-launch-stop-v1` state.
 `createWriterLaunchStopOperationRequest()` accepts only a version 3 `ATTACHED`
 session with no other active operation. Exact request version 1 embeds the
 complete current-launch pointer; version 2 additionally embeds the dispatch
-claimant digest. V1 claim/reconcile retains the original receipt shape and
-edge-only semantics. V2 `claimWriterLaunchStopDispatch()` requires the matching
-raw token and grants the typed `prepared -> starting` transition once.
+claimant digest; version 3 additionally embeds the complete exact capture
+intent. V1 claim/reconcile retains the original receipt shape and edge-only
+semantics. V2 and V3 `claimWriterLaunchStopDispatch()` require the matching
+raw token and grant the typed `prepared -> starting` transition once. For V3,
+that same transaction first preclaims the capture operation ID.
 Same-token replay reports a matched claimant without granting the edge again;
 a mismatched token performs no transition. Lease validity is deliberately not
 a stop gate, and `starting` or `uncertain` retains the launch.
@@ -1176,9 +1243,18 @@ uses exact operation reconciliation to select revision 2 only when authority
 readback proves `uncertain`. A committed readback is recovered through the
 matching predecessor-revision replay; no finalization retry invokes physical
 stop again.
-It leaves the original started operation unchanged while atomically releasing
-the stop reservation, clearing the current launch, and advancing
-`lastOperation`. The authority does not call a supervisor automatically.
+For V1/V2, it leaves the original started operation unchanged while atomically
+releasing the stop reservation, clearing the current launch, and advancing
+`lastOperation`. V3 instead requires
+`finalizeWriterLaunchStoppedAndReserveCheckpointCapture()`, whose one
+transaction also materializes the preclaim, creates the exact capture and
+reservation as `prepared`, and installs its active pointer. Fresh V3 reserve
+is default-denied unless construction supplies
+`writerLaunchStopV3FleetCompatible: true` after fleet compatibility is known.
+The gate is evaluated only after lookup proves the operation absent; exact
+replay and recovery of existing V3 state remain available when it is closed.
+V1/V2 creation, capability issuance, replay, and finalization are unchanged.
+The authority does not call a supervisor automatically.
 
 `listWriterLaunchAttemptRecoveryCandidates()` now returns bounded keyset pages
 of `prepared`, `starting`, and `uncertain` attempts with each candidate's exact
@@ -1190,31 +1266,46 @@ cursor. Discovery records are recovery inputs only: they cannot consume an
 image, invoke a launcher, reconstruct a writer handle, or prove a stopped
 boundary.
 
-## Implemented Same-Process Durable Stop-to-Capture Composition
+## Implemented Durable Stop-to-Capture Compositions
 
-`createPostgresDurableStopCaptureComposition({ launcher })` exposes one frozen
-`runCapture()` operation. It prepares the deterministic clean-capture tuple
-before stop, asks the exact launcher to bind that tuple to its retained writer,
-and independently re-derives the stop operation ID from the complete
-attachment/checkpoint/request tuple and the launch-attempt ID before admitting
-the returned receipt.
+`createPostgresDurableStopCaptureComposition({ launcher })` exposes frozen
+`runCapture()` and `runPreparedCapture()` operations. Both prepare the
+deterministic clean-capture tuple before stop, bind it to the launcher's exact
+retained writer, and independently re-derive the stop operation ID from the
+complete attachment/checkpoint/request tuple and launch-attempt ID.
 
-The launcher's registered coordinator callback reserves and definitely claims
-one `writer-launch-stop-v1` operation before invoking physical supervisor stop
-once. Only complete `complete-stopped` evidence for the exact current launch
-may finalize. A stop-specific proof validator then checks the canonical typed
-request/result, released reservation, terminal session revision and pointer,
-cleared launch, and unchanged business state before coordinator confirmation
-can issue its opaque one-use capability.
-
-The snapshot core dispatches that same prepared tuple exactly once with the
+Legacy `runCapture()` keeps the V1/V2 same-process capability protocol
+unchanged. The launcher's registered coordinator callback definitely claims
+the stop before one physical supervisor stop, validates exact
+`complete-stopped` evidence and the committed stop transition, and issues one
+opaque capability. The snapshot core dispatches the same tuple once with that
 capability. Only confirmed capture completion permits
-`retireStoppedWriter(resolution)` to release same-process identity. Physical
-stop, finalisation, capability, capture, or retirement ambiguity remains
-fail-closed and cannot reconstruct a handle, issue another capability, or
-repeat physical stop. Until that retirement, the canonical local
-`StoppedWriterCapabilityCoordinator` uses retained per-session identity—not a
-pathname or serialized receipt—to reject `runLaunch()` and
+`retireStoppedWriter(resolution)` to release same-process identity.
+
+V3 `runPreparedCapture()` calls `stopWriterForPreparedCapture()`. Before
+physical stop, the V3 request fixes the complete capture intent and the stop
+dispatch transaction preclaims its capture operation ID. The registered
+callback then performs physical stop once and obtains the atomic handoff
+receipt: committed stop plus the exact prepared capture, reservation, and
+active session pointer. The transient stopped-writer capability is revoked;
+the composition supplies no capability to storage. It instead calls the
+backend's fresh-only `resumePreparedCheckpointCapture()` with the exact
+checkpoint and mutation request already embedded in the stop.
+
+The prepared backend path reads only that handoff-produced operation, obtains
+its single exact `prepared -> starting` dispatch grant, publishes once, and
+returns only after capture finalization or exact committed readback. If the
+grant, publication, or finalization is ambiguous, neither the foreground path
+nor cold recovery starts another publication. `starting` and `uncertain`
+recovery are source-free and committed-only. Finally,
+`retirePreparedCapture()` requires the returned checkpoint and mutation to
+match the V3 request's exact predetermined result; only that match retires the
+retained local writer identity.
+
+Physical stop, finalisation, capability, capture, or retirement ambiguity
+remains fail-closed. Until the applicable retirement succeeds, the canonical
+local `StoppedWriterCapabilityCoordinator` uses retained per-session
+identity—not a pathname or serialized receipt—to reject `runLaunch()` and
 `runPreparedLaunch()` before durable claim, image consumption, or physical
 launch, including when the candidate uses another backend or storage slot.
 This exclusion applies only to launcher instances sharing that exact
@@ -1568,32 +1659,32 @@ adapter yet.
 
 ## Remaining Production Restore Composition
 
-The launcher foundation plus capture-bound detached activation now close the
-committed publication, old-writer stop/capture/detach, provider-backed
-attachment, atomic prepared-launch reservation, and bounded no-relaunch
-recovery boundaries. They remain independent protocol components rather than
-a production restore entry point. Later serial pull requests must:
+The launcher foundation, V3 durable stop-to-prepared-capture handoff, and
+capture-bound detached activation now close the committed publication,
+old-writer stop/capture/detach, provider-backed attachment, atomic prepared-
+launch reservation, and bounded no-relaunch recovery boundaries. They remain
+independent protocol components rather than a production restore entry point.
+Later serial pull requests must:
 
-- consume the exact durable stop-to-capture result as a prerequisite, then
-  physically fence and detach the old attachment before any restored
-  attachment can become launch authority;
-- dispatch the already-reserved launch with the original image reservation, or
-  with a newly minted exact-match reservation while it is still durably
-  `prepared`, through the implemented clean-detached intent and
-  activation-materialized launch path, while routing every active attempt
-  without another launch;
-- hold a cross-process foreground/recovery lifecycle guard around prepared
-  launch so scheduled cancellation cannot race foreground dispatch;
-- start and schedule the durable four-lane recovery runner with an explicit
-  recovery scope and fixed per-lane limits;
-- wire the whole protocol into `runRestore()` only after every uncertain
-  publication, launch, registration, stop, and finalisation boundary remains
-  fail-closed.
+- add the cross-process shared/exclusive lifecycle guard so foreground
+  admission and scheduled recovery cannot concurrently dispatch or retire the
+  same prepared lifecycle work;
+- start and schedule the durable recovery runner with an explicit recovery
+  scope and fixed per-lane limits;
+- enforce the detached-production fleet decision at each invocation, rather
+  than treating startup construction as a lasting grant; and
+- wire committed publication, durable stop and prepared capture, canonical
+  detach, capture-bound activation, prepared launch, and bounded no-relaunch
+  recovery through the production checkpoint adapter.
+
+That final wiring may enable `runRestore()` only after every uncertain
+publication, launch, registration, stop, capture, and finalisation boundary
+remains fail-closed.
 
 Until that integration lands, the production checkpoint adapter rejects
 restore. The resolver alone is not stop/capture authority, and neither the
-same-process stop-to-capture facade nor the detached activation/recovery
-components are wired into the production adapter.
+legacy capability path, V3 prepared-capture handoff, nor detached
+activation/recovery components are wired into the production adapter.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -1690,10 +1781,12 @@ revalidation and one-use consumption, no callback before durable `starting`,
 single external launch, register-before-finalise ordering, no-relaunch
 reconciliation, provisional-handle loss, typed complete-stop finalisation, and
 bounded discovery. Durable stop-to-capture validation covers exact tuple-bound
-stop identity, one physical stop, committed-transition proof before capability
-issue, one-use capture admission, and retained local identity after ambiguity.
-The next integration slice must wire durable stop, detached publication,
-activation, prepared launch, and scheduled recovery through production
-`runRestore()` with complete failure-injection coverage.
+stop identity, one physical stop, unchanged V1/V2 capability behavior, V3
+preclaim before stop, atomic committed-stop-to-prepared-capture handoff,
+prepared-only fresh dispatch, source-free active recovery, no second
+publication after ambiguity, and retained local identity until the exact
+predetermined committed result. The next integration slices must add the
+cross-process lifecycle guard, scheduler, invocation-time production gate, and
+adapter wiring before production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

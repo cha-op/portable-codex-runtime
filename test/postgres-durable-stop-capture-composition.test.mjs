@@ -8,6 +8,11 @@ import {
 import {
   derivePostgresLogicalWriterStopOperationId,
 } from "../src/postgres-logical-writer-launcher.mjs";
+import {
+  SESSION_AUTHORITY_DOCUMENT_VERSION,
+  SESSION_OPERATION_CONFLICT_CLASS,
+  createCheckpointCaptureOperationRequest,
+} from "../src/postgres-session-authority.mjs";
 import { createSessionManifest } from "../src/session-storage-contracts.mjs";
 
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
@@ -20,6 +25,7 @@ const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
 const SUPERVISOR_ID = "supervisor-001";
 const STOP_DISPATCH_CLAIM_SHA256 = "d".repeat(64);
+const CAPTURE_ATTEMPT_ID = "019f2100-0000-7000-8000-000000000003";
 
 function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
@@ -115,8 +121,10 @@ function mutationResult(request) {
   };
 }
 
-function createBackend({ capture } = {}) {
+function createBackend({ capture, reconcile, resumePrepared } = {}) {
   const calls = [];
+  const preparedCalls = [];
+  const reconciliationCalls = [];
   const operation = async () => {};
   const backend = {
     contractVersion: 1,
@@ -135,14 +143,32 @@ function createBackend({ capture } = {}) {
         mutation: mutationResult(input.request),
       };
     },
+    captureReconciliationContractVersion: 1,
+    async reconcileCheckpointCapture(input) {
+      reconciliationCalls.push(input);
+      if (reconcile) return reconcile.call(this, input);
+      return {
+        checkpoint: input.checkpoint,
+        mutation: mutationResult(input.request),
+      };
+    },
     destroySession: operation,
     detachAttachment: operation,
     forceFence: operation,
     prepareWritableAttachment: operation,
     provisionSession: operation,
+    preparedCheckpointCaptureContractVersion: 1,
+    async resumePreparedCheckpointCapture(input) {
+      preparedCalls.push(input);
+      if (resumePrepared) return resumePrepared.call(this, input);
+      return {
+        checkpoint: input.checkpoint,
+        mutation: mutationResult(input.request),
+      };
+    },
     restoreCheckpoint: operation,
   };
-  return { backend, calls };
+  return { backend, calls, preparedCalls, reconciliationCalls };
 }
 
 function captureOptions(backend) {
@@ -163,11 +189,12 @@ function opaqueHandle() {
   return Object.freeze(Object.create(null));
 }
 
-function writerLaunchStopRequest(contractVersion) {
+function writerLaunchStopRequest(contractVersion, captureIntent = null) {
   const request = { contractVersion };
-  if (contractVersion === 2) {
+  if (contractVersion === 2 || contractVersion === 3) {
     request.dispatchClaimSha256 = STOP_DISPATCH_CLAIM_SHA256;
   }
+  if (contractVersion === 3) request.captureIntent = captureIntent;
   request.launch = {
     attachmentId: "attachment-001",
     contractVersion: 1,
@@ -181,7 +208,10 @@ function writerLaunchStopRequest(contractVersion) {
   return request;
 }
 
-function stoppedCaptureResult(capture, { stopRequestVersion = 2 } = {}) {
+function stoppedCaptureResult(
+  capture,
+  { captureIntent = null, stopRequestVersion = 2 } = {},
+) {
   const stopOperationId = derivePostgresLogicalWriterStopOperationId({
     ...capture,
     launchAttemptId: LAUNCH_ATTEMPT_ID,
@@ -217,7 +247,7 @@ function stoppedCaptureResult(capture, { stopRequestVersion = 2 } = {}) {
     },
     operation: {
       operationId: stopOperationId,
-      request: writerLaunchStopRequest(stopRequestVersion),
+      request: writerLaunchStopRequest(stopRequestVersion, captureIntent),
       result: terminal,
       sessionId: SESSION_ID,
       state: "committed",
@@ -232,7 +262,7 @@ function stoppedCaptureResult(capture, { stopRequestVersion = 2 } = {}) {
     stop: {
       contractVersion: stopRequestVersion,
       launchAttemptId: LAUNCH_ATTEMPT_ID,
-      request: writerLaunchStopRequest(stopRequestVersion),
+      request: writerLaunchStopRequest(stopRequestVersion, captureIntent),
       result: terminal,
       state: "committed",
       stopOperationId,
@@ -241,8 +271,111 @@ function stoppedCaptureResult(capture, { stopRequestVersion = 2 } = {}) {
   return deepFreeze({ capability, evidence, resolution, stop });
 }
 
-function createLauncher({ retire, stop, stopRequestVersion = 2 } = {}) {
-  const calls = { retire: [], stop: [] };
+function captureExpectedSession(stopOperationId) {
+  return deepFreeze({
+    createdAt: "2026-08-05T11:00:00.000Z",
+    document: {
+      activeOperation: null,
+      attachment: attachment(),
+      backendCapabilities: {
+        atomicPointInTimeCheckpoint: true,
+        exclusiveWriterAttachment: true,
+        fencing: "epoch-enforced",
+        normalDirectoryAttachment: true,
+      },
+      documentVersion: SESSION_AUTHORITY_DOCUMENT_VERSION,
+      lastOperation: {
+        conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
+        expectedSessionRevision: "8",
+        kind: "writer-launch-stop-v1",
+        operationId: stopOperationId,
+        operationRevision: "2",
+        requestSha256: "e".repeat(64),
+        reservationId: `reservation-${stopOperationId}`,
+        resultSha256: "f".repeat(64),
+        state: "committed",
+      },
+      launch: null,
+      lease: lease(),
+      lifecycle: "ATTACHED",
+      manifest: manifest(),
+      recovery: null,
+      storageRef: storageRef(),
+      writerEpoch: lease().fencingEpoch,
+    },
+    revision: "11",
+    sessionId: SESSION_ID,
+    updatedAt: "2026-08-05T11:30:00.000Z",
+  });
+}
+
+function preparedStoppedCaptureResult(capture, status = "prepared") {
+  const stopOperationId = derivePostgresLogicalWriterStopOperationId({
+    ...capture,
+    launchAttemptId: LAUNCH_ATTEMPT_ID,
+  });
+  const expectedSession = captureExpectedSession(stopOperationId);
+  const captureIntent = createCheckpointCaptureOperationRequest({
+    admission: {
+      attachment: capture.attachment,
+      captureAttemptId: CAPTURE_ATTEMPT_ID,
+      checkpoint: capture.checkpoint,
+      processIncarnationId: PROCESS_INCARNATION_ID,
+      request: capture.request,
+      stopOperationId,
+      writerIncarnationId: WRITER_INCARNATION_ID,
+    },
+    expectedSession,
+  });
+  const stopped = stoppedCaptureResult(capture, {
+    captureIntent,
+    stopRequestVersion: 3,
+  });
+  const captureOperation = deepFreeze({
+    expectedSession,
+    kind: "checkpoint-capture-v1",
+    operationId: capture.request.operationId,
+    request: captureIntent,
+    sessionId: SESSION_ID,
+    state: status,
+  });
+  const captureReservation = deepFreeze({
+    operationId: capture.request.operationId,
+    sessionId: SESSION_ID,
+    state: status === "committed" ? "released" : status,
+  });
+  return deepFreeze({
+    capture: {
+      operation: captureOperation,
+      reservation: captureReservation,
+    },
+    evidence: stopped.evidence,
+    resolution: stopped.resolution,
+    session: stopped.stop.session,
+    status,
+    stop: {
+      finalized: stopped.stop.finalized,
+      operation: stopped.stop.operation,
+      record: stopped.stop.stop,
+      reservation: stopped.stop.reservation,
+    },
+  });
+}
+
+function createLauncher({
+  preparedRetire,
+  preparedStatus = "prepared",
+  preparedStop,
+  retire,
+  stop,
+  stopRequestVersion = 2,
+} = {}) {
+  const calls = {
+    preparedRetire: [],
+    preparedStop: [],
+    retire: [],
+    stop: [],
+  };
   const fixture = { calls, defaultStopped: null, launcher: null };
   const stopWriterForCapture = async function (input) {
     calls.stop.push(input);
@@ -256,11 +389,31 @@ function createLauncher({ retire, stop, stopRequestVersion = 2 } = {}) {
     if (retire) return retire(input);
     return undefined;
   };
+  const stopWriterForPreparedCapture = async function (input) {
+    calls.preparedStop.push(input);
+    const status =
+      typeof preparedStatus === "function"
+        ? preparedStatus(input, calls.preparedStop.length)
+        : preparedStatus;
+    const defaultStopped = preparedStoppedCaptureResult(input, status);
+    fixture.defaultStopped = defaultStopped;
+    if (preparedStop) return preparedStop(input, defaultStopped);
+    return defaultStopped;
+  };
+  const retirePreparedCapture = function (input) {
+    calls.preparedRetire.push(input);
+    if (preparedRetire) return preparedRetire(input);
+    return input.result;
+  };
   Object.freeze(stopWriterForCapture);
+  Object.freeze(retirePreparedCapture);
   Object.freeze(retireStoppedWriter);
+  Object.freeze(stopWriterForPreparedCapture);
   fixture.launcher = Object.freeze({
+    retirePreparedCapture,
     retireStoppedWriter,
     stopWriterForCapture,
+    stopWriterForPreparedCapture,
   });
   return fixture;
 }
@@ -295,6 +448,41 @@ async function assertStopReceiptRejected(
   );
   assert.equal(launcherFixture.calls.stop.length, 1);
   assert.equal(backendCalls.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+}
+
+async function assertPreparedStopReceiptRejected(mutateIntent) {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+  } = createBackend();
+  const launcherFixture = createLauncher({
+    preparedStop(_input, result) {
+      const mutated = structuredClone(result);
+      mutated.resolution.writer = result.resolution.writer;
+      const intent = structuredClone(result.capture.operation.request);
+      mutateIntent(intent.admission);
+      mutated.capture.operation.request = intent;
+      mutated.stop.operation.request.captureIntent = intent;
+      mutated.stop.record.request.captureIntent = intent;
+      return deepFreeze(mutated);
+    },
+  });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(launcherFixture.calls.preparedStop.length, 1);
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
   assert.equal(launcherFixture.calls.retire.length, 0);
 }
 
@@ -363,11 +551,314 @@ test("durable stop composition dispatches one exact tuple and retires after capt
   assert.deepEqual(order, ["stop", "capture", "retire"]);
   assert.equal(launcherFixture.calls.stop.length, 1);
   assert.equal(backendCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
   assert.equal(launcherFixture.calls.retire.length, 1);
   assert.deepEqual(result, {
     checkpoint: stopInput.checkpoint,
     mutation: mutationResult(stopInput.request),
   });
+});
+
+test("prepared capture path publishes only after one atomic stop handoff", async () => {
+  const order = [];
+  let stopInput;
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+  } = createBackend({
+    resumePrepared(input) {
+      order.push("prepared-capture");
+      assert.strictEqual(input.checkpoint, stopInput.checkpoint);
+      assert.strictEqual(input.request, stopInput.request);
+      return launcherFixture.defaultStopped.capture.operation.request
+        .predeterminedResult;
+    },
+  });
+  const launcherFixture = createLauncher({
+    preparedStop(input, result) {
+      order.push("atomic-stop");
+      stopInput = input;
+      assert.equal(result.status, "prepared");
+      assert.equal(result.stop.record.contractVersion, 3);
+      assert.equal(result.capture.operation.state, "prepared");
+      return result;
+    },
+    preparedRetire(input) {
+      order.push("retire");
+      assert.strictEqual(
+        input.resolution,
+        launcherFixture.defaultStopped.resolution,
+      );
+      return input.result;
+    },
+  });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  const result = await composition.runPreparedCapture(
+    captureOptions(backend),
+  );
+
+  assert.deepEqual(order, ["atomic-stop", "prepared-capture", "retire"]);
+  assert.equal(launcherFixture.calls.stop.length, 0);
+  assert.equal(launcherFixture.calls.preparedStop.length, 1);
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 1);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+  assert.deepEqual(
+    result,
+    structuredClone(
+      launcherFixture.defaultStopped.capture.operation.request
+        .predeterminedResult,
+    ),
+  );
+});
+
+test("prepared capture requires committed reconciliation support before stopping", async () => {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend();
+  delete backend.captureReconciliationContractVersion;
+  delete backend.reconcileCheckpointCapture;
+  const launcherFixture = createLauncher();
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "invalid_postgres_durable_stop_capture_composition_request",
+    ),
+  );
+  assert.equal(launcherFixture.calls.preparedStop.length, 0);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(reconciliationCalls.length, 0);
+});
+
+test("recovery-advanced prepared captures use committed-only reconciliation", async (t) => {
+  for (const status of ["starting", "uncertain", "committed"]) {
+    await t.test(status, async () => {
+      const order = [];
+      const {
+        backend,
+        calls: legacyCaptureCalls,
+        preparedCalls,
+        reconciliationCalls,
+      } = createBackend({
+        reconcile(input) {
+          order.push("reconcile");
+          assert.equal(input.request.operationId, "operation-checkpoint-001");
+          return launcherFixture.defaultStopped.capture.operation.request
+            .predeterminedResult;
+        },
+        resumePrepared() {
+          assert.fail("advanced capture state must not fresh-publish");
+        },
+      });
+      const launcherFixture = createLauncher({
+        preparedRetire(input) {
+          order.push("retire");
+          return input.result;
+        },
+        preparedStatus: status,
+        preparedStop(_input, stopped) {
+          order.push("atomic-stop");
+          assert.equal(stopped.status, status);
+          return stopped;
+        },
+      });
+      const composition = createPostgresDurableStopCaptureComposition({
+        launcher: launcherFixture.launcher,
+      });
+
+      const result = await composition.runPreparedCapture(
+        captureOptions(backend),
+      );
+
+      assert.deepEqual(order, ["atomic-stop", "reconcile", "retire"]);
+      assert.deepEqual(
+        result,
+        structuredClone(
+          launcherFixture.defaultStopped.capture.operation.request
+            .predeterminedResult,
+        ),
+      );
+      assert.equal(legacyCaptureCalls.length, 0);
+      assert.equal(preparedCalls.length, 0);
+      assert.equal(reconciliationCalls.length, 1);
+      assert.equal(launcherFixture.calls.preparedRetire.length, 1);
+      assert.equal(launcherFixture.calls.retire.length, 0);
+    });
+  }
+});
+
+test("advanced prepared capture rejects a non-predetermined committed result before retirement", async () => {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend({
+    reconcile(input) {
+      return {
+        checkpoint: input.checkpoint,
+        mutation: mutationResult(input.request),
+      };
+    },
+    resumePrepared() {
+      assert.fail("advanced capture state must not fresh-publish");
+    },
+  });
+  const launcherFixture = createLauncher({ preparedStatus: "committed" });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(reconciliationCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+});
+
+test("advanced prepared capture reconciliation failure preserves the stopped record", async () => {
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend({
+    reconcile() {
+      throw new Error("committed verification unavailable");
+    },
+    resumePrepared() {
+      assert.fail("advanced capture state must not fresh-publish");
+    },
+  });
+  const launcherFixture = createLauncher({ preparedStatus: "uncertain" });
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.equal(preparedCalls.length, 0);
+  assert.equal(reconciliationCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+});
+
+test("prepared capture acknowledgement loss replays through committed verification without republishing", async () => {
+  let freshPublications = 0;
+  let resumeInvocations = 0;
+  let reconciliationInvocations = 0;
+  let committedResult = null;
+  const {
+    backend,
+    calls: legacyCaptureCalls,
+    preparedCalls,
+    reconciliationCalls,
+  } = createBackend({
+    reconcile() {
+      reconciliationInvocations += 1;
+      assert.notEqual(committedResult, null);
+      if (reconciliationInvocations === 1) {
+        throw new Error("committed verification not yet observable");
+      }
+      return committedResult;
+    },
+    resumePrepared() {
+      resumeInvocations += 1;
+      if (resumeInvocations === 1) {
+        freshPublications += 1;
+        committedResult =
+          launcherFixture.defaultStopped.capture.operation.request
+            .predeterminedResult;
+        throw new Error("publication acknowledgement lost");
+      }
+      throw new Error("capture is no longer prepared");
+    },
+  });
+  const launcherFixture = createLauncher();
+  const composition = createPostgresDurableStopCaptureComposition({
+    launcher: launcherFixture.launcher,
+  });
+
+  await assert.rejects(
+    () => composition.runPreparedCapture(captureOptions(backend)),
+    assertCompositionError(
+      "postgres_durable_stop_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(freshPublications, 1);
+  assert.equal(preparedCalls.length, 1);
+  assert.equal(reconciliationCalls.length, 1);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 0);
+
+  const result = await composition.runPreparedCapture(
+    captureOptions(backend),
+  );
+
+  assert.equal(freshPublications, 1);
+  assert.equal(resumeInvocations, 2);
+  assert.equal(preparedCalls.length, 2);
+  assert.equal(reconciliationCalls.length, 2);
+  assert.equal(launcherFixture.calls.preparedStop.length, 2);
+  assert.equal(launcherFixture.calls.preparedRetire.length, 1);
+  assert.equal(launcherFixture.calls.retire.length, 0);
+  assert.equal(legacyCaptureCalls.length, 0);
+  assert.deepEqual(result, structuredClone(committedResult));
+});
+
+test("prepared capture binds every durable intent field before publication", async (t) => {
+  const cases = [
+    ["attachment", (admission) => {
+      admission.attachment.proofId = "wrong-attachment-proof";
+    }],
+    ["checkpoint", (admission) => {
+      admission.checkpoint.createdAt = "2026-08-05T11:59:59.000Z";
+    }],
+    ["request", (admission) => {
+      admission.request.holderId = "wrong-host";
+    }],
+    ["capture attempt", (admission) => {
+      admission.captureAttemptId = "019f2100-0000-7000-8000-000000000004";
+    }],
+    ["stop operation", (admission) => {
+      admission.stopOperationId = "wrong-stop-operation";
+    }],
+    ["process incarnation", (admission) => {
+      admission.processIncarnationId = "wrong-process";
+    }],
+    ["writer incarnation", (admission) => {
+      admission.writerIncarnationId = "wrong-writer";
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      await assertPreparedStopReceiptRejected(mutate);
+    });
+  }
 });
 
 test("durable stop composition retains v1 receipt compatibility", async () => {

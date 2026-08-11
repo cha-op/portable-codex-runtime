@@ -1,12 +1,21 @@
 import { types as utilTypes } from "node:util";
 
 import {
+  assertPreparedCleanCheckpointResult,
   capturePreparedCleanCheckpoint,
   prepareCleanCheckpointCapture,
+  reconcileCleanCheckpointCapture,
 } from "./session-snapshot-core.mjs";
+import {
+  assertCheckpointCaptureReconciliationBackend,
+  assertPreparedCheckpointCaptureBackend,
+} from "./session-storage-contracts.mjs";
 import {
   derivePostgresLogicalWriterStopOperationId,
 } from "./postgres-logical-writer-launcher.mjs";
+import {
+  createCheckpointCaptureOperationRequest,
+} from "./postgres-session-authority.mjs";
 
 // The validated receipt and retirement resolution must remain bound to the
 // stopped writer even when the stop collaborator mutates shared intrinsics.
@@ -69,6 +78,35 @@ const STOP_RESULT_KEYS = objectFreeze([
   "resolution",
   "stop",
 ]);
+const PREPARED_STOP_RESULT_KEYS = objectFreeze([
+  "capture",
+  "evidence",
+  "resolution",
+  "session",
+  "status",
+  "stop",
+]);
+const PREPARED_CAPTURE_KEYS = objectFreeze(["operation", "reservation"]);
+const CAPTURE_INTENT_KEYS = objectFreeze([
+  "admission",
+  "contractVersion",
+  "predeterminedResult",
+]);
+const CAPTURE_ADMISSION_KEYS = objectFreeze([
+  "attachment",
+  "captureAttemptId",
+  "checkpoint",
+  "processIncarnationId",
+  "request",
+  "stopOperationId",
+  "writerIncarnationId",
+]);
+const PREPARED_STOP_KEYS = objectFreeze([
+  "finalized",
+  "operation",
+  "record",
+  "reservation",
+]);
 const STOP_RECEIPT_KEYS = objectFreeze([
   "status",
   "session",
@@ -93,6 +131,12 @@ const STOP_TERMINAL_RESULT_KEYS = objectFreeze([
 ]);
 const STOP_REQUEST_V1_KEYS = objectFreeze(["contractVersion", "launch"]);
 const STOP_REQUEST_V2_KEYS = objectFreeze([
+  "contractVersion",
+  "dispatchClaimSha256",
+  "launch",
+]);
+const STOP_REQUEST_V3_KEYS = objectFreeze([
+  "captureIntent",
   "contractVersion",
   "dispatchClaimSha256",
   "launch",
@@ -484,14 +528,23 @@ function normalizeStopRequest(value, code) {
     code,
   );
   const contractVersion = contractVersionDescriptor.value;
-  ensure(contractVersion === 1 || contractVersion === 2, code);
+  ensure(
+    contractVersion === 1 ||
+      contractVersion === 2 ||
+      contractVersion === 3,
+    code,
+  );
   const request = exactDataObject(
     record,
-    contractVersion === 1 ? STOP_REQUEST_V1_KEYS : STOP_REQUEST_V2_KEYS,
+    contractVersion === 1
+      ? STOP_REQUEST_V1_KEYS
+      : contractVersion === 2
+        ? STOP_REQUEST_V2_KEYS
+        : STOP_REQUEST_V3_KEYS,
     code,
     { frozen: true },
   );
-  if (contractVersion === 2) {
+  if (contractVersion !== 1) {
     ensure(
       typeof request.dispatchClaimSha256 === "string" &&
         regexpTest(SHA256_PATTERN, request.dispatchClaimSha256),
@@ -666,6 +719,147 @@ function normalizeStoppedCapture(value, preparedCapture, code) {
   });
 }
 
+function normalizePreparedStoppedCapture(value, preparedCapture, code) {
+  const stopped = exactDataObject(
+    value,
+    PREPARED_STOP_RESULT_KEYS,
+    code,
+    { frozen: true },
+  );
+  const evidence = normalizeEvidence(stopped.evidence, code);
+  const resolution = normalizeResolution(
+    stopped.resolution,
+    preparedCapture,
+    code,
+  );
+  let expectedStopOperationId;
+  try {
+    expectedStopOperationId = derivePostgresLogicalWriterStopOperationId({
+      attachment: preparedCapture.attachment,
+      checkpoint: preparedCapture.checkpoint,
+      launchAttemptId: evidence.launchAttemptId,
+      request: preparedCapture.request,
+    });
+  } catch {
+    fail(code);
+  }
+  ensure(
+    evidence.processIncarnationId === resolution.processIncarnationId &&
+      evidence.writerIncarnationId === resolution.writerIncarnationId &&
+      evidence.proofId === expectedStopOperationId &&
+      resolution.stopOperationId === expectedStopOperationId,
+    code,
+  );
+
+  const capture = exactDataObject(
+    stopped.capture,
+    PREPARED_CAPTURE_KEYS,
+    code,
+    { frozen: true },
+  );
+  const captureOperation = frozenDataProjection(
+    capture.operation,
+    [
+      "expectedSession",
+      "kind",
+      "operationId",
+      "request",
+      "sessionId",
+      "state",
+    ],
+    code,
+  );
+  const captureReservation = frozenDataProjection(
+    capture.reservation,
+    ["operationId", "sessionId", "state"],
+    code,
+  );
+  ensure(
+    arrayIncludes(
+      ["prepared", "starting", "uncertain", "committed"],
+      stopped.status,
+    ) &&
+      captureOperation.kind === "checkpoint-capture-v1" &&
+      captureOperation.operationId === preparedCapture.request.operationId &&
+      captureOperation.sessionId === preparedCapture.attachment.sessionId &&
+      captureOperation.state === stopped.status &&
+      captureReservation.operationId === captureOperation.operationId &&
+      captureReservation.sessionId === captureOperation.sessionId &&
+      captureReservation.state ===
+        (stopped.status === "committed" ? "released" : stopped.status),
+    code,
+  );
+
+  const stop = exactDataObject(
+    stopped.stop,
+    PREPARED_STOP_KEYS,
+    code,
+    { frozen: true },
+  );
+  const stopRecord = exactDataObject(stop.record, STOP_RECORD_KEYS, code, {
+    frozen: true,
+  });
+  const stopRequest = normalizeStopRequest(stopRecord.request, code);
+  const captureIntent = exactDataObject(
+    stopRequest.captureIntent,
+    CAPTURE_INTENT_KEYS,
+    code,
+    { frozen: true },
+  );
+  const captureAdmission = exactDataObject(
+    captureIntent.admission,
+    CAPTURE_ADMISSION_KEYS,
+    code,
+    { frozen: true },
+  );
+  let expectedCaptureIntent;
+  try {
+    expectedCaptureIntent = createCheckpointCaptureOperationRequest({
+      admission: objectFreeze({
+        attachment: preparedCapture.attachment,
+        captureAttemptId: captureAdmission.captureAttemptId,
+        checkpoint: preparedCapture.checkpoint,
+        processIncarnationId: evidence.processIncarnationId,
+        request: preparedCapture.request,
+        stopOperationId: resolution.stopOperationId,
+        writerIncarnationId: evidence.writerIncarnationId,
+      }),
+      expectedSession: captureOperation.expectedSession,
+    });
+  } catch {
+    fail(code);
+  }
+  ensure(
+    stopRequest.contractVersion === 3 &&
+      sameFrozenData(stopRequest.captureIntent, captureOperation.request) &&
+      sameFrozenData(stopRequest.captureIntent, expectedCaptureIntent),
+    code,
+  );
+  normalizeStopReceipt(
+    objectFreeze({
+      finalized: stop.finalized,
+      launch: null,
+      operation: stop.operation,
+      reservation: stop.reservation,
+      session: stopped.session,
+      status: "committed",
+      stop: stop.record,
+    }),
+    evidence,
+    resolution,
+    preparedCapture,
+    code,
+  );
+  return objectFreeze({
+    capture: stopped.capture,
+    evidence: stopped.evidence,
+    resolution: stopped.resolution,
+    session: stopped.session,
+    status: stopped.status,
+    stop: stopped.stop,
+  });
+}
+
 const absorbRetirementRejection = objectFreeze(
   function absorbRetirementRejection() {},
 );
@@ -707,6 +901,24 @@ function collaboratorMethod(value, name, code) {
   return descriptor.value;
 }
 
+function optionalCollaboratorMethod(value, name, code) {
+  let descriptor;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(value, name);
+  } catch {
+    fail(code);
+  }
+  if (descriptor === undefined) return null;
+  ensure(
+    descriptor.enumerable === true &&
+      objectHasOwn(descriptor, "value") &&
+      typeof descriptor.value === "function" &&
+      !isProxyValue(descriptor.value),
+    code,
+  );
+  return descriptor.value;
+}
+
 export function createPostgresDurableStopCaptureComposition(options) {
   const optionCode =
     "invalid_postgres_durable_stop_capture_composition_options";
@@ -723,9 +935,19 @@ export function createPostgresDurableStopCaptureComposition(options) {
     "stopWriterForCapture",
     optionCode,
   );
+  const stopWriterForPreparedCapture = optionalCollaboratorMethod(
+    launcher,
+    "stopWriterForPreparedCapture",
+    optionCode,
+  );
   const retireStoppedWriter = collaboratorMethod(
     launcher,
     "retireStoppedWriter",
+    optionCode,
+  );
+  const retirePreparedCapture = optionalCollaboratorMethod(
+    launcher,
+    "retirePreparedCapture",
     optionCode,
   );
 
@@ -799,8 +1021,164 @@ export function createPostgresDurableStopCaptureComposition(options) {
     return result;
   };
 
+  const runPreparedCapture = async function runPreparedCapture(optionsValue) {
+    ensure(
+      stopWriterForPreparedCapture !== null &&
+        retirePreparedCapture !== null,
+      optionCode,
+    );
+    const captureOptions = exactDataObject(
+      optionsValue,
+      CAPTURE_OPTION_KEYS,
+      requestCode,
+    );
+    let preparedCapture;
+    let backend;
+    let resumePreparedCheckpointCapture;
+    try {
+      preparedCapture = prepareCleanCheckpointCapture(captureOptions);
+      backend = assertPreparedCheckpointCaptureBackend(
+        preparedCapture.backend,
+      );
+      assertCheckpointCaptureReconciliationBackend(backend);
+      resumePreparedCheckpointCapture =
+        backend.resumePreparedCheckpointCapture;
+    } catch {
+      fail(requestCode);
+    }
+    const stopInput = objectFreeze({
+      attachment: preparedCapture.attachment,
+      checkpoint: preparedCapture.checkpoint,
+      request: preparedCapture.request,
+    });
+
+    let pendingStop;
+    try {
+      pendingStop = reflectApply(stopWriterForPreparedCapture, launcher, [
+        stopInput,
+      ]);
+    } catch {
+      fail(outcomeCode);
+    }
+    pendingStop = normalizeSafeNativePromise(pendingStop);
+    ensure(pendingStop !== null, outcomeCode);
+
+    let stoppedValue;
+    try {
+      stoppedValue = await pendingStop;
+    } catch {
+      fail(outcomeCode);
+    }
+    let stopped;
+    try {
+      stopped = normalizePreparedStoppedCapture(
+        stoppedValue,
+        preparedCapture,
+        outcomeCode,
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+
+    let predeterminedResult;
+    try {
+      predeterminedResult = assertPreparedCleanCheckpointResult({
+        preparedCapture,
+        result: stopped.capture.operation.request.predeterminedResult,
+      });
+    } catch {
+      fail(outcomeCode);
+    }
+
+    let resultValue;
+    let requiresCommittedReconciliation = stopped.status !== "prepared";
+    if (!requiresCommittedReconciliation) {
+      try {
+        let pendingCapture = reflectApply(
+          resumePreparedCheckpointCapture,
+          backend,
+          [
+            objectFreeze({
+              checkpoint: preparedCapture.checkpoint,
+              request: preparedCapture.request,
+            }),
+          ],
+        );
+        pendingCapture = normalizeSafeNativePromise(pendingCapture);
+        ensure(pendingCapture !== null, outcomeCode);
+        resultValue = await pendingCapture;
+      } catch {
+        // A recovery worker may have claimed the prepared handoff after the
+        // stop receipt was read. From this point forward only source-free
+        // committed verification may settle the retained local record.
+        requiresCommittedReconciliation = true;
+      }
+    }
+    if (requiresCommittedReconciliation) {
+      let pendingCapture;
+      try {
+        pendingCapture = reflectApply(
+          reconcileCleanCheckpointCapture,
+          undefined,
+          [
+            objectFreeze({
+              backend,
+              checkpoint: preparedCapture.checkpoint,
+              manifest: preparedCapture.manifest,
+              request: preparedCapture.request,
+              storageRef: preparedCapture.storageRef,
+            }),
+          ],
+        );
+      } catch {
+        fail(outcomeCode);
+      }
+      pendingCapture = normalizeSafeNativePromise(pendingCapture);
+      ensure(pendingCapture !== null, outcomeCode);
+      try {
+        resultValue = await pendingCapture;
+      } catch {
+        fail(outcomeCode);
+      }
+    }
+    let result;
+    try {
+      result = assertPreparedCleanCheckpointResult({
+        preparedCapture,
+        result: resultValue,
+      });
+      ensure(sameFrozenData(result, predeterminedResult), outcomeCode);
+    } catch {
+      fail(outcomeCode);
+    }
+
+    let retirement;
+    let normalizedRetirement;
+    try {
+      retirement = reflectApply(retirePreparedCapture, launcher, [
+        objectFreeze({
+          resolution: stopped.resolution,
+          result,
+        }),
+      ]);
+      normalizedRetirement = assertPreparedCleanCheckpointResult({
+        preparedCapture,
+        result: retirement,
+      });
+    } catch {
+      drainRetirementPromise(retirement);
+      fail(retirementCode);
+    }
+    if (!sameFrozenData(normalizedRetirement, result)) {
+      drainRetirementPromise(retirement);
+      fail(retirementCode);
+    }
+    return result;
+  };
+
   objectFreeze(runCapture);
-  return objectFreeze({ runCapture });
+  objectFreeze(runPreparedCapture);
+  return objectFreeze({ runCapture, runPreparedCapture });
 }
 
 objectFreeze(PostgresDurableStopCaptureCompositionError.prototype);

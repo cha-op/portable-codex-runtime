@@ -56,6 +56,14 @@ The adapter separately advertises
 `reconcileCheckpointCapture()` extension. The extension does not change the v1
 base storage-backend method set.
 
+When the mutation authority additionally exposes exact own-data
+`runPreparedCapture`, the adapter also advertises
+`preparedCheckpointCaptureContractVersion: 1` and implements the optional
+fresh-only `resumePreparedCheckpointCapture()` extension. Supplying the legacy
+three-method authority leaves both fields absent. This extension resumes only
+an exact capture operation durably prepared by the V3 writer-stop handoff; it
+does not widen the base storage-backend method set.
+
 The mutation authority may additionally expose the exact own-data field
 `restoreContextContractVersion`. Omitting it, or setting it to `2`, preserves
 the legacy restore callback contract. Version `3` selects the full typed
@@ -87,9 +95,11 @@ layers must prevent a stale writer from crossing the mutation guard.
 
 `captureCheckpoint` and `restoreCheckpoint` implement the base mutation
 contract. `reconcileCheckpointCapture` implements the optional committed
-capture-reconciliation extension. If present, `prepareRestoreAttachment`
-implements only the optional detached-destination activation extension; it is
-not synthesized from `prepareWritableAttachment`.
+capture-reconciliation extension. When advertised,
+`resumePreparedCheckpointCapture` implements the optional fresh prepared-
+capture extension. If present, `prepareRestoreAttachment` implements only the
+optional detached-destination activation extension; it is not synthesized from
+`prepareWritableAttachment`.
 
 ## Trusted Collaborators
 
@@ -128,7 +138,8 @@ correlation values, but none of those fields independently carries stop
 authority.
 
 The mutation authority exposes exact own-data `runCapture`,
-`runCaptureReconciliation`, and `runRestore` methods. It is the durable
+`runCaptureReconciliation`, and `runRestore` methods and may add exact
+`runPreparedCapture`. It is the durable
 catalogue and admission seam: before invoking a normal mutation callback, it
 must reserve the exact request, checkpoint descriptor, and predetermined
 result. During the complete normal callback it must hold the canonical fence
@@ -268,6 +279,36 @@ correlation IDs are not independently proof that an earlier artifact was
 created after the current writer stop. Exact replay belongs to the separate
 authenticated reconciliation API, not a new stopped-writer capability.
 
+## Prepared Capture Continuation
+
+`resumePreparedCheckpointCapture({ checkpoint, request })` accepts only the
+exact clean-capture tuple already embedded in a V3 stop request and atomically
+materialized as the session's active `prepared` capture. It does not resolve a
+writer, consume a stopped-writer capability, or call the coordinator. The
+durable stop finalizer, not a serialized caller assertion, is the provenance
+for this entry point.
+
+The backend invokes `mutationAuthority.runPreparedCapture(admission, publish)`.
+The authority first reads and validates the exact handoff-produced operation
+and reservation. Under its per-operation guard it obtains the one
+`prepared -> starting` dispatch grant, creates the canonical authorized
+capture attempt, and supplies the stopped attachment, historical lease tuple,
+storage reference, exact source plan, artifact plan, and predetermined result
+to `publish`. The historical lease is immutable stopped-source identity, not a
+new writer-access grant, so expiry alone does not invalidate this continuation.
+
+The callback calls `publishFreshCheckpointArtifact()` and requires
+`replayed: false`. It never adopts an existing journal record. After the
+dispatch grant may have committed, any publication or finalization ambiguity
+leaves the durable operation active or uncertain and fails closed. A caller
+retry may present a cached `prepared` handoff receipt and invoke this method
+again, but the mutation authority re-reads the durable operation and rejects
+an already `starting`, `uncertain`, or `committed` state before the fresh
+publication callback. The caller then routes through
+`reconcileCheckpointCapture()`, whose verifier has no source path and accepts
+only an already committed journal publication. Thus an ambiguous grant cannot
+produce a second fresh publication.
+
 ## Committed Capture Reconciliation
 
 `reconcileCheckpointCapture({ checkpoint, request })` receives only the exact
@@ -390,11 +431,12 @@ authority. The adapter's v1 coordinator projection is sufficient only for
 legacy adapter replay; it is not the complete typed generation binding required
 by PostgreSQL generation document v2. Version 3 now transports that complete
 binding without enabling production restore by itself. The production mutation
-authority still fails closed until the remaining stop, detach, activation,
-launch, fleet-gate, and recovery-scheduler composition lands. Once enabled, the
-authority must durably finalize launcher-visible destination state and return
-the same completion object before the backend reports success. A published path
-or journal record alone is not writable-launch authority.
+authority's `runRestore()` still fails closed until the cross-process
+shared/exclusive lifecycle guard, production recovery scheduler,
+invocation-time detached-production gate, and adapter wiring land. Once
+enabled, the authority must durably finalize launcher-visible destination state
+and return the same completion object before the backend reports success. A
+published path or journal record alone is not writable-launch authority.
 
 ## Detached Restore Attachment Activation
 
@@ -423,8 +465,8 @@ uncertain; no fallback calls the ordinary writable-attachment method.
 
 ## Callback and Uncertainty Contract
 
-All three mutation-authority methods must await their single callback. Calling it
-zero times, more than once, after the authority method has returned, or
+Every invoked mutation-authority method must await its single callback. Calling
+it zero times, more than once, after the authority method has returned, or
 returning a substituted completion object fails closed as uncertain. The
 authority guard must span the callback's complete asynchronous lifetime and
 durable finalization; fence, attach, or launcher admission cannot cross it.
@@ -496,8 +538,8 @@ fencing, idempotency, publication, and fault evidence.
 
 This backend deliberately does not provide:
 
-- automatic repair or continuation of `prepared` or `materialized` capture
-  attempts;
+- automatic repair or continuation of `prepared` or `materialized`
+  publication-journal phases;
 - a production linearizable lease, reservation, catalogue, and
   launcher-admission database;
 - NFS or another remote/shared-filesystem adapter;
