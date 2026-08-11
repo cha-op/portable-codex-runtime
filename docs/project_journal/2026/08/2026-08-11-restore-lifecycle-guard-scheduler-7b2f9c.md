@@ -40,7 +40,8 @@ overlapping steps. Production `runRestore()` remains fail-closed.
   guarded variant and binds each one-shot batch receipt to the exact lease.
 - `PostgresRestoreRecoveryScheduler` starts with one immediate bounded pass,
   serializes later fixed-delay passes, coalesces concurrent kicks, reports
-  busy and uncertain outcomes through one observer, and drains an admitted
+  busy and uncertain outcomes through one synchronous `undefined`-returning
+  observer, rejects Promise/thenable observer returns, and drains an admitted
   pass before `stop()` settles.
 
 ## Safety Decisions

@@ -77,6 +77,9 @@ const STEP_OUTCOME_UNCERTAIN =
 const schedulerBrands = new WeakSetConstructor();
 const schedulerErrorBrands = new WeakSetConstructor();
 const observerContexts = new AsyncLocalStorage();
+const discardObserverSettlement = objectFreeze(
+  function discardObserverSettlement() {},
+);
 const promiseSpeciesHolder = objectCreate(null);
 objectDefineProperty(promiseSpeciesHolder, promiseSpeciesSymbol, {
   configurable: false,
@@ -398,6 +401,20 @@ function normalizeSafeNativePromise(value) {
   }
 }
 
+function drainObserverPromise(value) {
+  const normalized = normalizeSafeNativePromise(value);
+  if (normalized === null) return false;
+  try {
+    callIntrinsic(promiseThenIntrinsic, normalized, [
+      discardObserverSettlement,
+      discardObserverSettlement,
+    ]);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 function hasUntrustedThenableShape(value) {
   if (
     value === null ||
@@ -500,14 +517,11 @@ export function createPostgresRestoreRecoveryScheduler(...args) {
   const stoppedResult = exactFrozenRecord({ status: "stopped" });
 
   function observerReentryIsActive() {
-    return (
-      observerOpen &&
-      callIntrinsic(
-        asyncLocalStorageGetStoreIntrinsic,
-        observerContexts,
-        [],
-      ) === observerContext
-    );
+    return callIntrinsic(
+      asyncLocalStorageGetStoreIntrinsic,
+      observerContexts,
+      [],
+    ) === observerContext;
   }
 
   async function callObserverInternal(receipt) {
@@ -522,14 +536,10 @@ export function createPostgresRestoreRecoveryScheduler(...args) {
         observerContexts,
         [observerContext, invokeObserver],
       );
-      if (value === activeStep || value === completion) fail(outcomeCode);
       if (isGeneratorObjectValue(value)) fail(outcomeCode);
       if (isPromiseValue(value)) {
-        value = normalizeSafeNativePromise(value);
-        ensure(value !== null, outcomeCode);
-        value = await value;
-      } else {
-        ensure(!hasUntrustedThenableShape(value), outcomeCode);
+        ensure(drainObserverPromise(value), outcomeCode);
+        fail(outcomeCode);
       }
       ensure(
         value === undefined &&

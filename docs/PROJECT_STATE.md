@@ -280,9 +280,11 @@
   runner and service revalidate the lease around lane, candidate, and cursor
   boundaries. A fixed-delay scheduler starts with one immediate bounded
   pass, prevents overlapping passes, coalesces concurrent kicks, reports busy
-  or uncertain ticks, and drains admitted work during shutdown. Cursor scopes
-  do not partition this lock, and these components do not enable production
-  restore.
+  or uncertain ticks through a synchronous observer, and drains admitted work
+  during shutdown. The observer must return `undefined`; Promise and thenable
+  returns are rejected to prevent observer/scheduler completion cycles. Cursor
+  scopes do not partition this lock, and these components do not enable
+  production restore.
 - Stopped-directory backend contract version 3 can transport the complete
   authority-issued restore-generation binding to fresh publication or to
   source-free committed verification. Version 2 callback behavior remains

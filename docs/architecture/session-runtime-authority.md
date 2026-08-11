@@ -1675,10 +1675,13 @@ so an unguarded or cross-lease result cannot advance a durable cursor.
 `PostgresRestoreRecoveryScheduler` starts with one immediate bounded pass and
 then uses serial fixed-delay ticks. Concurrent explicit kicks coalesce with the
 one active pass; a foreground shared lease yields a normal busy tick without
-calling recovery. An uncertain pass is reported to the observer and a later
-tick may retry. `stop()` prevents later admission, aborts the active runner at
-its cooperative boundaries, and waits for an admitted candidate plus any
-settled cursor transition to drain before the exclusive lease is released.
+calling recovery. An uncertain pass is reported to a synchronous observer and
+a later tick may retry. The observer must return `undefined`; Promise and
+thenable returns fail closed so an observer cannot wait on the step or scheduler
+completion that is waiting for that same observer. `stop()` prevents later
+admission, aborts the active runner at its cooperative boundaries, and waits for
+an admitted candidate plus any settled cursor transition to drain before the
+exclusive lease is released.
 
 Session advisory-lock loss is detected by the same checked dedicated-client
 probe used by the operation guard. Those probes are cooperative fail-closed

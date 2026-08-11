@@ -698,7 +698,7 @@ test("observer cannot spoof scheduler error identity", async () => {
 });
 
 test(
-  "callback-time Promise pollution cannot settle an observer early",
+  "callback-time Promise pollution cannot admit an async observer",
   { concurrency: false },
   async () => {
     const constructorDescriptor = Object.getOwnPropertyDescriptor(
@@ -758,29 +758,80 @@ test(
       },
     });
     const completion = fixture.scheduler.start();
-    let settled = false;
-    completion.then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      },
-    );
     try {
       await restoration.promise;
     } finally {
       restore();
     }
     assert.equal(poisonedThenCalls, 0);
-    assert.equal(settled, false);
     assert.equal(fixture.steps.length, 1);
+    await assert.rejects(
+      completion,
+      schedulerCode(
+        "postgres_restore_recovery_scheduler_outcome_uncertain",
+      ),
+    );
 
-    observer.resolve();
+    observer.reject(new Error("late observer rejection"));
+    await nextTurn();
     await nextTurn();
     const stop = fixture.scheduler.stop();
     assert.strictEqual(stop, completion);
-    assert.deepEqual(await completion, freezeRecord({ status: "stopped" }));
+    await assert.rejects(
+      stop,
+      schedulerCode(
+        "postgres_restore_recovery_scheduler_outcome_uncertain",
+      ),
+    );
+  },
+);
+
+test(
+  "observer cannot wait on a completion-derived Promise",
+  { timeout: 1_000 },
+  async () => {
+    let completion;
+    const fixture = createSchedulerFixture({
+      onStep() {
+        return completion.then(() => undefined);
+      },
+    });
+    completion = fixture.scheduler.start();
+    await assert.rejects(
+      completion,
+      schedulerCode(
+        "postgres_restore_recovery_scheduler_outcome_uncertain",
+      ),
+    );
+    assert.strictEqual(fixture.scheduler.stop(), completion);
+  },
+);
+
+test(
+  "observer cannot wait on an active-step-derived Promise",
+  { timeout: 1_000 },
+  async () => {
+    let activeStep;
+    const fixture = createSchedulerFixture({
+      onStep() {
+        return activeStep.then(() => undefined);
+      },
+    });
+    const completion = fixture.scheduler.start();
+    activeStep = fixture.scheduler.runStep({ signal: null });
+    await assert.rejects(
+      activeStep,
+      schedulerCode(
+        "postgres_restore_recovery_scheduler_outcome_uncertain",
+      ),
+    );
+    await assert.rejects(
+      completion,
+      schedulerCode(
+        "postgres_restore_recovery_scheduler_outcome_uncertain",
+      ),
+    );
+    assert.strictEqual(fixture.scheduler.stop(), completion);
   },
 );
 
@@ -800,7 +851,7 @@ test("observer cannot create a completion cycle by returning stop", async () => 
   assert.strictEqual(scheduler.stop(), completion);
 });
 
-test("observer descendants cannot await scheduler completion", async () => {
+test("async observer descendants cannot reenter the scheduler", async () => {
   let scheduler;
   const fixture = createSchedulerFixture({
     onStep() {

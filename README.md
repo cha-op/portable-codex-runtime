@@ -324,8 +324,11 @@ lease around lane reads, reconciliation batches, and durable cursor advances;
 the service revalidates it around listing and each admitted candidate. The
 production recovery scheduler runs one immediate bounded pass, then fixed-
 delay non-overlapping passes, coalesces concurrent kicks, and drains an
-admitted pass before shutdown settles. Cursor recovery scopes remain fairness
-and replay identities only; they do not partition the lifecycle lock.
+admitted pass before shutdown settles. Its `onStep` hook is synchronous
+notification only and must return exactly `undefined`; Promise, thenable,
+generator, and other values fail the scheduler closed. A returned safe native
+Promise is rejection-drained but never awaited. Cursor recovery scopes remain
+fairness and replay identities only; they do not partition the lifecycle lock.
 
 Production restore therefore remains fail-closed. The remaining serial
 prerequisites are an invocation-time detached-production compatibility gate
