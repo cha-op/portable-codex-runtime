@@ -1225,7 +1225,7 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       requestCode,
     );
     signalIsAborted(request.signal, requestCode);
-    ensure(!inFlight, outcomeCode);
+    ensure(!inFlight, busyCode);
     inFlight = true;
     try {
       if (signalIsAborted(request.signal, requestCode)) {

@@ -628,6 +628,42 @@ test("maps an outer lifecycle conflict to the stable runner busy code", async ()
   assert.equal(manager.holder, null);
 });
 
+test("maps same-runner overlap to the stable busy code before new work", async () => {
+  const entered = deferred();
+  const finish = deferred();
+  const cursorFixture = createCursorStore({ recordCalls: false });
+  const originalStore = cursorFixture.store;
+  let readCalls = 0;
+  const blockingStore = freezeRecord({
+    advanceLane: originalStore.advanceLane,
+    async readLane(input) {
+      readCalls += 1;
+      if (readCalls === 1) {
+        entered.resolve();
+        await finish.promise;
+      }
+      return originalStore.readLane(input);
+    },
+  });
+  const fixture = createRunner({
+    cursorFixture: { ...cursorFixture, store: blockingStore },
+  });
+
+  const firstRun = fixture.runner.runOnce({ signal: null });
+  await entered.promise;
+  const serviceCallsBefore = fixture.serviceFixture.calls.length;
+  await assert.rejects(
+    fixture.runner.runOnce({ signal: null }),
+    assertCode("postgres_restore_recovery_runner_busy"),
+  );
+  assert.equal(readCalls, 1);
+  assert.equal(fixture.serviceFixture.calls.length, serviceCallsBefore);
+
+  finish.resolve();
+  await firstRun;
+  assert.equal(fixture.lifecycleFixture.manager.holder, null);
+});
+
 test("lease loss after one reconcile stops later candidates and cursor CAS", async () => {
   let reconcileCalls = 0;
   let lost = false;
@@ -1551,7 +1587,7 @@ test("one runner admits only one run at a time", async () => {
   const first = runner.runOnce({ signal: null });
   await assert.rejects(
     runner.runOnce({ signal: null }),
-    assertCode("postgres_restore_recovery_runner_outcome_uncertain"),
+    assertCode("postgres_restore_recovery_runner_busy"),
   );
   release();
   await first;
