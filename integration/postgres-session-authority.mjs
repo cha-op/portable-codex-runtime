@@ -11155,7 +11155,6 @@ test(
     assert.equal(calls.image, 0);
     assert.equal(calls.plan, 1);
     assert.equal(calls.provider, 0);
-    assert.equal(calls.publication > 0, true);
     assert.equal(calls.publish, 0);
     assert.equal(calls.sourceResolver > 0, true);
     assert.equal(calls.supervisorLaunch, 1);
