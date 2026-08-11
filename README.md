@@ -322,6 +322,9 @@ Foreground composition can hold a shared lease, while each bounded recovery
 pass holds the matching exclusive lease. The recovery runner revalidates that
 lease around lane reads, reconciliation batches, and durable cursor advances;
 the service revalidates it around listing and each admitted candidate. The
+fixed lifecycle lock uses a versioned advisory-key namespace distinct from
+ordinary durable operation IDs, so an operation whose ID matches the lifecycle
+label cannot self-conflict with the outer shared or exclusive lease. The
 underlying operation guard uses callback-only node-postgres adapters and a
 callback-scoped `complete(value)` carrier, so driver results and asynchronous
 lifecycle results cannot be assimilated through mutable Promise or object

@@ -4,6 +4,8 @@ import test from "node:test";
 
 import {
   POSTGRES_OPERATION_GUARD_NAMESPACE,
+  POSTGRES_RESTORE_LIFECYCLE_GUARD_NAMESPACE,
+  POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
   PostgresOperationGuard,
   PostgresOperationGuardError,
 } from "../src/postgres-operation-guard.mjs";
@@ -363,6 +365,16 @@ function lockKeyFor(operationId) {
     .toString();
 }
 
+function restoreLifecycleLockKey() {
+  return createHash("sha256")
+    .update(POSTGRES_RESTORE_LIFECYCLE_GUARD_NAMESPACE, "utf8")
+    .update("\0", "utf8")
+    .update(POSTGRES_RESTORE_LIFECYCLE_LOCK_ID, "utf8")
+    .digest()
+    .readBigInt64BE(0)
+    .toString();
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -662,6 +674,59 @@ test("runShared uses the same key derivation with shared lock SQL", async () => 
     true,
   );
   assert.deepEqual(unlock[0].values, tryLock[0].values);
+  assert.equal(manager.holders.size, 0);
+});
+
+test("restore lifecycle methods use a fixed key domain separate from ordinary operation IDs", async () => {
+  const manager = new AdvisoryLockManager();
+  const lifecycleClient = new FakeClient(clientOptions(manager, 152));
+  const ordinaryClient = new FakeClient(clientOptions(manager, 153));
+  const lifecycleGuard = makeGuard(lifecycleClient).guard;
+  const ordinaryGuard = makeGuard(ordinaryClient).guard;
+
+  assert.equal(
+    Object.isFrozen(
+      PostgresOperationGuard.prototype.runRestoreLifecycleExclusive,
+    ),
+    true,
+  );
+  assert.equal(
+    Object.isFrozen(
+      PostgresOperationGuard.prototype.runRestoreLifecycleShared,
+    ),
+    true,
+  );
+  assert.equal(
+    await lifecycleGuard.runRestoreLifecycleExclusive(
+      async (probe, complete) => {
+        await probe.assertHeld();
+        return complete("lifecycle");
+      },
+    ),
+    "lifecycle",
+  );
+  assert.equal(
+    await ordinaryGuard.runExclusive(
+      POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
+      async (probe, complete) => {
+        await probe.assertHeld();
+        return complete("ordinary");
+      },
+    ),
+    "ordinary",
+  );
+
+  const lifecycleTry = lifecycleClient.queries.find(([query]) =>
+    query?.text?.includes("pg_try_advisory_lock("),
+  )[0];
+  const ordinaryTry = ordinaryClient.queries.find(([query]) =>
+    query?.text?.includes("pg_try_advisory_lock("),
+  )[0];
+  assert.deepEqual(lifecycleTry.values, [restoreLifecycleLockKey()]);
+  assert.deepEqual(ordinaryTry.values, [
+    lockKeyFor(POSTGRES_RESTORE_LIFECYCLE_LOCK_ID),
+  ]);
+  assert.notEqual(lifecycleTry.values[0], ordinaryTry.values[0]);
   assert.equal(manager.holders.size, 0);
 });
 

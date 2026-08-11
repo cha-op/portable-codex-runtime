@@ -25,6 +25,7 @@ import {
   createPostgresRestoreActivationRecoveryService,
 } from "../src/postgres-restore-activation-recovery-service.mjs";
 import {
+  POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
   createPostgresRestoreLifecycleGuard,
 } from "../src/postgres-restore-lifecycle-guard.mjs";
 import {
@@ -10612,6 +10613,12 @@ test(
       connectionString: databaseUrl,
       max: 4,
     });
+    const collisionPool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-lifecycle-collision-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
+    });
     const recoveryScopeId = `integration-restore-${randomUUID()}`;
     t.after(async () => {
       try {
@@ -10624,9 +10631,13 @@ test(
         );
       } finally {
         try {
-          await lifecyclePool.end();
+          await collisionPool.end();
         } finally {
-          await pool.end();
+          try {
+            await lifecyclePool.end();
+          } finally {
+            await pool.end();
+          }
         }
       }
     });
@@ -10646,6 +10657,22 @@ test(
         dedicatedPool: lifecyclePool,
       }),
     });
+    const collidingOperationGuard = new PostgresOperationGuard({
+      dedicatedPool: collisionPool,
+    });
+    const collisionResult = await lifecycleGuard.runRecovery(
+      async (_lease, lifecycleComplete) => {
+        const operationResult = await collidingOperationGuard.runExclusive(
+          POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
+          async (probe, operationComplete) => {
+            await probe.assertHeld();
+            return operationComplete("operation-lock-acquired");
+          },
+        );
+        return lifecycleComplete(operationResult);
+      },
+    );
+    assert.equal(collisionResult, "operation-lock-acquired");
     let unexpectedReconciliations = 0;
     const recoveryService =
       createPostgresRestoreActivationRecoveryService({

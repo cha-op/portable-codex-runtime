@@ -3,6 +3,10 @@ import { types as utilTypes } from "node:util";
 
 export const POSTGRES_OPERATION_GUARD_NAMESPACE =
   "portable-codex-runtime:postgres-operation-guard:v1";
+export const POSTGRES_RESTORE_LIFECYCLE_GUARD_NAMESPACE =
+  "portable-codex-runtime:postgres-restore-lifecycle-guard:v1";
+export const POSTGRES_RESTORE_LIFECYCLE_LOCK_ID =
+  "portable-codex-runtime:postgres-restore-lifecycle:v1";
 
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SIGNED_INT64_MIN = -(1n << 63n);
@@ -692,14 +696,11 @@ function normalizeCallback(value) {
   return value;
 }
 
-function operationLockKey(operationId) {
+function namespacedLockKey(namespace, lockId) {
   const hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
-  callIntrinsic(hashUpdateIntrinsic, hash, [
-    POSTGRES_OPERATION_GUARD_NAMESPACE,
-    "utf8",
-  ]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [namespace, "utf8"]);
   callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
-  callIntrinsic(hashUpdateIntrinsic, hash, [operationId, "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [lockId, "utf8"]);
   const digest = callIntrinsic(hashDigestIntrinsic, hash, []);
   const signed = callIntrinsic(bufferReadBigInt64BEIntrinsic, digest, [0]);
   ensure(
@@ -708,6 +709,18 @@ function operationLockKey(operationId) {
   );
   return callIntrinsic(bigIntToStringIntrinsic, signed, []);
 }
+
+function operationLockKey(operationId) {
+  return namespacedLockKey(
+    POSTGRES_OPERATION_GUARD_NAMESPACE,
+    operationId,
+  );
+}
+
+const RESTORE_LIFECYCLE_LOCK_KEY = namespacedLockKey(
+  POSTGRES_RESTORE_LIFECYCLE_GUARD_NAMESPACE,
+  POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
+);
 
 function ownDataValue(value, key, code) {
   if (
@@ -1145,14 +1158,23 @@ function cleanAndRelease(binding, options) {
   return protectPromise(cleanAndReleaseInternal(binding, options));
 }
 
-async function runWithLockModeInternal(poolBinding, args, lockMode) {
+async function runWithLockModeInternal(
+  poolBinding,
+  args,
+  lockMode,
+  fixedLockKey = undefined,
+) {
   ensure(
-    args.length === 2,
+    args.length === (fixedLockKey === undefined ? 2 : 1),
     "invalid_postgres_operation_guard_request",
   );
-  const operationId = normalizeOperationId(args[0]);
-  const callback = normalizeCallback(args[1]);
-  const key = operationLockKey(operationId);
+  const callback = normalizeCallback(
+    args[fixedLockKey === undefined ? 1 : 0],
+  );
+  const key =
+    fixedLockKey === undefined
+      ? operationLockKey(normalizeOperationId(args[0]))
+      : fixedLockKey;
   const binding = await acquireClient(poolBinding);
 
   try {
@@ -1368,6 +1390,17 @@ function runWithLockMode(poolBinding, args, lockMode) {
   return protectPromise(runWithLockModeInternal(poolBinding, args, lockMode));
 }
 
+function runWithRestoreLifecycleLockMode(poolBinding, args, lockMode) {
+  return protectPromise(
+    runWithLockModeInternal(
+      poolBinding,
+      args,
+      lockMode,
+      RESTORE_LIFECYCLE_LOCK_KEY,
+    ),
+  );
+}
+
 export class PostgresOperationGuardError extends ErrorConstructor {
   constructor(code) {
     const message = ERROR_MESSAGES[code];
@@ -1425,6 +1458,22 @@ export class PostgresOperationGuard {
   runShared(...args) {
     return runWithLockMode(this.#poolBinding, args, SHARED_LOCK_MODE);
   }
+
+  runRestoreLifecycleExclusive(...args) {
+    return runWithRestoreLifecycleLockMode(
+      this.#poolBinding,
+      args,
+      EXCLUSIVE_LOCK_MODE,
+    );
+  }
+
+  runRestoreLifecycleShared(...args) {
+    return runWithRestoreLifecycleLockMode(
+      this.#poolBinding,
+      args,
+      SHARED_LOCK_MODE,
+    );
+  }
 }
 
 export function isPostgresOperationGuard(value) {
@@ -1436,5 +1485,9 @@ export function isPostgresOperationGuard(value) {
   );
 }
 
+objectFreeze(
+  PostgresOperationGuard.prototype.runRestoreLifecycleExclusive,
+);
+objectFreeze(PostgresOperationGuard.prototype.runRestoreLifecycleShared);
 objectFreeze(PostgresOperationGuard.prototype);
 objectFreeze(PostgresOperationGuardError.prototype);

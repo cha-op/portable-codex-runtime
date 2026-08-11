@@ -521,6 +521,14 @@ completion values fail closed. This keeps the advisory lock held until the
 real callback settles even when callback code mutates the process-wide Promise
 or object prototypes.
 
+Ordinary operation locks and the database-global restore lifecycle lock use
+different versioned advisory-key namespaces. The lifecycle facade reaches the
+lifecycle namespace only through exact methods captured from a branded frozen
+`PostgresOperationGuard`; its shared and exclusive modes still hash to the same
+lifecycle key. A durable operation ID equal to the lifecycle lock label remains
+in the ordinary namespace and therefore cannot self-conflict with an outer
+lifecycle lease, including for historical operation rows.
+
 Serialization failures and deadlocks may be retried only when the same
 node-postgres `DatabaseError` object was first observed on that client's
 `errorMessage` connection event and then rejected the active query with the

@@ -54,6 +54,11 @@ overlapping steps. Production `runRestore()` remains fail-closed.
   exclusion over the full database candidate universe. Recovery cursor scopes
   do not partition authority candidates, so lifecycle lock identity is not
   derived from `recoveryScopeId`.
+- The fixed lifecycle lock and ordinary per-operation locks use distinct
+  versioned advisory-key namespaces. Shared and exclusive lifecycle modes keep
+  one key, while an existing durable operation whose ID equals the lifecycle
+  label remains in the ordinary namespace and cannot deadlock against its
+  outer lifecycle lease.
 - The exclusive lease spans list, reconcile, and cursor settlement. A cursor
   cannot advance from an unguarded or differently guarded batch receipt, and a
   later lane is not admitted after a failed lease probe.

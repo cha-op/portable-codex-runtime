@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   POSTGRES_OPERATION_GUARD_NAMESPACE,
+  POSTGRES_RESTORE_LIFECYCLE_GUARD_NAMESPACE,
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
@@ -229,6 +230,16 @@ function deferred() {
 
 function lockKey() {
   return createHash("sha256")
+    .update(POSTGRES_RESTORE_LIFECYCLE_GUARD_NAMESPACE, "utf8")
+    .update("\0", "utf8")
+    .update(POSTGRES_RESTORE_LIFECYCLE_LOCK_ID, "utf8")
+    .digest()
+    .readBigInt64BE(0)
+    .toString();
+}
+
+function ordinaryCollisionLockKey() {
+  return createHash("sha256")
     .update(POSTGRES_OPERATION_GUARD_NAMESPACE, "utf8")
     .update("\0", "utf8")
     .update(POSTGRES_RESTORE_LIFECYCLE_LOCK_ID, "utf8")
@@ -359,6 +370,57 @@ for (const scenario of [
     await firstRun;
     assert.equal(manager.holders.size, 0);
   });
+}
+
+for (const [lifecycleMode, lifecycleMethod] of [
+  ["foreground", "runForeground"],
+  ["recovery", "runRecovery"],
+]) {
+  test(
+    `ordinary collision ID remains independent during ${lifecycleMode} lifecycle lock`,
+    async () => {
+      const manager = new AdvisoryLockManager();
+      const lifecycleFixture = createFixture(manager, 230);
+      const ordinaryFixture = createFixture(manager, 231);
+      let ordinaryCallbackCalls = 0;
+
+      const result = await lifecycleFixture.lifecycle[lifecycleMethod](
+        async (lease, completeLifecycle) => {
+          await assertPostgresRestoreLifecycleLeaseHeld(
+            lease,
+            lifecycleMode,
+          );
+          const ordinaryResult =
+            await ordinaryFixture.operationGuard.runExclusive(
+              POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
+              async (probe, completeOperation) => {
+                ordinaryCallbackCalls += 1;
+                await probe.assertHeld();
+                return completeOperation("ordinary-complete");
+              },
+            );
+          await assertPostgresRestoreLifecycleLeaseHeld(
+            lease,
+            lifecycleMode,
+          );
+          return completeLifecycle(ordinaryResult);
+        },
+      );
+
+      const lifecycleTry = lifecycleFixture.client.queries.find(([query]) =>
+        query?.text?.includes("pg_try_advisory_lock"),
+      )[0];
+      const ordinaryTry = ordinaryFixture.client.queries.find(([query]) =>
+        query?.text?.includes("pg_try_advisory_lock("),
+      )[0];
+      assert.equal(result, "ordinary-complete");
+      assert.equal(ordinaryCallbackCalls, 1);
+      assert.deepEqual(lifecycleTry.values, [lockKey()]);
+      assert.deepEqual(ordinaryTry.values, [ordinaryCollisionLockKey()]);
+      assert.notEqual(lifecycleTry.values[0], ordinaryTry.values[0]);
+      assert.equal(manager.holders.size, 0);
+    },
+  );
 }
 
 test("foreground and recovery SQL use one fixed derived key and exact modes", async () => {

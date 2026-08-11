@@ -2,13 +2,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { types as utilTypes } from "node:util";
 
 import {
+  POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
   PostgresOperationGuard,
   PostgresOperationGuardError,
   isPostgresOperationGuard,
 } from "./postgres-operation-guard.mjs";
 
-export const POSTGRES_RESTORE_LIFECYCLE_LOCK_ID =
-  "portable-codex-runtime:postgres-restore-lifecycle:v1";
+export { POSTGRES_RESTORE_LIFECYCLE_LOCK_ID };
 
 const FOREGROUND_MODE = "foreground";
 const RECOVERY_MODE = "recovery";
@@ -53,9 +53,10 @@ const promiseResolveIntrinsic = Promise.resolve;
 const promiseSpeciesSymbol = Symbol.species;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectOwnKeys = Reflect.ownKeys;
-const runExclusiveIntrinsic =
-  PostgresOperationGuard.prototype.runExclusive;
-const runSharedIntrinsic = PostgresOperationGuard.prototype.runShared;
+const runRestoreLifecycleExclusiveIntrinsic =
+  PostgresOperationGuard.prototype.runRestoreLifecycleExclusive;
+const runRestoreLifecycleSharedIntrinsic =
+  PostgresOperationGuard.prototype.runRestoreLifecycleShared;
 const TypeErrorConstructor = TypeError;
 const WeakMapConstructor = WeakMap;
 const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
@@ -210,13 +211,16 @@ function trustedCallback(value, code) {
 
 function operationGuardBinding(value, code) {
   ensure(
-    isPostgresOperationGuard(value) && objectIsFrozen(value),
+    isPostgresOperationGuard(value) &&
+      objectIsFrozen(value) &&
+      objectIsFrozen(runRestoreLifecycleExclusiveIntrinsic) &&
+      objectIsFrozen(runRestoreLifecycleSharedIntrinsic),
     code,
   );
   return exactFrozenRecord({
     receiver: value,
-    runExclusive: runExclusiveIntrinsic,
-    runShared: runSharedIntrinsic,
+    runExclusive: runRestoreLifecycleExclusiveIntrinsic,
+    runShared: runRestoreLifecycleSharedIntrinsic,
   });
 }
 
@@ -759,7 +763,6 @@ async function invokeLifecycleInternal(binding, mode, callback) {
   let pending;
   try {
     pending = callIntrinsic(method, binding.receiver, [
-      POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
       callbackAdapter,
     ]);
   } catch {
