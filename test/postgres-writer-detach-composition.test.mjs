@@ -310,27 +310,30 @@ class DetachGuardClient {
     this.resetCount = 0;
   }
 
-  async query(...args) {
+  query(...args) {
     const query = args[0];
-    const text = typeof query === "string" ? query : query.text;
+    const callback = query?.callback;
+    const text = query?.text;
 
     if (text === "DISCARD ALL") {
       this.resetCount += 1;
       this.manager.releaseAll(this);
-      return { command: "DISCARD", rows: [] };
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
     }
 
-    const values = typeof query === "string" ? args[1] : query.values;
+    const values = query.values;
     const key = values[0];
     if (text.includes("pg_try_advisory_lock")) {
       const acquired =
         this.guardState.mode === "busy"
           ? false
           : this.manager.tryAcquire(key, this);
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [{ acquired, backend_pid: this.pid }],
-      };
+      });
+      return undefined;
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
       this.heldProbeCount += 1;
@@ -340,16 +343,18 @@ class DetachGuardClient {
         this.guardState.mode === requestedFailure
           ? false
           : this.manager.isHeld(key, this);
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [{ backend_pid: this.pid, lock_held: lockHeld }],
-      };
+      });
+      return undefined;
     }
     if (text.includes("pg_advisory_unlock")) {
       if (this.guardState.mode === "cleanup") {
-        throw new Error("guard cleanup failed");
+        callback(new Error("guard cleanup failed"));
+        return undefined;
       }
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -357,14 +362,17 @@ class DetachGuardClient {
             unlocked: this.manager.unlock(key, this),
           },
         ],
-      };
+      });
+      return undefined;
     }
-    throw new Error(`unexpected guard query: ${text}`);
+    callback(new Error(`unexpected guard query: ${text}`));
+    return undefined;
   }
 
-  async release(...args) {
+  release(...args) {
     this.releaseCalls.push(args);
     this.manager.releaseAll(this);
+    return undefined;
   }
 }
 
@@ -377,7 +385,7 @@ class DetachGuardPool {
     this.nextPid = 8_001;
   }
 
-  async connect() {
+  connect(callback) {
     this.calls.push(["runExclusive"]);
     const client = new DetachGuardClient({
       calls: this.calls,
@@ -387,7 +395,8 @@ class DetachGuardPool {
     });
     this.nextPid += 1;
     this.clients.push(client);
-    return client;
+    callback(null, client);
+    return undefined;
   }
 }
 

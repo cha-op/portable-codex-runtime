@@ -7,6 +7,9 @@ import {
   PostgresCheckpointMutationAuthorityError,
 } from "../src/postgres-checkpoint-mutation-authority.mjs";
 import {
+  PostgresOperationGuard,
+} from "../src/postgres-operation-guard.mjs";
+import {
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   createCheckpointCaptureOperationRequest,
   SESSION_AUTHORITY_DOCUMENT_VERSION,
@@ -51,6 +54,66 @@ function deepFreeze(value) {
 
 function exactKeys(value, keys) {
   assert.deepEqual(Reflect.ownKeys(value).sort(), [...keys].sort());
+}
+
+function callbackOnlyOperationGuardPool() {
+  const state = {
+    connectCallbacks: 0,
+    connectCalls: 0,
+    lockHeld: false,
+    queryCallbacks: 0,
+    queryCalls: 0,
+    releaseCalls: 0,
+  };
+  const client = {
+    query(config) {
+      state.queryCalls += 1;
+      assert.equal(config.queryMode, "extended");
+      assert.equal(Object.isFrozen(config.callback), true);
+      let result;
+      if (config.text === "DISCARD ALL") {
+        result = { command: "DISCARD", rows: [] };
+      } else if (config.text.includes("pg_try_advisory_lock(")) {
+        state.lockHeld = true;
+        result = {
+          command: "SELECT",
+          rows: [{ acquired: true, backend_pid: 9001 }],
+        };
+      } else if (config.text.includes("FROM pg_catalog.pg_locks")) {
+        result = {
+          command: "SELECT",
+          rows: [{ backend_pid: 9001, lock_held: state.lockHeld }],
+        };
+      } else if (config.text.includes("pg_advisory_unlock(")) {
+        const unlocked = state.lockHeld;
+        state.lockHeld = false;
+        result = {
+          command: "SELECT",
+          rows: [{ backend_pid: 9001, unlocked }],
+        };
+      } else {
+        assert.fail(`unexpected operation guard query: ${config.text}`);
+      }
+      state.queryCallbacks += 1;
+      assert.equal(config.callback(null, result), undefined);
+      return undefined;
+    },
+    release(...args) {
+      state.releaseCalls += 1;
+      assert.equal(args.length, 0);
+      state.lockHeld = false;
+      return undefined;
+    },
+  };
+  const pool = {
+    connect(callback) {
+      state.connectCalls += 1;
+      state.connectCallbacks += 1;
+      assert.equal(callback(null, client), undefined);
+      return undefined;
+    },
+  };
+  return { pool, state };
 }
 
 function sha256(value) {
@@ -753,7 +816,17 @@ class FakeGuard {
     this.state.trace.push("guard:start");
     assert.equal(operationId, OPERATION_ID);
     let probes = 0;
-    const result = await callback(
+    let completionCalls = 0;
+    let completionCarrier;
+    let completionValue;
+    const complete = Object.freeze((value) => {
+      completionCalls += 1;
+      assert.equal(completionCalls, 1);
+      completionValue = value;
+      completionCarrier = Object.freeze(Object.create(null));
+      return completionCarrier;
+    });
+    const carrier = await callback(
       Object.freeze({
         assertHeld: () => {
           probes += 1;
@@ -764,13 +837,20 @@ class FakeGuard {
           return Promise.resolve();
         },
       }),
+      complete,
     );
+    assert.equal(completionCalls, 1);
+    assert.strictEqual(carrier, completionCarrier);
     this.state.trace.push("guard:end");
-    return result;
+    return completionValue;
   }
 }
 
 function fixture(overrides = {}) {
+  const {
+    operationGuard: providedOperationGuard,
+    ...stateOverrides
+  } = overrides;
   const expectedSession = session();
   const admission = captureAdmission();
   const state = {
@@ -801,7 +881,7 @@ function fixture(overrides = {}) {
     staleHistoricalReadSession: false,
     trace: [],
     uncertainCalls: 0,
-    ...overrides,
+    ...stateOverrides,
   };
   state.typedRequest = createCheckpointCaptureOperationRequest({
     admission,
@@ -814,7 +894,8 @@ function fixture(overrides = {}) {
     request: state.typedRequest,
   });
   const authority = Object.freeze(new FakeAuthority(state));
-  const operationGuard = Object.freeze(new FakeGuard(state));
+  const operationGuard =
+    providedOperationGuard ?? Object.freeze(new FakeGuard(state));
   let artifactPlannerCalls = 0;
   let sourcePlannerCalls = 0;
   const resolveArtifactPaths = (input) => {
@@ -882,6 +963,34 @@ test("factory returns an exact frozen stopped-directory authority facade", () =>
   assert.equal(typeof adapter.runCaptureReconciliation, "function");
   assert.equal(typeof adapter.runPreparedCapture, "function");
   assert.equal(typeof adapter.runRestore, "function");
+});
+
+test("capture composes with a real callback-only PostgreSQL operation guard", async () => {
+  const database = callbackOnlyOperationGuardPool();
+  const operationGuard = new PostgresOperationGuard({
+    dedicatedPool: database.pool,
+  });
+  const value = fixture({ operationGuard });
+  let callbackCalls = 0;
+  let callbackCompletion;
+
+  const result = await value.adapter.runCapture(
+    value.admission,
+    async () => {
+      callbackCalls += 1;
+      callbackCompletion = completion(value.state, false);
+      return callbackCompletion;
+    },
+  );
+
+  assert.strictEqual(result, callbackCompletion);
+  assert.equal(callbackCalls, 1);
+  assert.equal(database.state.connectCalls, 1);
+  assert.equal(database.state.connectCallbacks, 1);
+  assert.equal(database.state.queryCalls > 0, true);
+  assert.equal(database.state.queryCallbacks, database.state.queryCalls);
+  assert.equal(database.state.releaseCalls, 1);
+  assert.equal(database.state.lockHeld, false);
 });
 
 test("error constructor rejects inherited and prototype-polluted codes", () => {

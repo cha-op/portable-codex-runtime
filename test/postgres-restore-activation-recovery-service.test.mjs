@@ -53,15 +53,24 @@ class ServiceRecoveryGuardClient {
     this.pid = pid;
   }
 
-  async query(...args) {
+  query(...args) {
+    assert.equal(args.length, 1);
     const query = args[0];
-    const text = typeof query === "string" ? query : query.text;
+    const text = query.text;
+    const callbackDescriptor = Object.getOwnPropertyDescriptor(
+      query,
+      "callback",
+    );
+    assert.equal(callbackDescriptor?.enumerable, true);
+    assert.equal(Object.hasOwn(callbackDescriptor, "value"), true);
+    const callback = callbackDescriptor.value;
     if (text === "DISCARD ALL") {
       this.manager.releaseAll(this);
-      return { command: "DISCARD", rows: [] };
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
     }
     if (text.includes("pg_try_advisory_lock")) {
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -69,12 +78,13 @@ class ServiceRecoveryGuardClient {
             backend_pid: this.pid,
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
       this.events?.push("probe");
       if (this.loseWhen?.()) this.manager.releaseAll(this);
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -82,10 +92,11 @@ class ServiceRecoveryGuardClient {
             lock_held: this.manager.isHeld(this),
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("pg_advisory_unlock")) {
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -93,13 +104,16 @@ class ServiceRecoveryGuardClient {
             unlocked: this.manager.unlock(this),
           },
         ],
-      };
+      });
+      return undefined;
     }
-    throw new Error(`unexpected query: ${text}`);
+    callback(new Error(`unexpected query: ${text}`));
+    return undefined;
   }
 
-  async release(...args) {
+  release(...args) {
     if (args.length === 1) this.manager.releaseAll(this);
+    return undefined;
   }
 }
 
@@ -111,7 +125,7 @@ class ServiceRecoveryGuardPool {
     this.nextPid = 5_001;
   }
 
-  async connect() {
+  connect(callback) {
     const client = new ServiceRecoveryGuardClient({
       events: this.events,
       loseWhen: this.loseWhen,
@@ -119,7 +133,9 @@ class ServiceRecoveryGuardPool {
       pid: this.nextPid,
     });
     this.nextPid += 1;
-    return client;
+    const release = (...args) => client.release(...args);
+    callback(null, client, release);
+    return undefined;
   }
 }
 
@@ -731,7 +747,10 @@ test("guarded sweep probes around every list and candidate action", async () => 
     fixture.options,
   );
 
-  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+  await lifecycleFixture.guard.runRecovery(async (
+    lifecycleLease,
+    complete,
+  ) => {
     const result = await service.runSweep({
       activation: lane(),
       currentLaunch: lane(),
@@ -758,6 +777,7 @@ test("guarded sweep probes around every list and candidate action", async () => 
         true,
       );
     }
+    return complete(undefined);
   });
 
   assert.deepEqual(events, [
@@ -799,12 +819,18 @@ test("guarded receipts reject legacy arity, cross-lease use, and replay", async 
   let firstLease;
   let staleReceipt;
 
-  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+  await lifecycleFixture.guard.runRecovery(async (
+    lifecycleLease,
+    complete,
+  ) => {
     firstLease = lifecycleLease;
     const crossLeaseReceipt = await service.runGenerationBatch(
       request({ lifecycleLease }),
     );
-    await otherLifecycleFixture.guard.runRecovery(async (otherLease) => {
+    await otherLifecycleFixture.guard.runRecovery(async (
+      otherLease,
+      otherComplete,
+    ) => {
       assert.notEqual(otherLease, lifecycleLease);
       assert.equal(
         consumePostgresRestoreActivationRecoveryBatchReceipt(
@@ -817,6 +843,7 @@ test("guarded receipts reject legacy arity, cross-lease use, and replay", async 
         ),
         false,
       );
+      return otherComplete(undefined);
     });
     assert.equal(
       consumePostgresRestoreActivationRecoveryBatchReceipt(
@@ -867,9 +894,13 @@ test("guarded receipts reject legacy arity, cross-lease use, and replay", async 
       ),
       true,
     );
+    return complete(undefined);
   });
 
-  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+  await lifecycleFixture.guard.runRecovery(async (
+    lifecycleLease,
+    complete,
+  ) => {
     assert.notEqual(lifecycleLease, firstLease);
     assert.equal(
       consumePostgresRestoreActivationRecoveryBatchReceipt(
@@ -918,6 +949,7 @@ test("guarded receipts reject legacy arity, cross-lease use, and replay", async 
       ),
       false,
     );
+    return complete(undefined);
   });
 });
 
@@ -1010,7 +1042,10 @@ test("guarded receipt is minted only after reconciliation drains", async () => {
     fixture.options,
   );
 
-  await lifecycleFixture.guard.runRecovery(async (lifecycleLease) => {
+  await lifecycleFixture.guard.runRecovery(async (
+    lifecycleLease,
+    complete,
+  ) => {
     const pending = service.runGenerationBatch(
       request({ lifecycleLease }),
     );
@@ -1032,6 +1067,7 @@ test("guarded receipt is minted only after reconciliation drains", async () => {
       ),
       true,
     );
+    return complete(undefined);
   });
 });
 

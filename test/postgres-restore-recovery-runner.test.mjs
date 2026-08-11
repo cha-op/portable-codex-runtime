@@ -66,15 +66,24 @@ class RecoveryGuardClient {
     this.releaseCalls = [];
   }
 
-  async query(...args) {
+  query(...args) {
+    assert.equal(args.length, 1);
     const query = args[0];
-    const text = typeof query === "string" ? query : query.text;
+    const text = query.text;
+    const callbackDescriptor = Object.getOwnPropertyDescriptor(
+      query,
+      "callback",
+    );
+    assert.equal(callbackDescriptor?.enumerable, true);
+    assert.equal(Object.hasOwn(callbackDescriptor, "value"), true);
+    const callback = callbackDescriptor.value;
     if (text === "DISCARD ALL") {
       this.manager.releaseAll(this);
-      return { command: "DISCARD", rows: [] };
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
     }
     if (text.includes("pg_try_advisory_lock")) {
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -82,13 +91,14 @@ class RecoveryGuardClient {
             backend_pid: this.pid,
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
       this.probeCount += 1;
       this.events?.push("probe");
       if (this.loseWhen?.()) this.manager.releaseAll(this);
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -96,10 +106,11 @@ class RecoveryGuardClient {
             lock_held: this.manager.isHeld(this),
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("pg_advisory_unlock")) {
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -107,14 +118,17 @@ class RecoveryGuardClient {
             unlocked: this.manager.unlock(this),
           },
         ],
-      };
+      });
+      return undefined;
     }
-    throw new Error(`unexpected query: ${text}`);
+    callback(new Error(`unexpected query: ${text}`));
+    return undefined;
   }
 
-  async release(...args) {
+  release(...args) {
     this.releaseCalls.push(args);
     if (args.length === 1) this.manager.releaseAll(this);
+    return undefined;
   }
 }
 
@@ -127,7 +141,7 @@ class RecoveryGuardPool {
     this.nextPid = 4_001;
   }
 
-  async connect() {
+  connect(callback) {
     const client = new RecoveryGuardClient({
       events: this.events,
       loseWhen: this.loseWhen,
@@ -136,7 +150,9 @@ class RecoveryGuardPool {
     });
     this.nextPid += 1;
     this.clients.push(client);
-    return client;
+    const release = (...args) => client.release(...args);
+    callback(null, client, release);
+    return undefined;
   }
 }
 

@@ -503,6 +503,24 @@ option; legacy or ambiguous `pool` input is rejected. It:
 7. accepts only an exact node-postgres `COMMIT` acknowledgement, then verifies
    another `DISCARD ALL` before returning the client to its dedicated pool.
 
+The operation guard obtains clients and submits queries only through the
+node-postgres callback API. Driver callbacks place the raw client, error, or
+query result inside a module-owned frozen null-prototype carrier before any
+Promise is resolved; no authority-bearing driver object is itself a Promise
+fulfillment value. Pool acquisition, query submission, and client release must
+return synchronously with exact `undefined`. This boundary prevents mutable
+`Object.prototype.then`, `Promise.prototype`, or `Promise[Symbol.species]`
+from assimilating a driver result before the guard can validate it.
+
+An operation callback receives `(probe, complete)`. Synchronous raw returns
+remain supported, but a Promise-returning callback must fulfill with the exact
+callback-scoped carrier minted by `complete(value)`. The guard drains that
+Promise and all lock probes and cleanup before unwrapping the carrier and
+returning the original value. Structural, stale, cross-run, or multiply minted
+completion values fail closed. This keeps the advisory lock held until the
+real callback settles even when callback code mutates the process-wide Promise
+or object prototypes.
+
 Serialization failures and deadlocks may be retried only when the same
 node-postgres `DatabaseError` object was first observed on that client's
 `errorMessage` connection event and then rejected the active query with the
@@ -1664,6 +1682,13 @@ lease, while recovery receives the matching exclusive lease. Cursor
 `recoveryScopeId` is deliberately absent from this key because the authority
 candidate queries are database-global; two cursor scopes can enumerate the
 same durable operation.
+
+Lifecycle callbacks receive `(lease, complete)` and pass the operation guard's
+same callback-scoped `complete` function through the lifecycle boundary. An
+asynchronous lifecycle callback must therefore fulfill with
+`complete(result)`; the public lifecycle operation still resolves to the
+original result only after the underlying operation guard has drained its
+probe and release path.
 
 The runner acquires the exclusive recovery lease for its complete four-lane
 pass and revalidates it before and after cursor reads, service batches, and

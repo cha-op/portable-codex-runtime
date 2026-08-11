@@ -1237,14 +1237,18 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       let callbackResult;
       const recoveryCallback = async function recoveryCallback(
         lifecycleLease,
+        complete,
       ) {
         try {
           callbackResult = await executeRecovery(
             lifecycleLease,
             request.signal,
           );
+          const completion = callIntrinsic(complete, undefined, [
+            callbackResult,
+          ]);
           callbackCompleted = true;
-          return callbackResult;
+          return completion;
         } catch (error) {
           callbackFailed = true;
           callbackCompleted = true;

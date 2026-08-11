@@ -1305,31 +1305,42 @@ function settleGuardPromise(value, markSettled) {
 async function runGuarded(operationGuard, operationId, callback) {
   const code = "postgres_writer_detach_composition_outcome_uncertain";
   let callbackCalls = 0;
+  let callbackCarrier = null;
   let callbackCompletion = null;
+  let callbackResult;
+  let callbackResultCaptured = false;
   let callbackSettlement = null;
   let callbackViolation = false;
   let guardSettled = false;
   let open = true;
-  const runCallback = async (probeValue) => {
+  const runCallback = async (probeValue, completeValue) => {
     await resolveProtectedPromise(undefined);
     await resolveProtectedPromise(undefined);
     ensure(open && !guardSettled && !callbackViolation, code);
     const rawAssertHeld = normalizeProbe(probeValue, code);
+    const complete = trustedFunction(completeValue, code);
+    ensure(objectIsFrozen(completeValue), code);
     const guardedAssertHeld = objectFreeze(async () => {
       ensure(open && !guardSettled && !callbackViolation, code);
       await protectPromise(assertGuardHeld(rawAssertHeld));
       await resolveProtectedPromise(undefined);
       ensure(open && !guardSettled && !callbackViolation, code);
     });
-    return await protectPromise(callback(guardedAssertHeld));
+    callbackResult = await protectPromise(callback(guardedAssertHeld));
+    callbackResultCaptured = true;
+    ensure(open && !guardSettled && !callbackViolation, code);
+    callbackCarrier = callIntrinsic(complete, undefined, [callbackResult]);
+    return callbackCarrier;
   };
-  const guardedCallback = (probeValue) => {
+  const guardedCallback = (probeValue, completeValue) => {
     callbackCalls += 1;
     if (!open || callbackCalls !== 1) {
       callbackViolation = true;
       return callbackCompletion ?? resolveProtectedPromise(undefined);
     }
-    callbackCompletion = protectPromise(runCallback(probeValue));
+    callbackCompletion = protectPromise(
+      runCallback(probeValue, completeValue),
+    );
     callbackSettlement = settleProtectedPromise(callbackCompletion);
     return callbackCompletion;
   };
@@ -1377,7 +1388,9 @@ async function runGuarded(operationGuard, operationId, callback) {
       callbackCalls === 1 &&
       !callbackViolation &&
       callbackOutcome?.fulfilled === true &&
-      objectIs(guardOutcome.value, callbackOutcome.value),
+      callbackResultCaptured &&
+      objectIs(callbackOutcome.value, callbackCarrier) &&
+      objectIs(guardOutcome.value, callbackResult),
     code,
   );
   return guardOutcome.value;

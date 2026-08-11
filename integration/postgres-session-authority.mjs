@@ -6497,10 +6497,11 @@ test(
         const releaseGuard = deferred();
         const heldGuard = operationGuard.runExclusive(
           startingAdmission.request.operationId,
-          async (probe) => {
+          async (probe, complete) => {
             await probe.assertHeld();
             guardEntered.resolve();
             await releaseGuard.promise;
+            return complete(undefined);
           },
         );
         await guardEntered.promise;
@@ -8909,9 +8910,9 @@ test(
 
         const guardResult = await operationGuard.runExclusive(
           launchAttemptId,
-          async (probe) => {
+          async (probe, complete) => {
             await probe.assertHeld();
-            return "guard-reacquired";
+            return complete("guard-reacquired");
           },
         );
         assert.equal(guardResult, "guard-reacquired");
@@ -10699,15 +10700,21 @@ test(
     const releaseForeground = deferred();
     const firstForegroundEntered = deferred();
     const secondForegroundEntered = deferred();
-    const firstForeground = lifecycleGuard.runForeground(async () => {
-      firstForegroundEntered.resolve();
-      await releaseForeground.promise;
-    });
+    const firstForeground = lifecycleGuard.runForeground(
+      async (_lease, complete) => {
+        firstForegroundEntered.resolve();
+        await releaseForeground.promise;
+        return complete(undefined);
+      },
+    );
     await firstForegroundEntered.promise;
-    const secondForeground = lifecycleGuard.runForeground(async () => {
-      secondForegroundEntered.resolve();
-      await releaseForeground.promise;
-    });
+    const secondForeground = lifecycleGuard.runForeground(
+      async (_lease, complete) => {
+        secondForegroundEntered.resolve();
+        await releaseForeground.promise;
+        return complete(undefined);
+      },
+    );
     await secondForegroundEntered.promise;
 
     const busy = await scheduler.runStep({ signal: null });

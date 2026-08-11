@@ -630,31 +630,18 @@ function createLease(mode, assertHeld, context) {
   return lease;
 }
 
-async function invokeCallbackInternal(mode, callback, assertHeld, context) {
-  const lease = createLease(mode, assertHeld, context);
+function closeCallbackContext(lease, context) {
+  const failed = weakSetHas(failedLifecycleContexts, context);
+  weakMapDelete(lifecycleLeases, lease);
+  weakSetDelete(failedLifecycleContexts, context);
+  weakSetDelete(activeLifecycleContexts, context);
+  if (failed) {
+    fail("postgres_restore_lifecycle_guard_outcome_uncertain");
+  }
+}
+
+async function settleCallbackResultInternal(result, lease, context) {
   try {
-    let result;
-    try {
-      result = callIntrinsic(callback, undefined, [lease]);
-    } catch (error) {
-      throw callbackFailure(error);
-    }
-    ensure(
-      !isProxyValue(result) &&
-        !isGeneratorFunctionValue(result) &&
-        !isGeneratorObjectValue(result),
-      "postgres_restore_lifecycle_guard_outcome_uncertain",
-    );
-    if (!isPromiseValue(result)) {
-      ensure(
-        !hasThenProperty(
-          result,
-          "postgres_restore_lifecycle_guard_outcome_uncertain",
-        ),
-        "postgres_restore_lifecycle_guard_outcome_uncertain",
-      );
-      return result;
-    }
     const settlement = await settleNativePromise(
       result,
       "postgres_restore_lifecycle_guard_outcome_uncertain",
@@ -674,22 +661,71 @@ async function invokeCallbackInternal(mode, callback, assertHeld, context) {
     );
     return settlement.value;
   } finally {
-    const failed = weakSetHas(failedLifecycleContexts, context);
-    weakMapDelete(lifecycleLeases, lease);
-    weakSetDelete(failedLifecycleContexts, context);
-    weakSetDelete(activeLifecycleContexts, context);
-    if (failed) {
-      fail("postgres_restore_lifecycle_guard_outcome_uncertain");
-    }
+    closeCallbackContext(lease, context);
   }
 }
 
-function invokeCallback(mode, callback, assertHeld) {
+function settleCallbackResult(result, lease, context) {
+  return protectPromise(
+    settleCallbackResultInternal(result, lease, context),
+  );
+}
+
+function invokeCallbackInternal(
+  mode,
+  callback,
+  assertHeld,
+  complete,
+  context,
+) {
+  const lease = createLease(mode, assertHeld, context);
+  let result;
+  try {
+    result = callIntrinsic(callback, undefined, [lease, complete]);
+  } catch (error) {
+    closeCallbackContext(lease, context);
+    throw callbackFailure(error);
+  }
+  try {
+    ensure(
+      !isProxyValue(result) &&
+        !isGeneratorFunctionValue(result) &&
+        !isGeneratorObjectValue(result),
+      "postgres_restore_lifecycle_guard_outcome_uncertain",
+    );
+  } catch (error) {
+    closeCallbackContext(lease, context);
+    throw error;
+  }
+  if (isPromiseValue(result)) {
+    return settleCallbackResult(result, lease, context);
+  }
+  try {
+    ensure(
+      !hasThenProperty(
+        result,
+        "postgres_restore_lifecycle_guard_outcome_uncertain",
+      ),
+      "postgres_restore_lifecycle_guard_outcome_uncertain",
+    );
+    return result;
+  } finally {
+    closeCallbackContext(lease, context);
+  }
+}
+
+function invokeCallback(mode, callback, assertHeld, complete) {
   const context = objectFreeze(objectCreate(null));
   weakSetAdd(activeLifecycleContexts, context);
   const runInContext = () =>
     protectPromise(
-      invokeCallbackInternal(mode, callback, assertHeld, context),
+      invokeCallbackInternal(
+        mode,
+        callback,
+        assertHeld,
+        complete,
+        context,
+      ),
     );
   objectFreeze(runInContext);
   return callIntrinsic(asyncLocalStorageRunIntrinsic, lifecycleContext, [
@@ -698,21 +734,27 @@ function invokeCallback(mode, callback, assertHeld) {
   ]);
 }
 
-function guardCallback(mode, callback, probeValue) {
+function guardCallback(mode, callback, probeValue, completeValue) {
   const code = "postgres_restore_lifecycle_guard_outcome_uncertain";
   let assertHeld;
+  let complete;
   try {
     assertHeld = operationProbeBinding(probeValue, code);
+    complete = trustedCallback(completeValue, code);
+    ensure(objectIsFrozen(completeValue), code);
   } catch {
     fail(code);
   }
-  return protectPromise(invokeCallback(mode, callback, assertHeld));
+  return protectPromise(
+    invokeCallback(mode, callback, assertHeld, complete),
+  );
 }
 
 async function invokeLifecycleInternal(binding, mode, callback) {
   const method =
     mode === FOREGROUND_MODE ? binding.runShared : binding.runExclusive;
-  const callbackAdapter = (probe) => guardCallback(mode, callback, probe);
+  const callbackAdapter = (probe, complete) =>
+    guardCallback(mode, callback, probe, complete);
   objectFreeze(callbackAdapter);
   let pending;
   try {
@@ -743,6 +785,12 @@ async function invokeLifecycleInternal(binding, mode, callback) {
   ) {
     const callbackError = weakMapGet(callbackFailures, error);
     weakMapDelete(callbackFailures, error);
+    if (
+      operationErrorCode(callbackError) ===
+      "postgres_operation_guard_outcome_uncertain"
+    ) {
+      fail("postgres_restore_lifecycle_guard_outcome_uncertain");
+    }
     throw callbackError;
   }
   if (

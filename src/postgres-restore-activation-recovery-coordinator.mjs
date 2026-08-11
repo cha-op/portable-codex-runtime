@@ -3122,7 +3122,7 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     try {
       pending = callIntrinsic(runExclusiveIntrinsic, options.operationGuard, [
         operationId,
-        async (probeValue) => {
+        async (probeValue, completeValue) => {
           const probe = exactDataObject(
             probeValue,
             OPERATION_GUARD_PROBE_KEYS,
@@ -3132,7 +3132,11 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
             probe.assertHeld,
             outcomeCode,
           );
-          return callback(assertHeld);
+          const complete = trustedFunction(completeValue, outcomeCode);
+          ensure(objectIsFrozen(completeValue), outcomeCode);
+          return callIntrinsic(complete, undefined, [
+            await callback(assertHeld),
+          ]);
         },
       ]);
     } catch {

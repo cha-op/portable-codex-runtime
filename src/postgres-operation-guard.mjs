@@ -109,6 +109,11 @@ const UNLOCK_SHARED_QUERY = Object.freeze({
   ].join(" "),
 });
 
+const RESET_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: "DISCARD ALL",
+});
+
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -158,6 +163,10 @@ const SHARED_LOCK_MODE = objectFreeze({
 });
 
 const operationGuards = new WeakSetConstructor();
+const completionCarriers = new WeakSetConstructor();
+const completionCarrierToken = Symbol(
+  "portable-codex-runtime.postgres-operation-guard.completion-carrier",
+);
 const promiseSpeciesHolder = objectFreeze(
   objectCreate(null, {
     [promiseSpeciesSymbol]: {
@@ -219,6 +228,95 @@ function exactFrozenRecord(value) {
     });
   }
   return objectFreeze(result);
+}
+
+function frozenValues(values = undefined) {
+  if (values === undefined) return objectFreeze([]);
+  ensure(
+    arrayIsArray(values) && !isProxyValue(values),
+    "postgres_operation_guard_outcome_uncertain",
+  );
+  const result = [];
+  for (let index = 0; index < values.length; index += 1) {
+    result[index] = values[index];
+  }
+  return objectFreeze(result);
+}
+
+function privateDeferred() {
+  let resolve;
+  const promise = protectPromise(
+    new PromiseConstructor((resolvePromise) => {
+      resolve = resolvePromise;
+    }),
+  );
+  return exactFrozenRecord({ promise, resolve });
+}
+
+function exactDirectAwaitPromise(value) {
+  if (
+    !isPromiseValue(value) ||
+    isProxyValue(value) ||
+    isGeneratorObjectValue(value)
+  ) {
+    return false;
+  }
+  let prototype;
+  let constructorDescriptor;
+  try {
+    prototype = objectGetPrototypeOf(value);
+    constructorDescriptor = objectGetOwnPropertyDescriptor(
+      value,
+      "constructor",
+    );
+  } catch {
+    return false;
+  }
+  return (
+    prototype === promisePrototype &&
+    constructorDescriptor?.configurable === false &&
+    objectHasOwn(constructorDescriptor, "value") &&
+    constructorDescriptor.value === PromiseConstructor
+  );
+}
+
+function makeCompletionCarrier(value) {
+  const carrier = objectCreate(null);
+  objectDefineProperties(carrier, {
+    [completionCarrierToken]: {
+      configurable: false,
+      enumerable: false,
+      value: true,
+      writable: false,
+    },
+    value: {
+      configurable: false,
+      enumerable: true,
+      value,
+      writable: false,
+    },
+  });
+  objectFreeze(carrier);
+  weakSetAdd(completionCarriers, carrier);
+  return carrier;
+}
+
+function hasCompletionCarrierToken(value) {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function") ||
+    isProxyValue(value)
+  ) {
+    return false;
+  }
+  try {
+    return (
+      objectGetOwnPropertyDescriptor(value, completionCarrierToken) !==
+      undefined
+    );
+  } catch {
+    return false;
+  }
 }
 
 function safePromiseSpeciesHolder(value) {
@@ -431,16 +529,15 @@ function normalizeSafeNativePromise(value, code) {
     objectHasOwn(constructorDescriptor, "value") &&
     constructorDescriptor.value === PromiseConstructor
   ) {
+    if (constructorDescriptor.writable !== true) return null;
     try {
       objectDefineProperty(value, "constructor", {
         configurable: false,
         enumerable: false,
-        value: PromiseConstructor,
+        value: promiseSpeciesHolder,
         writable: false,
       });
-      return protectPromise(
-        callIntrinsic(promiseThenIntrinsic, value, [undefined, undefined]),
-      );
+      return protectPromise(value);
     } catch {
       return null;
     }
@@ -502,11 +599,18 @@ async function settleValueInternal(value, code) {
     assertSafeFulfilledValue(value, code);
     return exactFrozenRecord({ status: "fulfilled", value });
   }
-  const normalized = normalizeSafeNativePromise(value, code);
-  ensure(normalized !== null, code);
   let settled;
   try {
-    settled = await normalized;
+    if (exactDirectAwaitPromise(value)) {
+      // Await performs the native Promise operation directly for an exact
+      // captured-constructor Promise. Calling Promise.prototype.then here
+      // would unnecessarily consult Promise[Symbol.species].
+      settled = await value;
+    } else {
+      const normalized = normalizeSafeNativePromise(value, code);
+      ensure(normalized !== null, code);
+      settled = await normalized;
+    }
   } catch (error) {
     return exactFrozenRecord({ status: "rejected", value: error });
   }
@@ -516,22 +620,6 @@ async function settleValueInternal(value, code) {
 
 function settleValue(value, code) {
   return protectPromise(settleValueInternal(value, code));
-}
-
-async function callAsyncValueInternal(method, receiver, args, code) {
-  let value;
-  try {
-    value = callIntrinsic(method, receiver, args);
-  } catch {
-    fail(code);
-  }
-  const settlement = await settleValue(value, code);
-  ensure(settlement.status === "fulfilled", code);
-  return settlement.value;
-}
-
-function callAsyncValue(method, receiver, args, code) {
-  return protectPromise(callAsyncValueInternal(method, receiver, args, code));
 }
 
 function inspectExactOptions(value) {
@@ -702,43 +790,140 @@ function discardAcknowledged(result) {
   ) === "DISCARD";
 }
 
-async function acquireClientInternal(poolBinding) {
-  let client;
+async function drainExactNativePromiseInternal(value) {
   try {
-    client = await callAsyncValue(
-      poolBinding.connect,
-      poolBinding.pool,
-      [],
+    await value;
+  } catch {
+    // Only rejection observation is required for this detached drain.
+  }
+}
+
+function bestEffortDrainRejectedPromise(value) {
+  if (!isPromiseValue(value) || isProxyValue(value)) return;
+  if (exactDirectAwaitPromise(value)) {
+    void drainExactNativePromiseInternal(value);
+    return;
+  }
+  try {
+    const normalized = normalizeSafeNativePromise(
+      value,
       "postgres_operation_guard_outcome_uncertain",
     );
+    if (normalized === null) return;
+    callIntrinsic(promiseThenIntrinsic, normalized, [
+      () => undefined,
+      () => undefined,
+    ]);
   } catch {
+    // This drain is diagnostic hygiene only; the caller still fails closed.
+  }
+}
+
+function bestEffortDestroyRawClient(client, release) {
+  if (typeof release !== "function" || isProxyValue(release)) return;
+  try {
+    const returned = callIntrinsic(release, client, [
+      makeError("postgres_operation_guard_outcome_uncertain"),
+    ]);
+    if (returned !== undefined) {
+      bestEffortDrainRejectedPromise(returned);
+    }
+  } catch {
+    // The caller retains the primary malformed-client failure.
+  }
+}
+
+function bestEffortDestroyConnection(connection) {
+  if (connection === undefined) return;
+  const client = connection.client;
+  let release = connection.release;
+  if (release === undefined || release === null) {
+    if (
+      client === null ||
+      !arrayIncludes(["object", "function"], typeof client) ||
+      isProxyValue(client)
+    ) {
+      return;
+    }
+    try {
+      release = client.release;
+    } catch {
+      return;
+    }
+  }
+  bestEffortDestroyRawClient(client, release);
+}
+
+async function acquireClientInternal(poolBinding) {
+  const pending = privateDeferred();
+  let callbackClosed = false;
+  let callbackCount = 0;
+  let callbackProtocolFailed = false;
+  let deliveredConnection;
+  const onConnect = objectFreeze((error, client, release) => {
+    if (callbackClosed || callbackCount !== 0) {
+      callbackProtocolFailed = true;
+      if (client !== deliveredConnection?.client) {
+        bestEffortDestroyConnection(
+          exactFrozenRecord({ client, error, release }),
+        );
+      }
+      return undefined;
+    }
+    callbackCount = 1;
+    const settlement = exactFrozenRecord({ client, error, release });
+    deliveredConnection = settlement;
+    callIntrinsic(pending.resolve, undefined, [settlement]);
+    return undefined;
+  });
+
+  let returned;
+  try {
+    returned = callIntrinsic(poolBinding.connect, poolBinding.pool, [
+      onConnect,
+    ]);
+  } catch {
+    callbackClosed = true;
+    bestEffortDestroyConnection(deliveredConnection);
     fail("postgres_operation_guard_outcome_uncertain");
   }
+  if (returned !== undefined) {
+    callbackClosed = true;
+    bestEffortDrainRejectedPromise(returned);
+    bestEffortDestroyConnection(deliveredConnection);
+    fail("postgres_operation_guard_outcome_uncertain");
+  }
+
+  const connection = await pending.promise;
+  callbackClosed = true;
+  if (callbackCount !== 1 || callbackProtocolFailed) {
+    bestEffortDestroyConnection(connection);
+    fail("postgres_operation_guard_outcome_uncertain");
+  }
+  if (connection.error !== undefined && connection.error !== null) {
+    bestEffortDestroyConnection(connection);
+    fail("postgres_operation_guard_outcome_uncertain");
+  }
+  const client = connection.client;
   if (
     client === null ||
     !arrayIncludes(["object", "function"], typeof client) ||
     isProxyValue(client)
   ) {
+    bestEffortDestroyConnection(connection);
     fail("postgres_operation_guard_outcome_uncertain");
   }
   let query;
   let release;
   try {
-    release = client.release;
+    if (connection.release !== undefined && connection.release !== null) {
+      release = connection.release;
+    } else {
+      release = client.release;
+    }
     query = client.query;
   } catch {
-    if (typeof release === "function" && !isProxyValue(release)) {
-      try {
-        await callAsyncValue(
-          release,
-          client,
-          [makeError("postgres_operation_guard_outcome_uncertain")],
-          "postgres_operation_guard_outcome_uncertain",
-        );
-      } catch {
-        // Shape uncertainty remains primary after best-effort destruction.
-      }
-    }
+    bestEffortDestroyRawClient(client, release);
     fail("postgres_operation_guard_outcome_uncertain");
   }
   if (
@@ -747,18 +932,7 @@ async function acquireClientInternal(poolBinding) {
     isProxyValue(query) ||
     isProxyValue(release)
   ) {
-    if (typeof release === "function" && !isProxyValue(release)) {
-      try {
-        await callAsyncValue(
-          release,
-          client,
-          [makeError("postgres_operation_guard_outcome_uncertain")],
-          "postgres_operation_guard_outcome_uncertain",
-        );
-      } catch {
-        // Shape uncertainty remains primary after best-effort destruction.
-      }
-    }
+    bestEffortDestroyRawClient(client, release);
     fail("postgres_operation_guard_outcome_uncertain");
   }
   return exactFrozenRecord({ client, query, release });
@@ -769,26 +943,49 @@ function acquireClient(poolBinding) {
 }
 
 async function queryClientInternal(binding, query, values = undefined) {
+  const pending = privateDeferred();
+  let callbackClosed = false;
+  let callbackCount = 0;
+  let callbackProtocolFailed = false;
+  const callback = objectFreeze((error, result) => {
+    if (callbackClosed || callbackCount !== 0) {
+      callbackProtocolFailed = true;
+      return undefined;
+    }
+    callbackCount = 1;
+    const settlement = exactFrozenRecord({ error, result });
+    callIntrinsic(pending.resolve, undefined, [settlement]);
+    return undefined;
+  });
+  const config = exactFrozenRecord({
+    callback,
+    queryMode: query.queryMode,
+    text: query.text,
+    values: frozenValues(values),
+  });
+  let returned;
   try {
-    const args =
-      values === undefined
-        ? [query]
-        : [
-            objectFreeze({
-              queryMode: query.queryMode,
-              text: query.text,
-              values: objectFreeze(values),
-            }),
-          ];
-    return await callAsyncValue(
-      binding.query,
-      binding.client,
-      args,
-      "postgres_operation_guard_outcome_uncertain",
-    );
+    returned = callIntrinsic(binding.query, binding.client, [config]);
   } catch {
+    callbackClosed = true;
     fail("postgres_operation_guard_outcome_uncertain");
   }
+  if (returned !== undefined) {
+    callbackClosed = true;
+    bestEffortDrainRejectedPromise(returned);
+    fail("postgres_operation_guard_outcome_uncertain");
+  }
+  const settlement = await pending.promise;
+  callbackClosed = true;
+  ensure(
+    callbackCount === 1 && !callbackProtocolFailed,
+    "postgres_operation_guard_outcome_uncertain",
+  );
+  ensure(
+    settlement.error === undefined || settlement.error === null,
+    "postgres_operation_guard_outcome_uncertain",
+  );
+  return settlement;
 }
 
 function queryClient(binding, query, values = undefined) {
@@ -796,9 +993,9 @@ function queryClient(binding, query, values = undefined) {
 }
 
 async function resetClientInternal(binding) {
-  const result = await queryClient(binding, "DISCARD ALL");
+  const settlement = await queryClient(binding, RESET_QUERY);
   ensure(
-    discardAcknowledged(result),
+    discardAcknowledged(settlement.result),
     "postgres_operation_guard_outcome_uncertain",
   );
 }
@@ -807,43 +1004,31 @@ function resetClient(binding) {
   return protectPromise(resetClientInternal(binding));
 }
 
-async function destroyClientInternal(binding, cause) {
-  try {
-    await callAsyncValue(
-      binding.release,
-      binding.client,
-      [cause],
-      "postgres_operation_guard_outcome_uncertain",
-    );
-  } catch {
-    fail("postgres_operation_guard_outcome_uncertain");
-  }
-}
-
 function destroyClient(binding, cause) {
-  return protectPromise(destroyClientInternal(binding, cause));
-}
-
-async function releaseClientInternal(binding) {
+  let returned;
   try {
-    await callAsyncValue(
-      binding.release,
-      binding.client,
-      [],
-      "postgres_operation_guard_outcome_uncertain",
-    );
+    returned = callIntrinsic(binding.release, binding.client, [cause]);
   } catch {
     fail("postgres_operation_guard_outcome_uncertain");
   }
+  if (returned !== undefined) bestEffortDrainRejectedPromise(returned);
+  ensure(returned === undefined, "postgres_operation_guard_outcome_uncertain");
 }
 
 function releaseClient(binding) {
-  return protectPromise(releaseClientInternal(binding));
+  let returned;
+  try {
+    returned = callIntrinsic(binding.release, binding.client, []);
+  } catch {
+    fail("postgres_operation_guard_outcome_uncertain");
+  }
+  if (returned !== undefined) bestEffortDrainRejectedPromise(returned);
+  ensure(returned === undefined, "postgres_operation_guard_outcome_uncertain");
 }
 
 async function acquireAdvisoryLockInternal(binding, key, lockMode) {
-  const result = await queryClient(binding, lockMode.tryLockQuery, [key]);
-  const row = exactRow(result, ["acquired", "backend_pid"]);
+  const settlement = await queryClient(binding, lockMode.tryLockQuery, [key]);
+  const row = exactRow(settlement.result, ["acquired", "backend_pid"]);
   const backendPid = validatedBackendPid(row.backend_pid);
   ensure(
     typeof row.acquired === "boolean",
@@ -864,8 +1049,12 @@ async function assertAdvisoryLockHeldInternal(
   expectedBackendPid,
   lockMode,
 ) {
-  const result = await queryClient(binding, lockMode.assertHeldQuery, [key]);
-  const row = exactRow(result, ["backend_pid", "lock_held"]);
+  const settlement = await queryClient(
+    binding,
+    lockMode.assertHeldQuery,
+    [key],
+  );
+  const row = exactRow(settlement.result, ["backend_pid", "lock_held"]);
   ensure(
     validatedBackendPid(row.backend_pid) === expectedBackendPid &&
       row.lock_held === true,
@@ -890,8 +1079,8 @@ async function unlockAdvisoryLockInternal(
   expectedBackendPid,
   lockMode,
 ) {
-  const result = await queryClient(binding, lockMode.unlockQuery, [key]);
-  const row = exactRow(result, ["backend_pid", "unlocked"]);
+  const settlement = await queryClient(binding, lockMode.unlockQuery, [key]);
+  const row = exactRow(settlement.result, ["backend_pid", "unlocked"]);
   ensure(
     validatedBackendPid(row.backend_pid) === expectedBackendPid &&
       row.unlocked === true,
@@ -940,9 +1129,9 @@ async function cleanAndReleaseInternal(
       : undefined;
   try {
     if (destroyCause === undefined) {
-      await releaseClient(binding);
+      releaseClient(binding);
     } else {
-      await destroyClient(binding, destroyCause);
+      destroyClient(binding, destroyCause);
     }
   } catch {
     cleanupFailed = true;
@@ -970,7 +1159,7 @@ async function runWithLockModeInternal(poolBinding, args, lockMode) {
     await resetClient(binding);
   } catch {
     try {
-      await destroyClient(
+      destroyClient(
         binding,
         makeError("postgres_operation_guard_outcome_uncertain"),
       );
@@ -1056,10 +1245,31 @@ async function runWithLockModeInternal(poolBinding, args, lockMode) {
         return pending;
       };
       const probe = objectFreeze({ assertHeld });
+      let completionCarrier;
+      let completionCalled = false;
+      let completionProtocolFailed = false;
+      const complete = objectFreeze((...completeArgs) => {
+        if (
+          !callbackOpen ||
+          completeArgs.length !== 1 ||
+          completionCalled
+        ) {
+          completionProtocolFailed = true;
+          fail("postgres_operation_guard_outcome_uncertain");
+        }
+        completionCalled = true;
+        completionCarrier = makeCompletionCarrier(completeArgs[0]);
+        return completionCarrier;
+      });
 
       let rawCallbackResult;
+      let callbackReturnedPromise = false;
       try {
-        rawCallbackResult = callIntrinsic(callback, undefined, [probe]);
+        rawCallbackResult = callIntrinsic(callback, undefined, [
+          probe,
+          complete,
+        ]);
+        callbackReturnedPromise = isPromiseValue(rawCallbackResult);
       } catch (error) {
         callbackFailed = true;
         callbackError = error;
@@ -1074,7 +1284,37 @@ async function runWithLockModeInternal(poolBinding, args, lockMode) {
             callbackFailed = true;
             callbackError = callbackSettlement.value;
           } else {
-            callbackResult = callbackSettlement.value;
+            const fulfilled = callbackSettlement.value;
+            if (callbackReturnedPromise) {
+              ensure(
+                completionCalled &&
+                  !completionProtocolFailed &&
+                  fulfilled === completionCarrier &&
+                  weakSetHas(completionCarriers, fulfilled),
+                "postgres_operation_guard_outcome_uncertain",
+              );
+              callbackResult = completionCarrier.value;
+            } else if (
+              completionCalled &&
+              fulfilled === completionCarrier
+            ) {
+              ensure(
+                completionCalled &&
+                  !completionProtocolFailed &&
+                  weakSetHas(completionCarriers, fulfilled),
+                "postgres_operation_guard_outcome_uncertain",
+              );
+              callbackResult = completionCarrier.value;
+            } else {
+              ensure(
+                !completionCalled &&
+                  !completionProtocolFailed &&
+                  !weakSetHas(completionCarriers, fulfilled) &&
+                  !hasCompletionCarrierToken(fulfilled),
+                "postgres_operation_guard_outcome_uncertain",
+              );
+              callbackResult = fulfilled;
+            }
           }
         } catch (error) {
           callbackFailed = true;

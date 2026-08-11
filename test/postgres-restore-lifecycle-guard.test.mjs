@@ -91,10 +91,18 @@ class FakeClient {
     this.resetCount = 0;
   }
 
-  async query(...args) {
+  query(...args) {
     this.queries.push(args);
+    assert.equal(args.length, 1);
     const query = args[0];
-    const text = typeof query === "string" ? query : query?.text;
+    const text = query?.text;
+    const callbackDescriptor = Object.getOwnPropertyDescriptor(
+      query,
+      "callback",
+    );
+    assert.equal(callbackDescriptor?.enumerable, true);
+    assert.equal(Object.hasOwn(callbackDescriptor, "value"), true);
+    const callback = callbackDescriptor.value;
 
     if (text === "DISCARD ALL") {
       this.resetCount += 1;
@@ -103,14 +111,19 @@ class FakeClient {
         (this.resetCount === 2 && this.failPostReset) ||
         this.connectionLost
       ) {
-        throw new Error("reset failed");
+        callback(new Error("reset failed"));
+        return undefined;
       }
       this.manager.releaseAll(this);
-      return { command: "DISCARD", rows: [] };
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
     }
 
-    if (this.connectionLost) throw new Error("connection lost");
-    const values = typeof query === "string" ? args[1] : query.values;
+    if (this.connectionLost) {
+      callback(new Error("connection lost"));
+      return undefined;
+    }
+    const values = query.values;
     const key = values[0];
     if (text.includes("pg_try_advisory_lock")) {
       const mode = text.includes("pg_try_advisory_lock_shared")
@@ -118,19 +131,21 @@ class FakeClient {
         : "exclusive";
       const acquired = this.manager.tryAcquire(key, this, mode);
       if (this.loseTryLockResponse) {
-        throw new Error("try-lock response lost");
+        callback(new Error("try-lock response lost"));
+        return undefined;
       }
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [{ acquired, backend_pid: this.pid }],
-      };
+      });
+      return undefined;
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
       const mode = text.includes("mode = 'ShareLock'")
         ? "shared"
         : "exclusive";
       this.heldProbeCount += 1;
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -138,14 +153,18 @@ class FakeClient {
             lock_held: this.manager.isHeld(key, this, mode),
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("pg_advisory_unlock")) {
       const mode = text.includes("pg_advisory_unlock_shared")
         ? "shared"
         : "exclusive";
-      if (this.failUnlock) throw new Error("unlock failed");
-      return {
+      if (this.failUnlock) {
+        callback(new Error("unlock failed"));
+        return undefined;
+      }
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -153,15 +172,18 @@ class FakeClient {
             unlocked: this.manager.unlock(key, this, mode),
           },
         ],
-      };
+      });
+      return undefined;
     }
-    throw new Error(`unexpected query: ${text}`);
+    callback(new Error(`unexpected query: ${text}`));
+    return undefined;
   }
 
-  async release(...args) {
+  release(...args) {
     this.releaseCalls.push(args);
     if (args.length === 1) this.manager.releaseAll(this);
     if (this.failRelease) throw new Error("release failed");
+    return undefined;
   }
 }
 
@@ -171,10 +193,13 @@ class FakePool {
     this.connectCalls = 0;
   }
 
-  async connect() {
+  connect(callback) {
     this.connectCalls += 1;
     assert.notEqual(this.clients.length, 0, "unexpected pool.connect()");
-    return this.clients.shift();
+    const client = this.clients.shift();
+    const release = (...args) => client.release(...args);
+    callback(null, client, release);
+    return undefined;
   }
 }
 
@@ -213,9 +238,7 @@ function lockKey() {
 }
 
 function queryTexts(client) {
-  return client.queries.map(([query]) =>
-    typeof query === "string" ? query : query.text,
-  );
+  return client.queries.map(([query]) => query.text);
 }
 
 async function assertLifecycleError(promise, code) {
@@ -278,7 +301,7 @@ test("foreground callbacks overlap under shared locks", async () => {
   let active = 0;
   let maximumActive = 0;
 
-  const callback = async (lease) => {
+  const callback = async (lease, complete) => {
     assert.equal(
       isPostgresRestoreLifecycleLease(lease, "foreground"),
       true,
@@ -288,6 +311,7 @@ test("foreground callbacks overlap under shared locks", async () => {
     if (active === 2) bothEntered.resolve();
     await finish.promise;
     active -= 1;
+    return complete(undefined);
   };
   const runs = [first.runForeground(callback), second.runForeground(callback)];
   await bothEntered.promise;
@@ -316,14 +340,16 @@ for (const scenario of [
       secondMode === "foreground" ? "runForeground" : "runRecovery";
     let secondCallbackCalls = 0;
 
-    const firstRun = first[firstMethod](async () => {
+    const firstRun = first[firstMethod](async (_lease, complete) => {
       entered.resolve();
       await finish.promise;
+      return complete(undefined);
     });
     await entered.promise;
     await assertLifecycleError(
-      secondFixture.lifecycle[secondMethod](async () => {
+      secondFixture.lifecycle[secondMethod](async (_lease, complete) => {
         secondCallbackCalls += 1;
+        return complete(undefined);
       }),
       "postgres_restore_lifecycle_guard_busy",
     );
@@ -339,11 +365,13 @@ test("foreground and recovery SQL use one fixed derived key and exact modes", as
   const manager = new AdvisoryLockManager();
   const foreground = createFixture(manager, 206);
   const recovery = createFixture(manager, 207);
-  await foreground.lifecycle.runForeground(async (lease) => {
+  await foreground.lifecycle.runForeground(async (lease, complete) => {
     await assertPostgresRestoreLifecycleLeaseHeld(lease, "foreground");
+    return complete(undefined);
   });
-  await recovery.lifecycle.runRecovery(async (lease) => {
+  await recovery.lifecycle.runRecovery(async (lease, complete) => {
     await assertPostgresRestoreLifecycleLeaseHeld(lease, "recovery");
+    return complete(undefined);
   });
 
   const foregroundTry = foreground.client.queries.find(([query]) =>
@@ -389,20 +417,31 @@ test("lease is opaque, callback-bound, probed, and invalid after closure", async
   const expected = Object.freeze({ identity: "preserved" });
   let capturedLease;
 
-  const result = await fixture.lifecycle.runForeground(async (lease) => {
-    capturedLease = lease;
-    assert.equal(Object.getPrototypeOf(lease), null);
-    assert.equal(Object.isFrozen(lease), true);
-    assert.deepEqual(Reflect.ownKeys(lease), ["mode"]);
-    assert.equal(lease.mode, "foreground");
-    assert.equal(isPostgresRestoreLifecycleLease(lease, "foreground"), true);
-    assert.equal(isPostgresRestoreLifecycleLease(lease, "recovery"), false);
-    assert.equal(
-      await assertPostgresRestoreLifecycleLeaseHeld(lease, "foreground"),
-      undefined,
-    );
-    return expected;
-  });
+  const result = await fixture.lifecycle.runForeground(
+    async (lease, complete) => {
+      capturedLease = lease;
+      assert.equal(Object.getPrototypeOf(lease), null);
+      assert.equal(Object.isFrozen(lease), true);
+      assert.deepEqual(Reflect.ownKeys(lease), ["mode"]);
+      assert.equal(lease.mode, "foreground");
+      assert.equal(
+        isPostgresRestoreLifecycleLease(lease, "foreground"),
+        true,
+      );
+      assert.equal(
+        isPostgresRestoreLifecycleLease(lease, "recovery"),
+        false,
+      );
+      assert.equal(
+        await assertPostgresRestoreLifecycleLeaseHeld(
+          lease,
+          "foreground",
+        ),
+        undefined,
+      );
+      return complete(expected);
+    },
+  );
 
   assert.strictEqual(result, expected);
   assert.equal(fixture.client.heldProbeCount, 3);
@@ -420,12 +459,12 @@ test("wrong-mode and cross-callback leases fail closed", async () => {
   const manager = new AdvisoryLockManager();
   const wrongMode = createFixture(manager, 209).lifecycle;
   await assertLifecycleError(
-    wrongMode.runForeground(async (lease) => {
+    wrongMode.runForeground(async (lease, complete) => {
       await assertLifecycleError(
         assertPostgresRestoreLifecycleLeaseHeld(lease, "recovery"),
         "postgres_restore_lifecycle_guard_outcome_uncertain",
       );
-      return "must not escape";
+      return complete("must not escape");
     }),
     "postgres_restore_lifecycle_guard_outcome_uncertain",
   );
@@ -435,14 +474,15 @@ test("wrong-mode and cross-callback leases fail closed", async () => {
   const firstEntered = deferred();
   const finishFirst = deferred();
   let firstLease;
-  const firstRun = first.runForeground(async (lease) => {
+  const firstRun = first.runForeground(async (lease, complete) => {
     firstLease = lease;
     firstEntered.resolve();
     await finishFirst.promise;
+    return complete(undefined);
   });
   await firstEntered.promise;
   await assertLifecycleError(
-    second.runForeground(async (ownLease) => {
+    second.runForeground(async (ownLease, complete) => {
       assert.equal(
         isPostgresRestoreLifecycleLease(ownLease, "foreground"),
         true,
@@ -458,6 +498,7 @@ test("wrong-mode and cross-callback leases fail closed", async () => {
         ),
         "postgres_restore_lifecycle_guard_outcome_uncertain",
       );
+      return complete(undefined);
     }),
     "postgres_restore_lifecycle_guard_outcome_uncertain",
   );
@@ -484,13 +525,13 @@ test("caught lease probe loss still makes the lifecycle outcome uncertain", asyn
   const manager = new AdvisoryLockManager();
   const fixture = createFixture(manager, 213);
   await assertLifecycleError(
-    fixture.lifecycle.runForeground(async (lease) => {
+    fixture.lifecycle.runForeground(async (lease, complete) => {
       manager.releaseAll(fixture.client);
       await assertLifecycleError(
         assertPostgresRestoreLifecycleLeaseHeld(lease, "foreground"),
         "postgres_restore_lifecycle_guard_outcome_uncertain",
       );
-      return "must not escape";
+      return complete("must not escape");
     }),
     "postgres_restore_lifecycle_guard_outcome_uncertain",
   );
@@ -531,8 +572,9 @@ for (const scenario of [
     const manager = new AdvisoryLockManager();
     const fixture = createFixture(manager, 214, scenario.overrides);
     await assertLifecycleError(
-      fixture.lifecycle.runRecovery(async () => {
+      fixture.lifecycle.runRecovery(async (_lease, complete) => {
         scenario.callback?.(fixture);
+        return complete(undefined);
       }),
       "postgres_restore_lifecycle_guard_outcome_uncertain",
     );
@@ -650,9 +692,120 @@ test("unsafe callback values are rejected without thenable or proxy traps", asyn
   assert.equal(manager.holders.size, 0);
 });
 
+test("Promise callbacks must fulfill their authentic completion carrier", async () => {
+  const manager = new AdvisoryLockManager();
+  const primitiveFixture = createFixture(manager, 218);
+  await assertLifecycleError(
+    primitiveFixture.lifecycle.runForeground(async () => "raw"),
+    "postgres_restore_lifecycle_guard_outcome_uncertain",
+  );
+
+  const objectFixture = createFixture(manager, 219);
+  await assertLifecycleError(
+    objectFixture.lifecycle.runRecovery(async () =>
+      Object.freeze({ raw: true }),
+    ),
+    "postgres_restore_lifecycle_guard_outcome_uncertain",
+  );
+  assert.equal(manager.holders.size, 0);
+});
+
+test("completion carriers are exact, per-run, and exactly once", async () => {
+  const manager = new AdvisoryLockManager();
+  const fixture = createFixture(manager, 220);
+  let firstCarrier;
+  let firstComplete;
+
+  assert.equal(
+    await fixture.lifecycle.runForeground((_lease, complete) => {
+      firstComplete = complete;
+      assert.equal(Object.isFrozen(complete), true);
+      firstCarrier = complete("first");
+      assert.equal(Object.getPrototypeOf(firstCarrier), null);
+      assert.equal(Object.isFrozen(firstCarrier), true);
+      return firstCarrier;
+    }),
+    "first",
+  );
+
+  await assertLifecycleError(
+    fixture.lifecycle.runForeground(async (_lease, complete) => {
+      complete("second");
+      return firstCarrier;
+    }),
+    "postgres_restore_lifecycle_guard_outcome_uncertain",
+  );
+  assert.throws(
+    () => firstComplete("late"),
+    (error) =>
+      error?.code === "postgres_operation_guard_outcome_uncertain",
+  );
+
+  await assertLifecycleError(
+    fixture.lifecycle.runRecovery((_lease, complete) => {
+      complete("first");
+      return complete("second");
+    }),
+    "postgres_restore_lifecycle_guard_outcome_uncertain",
+  );
+  assert.equal(manager.holders.size, 0);
+});
+
+test(
+  "inherited Object.prototype.then is never invoked",
+  { concurrency: false },
+  async () => {
+    const manager = new AdvisoryLockManager();
+    const fixture = createFixture(manager, 221);
+    const thenDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      "then",
+    );
+    let thenCalls = 0;
+    let rejected = false;
+    try {
+      Object.defineProperty(Object.prototype, "then", {
+        configurable: true,
+        get() {
+          thenCalls += 1;
+          throw new Error("Object.prototype.then must not run");
+        },
+      });
+      await fixture.lifecycle
+        .runForeground(async (_lease, complete) =>
+          complete(Object.freeze({ result: "unsafe" })),
+        )
+        .then(
+          () => assert.fail("unsafe result must not fulfill"),
+          (error) => {
+            rejected = true;
+            assert.ok(error instanceof PostgresRestoreLifecycleGuardError);
+            assert.equal(
+              error.code,
+              "postgres_restore_lifecycle_guard_outcome_uncertain",
+            );
+          },
+        );
+    } finally {
+      if (thenDescriptor === undefined) {
+        delete Object.prototype.then;
+      } else {
+        Object.defineProperty(
+          Object.prototype,
+          "then",
+          thenDescriptor,
+        );
+      }
+    }
+    assert.equal(rejected, true);
+    assert.equal(thenCalls, 0);
+    assert.equal(manager.holders.size, 0);
+  },
+);
+
 test("captured Promise intrinsics survive callback-time poisoning", async () => {
   const manager = new AdvisoryLockManager();
-  const fixture = createFixture(manager, 218);
+  const fixture = createFixture(manager, 222);
   const allSettledDescriptor = Object.getOwnPropertyDescriptor(
     Promise,
     "allSettled",
@@ -698,7 +851,7 @@ test("captured Promise intrinsics survive callback-time poisoning", async () => 
 
 test("callbacks can return structurally protected foreign promises", async () => {
   const manager = new AdvisoryLockManager();
-  const fixture = createFixture(manager, 219);
+  const fixture = createFixture(manager, 223);
   const speciesHolder = Object.freeze(
     Object.create(null, {
       [Symbol.species]: {
@@ -710,28 +863,31 @@ test("callbacks can return structurally protected foreign promises", async () =>
     }),
   );
   let foreignThenCalls = 0;
-  const foreign = Promise.resolve("completed");
-  Object.defineProperties(foreign, {
-    constructor: {
-      configurable: false,
-      enumerable: false,
-      value: speciesHolder,
-      writable: false,
-    },
-    then: {
-      configurable: false,
-      enumerable: false,
-      value() {
-        foreignThenCalls += 1;
-        throw new Error("foreign own then must not run");
-      },
-      writable: false,
-    },
-  });
-
-  assert.equal(
-    await fixture.lifecycle.runForeground(() => foreign),
-    "completed",
+  const expected = Object.freeze({ identity: "completed" });
+  assert.strictEqual(
+    await fixture.lifecycle.runForeground((_lease, complete) => {
+      const carrier = complete(expected);
+      const foreign = Promise.resolve(carrier);
+      Object.defineProperties(foreign, {
+        constructor: {
+          configurable: false,
+          enumerable: false,
+          value: speciesHolder,
+          writable: false,
+        },
+        then: {
+          configurable: false,
+          enumerable: false,
+          value() {
+            foreignThenCalls += 1;
+            throw new Error("foreign own then must not run");
+          },
+          writable: false,
+        },
+      });
+      return foreign;
+    }),
+    expected,
   );
   assert.equal(foreignThenCalls, 0);
   assert.equal(manager.holders.size, 0);

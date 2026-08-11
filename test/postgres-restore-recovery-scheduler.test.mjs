@@ -112,21 +112,30 @@ class GuardClient {
     this.releaseCalls = [];
   }
 
-  async query(...args) {
+  query(...args) {
+    assert.equal(args.length, 1);
     const query = args[0];
-    const text = typeof query === "string" ? query : query.text;
+    const text = query.text;
+    const callbackDescriptor = Object.getOwnPropertyDescriptor(
+      query,
+      "callback",
+    );
+    assert.equal(callbackDescriptor?.enumerable, true);
+    assert.equal(Object.hasOwn(callbackDescriptor, "value"), true);
+    const callback = callbackDescriptor.value;
     if (text === "DISCARD ALL") {
       this.resetCount += 1;
       this.manager.releaseAll(this);
-      return { command: "DISCARD", rows: [] };
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
     }
-    const values = typeof query === "string" ? args[1] : query.values;
+    const values = query.values;
     const key = values[0];
     if (text.includes("pg_try_advisory_lock")) {
       const mode = text.includes("pg_try_advisory_lock_shared")
         ? "shared"
         : "exclusive";
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -134,13 +143,14 @@ class GuardClient {
             backend_pid: this.pid,
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
       const mode = text.includes("mode = 'ShareLock'")
         ? "shared"
         : "exclusive";
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -148,13 +158,14 @@ class GuardClient {
             lock_held: this.manager.isHeld(key, this, mode),
           },
         ],
-      };
+      });
+      return undefined;
     }
     if (text.includes("pg_advisory_unlock")) {
       const mode = text.includes("pg_advisory_unlock_shared")
         ? "shared"
         : "exclusive";
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [
           {
@@ -162,14 +173,17 @@ class GuardClient {
             unlocked: this.manager.unlock(key, this, mode),
           },
         ],
-      };
+      });
+      return undefined;
     }
-    throw new Error(`unexpected guard query: ${text}`);
+    callback(new Error(`unexpected guard query: ${text}`));
+    return undefined;
   }
 
-  async release(...args) {
+  release(...args) {
     this.releaseCalls.push(args);
     if (args.length === 1) this.manager.releaseAll(this);
+    return undefined;
   }
 }
 
@@ -181,7 +195,7 @@ class GuardPool {
     this.onConnect = null;
   }
 
-  async connect() {
+  connect(callback) {
     this.connectCalls += 1;
     this.onConnect?.();
     const client = new GuardClient(
@@ -189,7 +203,9 @@ class GuardPool {
       20_000 + this.connectCalls,
     );
     this.clients.push(client);
-    return client;
+    const release = (...args) => client.release(...args);
+    callback(null, client, release);
+    return undefined;
   }
 }
 
@@ -435,9 +451,10 @@ test("a foreground shared lease produces a busy tick without recovery work", asy
   const foregroundEntered = deferred();
   const releaseForeground = deferred();
   const foreground = runnerFixture.lifecycleFixture.lifecycleGuard.runForeground(
-    async () => {
+    async (_lease, complete) => {
       foregroundEntered.resolve();
       await releaseForeground.promise;
+      return complete(undefined);
     },
   );
   await foregroundEntered.promise;

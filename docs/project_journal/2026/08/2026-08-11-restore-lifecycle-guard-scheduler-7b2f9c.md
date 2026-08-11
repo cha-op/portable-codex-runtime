@@ -26,7 +26,11 @@ overlapping steps. Production `runRestore()` remains fail-closed.
 - `PostgresOperationGuard` supports both shared and exclusive PostgreSQL
   session advisory locks over the same versioned lock key. Its dedicated
   client, reset, health probe, unlock, and destruction rules apply to both
-  modes.
+  modes. Pool acquisition and query submission use callback-only node-postgres
+  adapters whose raw values are sealed inside private null-prototype carriers
+  before Promise settlement. Promise-returning guard callbacks must fulfill
+  with the exact per-run `complete(value)` carrier, so prototype or species
+  poisoning cannot release a lock before the real callback drains.
 - `PostgresRestoreLifecycleGuard` fixes one versioned lock identity for the
   complete candidate universe in an authoritative database. It mints opaque,
   callback-scoped foreground or recovery leases; structural lookalikes and
@@ -69,6 +73,10 @@ overlapping steps. Production `runRestore()` remains fail-closed.
   reactions. Callback-time prototype poisoning cannot settle public work
   before its probes and cleanup drain, while a structurally protected Promise
   from another trusted module is adopted through a captured native bridge.
+- Lifecycle callbacks receive the same operation-scoped `complete` capability
+  as the underlying guard. Async recovery work returns that authentic carrier;
+  only after the exclusive lock probe and cleanup drain does the facade expose
+  the original recovery result.
 
 ## Next Steps
 

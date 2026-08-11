@@ -5,6 +5,10 @@ import {
   PlatformImageReservationCoordinator,
 } from "./platform-image-reservation.mjs";
 import {
+  PostgresOperationGuard,
+  isPostgresOperationGuard,
+} from "./postgres-operation-guard.mjs";
+import {
   RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
   RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
   SESSION_OPERATION_CONFLICT_CLASS,
@@ -70,9 +74,12 @@ const objectIs = Object.is;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
+const promisePrototype = Promise.prototype;
 const promiseResolveIntrinsic = Promise.resolve;
 const promiseSpeciesSymbol = Symbol.species;
 const promiseThenIntrinsic = Promise.prototype.then;
+const postgresOperationGuardRunExclusiveIntrinsic =
+  PostgresOperationGuard.prototype.runExclusive;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -1198,6 +1205,25 @@ function collaboratorBinding(value, methodNames, code) {
   });
 }
 
+function operationGuardBinding(value, code) {
+  if (isPostgresOperationGuard(value)) {
+    ensure(objectIsFrozen(value), code);
+    return exactFrozenRecord({
+      kind: "postgres-operation-guard",
+      methods: exactFrozenRecord({
+        runExclusive: postgresOperationGuardRunExclusiveIntrinsic,
+      }),
+      receiver: value,
+    });
+  }
+  const legacy = collaboratorBinding(value, ["runExclusive"], code);
+  return exactFrozenRecord({
+    kind: "legacy-async",
+    methods: legacy.methods,
+    receiver: legacy.receiver,
+  });
+}
+
 function isSafeNativePromise(value) {
   if (
     !isPromiseValue(value) ||
@@ -1230,6 +1256,136 @@ function isSafeNativePromise(value) {
   return false;
 }
 
+function adoptPostgresOperationGuardPromise(value, code) {
+  ensure(
+    isPromiseValue(value) &&
+      !isProxyValue(value) &&
+      !isGeneratorObjectValue(value),
+    code,
+  );
+  let sourceConstructorDescriptor;
+  let sourceConstructorKeys;
+  let sourceConstructorPrototype;
+  let sourceSpeciesDescriptor;
+  let sourcePrototype;
+  try {
+    sourcePrototype = objectGetPrototypeOf(value);
+    sourceConstructorDescriptor = objectGetOwnPropertyDescriptor(
+      value,
+      "constructor",
+    );
+  } catch {
+    fail(code);
+  }
+  const sourceConstructor = sourceConstructorDescriptor?.value;
+  ensure(
+    sourcePrototype === promisePrototype &&
+      sourceConstructorDescriptor?.configurable === false &&
+      sourceConstructorDescriptor.enumerable === false &&
+      objectHasOwn(sourceConstructorDescriptor, "value") &&
+      sourceConstructorDescriptor.writable === false &&
+      sourceConstructor !== null &&
+      typeof sourceConstructor === "object" &&
+      !isProxyValue(sourceConstructor) &&
+      objectIsFrozen(sourceConstructor),
+    code,
+  );
+  try {
+    sourceConstructorPrototype = objectGetPrototypeOf(sourceConstructor);
+    sourceConstructorKeys = reflectOwnKeys(sourceConstructor);
+    sourceSpeciesDescriptor = objectGetOwnPropertyDescriptor(
+      sourceConstructor,
+      promiseSpeciesSymbol,
+    );
+  } catch {
+    fail(code);
+  }
+  ensure(
+    sourceConstructorPrototype === null &&
+      sourceConstructorKeys.length === 1 &&
+      sourceConstructorKeys[0] === promiseSpeciesSymbol &&
+      sourceSpeciesDescriptor?.configurable === false &&
+      sourceSpeciesDescriptor.enumerable === false &&
+      objectHasOwn(sourceSpeciesDescriptor, "value") &&
+      sourceSpeciesDescriptor.value === PromiseConstructor &&
+      sourceSpeciesDescriptor.writable === false,
+    code,
+  );
+
+  let adopted;
+  let adoptedConstructorDescriptor;
+  let adoptedPrototype;
+  try {
+    adopted = callIntrinsic(promiseThenIntrinsic, value, [
+      undefined,
+      undefined,
+    ]);
+    adoptedPrototype = objectGetPrototypeOf(adopted);
+    adoptedConstructorDescriptor = objectGetOwnPropertyDescriptor(
+      adopted,
+      "constructor",
+    );
+  } catch {
+    fail(code);
+  }
+  ensure(
+    isPromiseValue(adopted) &&
+      !isProxyValue(adopted) &&
+      !isGeneratorObjectValue(adopted) &&
+      adoptedPrototype === promisePrototype &&
+      adoptedConstructorDescriptor === undefined,
+    code,
+  );
+  try {
+    objectDefineProperty(adopted, "constructor", {
+      configurable: false,
+      enumerable: false,
+      value: PromiseConstructor,
+      writable: false,
+    });
+    adoptedConstructorDescriptor = objectGetOwnPropertyDescriptor(
+      adopted,
+      "constructor",
+    );
+  } catch {
+    fail(code);
+  }
+  ensure(
+    adoptedConstructorDescriptor?.configurable === false &&
+      adoptedConstructorDescriptor.enumerable === false &&
+      objectHasOwn(adoptedConstructorDescriptor, "value") &&
+      adoptedConstructorDescriptor.value === PromiseConstructor &&
+      adoptedConstructorDescriptor.writable === false,
+    code,
+  );
+  return adopted;
+}
+
+function bridgePostgresOperationGuardProbe(value, code) {
+  const probe = exactDataObject(value, PROBE_KEYS, code);
+  ensure(objectIsFrozen(value), code);
+  const assertHeldIntrinsic = assertCallback(probe.assertHeld, code);
+  const assertHeld = objectFreeze((...args) => {
+    let pending;
+    try {
+      pending = callIntrinsic(assertHeldIntrinsic, undefined, args);
+    } catch {
+      fail(code);
+    }
+    return adoptPostgresOperationGuardPromise(pending, code);
+  });
+  return exactFrozenRecord({ assertHeld });
+}
+
+function bridgePostgresOperationGuardCallback(callback, code) {
+  const guardedCallback = assertCallback(callback, code);
+  return objectFreeze((probe, complete) =>
+    callIntrinsic(guardedCallback, undefined, [
+      bridgePostgresOperationGuardProbe(probe, code),
+      complete,
+    ]));
+}
+
 async function invokeAsync(binding, name, args, code) {
   let pending;
   try {
@@ -1247,17 +1403,28 @@ async function invokeAsync(binding, name, args, code) {
 
 async function invokeGuard(binding, args, code) {
   let pending;
+  const callArgs =
+    binding.kind === "postgres-operation-guard"
+      ? [
+          args[0],
+          bridgePostgresOperationGuardCallback(args[1], code),
+        ]
+      : args;
   try {
     pending = callIntrinsic(
       binding.methods.runExclusive,
       binding.receiver,
-      args,
+      callArgs,
     );
   } catch (error) {
     if (isInternalError(error)) throw error;
     fail(code);
   }
-  ensure(isSafeNativePromise(pending), code);
+  if (binding.kind === "postgres-operation-guard") {
+    pending = adoptPostgresOperationGuardPromise(pending, code);
+  } else {
+    ensure(binding.kind === "legacy-async" && isSafeNativePromise(pending), code);
+  }
   try {
     return await pending;
   } catch (error) {
@@ -2873,9 +3040,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
     AUTHORITY_METHODS,
     optionCode,
   );
-  const operationGuard = collaboratorBinding(
+  const operationGuard = operationGuardBinding(
     options.operationGuard,
-    ["runExclusive"],
     optionCode,
   );
   ensure(
@@ -3545,8 +3711,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
         operationGuard,
         [
           input.launchAttemptId,
-          async (probeValue) => {
+          async (probeValue, completeValue) => {
             const probe = normalizeProbe(probeValue, admissionCode);
+            const complete = assertCallback(completeValue, admissionCode);
+            ensure(objectIsFrozen(completeValue), admissionCode);
             await assertGuardHeld(probe, admissionCode);
             const measuredImage = await revalidateImageReservation(
               input.imageReservation,
@@ -3558,7 +3726,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
               input.expectedSession,
               optionCode,
             );
-            return exactFrozenRecord({
+            const result = exactFrozenRecord({
               launchAttemptId: input.launchAttemptId,
               measuredImage,
               supervisor: exactFrozenRecord({
@@ -3566,6 +3734,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 supervisorId: supervisor.supervisorId,
               }),
             });
+            return callIntrinsic(complete, undefined, [result]);
           },
         ],
         admissionCode,
@@ -3594,8 +3763,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
         operationGuard,
         [
           input.launchAttemptId,
-          async (probeValue) => {
+          async (probeValue, completeValue) => {
             const probe = normalizeProbe(probeValue, outcomeCode);
+            const complete = assertCallback(completeValue, outcomeCode);
+            ensure(objectIsFrozen(completeValue), outcomeCode);
             const expectedSession = normalizeSession(
               await invokeAsync(
                 authority,
@@ -3652,20 +3823,24 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 outcomeCode,
               );
             } catch {
-              return reconcileWithinGuard(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                typedRequest,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcileWithinGuard(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  typedRequest,
+                ),
+              ]);
             }
             if (!reserve.acquired) {
-              return reconcileWithinGuard(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                typedRequest,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcileWithinGuard(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  typedRequest,
+                ),
+              ]);
             }
 
             assertWriterLaunchAvailable(
@@ -3695,29 +3870,35 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 outcomeCode,
               );
             } catch {
-              return reconcileWithinGuard(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                typedRequest,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcileWithinGuard(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  typedRequest,
+                ),
+              ]);
             }
             if (!claim.dispatchGranted) {
-              return reconcileWithinGuard(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                typedRequest,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcileWithinGuard(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  typedRequest,
+                ),
+              ]);
             }
             dispatchDefinitelyBegan = true;
             dispatchOperation = claim.operation;
-            return dispatchGrantedLaunch(
-              claim,
-              input.imageReservation,
-              probe,
-              uncertaintyState,
-            );
+            return callIntrinsic(complete, undefined, [
+              await dispatchGrantedLaunch(
+                claim,
+                input.imageReservation,
+                probe,
+                uncertaintyState,
+              ),
+            ]);
           },
         ],
         outcomeCode,
@@ -3750,23 +3931,29 @@ export function createPostgresLogicalWriterLauncher(...args) {
         operationGuard,
         [
           input.launchAttemptId,
-          async (probeValue) => {
+          async (probeValue, completeValue) => {
             const probe = normalizeProbe(probeValue, outcomeCode);
+            const complete = assertCallback(completeValue, outcomeCode);
+            ensure(objectIsFrozen(completeValue), outcomeCode);
             const read = await readAttempt(input.launchAttemptId);
             if (read.operation.state === "committed") {
-              return terminalResultFromRead(read);
+              return callIntrinsic(complete, undefined, [
+                terminalResultFromRead(read),
+              ]);
             }
             validateFacadeSupervisor(read.attempt.request, optionCode);
             if (
               read.operation.state === "starting" ||
               read.operation.state === "uncertain"
             ) {
-              return reconcileWithinGuard(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                read.attempt.request,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcileWithinGuard(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  read.attempt.request,
+                ),
+              ]);
             }
 
             validatePreparedAuthorityRelation(read);
@@ -3812,29 +3999,35 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 outcomeCode,
               );
             } catch {
-              return reconcilePreparedClaimAmbiguity(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                read.attempt.request,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcilePreparedClaimAmbiguity(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  read.attempt.request,
+                ),
+              ]);
             }
             if (!claim.dispatchGranted) {
-              return reconcilePreparedClaimAmbiguity(
-                input.launchAttemptId,
-                probe,
-                uncertaintyState,
-                read.attempt.request,
-              );
+              return callIntrinsic(complete, undefined, [
+                await reconcilePreparedClaimAmbiguity(
+                  input.launchAttemptId,
+                  probe,
+                  uncertaintyState,
+                  read.attempt.request,
+                ),
+              ]);
             }
             dispatchDefinitelyBegan = true;
             dispatchOperation = claim.operation;
-            return dispatchGrantedLaunch(
-              claim,
-              input.imageReservation,
-              probe,
-              uncertaintyState,
-            );
+            return callIntrinsic(complete, undefined, [
+              await dispatchGrantedLaunch(
+                claim,
+                input.imageReservation,
+                probe,
+                uncertaintyState,
+              ),
+            ]);
           },
         ],
         outcomeCode,
@@ -3863,12 +4056,17 @@ export function createPostgresLogicalWriterLauncher(...args) {
         operationGuard,
         [
           input.launchAttemptId,
-          async (probeValue) =>
-            reconcileWithinGuard(
-              input.launchAttemptId,
-              normalizeProbe(probeValue, outcomeCode),
-              uncertaintyState,
-            ),
+          async (probeValue, completeValue) => {
+            const complete = assertCallback(completeValue, outcomeCode);
+            ensure(objectIsFrozen(completeValue), outcomeCode);
+            return callIntrinsic(complete, undefined, [
+              await reconcileWithinGuard(
+                input.launchAttemptId,
+                normalizeProbe(probeValue, outcomeCode),
+                uncertaintyState,
+              ),
+            ]);
+          },
         ],
         outcomeCode,
       );
@@ -4444,8 +4642,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
         operationGuard,
         [
           stopOperation,
-          async (probeValue) => {
+          async (probeValue, completeValue) => {
             const probe = normalizeProbe(probeValue, outcomeCode);
+            const complete = assertCallback(completeValue, outcomeCode);
+            ensure(objectIsFrozen(completeValue), outcomeCode);
             const record = captureRecord(
               capture,
               acceptedRecordStates,
@@ -4460,7 +4660,9 @@ export function createPostgresLogicalWriterLauncher(...args) {
                   WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
                 outcomeCode,
               );
-              return replayPreparedCaptureHandoff(record, capture);
+              return callIntrinsic(complete, undefined, [
+                replayPreparedCaptureHandoff(record, capture),
+              ]);
             }
             let baseInput = record.stopBaseInput;
             const retainedBaseInput = baseInput !== null;
@@ -4661,14 +4863,17 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 }),
                 outcomeCode,
               );
-              return storePreparedCaptureHandoff(record, capture);
+              return callIntrinsic(complete, undefined, [
+                storePreparedCaptureHandoff(record, capture),
+              ]);
             }
-            return exactFrozenRecord({
+            const result = exactFrozenRecord({
               capability,
               evidence: record.stopEvidence,
               resolution: resolutionForRecord(record),
               stop: record.stopReceipt,
             });
+            return callIntrinsic(complete, undefined, [result]);
           },
         ],
         outcomeCode,
