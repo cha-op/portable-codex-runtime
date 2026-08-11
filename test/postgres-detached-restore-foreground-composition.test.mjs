@@ -828,19 +828,26 @@ function happyFacadeFixture({
   crossedPreparedCapture = null,
   crossedRenewalReservation = false,
   generationClaimAckLoss = null,
+  initialLeaseExpiresAt = "2027-08-11T08:00:00.000Z",
   preparedGenerationReservation = false,
+  renewalAuthorityNow = "2026-08-11T09:00:01.000Z",
+  renewalExpiresAt = "2027-08-11T08:05:00.000Z",
+  renewalReceiptRenewed = true,
 } = {}) {
   const plan = fixturePlan();
   const events = [];
   let captureDurable = false;
-  const initial = runningSession();
+  let captureNow = null;
+  const initial = runningSession({
+    document: { lease: lease(initialLeaseExpiresAt) },
+  });
   const renewedLease = deepFreeze({
     contractVersion: initial.document.lease.contractVersion,
     sessionId: initial.document.lease.sessionId,
     leaseId: initial.document.lease.leaseId,
     holderId: initial.document.lease.holderId,
     fencingEpoch: initial.document.lease.fencingEpoch,
-    expiresAt: "2027-08-11T08:05:00.000Z",
+    expiresAt: renewalExpiresAt,
   });
   const renewalOperation = authorityOperation({
     expectedSession: initial,
@@ -1288,7 +1295,11 @@ function happyFacadeFixture({
       assert.equal(input.operationId, plan.renewalOperationId);
       const reservation = operationReservation(renewalOperation, "released");
       return deepFreeze({
+        ...(renewalAuthorityNow === null
+          ? {}
+          : { authorityNow: renewalAuthorityNow }),
         operation: renewalOperation,
+        renewed: renewalReceiptRenewed,
         reservation: crossedRenewalReservation
           ? {
               ...reservation,
@@ -1503,6 +1514,7 @@ function happyFacadeFixture({
       async runPreparedCapture(input) {
         events.push("stop");
         captureDurable = true;
+        captureNow = input.now;
         assert.equal(input.request.operationId, plan.captureOperationId);
         return captureProviderResult;
       },
@@ -1910,6 +1922,9 @@ function happyFacadeFixture({
         },
       });
     },
+    get captureNow() {
+      return captureNow;
+    },
     events,
     facade,
     setActivationReplayState(state) {
@@ -2295,6 +2310,70 @@ test("renewal receipt must prove the exact reservation before writer stop", asyn
     ),
     "postgres_detached_restore_foreground_composition_outcome_uncertain",
   );
+  assert.deepEqual(fixture.events, ["gate", "renew"]);
+});
+
+test("fresh capture uses renewal database time when the worker clock is past lease expiry", async () => {
+  const authorityNow = "2026-08-11T09:00:01.000Z";
+  const expiresAt = "2026-08-11T09:10:01.000Z";
+  assert.equal(Date.parse(expiresAt) < Date.now(), true);
+  const fixture = happyFacadeFixture({
+    initialLeaseExpiresAt: "2026-08-11T09:05:00.000Z",
+    renewalAuthorityNow: authorityNow,
+    renewalExpiresAt: expiresAt,
+  });
+  await seedCommittedRestore(fixture, "database-time-capture-001");
+  assert.equal(fixture.captureNow, Date.parse(authorityNow));
+  assert.equal(fixture.events.includes("stop"), true);
+});
+
+for (const [label, options] of [
+  [
+    "authorityNow at lease expiry",
+    {
+      renewalAuthorityNow: "2027-08-11T08:10:00.000Z",
+      renewalExpiresAt: "2027-08-11T08:10:00.000Z",
+    },
+  ],
+  [
+    "non-canonical authorityNow",
+    { renewalAuthorityNow: "2026-08-11T09:00:01Z" },
+  ],
+  ["renewed false", { renewalReceiptRenewed: false }],
+  ["missing authorityNow", { renewalAuthorityNow: null }],
+]) {
+  test(`fresh renewal rejects ${label} before writer stop`, async () => {
+    const fixture = happyFacadeFixture(options);
+    await rejectsWithCode(
+      fixture.facade.runRestore(
+        admission(),
+        async () => assert.fail("invalid renewal must not publish"),
+      ),
+      "postgres_detached_restore_foreground_composition_outcome_uncertain",
+    );
+    assert.equal(fixture.events.includes("stop"), false);
+    assert.deepEqual(fixture.events, ["gate", "renew"]);
+  });
+}
+
+test("fresh renewal rejects a frozen object authorityNow without coercion", async () => {
+  let coercions = 0;
+  const authorityNow = Object.freeze({
+    [Symbol.toPrimitive]() {
+      coercions += 1;
+      return "2026-08-11T09:00:01.000Z";
+    },
+  });
+  const fixture = happyFacadeFixture({ renewalAuthorityNow: authorityNow });
+  await rejectsWithCode(
+    fixture.facade.runRestore(
+      admission(),
+      async () => assert.fail("invalid renewal must not publish"),
+    ),
+    "postgres_detached_restore_foreground_composition_outcome_uncertain",
+  );
+  assert.equal(coercions, 0);
+  assert.equal(fixture.events.filter((event) => event === "stop").length, 0);
   assert.deepEqual(fixture.events, ["gate", "renew"]);
 });
 
@@ -2962,6 +3041,7 @@ test("an expired renewed lease is rejected at the stop effect boundary", async (
     readSession: async () => initial,
     renewWriterLease(input) {
       return deepFreeze({
+        authorityNow: renewedExpiresAt,
         operation: {
           conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
           createdAt: renewedUpdatedAt,
@@ -2984,6 +3064,7 @@ test("an expired renewed lease is rejected at the stop effect boundary", async (
         reservation: {
           reservationId: `reservation-${plan.renewalOperationId}`,
         },
+        renewed: true,
         session: renewed,
       });
     },

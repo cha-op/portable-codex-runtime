@@ -111,14 +111,20 @@ runtime assembly and end-to-end coverage land.
 ## Lease Boundary
 
 The facade renews the current writer lease before stop, but that does not make
-the lease timeless. The stable `captureCreatedAt` and derived identities remain
-unchanged if capture is slow; generation V1 still validates the matching
-database-clock lease at its own reservation and claim boundaries. Expiry there
-fails closed and authorizes neither a second stop nor a second fresh capture.
-Activation V2 creates the prepared launch under another bounded lease; expiry
-before the launch claim likewise fails closed and never authorizes relaunch.
-Phase B must choose an operational lease budget/deadline and explicit recovery
-policy for both windows.
+the lease timeless. On the fresh path, the successful renewal's PostgreSQL
+`authorityNow`, not worker `Date.now()`, supplies `now` to local capture
+preparation as its database-authoritative timestamp. Lease expiry is
+deliberately not a stop-claim gate: that claim advances only through the exact
+session identity, claimant token, and capture intent. Generation V1 later
+reads the current database clock independently in its dispatch-claim
+transaction; the preceding generic reserve does not read that clock. The
+stable `captureCreatedAt` and derived identities remain unchanged if capture
+is slow, but expiry discovered after capture fails closed and authorizes
+neither a second stop nor a second fresh capture. Activation V2 creates the
+prepared launch under another bounded lease; expiry before the launch claim
+likewise fails closed and never authorizes relaunch. Phase B must choose an
+operational lease budget/deadline and explicit recovery policy for long
+capture and activation windows.
 
 ## Next Steps
 

@@ -1815,15 +1815,21 @@ committed-only or no-relaunch recovery path; an unresolved earlier cut can
 leave the caller-driven sequence blocked rather than being guessed forward.
 
 Renewal-before-stop narrows but does not remove the database-clock lease
-boundary. `captureCreatedAt` and every derived ID stay stable if a long safety
-capture crosses that boundary, but generation V1 still requires the matching
-current lease at its own reservation/claim checks. Expiry there fails closed:
-it does not authorize another stop or fresh capture, and phase B must supply
-an operational lease budget/deadline and explicit recovery policy rather than
-silently renewing through active capture state. Activation V2 creates the
-prepared launch under a new bounded lease; expiry before the launch claim also
-fails closed and never authorizes relaunch. The configured duration must cover
-both windows.
+boundary. On a fresh path, the successful renewal's PostgreSQL `authorityNow`,
+not the worker's `Date.now()`, supplies the `now` used for local prepared-
+capture construction as its database-authoritative timestamp. This local use
+does not extend the lease. Lease expiry is deliberately not a stop-claim gate;
+the V3 claim progresses only through its exact session identity, claimant
+token, and capture intent. Generation V1 later reads the current database
+clock independently in its dispatch-claim transaction; the preceding generic
+reserve does not read that clock. `captureCreatedAt` and every derived ID stay
+stable if a long safety capture crosses that boundary, but expiry discovered
+after capture fails closed and does not authorize another stop or fresh
+capture. Phase B must supply an operational lease budget/deadline and explicit
+recovery policy rather than silently renewing through active capture state.
+Activation V2 creates the prepared launch under a new bounded lease; expiry
+before the launch claim also fails closed and never authorizes relaunch. The
+phase-B budget must cover long capture and activation windows.
 
 Until phase B lands, the production checkpoint adapter still rejects restore:
 its `runRestore()` implementation remains the fixed fail-closed stub. Runtime

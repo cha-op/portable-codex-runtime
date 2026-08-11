@@ -46,8 +46,8 @@ const arrayIsArray = Array.isArray;
 const arraySortIntrinsic = Array.prototype.sort;
 const BigIntConstructor = BigInt;
 const DateConstructor = Date;
-const dateNowIntrinsic = Date.now;
 const dateParseIntrinsic = Date.parse;
+const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const functionApplyIntrinsic = Reflect.apply;
 const haveDistinctLifecycleOperationGuardPoolsIntrinsic =
   haveDistinctPostgresRestoreLifecycleOperationGuardPools;
@@ -900,8 +900,25 @@ function operationMatches(operation, operationId, kind, code) {
 }
 
 function parseTimestamp(value, code) {
+  ensure(typeof value === "string", code);
   const milliseconds = callIntrinsic(dateParseIntrinsic, DateConstructor, [value]);
   ensure(numberIsFinite(milliseconds), code);
+  return milliseconds;
+}
+
+function parseCanonicalTimestamp(value, code) {
+  const milliseconds = parseTimestamp(value, code);
+  let canonical;
+  try {
+    canonical = callIntrinsic(
+      dateToISOStringIntrinsic,
+      new DateConstructor(milliseconds),
+      [],
+    );
+  } catch {
+    fail(code);
+  }
+  ensure(canonical === value, code);
   return milliseconds;
 }
 
@@ -1471,6 +1488,11 @@ function deriveCurrentStopOperationId(session, tuple, code) {
 
 function normalizeRenewalReceipt(value, base, code) {
   const receipt = frozenReceipt(value, code);
+  const renewed = ownDataValue(receipt, "renewed", code);
+  const authorityNow = parseCanonicalTimestamp(
+    ownDataValue(receipt, "authorityNow", code),
+    code,
+  );
   const operation = operationMatches(
     ownDataValue(receipt, "operation", code),
     base.operationId,
@@ -1486,9 +1508,14 @@ function normalizeRenewalReceipt(value, base, code) {
   const session = sessionSnapshot(ownDataValue(receipt, "session", code), code);
   const reservation = ownDataValue(receipt, "reservation", code);
   ensure(
-    session.document.lifecycle === "ATTACHED" &&
+    renewed === true &&
+      authorityNow >=
+        parseTimestamp(ownDataValue(operation, "updatedAt", code), code) &&
+      session.document.lifecycle === "ATTACHED" &&
       session.document.lease !== null &&
       session.document.attachment !== null &&
+      authorityNow <
+        parseTimestamp(session.document.lease.expiresAt, code) &&
       pointerMatches(
         session.document.lastOperation,
         base.operationId,
@@ -1505,7 +1532,7 @@ function normalizeRenewalReceipt(value, base, code) {
   } catch {
     fail(code);
   }
-  return session;
+  return exactFrozenRecord({ authorityNow, session });
 }
 
 async function renewFreshSession(authority, plan, session, lease, code) {
@@ -1526,9 +1553,9 @@ async function renewFreshSession(authority, plan, session, lease, code) {
     code,
   );
   if (settled.ok) {
-    const renewed = normalizeRenewalReceipt(settled.value, base, code);
+    const renewal = normalizeRenewalReceipt(settled.value, base, code);
     await assertLifecycleHeld(lease, code);
-    return assertThenFreeValue(renewed, code);
+    return assertThenFreeValue(renewal, code);
   }
   // There is no typed read-by-operation-id seam for a renewal. A last-pointer
   // match cannot prove the original expected snapshot or request digest after
@@ -1563,6 +1590,7 @@ async function continueCapture(
   tuple,
   plan,
   session,
+  authorityNow,
   captureRead,
   stopOperationId,
   lease,
@@ -1587,10 +1615,9 @@ async function continueCapture(
       stopOperationId === null || stopOperationId === actualStopOperationId,
       code,
     );
-    const now = callIntrinsic(dateNowIntrinsic, DateConstructor, []);
     ensure(
-      numberIsFinite(now) &&
-        now < parseTimestamp(session.document.lease.expiresAt, code),
+      numberIsFinite(authorityNow) &&
+        authorityNow < parseTimestamp(session.document.lease.expiresAt, code),
       code,
     );
     await assertLifecycleHeld(lease, code);
@@ -1605,7 +1632,7 @@ async function continueCapture(
           checkpointClass: "clean",
           createdAt: plan.captureCreatedAt,
           manifest: session.document.manifest,
-          now,
+          now: authorityNow,
           request: tuple.request,
           storageRef: session.document.storageRef,
         }),
@@ -3009,6 +3036,7 @@ async function executeForegroundRestore(
   let stopOperationId = capture?.stopOperationId ?? null;
   const active = current.document.activeOperation;
   const last = current.document.lastOperation;
+  let freshCaptureAuthorityNow = null;
   let preparedGenerationSession = null;
   if (
     capture === null &&
@@ -3056,13 +3084,15 @@ async function executeForegroundRestore(
       capability === POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED,
       "postgres_detached_restore_fleet_capability_required",
     );
-    current = await renewFreshSession(
+    const renewal = await renewFreshSession(
       bindings.authority,
       plan,
       current,
       lease,
       code,
     );
+    current = renewal.session;
+    freshCaptureAuthorityNow = renewal.authorityNow;
   } else if (capture === null && generation === null) {
     // A renewal pointer does not expose the original expected-session or
     // request digest. Without a typed renewal read, this cold cut cannot be
@@ -3077,6 +3107,7 @@ async function executeForegroundRestore(
       tuple,
       plan,
       current,
+      freshCaptureAuthorityNow,
       capture,
       stopOperationId,
       lease,
