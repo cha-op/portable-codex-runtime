@@ -13,7 +13,8 @@ reconciliation, durable stopped-writer-to-prepared-capture handoff, and
 restore.
 It also includes source-free committed restore-destination verification, a
 versioned provider attachment proof, atomic detached activation into a
-prepared launch, and four bounded no-relaunch recovery lanes.
+prepared launch, four bounded no-relaunch recovery lanes, and a
+production-neutral detached-restore foreground composition seam.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -327,7 +328,10 @@ ordinary durable operation IDs, so an operation whose ID matches the lifecycle
 label cannot self-conflict with the outer shared or exclusive lease. Foreground
 shared admission and recovery-exclusive admission use distinct dedicated
 operation-guard pools, so exhausting foreground connections cannot delay the
-recovery lock attempt or scheduler shutdown. The
+recovery lock attempt or scheduler shutdown. The detached-restore foreground
+factory also rejects an inner per-operation guard that reuses either lifecycle
+pool, preventing a max-one pool from self-deadlocking while the outer shared
+lease waits for a nested exclusive operation. The
 underlying operation guard uses callback-only node-postgres adapters and a
 callback-scoped `complete(value)` carrier, so driver results and asynchronous
 lifecycle results cannot be assimilated through mutable Promise or object
@@ -340,13 +344,37 @@ generator, and other values fail the scheduler closed. A returned safe native
 Promise is rejection-drained but never awaited. Cursor recovery scopes remain
 fairness and replay identities only; they do not partition the lifecycle lock.
 
-Production restore therefore remains fail-closed. The remaining serial
-prerequisites are an invocation-time detached-production compatibility gate
-and final adapter wiring. That wiring must hold the shared lifecycle lease
-across committed publication, durable stop and prepared clean capture,
-canonical detach, capture-bound activation, and prepared launch while the
-exclusive scheduler continues bounded no-relaunch recovery. `runRestore()`
-remains disabled until both prerequisites are composed.
+Detached-restore foreground phase A now provides one caller-persisted stable
+root plan and a production-neutral composition facade. The plan binds the
+outer restore request, source checkpoint artefact and detached destination,
+stable capture timestamp, detach mode, holder, image plan, and lease duration;
+domain-separated hashes derive the renewal, safety-capture, generation,
+detach, activation, and launch identities. The logical launcher and capture
+authority still mint the formal stop-operation and capture-attempt identities.
+The source checkpoint paths are not the fresh safety-capture paths: the
+capture backend resolves the latter from the derived capture identities.
+
+Each facade invocation first distinguishes fresh work from an exact typed
+durable continuation. Fresh work must pass the default-deny detached-production
+fleet gate; an already-materialized V3 stop-to-capture handoff or later typed
+operation may continue without reopening fresh admission. A stop that may have
+started before that atomic handoff remains blocked. One shared restore-
+lifecycle lease spans:
+lease renewal before stop, V3 stop-to-prepared-capture, version 1 target-
+generation publication, canonical release or force-fence detach without
+fallback, activation version 2, and prepared launch. Exact retries reuse the
+same caller-persisted plan and durable subordinate identities; there is no
+autonomous cross-stage saga that guesses progress after restart.
+
+The configured lease duration must cover both database-clock claim windows:
+the safety-capture-to-generation boundary and the activation-to-launch
+boundary. Expiry fails closed and never authorizes a second physical dispatch.
+
+Production restore nevertheless remains fail-closed. The production
+checkpoint adapter's `runRestore()` stub is unchanged. Phase B must assemble
+the facade, capture-only backend, scheduler, and runtime-owned dependencies,
+then add end-to-end ambiguous-outcome coverage before enabling that entry
+point. The exclusive scheduler continues bounded no-relaunch recovery.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.

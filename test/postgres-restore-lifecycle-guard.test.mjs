@@ -12,6 +12,7 @@ import {
   PostgresRestoreLifecycleGuardError,
   assertPostgresRestoreLifecycleLeaseHeld,
   createPostgresRestoreLifecycleGuard,
+  haveDistinctPostgresRestoreLifecycleOperationGuardPools,
   isPostgresRestoreLifecycleGuard,
   isPostgresRestoreLifecycleLease,
 } from "../src/postgres-restore-lifecycle-guard.mjs";
@@ -366,6 +367,129 @@ test("creates an exact branded facade only from distinct real operation guard po
       error.code === "invalid_postgres_restore_lifecycle_guard_options",
   );
   assert.equal(fixture.foregroundPool.connectCalls, 0);
+});
+
+test("compares a lifecycle facade with a third distinct operation guard pool without property access", () => {
+  const manager = new AdvisoryLockManager();
+  const fixture = createFixture(manager, 211);
+  const thirdPool = new FakePool(
+    new FakeClient({ manager, pid: 20_211 }),
+  );
+  const thirdOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: thirdPool,
+  });
+  const sameForegroundPoolGuard = new PostgresOperationGuard({
+    dedicatedPool: fixture.foregroundPool,
+  });
+  const sameRecoveryPoolGuard = new PostgresOperationGuard({
+    dedicatedPool: fixture.recoveryPool,
+  });
+  let trapCalls = 0;
+  const traps = {
+    get() {
+      trapCalls += 1;
+      throw new Error("lifecycle pool predicate must not read properties");
+    },
+    getPrototypeOf() {
+      trapCalls += 1;
+      throw new Error("lifecycle pool predicate must not inspect prototypes");
+    },
+  };
+  const lifecycleProxy = new Proxy(fixture.lifecycle, traps);
+  const operationGuardProxy = new Proxy(thirdOperationGuard, traps);
+  const unbranded = Object.freeze(Object.create(null));
+
+  assert.equal(
+    Object.isFrozen(
+      haveDistinctPostgresRestoreLifecycleOperationGuardPools,
+    ),
+    true,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      thirdOperationGuard,
+    ),
+    true,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      fixture.foregroundOperationGuard,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      fixture.recoveryOperationGuard,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      sameForegroundPoolGuard,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      sameRecoveryPoolGuard,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      lifecycleProxy,
+      thirdOperationGuard,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      operationGuardProxy,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      unbranded,
+      thirdOperationGuard,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      unbranded,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+    ),
+    false,
+  );
+  assert.equal(
+    haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+      fixture.lifecycle,
+      thirdOperationGuard,
+      unbranded,
+    ),
+    false,
+  );
+  assert.equal(trapCalls, 0);
+  assert.equal(fixture.foregroundPool.connectCalls, 0);
+  assert.equal(fixture.recoveryPool.connectCalls, 0);
+  assert.equal(thirdPool.connectCalls, 0);
 });
 
 test("foreground callbacks overlap under shared locks", async () => {

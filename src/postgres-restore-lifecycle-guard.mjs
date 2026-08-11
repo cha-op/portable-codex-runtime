@@ -81,6 +81,7 @@ const failedLifecycleContexts = new WeakSetConstructor();
 const activeLifecycleContexts = new WeakSetConstructor();
 const lifecycleErrors = new WeakSetConstructor();
 const lifecycleFacades = new WeakSetConstructor();
+const lifecycleFacadeOperationGuardReceivers = new WeakMapConstructor();
 const lifecycleLeases = new WeakMapConstructor();
 const callbackFailures = new WeakMapConstructor();
 const promiseSettlementBrand = objectFreeze(objectCreate(null));
@@ -942,6 +943,14 @@ export function createPostgresRestoreLifecycleGuard(...args) {
   objectFreeze(runForeground);
   objectFreeze(runRecovery);
   const facade = exactFrozenRecord({ runForeground, runRecovery });
+  weakMapSet(
+    lifecycleFacadeOperationGuardReceivers,
+    facade,
+    exactFrozenRecord({
+      foreground: foregroundBinding.receiver,
+      recovery: recoveryBinding.receiver,
+    }),
+  );
   weakSetAdd(lifecycleFacades, facade);
   return facade;
 }
@@ -955,6 +964,34 @@ export function isPostgresRestoreLifecycleGuard(value) {
   );
 }
 
+export function haveDistinctPostgresRestoreLifecycleOperationGuardPools(
+  lifecycleGuard,
+  operationGuard,
+) {
+  if (
+    arguments.length !== 2 ||
+    !isPostgresRestoreLifecycleGuard(lifecycleGuard)
+  ) {
+    return false;
+  }
+  const receivers = weakMapGet(
+    lifecycleFacadeOperationGuardReceivers,
+    lifecycleGuard,
+  );
+  return (
+    receivers !== undefined &&
+    objectIsFrozen(haveDistinctOperationGuardPoolsIntrinsic) &&
+    callIntrinsic(haveDistinctOperationGuardPoolsIntrinsic, undefined, [
+      receivers.foreground,
+      operationGuard,
+    ]) &&
+    callIntrinsic(haveDistinctOperationGuardPoolsIntrinsic, undefined, [
+      receivers.recovery,
+      operationGuard,
+    ])
+  );
+}
+
 export function isPostgresRestoreLifecycleLease(value, expectedMode) {
   return leaseRecord(value, expectedMode) !== null;
 }
@@ -965,3 +1002,6 @@ export function assertPostgresRestoreLifecycleLeaseHeld(...args) {
 
 objectFreeze(PostgresRestoreLifecycleGuardError.prototype);
 objectFreeze(PostgresRestoreLifecycleGuardError);
+objectFreeze(
+  haveDistinctPostgresRestoreLifecycleOperationGuardPools,
+);

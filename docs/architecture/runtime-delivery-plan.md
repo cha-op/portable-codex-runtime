@@ -274,7 +274,8 @@ Restore and launcher authority are now split into eight serial pull requests:
      PostgreSQL row per recovery scope and lane persists keyset position,
      cycle, revision, and exact transition replay evidence. A bounded runner
      processes the lanes in order and commits each settled continuation before
-     admitting the next lane, but no production scheduler invokes it yet.
+     admitting the next lane. The fixed-delay production scheduler now invokes
+     that runner under the database-global exclusive lifecycle lease.
    - The canonical detach prerequisite is complete: one provider-neutral
      facade holds the per-operation advisory guard across typed release or
      force-fence admission, provider execution, proof validation, and durable
@@ -313,12 +314,32 @@ Restore and launcher authority are now split into eight serial pull requests:
      lane, candidate, and cursor boundaries. Startup runs one immediate pass;
      later fixed-delay ticks do not overlap, and shutdown drains admitted
      work before releasing the lease.
-   - Enforce the detached-production compatibility decision at invocation
-     time, not only while constructing startup collaborators.
-   - Wire publication, durable stop and prepared clean capture, canonical
-     detach, capture-bound activation, prepared launch, no-relaunch recovery,
-     and the durable recovery runner through the production checkpoint
-     adapter.
+   - Foreground composition phase A is complete. A caller-persisted contract
+     version 1 root plan binds the outer restore request, source checkpoint
+     artefact, destination plan, stable `captureCreatedAt`, detach mode,
+     holder, image plan, and lease duration. Domain-separated digests derive
+     stable renewal, capture, generation, detach, activation, and launch IDs;
+     the existing launcher and capture authority still produce the formal
+     stop-operation and capture-attempt identities. The fresh safety-capture
+     path is resolved by the capture backend and is not the plan's source-
+     artefact path.
+   - The phase-A facade re-evaluates whether each invocation is fresh or an
+     exact typed durable continuation. It requires default-deny detached-
+     production compatibility only for fresh work, admits an already-
+     materialized V3 stop-to-capture handoff or later typed work through
+     authority readback, and holds one shared lifecycle lease across renewal-
+     before-stop, V3 stop/prepared capture, generation V1 publication, release
+     or force-fence detach without fallback, activation V2, and prepared
+     launch. A stop that may have started before the atomic handoff remains
+     blocked. The factory requires the nested per-operation guard pool to be
+     distinct from both lifecycle pools before any connection is acquired.
+   - Phase A is caller-driven retry, not an autonomous durable saga. The caller
+     must retain and resubmit the exact stable plan. Retained or ambiguous
+     subordinate state is interpreted only by the existing typed authorities;
+     the facade does not infer completion or repeat a physical side effect.
+   - Phase B must assemble the facade, capture-only backend, scheduler, three
+     distinct guard pools, and runtime-owned dependencies through the
+     production checkpoint adapter.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation
