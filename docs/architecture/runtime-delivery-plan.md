@@ -337,9 +337,18 @@ Restore and launcher authority are now split into eight serial pull requests:
      must retain and resubmit the exact stable plan. Retained or ambiguous
      subordinate state is interpreted only by the existing typed authorities;
      the facade does not infer completion or repeat a physical side effect.
-   - Phase B must assemble the facade, capture-only backend, scheduler, three
-     distinct guard pools, and runtime-owned dependencies through the
-     production checkpoint adapter.
+   - The production-neutral phase-B assembly foundation is complete. One
+     strict factory constructs the capture-only backend, standalone foreground
+     facade, and idle scheduler from a single internal authority graph, one
+     authority/store pool, and three pairwise-distinct nested/foreground/
+     recovery guard pools. Construction performs no migration, scheduler
+     lifecycle action, provider action, pool close, or production restore
+     routing.
+   - The remaining phase-B work belongs to deployment assembly: durable stable-
+     plan resolution, physical provider/image and PostgreSQL bootstrap
+     bindings, lease budgets and admission/drain ownership, complete assembled
+     restart/ambiguity validation, and construction of the final public
+     restore-capable backend.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

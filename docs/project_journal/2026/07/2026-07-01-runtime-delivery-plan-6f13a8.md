@@ -3,7 +3,7 @@ id: 20260701-6f13a8
 title: Portable Runtime Delivery Plan
 status: active
 created: 2026-07-01
-updated: 2026-07-29
+updated: 2026-08-11
 branch:
 pr:
 supersedes: []
@@ -35,15 +35,20 @@ superseded_by:
 - Canonical session registration and strict readback are complete as the first
   production-authority slice without allocating a lease or authorizing a
   writer.
+- The serial authority, durable stop/capture, detached activation, prepared
+  launch, foreground composition, bounded recovery scheduler, and production-
+  neutral runtime assembly foundations are complete. The production adapter
+  remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Implement the serial authority slices in order: durable operation and
-  reservation claims; lease and attachment acquisition; release and
-  force-fence reconciliation; checkpoint catalogue authority; and logical
-  launcher admission.
+- Supply deployment-owned stable-plan, physical provider/image, PostgreSQL
+  bootstrap, lease-budget, and lifecycle bindings for the assembled runtime.
+- Validate the complete assembled restart and ambiguous-outcome matrix, then
+  construct the final public restore-capable backend and enable the production
+  adapter only if the no-second-writer boundary remains closed.
 
 ## Evidence
 

@@ -306,11 +306,16 @@
   both lifecycle pools before any connection is acquired. This prevents a
   max-one foreground lifecycle pool from self-deadlocking while its shared
   lease waits for a nested exclusive operation.
+- A production-neutral runtime factory now constructs one internally
+  consistent authority graph, capture-only backend, standalone foreground
+  facade, and idle recovery scheduler from four pairwise-distinct borrowed
+  pools. It performs no migration, start, stop, provider action, or pool close,
+  and it does not inject foreground restore into the checkpoint backend.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  because its `runRestore()` stub is unchanged. Phase B must assemble this
-  facade, its capture-only backend, three distinct guard pools, runtime-owned
-  dependencies, and scheduled no-relaunch recovery before enabling the entry
-  point.
+  because its `runRestore()` stub is unchanged. Production enablement still
+  requires deployment-owned stable-plan/provider/bootstrap bindings, full
+  assembled restart and ambiguous-outcome validation, and the final public
+  adapter route.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -385,6 +390,8 @@
   `docs/project_journal/2026/08/2026-08-10-durable-stop-prepared-capture-handoff-d4c6a1.md`
 - Detached restore foreground composition:
   `docs/project_journal/2026/08/2026-08-11-detached-restore-foreground-composition-4f8c2d.md`
+- Production-neutral restore runtime assembly:
+  `docs/project_journal/2026/08/2026-08-11-production-neutral-restore-runtime-assembly-8b42f1.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -400,6 +407,7 @@
   adapter. Capture-bound detached activation and bounded no-relaunch recovery
   now exist, the stop-to-prepared-capture handoff is durable, and the cross-
   process lifecycle guard, scheduler, stable root plan, invocation-time fleet
-  gate, and foreground composition seam are implemented. Production still
-  requires phase-B runtime/adapter assembly and end-to-end fail-closed
-  validation before `runRestore()` may be enabled.
+  gate, foreground composition seam, and production-neutral runtime assembly
+  are implemented. Production still requires deployment-owned bindings, final
+  public-adapter assembly, and end-to-end fail-closed validation before
+  `runRestore()` may be enabled.

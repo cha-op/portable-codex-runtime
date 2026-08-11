@@ -1831,12 +1831,16 @@ Activation V2 creates the prepared launch under a new bounded lease; expiry
 before the launch claim also fails closed and never authorizes relaunch. The
 phase-B budget must cover long capture and activation windows.
 
-Until phase B lands, the production checkpoint adapter still rejects restore:
-its `runRestore()` implementation remains the fixed fail-closed stub. Runtime
-assembly must construct the capture-only backend, stable-plan resolver,
-foreground facade, three distinct guard pools, and scheduler together, then
-validate the complete ambiguous-outcome matrix before enabling the entry
-point.
+The production-neutral phase-B assembly foundation now constructs one
+capture-only backend, standalone foreground facade, and idle scheduler from
+one internally consistent authority graph and four pairwise-distinct borrowed
+pool objects. It does not migrate the store, own scheduler or pool lifecycle,
+resolve deployment configuration, inject foreground restore into the backend,
+or construct the final public restore-capable backend. The production
+checkpoint adapter therefore still rejects restore through its fixed fail-
+closed `runRestore()` implementation. Deployment assembly must supply the
+stable-plan/provider/bootstrap bindings and validate the complete assembled
+ambiguous-outcome matrix before enabling that entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -1943,8 +1947,9 @@ stop identity, one physical stop, unchanged V1/V2 capability behavior, V3
 preclaim before stop, atomic committed-stop-to-prepared-capture handoff,
 prepared-only fresh dispatch, source-free active recovery, no second
 publication after ambiguity, and retained local identity until the exact
-predetermined committed result. The next integration slices must add the
-invocation-time production gate and adapter wiring before production
-`runRestore()` can open.
+predetermined committed result. The invocation-time gate and production-
+neutral object graph now exist. The next integration slices must add
+deployment-owned bindings, whole-graph restart/ambiguity validation, and final
+adapter wiring before production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.
