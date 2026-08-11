@@ -316,14 +316,37 @@ or reconcile stopped-only supervisor evidence. It never republishes, reserves
 or consumes an image, invokes the launch callback, reconstructs an opaque
 writer capability, or treats current-launch inventory as adoptable work.
 
+A database-global restore lifecycle guard now uses one versioned PostgreSQL
+session advisory-lock identity for the complete authority candidate universe.
+Foreground composition can hold a shared lease, while each bounded recovery
+pass holds the matching exclusive lease. The recovery runner revalidates that
+lease around lane reads, reconciliation batches, and durable cursor advances;
+the service revalidates it around listing and each admitted candidate. The
+fixed lifecycle lock uses a versioned advisory-key namespace distinct from
+ordinary durable operation IDs, so an operation whose ID matches the lifecycle
+label cannot self-conflict with the outer shared or exclusive lease. Foreground
+shared admission and recovery-exclusive admission use distinct dedicated
+operation-guard pools, so exhausting foreground connections cannot delay the
+recovery lock attempt or scheduler shutdown. The
+underlying operation guard uses callback-only node-postgres adapters and a
+callback-scoped `complete(value)` carrier, so driver results and asynchronous
+lifecycle results cannot be assimilated through mutable Promise or object
+prototypes before the advisory-lock probes and cleanup drain. The
+production recovery scheduler runs one immediate bounded pass, then fixed-
+delay non-overlapping passes, coalesces concurrent kicks, and drains an
+admitted pass before shutdown settles. Its `onStep` hook is synchronous
+notification only and must return exactly `undefined`; Promise, thenable,
+generator, and other values fail the scheduler closed. A returned safe native
+Promise is rejection-drained but never awaited. Cursor recovery scopes remain
+fairness and replay identities only; they do not partition the lifecycle lock.
+
 Production restore therefore remains fail-closed. The remaining serial
-prerequisites are a cross-process shared/exclusive foreground/recovery
-lifecycle guard, the production recovery scheduler, an invocation-time
-detached-production compatibility gate, and final adapter wiring. That wiring
-must connect committed publication, durable stop and prepared clean capture,
-canonical detach, capture-bound activation, prepared launch, and bounded
-no-relaunch recovery. `runRestore()` remains disabled until all four
-prerequisites are composed.
+prerequisites are an invocation-time detached-production compatibility gate
+and final adapter wiring. That wiring must hold the shared lifecycle lease
+across committed publication, durable stop and prepared clean capture,
+canonical detach, capture-bound activation, and prepared launch while the
+exclusive scheduler continues bounded no-relaunch recovery. `runRestore()`
+remains disabled until both prerequisites are composed.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -495,9 +518,10 @@ an executable clean-detached intent-to-launch handoff, and four-lane
 no-relaunch recovery. The backend's version 3 restore callback
 can now carry the complete authority-issued generation binding to either fresh
 publication or committed-only verification without changing the legacy version
-2 callback. Production restore remains fail-closed until later slices add the
-cross-process lifecycle guard, recovery scheduler, invocation-time detached-
-production gate, and adapter wiring;
+2 callback. The database-global shared/exclusive lifecycle guard and bounded
+recovery scheduler are now complete. Production restore remains fail-closed
+until later slices add the invocation-time detached-production gate and adapter
+wiring;
 filesystem-image execution
 and differential backup remain later work. See
 `docs/architecture/stopped-directory-backend.md`.

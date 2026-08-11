@@ -622,37 +622,46 @@ class GuardClient {
     this.pid = pid;
   }
 
-  async query(query) {
-    const text = typeof query === "string" ? query : query.text;
+  query(query) {
+    const callback = query?.callback;
+    const text = query?.text;
     if (text === "DISCARD ALL") {
       this.held = false;
-      return { command: "DISCARD", rows: [] };
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
     }
     if (text.includes("pg_try_advisory_lock")) {
       this.held = true;
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [{ acquired: true, backend_pid: this.pid }],
-      };
+      });
+      return undefined;
     }
     if (text.includes("FROM pg_catalog.pg_locks")) {
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [{ backend_pid: this.pid, lock_held: this.held }],
-      };
+      });
+      return undefined;
     }
     if (text.includes("pg_advisory_unlock")) {
       const unlocked = this.held;
       this.held = false;
-      return {
+      callback(null, {
         command: "SELECT",
         rows: [{ backend_pid: this.pid, unlocked }],
-      };
+      });
+      return undefined;
     }
-    throw new Error(`unexpected guard query: ${text}`);
+    callback(new Error(`unexpected guard query: ${text}`));
+    return undefined;
   }
 
-  async release() {}
+  release() {
+    this.held = false;
+    return undefined;
+  }
 }
 
 class GuardPool {
@@ -660,9 +669,10 @@ class GuardPool {
     this.connectCalls = 0;
   }
 
-  async connect() {
+  connect(callback) {
     this.connectCalls += 1;
-    return new GuardClient(1000 + this.connectCalls);
+    callback(null, new GuardClient(1000 + this.connectCalls));
+    return undefined;
   }
 }
 

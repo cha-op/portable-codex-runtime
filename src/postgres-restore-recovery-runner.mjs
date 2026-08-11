@@ -5,6 +5,12 @@ import {
   consumePostgresRestoreActivationRecoveryBatchReceipt,
   isPostgresRestoreActivationRecoveryService,
 } from "./postgres-restore-activation-recovery-service.mjs";
+import {
+  PostgresRestoreLifecycleGuardError,
+  assertPostgresRestoreLifecycleLeaseHeld,
+  isPostgresRestoreLifecycleGuard,
+  isPostgresRestoreLifecycleLease,
+} from "./postgres-restore-lifecycle-guard.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -23,6 +29,7 @@ const jsonStringifyIntrinsic = JSON.stringify;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
 const objectCreate = Object.create;
+const objectDefineProperties = Object.defineProperties;
 const objectDefineProperty = Object.defineProperty;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
@@ -33,6 +40,7 @@ const objectPrototype = Object.prototype;
 const objectSetPrototypeOfIntrinsic = Object.setPrototypeOf;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
+const promiseResolveIntrinsic = Promise.resolve;
 const promiseSpeciesSymbol = Symbol.species;
 const promiseThenIntrinsic = Promise.prototype.then;
 const randomUUIDIntrinsic = randomUUID;
@@ -40,6 +48,22 @@ const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const TypeErrorConstructor = TypeError;
+const WeakSetConstructor = WeakSet;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+
+const recoveryRunnerBrands = new WeakSetConstructor();
+const recoveryRunnerErrorBrands = new WeakSetConstructor();
+const promiseSpeciesHolder = objectCreate(null);
+objectDefineProperty(promiseSpeciesHolder, promiseSpeciesSymbol, {
+  configurable: false,
+  enumerable: false,
+  value: PromiseConstructor,
+  writable: false,
+});
+objectFreeze(promiseSpeciesHolder);
+const lifecycleGuardErrorPrototype =
+  PostgresRestoreLifecycleGuardError.prototype;
 
 const hashProbe = createHashIntrinsic("sha256");
 const hashPrototype = objectGetPrototypeOf(hashProbe);
@@ -64,6 +88,7 @@ const UNSIGNED_DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 
 const OPTION_KEYS = objectFreeze([
   "cursorStore",
+  "lifecycleGuard",
   "limits",
   "recoveryScopeId",
   "recoveryService",
@@ -123,6 +148,8 @@ const ERROR_MESSAGES = objectFreeze({
     "PostgreSQL restore recovery runner options are invalid",
   invalid_postgres_restore_recovery_runner_request:
     "PostgreSQL restore recovery runner request is invalid",
+  postgres_restore_recovery_runner_busy:
+    "PostgreSQL restore recovery runner is already active",
   postgres_restore_recovery_runner_outcome_uncertain:
     "PostgreSQL restore recovery runner outcome is uncertain",
 });
@@ -355,6 +382,106 @@ function collaboratorMethod(value, name, code) {
   return descriptor.value;
 }
 
+function protectPromiseReaction(callback) {
+  if (typeof callback !== "function") return callback;
+  return (value) =>
+    protectPromise(callIntrinsic(callback, undefined, [value]));
+}
+
+function protectedPromiseThen(onFulfilled, onRejected) {
+  return protectPromise(
+    callIntrinsic(promiseThenIntrinsic, this, [
+      protectPromiseReaction(onFulfilled),
+      protectPromiseReaction(onRejected),
+    ]),
+  );
+}
+
+function protectedPromiseCatch(onRejected) {
+  return callIntrinsic(protectedPromiseThen, this, [
+    undefined,
+    onRejected,
+  ]);
+}
+
+function resolveProtectedPromise(value) {
+  return protectPromise(
+    callIntrinsic(promiseResolveIntrinsic, PromiseConstructor, [
+      protectPromise(value),
+    ]),
+  );
+}
+
+function protectedPromiseFinally(onFinally) {
+  if (typeof onFinally !== "function") {
+    return callIntrinsic(protectedPromiseThen, this, [
+      onFinally,
+      onFinally,
+    ]);
+  }
+  const runFinally = () =>
+    resolveProtectedPromise(callIntrinsic(onFinally, undefined, []));
+  return callIntrinsic(protectedPromiseThen, this, [
+    (value) =>
+      callIntrinsic(protectedPromiseThen, runFinally(), [
+        () => value,
+        undefined,
+      ]),
+    (reason) =>
+      callIntrinsic(protectedPromiseThen, runFinally(), [
+        () => {
+          throw reason;
+        },
+        undefined,
+      ]),
+  ]);
+}
+
+function protectPromise(value) {
+  if (!isPromiseValue(value)) return value;
+  const constructorDescriptor = objectGetOwnPropertyDescriptor(
+    value,
+    "constructor",
+  );
+  if (
+    constructorDescriptor !== undefined &&
+    objectHasOwn(constructorDescriptor, "value") &&
+    constructorDescriptor.value !== promiseSpeciesHolder &&
+    isSafePromiseSpeciesHolder(constructorDescriptor.value)
+  ) {
+    return protectPromise(
+      callIntrinsic(promiseThenIntrinsic, value, [undefined, undefined]),
+    );
+  }
+  objectDefineProperties(value, {
+    catch: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseCatch,
+      writable: false,
+    },
+    constructor: {
+      configurable: false,
+      enumerable: false,
+      value: promiseSpeciesHolder,
+      writable: false,
+    },
+    finally: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseFinally,
+      writable: false,
+    },
+    then: {
+      configurable: false,
+      enumerable: false,
+      value: protectedPromiseThen,
+      writable: false,
+    },
+  });
+  return value;
+}
+
 function isSafePromiseSpeciesHolder(value) {
   if (
     value === null ||
@@ -464,7 +591,7 @@ function hasUntrustedThenableShape(value) {
   return current !== null;
 }
 
-async function callCollaborator(method, receiver, input, code) {
+async function callCollaboratorInternal(method, receiver, input, code) {
   let value;
   try {
     value = callIntrinsic(method, receiver, [input]);
@@ -487,6 +614,67 @@ async function callCollaborator(method, receiver, input, code) {
     // escape as a caller/request classification.
     fail(code);
   }
+}
+
+function callCollaborator(...args) {
+  return protectPromise(callCollaboratorInternal(...args));
+}
+
+async function assertRecoveryLeaseHeldInternal(lifecycleLease, code) {
+  let pending;
+  try {
+    pending = callIntrinsic(
+      assertPostgresRestoreLifecycleLeaseHeld,
+      undefined,
+      [lifecycleLease, "recovery"],
+    );
+    if (isGeneratorObjectValue(pending)) fail(code);
+    if (isPromiseValue(pending)) {
+      pending = normalizeSafeNativePromise(pending);
+      ensure(pending !== null, code);
+      pending = await pending;
+    } else {
+      ensure(!hasUntrustedThenableShape(pending), code);
+    }
+    ensure(
+      !isGeneratorObjectValue(pending) &&
+        !hasUntrustedThenableShape(pending),
+      code,
+    );
+  } catch {
+    fail(code);
+  }
+}
+
+function assertRecoveryLeaseHeld(...args) {
+  return protectPromise(assertRecoveryLeaseHeldInternal(...args));
+}
+
+function isLifecycleGuardBusyError(value) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    isProxyValue(value) ||
+    !objectIsFrozen(value)
+  ) {
+    return false;
+  }
+  let prototype;
+  let descriptor;
+  try {
+    prototype = objectGetPrototypeOf(value);
+    descriptor = objectGetOwnPropertyDescriptor(value, "code");
+  } catch {
+    return false;
+  }
+  return (
+    prototype === lifecycleGuardErrorPrototype &&
+    descriptor?.configurable === false &&
+    descriptor.enumerable === true &&
+    objectHasOwn(descriptor, "value") &&
+    descriptor.value === "postgres_restore_lifecycle_guard_busy" &&
+    descriptor.writable === false
+  );
 }
 
 function normalizeCursor(value, recoveryScopeId, lane, code) {
@@ -757,6 +945,25 @@ function emptyResult(recoveryScopeId) {
   });
 }
 
+/**
+ * Reports whether `value` is an exact runner instance minted by this module.
+ * The probe reads no properties from `value`, including when it is a revoked
+ * Proxy.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isPostgresRestoreRecoveryRunner(value) {
+  if (
+    arguments.length !== 1 ||
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return false;
+  }
+  return callIntrinsic(weakSetHasIntrinsic, recoveryRunnerBrands, [value]);
+}
+
 export class PostgresRestoreRecoveryRunnerError extends ErrorConstructor {
   constructor(code) {
     if (typeof code !== "string" || !objectHasOwn(ERROR_MESSAGES, code)) {
@@ -779,6 +986,7 @@ export class PostgresRestoreRecoveryRunnerError extends ErrorConstructor {
       enumerable: false,
       value: `PostgresRestoreRecoveryRunnerError: ${message}`,
     });
+    callIntrinsic(weakSetAddIntrinsic, recoveryRunnerErrorBrands, [this]);
     objectFreeze(this);
   }
 }
@@ -793,9 +1001,18 @@ export function createPostgresRestoreRecoveryRunner(...args) {
   );
   const limits = normalizeLimits(options.limits, optionCode);
   const cursorStore = options.cursorStore;
+  const lifecycleGuard = options.lifecycleGuard;
   const recoveryService = options.recoveryService;
   ensure(
-    isPostgresRestoreActivationRecoveryService(recoveryService),
+    isPostgresRestoreActivationRecoveryService(recoveryService) &&
+      callIntrinsic(isPostgresRestoreLifecycleGuard, undefined, [
+        lifecycleGuard,
+      ]),
+    optionCode,
+  );
+  const runRecovery = collaboratorMethod(
+    lifecycleGuard,
+    "runRecovery",
     optionCode,
   );
   const readLane = collaboratorMethod(cursorStore, "readLane", optionCode);
@@ -818,10 +1035,189 @@ export function createPostgresRestoreRecoveryRunner(...args) {
   const frozenRecoveryMethods = exactFrozenRecord(recoveryMethods);
 
   const requestCode = "invalid_postgres_restore_recovery_runner_request";
+  const busyCode = "postgres_restore_recovery_runner_busy";
   const outcomeCode = "postgres_restore_recovery_runner_outcome_uncertain";
   let inFlight = false;
 
-  const runOnce = async function runOnce(...runArgs) {
+  async function executeRecoveryInternal(lifecycleLease, signal) {
+    ensure(
+      callIntrinsic(isPostgresRestoreLifecycleLease, undefined, [
+        lifecycleLease,
+        "recovery",
+      ]),
+      outcomeCode,
+    );
+    const laneReceipts = objectCreate(null);
+    for (let index = 0; index < RESULT_LANE_KEYS.length; index += 1) {
+      laneReceipts[RESULT_LANE_KEYS[index]] = null;
+    }
+    let status = "limit-reached";
+    for (let index = 0; index < LANE_ORDER.length; index += 1) {
+      const laneSpecification = LANE_ORDER[index];
+      const field = laneSpecification[0];
+      const lane = laneSpecification[1];
+      if (signalIsAborted(signal, outcomeCode)) {
+        status = "aborted";
+        break;
+      }
+
+      await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
+      const rawCursor = await callCollaborator(
+        readLane,
+        cursorStore,
+        exactFrozenRecord({ recoveryScopeId, lane }),
+        outcomeCode,
+      );
+      await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
+      const cursorBefore = normalizeCursor(
+        rawCursor,
+        recoveryScopeId,
+        lane,
+        outcomeCode,
+      );
+
+      await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
+      const rawBatch = await callCollaborator(
+        frozenRecoveryMethods[field],
+        recoveryService,
+        exactFrozenRecord({
+          afterSessionId: cursorBefore.afterSessionId,
+          lifecycleLease,
+          limit: limits[field],
+          signal,
+        }),
+        outcomeCode,
+      );
+      await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
+      ensure(
+        consumePostgresRestoreActivationRecoveryBatchReceipt(
+          recoveryService,
+          field,
+          cursorBefore.afterSessionId,
+          limits[field],
+          lifecycleLease,
+          rawBatch,
+        ),
+        outcomeCode,
+      );
+      const batch = normalizeBatch(
+        rawBatch,
+        cursorBefore,
+        field,
+        limits[field],
+        outcomeCode,
+      );
+      if (
+        batch.status === "aborted" &&
+        batch.nextAfterSessionId === cursorBefore.afterSessionId
+      ) {
+        laneReceipts[field] = exactFrozenRecord({
+          cursorBefore,
+          batch,
+          transitionId: null,
+          requestSha256: null,
+          advance: null,
+        });
+        status = "aborted";
+        break;
+      }
+
+      const requestSha256 = canonicalRequestSha256({
+        batch,
+        cursor: cursorBefore,
+        lane,
+        limit: limits[field],
+        recoveryScopeId,
+      });
+      let transitionId;
+      try {
+        transitionId = canonicalOpaqueId(
+          callIntrinsic(randomUUIDIntrinsic, undefined, []),
+          outcomeCode,
+        );
+        ensure(regexpTest(UUID_PATTERN, transitionId), outcomeCode);
+      } catch (error) {
+        if (
+          error !== null &&
+          (typeof error === "object" || typeof error === "function") &&
+          callIntrinsic(weakSetHasIntrinsic, recoveryRunnerErrorBrands, [
+            error,
+          ])
+        ) {
+          throw error;
+        }
+        fail(outcomeCode);
+      }
+
+      await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
+      const rawAdvance = await callCollaborator(
+        advanceLane,
+        cursorStore,
+        exactFrozenRecord({
+          recoveryScopeId,
+          lane,
+          transitionId,
+          expectedRevision: cursorBefore.revision,
+          expectedCycle: cursorBefore.cycle,
+          expectedAfterSessionId: cursorBefore.afterSessionId,
+          nextAfterSessionId: batch.nextAfterSessionId,
+          requestSha256,
+        }),
+        outcomeCode,
+      );
+      await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
+      const advance = normalizeAdvance(
+        rawAdvance,
+        {
+          batch,
+          cursorBefore,
+          lane,
+          recoveryScopeId,
+          requestSha256,
+          transitionId,
+        },
+        outcomeCode,
+      );
+      laneReceipts[field] = exactFrozenRecord({
+        cursorBefore,
+        batch,
+        transitionId,
+        requestSha256,
+        advance,
+      });
+      if (batch.status === "aborted") {
+        status = "aborted";
+        break;
+      }
+    }
+
+    if (status !== "aborted") {
+      let allComplete = true;
+      for (let index = 0; index < RESULT_LANE_KEYS.length; index += 1) {
+        const receipt = laneReceipts[RESULT_LANE_KEYS[index]];
+        if (receipt === null || receipt.batch.status !== "sweep-complete") {
+          allComplete = false;
+          break;
+        }
+      }
+      status = allComplete ? "sweep-complete" : "limit-reached";
+    }
+
+    return exactFrozenRecord({
+      recoveryScopeId,
+      generation: laneReceipts.generation,
+      activation: laneReceipts.activation,
+      launchAttempt: laneReceipts.launchAttempt,
+      currentLaunch: laneReceipts.currentLaunch,
+      status,
+    });
+  }
+
+  function executeRecovery(...recoveryArgs) {
+    return protectPromise(executeRecoveryInternal(...recoveryArgs));
+  }
+
+  async function runOnceInternal(runArgs) {
     ensure(runArgs.length === 1, requestCode);
     const request = exactDataObject(
       runArgs[0],
@@ -829,163 +1225,91 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       requestCode,
     );
     signalIsAborted(request.signal, requestCode);
-    ensure(!inFlight, outcomeCode);
+    ensure(!inFlight, busyCode);
     inFlight = true;
     try {
       if (signalIsAborted(request.signal, requestCode)) {
         return emptyResult(recoveryScopeId);
       }
-      const laneReceipts = objectCreate(null);
-      for (let index = 0; index < RESULT_LANE_KEYS.length; index += 1) {
-        laneReceipts[RESULT_LANE_KEYS[index]] = null;
-      }
-      let status = "limit-reached";
-      for (let index = 0; index < LANE_ORDER.length; index += 1) {
-        const laneSpecification = LANE_ORDER[index];
-        const field = laneSpecification[0];
-        const lane = laneSpecification[1];
-        if (signalIsAborted(request.signal, requestCode)) {
-          status = "aborted";
-          break;
-        }
-
-        const rawCursor = await callCollaborator(
-          readLane,
-          cursorStore,
-          exactFrozenRecord({ recoveryScopeId, lane }),
-          outcomeCode,
-        );
-        const cursorBefore = normalizeCursor(
-          rawCursor,
-          recoveryScopeId,
-          lane,
-          outcomeCode,
-        );
-        const rawBatch = await callCollaborator(
-          frozenRecoveryMethods[field],
-          recoveryService,
-          exactFrozenRecord({
-            afterSessionId: cursorBefore.afterSessionId,
-            limit: limits[field],
-            signal: request.signal,
-          }),
-          outcomeCode,
-        );
-        ensure(
-          consumePostgresRestoreActivationRecoveryBatchReceipt(
-            recoveryService,
-            field,
-            cursorBefore.afterSessionId,
-            limits[field],
-            rawBatch,
-          ),
-          outcomeCode,
-        );
-        const batch = normalizeBatch(
-          rawBatch,
-          cursorBefore,
-          field,
-          limits[field],
-          outcomeCode,
-        );
-        if (
-          batch.status === "aborted" &&
-          batch.nextAfterSessionId === cursorBefore.afterSessionId
-        ) {
-          laneReceipts[field] = exactFrozenRecord({
-            cursorBefore,
-            batch,
-            transitionId: null,
-            requestSha256: null,
-            advance: null,
-          });
-          status = "aborted";
-          break;
-        }
-
-        const requestSha256 = canonicalRequestSha256({
-          batch,
-          cursor: cursorBefore,
-          lane,
-          limit: limits[field],
-          recoveryScopeId,
-        });
-        let transitionId;
+      let callbackCompleted = false;
+      let callbackFailed = false;
+      let callbackError;
+      let callbackResult;
+      const recoveryCallback = async function recoveryCallback(
+        lifecycleLease,
+        complete,
+      ) {
         try {
-          transitionId = canonicalOpaqueId(
-            callIntrinsic(randomUUIDIntrinsic, undefined, []),
-            outcomeCode,
+          callbackResult = await executeRecovery(
+            lifecycleLease,
+            request.signal,
           );
-          ensure(regexpTest(UUID_PATTERN, transitionId), outcomeCode);
+          const completion = callIntrinsic(complete, undefined, [
+            callbackResult,
+          ]);
+          callbackCompleted = true;
+          return completion;
         } catch (error) {
-          if (error instanceof PostgresRestoreRecoveryRunnerError) throw error;
-          fail(outcomeCode);
-        }
-        const rawAdvance = await callCollaborator(
-          advanceLane,
-          cursorStore,
-          exactFrozenRecord({
-            recoveryScopeId,
-            lane,
-            transitionId,
-            expectedRevision: cursorBefore.revision,
-            expectedCycle: cursorBefore.cycle,
-            expectedAfterSessionId: cursorBefore.afterSessionId,
-            nextAfterSessionId: batch.nextAfterSessionId,
-            requestSha256,
-          }),
-          outcomeCode,
-        );
-        const advance = normalizeAdvance(
-          rawAdvance,
-          {
-            batch,
-            cursorBefore,
-            lane,
-            recoveryScopeId,
-            requestSha256,
-            transitionId,
-          },
-          outcomeCode,
-        );
-        laneReceipts[field] = exactFrozenRecord({
-          cursorBefore,
-          batch,
-          transitionId,
-          requestSha256,
-          advance,
-        });
-        if (batch.status === "aborted") {
-          status = "aborted";
-          break;
-        }
-      }
-
-      if (status !== "aborted") {
-        let allComplete = true;
-        for (let index = 0; index < RESULT_LANE_KEYS.length; index += 1) {
-          const receipt = laneReceipts[RESULT_LANE_KEYS[index]];
-          if (receipt === null || receipt.batch.status !== "sweep-complete") {
-            allComplete = false;
-            break;
+          callbackFailed = true;
+          callbackCompleted = true;
+          if (
+            error !== null &&
+            (typeof error === "object" || typeof error === "function") &&
+            callIntrinsic(weakSetHasIntrinsic, recoveryRunnerErrorBrands, [
+              error,
+            ])
+          ) {
+            callbackError = error;
+          } else {
+            callbackError = new PostgresRestoreRecoveryRunnerError(
+              outcomeCode,
+            );
           }
+          throw callbackError;
         }
-        status = allComplete ? "sweep-complete" : "limit-reached";
-      }
+      };
+      objectFreeze(recoveryCallback);
 
-      return exactFrozenRecord({
-        recoveryScopeId,
-        generation: laneReceipts.generation,
-        activation: laneReceipts.activation,
-        launchAttempt: laneReceipts.launchAttempt,
-        currentLaunch: laneReceipts.currentLaunch,
-        status,
-      });
+      let result;
+      try {
+        result = callIntrinsic(runRecovery, lifecycleGuard, [
+          recoveryCallback,
+        ]);
+        if (isGeneratorObjectValue(result)) fail(outcomeCode);
+        if (isPromiseValue(result)) {
+          result = normalizeSafeNativePromise(result);
+          ensure(result !== null, outcomeCode);
+          result = await result;
+        } else {
+          ensure(!hasUntrustedThenableShape(result), outcomeCode);
+        }
+        ensure(
+          callbackCompleted &&
+            !callbackFailed &&
+            result === callbackResult &&
+            !isGeneratorObjectValue(result) &&
+            !hasUntrustedThenableShape(result),
+          outcomeCode,
+        );
+      } catch (error) {
+        if (callbackFailed && error === callbackError) throw callbackError;
+        if (isLifecycleGuardBusyError(error)) fail(busyCode);
+        fail(outcomeCode);
+      }
+      return result;
     } finally {
       inFlight = false;
     }
+  }
+
+  const runOnce = function runOnce(...runArgs) {
+    return protectPromise(runOnceInternal(runArgs));
   };
 
   objectFreeze(runOnce);
-  return exactFrozenRecord({ runOnce });
+  const runner = exactFrozenRecord({ runOnce });
+  callIntrinsic(weakSetAddIntrinsic, recoveryRunnerBrands, [runner]);
+  return runner;
 }
+
+objectFreeze(PostgresRestoreRecoveryRunnerError.prototype);

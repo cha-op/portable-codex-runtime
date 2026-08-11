@@ -22,6 +22,19 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
+  createPostgresRestoreActivationRecoveryService,
+} from "../src/postgres-restore-activation-recovery-service.mjs";
+import {
+  POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
+  createPostgresRestoreLifecycleGuard,
+} from "../src/postgres-restore-lifecycle-guard.mjs";
+import {
+  createPostgresRestoreRecoveryRunner,
+} from "../src/postgres-restore-recovery-runner.mjs";
+import {
+  createPostgresRestoreRecoveryScheduler,
+} from "../src/postgres-restore-recovery-scheduler.mjs";
+import {
   PostgresWriterDetachCompositionError,
   createPostgresWriterDetachComposition,
 } from "../src/postgres-writer-detach-composition.mjs";
@@ -6485,10 +6498,11 @@ test(
         const releaseGuard = deferred();
         const heldGuard = operationGuard.runExclusive(
           startingAdmission.request.operationId,
-          async (probe) => {
+          async (probe, complete) => {
             await probe.assertHeld();
             guardEntered.resolve();
             await releaseGuard.promise;
+            return complete(undefined);
           },
         );
         await guardEntered.promise;
@@ -8897,9 +8911,9 @@ test(
 
         const guardResult = await operationGuard.runExclusive(
           launchAttemptId,
-          async (probe) => {
+          async (probe, complete) => {
             await probe.assertHeld();
-            return "guard-reacquired";
+            return complete("guard-reacquired");
           },
         );
         assert.equal(guardResult, "guard-reacquired");
@@ -10580,5 +10594,232 @@ test(
         );
       },
     );
+  },
+);
+
+test(
+  "restore lifecycle guard schedules one exclusive database-global recovery pass",
+  { timeout: 30_000 },
+  async (t) => {
+    const pool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-scheduler-integration-test",
+      connectionString: databaseUrl,
+      max: 2,
+    });
+    const foregroundLifecyclePool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-lifecycle-foreground-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
+    });
+    const recoveryLifecyclePool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-lifecycle-recovery-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
+    });
+    const collisionPool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-lifecycle-collision-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
+    });
+    const recoveryScopeId = `integration-restore-${randomUUID()}`;
+    t.after(async () => {
+      try {
+        await pool.query(
+          [
+            "DELETE FROM session_authority.restore_recovery_cursors",
+            "WHERE recovery_scope_id = $1",
+          ].join(" "),
+          [recoveryScopeId],
+        );
+      } finally {
+        try {
+          await collisionPool.end();
+        } finally {
+          try {
+            await recoveryLifecyclePool.end();
+          } finally {
+            try {
+              await foregroundLifecyclePool.end();
+            } finally {
+              await pool.end();
+            }
+          }
+        }
+      }
+    });
+
+    const store = new PostgresSerializableStore({ dedicatedPool: pool });
+    await store.migrate();
+    const authority = new PostgresSessionAuthority({
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
+        true,
+      restoreGenerationV2FleetCompatible: true,
+      store,
+      writerLaunchStopV3FleetCompatible: true,
+    });
+    const lifecycleGuard = createPostgresRestoreLifecycleGuard({
+      foregroundOperationGuard: new PostgresOperationGuard({
+        dedicatedPool: foregroundLifecyclePool,
+      }),
+      recoveryOperationGuard: new PostgresOperationGuard({
+        dedicatedPool: recoveryLifecyclePool,
+      }),
+    });
+    const collidingOperationGuard = new PostgresOperationGuard({
+      dedicatedPool: collisionPool,
+    });
+    const collisionResult = await lifecycleGuard.runRecovery(
+      async (_lease, lifecycleComplete) => {
+        const operationResult = await collidingOperationGuard.runExclusive(
+          POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
+          async (probe, operationComplete) => {
+            await probe.assertHeld();
+            return operationComplete("operation-lock-acquired");
+          },
+        );
+        return lifecycleComplete(operationResult);
+      },
+    );
+    assert.equal(collisionResult, "operation-lock-acquired");
+    let unexpectedReconciliations = 0;
+    const recoveryService =
+      createPostgresRestoreActivationRecoveryService({
+        listCurrentWriterLaunchCandidates: (input) =>
+          authority.listCurrentWriterLaunchRecoveryCandidates(input),
+        listRestoreAttachmentActivationCandidates: (input) =>
+          authority.listRestoreAttachmentActivationRecoveryCandidates(input),
+        listRestoreGenerationCandidates: (input) =>
+          authority.listRestoreDestinationGenerationRecoveryCandidates(input),
+        listWriterLaunchAttemptCandidates: (input) =>
+          authority.listWriterLaunchAttemptRecoveryCandidates(input),
+        reconcileRestoreAttachmentActivation() {
+          unexpectedReconciliations += 1;
+        },
+        reconcileRestoreGeneration() {
+          unexpectedReconciliations += 1;
+        },
+        reconcileWriterLaunchAttempt() {
+          unexpectedReconciliations += 1;
+        },
+      });
+    const runner = createPostgresRestoreRecoveryRunner({
+      cursorStore: createPostgresRestoreRecoveryCursorStore({ store }),
+      lifecycleGuard,
+      limits: {
+        activation: 10,
+        currentLaunch: 10,
+        generation: 10,
+        launchAttempt: 10,
+      },
+      recoveryScopeId,
+      recoveryService,
+    });
+
+    const firstStep = deferred();
+    const steps = [];
+    const scheduler = createPostgresRestoreRecoveryScheduler({
+      intervalMilliseconds: 60_000,
+      onStep(receipt) {
+        steps.push(receipt);
+        if (steps.length === 1) firstStep.resolve(receipt);
+      },
+      runner,
+    });
+    const completion = scheduler.start();
+    const first = await firstStep.promise;
+    assert.equal(first.status, "completed");
+    assert.equal(first.recovery.status, "sweep-complete");
+    assert.equal(unexpectedReconciliations, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const releaseForeground = deferred();
+    const firstForegroundEntered = deferred();
+    const firstForeground = lifecycleGuard.runForeground(
+      async (_lease, complete) => {
+        firstForegroundEntered.resolve();
+        await releaseForeground.promise;
+        return complete(undefined);
+      },
+    );
+    let busyStep = null;
+    let busyTimeout = null;
+    let stoppedCompletion;
+    let stoppedResult;
+    try {
+      await firstForegroundEntered.promise;
+      busyStep = scheduler.runStep({ signal: null });
+      const boundedBusy = new Promise((resolve, reject) => {
+        busyTimeout = setTimeout(
+          () => reject(new Error("recovery busy step did not settle")),
+          5_000,
+        );
+        busyStep.then(resolve, reject);
+      });
+      const busy = await boundedBusy;
+      assert.deepEqual(structuredClone(busy), {
+        errorCode: null,
+        recovery: null,
+        status: "busy",
+      });
+    } finally {
+      clearTimeout(busyTimeout);
+      releaseForeground.resolve();
+      try {
+        await firstForeground;
+      } finally {
+        try {
+          if (busyStep !== null) await busyStep;
+        } finally {
+          stoppedCompletion = scheduler.stop();
+          stoppedResult = await completion;
+        }
+      }
+    }
+
+    assert.strictEqual(stoppedCompletion, completion);
+    assert.deepEqual(structuredClone(stoppedResult), { status: "stopped" });
+    assert.equal(steps.length, 2);
+    assert.equal(steps[1].status, "busy");
+
+    const stored = await pool.query(
+      [
+        "SELECT lane, cycle::text, revision::text, after_session_id",
+        "FROM session_authority.restore_recovery_cursors",
+        "WHERE recovery_scope_id = $1",
+        "ORDER BY lane",
+      ].join(" "),
+      [recoveryScopeId],
+    );
+    assert.deepEqual(stored.rows, [
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "activation",
+        revision: "1",
+      },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "current-launch",
+        revision: "1",
+      },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "generation",
+        revision: "1",
+      },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "launch-attempt",
+        revision: "1",
+      },
+    ]);
   },
 );

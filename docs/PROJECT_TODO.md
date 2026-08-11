@@ -101,7 +101,7 @@
   only after one definite cold dispatch grant, and keep starting or uncertain
   recovery committed-only. Preserve the legacy same-process capability path
   and keep fresh V3 reservation default-denied by its own fleet decision.
-- [pending] Add a cross-process shared/exclusive restore lifecycle guard and a
+- [done] Add a cross-process shared/exclusive restore lifecycle guard and a
   bounded production recovery scheduler so foreground prepared launch cannot
   race recovery cancellation.
 - [pending] Behind a separate detached-production fleet capability, wire

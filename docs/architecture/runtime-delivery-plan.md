@@ -306,10 +306,13 @@ Restore and launcher authority are now split into eight serial pull requests:
      candidate is source-free and committed-only, and ambiguity after a grant
      never permits a second publication. The V3 local writer exclusion is
      retired only after the exact predetermined committed result returns.
-   - Add the cross-process shared/exclusive lifecycle guard so foreground
-     prepared dispatch cannot race recovery.
-   - Start and schedule the durable recovery runner with fixed scope and
-     limits.
+   - The cross-process restore lifecycle guard and recovery scheduler are
+     complete. One database-global versioned advisory-lock identity gives
+     foreground work a shared lease and each bounded four-lane pass an
+     exclusive lease. The runner and service revalidate that lease at their
+     lane, candidate, and cursor boundaries. Startup runs one immediate pass;
+     later fixed-delay ticks do not overlap, and shutdown drains admitted
+     work before releasing the lease.
    - Enforce the detached-production compatibility decision at invocation
      time, not only while constructing startup collaborators.
    - Wire publication, durable stop and prepared clean capture, canonical
