@@ -8,6 +8,7 @@ import {
   POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
   PostgresOperationGuard,
   PostgresOperationGuardError,
+  haveDistinctPostgresOperationGuardPools,
 } from "../src/postgres-operation-guard.mjs";
 
 const setSizeGetter = Object.getOwnPropertyDescriptor(
@@ -520,6 +521,43 @@ test("validates exact options and requests before acquiring a client", async () 
     "invalid_postgres_operation_guard_request",
   );
   assert.equal(pool.connectCalls, 0);
+});
+
+test("compares authentic operation guard pool identities without property access", () => {
+  const manager = new AdvisoryLockManager();
+  const sharedPool = new FakePool(
+    new FakeClient(clientOptions(manager, 154)),
+  );
+  const distinctPool = new FakePool(
+    new FakeClient(clientOptions(manager, 155)),
+  );
+  const first = new PostgresOperationGuard({ dedicatedPool: sharedPool });
+  const second = new PostgresOperationGuard({ dedicatedPool: sharedPool });
+  const distinct = new PostgresOperationGuard({
+    dedicatedPool: distinctPool,
+  });
+  let trapCalls = 0;
+  const proxy = new Proxy(
+    {},
+    {
+      get() {
+        trapCalls += 1;
+        throw new Error("pool identity predicate must not read properties");
+      },
+    },
+  );
+
+  assert.equal(Object.isFrozen(haveDistinctPostgresOperationGuardPools), true);
+  assert.equal(haveDistinctPostgresOperationGuardPools(first, first), false);
+  assert.equal(haveDistinctPostgresOperationGuardPools(first, second), false);
+  assert.equal(
+    haveDistinctPostgresOperationGuardPools(first, distinct),
+    true,
+  );
+  assert.equal(haveDistinctPostgresOperationGuardPools(first, proxy), false);
+  assert.equal(trapCalls, 0);
+  assert.equal(sharedPool.connectCalls, 0);
+  assert.equal(distinctPool.connectCalls, 0);
 });
 
 test("destroys a malformed acquired client and fails closed", async () => {

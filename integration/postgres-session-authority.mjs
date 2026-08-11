@@ -10607,11 +10607,17 @@ test(
       connectionString: databaseUrl,
       max: 2,
     });
-    const lifecyclePool = new Pool({
+    const foregroundLifecyclePool = new Pool({
       application_name:
-        "portable-codex-runtime-restore-lifecycle-guard-integration-test",
+        "portable-codex-runtime-restore-lifecycle-foreground-integration-test",
       connectionString: databaseUrl,
-      max: 4,
+      max: 1,
+    });
+    const recoveryLifecyclePool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-lifecycle-recovery-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
     });
     const collisionPool = new Pool({
       application_name:
@@ -10634,9 +10640,13 @@ test(
           await collisionPool.end();
         } finally {
           try {
-            await lifecyclePool.end();
+            await recoveryLifecyclePool.end();
           } finally {
-            await pool.end();
+            try {
+              await foregroundLifecyclePool.end();
+            } finally {
+              await pool.end();
+            }
           }
         }
       }
@@ -10653,8 +10663,11 @@ test(
       writerLaunchStopV3FleetCompatible: true,
     });
     const lifecycleGuard = createPostgresRestoreLifecycleGuard({
-      operationGuard: new PostgresOperationGuard({
-        dedicatedPool: lifecyclePool,
+      foregroundOperationGuard: new PostgresOperationGuard({
+        dedicatedPool: foregroundLifecyclePool,
+      }),
+      recoveryOperationGuard: new PostgresOperationGuard({
+        dedicatedPool: recoveryLifecyclePool,
       }),
     });
     const collidingOperationGuard = new PostgresOperationGuard({
@@ -10726,7 +10739,6 @@ test(
 
     const releaseForeground = deferred();
     const firstForegroundEntered = deferred();
-    const secondForegroundEntered = deferred();
     const firstForeground = lifecycleGuard.runForeground(
       async (_lease, complete) => {
         firstForegroundEntered.resolve();
@@ -10734,27 +10746,43 @@ test(
         return complete(undefined);
       },
     );
-    await firstForegroundEntered.promise;
-    const secondForeground = lifecycleGuard.runForeground(
-      async (_lease, complete) => {
-        secondForegroundEntered.resolve();
-        await releaseForeground.promise;
-        return complete(undefined);
-      },
-    );
-    await secondForegroundEntered.promise;
+    let busyStep = null;
+    let busyTimeout = null;
+    let stoppedCompletion;
+    let stoppedResult;
+    try {
+      await firstForegroundEntered.promise;
+      busyStep = scheduler.runStep({ signal: null });
+      const boundedBusy = new Promise((resolve, reject) => {
+        busyTimeout = setTimeout(
+          () => reject(new Error("recovery busy step did not settle")),
+          5_000,
+        );
+        busyStep.then(resolve, reject);
+      });
+      const busy = await boundedBusy;
+      assert.deepEqual(structuredClone(busy), {
+        errorCode: null,
+        recovery: null,
+        status: "busy",
+      });
+    } finally {
+      clearTimeout(busyTimeout);
+      releaseForeground.resolve();
+      try {
+        await firstForeground;
+      } finally {
+        try {
+          if (busyStep !== null) await busyStep;
+        } finally {
+          stoppedCompletion = scheduler.stop();
+          stoppedResult = await completion;
+        }
+      }
+    }
 
-    const busy = await scheduler.runStep({ signal: null });
-    assert.deepEqual(structuredClone(busy), {
-      errorCode: null,
-      recovery: null,
-      status: "busy",
-    });
-    releaseForeground.resolve();
-    await Promise.all([firstForeground, secondForeground]);
-
-    assert.strictEqual(scheduler.stop(), completion);
-    assert.deepEqual(structuredClone(await completion), { status: "stopped" });
+    assert.strictEqual(stoppedCompletion, completion);
+    assert.deepEqual(structuredClone(stoppedResult), { status: "stopped" });
     assert.equal(steps.length, 2);
     assert.equal(steps[1].status, "busy");
 

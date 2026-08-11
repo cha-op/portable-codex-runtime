@@ -198,24 +198,57 @@ class FakePool {
     this.connectCalls += 1;
     assert.notEqual(this.clients.length, 0, "unexpected pool.connect()");
     const client = this.clients.shift();
-    const release = (...args) => client.release(...args);
+    let released = false;
+    const release = (...args) => {
+      const result = client.release(...args);
+      if (!released && args.length === 0) {
+        released = true;
+        this.clients.push(client);
+      }
+      return result;
+    };
     callback(null, client, release);
     return undefined;
   }
 }
 
 function createFixture(manager, pid, overrides = {}) {
-  const client = new FakeClient({ manager, pid, ...overrides });
-  const pool = new FakePool(client);
-  const operationGuard = new PostgresOperationGuard({
-    dedicatedPool: pool,
+  const foregroundClient = new FakeClient({
+    manager,
+    pid,
+    ...overrides,
+  });
+  const recoveryClient = new FakeClient({
+    manager,
+    pid: pid + 10_000,
+    ...overrides,
+  });
+  const foregroundPool = new FakePool(foregroundClient);
+  const recoveryPool = new FakePool(recoveryClient);
+  const foregroundOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: foregroundPool,
+  });
+  const recoveryOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: recoveryPool,
   });
   return {
-    client,
-    lifecycle: createPostgresRestoreLifecycleGuard({ operationGuard }),
-    operationGuard,
-    pool,
+    foregroundClient,
+    foregroundOperationGuard,
+    foregroundPool,
+    lifecycle: createPostgresRestoreLifecycleGuard({
+      foregroundOperationGuard,
+      recoveryOperationGuard,
+    }),
+    recoveryClient,
+    recoveryOperationGuard,
+    recoveryPool,
   };
+}
+
+function clientForMode(fixture, mode) {
+  return mode === "foreground"
+    ? fixture.foregroundClient
+    : fixture.recoveryClient;
 }
 
 function deferred() {
@@ -260,13 +293,15 @@ async function assertLifecycleError(promise, code) {
     assert.equal(error.retryable, false);
     assert.equal(Object.isFrozen(error), true);
     assert.equal("operationGuard" in error, false);
+    assert.equal("foregroundOperationGuard" in error, false);
+    assert.equal("recoveryOperationGuard" in error, false);
     assert.equal("probe" in error, false);
     assert.equal("lease" in error, false);
     return true;
   });
 }
 
-test("creates an exact branded facade only from a real operation guard", () => {
+test("creates an exact branded facade only from distinct real operation guard pools", () => {
   const manager = new AdvisoryLockManager();
   const fixture = createFixture(manager, 201);
   assert.equal(isPostgresRestoreLifecycleGuard(fixture.lifecycle), true);
@@ -279,13 +314,15 @@ test("creates an exact branded facade only from a real operation guard", () => {
   assert.equal(Object.isFrozen(fixture.lifecycle.runForeground), true);
   assert.equal(Object.isFrozen(fixture.lifecycle.runRecovery), true);
 
+  const structuralGuard = Object.freeze({
+    runRestoreLifecycleExclusive() {},
+    runRestoreLifecycleShared() {},
+  });
   assert.throws(
     () =>
       createPostgresRestoreLifecycleGuard({
-        operationGuard: Object.freeze({
-          runExclusive() {},
-          runShared() {},
-        }),
+        foregroundOperationGuard: structuralGuard,
+        recoveryOperationGuard: structuralGuard,
       }),
     (error) =>
       error instanceof PostgresRestoreLifecycleGuardError &&
@@ -294,13 +331,41 @@ test("creates an exact branded facade only from a real operation guard", () => {
   assert.throws(
     () =>
       createPostgresRestoreLifecycleGuard({
-        operationGuard: fixture.operationGuard,
+        foregroundOperationGuard: fixture.foregroundOperationGuard,
+        recoveryOperationGuard: fixture.recoveryOperationGuard,
         recoveryScopeId: "must-not-be-accepted",
       }),
     (error) =>
       error instanceof PostgresRestoreLifecycleGuardError &&
       error.code === "invalid_postgres_restore_lifecycle_guard_options",
   );
+
+  assert.throws(
+    () =>
+      createPostgresRestoreLifecycleGuard({
+        foregroundOperationGuard: fixture.foregroundOperationGuard,
+        recoveryOperationGuard: fixture.foregroundOperationGuard,
+      }),
+    (error) =>
+      error instanceof PostgresRestoreLifecycleGuardError &&
+      error.code === "invalid_postgres_restore_lifecycle_guard_options",
+  );
+  assert.equal(fixture.foregroundPool.connectCalls, 0);
+
+  const samePoolRecoveryGuard = new PostgresOperationGuard({
+    dedicatedPool: fixture.foregroundPool,
+  });
+  assert.throws(
+    () =>
+      createPostgresRestoreLifecycleGuard({
+        foregroundOperationGuard: fixture.foregroundOperationGuard,
+        recoveryOperationGuard: samePoolRecoveryGuard,
+      }),
+    (error) =>
+      error instanceof PostgresRestoreLifecycleGuardError &&
+      error.code === "invalid_postgres_restore_lifecycle_guard_options",
+  );
+  assert.equal(fixture.foregroundPool.connectCalls, 0);
 });
 
 test("foreground callbacks overlap under shared locks", async () => {
@@ -365,12 +430,87 @@ for (const scenario of [
       "postgres_restore_lifecycle_guard_busy",
     );
     assert.equal(secondCallbackCalls, 0);
-    assert.deepEqual(secondFixture.client.releaseCalls, [[]]);
+    assert.deepEqual(
+      clientForMode(secondFixture, secondMode).releaseCalls,
+      [[]],
+    );
     finish.resolve();
     await firstRun;
     assert.equal(manager.holders.size, 0);
   });
 }
+
+test(
+  "same facade recovery reaches its pool and reports busy while foreground remains held",
+  { timeout: 2_000 },
+  async () => {
+    const manager = new AdvisoryLockManager();
+    const fixture = createFixture(manager, 229);
+    const foregroundEntered = deferred();
+    const finishForeground = deferred();
+    let foregroundCompleted = false;
+    let recoveryCallbackCalls = 0;
+    let timeout;
+
+    const foregroundRun = fixture.lifecycle.runForeground(
+      async (_lease, complete) => {
+        foregroundEntered.resolve();
+        await finishForeground.promise;
+        foregroundCompleted = true;
+        return complete(undefined);
+      },
+    );
+    await foregroundEntered.promise;
+    assert.equal(fixture.foregroundPool.clients.length, 0);
+    assert.equal(fixture.recoveryPool.clients.length, 1);
+
+    try {
+      const recoveryBusy = assertLifecycleError(
+        fixture.lifecycle.runRecovery(async (_lease, complete) => {
+          recoveryCallbackCalls += 1;
+          return complete(undefined);
+        }),
+        "postgres_restore_lifecycle_guard_busy",
+      );
+      const boundedFailure = new Promise((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("recovery lock attempt did not settle")),
+          500,
+        );
+      });
+      await Promise.race([recoveryBusy, boundedFailure]);
+
+      assert.equal(recoveryCallbackCalls, 0);
+      assert.equal(foregroundCompleted, false);
+      assert.equal(fixture.foregroundPool.connectCalls, 1);
+      assert.equal(fixture.recoveryPool.connectCalls, 1);
+      assert.equal(fixture.foregroundPool.clients.length, 0);
+      assert.equal(fixture.recoveryPool.clients.length, 1);
+      assert.equal(
+        fixture.recoveryClient.queries.some(([query]) =>
+          query?.text?.includes("pg_try_advisory_lock("),
+        ),
+        true,
+      );
+      assert.equal(
+        manager.isHeld(
+          lockKey(),
+          fixture.foregroundClient,
+          "shared",
+        ),
+        true,
+      );
+    } finally {
+      clearTimeout(timeout);
+      finishForeground.resolve();
+      await foregroundRun;
+    }
+
+    assert.equal(foregroundCompleted, true);
+    assert.equal(fixture.foregroundPool.clients.length, 1);
+    assert.equal(manager.holders.size, 0);
+  },
+);
 
 for (const [lifecycleMode, lifecycleMethod] of [
   ["foreground", "runForeground"],
@@ -391,7 +531,7 @@ for (const [lifecycleMode, lifecycleMethod] of [
             lifecycleMode,
           );
           const ordinaryResult =
-            await ordinaryFixture.operationGuard.runExclusive(
+            await ordinaryFixture.foregroundOperationGuard.runExclusive(
               POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
               async (probe, completeOperation) => {
                 ordinaryCallbackCalls += 1;
@@ -407,11 +547,14 @@ for (const [lifecycleMode, lifecycleMethod] of [
         },
       );
 
-      const lifecycleTry = lifecycleFixture.client.queries.find(([query]) =>
+      const lifecycleTry = clientForMode(
+        lifecycleFixture,
+        lifecycleMode,
+      ).queries.find(([query]) =>
         query?.text?.includes("pg_try_advisory_lock"),
       )[0];
-      const ordinaryTry = ordinaryFixture.client.queries.find(([query]) =>
-        query?.text?.includes("pg_try_advisory_lock("),
+      const ordinaryTry = ordinaryFixture.foregroundClient.queries.find(
+        ([query]) => query?.text?.includes("pg_try_advisory_lock("),
       )[0];
       assert.equal(result, "ordinary-complete");
       assert.equal(ordinaryCallbackCalls, 1);
@@ -436,10 +579,10 @@ test("foreground and recovery SQL use one fixed derived key and exact modes", as
     return complete(undefined);
   });
 
-  const foregroundTry = foreground.client.queries.find(([query]) =>
+  const foregroundTry = foreground.foregroundClient.queries.find(([query]) =>
     query?.text?.includes("pg_try_advisory_lock_shared"),
   )[0];
-  const recoveryTry = recovery.client.queries.find(([query]) =>
+  const recoveryTry = recovery.recoveryClient.queries.find(([query]) =>
     query?.text?.includes("pg_try_advisory_lock("),
   )[0];
   assert.deepEqual(foregroundTry.values, [lockKey()]);
@@ -447,25 +590,25 @@ test("foreground and recovery SQL use one fixed derived key and exact modes", as
   assert.equal(foregroundTry.queryMode, "extended");
   assert.equal(recoveryTry.queryMode, "extended");
   assert.equal(
-    queryTexts(foreground.client).some((text) =>
+    queryTexts(foreground.foregroundClient).some((text) =>
       text.includes("mode = 'ShareLock'"),
     ),
     true,
   );
   assert.equal(
-    queryTexts(foreground.client).some((text) =>
+    queryTexts(foreground.foregroundClient).some((text) =>
       text.includes("pg_advisory_unlock_shared"),
     ),
     true,
   );
   assert.equal(
-    queryTexts(recovery.client).some((text) =>
+    queryTexts(recovery.recoveryClient).some((text) =>
       text.includes("mode = 'ExclusiveLock'"),
     ),
     true,
   );
   assert.equal(
-    queryTexts(recovery.client).some((text) =>
+    queryTexts(recovery.recoveryClient).some((text) =>
       text.includes("pg_advisory_unlock(") &&
       !text.includes("pg_advisory_unlock_shared"),
     ),
@@ -506,7 +649,7 @@ test("lease is opaque, callback-bound, probed, and invalid after closure", async
   );
 
   assert.strictEqual(result, expected);
-  assert.equal(fixture.client.heldProbeCount, 3);
+  assert.equal(fixture.foregroundClient.heldProbeCount, 3);
   assert.equal(
     isPostgresRestoreLifecycleLease(capturedLease, "foreground"),
     false,
@@ -579,8 +722,8 @@ test("callback rejection identity escapes only after lock cleanup", async () => 
     (error) => error === callbackError,
   );
   assert.equal(manager.holders.size, 0);
-  assert.equal(fixture.client.resetCount, 2);
-  assert.deepEqual(fixture.client.releaseCalls, [[]]);
+  assert.equal(fixture.recoveryClient.resetCount, 2);
+  assert.deepEqual(fixture.recoveryClient.releaseCalls, [[]]);
 });
 
 test("caught lease probe loss still makes the lifecycle outcome uncertain", async () => {
@@ -588,7 +731,7 @@ test("caught lease probe loss still makes the lifecycle outcome uncertain", asyn
   const fixture = createFixture(manager, 213);
   await assertLifecycleError(
     fixture.lifecycle.runForeground(async (lease, complete) => {
-      manager.releaseAll(fixture.client);
+      manager.releaseAll(fixture.foregroundClient);
       await assertLifecycleError(
         assertPostgresRestoreLifecycleLeaseHeld(lease, "foreground"),
         "postgres_restore_lifecycle_guard_outcome_uncertain",
@@ -597,15 +740,15 @@ test("caught lease probe loss still makes the lifecycle outcome uncertain", asyn
     }),
     "postgres_restore_lifecycle_guard_outcome_uncertain",
   );
-  assert.equal(fixture.client.releaseCalls.length, 1);
-  assert.equal(fixture.client.releaseCalls[0].length, 1);
+  assert.equal(fixture.foregroundClient.releaseCalls.length, 1);
+  assert.equal(fixture.foregroundClient.releaseCalls[0].length, 1);
 });
 
 for (const scenario of [
   {
     name: "connection loss",
     callback(fixture) {
-      fixture.client.connectionLost = true;
+      fixture.recoveryClient.connectionLost = true;
     },
   },
   {
@@ -640,9 +783,9 @@ for (const scenario of [
       }),
       "postgres_restore_lifecycle_guard_outcome_uncertain",
     );
-    assert.equal(fixture.client.releaseCalls.length, 1);
+    assert.equal(fixture.recoveryClient.releaseCalls.length, 1);
     assert.equal(
-      fixture.client.releaseCalls[0].length,
+      fixture.recoveryClient.releaseCalls[0].length,
       scenario.releaseArgumentCount ?? 1,
     );
     assert.equal(manager.holders.size, 0);
@@ -683,12 +826,18 @@ test("structural fakes, proxies, accessors, and generators are zero-trap rejecte
   assert.equal(isPostgresRestoreLifecycleGuard(proxy), false);
   assert.equal(isPostgresRestoreLifecycleLease(proxy, "foreground"), false);
 
-  const accessorOptions = {};
-  Object.defineProperty(accessorOptions, "operationGuard", {
-    enumerable: true,
-    get() {
-      trapCalls += 1;
-      throw new Error("accessor must not run");
+  const accessorOptions = Object.create(null);
+  Object.defineProperties(accessorOptions, {
+    foregroundOperationGuard: {
+      enumerable: true,
+      get() {
+        trapCalls += 1;
+        throw new Error("accessor must not run");
+      },
+    },
+    recoveryOperationGuard: {
+      enumerable: true,
+      value: fixture.recoveryOperationGuard,
     },
   });
   assert.throws(
@@ -712,7 +861,8 @@ test("structural fakes, proxies, accessors, and generators are zero-trap rejecte
     fixture.lifecycle.runRecovery(function* callback() {}),
     "invalid_postgres_restore_lifecycle_guard_request",
   );
-  assert.equal(fixture.pool.connectCalls, 0);
+  assert.equal(fixture.foregroundPool.connectCalls, 0);
+  assert.equal(fixture.recoveryPool.connectCalls, 0);
   assert.equal(trapCalls, 0);
 });
 

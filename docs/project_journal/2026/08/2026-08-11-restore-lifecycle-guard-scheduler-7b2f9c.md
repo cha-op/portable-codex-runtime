@@ -32,9 +32,12 @@ overlapping steps. Production `runRestore()` remains fail-closed.
   with the exact per-run `complete(value)` carrier, so prototype or species
   poisoning cannot release a lock before the real callback drains.
 - `PostgresRestoreLifecycleGuard` fixes one versioned lock identity for the
-  complete candidate universe in an authoritative database. It mints opaque,
-  callback-scoped foreground or recovery leases; structural lookalikes and
-  stale leases cannot authorize a lifecycle action.
+  complete candidate universe in an authoritative database. Foreground shared
+  and recovery-exclusive admission use distinct branded operation guards with
+  distinct dedicated pools, preventing foreground pool saturation from
+  delaying the recovery lock attempt. It mints opaque, callback-scoped
+  foreground or recovery leases; structural lookalikes and stale leases cannot
+  authorize a lifecycle action.
 - The restore recovery runner requires a branded lifecycle guard and executes
   every four-lane pass under its exclusive recovery lease. It revalidates that
   lease around cursor reads, service batches, and durable cursor advances.
@@ -59,6 +62,10 @@ overlapping steps. Production `runRestore()` remains fail-closed.
   one key, while an existing durable operation whose ID equals the lifecycle
   label remains in the ordinary namespace and cannot deadlock against its
   outer lifecycle lease.
+- Distinct foreground and recovery pool identities are part of lifecycle
+  admission, not an optional deployment tuning. Recovery must reach the
+  nonblocking exclusive lock probe even when foreground shared leases consume
+  every connection in their own pool.
 - The exclusive lease spans list, reconcile, and cursor settlement. A cursor
   cannot advance from an unguarded or differently guarded batch receipt, and a
   later lane is not admitted after a failed lease probe.

@@ -211,12 +211,26 @@ class GuardPool {
 
 function createLifecycleFixture() {
   const manager = new AdvisoryLockManager();
-  const pool = new GuardPool(manager);
-  const operationGuard = new PostgresOperationGuard({ dedicatedPool: pool });
-  const lifecycleGuard = createPostgresRestoreLifecycleGuard({
-    operationGuard,
+  const foregroundPool = new GuardPool(manager);
+  const recoveryPool = new GuardPool(manager);
+  const foregroundOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: foregroundPool,
   });
-  return { lifecycleGuard, manager, operationGuard, pool };
+  const recoveryOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: recoveryPool,
+  });
+  const lifecycleGuard = createPostgresRestoreLifecycleGuard({
+    foregroundOperationGuard,
+    recoveryOperationGuard,
+  });
+  return {
+    foregroundOperationGuard,
+    foregroundPool,
+    lifecycleGuard,
+    manager,
+    recoveryOperationGuard,
+    recoveryPool,
+  };
 }
 
 function checkpoint() {
@@ -473,6 +487,8 @@ test("a foreground shared lease produces a busy tick without recovery work", asy
     recovery: null,
     status: "busy",
   }));
+  assert.equal(runnerFixture.lifecycleFixture.foregroundPool.connectCalls, 1);
+  assert.equal(runnerFixture.lifecycleFixture.recoveryPool.connectCalls, 1);
   assert.deepEqual(runnerFixture.cursorFixture.calls, []);
 
   releaseForeground.resolve();
@@ -886,7 +902,7 @@ test("async observer descendants cannot reenter the scheduler", async () => {
 
 test("synchronous lower-layer reentry observes stable scheduler promises", async () => {
   const fixture = createSchedulerFixture();
-  const pool = fixture.runnerFixture.lifecycleFixture.pool;
+  const pool = fixture.runnerFixture.lifecycleFixture.recoveryPool;
   let reenteredStart;
   let reenteredStep;
   let reenteredStop;

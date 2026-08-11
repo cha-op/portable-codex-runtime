@@ -529,6 +529,15 @@ lifecycle key. A durable operation ID equal to the lifecycle lock label remains
 in the ordinary namespace and therefore cannot self-conflict with an outer
 lifecycle lease, including for historical operation rows.
 
+The lifecycle facade requires separate branded operation guards backed by
+distinct dedicated pool objects: one admits foreground shared leases and the
+other admits recovery-exclusive leases. The factory proves the pool identities
+through operation-guard-private bindings before accepting either guard. Thus a
+foreground pool at capacity cannot delay recovery before its nonblocking
+advisory-lock attempt; the recovery path can still report `busy` and let
+scheduler shutdown drain. A pool supplied to either guard remains dedicated to
+that role and must not be used by another runtime component.
+
 Serialization failures and deadlocks may be retried only when the same
 node-postgres `DatabaseError` object was first observed on that client's
 `errorMessage` connection event and then rejected the active query with the
@@ -1685,8 +1694,9 @@ adapter.
 
 `PostgresRestoreLifecycleGuard` fixes one versioned advisory-lock identity for
 the full authority candidate universe in an authoritative database. It wraps a
-dedicated `PostgresOperationGuard`: foreground composition receives a shared
-lease, while recovery receives the matching exclusive lease. Cursor
+pair of `PostgresOperationGuard` instances with distinct dedicated pools:
+foreground composition receives a shared lease from one, while recovery
+receives the matching exclusive lease from the other. Cursor
 `recoveryScopeId` is deliberately absent from this key because the authority
 candidate queries are database-global; two cursor scopes can enumerate the
 same durable operation.
@@ -1767,12 +1777,15 @@ Production deployment requires:
   checked-out connection can hold its PostgreSQL session advisory lock across
   out-of-transaction publication without sharing connection state with the
   serializable executor;
-- a separate operation-guard instance and dedicated pool for the database-
-  global restore lifecycle lease, so a long-lived shared or exclusive lease
-  cannot starve or self-deadlock a nested per-operation guard;
-- both pools connected directly to the same authoritative database and primary;
-  the guard connection requires backend-session affinity and cannot use
-  PgBouncer transaction or statement pooling;
+- two additional restore-lifecycle operation guards, each with its own
+  dedicated pool: one for foreground shared leases and one for recovery-
+  exclusive leases. Their distinct capacity prevents a long-lived foreground
+  lease from delaying recovery before its nonblocking lock attempt, while the
+  separate per-operation guard pool prevents nested-operation self-deadlock;
+- the executor pool, per-operation guard pool, and both lifecycle guard pools
+  connected directly to the same authoritative database and primary; every
+  guard connection requires backend-session affinity and cannot use PgBouncer
+  transaction or statement pooling;
 - TLS, database authentication, backup, and access control outside this module;
 - migration application before serving authority requests;
 - durable database backups independent of session-volume snapshots;

@@ -5,6 +5,7 @@ import {
   POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
   PostgresOperationGuard,
   PostgresOperationGuardError,
+  haveDistinctPostgresOperationGuardPools,
   isPostgresOperationGuard,
 } from "./postgres-operation-guard.mjs";
 
@@ -57,6 +58,8 @@ const runRestoreLifecycleExclusiveIntrinsic =
   PostgresOperationGuard.prototype.runRestoreLifecycleExclusive;
 const runRestoreLifecycleSharedIntrinsic =
   PostgresOperationGuard.prototype.runRestoreLifecycleShared;
+const haveDistinctOperationGuardPoolsIntrinsic =
+  haveDistinctPostgresOperationGuardPools;
 const TypeErrorConstructor = TypeError;
 const WeakMapConstructor = WeakMap;
 const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
@@ -68,7 +71,10 @@ const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
 
-const OPTION_KEYS = objectFreeze(["operationGuard"]);
+const OPTION_KEYS = objectFreeze([
+  "foregroundOperationGuard",
+  "recoveryOperationGuard",
+]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 const lifecycleContext = new AsyncLocalStorage();
 const failedLifecycleContexts = new WeakSetConstructor();
@@ -209,18 +215,29 @@ function trustedCallback(value, code) {
   return value;
 }
 
-function operationGuardBinding(value, code) {
+function foregroundOperationGuardBinding(value, code) {
   ensure(
     isPostgresOperationGuard(value) &&
       objectIsFrozen(value) &&
-      objectIsFrozen(runRestoreLifecycleExclusiveIntrinsic) &&
       objectIsFrozen(runRestoreLifecycleSharedIntrinsic),
     code,
   );
   return exactFrozenRecord({
+    method: runRestoreLifecycleSharedIntrinsic,
     receiver: value,
-    runExclusive: runRestoreLifecycleExclusiveIntrinsic,
-    runShared: runRestoreLifecycleSharedIntrinsic,
+  });
+}
+
+function recoveryOperationGuardBinding(value, code) {
+  ensure(
+    isPostgresOperationGuard(value) &&
+      objectIsFrozen(value) &&
+      objectIsFrozen(runRestoreLifecycleExclusiveIntrinsic),
+    code,
+  );
+  return exactFrozenRecord({
+    method: runRestoreLifecycleExclusiveIntrinsic,
+    receiver: value,
   });
 }
 
@@ -755,14 +772,12 @@ function guardCallback(mode, callback, probeValue, completeValue) {
 }
 
 async function invokeLifecycleInternal(binding, mode, callback) {
-  const method =
-    mode === FOREGROUND_MODE ? binding.runShared : binding.runExclusive;
   const callbackAdapter = (probe, complete) =>
     guardCallback(mode, callback, probe, complete);
   objectFreeze(callbackAdapter);
   let pending;
   try {
-    pending = callIntrinsic(method, binding.receiver, [
+    pending = callIntrinsic(binding.method, binding.receiver, [
       callbackAdapter,
     ]);
   } catch {
@@ -897,16 +912,31 @@ export function createPostgresRestoreLifecycleGuard(...args) {
   const code = "invalid_postgres_restore_lifecycle_guard_options";
   ensure(args.length === 1, code);
   const options = exactDataObject(args[0], OPTION_KEYS, code);
-  const binding = operationGuardBinding(options.operationGuard, code);
+  const foregroundBinding = foregroundOperationGuardBinding(
+    options.foregroundOperationGuard,
+    code,
+  );
+  const recoveryBinding = recoveryOperationGuardBinding(
+    options.recoveryOperationGuard,
+    code,
+  );
+  ensure(
+    objectIsFrozen(haveDistinctOperationGuardPoolsIntrinsic) &&
+      callIntrinsic(haveDistinctOperationGuardPoolsIntrinsic, undefined, [
+        foregroundBinding.receiver,
+        recoveryBinding.receiver,
+      ]),
+    code,
+  );
 
   const runForeground = function runForeground(...methodArgs) {
     return protectPromise(
-      invokeLifecycle(binding, FOREGROUND_MODE, methodArgs),
+      invokeLifecycle(foregroundBinding, FOREGROUND_MODE, methodArgs),
     );
   };
   const runRecovery = function runRecovery(...methodArgs) {
     return protectPromise(
-      invokeLifecycle(binding, RECOVERY_MODE, methodArgs),
+      invokeLifecycle(recoveryBinding, RECOVERY_MODE, methodArgs),
     );
   };
   objectFreeze(runForeground);

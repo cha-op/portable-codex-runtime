@@ -151,6 +151,9 @@ const promiseThenIntrinsic = Promise.prototype.then;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpTestIntrinsic = RegExp.prototype.test;
 const TypeErrorConstructor = TypeError;
+const WeakMapConstructor = WeakMap;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
 const WeakSetConstructor = WeakSet;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
@@ -167,6 +170,7 @@ const SHARED_LOCK_MODE = objectFreeze({
 });
 
 const operationGuards = new WeakSetConstructor();
+const operationGuardPoolIdentities = new WeakMapConstructor();
 const completionCarriers = new WeakSetConstructor();
 const completionCarrierToken = Symbol(
   "portable-codex-runtime.postgres-operation-guard.completion-carrier",
@@ -192,6 +196,14 @@ function weakSetAdd(set, value) {
 
 function weakSetHas(set, value) {
   return callIntrinsic(weakSetHasIntrinsic, set, [value]);
+}
+
+function weakMapGet(map, key) {
+  return callIntrinsic(weakMapGetIntrinsic, map, [key]);
+}
+
+function weakMapSet(map, key, value) {
+  callIntrinsic(weakMapSetIntrinsic, map, [key, value]);
 }
 
 function arrayEvery(value, callback) {
@@ -1447,6 +1459,11 @@ export class PostgresOperationGuard {
       "invalid_postgres_operation_guard_options",
     );
     this.#poolBinding = trustedPool(inspectExactOptions(args[0]));
+    weakMapSet(
+      operationGuardPoolIdentities,
+      this,
+      this.#poolBinding.pool,
+    );
     weakSetAdd(operationGuards, this);
     objectFreeze(this);
   }
@@ -1485,6 +1502,16 @@ export function isPostgresOperationGuard(value) {
   );
 }
 
+export function haveDistinctPostgresOperationGuardPools(first, second) {
+  return (
+    isPostgresOperationGuard(first) &&
+    isPostgresOperationGuard(second) &&
+    weakMapGet(operationGuardPoolIdentities, first) !==
+      weakMapGet(operationGuardPoolIdentities, second)
+  );
+}
+
+objectFreeze(haveDistinctPostgresOperationGuardPools);
 objectFreeze(
   PostgresOperationGuard.prototype.runRestoreLifecycleExclusive,
 );

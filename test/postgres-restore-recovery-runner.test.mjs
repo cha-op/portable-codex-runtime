@@ -157,14 +157,29 @@ class RecoveryGuardPool {
 }
 
 function createLifecycleFixture(options = {}) {
-  const pool = new RecoveryGuardPool(options);
-  const operationGuard = new PostgresOperationGuard({
-    dedicatedPool: pool,
+  const manager = options.manager ?? new RecoveryLockManager();
+  const foregroundPool = new RecoveryGuardPool({
+    ...options,
+    manager,
+  });
+  const recoveryPool = new RecoveryGuardPool({
+    ...options,
+    manager,
+  });
+  const foregroundOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: foregroundPool,
+  });
+  const recoveryOperationGuard = new PostgresOperationGuard({
+    dedicatedPool: recoveryPool,
   });
   return {
-    guard: createPostgresRestoreLifecycleGuard({ operationGuard }),
-    manager: pool.manager,
-    pool,
+    foregroundPool,
+    guard: createPostgresRestoreLifecycleGuard({
+      foregroundOperationGuard,
+      recoveryOperationGuard,
+    }),
+    manager,
+    recoveryPool,
   };
 }
 
