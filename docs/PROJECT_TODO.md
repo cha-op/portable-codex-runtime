@@ -104,12 +104,16 @@
 - [done] Add a cross-process shared/exclusive restore lifecycle guard and a
   bounded production recovery scheduler so foreground prepared launch cannot
   race recovery cancellation.
-- [pending] Behind a separate detached-production fleet capability, wire
-  committed restore publication, durable stop and clean capture, canonical
-  detach, capture-bound activation, prepared launch, and the durable bounded
-  no-relaunch recovery runner through the production checkpoint
-  adapter. Keep `runRestore()` fail-closed until that adapter composition and
-  its ambiguous-outcome coverage are complete.
+- [pending] Complete production restore adapter enablement. Phase A now
+  provides the caller-persisted stable plan, invocation-time default-deny fleet
+  gate, and shared-lifecycle foreground composition seam across committed
+  publication, durable stop/capture, canonical detach, activation, and
+  prepared launch. Phase B must assemble that facade, its capture-only backend,
+  three distinct foreground-lifecycle, recovery-lifecycle, and nested-
+  operation guard pools, runtime-owned dependencies, and the durable bounded
+  no-relaunch scheduler through the production checkpoint adapter. Keep
+  `runRestore()` fail-closed until that assembly and its ambiguous-outcome
+  coverage are complete.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

@@ -289,10 +289,28 @@
   authority-issued restore-generation binding to fresh publication or to
   source-free committed verification. Version 2 callback behavior remains
   compatible, and the new transport seam does not enable `runRestore()`.
+- Detached-restore foreground phase A now provides a canonical caller-
+  persisted root plan, invocation-time default-deny fleet admission, and one
+  production-neutral facade under the shared lifecycle lease. The stable plan
+  derives renewal, capture, generation, detach, activation, and launch IDs
+  while keeping `captureCreatedAt` fixed across retry. The logical launcher and
+  capture authority remain the source of the formal stop-operation and
+  capture-attempt identities.
+- The foreground order is renewal-before-stop, V3 stop/prepared capture,
+  generation V1 publication, exact release or force-fence detach with no mode
+  fallback, activation V2, and prepared launch. The caller must persist and
+  resubmit the same plan; the facade does not add an autonomous cross-stage
+  saga. The plan's source checkpoint artefact path is distinct from the fresh
+  safety-capture path selected by the capture backend from derived IDs.
+- The facade requires its nested per-operation guard pool to be distinct from
+  both lifecycle pools before any connection is acquired. This prevents a
+  max-one foreground lifecycle pool from self-deadlocking while its shared
+  lease waits for a nested exclusive operation.
 - The production checkpoint adapter remains capture-only. Restore fails closed
-  until a later serial slice wires committed publication, detached activation,
-  prepared launch, and scheduled no-relaunch recovery into `runRestore()`
-  behind the detached-production fleet gate and shared lifecycle lease.
+  because its `runRestore()` stub is unchanged. Phase B must assemble this
+  facade, its capture-only backend, three distinct guard pools, runtime-owned
+  dependencies, and scheduled no-relaunch recovery before enabling the entry
+  point.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -365,6 +383,8 @@
   `docs/project_journal/2026/08/2026-08-05-durable-stop-capture-composition-7e3a91.md`
 - Durable stop-to-prepared-capture handoff:
   `docs/project_journal/2026/08/2026-08-10-durable-stop-prepared-capture-handoff-d4c6a1.md`
+- Detached restore foreground composition:
+  `docs/project_journal/2026/08/2026-08-11-detached-restore-foreground-composition-4f8c2d.md`
 - External-auth probe workstream:
   `docs/project_journal/2026/06/2026-06-30-external-auth-probe-1424ea.md`
 
@@ -379,7 +399,7 @@
 - Restore remains intentionally unavailable in the production checkpoint
   adapter. Capture-bound detached activation and bounded no-relaunch recovery
   now exist, the stop-to-prepared-capture handoff is durable, and the cross-
-  process foreground/recovery lifecycle guard plus scheduler are implemented.
-  Production still requires a separate explicit invocation fleet capability,
-  adapter composition, and end-to-end fail-closed validation before
-  `runRestore()` may be enabled.
+  process lifecycle guard, scheduler, stable root plan, invocation-time fleet
+  gate, and foreground composition seam are implemented. Production still
+  requires phase-B runtime/adapter assembly and end-to-end fail-closed
+  validation before `runRestore()` may be enabled.

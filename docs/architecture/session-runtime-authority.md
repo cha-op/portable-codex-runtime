@@ -1733,30 +1733,110 @@ executes in the interval between a successful probe and a later external side
 effect. Typed authority transitions, exact provider idempotency, and the
 per-operation guard remain the physical-dispatch safety boundary.
 
-## Remaining Production Restore Composition
+## Detached Restore Foreground Composition and Remaining Assembly
 
-The launcher foundation, V3 durable stop-to-prepared-capture handoff, and
-capture-bound detached activation now close the committed publication,
-old-writer stop/capture/detach, provider-backed attachment, atomic prepared-
-launch reservation, and bounded no-relaunch recovery boundaries. They remain
-independent protocol components rather than a production restore entry point.
-The remaining serial integration must:
+Foreground phase A introduces a caller-persisted contract version 1 root plan.
+It binds the exact outer restore request, the source checkpoint's
+`sourceArtifactDirectory` and `sourceArtifactOwnedRoot`, the detached
+destination plan, stable `captureCreatedAt`, detach mode, target holder, image
+plan, and bounded lease duration. Its domain-separated SHA-256 derivation fixes
+the renewal operation, safety-capture operation/artifact/checkpoint,
+restore-generation, destination-isolation proof, detach operation, activation
+operation, and launch-attempt identities plus one complete `planSha256`.
+Property order does not change the result; path aliases, nested source and
+destination roots, accessors, Proxies, extra fields, and drift fail closed.
 
-- enforce the detached-production fleet decision at each invocation, rather
-  than treating startup construction as a lasting grant; and
-- wire committed publication, durable stop and prepared capture, canonical
-  detach, capture-bound activation, and prepared launch under the shared lease,
-  while the bounded exclusive scheduler supplies no-relaunch recovery through
-  the production checkpoint adapter.
+The source checkpoint artefact and the fresh safety capture are distinct
+objects. The stable plan names only the former. The capture backend's frozen
+resolver maps the derived capture identities to the latter's path. The logical
+launcher still mints the formal writer-stop operation ID, and the checkpoint
+authority still mints the formal capture-attempt UUID; the plan does not
+pretend either existing authority has an injection seam.
 
-That final wiring may enable `runRestore()` only after every uncertain
-publication, launch, registration, stop, capture, and finalisation boundary
-remains fail-closed.
+The phase-A foreground facade evaluates the detached-production decision at
+each invocation and requires the exact opaque confirmation capability for
+fresh work. Exact durable lookup precedes the default-deny decision so closing
+the gate does not strand an already-materialized V3 stop-to-capture handoff or
+later subordinate operation owned by the stable plan. A stop that may have
+started before that atomic handoff remains outcome-uncertain and cannot be
+redispatched. After admission, one shared restore-lifecycle lease spans the
+entire sequence:
 
-Until that integration lands, the production checkpoint adapter rejects
-restore. The resolver alone is not stop/capture authority, and neither the
-legacy capability path, V3 prepared-capture handoff, nor detached
-activation/recovery components are wired into the production adapter.
+1. renew the exact current writer lease before any stop dispatch;
+2. use the V3 durable stop-to-prepared-capture handoff and permit fresh safety
+   capture only from its definite prepared dispatch grant;
+3. reserve, claim, publish, and finalize the target restore generation under
+   request version 1;
+4. detach the old writer through exactly the selected release or force-fence
+   mode, with no automatic mode fallback;
+5. prepare the launch intent from the exact clean `DETACHED` session and run
+   capture-bound activation request version 2; and
+6. consume only the activation-materialized prepared launch attempt.
+
+One narrow pre-dispatch retry cut is reconstructable without a new saga row.
+The current session must expose the exact revision-zero `prepared` generation
+active pointer, request and reservation identities derived from the stable
+plan, the expected revision derived from its direct predecessor, and one exact
+database timestamp shared by the reconstructed operation, reservation, and
+current session. Its `lastOperation` must be the immediately preceding
+committed safety-capture terminal. That complete transition witness permits
+retry of the same claim without a second reserve or publication; the sole
+publication remains gated on a definite claim grant. A missing, crossed,
+unproved, or non-direct predecessor, including any request, pointer, revision,
+timestamp, or reservation mismatch, remains outcome-uncertain and fails
+closed.
+
+Launch recovery separates preparation from reconciliation. Only a `prepared`
+attempt may mint the image reservation and enter prepared-launch dispatch.
+`starting`, `uncertain`, and `committed` attempts instead use no-relaunch
+supervisor reconciliation and do not prepare another image. A committed
+launch remains adoptable after a later active or terminal operation replaces
+the session anchors only when its immutable operation and reservation rebuild
+the original committed transition, the current `document.launch` pointer
+matches it exactly, and the current session is proved to be the same identity
+and a valid descendant. Missing or crossed launch pointers, results, requests,
+reservations, or session identity fail closed.
+
+Before it acquires any connection, the facade requires its nested per-
+operation guard pool to be distinct from both the foreground-shared and
+recovery-exclusive lifecycle pools. This protects callback-bound lock lifetime
+from a max-one-pool self-deadlock; it proves pool-object separation, not DSN,
+capacity, or primary identity.
+
+This is a foreground composition seam, not a new monolithic saga journal. The
+caller must durably retain the exact plan and resubmit it on retry. Each typed
+authority remains the source of truth for its own subordinate phase. A lost
+database-finalization acknowledgement may replay exact readback/finalization,
+but a stop, capture publication, generation publication, detach, provider
+activation, or launch that may have crossed its dispatch boundary never gains
+a second physical dispatch merely because the facade is called again. In
+particular, retained `starting` or `uncertain` work stays on its existing
+committed-only or no-relaunch recovery path; an unresolved earlier cut can
+leave the caller-driven sequence blocked rather than being guessed forward.
+
+Renewal-before-stop narrows but does not remove the database-clock lease
+boundary. On a fresh path, the successful renewal's PostgreSQL `authorityNow`,
+not the worker's `Date.now()`, supplies the `now` used for local prepared-
+capture construction as its database-authoritative timestamp. This local use
+does not extend the lease. Lease expiry is deliberately not a stop-claim gate;
+the V3 claim progresses only through its exact session identity, claimant
+token, and capture intent. Generation V1 later reads the current database
+clock independently in its dispatch-claim transaction; the preceding generic
+reserve does not read that clock. `captureCreatedAt` and every derived ID stay
+stable if a long safety capture crosses that boundary, but expiry discovered
+after capture fails closed and does not authorize another stop or fresh
+capture. Phase B must supply an operational lease budget/deadline and explicit
+recovery policy rather than silently renewing through active capture state.
+Activation V2 creates the prepared launch under a new bounded lease; expiry
+before the launch claim also fails closed and never authorizes relaunch. The
+phase-B budget must cover long capture and activation windows.
+
+Until phase B lands, the production checkpoint adapter still rejects restore:
+its `runRestore()` implementation remains the fixed fail-closed stub. Runtime
+assembly must construct the capture-only backend, stable-plan resolver,
+foreground facade, three distinct guard pools, and scheduler together, then
+validate the complete ambiguous-outcome matrix before enabling the entry
+point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
