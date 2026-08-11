@@ -6,6 +6,7 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  FilesystemOperationJournal,
   operationJournalBindingSha256,
 } from "../src/filesystem-operation-journal.mjs";
 import {
@@ -22,18 +23,11 @@ import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
 import {
-  createPostgresRestoreActivationRecoveryService,
-} from "../src/postgres-restore-activation-recovery-service.mjs";
+  createPostgresDetachedRestorePlan,
+} from "../src/postgres-detached-restore-plan.mjs";
 import {
-  POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
-  createPostgresRestoreLifecycleGuard,
-} from "../src/postgres-restore-lifecycle-guard.mjs";
-import {
-  createPostgresRestoreRecoveryRunner,
-} from "../src/postgres-restore-recovery-runner.mjs";
-import {
-  createPostgresRestoreRecoveryScheduler,
-} from "../src/postgres-restore-recovery-scheduler.mjs";
+  createPostgresDetachedRestoreRuntimeComposition,
+} from "../src/postgres-detached-restore-runtime-composition.mjs";
 import {
   PostgresWriterDetachCompositionError,
   createPostgresWriterDetachComposition,
@@ -73,7 +67,13 @@ import {
   PostgresRestoreRecoveryCursorStoreError,
   createPostgresRestoreRecoveryCursorStore,
 } from "../src/postgres-restore-recovery-cursor-store.mjs";
-import { createSessionManifest } from "../src/session-storage-contracts.mjs";
+import {
+  RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  createSessionManifest,
+} from "../src/session-storage-contracts.mjs";
+import {
+  StoppedDirectoryPublication,
+} from "../src/stopped-directory-publication.mjs";
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
   StoppedWriterCapabilityCoordinator,
@@ -2183,6 +2183,59 @@ function writerDetachIntegrationBackend({
     prepareWritableAttachment: unsupported,
     provisionSession: unsupported,
     restoreCheckpoint: unsupported,
+  });
+}
+
+function restoreRuntimeIntegrationLifecycleBackend(calls) {
+  const unexpectedProviderCall = async function unexpectedProviderCall() {
+    calls.provider += 1;
+    throw new Error("restore runtime lifecycle provider must not run");
+  };
+  return Object.freeze({
+    backendId: "postgres-authority-integration",
+    capabilities: Object.freeze({
+      atomicPointInTimeCheckpoint: true,
+      exclusiveWriterAttachment: true,
+      fencing: "epoch-enforced",
+      normalDirectoryAttachment: true,
+    }),
+    captureCheckpoint: unexpectedProviderCall,
+    contractVersion: 1,
+    destroySession: unexpectedProviderCall,
+    detachAttachment: unexpectedProviderCall,
+    forceFence: unexpectedProviderCall,
+    prepareRestoreAttachment: unexpectedProviderCall,
+    prepareWritableAttachment: unexpectedProviderCall,
+    provisionSession: unexpectedProviderCall,
+    restoreAttachmentActivationContractVersion:
+      RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    restoreCheckpoint: unexpectedProviderCall,
+  });
+}
+
+function restoreRuntimeIntegrationPublication(calls, recoveryScopeId) {
+  const unexpectedPublicationCall =
+    async function unexpectedPublicationCall() {
+      calls.publication += 1;
+      throw new Error("restore runtime publication must not run");
+    };
+  const journal = new FilesystemOperationJournal({
+    acquireLock: unexpectedPublicationCall,
+    directory:
+      `/var/lib/portable-codex/runtime-${recoveryScopeId}-journal`,
+    inspectAncestorAcl: unexpectedPublicationCall,
+    inspectDirectoryAcl: unexpectedPublicationCall,
+    inspectTemporaryRecord: unexpectedPublicationCall,
+    syncDirectory: unexpectedPublicationCall,
+  });
+  return new StoppedDirectoryPublication({
+    acquireLock: unexpectedPublicationCall,
+    inspectFilesystem: unexpectedPublicationCall,
+    inspectOwnedRootAcl: unexpectedPublicationCall,
+    inspectOwnedRootAncestorAcl: unexpectedPublicationCall,
+    inspectPersistentObjectIdentity: unexpectedPublicationCall,
+    journal,
+    listMountPoints: unexpectedPublicationCall,
   });
 }
 
@@ -10598,14 +10651,20 @@ test(
 );
 
 test(
-  "restore lifecycle guard schedules one exclusive database-global recovery pass",
-  { timeout: 30_000 },
+  "production-neutral restore runtime assembles four PostgreSQL lanes and keeps gated foreground effects closed",
+  { timeout: 60_000 },
   async (t) => {
-    const pool = new Pool({
+    const authorityPool = new Pool({
       application_name:
-        "portable-codex-runtime-restore-scheduler-integration-test",
+        "portable-codex-runtime-restore-authority-integration-test",
       connectionString: databaseUrl,
       max: 2,
+    });
+    const operationPool = new Pool({
+      application_name:
+        "portable-codex-runtime-restore-operation-integration-test",
+      connectionString: databaseUrl,
+      max: 1,
     });
     const foregroundLifecyclePool = new Pool({
       application_name:
@@ -10619,25 +10678,118 @@ test(
       connectionString: databaseUrl,
       max: 1,
     });
-    const collisionPool = new Pool({
-      application_name:
-        "portable-codex-runtime-restore-lifecycle-collision-integration-test",
-      connectionString: databaseUrl,
-      max: 1,
-    });
     const recoveryScopeId = `integration-restore-${randomUUID()}`;
+    const sessionId = randomUUID();
+    const sessionIds = [sessionId];
+    let runtime = null;
+    let foregroundTeardown = null;
     t.after(async () => {
+      let teardownToAwait = foregroundTeardown;
+      if (teardownToAwait === null && runtime !== null) {
+        try {
+          teardownToAwait = runtime.scheduler.stop();
+        } catch (error) {
+          teardownToAwait = Promise.reject(error);
+        }
+      }
+      if (teardownToAwait !== null) {
+        await Promise.allSettled([teardownToAwait]);
+      }
       try {
-        await pool.query(
+        await authorityPool.query(
           [
             "DELETE FROM session_authority.restore_recovery_cursors",
             "WHERE recovery_scope_id = $1",
           ].join(" "),
           [recoveryScopeId],
         );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.restore_destination_generations",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.checkpoint_catalogue",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.capture_attempt_tombstones",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.capture_attempt_claims",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.reservations",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.operation_claims",
+            "WHERE operation_id IN (",
+            "SELECT operation_id",
+            "FROM session_authority.operation_id_registry",
+            "WHERE session_id = ANY($1::uuid[])",
+            "AND claim_type IN (",
+            "'restore-launch-intent-v2',",
+            "'restore-activation-launch-intent-v1',",
+            "'writer-stop-capture-intent-v3'",
+            ")",
+            ")",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.operation_id_registry",
+            "WHERE session_id = ANY($1::uuid[])",
+            "AND claim_type IN (",
+            "'restore-launch-intent-v2',",
+            "'restore-activation-launch-intent-v1',",
+            "'writer-stop-capture-intent-v3'",
+            ")",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.operation_claims",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.operation_id_registry",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
+        await authorityPool.query(
+          [
+            "DELETE FROM session_authority.sessions",
+            "WHERE session_id = ANY($1::uuid[])",
+          ].join(" "),
+          [sessionIds],
+        );
       } finally {
         try {
-          await collisionPool.end();
+          await operationPool.end();
         } finally {
           try {
             await recoveryLifecyclePool.end();
@@ -10645,14 +10797,17 @@ test(
             try {
               await foregroundLifecyclePool.end();
             } finally {
-              await pool.end();
+              await authorityPool.end();
             }
           }
         }
       }
     });
 
-    const store = new PostgresSerializableStore({ dedicatedPool: pool });
+    const store = new PostgresSerializableStore({
+      dedicatedPool: authorityPool,
+      maxTransactionAttempts: 3,
+    });
     await store.migrate();
     const authority = new PostgresSessionAuthority({
       restoreAttachmentActivationV2FleetCompatible: true,
@@ -10662,131 +10817,299 @@ test(
       store,
       writerLaunchStopV3FleetCompatible: true,
     });
-    const lifecycleGuard = createPostgresRestoreLifecycleGuard({
-      foregroundOperationGuard: new PostgresOperationGuard({
-        dedicatedPool: foregroundLifecyclePool,
+    const checkpointAuthority = createPostgresCheckpointMutationAuthority({
+      authority,
+      operationGuard: new PostgresOperationGuard({
+        dedicatedPool: operationPool,
       }),
-      recoveryOperationGuard: new PostgresOperationGuard({
-        dedicatedPool: recoveryLifecyclePool,
-      }),
-    });
-    const collidingOperationGuard = new PostgresOperationGuard({
-      dedicatedPool: collisionPool,
-    });
-    const collisionResult = await lifecycleGuard.runRecovery(
-      async (_lease, lifecycleComplete) => {
-        const operationResult = await collidingOperationGuard.runExclusive(
-          POSTGRES_RESTORE_LIFECYCLE_LOCK_ID,
-          async (probe, operationComplete) => {
-            await probe.assertHeld();
-            return operationComplete("operation-lock-acquired");
-          },
-        );
-        return lifecycleComplete(operationResult);
-      },
-    );
-    assert.equal(collisionResult, "operation-lock-acquired");
-    let unexpectedReconciliations = 0;
-    const recoveryService =
-      createPostgresRestoreActivationRecoveryService({
-        listCurrentWriterLaunchCandidates: (input) =>
-          authority.listCurrentWriterLaunchRecoveryCandidates(input),
-        listRestoreAttachmentActivationCandidates: (input) =>
-          authority.listRestoreAttachmentActivationRecoveryCandidates(input),
-        listRestoreGenerationCandidates: (input) =>
-          authority.listRestoreDestinationGenerationRecoveryCandidates(input),
-        listWriterLaunchAttemptCandidates: (input) =>
-          authority.listWriterLaunchAttemptRecoveryCandidates(input),
-        reconcileRestoreAttachmentActivation() {
-          unexpectedReconciliations += 1;
-        },
-        reconcileRestoreGeneration() {
-          unexpectedReconciliations += 1;
-        },
-        reconcileWriterLaunchAttempt() {
-          unexpectedReconciliations += 1;
-        },
-      });
-    const runner = createPostgresRestoreRecoveryRunner({
-      cursorStore: createPostgresRestoreRecoveryCursorStore({ store }),
-      lifecycleGuard,
-      limits: {
-        activation: 10,
-        currentLaunch: 10,
-        generation: 10,
-        launchAttempt: 10,
-      },
-      recoveryScopeId,
-      recoveryService,
+      resolveArtifactPaths: integrationArtifactPaths,
+      resolveSourceOwnedRoot: integrationSourceOwnedRoot,
     });
 
     const firstStep = deferred();
+    const planResolverEntered = deferred();
+    const releasePlanResolver = deferred();
     const steps = [];
-    const scheduler = createPostgresRestoreRecoveryScheduler({
-      intervalMilliseconds: 60_000,
-      onStep(receipt) {
-        steps.push(receipt);
-        if (steps.length === 1) firstStep.resolve(receipt);
+    const calls = {
+      fleetGate: 0,
+      image: 0,
+      plan: 0,
+      provider: 0,
+      publication: 0,
+      publish: 0,
+      storageResolver: 0,
+      supervisor: 0,
+    };
+    let stablePlan = null;
+    runtime = createPostgresDetachedRestoreRuntimeComposition({
+      authority: {
+        maxTransactionAttempts: 3,
+        restoreAttachmentActivationV2FleetCompatible: true,
+        restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
+          true,
+        restoreGenerationV2FleetCompatible: true,
+        writerLaunchStopV3FleetCompatible: true,
       },
-      runner,
+      foreground: {
+        fleetCapabilityGate({ admission, plan }) {
+          calls.fleetGate += 1;
+          assert.equal(admission.request.sessionId, sessionId);
+          assert.strictEqual(plan, stablePlan);
+          return null;
+        },
+        async resolveStablePlan({ admission, expectedSession }) {
+          calls.plan += 1;
+          assert.equal(admission.request.sessionId, sessionId);
+          assert.equal(expectedSession.sessionId, sessionId);
+          planResolverEntered.resolve();
+          await releasePlanResolver.promise;
+          assert.notEqual(stablePlan, null);
+          return stablePlan;
+        },
+      },
+      launch: {
+        imageReservations: new PlatformImageReservationCoordinator(),
+        prepareImageReservation() {
+          calls.image += 1;
+          throw new Error("restore runtime image preparation must not run");
+        },
+        stoppedWriterCoordinator:
+          new StoppedWriterCapabilityCoordinator(),
+        supervisor: Object.freeze({
+          contractVersion: 1,
+          async launchWriter() {
+            calls.supervisor += 1;
+            throw new Error("restore runtime supervisor must not launch");
+          },
+          async reconcileWriterLaunch() {
+            calls.supervisor += 1;
+            throw new Error("restore runtime supervisor must not reconcile");
+          },
+          supervisorId: `runtime-supervisor-${randomUUID()}`,
+        }),
+      },
+      pools: {
+        authority: authorityPool,
+        foregroundLifecycle: foregroundLifecyclePool,
+        operation: operationPool,
+        recoveryLifecycle: recoveryLifecyclePool,
+      },
+      recovery: {
+        intervalMilliseconds: 60_000,
+        limits: {
+          activation: 10,
+          currentLaunch: 10,
+          generation: 10,
+          launchAttempt: 10,
+        },
+        onStep(receipt) {
+          steps.push(receipt);
+          if (steps.length === 1) firstStep.resolve(receipt);
+        },
+        recoveryScopeId,
+      },
+      storage: {
+        backendId: "postgres-authority-integration",
+        lifecycleBackend:
+          restoreRuntimeIntegrationLifecycleBackend(calls),
+        publication: restoreRuntimeIntegrationPublication(
+          calls,
+          recoveryScopeId,
+        ),
+        resolveArtifactPaths() {
+          calls.storageResolver += 1;
+          throw new Error("restore runtime artifact paths must not resolve");
+        },
+        resolveRestoreDestination() {
+          calls.storageResolver += 1;
+          throw new Error(
+            "restore runtime destination must not resolve",
+          );
+        },
+        resolveSourceOwnedRoot() {
+          calls.storageResolver += 1;
+          throw new Error("restore runtime source root must not resolve");
+        },
+      },
     });
-    const completion = scheduler.start();
-    const first = await firstStep.promise;
+    const completion = runtime.scheduler.start();
+    const first = await settleWithin(
+      firstStep.promise,
+      "restore runtime initial recovery step",
+    );
     assert.equal(first.status, "completed");
     assert.equal(first.recovery.status, "sweep-complete");
-    assert.equal(unexpectedReconciliations, 0);
+    for (const field of [
+      "generation",
+      "activation",
+      "launchAttempt",
+      "currentLaunch",
+    ]) {
+      assert.equal(first.recovery[field].batch.status, "sweep-complete");
+      assert.equal(first.recovery[field].batch.results.length, 0);
+    }
     await new Promise((resolve) => setImmediate(resolve));
 
-    const releaseForeground = deferred();
-    const firstForegroundEntered = deferred();
-    const firstForeground = lifecycleGuard.runForeground(
-      async (_lease, complete) => {
-        firstForegroundEntered.resolve();
-        await releaseForeground.promise;
-        return complete(undefined);
+    const fixture = await prepareCommittedRestoreGenerationFixture(
+      authority,
+      checkpointAuthority,
+      sessionId,
+    );
+    const launchInput = writerLaunchAttemptInput(
+      fixture.finalized.session,
+      fixture.finalized.generation,
+    );
+    await authority.reserveOperation(launchInput);
+    await authority.claimWriterLaunchAttemptDispatch({
+      ...structuredClone(launchInput),
+      expectedOperationRevision: "0",
+    });
+    const launched = await authority.finalizeWriterLaunchAttemptStarted({
+      ...structuredClone(launchInput),
+      evidence: writerLaunchEvidence(launchInput, "started"),
+      expectedOperationRevision: "1",
+    });
+    assertOperationReceipt(launched, "committed");
+    assert.equal(launched.session.document.lifecycle, "ATTACHED");
+    assert.notEqual(launched.session.document.launch, null);
+
+    const admission = restoreGenerationAdmission(
+      launched,
+      fixture.checkpoint,
+    );
+    const sourceArtifact = integrationArtifactPaths({
+      checkpoint: fixture.checkpoint,
+    });
+    stablePlan = createPostgresDetachedRestorePlan({
+      request: admission.request,
+      plan: {
+        captureCreatedAt: new Date().toISOString(),
+        destinationDirectory:
+          `/var/lib/portable-codex-restores/${sessionId}`,
+        destinationOwnedRoot: "/var/lib/portable-codex-restores",
+        detachMode: "release",
+        holderId: `restore-holder-${randomUUID()}`,
+        imagePlanId: `image-plan-${randomUUID()}`,
+        leaseDurationMilliseconds: 300_000,
+        sourceArtifactDirectory: sourceArtifact.artifactDirectory,
+        sourceArtifactOwnedRoot: sourceArtifact.artifactOwnedRoot,
+      },
+    });
+
+    const beforeSession = await authority.readSession({ sessionId });
+    const beforeOperations = await authorityPool.query(
+      [
+        "SELECT operation_id, kind, state, revision::text AS revision",
+        "FROM session_authority.operation_claims",
+        "WHERE session_id = $1",
+        "ORDER BY operation_id",
+      ].join(" "),
+      [sessionId],
+    );
+    const foreground = runtime.foreground.runRestore(
+      admission,
+      async () => {
+        calls.publish += 1;
+        throw new Error("restore runtime publish callback must not run");
       },
     );
     let busyStep = null;
-    let busyTimeout = null;
-    let stoppedCompletion;
-    let stoppedResult;
+    let primaryFailure = null;
     try {
-      await firstForegroundEntered.promise;
-      busyStep = scheduler.runStep({ signal: null });
-      const boundedBusy = new Promise((resolve, reject) => {
-        busyTimeout = setTimeout(
-          () => reject(new Error("recovery busy step did not settle")),
-          5_000,
-        );
-        busyStep.then(resolve, reject);
-      });
-      const busy = await boundedBusy;
+      await settleWithin(
+        planResolverEntered.promise,
+        "restore runtime foreground lifecycle lease",
+      );
+      busyStep = runtime.scheduler.runStep({ signal: null });
+      const busy = await settleWithin(
+        busyStep,
+        "restore runtime recovery collision",
+      );
       assert.deepEqual(structuredClone(busy), {
         errorCode: null,
         recovery: null,
         status: "busy",
       });
+    } catch (error) {
+      primaryFailure = error;
     } finally {
-      clearTimeout(busyTimeout);
-      releaseForeground.resolve();
-      try {
-        await firstForeground;
-      } finally {
-        try {
-          if (busyStep !== null) await busyStep;
-        } finally {
-          stoppedCompletion = scheduler.stop();
-          stoppedResult = await completion;
-        }
-      }
+      releasePlanResolver.resolve();
+      foregroundTeardown = (async () => {
+        const stoppedCompletion = runtime.scheduler.stop();
+        const effects =
+          busyStep === null
+            ? [foreground, completion]
+            : [foreground, busyStep, completion];
+        const settlements = await Promise.allSettled(effects);
+        return {
+          busySettlement:
+            busyStep === null ? null : settlements[1],
+          foregroundSettlement: settlements[0],
+          schedulerSettlement:
+            settlements[busyStep === null ? 1 : 2],
+          stoppedCompletion,
+        };
+      })();
     }
 
-    assert.strictEqual(stoppedCompletion, completion);
-    assert.deepEqual(structuredClone(stoppedResult), { status: "stopped" });
+    let teardown = null;
+    try {
+      teardown = await settleWithin(
+        foregroundTeardown,
+        "restore runtime foreground and scheduler shutdown",
+      );
+    } catch (error) {
+      if (primaryFailure === null) primaryFailure = error;
+    }
+    if (primaryFailure !== null) throw primaryFailure;
+    if (teardown.busySettlement?.status === "rejected") {
+      throw teardown.busySettlement.reason;
+    }
+    assert.equal(teardown.busySettlement?.status, "fulfilled");
+    if (teardown.schedulerSettlement.status === "rejected") {
+      throw teardown.schedulerSettlement.reason;
+    }
+    assert.equal(teardown.foregroundSettlement.status, "rejected");
+    assert.equal(
+      teardown.foregroundSettlement.reason.code,
+      "postgres_detached_restore_fleet_capability_required",
+    );
+    assert.deepEqual(
+      await authority.readSession({ sessionId }),
+      beforeSession,
+    );
+    const afterOperations = await authorityPool.query(
+      [
+        "SELECT operation_id, kind, state, revision::text AS revision",
+        "FROM session_authority.operation_claims",
+        "WHERE session_id = $1",
+        "ORDER BY operation_id",
+      ].join(" "),
+      [sessionId],
+    );
+    assert.deepEqual(afterOperations.rows, beforeOperations.rows);
+    assert.deepEqual(calls, {
+      fleetGate: 1,
+      image: 0,
+      plan: 1,
+      provider: 0,
+      publication: 0,
+      publish: 0,
+      storageResolver: 0,
+      supervisor: 0,
+    });
+
+    assert.strictEqual(teardown.stoppedCompletion, completion);
+    assert.deepEqual(
+      structuredClone(teardown.schedulerSettlement.value),
+      {
+        status: "stopped",
+      },
+    );
     assert.equal(steps.length, 2);
     assert.equal(steps[1].status, "busy");
 
-    const stored = await pool.query(
+    const stored = await authorityPool.query(
       [
         "SELECT lane, cycle::text, revision::text, after_session_id",
         "FROM session_authority.restore_recovery_cursors",

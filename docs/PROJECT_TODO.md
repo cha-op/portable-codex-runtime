@@ -108,12 +108,13 @@
   provides the caller-persisted stable plan, invocation-time default-deny fleet
   gate, and shared-lifecycle foreground composition seam across committed
   publication, durable stop/capture, canonical detach, activation, and
-  prepared launch. Phase B must assemble that facade, its capture-only backend,
-  three distinct foreground-lifecycle, recovery-lifecycle, and nested-
-  operation guard pools, runtime-owned dependencies, and the durable bounded
-  no-relaunch scheduler through the production checkpoint adapter. Keep
-  `runRestore()` fail-closed until that assembly and its ambiguous-outcome
-  coverage are complete.
+  prepared launch. The production-neutral assembly foundation now constructs
+  that facade, its capture-only backend, three distinct lifecycle/operation
+  guard pools, authority/store pool, and idle bounded no-relaunch scheduler
+  without opening the adapter. Supply deployment-owned stable-plan, provider,
+  image, PostgreSQL bootstrap, lease-budget, and lifecycle bindings; run the
+  complete assembled restart/ambiguous-outcome matrix; then construct the
+  final public backend and replace the fixed fail-closed `runRestore()` stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

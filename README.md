@@ -371,10 +371,15 @@ the safety-capture-to-generation boundary and the activation-to-launch
 boundary. Expiry fails closed and never authorizes a second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
-checkpoint adapter's `runRestore()` stub is unchanged. Phase B must assemble
-the facade, capture-only backend, scheduler, and runtime-owned dependencies,
-then add end-to-end ambiguous-outcome coverage before enabling that entry
-point. The exclusive scheduler continues bounded no-relaunch recovery.
+checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
+must supply the deployment-owned bindings and final public backend, then add
+end-to-end ambiguous-outcome coverage before enabling that entry point. A
+production-neutral runtime factory now constructs the capture-only backend,
+standalone foreground facade, and idle scheduler from one internally consistent graph
+and four caller-owned pool objects that must be pairwise distinct. It does not
+migrate, start, stop, or close pools, replace the capture-only backend's fixed
+restore route, or wire foreground restore into the production adapter. The
+exclusive scheduler continues bounded no-relaunch recovery.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -546,12 +551,13 @@ an executable clean-detached intent-to-launch handoff, and four-lane
 no-relaunch recovery. The backend's version 3 restore callback
 can now carry the complete authority-issued generation binding to either fresh
 publication or committed-only verification without changing the legacy version
-2 callback. The database-global shared/exclusive lifecycle guard and bounded
-recovery scheduler are now complete. Production restore remains fail-closed
-until later slices add the invocation-time detached-production gate and adapter
-wiring;
-filesystem-image execution
-and differential backup remain later work. See
+2 callback. The database-global shared/exclusive lifecycle guard, bounded
+recovery scheduler, invocation-time detached-production gate, foreground
+composition, and production-neutral runtime assembly are now complete.
+Production restore remains fail-closed until later slices supply deployment-
+owned bindings, assembled restart/ambiguity validation, and final adapter
+wiring. Filesystem-image execution and differential backup remain later work.
+See
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery
