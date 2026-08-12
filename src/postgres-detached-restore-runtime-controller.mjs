@@ -583,12 +583,16 @@ function settlement(value) {
   return exactFrozenRecord(value);
 }
 
-async function settlePromise(pending) {
+async function settlePromiseInternal(pending) {
   try {
     return settlement({ error: null, ok: true, value: await pending });
   } catch (error) {
     return settlement({ error, ok: false, value: null });
   }
+}
+
+function settlePromise(pending) {
+  return protectPromise(settlePromiseInternal(protectPromise(pending)));
 }
 
 export function createPostgresDetachedRestoreRuntimeController(...args) {
@@ -708,7 +712,7 @@ export function createPostgresDetachedRestoreRuntimeController(...args) {
       return READY_RESULT;
     } catch (error) {
       if (state === "starting") state = "failed";
-      await stopSchedulerAfterStartFailure();
+      await protectPromise(stopSchedulerAfterStartFailure());
       if (isControllerError(error) && error.code === OUTCOME_ERROR_CODE) {
         throw error;
       }

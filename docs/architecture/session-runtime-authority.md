@@ -1904,15 +1904,54 @@ closed. Exactly one controller claims each assembled runtime for its lifetime,
 so one shutdown barrier cannot race a second admission ledger over the same
 scheduler and pools. Stop first closes those facets, requests scheduler
 shutdown, and then drains the scheduler plus every already-admitted call. An
-admitted call and its asynchronous descendants cannot invoke that same
-controller's stop operation, which prevents the stop barrier from waiting on a
-call that is itself waiting on stop. The four pools remain borrowed; deployment
-closes them only after that barrier settles. The raw runtime is a low-level
-assembly capability and is not a second serving ingress.
-Deployment must next supply the remaining provider/image, PostgreSQL
-connection/bootstrap configuration, and operational lease-budget bindings and
-complete the assembled ambiguous-outcome matrix before enabling the production
-entry point.
+admitted call in the controller's ordinary asynchronous context is rejected if
+it invokes that same controller's stop operation, which prevents common direct
+or Promise-descendant self-wait mistakes. This is defense in depth, not an
+authorization boundary across arbitrary `AsyncResource` context replacement.
+The lifecycle `stop` capability belongs only to the deployment owner: injected
+runtime collaborators must not hold or invoke it and must not return a Promise
+that depends on it. The four pools remain borrowed; deployment closes them only
+after that barrier settles. The raw runtime is a low-level assembly capability
+and is not a second serving ingress.
+
+`createPostgresDetachedRestoreDeployment()` now owns the concrete PostgreSQL
+boundary above that controller. Its exact configuration names the host, port,
+database, user, credential, verified TLS material or explicit TLS disablement,
+bounded connection/query/statement/lock/idle-transaction timeouts, application
+name prefix, and the capacity of each authority, per-operation,
+foreground-lifecycle, and recovery-lifecycle pool. It accepts no DSN and does
+not consult `PG*` environment configuration. In verified-TLS mode,
+`serverName` must exactly equal `host`. The four `pg.Pool`
+instances and the assembled runtime/controller graph stay private.
+
+Startup simultaneously checks out one connection from every role before
+migration. Every connection must report the configured database, PostgreSQL
+13 or newer, `transaction_read_only = off`, `pg_is_in_recovery() = false`, and
+a distinct backend PID. The authority connection must acquire one
+deployment-instance-unique two-key advisory probe lock while each other held
+connection fails its nonblocking attempt for that same lock; the authority
+then releases it. This proves that those four observed connections share one
+writable database lock domain at that instant. It does not prove that a proxy,
+DNS target, failover manager, or later replacement connection will preserve
+primary affinity, so deployment remains responsible for that continuous
+routing invariant.
+
+`stop()` first waits for the controller's scheduler and admitted-call drain,
+then calls and awaits pool closure in recovery-lifecycle,
+foreground-lifecycle, per-operation, and authority order. All four close
+attempts are made even if one fails. Startup failure takes the same terminal
+drain-and-close path. `start()` still rejects with the fixed deployment
+outcome error. When that automatic cleanup completes cleanly, the deployment
+is stopped and every later `stop()` call reuses the same fulfilled frozen
+`{status: "stopped"}` receipt. A cleanup or fatal-shutdown failure instead
+leaves the memoized stop result rejected with the fixed deployment outcome
+error. This distinction applies only after the factory returned a deployment;
+construction failure has no deployment handle. Neither failed nor stopped
+deployments can reopen admission.
+
+Deployment must next supply the remaining provider/image and operational
+lease-budget bindings and complete the assembled ambiguous-outcome matrix
+before enabling the production entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -1942,7 +1981,11 @@ Production deployment requires:
   connected directly to the same authoritative database and primary; every
   guard connection requires backend-session affinity and cannot use PgBouncer
   transaction or statement pooling;
-- TLS, database authentication, backup, and access control outside this module;
+- explicit deployment configuration for verified TLS or an intentionally
+  disabled TLS mode, with credential issuance, rotation, database access
+  control, and trust-material provisioning remaining operational concerns;
+- continuous primary-affinity enforcement outside the startup-only topology
+  proof;
 - migration application before serving authority requests;
 - durable database backups independent of session-volume snapshots;
 - authority-ledger promotion and recovery that never admits mutations from a
@@ -2021,11 +2064,11 @@ prepared-only fresh dispatch, source-free active recovery, no second
 publication after ambiguity, and retained local identity until the exact
 predetermined committed result. The invocation-time gate, production-neutral
 object graph, same-launcher writer-start ingress, separately gated durable plan
-provisioning, restart readback, private read-only resolver, and deployment-
-owned migration/admission/drain controller now exist. The next integration
-slices must add the remaining provider/image, PostgreSQL connection/bootstrap
-configuration, and operational lease-budget bindings, whole-graph restart/
-ambiguity validation, and final adapter wiring before production `runRestore()`
-can open.
+provisioning, restart readback, private read-only resolver, deployment-owned
+migration/admission/drain controller, and explicit PostgreSQL pool-owning
+deployment now exist. The next integration slices must add the remaining
+provider/image and operational lease-budget bindings, whole-graph restart/
+ambiguity validation, and final adapter wiring before production
+`runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

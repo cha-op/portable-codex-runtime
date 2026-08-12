@@ -116,11 +116,14 @@
   private read-only foreground resolver are now complete. The deployment
   controller now owns migration-before-serving, the initial complete recovery
   sweep, restore admission, scheduler shutdown, and admitted-call drain while
-  leaving the four pools caller-owned. Supply the remaining provider/image,
-  PostgreSQL connection/bootstrap configuration, and operational lease-budget
+  leaving the four low-level pools borrowed. The production deployment factory
+  now owns explicit PostgreSQL connection/bootstrap configuration, constructs
+  those four private pools, performs a point-in-time same-primary topology
+  check before controller startup, and closes every pool after controller
+  drain. Supply the remaining provider/image and operational lease-budget
   bindings. Run the complete assembled restart/ambiguous-outcome matrix,
-  construct the final public backend, and only then replace the fixed fail-
-  closed `runRestore()` stub.
+  construct the final public backend, and only then replace the fixed
+  fail-closed `runRestore()` stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

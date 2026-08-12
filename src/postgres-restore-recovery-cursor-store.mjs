@@ -288,7 +288,8 @@ function rowsFromResult(result, code) {
   ensure(
     !isProxyValue(rows) &&
       arrayIsArray(rows) &&
-      objectGetPrototypeOf(rows) === arrayPrototype &&
+      (objectGetPrototypeOf(rows) === arrayPrototype ||
+        (objectGetPrototypeOf(rows) === null && objectIsFrozen(rows))) &&
       rows.length <= 1,
     code,
   );

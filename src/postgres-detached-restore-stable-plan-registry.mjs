@@ -754,7 +754,8 @@ function rowsFromResult(value, code) {
   ensure(
     arrayIsArray(rows) &&
       !isProxyValue(rows) &&
-      prototype === arrayPrototype &&
+      (prototype === arrayPrototype ||
+        (prototype === null && objectIsFrozen(rows))) &&
       lengthDescriptor?.enumerable === false &&
       objectHasOwn(lengthDescriptor, "value"),
     code,

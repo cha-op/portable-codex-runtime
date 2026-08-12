@@ -367,10 +367,18 @@ Restore and launcher authority are now split into eight serial pull requests:
      four-lane sweep, and only then opens the gated foreground, stable-plan,
      and writer-launch facets. Stop closes admission, stops the scheduler, and
      drains all accepted calls without closing the four borrowed pools.
-   - Remaining deployment assembly then owns physical provider/image and
-     PostgreSQL connection/bootstrap configuration, the operational lease
-     budget, complete assembled restart/ambiguity validation, and construction
-     of the final public restore-capable backend.
+   - The PostgreSQL deployment boundary now accepts exact explicit connection,
+     verified-TLS, timeout, application-name, and per-role capacity
+     configuration and constructs the four private pools. Before controller
+     startup it simultaneously checks out one connection from each pool and
+     proves PostgreSQL 13-or-newer, writable-primary state, database identity,
+     distinct backend sessions, and one shared advisory-lock domain. This is
+     point-in-time startup evidence, not continuous topology monitoring. Stop
+     drains the controller before it attempts and awaits closure of all four
+     pools; none of those internals is exposed.
+   - Remaining deployment assembly then owns physical provider/image, the
+     operational lease budget, complete assembled restart/ambiguity
+     validation, and construction of the final public restore-capable backend.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

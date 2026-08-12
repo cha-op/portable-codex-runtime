@@ -342,12 +342,20 @@
   Shutdown closes those facets first, stops the scheduler, and drains every
   admitted call before the caller may close the four borrowed pools. The raw
   runtime remains a low-level capability and is not a parallel serving route.
+- A higher PostgreSQL deployment factory now owns those four pools. It accepts
+  only explicit connection, verified-TLS, timeout, role-capacity, and
+  application-name configuration; constructs one private pool per authority,
+  operation, foreground-lifecycle, and recovery-lifecycle role; and admits the
+  controller startup only after simultaneous checked-out connections prove a
+  writable PostgreSQL 13-or-newer database in one advisory-lock domain. That
+  startup check is point-in-time evidence, not continuous primary-affinity
+  monitoring. Stop drains the controller before attempting and awaiting all
+  four pool closures; no pool or low-level runtime capability is exposed.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires the remaining deployment-owned provider/image, PostgreSQL
-  connection/bootstrap configuration, and lease-budget bindings, full
-  assembled restart and ambiguous-outcome validation, and the final public
-  adapter route.
+  requires the remaining deployment-owned provider/image and lease-budget
+  bindings, full assembled restart and ambiguous-outcome validation, and the
+  final public adapter route.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -448,7 +456,8 @@
   registry, separately gated provisioning surface, and private read-only
   foreground resolver are now implemented as well. Migration-before-serving,
   the initial recovery sweep, controlled restore admission, scheduler stop,
-  and admitted-call drain now have one deployment owner. Production still
-  requires provider/image, PostgreSQL connection/bootstrap configuration, and
-  operational lease-budget bindings, final public-adapter assembly, and end-
-  to-end fail-closed validation before `runRestore()` may be enabled.
+  admitted-call drain, explicit PostgreSQL bootstrap configuration, and pool
+  closure now have one deployment owner; its `stop` facet is not distributed
+  to injected runtime collaborators. Production still requires provider/
+  image and operational lease-budget bindings, final public-adapter assembly,
+  and end-to-end fail-closed validation before `runRestore()` may be enabled.
