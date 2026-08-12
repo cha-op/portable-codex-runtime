@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { Pool } from "pg";
@@ -11328,6 +11330,7 @@ test(
     let physicalBindings = null;
     let restartedController = null;
     let restartedPhysicalBindings = null;
+    let restartedArtifactOwnedRoot = null;
     let runtime = null;
     let foregroundTeardown = null;
     t.after(async () => {
@@ -11473,16 +11476,25 @@ test(
         }
       } finally {
         try {
-          await operationPool.end();
-        } finally {
           try {
-            await recoveryLifecyclePool.end();
+            await operationPool.end();
           } finally {
             try {
-              await foregroundLifecyclePool.end();
+              await recoveryLifecyclePool.end();
             } finally {
-              await authorityPool.end();
+              try {
+                await foregroundLifecyclePool.end();
+              } finally {
+                await authorityPool.end();
+              }
             }
+          }
+        } finally {
+          if (restartedArtifactOwnedRoot !== null) {
+            await rm(restartedArtifactOwnedRoot, {
+              force: true,
+              recursive: true,
+            });
           }
         }
       }
@@ -12867,6 +12879,9 @@ test(
       restartedCalls,
       restartedRecoveryScopeId,
     );
+    restartedArtifactOwnedRoot = await mkdtemp(
+      join(tmpdir(), "portable-codex-assembled-restart-"),
+    );
     restartedPhysicalBindings =
       createPostgresDetachedRestorePhysicalBindings({
         lifecycleBackend: restartedLifecycleBackend,
@@ -12968,7 +12983,13 @@ test(
           publication: restartedPhysicalBindings.publication,
           resolveArtifactPaths(options) {
             restartedCalls.artifactResolver += 1;
-            return integrationArtifactPaths(options);
+            return {
+              artifactDirectory: join(
+                restartedArtifactOwnedRoot,
+                options.checkpoint.artifactId,
+              ),
+              artifactOwnedRoot: restartedArtifactOwnedRoot,
+            };
           },
           resolveRestoreDestination:
             restartedPhysicalBindings.resolveRestoreDestination,
