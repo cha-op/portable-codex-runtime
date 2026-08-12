@@ -71,6 +71,8 @@ const PostgresSerializableStoreConstructor = PostgresSerializableStore;
 const PostgresSessionAuthorityConstructor = PostgresSessionAuthority;
 const PostgresOperationGuardConstructor = PostgresOperationGuard;
 const StoppedDirectoryBackendConstructor = StoppedDirectoryBackend;
+const migrateSerializableStoreIntrinsic =
+  PostgresSerializableStore.prototype.migrate;
 const createCheckpointMutationAuthorityIntrinsic =
   createPostgresCheckpointMutationAuthority;
 const createDetachedRestoreForegroundIntrinsic =
@@ -658,6 +660,9 @@ function assemble(options) {
       maxTransactionAttempts: options.authority.maxTransactionAttempts,
     }),
   );
+  const bootstrap = exactFrozenRecord({
+    migrate: receiverCallback(migrateSerializableStoreIntrinsic, store),
+  });
   const stablePlanRegistry = callFactory(
     createDetachedRestoreStablePlanRegistryIntrinsic,
     exactFrozenRecord({
@@ -814,6 +819,7 @@ function assemble(options) {
 
   const runtime = exactFrozenRecord({
     backend,
+    bootstrap,
     foreground,
     scheduler,
     stablePlanProvisioning,

@@ -411,6 +411,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
 
   assert.deepEqual(Reflect.ownKeys(runtime), [
     "backend",
+    "bootstrap",
     "foreground",
     "scheduler",
     "stablePlanProvisioning",
@@ -422,6 +423,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     isPostgresDetachedRestoreRuntimeComposition(
       Object.freeze({
         backend: runtime.backend,
+        bootstrap: runtime.bootstrap,
         foreground: runtime.foreground,
         scheduler: runtime.scheduler,
         stablePlanProvisioning: runtime.stablePlanProvisioning,
@@ -453,6 +455,24 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   );
   assert.equal(Object.isFrozen(runtime.backend), true);
+
+  exactKeys(runtime.bootstrap, ["migrate"]);
+  assert.equal(Object.getPrototypeOf(runtime.bootstrap), null);
+  assert.equal(Object.isFrozen(runtime.bootstrap), true);
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptor(runtime.bootstrap, "migrate"),
+    {
+      configurable: false,
+      enumerable: true,
+      value: runtime.bootstrap.migrate,
+      writable: false,
+    },
+  );
+  assert.equal(typeof runtime.bootstrap.migrate, "function");
+  assert.equal(Object.isFrozen(runtime.bootstrap.migrate), true);
+  for (const name of ["close", "pool", "runSerializable", "store"]) {
+    assert.equal(name in runtime.bootstrap, false);
+  }
 
   assert.equal(
     isPostgresDetachedRestoreForegroundComposition(runtime.foreground),
@@ -544,6 +564,8 @@ test("runtime facets keep per-runtime identity and captured receivers", async ()
   );
 
   assert.notStrictEqual(first.writerLaunch, second.writerLaunch);
+  assert.notStrictEqual(first.bootstrap, second.bootstrap);
+  assert.notStrictEqual(first.bootstrap.migrate, second.bootstrap.migrate);
   assert.notStrictEqual(
     first.writerLaunch.reconcileLaunchAttempt,
     second.writerLaunch.reconcileLaunchAttempt,

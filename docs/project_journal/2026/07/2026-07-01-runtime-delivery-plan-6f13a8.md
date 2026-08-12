@@ -3,7 +3,7 @@ id: 20260701-6f13a8
 title: Portable Runtime Delivery Plan
 status: active
 created: 2026-07-01
-updated: 2026-08-11
+updated: 2026-08-12
 branch:
 pr:
 supersedes: []
@@ -41,15 +41,19 @@ superseded_by:
   exposes the same internal launcher's narrow writer-start ingress, preserving
   the process-local opaque handle required by later stop/capture. The
   PostgreSQL durable stable-plan registry now provides separately gated
-  immutable provisioning and a read-only foreground resolver. The production
-  adapter remains fixed fail-closed.
+  immutable provisioning and a read-only foreground resolver. A deployment-
+  owned controller now binds migration-before-serving, an initial complete
+  recovery sweep, restore admission, and shutdown drain while retaining caller
+  ownership of the four pools. The production adapter remains fixed fail-
+  closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Supply the remaining physical provider/image, PostgreSQL bootstrap, lease-
-  budget, admission/drain, and lifecycle bindings for the assembled runtime.
+- Supply the remaining physical provider/image, PostgreSQL connection/
+  bootstrap configuration, and operational lease-budget bindings for the
+  assembled runtime.
 - Validate the complete assembled restart and ambiguous-outcome matrix, then
   construct the final public restore-capable backend and enable the production
   adapter only if the no-second-writer boundary remains closed.
@@ -58,6 +62,7 @@ superseded_by:
 
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
+- `docs/project_journal/2026/08/2026-08-12-detached-restore-deployment-lifecycle-3a7f6c.md`
 - `docs/project_journal/2026/08/2026-08-11-detached-restore-stable-plan-registry-8e4c21.md`
 - `docs/project_journal/2026/07/2026-07-15-pinned-executable-resume-tail-repair-9d813d.md`
 - `docs/project_journal/2026/07/2026-07-29-canonical-session-registry-4e8a2d.md`
