@@ -50,7 +50,14 @@ ALTER TABLE session_authority.operation_id_registry
       claim_type = 'detached-restore-stable-plan-v1'
       AND claimant_operation_id IS NULL
       AND binding IS NOT NULL
-      AND pg_catalog.jsonb_object_length(binding) = 4
+      AND (
+        binding - ARRAY[
+          'bindingSha256',
+          'contractVersion',
+          'planSha256',
+          'request'
+        ]
+      ) = '{}'::pg_catalog.jsonb
       AND binding ? 'bindingSha256'
       AND binding ? 'contractVersion'
       AND binding ? 'planSha256'
@@ -92,7 +99,9 @@ CREATE TABLE session_authority.detached_restore_stable_plans (
   CONSTRAINT detached_restore_stable_plans_admission_object
     CHECK ((
       pg_catalog.jsonb_typeof(admission) = 'object'
-      AND pg_catalog.jsonb_object_length(admission) = 2
+      AND (
+        admission - ARRAY['checkpoint', 'request']
+      ) = '{}'::pg_catalog.jsonb
       AND admission ? 'checkpoint'
       AND admission ? 'request'
       AND pg_catalog.jsonb_typeof(admission -> 'checkpoint') = 'object'
@@ -101,7 +110,19 @@ CREATE TABLE session_authority.detached_restore_stable_plans (
   CONSTRAINT detached_restore_stable_plans_plan_input_object
     CHECK ((
       pg_catalog.jsonb_typeof(plan_input) = 'object'
-      AND pg_catalog.jsonb_object_length(plan_input) = 9
+      AND (
+        plan_input - ARRAY[
+          'captureCreatedAt',
+          'destinationDirectory',
+          'destinationOwnedRoot',
+          'detachMode',
+          'holderId',
+          'imagePlanId',
+          'leaseDurationMilliseconds',
+          'sourceArtifactDirectory',
+          'sourceArtifactOwnedRoot'
+        ]
+      ) = '{}'::pg_catalog.jsonb
       AND plan_input ? 'captureCreatedAt'
       AND plan_input ? 'destinationDirectory'
       AND plan_input ? 'destinationOwnedRoot'

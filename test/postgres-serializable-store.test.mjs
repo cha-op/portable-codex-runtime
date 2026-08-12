@@ -2576,6 +2576,19 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     latestMigration.sql,
     /operation_claims_enforce_detached_restore_plan_materialization/u,
   );
+  assert.doesNotMatch(latestMigration.sql, /jsonb_object_length/u);
+  assert.match(
+    latestMigration.sql,
+    /binding - ARRAY\[[\s\S]+'bindingSha256',[\s\S]+'request'[\s\S]+\]\s*\)\s*= '\{\}'::pg_catalog\.jsonb/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /admission - ARRAY\['checkpoint', 'request'\][\s\S]+\) = '\{\}'::pg_catalog\.jsonb/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /plan_input - ARRAY\[[\s\S]+'captureCreatedAt',[\s\S]+'sourceArtifactOwnedRoot'[\s\S]+\]\s*\)\s*= '\{\}'::pg_catalog\.jsonb/u,
+  );
   assert.match(
     latestMigration.sql,
     /ADD CONSTRAINT operation_id_registry_claim_shape[\s\S]+jsonb_typeof\(binding -> 'bindingSha256'\) = 'string'[\s\S]+binding ->> 'bindingSha256' ~ '\^\[0-9a-f\]\{64\}\$'[\s\S]+jsonb_typeof\(binding -> 'planSha256'\) = 'string'[\s\S]+binding ->> 'planSha256' ~ '\^\[0-9a-f\]\{64\}\$'[\s\S]+\) IS TRUE\);/u,
