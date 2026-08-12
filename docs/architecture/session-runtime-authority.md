@@ -1875,12 +1875,13 @@ phase-B budget must cover long capture and activation windows.
 
 The production-neutral phase-B assembly foundation now constructs one
 capture-only backend, standalone foreground facade, idle scheduler, and narrow
-writer-launch and stable-plan-provisioning facets from one internally
-consistent authority graph and four pairwise-distinct borrowed pool objects.
-The launch facet exposes only `runLaunch()` and `reconcileLaunchAttempt()`
-through receiver-preserving wrappers bound to the same internal logical
-launcher. The frozen null-prototype provisioning facet exposes only
-`provisionStablePlan()` from the registry built on that same internal store;
+writer-launch, image-plan-reservation, and stable-plan-provisioning facets from
+one internally consistent authority graph and four pairwise-distinct borrowed
+pool objects. The launch facet exposes only `runLaunch()` and
+`reconcileLaunchAttempt()` through receiver-preserving wrappers bound to the
+same internal logical launcher. The frozen null-prototype provisioning facet
+exposes only `provisionStablePlan()` from the registry built on that same
+internal store;
 its receiver-preserving `resolveStablePlan()` wrapper remains private to the
 foreground facade. A successful same-process start therefore registers the
 opaque writer handle that the capture backend later resolves; another launcher
@@ -1897,13 +1898,14 @@ fixed fail-closed `runRestore()` implementation.
 The deployment controller owns the next lifecycle boundary without changing
 that backend. It invokes the low-level runtime's same-store bootstrap migration,
 starts the scheduler, and coalesces with the scheduler's immediate pass. It
-opens foreground, stable-plan-provisioning, and writer-launch admission only
-after an exact completed receipt proves a full four-lane sweep. A failed,
-busy, uncertain, or malformed initial result leaves the controller permanently
-closed. Exactly one controller claims each assembled runtime for its lifetime,
-so one shutdown barrier cannot race a second admission ledger over the same
-scheduler and pools. Stop first closes those facets, requests scheduler
-shutdown, and then drains the scheduler plus every already-admitted call. An
+opens foreground, image-plan-reservation, stable-plan-provisioning, and writer-
+launch admission only after an exact completed receipt proves a full four-lane
+sweep. A failed, busy, uncertain, or malformed initial result leaves the
+controller permanently closed. Exactly one controller claims each assembled
+runtime for its lifetime, so one shutdown barrier cannot race a second
+admission ledger over the same scheduler and pools. Stop first closes those
+facets, requests scheduler shutdown, and then drains the scheduler plus every
+already-admitted call. An
 admitted call in the controller's ordinary asynchronous context is rejected if
 it invokes that same controller's stop operation, which prevents common direct
 or Promise-descendant self-wait mistakes. This is defense in depth, not an
@@ -1923,6 +1925,21 @@ foreground-lifecycle, and recovery-lifecycle pool. It accepts no DSN and does
 not consult `PG*` environment configuration. In verified-TLS mode,
 `serverName` must exactly equal `host`. The four `pg.Pool`
 instances and the assembled runtime/controller graph stay private.
+
+Deployment also accepts one exact image-plan provider configuration and
+constructs one private binding for the assembled graph. The binding resolves
+an authentic plan's `imagePlanId` through that named provider to exact OCI
+platform-manifest and config bytes, passes those bytes through trusted Codex
+inspection and the existing bounded image verifier, and returns only an opaque
+process-local reservation. The gated deployment facet exposes preparation,
+not the bytes, provider, coordinator, or raw binding. Foreground preparation
+and the logical launcher's later reservation revalidation use that same
+binding, so a caller cannot substitute a resolver, inspector, or second
+reservation coordinator at the handoff. This authority covers exact image
+bytes, trusted inspection, and reservation identity. It does not fetch
+registry content, verify publisher or signature trust, pin a concrete runtime
+image, launch a container, implement the supervisor or physical
+provider/storage backend, or fence a writer.
 
 Startup simultaneously checks out one connection from every role before
 migration. Every connection must report the configured database, PostgreSQL
@@ -1949,9 +1966,10 @@ error. This distinction applies only after the factory returned a deployment;
 construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
-Deployment must next supply the remaining provider/image and operational
-lease-budget bindings and complete the assembled ambiguous-outcome matrix
-before enabling the production entry point.
+Deployment must next bound physical-collaborator settlement and deadlines,
+admit an explicit operational lease budget, and complete the assembled
+restart/ambiguous-outcome matrix before constructing the final public backend
+or enabling the production entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2065,10 +2083,10 @@ publication after ambiguity, and retained local identity until the exact
 predetermined committed result. The invocation-time gate, production-neutral
 object graph, same-launcher writer-start ingress, separately gated durable plan
 provisioning, restart readback, private read-only resolver, deployment-owned
-migration/admission/drain controller, and explicit PostgreSQL pool-owning
-deployment now exist. The next integration slices must add the remaining
-provider/image and operational lease-budget bindings, whole-graph restart/
-ambiguity validation, and final adapter wiring before production
-`runRestore()` can open.
+migration/admission/drain controller, explicit PostgreSQL pool-owning
+deployment, and deployment-owned image-plan binding now exist. The next
+integration slices must bound physical-collaborator settlement and deadlines,
+admit the operational lease budget, cover whole-graph restart/ambiguity, and
+wire the final adapter before production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

@@ -351,6 +351,30 @@ function ensure(condition, code) {
   if (!condition) fail(code);
 }
 
+function exactFrozenRecord(value) {
+  const result = objectCreate(null);
+  const keys = reflectOwnKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const descriptor = objectGetOwnPropertyDescriptor(value, key);
+    ensure(
+      typeof key === "string" &&
+        descriptor !== undefined &&
+        objectHasOwn(descriptor, "value"),
+      "invalid_platform_image_request",
+    );
+    objectDefineProperties(result, {
+      [key]: {
+        configurable: false,
+        enumerable: true,
+        value: descriptor.value,
+        writable: false,
+      },
+    });
+  }
+  return objectFreeze(result);
+}
+
 function isInternalError(error, code) {
   return (
     error !== null &&
@@ -1087,11 +1111,13 @@ async function inspectRuntime(inspectCodex, projection) {
     measurement.codexVersion === projection.codexVersion,
     "platform_image_identity_mismatch",
   );
-  return deepFreeze({
-    codexBinaryPath: measurement.codexBinaryPath,
-    codexBinarySha256: measurement.codexBinarySha256,
-    codexVersion: measurement.codexVersion,
-    platformImageDigest: projection.platformImage.digest,
+  return exactFrozenRecord({
+    value: deepFreeze({
+      codexBinaryPath: measurement.codexBinaryPath,
+      codexBinarySha256: measurement.codexBinarySha256,
+      codexVersion: measurement.codexVersion,
+      platformImageDigest: projection.platformImage.digest,
+    }),
   });
 }
 
@@ -1133,10 +1159,11 @@ async function verifyEvidence({
     document,
     expectedRuntime,
   );
-  const runtimeIdentity = await protectPromise(
+  const runtimeIdentityCarrier = await protectPromise(
     inspectRuntime(inspectCodex, projection),
   );
-  return { projection, runtimeIdentity };
+  const runtimeIdentity = runtimeIdentityCarrier.value;
+  return exactFrozenRecord({ projection, runtimeIdentity });
 }
 
 function makeOpaqueReservation() {
@@ -1144,7 +1171,7 @@ function makeOpaqueReservation() {
 }
 
 function consumptionProjection(record) {
-  return deepFreeze({
+  return exactFrozenRecord({
     projection: record.projection,
     runtimeIdentity: record.runtimeIdentity,
   });
@@ -1191,7 +1218,7 @@ export class PlatformImageReservationCoordinator {
       state: "issued",
     };
     weakMapSet(this.#reservations, reservation, record);
-    return deepFreeze({
+    return exactFrozenRecord({
       projection: record.projection,
       reservation,
       runtimeIdentity: record.runtimeIdentity,

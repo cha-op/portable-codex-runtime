@@ -49,6 +49,7 @@ const RUNTIME_KEYS = objectFreeze([
   "backend",
   "bootstrap",
   "foreground",
+  "imagePlanReservations",
   "scheduler",
   "stablePlanProvisioning",
   "writerLaunch",
@@ -57,6 +58,9 @@ const BOOTSTRAP_KEYS = objectFreeze(["migrate"]);
 const FOREGROUND_KEYS = objectFreeze([
   "restoreContextContractVersion",
   "runRestore",
+]);
+const IMAGE_PLAN_RESERVATIONS_KEYS = objectFreeze([
+  "prepareImageReservation",
 ]);
 const SCHEDULER_KEYS = objectFreeze(["runStep", "start", "stop"]);
 const STABLE_PLAN_PROVISIONING_KEYS = objectFreeze(["provisionStablePlan"]);
@@ -507,6 +511,11 @@ function runtimeBindings(runtime) {
     FOREGROUND_KEYS,
     OPTION_ERROR_CODE,
   );
+  const imagePlanReservations = exactFrozenSurface(
+    normalizedRuntime.imagePlanReservations,
+    IMAGE_PLAN_RESERVATIONS_KEYS,
+    OPTION_ERROR_CODE,
+  );
   const scheduler = exactFrozenSurface(
     normalizedRuntime.scheduler,
     SCHEDULER_KEYS,
@@ -525,6 +534,11 @@ function runtimeBindings(runtime) {
   ensure(foreground.restoreContextContractVersion === 3, OPTION_ERROR_CODE);
   return exactFrozenRecord({
     migrate: binding(bootstrap, "migrate", OPTION_ERROR_CODE),
+    prepareImageReservation: binding(
+      imagePlanReservations,
+      "prepareImageReservation",
+      OPTION_ERROR_CODE,
+    ),
     reconcileLaunchAttempt: binding(
       writerLaunch,
       "reconcileLaunchAttempt",
@@ -780,6 +794,9 @@ export function createPostgresDetachedRestoreRuntimeController(...args) {
     foreground: exactFrozenRecord({
       restoreContextContractVersion: 3,
       runRestore: ingress(bindings.runRestore),
+    }),
+    imagePlanReservations: exactFrozenRecord({
+      prepareImageReservation: ingress(bindings.prepareImageReservation),
     }),
     stablePlanProvisioning: exactFrozenRecord({
       provisionStablePlan: ingress(bindings.provisionStablePlan),

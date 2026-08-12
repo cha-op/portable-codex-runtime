@@ -7,6 +7,9 @@ import {
   createPostgresDetachedRestoreForegroundComposition,
 } from "./postgres-detached-restore-foreground-composition.mjs";
 import {
+  isPostgresDetachedRestoreImagePlanBinding,
+} from "./postgres-detached-restore-image-plan-binding.mjs";
+import {
   createPostgresDetachedRestoreStablePlanRegistry,
 } from "./postgres-detached-restore-stable-plan-registry.mjs";
 import {
@@ -156,8 +159,7 @@ const STORAGE_OPTION_KEYS = objectFreeze([
   "resolveSourceOwnedRoot",
 ]);
 const LAUNCH_OPTION_KEYS = objectFreeze([
-  "imageReservations",
-  "prepareImageReservation",
+  "imagePlanBinding",
   "stoppedWriterCoordinator",
   "supervisor",
 ]);
@@ -519,6 +521,18 @@ function createWriterLaunchFacet(launcher) {
   return exactFrozenRecord({ reconcileLaunchAttempt, runLaunch });
 }
 
+function createImagePlanReservationsFacet(imagePlanBinding) {
+  const method = ownFrozenDataFunction(
+    imagePlanBinding,
+    "prepareImageReservation",
+  );
+  const prepareImageReservation = function prepareImageReservation(...args) {
+    return callIntrinsic(method, imagePlanBinding, args);
+  };
+  objectFreeze(prepareImageReservation);
+  return exactFrozenRecord({ prepareImageReservation });
+}
+
 function receiverCallback(method, receiver) {
   trustedFunction(method);
   const callback = function receiverCallback(...args) {
@@ -649,7 +663,11 @@ function createRecoveryService(authority, coordinator, launcher) {
 function assemble(options) {
   preflightDistinctPools(options.pools);
   preflightLifecycleBackend(options.storage.lifecycleBackend);
-  preflightPrototypeChain(options.launch.imageReservations);
+  ensure(
+    isPostgresDetachedRestoreImagePlanBinding(
+      options.launch.imagePlanBinding,
+    ),
+  );
   preflightPrototypeChain(options.launch.stoppedWriterCoordinator);
   preflightPrototypeChain(options.storage.publication);
 
@@ -723,7 +741,7 @@ function assemble(options) {
     createLogicalWriterLauncherIntrinsic,
     exactFrozenRecord({
       authority,
-      imageReservations: options.launch.imageReservations,
+      imagePlanBinding: options.launch.imagePlanBinding,
       operationGuard,
       stoppedWriterCoordinator: options.launch.stoppedWriterCoordinator,
       supervisor: options.launch.supervisor,
@@ -779,10 +797,10 @@ function assemble(options) {
       captureBackend: backend,
       durableStopCapture,
       fleetCapabilityGate: options.foreground.fleetCapabilityGate,
+      imagePlanBinding: options.launch.imagePlanBinding,
       launcher,
       lifecycleGuard,
       operationGuard,
-      prepareImageReservation: options.launch.prepareImageReservation,
       resolveStablePlan,
       restoreActivationCoordinator,
       writerDetach,
@@ -821,6 +839,9 @@ function assemble(options) {
     backend,
     bootstrap,
     foreground,
+    imagePlanReservations: createImagePlanReservationsFacet(
+      options.launch.imagePlanBinding,
+    ),
     scheduler,
     stablePlanProvisioning,
     writerLaunch,

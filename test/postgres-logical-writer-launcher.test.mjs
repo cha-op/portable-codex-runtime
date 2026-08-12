@@ -3,8 +3,12 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
-  PlatformImageReservationCoordinator,
-} from "../src/platform-image-reservation.mjs";
+  POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+  createPostgresDetachedRestoreImagePlanBinding,
+} from "../src/postgres-detached-restore-image-plan-binding.mjs";
+import {
+  createPostgresDetachedRestorePlan,
+} from "../src/postgres-detached-restore-plan.mjs";
 import {
   PostgresOperationGuard,
 } from "../src/postgres-operation-guard.mjs";
@@ -75,6 +79,39 @@ const STOP_COMMITTED_TIME = "2026-08-04T12:00:08.000Z";
 const jsonStringify = JSON.stringify;
 const objectCreate = Object.create;
 const objectFreeze = Object.freeze;
+
+function detachedRestorePlan() {
+  return createPostgresDetachedRestorePlan({
+    request: {
+      backendId: BACKEND_ID,
+      contractVersion: 1,
+      fencingEpoch: "11",
+      holderId: "restore-holder-001",
+      leaseId: "restore-lease-001",
+      operation: "restore",
+      operationId: "restore-operation-001",
+      sessionId: SESSION_ID,
+      storageId: STORAGE_ID,
+      target: {
+        artifactId: ARTIFACT_ID,
+        checkpointId: CHECKPOINT_ID,
+        kind: "checkpoint",
+      },
+    },
+    plan: {
+      captureCreatedAt: "2026-08-04T11:00:00.000Z",
+      destinationDirectory: "/var/lib/portable-codex/restores/launcher-001",
+      destinationOwnedRoot: "/var/lib/portable-codex/restores",
+      detachMode: "release",
+      holderId: "restored-writer-holder-001",
+      imagePlanId: "launcher-image-plan-001",
+      leaseDurationMilliseconds: 600_000,
+      sourceArtifactDirectory:
+        "/var/lib/portable-codex/artifacts/launcher-source-001",
+      sourceArtifactOwnedRoot: "/var/lib/portable-codex/artifacts",
+    },
+  });
+}
 
 function callbackOnlyOperationGuardPool() {
   const state = {
@@ -205,6 +242,34 @@ function imageFixture() {
     },
   });
   return { configBytes, descriptor, manifest };
+}
+
+function expectedImageMeasurement(image) {
+  const platformImage = objectFreeze({
+    architecture: "arm64",
+    config: objectFreeze({
+      digest: digest(image.configBytes),
+      mediaType: OCI_CONFIG_MEDIA_TYPE,
+      size: image.configBytes.byteLength,
+    }),
+    digest: image.descriptor.digest,
+    mediaType: OCI_MANIFEST_MEDIA_TYPE,
+    os: "linux",
+    size: image.descriptor.size,
+  });
+  return objectFreeze({
+    projection: objectFreeze({
+      codexSandbox: "danger-full-access",
+      codexVersion: CODEX_VERSION,
+      platformImage,
+    }),
+    runtimeIdentity: objectFreeze({
+      codexBinaryPath: "/opt/portable-codex/bin/codex",
+      codexBinarySha256: "b".repeat(64),
+      codexVersion: CODEX_VERSION,
+      platformImageDigest: image.descriptor.digest,
+    }),
+  });
 }
 
 function lease(overrides = {}) {
@@ -1553,7 +1618,7 @@ async function fixture({
   });
   const operationGuard =
     providedOperationGuard ?? new MemoryOperationGuard(events);
-  const imageReservations = new PlatformImageReservationCoordinator();
+  const imagePlan = detachedRestorePlan();
   let inspectionCount = 0;
   let inspectionFailureAt = null;
   const inspectCodex = async () => {
@@ -1568,12 +1633,27 @@ async function fixture({
       codexVersion: CODEX_VERSION,
     };
   };
-  const reserved = await imageReservations.reservePlatformImage({
-    configBytes: image.configBytes,
-    descriptor: image.descriptor,
+  const imagePlanProvider = objectFreeze({
+    contractVersion:
+      POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+    imagePlanProviderId: "launcher-image-provider-001",
     inspectCodex,
-    sessionManifest: image.manifest,
+    async resolveImagePlan() {
+      return objectFreeze({
+        configBytes: image.configBytes,
+        descriptor: objectFreeze({ ...image.descriptor }),
+      });
+    },
   });
+  const imagePlanBinding =
+    createPostgresDetachedRestoreImagePlanBinding(imagePlanProvider);
+  const imageReservation = await imagePlanBinding.prepareImageReservation(
+    objectFreeze({
+      plan: imagePlan,
+      sessionManifest: image.manifest,
+    }),
+  );
+  const reserved = expectedImageMeasurement(image);
   events.length = 0;
   const stoppedWriterCoordinator =
     providedStoppedWriterCoordinator ??
@@ -1617,7 +1697,7 @@ async function fixture({
   };
   const facade = createPostgresLogicalWriterLauncher({
     authority,
-    imageReservations,
+    imagePlanBinding,
     operationGuard,
     stoppedWriterCoordinator,
     supervisor,
@@ -1635,13 +1715,10 @@ async function fixture({
       return inspectionCount;
     },
     image,
-    imageReservation: {
-      configBytes: image.configBytes,
-      descriptor: image.descriptor,
-      inspectCodex,
-      reservation: reserved.reservation,
-    },
-    imageReservations,
+    imagePlan,
+    imagePlanBinding,
+    imagePlanProvider,
+    imageReservation,
     get launchCalls() {
       return launchCalls;
     },
@@ -1870,18 +1947,12 @@ async function prepareLaunchCycle(
       revision: String(revision),
     });
     value.authority.beginNextAttempt({ expectedSession, generation });
-    const reserved = await value.imageReservations.reservePlatformImage({
-      configBytes: value.imageReservation.configBytes,
-      descriptor: value.imageReservation.descriptor,
-      inspectCodex: value.imageReservation.inspectCodex,
-      sessionManifest: value.image.manifest,
-    });
-    imageReservation = {
-      configBytes: value.imageReservation.configBytes,
-      descriptor: value.imageReservation.descriptor,
-      inspectCodex: value.imageReservation.inspectCodex,
-      reservation: reserved.reservation,
-    };
+    imageReservation = await value.imagePlanBinding.prepareImageReservation(
+      objectFreeze({
+        plan: value.imagePlan,
+        sessionManifest: value.image.manifest,
+      }),
+    );
   }
 
   return {
@@ -2907,7 +2978,7 @@ for (const terminalKind of [
     assert.equal(value.launchCalls, 0);
     assert.equal(value.inspectionCount, 2);
 
-    const stillIssued = await value.imageReservations.revalidateReservation(
+    const stillIssued = await value.imagePlanBinding.revalidateImageReservation(
       value.imageReservation,
     );
     assert.equal(Object.isFrozen(stillIssued), true);
@@ -3268,22 +3339,18 @@ test("cold launcher resumes a prepared attempt with a fresh equivalent image res
     supervisor: intent.supervisor,
   });
 
-  const freshImageReservations = new PlatformImageReservationCoordinator();
-  const fresh = await freshImageReservations.reservePlatformImage({
-    configBytes: value.imageReservation.configBytes,
-    descriptor: value.imageReservation.descriptor,
-    inspectCodex: value.imageReservation.inspectCodex,
-    sessionManifest: value.image.manifest,
-  });
-  const freshImageReservation = {
-    configBytes: value.imageReservation.configBytes,
-    descriptor: value.imageReservation.descriptor,
-    inspectCodex: value.imageReservation.inspectCodex,
-    reservation: fresh.reservation,
-  };
+  const freshImagePlanBinding =
+    createPostgresDetachedRestoreImagePlanBinding(value.imagePlanProvider);
+  const freshImageReservation =
+    await freshImagePlanBinding.prepareImageReservation(
+    objectFreeze({
+      plan: value.imagePlan,
+      sessionManifest: value.image.manifest,
+    }),
+  );
   const coldFacade = createPostgresLogicalWriterLauncher({
     authority: value.authority,
-    imageReservations: freshImageReservations,
+    imagePlanBinding: freshImagePlanBinding,
     operationGuard: new MemoryOperationGuard(value.events),
     stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
     supervisor: value.supervisor,
@@ -3305,9 +3372,9 @@ test("cold launcher resumes a prepared attempt with a fresh equivalent image res
   assert.equal(value.inspectionCount, 5);
 
   const originalStillIssued =
-    await value.imageReservations.revalidateReservation(
-      value.imageReservation,
-    );
+    await value.imagePlanBinding.revalidateImageReservation(
+    value.imageReservation,
+  );
   assert.equal(Object.isFrozen(originalStillIssued), true);
   assert.equal(value.inspectionCount, 6);
 });
@@ -3330,18 +3397,15 @@ test("prepared image revalidation failure leaves the attempt retryable with a fr
   assert.equal(value.inspectionCount, 2);
 
   value.failInspectionAt(null);
-  const fresh = await value.imageReservations.reservePlatformImage({
-    configBytes: value.imageReservation.configBytes,
-    descriptor: value.imageReservation.descriptor,
-    inspectCodex: value.imageReservation.inspectCodex,
-    sessionManifest: value.image.manifest,
-  });
+  const fresh = await value.imagePlanBinding.prepareImageReservation(
+    objectFreeze({
+      plan: value.imagePlan,
+      sessionManifest: value.image.manifest,
+    }),
+  );
   const retried = await value.facade.runPreparedLaunch(
     preparedRunInput(value, {
-      imageReservation: {
-        ...value.imageReservation,
-        reservation: fresh.reservation,
-      },
+      imageReservation: fresh,
     }),
   );
   assert.equal(retried.status, "started");
@@ -3374,7 +3438,7 @@ test("rejects a non-matching opaque image before claim, consumption, or cancella
   assert.equal(value.reconcileCalls, 0);
   assert.equal(value.inspectionCount, 2);
 
-  const stillIssued = await value.imageReservations.revalidateReservation(
+  const stillIssued = await value.imagePlanBinding.revalidateImageReservation(
     value.imageReservation,
   );
   assert.equal(Object.isFrozen(stillIssued), true);
@@ -3412,7 +3476,7 @@ test("rejects a prepared supervisor mismatch before image use or claim", async (
   assert.equal(value.reconcileCalls, 0);
   assert.equal(value.inspectionCount, 1);
 
-  await value.imageReservations.revalidateReservation(
+  await value.imagePlanBinding.revalidateImageReservation(
     value.imageReservation,
   );
   assert.equal(value.inspectionCount, 2);
@@ -3463,7 +3527,7 @@ test("claim acknowledgement loss reads back and reconciles without consuming", a
   assert.equal(value.reconcileCalls, 1);
   assert.equal(value.inspectionCount, 2);
 
-  await value.imageReservations.revalidateReservation(
+  await value.imagePlanBinding.revalidateImageReservation(
     value.imageReservation,
   );
   assert.equal(value.inspectionCount, 3);
@@ -3509,6 +3573,43 @@ test("claim failure before commit leaves prepared state and image reservation re
   assert.equal(value.authority.calls.cancel, 0);
   assert.equal(value.launchCalls, 1);
   assert.equal(value.inspectionCount, 4);
+});
+
+test("does not consume the image before the durable launch state becomes starting", async () => {
+  const value = await fixture();
+  seedPreparedLaunchHandoff(value);
+  value.authority.behaviour.claimThrowBeforeCommit = true;
+
+  await assert.rejects(
+    value.facade.runPreparedLaunch(preparedRunInput(value)),
+    assertLauncherError("logical_writer_launch_admission_unavailable", true),
+  );
+  assert.equal(value.authority.state, "prepared");
+  assert.equal(value.inspectionCount, 2);
+
+  const stillIssued =
+    await value.imagePlanBinding.revalidateImageReservation(
+      value.imageReservation,
+    );
+  assert.equal(Object.isFrozen(stillIssued), true);
+  assert.equal(value.inspectionCount, 3);
+
+  value.authority.behaviour.claimThrowBeforeCommit = false;
+  const started = await value.facade.runPreparedLaunch(
+    preparedRunInput(value),
+  );
+  assert.equal(started.status, "started");
+  assert.equal(value.authority.state, "committed");
+  assert.equal(value.inspectionCount, 5);
+  await assert.rejects(
+    value.imagePlanBinding.revalidateImageReservation(
+      value.imageReservation,
+    ),
+    (error) =>
+      error?.code ===
+      "postgres_detached_restore_image_plan_reservation_rejected",
+  );
+  assert.equal(value.inspectionCount, 5);
 });
 
 test("prepared launcher rejects a hostile authority read receipt before image use or claim", async () => {
@@ -3571,7 +3672,7 @@ test("hostile prepared-claim receipt uses durable readback without consuming or 
   assert.equal(value.reconcileCalls, 1);
   assert.equal(value.inspectionCount, 2);
 
-  await value.imageReservations.revalidateReservation(
+  await value.imagePlanBinding.revalidateImageReservation(
     value.imageReservation,
   );
   assert.equal(value.inspectionCount, 3);
@@ -3621,7 +3722,7 @@ for (const [name, mutateClaimReceipt] of [
     assert.equal(value.reconcileCalls, 1);
     assert.equal(value.inspectionCount, 2);
 
-    await value.imageReservations.revalidateReservation(
+    await value.imagePlanBinding.revalidateImageReservation(
       value.imageReservation,
     );
     assert.equal(value.inspectionCount, 3);
@@ -4329,7 +4430,7 @@ test("keeps launch behavior stable after selected mutable intrinsics are poisone
   };
   const facade = createPostgresLogicalWriterLauncher({
     authority: value.authority,
-    imageReservations: value.imageReservations,
+    imagePlanBinding: value.imagePlanBinding,
     operationGuard: value.operationGuard,
     stoppedWriterCoordinator: value.stoppedWriterCoordinator,
     supervisor: {
@@ -4404,12 +4505,13 @@ test("preexisting writer blocks before durable reservation or physical launch", 
 test("runLaunch rejects an operation-ID replay with a different durable request", async () => {
   const value = await fixture();
   const first = await value.facade.runLaunch(runInput(value));
-  const freshReservation = await value.imageReservations.reservePlatformImage({
-    configBytes: value.imageReservation.configBytes,
-    descriptor: value.imageReservation.descriptor,
-    inspectCodex: value.imageReservation.inspectCodex,
-    sessionManifest: value.image.manifest,
-  });
+  const freshReservation =
+    await value.imagePlanBinding.prepareImageReservation(
+      objectFreeze({
+        plan: value.imagePlan,
+        sessionManifest: value.image.manifest,
+      }),
+    );
   const inspectionsBeforeReplay = value.inspectionCount;
 
   await assert.rejects(
@@ -4417,12 +4519,7 @@ test("runLaunch rejects an operation-ID replay with a different durable request"
       generation: generationSnapshot({
         generationId: "restore-generation-002",
       }),
-      imageReservation: {
-        configBytes: value.imageReservation.configBytes,
-        descriptor: value.imageReservation.descriptor,
-        inspectCodex: value.imageReservation.inspectCodex,
-        reservation: freshReservation.reservation,
-      },
+      imageReservation: freshReservation,
       launchAttemptId: LAUNCH_ATTEMPT_ID,
     }),
     assertLauncherError("invalid_logical_writer_launch_request"),
@@ -4540,18 +4637,15 @@ test("image revalidation admission failure permits a fresh-reservation retry", a
   assert.equal(value.authority.calls.markUncertain, 0);
 
   value.failInspectionAt(null);
-  const fresh = await value.imageReservations.reservePlatformImage({
-    configBytes: value.imageReservation.configBytes,
-    descriptor: value.imageReservation.descriptor,
-    inspectCodex: value.imageReservation.inspectCodex,
-    sessionManifest: value.image.manifest,
-  });
+  const fresh = await value.imagePlanBinding.prepareImageReservation(
+    objectFreeze({
+      plan: value.imagePlan,
+      sessionManifest: value.image.manifest,
+    }),
+  );
   const result = await value.facade.runLaunch(
     runInput(value, {
-      imageReservation: {
-        ...value.imageReservation,
-        reservation: fresh.reservation,
-      },
+      imageReservation: fresh,
     }),
   );
   assert.equal(result.status, "started");
@@ -5062,7 +5156,7 @@ test("post-launch callback ambiguity marks uncertain once and recovery never rel
   };
   const facade = createPostgresLogicalWriterLauncher({
     authority: value.authority,
-    imageReservations: value.imageReservations,
+    imagePlanBinding: value.imagePlanBinding,
     operationGuard: value.operationGuard,
     stoppedWriterCoordinator: value.stoppedWriterCoordinator,
     supervisor: {
@@ -5191,7 +5285,7 @@ test("rejects hostile proxy inputs and unsafe callback receipts without dispatch
 
   const invalidReceiptFacade = createPostgresLogicalWriterLauncher({
     authority: value.authority,
-    imageReservations: value.imageReservations,
+    imagePlanBinding: value.imagePlanBinding,
     operationGuard: value.operationGuard,
     stoppedWriterCoordinator: value.stoppedWriterCoordinator,
     supervisor: {

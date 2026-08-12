@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { FilesystemOperationJournal } from "../src/filesystem-operation-journal.mjs";
-import { PlatformImageReservationCoordinator } from "../src/platform-image-reservation.mjs";
+import {
+  POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+  createPostgresDetachedRestoreImagePlanBinding,
+} from "../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
@@ -263,7 +266,21 @@ function createRuntimeFixture() {
   };
   const lifecycleBackend = createLifecycleBackend(calls);
   const publication = createPublication(calls);
-  const imageReservations = new PlatformImageReservationCoordinator();
+  const imagePlanBinding = createPostgresDetachedRestoreImagePlanBinding(
+    Object.freeze({
+      contractVersion:
+        POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+      imagePlanProviderId: "runtime-image-provider-001",
+      async inspectCodex() {
+        calls.image += 1;
+        throw new Error("image inspection must not run");
+      },
+      async resolveImagePlan() {
+        calls.image += 1;
+        throw new Error("image plan resolution must not run");
+      },
+    }),
+  );
   const stoppedWriterCoordinator = new StoppedWriterCapabilityCoordinator();
   const supervisor = Object.freeze({
     contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
@@ -292,11 +309,7 @@ function createRuntimeFixture() {
       },
     },
     launch: {
-      imageReservations,
-      prepareImageReservation() {
-        calls.image += 1;
-        throw new Error("image reservation preparation must not run");
-      },
+      imagePlanBinding,
       stoppedWriterCoordinator,
       supervisor,
     },
@@ -341,7 +354,7 @@ function createRuntimeFixture() {
   return {
     calls,
     collaborators: {
-      imageReservations,
+      imagePlanBinding,
       lifecycleBackend,
       publication,
       stoppedWriterCoordinator,
@@ -413,6 +426,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     "backend",
     "bootstrap",
     "foreground",
+    "imagePlanReservations",
     "scheduler",
     "stablePlanProvisioning",
     "writerLaunch",
@@ -425,6 +439,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
         backend: runtime.backend,
         bootstrap: runtime.bootstrap,
         foreground: runtime.foreground,
+        imagePlanReservations: runtime.imagePlanReservations,
         scheduler: runtime.scheduler,
         stablePlanProvisioning: runtime.stablePlanProvisioning,
         writerLaunch: runtime.writerLaunch,
@@ -481,6 +496,14 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   exactKeys(runtime.foreground, ["restoreContextContractVersion", "runRestore"]);
   assert.equal(runtime.foreground.restoreContextContractVersion, 3);
   assert.equal(Object.isFrozen(runtime.foreground), true);
+
+  exactKeys(runtime.imagePlanReservations, ["prepareImageReservation"]);
+  assert.equal(Object.getPrototypeOf(runtime.imagePlanReservations), null);
+  assert.equal(Object.isFrozen(runtime.imagePlanReservations), true);
+  assert.equal(
+    Object.isFrozen(runtime.imagePlanReservations.prepareImageReservation),
+    true,
+  );
 
   assert.equal(isPostgresRestoreRecoveryScheduler(runtime.scheduler), true);
   exactKeys(runtime.scheduler, ["runStep", "start", "stop"]);
@@ -802,11 +825,11 @@ test("runtime composition rejects hostile options without leaking hostile behavi
       apply(options, value) {
         return {
           ...options,
-          launch: { ...options.launch, imageReservations: value },
+          launch: { ...options.launch, imagePlanBinding: value },
         };
       },
-      name: "image reservations receiver with a Proxy prototype",
-      target: PlatformImageReservationCoordinator.prototype,
+      name: "image-plan binding receiver with a Proxy prototype",
+      target: createRuntimeFixture().collaborators.imagePlanBinding,
     },
     {
       apply(options, value) {

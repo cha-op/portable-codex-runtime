@@ -4,6 +4,10 @@ import {
   isPostgresDetachedRestorePlan,
 } from "./postgres-detached-restore-plan.mjs";
 import {
+  isPostgresDetachedRestoreImagePlanBinding,
+  isPostgresDetachedRestoreImagePlanReservation,
+} from "./postgres-detached-restore-image-plan-binding.mjs";
+import {
   derivePostgresLogicalWriterStopOperationId,
 } from "./postgres-logical-writer-launcher.mjs";
 import {
@@ -90,10 +94,10 @@ const OPTION_KEYS = objectFreeze([
   "captureBackend",
   "durableStopCapture",
   "fleetCapabilityGate",
+  "imagePlanBinding",
   "lifecycleGuard",
   "launcher",
   "operationGuard",
-  "prepareImageReservation",
   "resolveStablePlan",
   "restoreActivationCoordinator",
   "writerDetach",
@@ -143,11 +147,8 @@ const WRITER_DETACH_METHODS = objectFreeze([
   "forceFenceWriter",
 ]);
 const LIFECYCLE_METHODS = objectFreeze(["runForeground"]);
-const IMAGE_RESERVATION_KEYS = objectFreeze([
-  "configBytes",
-  "descriptor",
-  "inspectCodex",
-  "reservation",
+const IMAGE_PLAN_BINDING_METHODS = objectFreeze([
+  "prepareImageReservation",
 ]);
 const RESERVATION_IDENTITY_KEYS = objectFreeze([
   "conflictClass",
@@ -2299,24 +2300,16 @@ async function detachWriter(bindings, generation, plan, admission, lease, code) 
 }
 
 function normalizeImageReservation(value, code) {
-  const normalized = exactDataObject(value, IMAGE_RESERVATION_KEYS, code);
-  return exactFrozenRecord({
-    configBytes: normalized.configBytes,
-    descriptor: normalized.descriptor,
-    inspectCodex: trustedFunction(normalized.inspectCodex, code),
-    reservation: normalized.reservation,
-  });
+  ensure(isPostgresDetachedRestoreImagePlanReservation(value), code);
+  return value;
 }
 
-async function prepareImage(bindings, plan, launchIntent, lease, code) {
+async function prepareImage(bindings, plan, sessionManifest, lease, code) {
   await assertLifecycleHeld(lease, code);
-  const prepared = await invokeCallback(
-    bindings.prepareImageReservation,
-    exactFrozenRecord({
-      imagePlanId: plan.imagePlanId,
-      launchIntent,
-      plan,
-    }),
+  const prepared = await invoke(
+    bindings.imagePlanBinding,
+    "prepareImageReservation",
+    [exactFrozenRecord({ plan, sessionManifest })],
     code,
   );
   await assertLifecycleHeld(lease, code);
@@ -2790,16 +2783,25 @@ async function continuePreparedLaunch(
   bindings,
   expected,
   plan,
-  launchIntent,
   imageReservation,
   lease,
   code,
 ) {
   let result;
   if (expected.state === "prepared") {
+    const expectedSession = sessionSnapshot(
+      ownDataValue(expected.operation, "expectedSession", code),
+      code,
+    );
     const preparedImage =
       imageReservation === null
-        ? await prepareImage(bindings, plan, launchIntent, lease, code)
+        ? await prepareImage(
+            bindings,
+            plan,
+            expectedSession.document.manifest,
+            lease,
+            code,
+          )
         : imageReservation;
     await assertLifecycleHeld(lease, code);
     result = await invoke(
@@ -2857,7 +2859,13 @@ async function runActivationAndLaunch(
         ),
       code,
     );
-    imageReservation = await prepareImage(bindings, plan, null, lease, code);
+    imageReservation = await prepareImage(
+      bindings,
+      plan,
+      detachedSession.document.manifest,
+      lease,
+      code,
+    );
     launchIntent = normalizeLaunchIntent(
       await invoke(
         bindings.launcher,
@@ -2921,7 +2929,6 @@ async function runActivationAndLaunch(
       bindings,
       launchRead,
       plan,
-      launchIntent,
       imageReservation,
       lease,
       code,
@@ -2984,7 +2991,6 @@ async function runActivationAndLaunch(
     bindings,
     handoff,
     plan,
-    launchIntent,
     imageReservation,
     lease,
     code,
@@ -3168,6 +3174,10 @@ function createBindings(options, code) {
   ensure(isPostgresRestoreLifecycleGuard(options.lifecycleGuard), code);
   ensure(isPostgresOperationGuard(options.operationGuard), code);
   ensure(
+    isPostgresDetachedRestoreImagePlanBinding(options.imagePlanBinding),
+    code,
+  );
+  ensure(
     objectIsFrozen(haveDistinctLifecycleOperationGuardPoolsIntrinsic) &&
       callIntrinsic(
         haveDistinctLifecycleOperationGuardPoolsIntrinsic,
@@ -3192,6 +3202,11 @@ function createBindings(options, code) {
   } catch {
     fail(code);
   }
+  const imagePlanBinding = collaborator(
+    options.imagePlanBinding,
+    IMAGE_PLAN_BINDING_METHODS,
+    code,
+  );
   return exactFrozenRecord({
     authority: collaborator(options.authority, AUTHORITY_METHODS, code),
     captureBackend,
@@ -3201,13 +3216,10 @@ function createBindings(options, code) {
       code,
     ),
     fleetCapabilityGate: trustedFunction(options.fleetCapabilityGate, code),
+    imagePlanBinding,
     launcher: collaborator(options.launcher, LAUNCHER_METHODS, code),
     lifecycle: collaborator(options.lifecycleGuard, LIFECYCLE_METHODS, code),
     operationGuard: options.operationGuard,
-    prepareImageReservation: trustedFunction(
-      options.prepareImageReservation,
-      code,
-    ),
     resolveStablePlan: trustedFunction(options.resolveStablePlan, code),
     restoreActivationCoordinator: collaborator(
       options.restoreActivationCoordinator,
