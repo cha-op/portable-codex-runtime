@@ -12773,7 +12773,7 @@ test(
     await assert.rejects(
       deployment.writerLaunch.runLaunch({
         generation: {
-          binding: {},
+          binding: null,
           checkpointId,
           claimedAt: new Date().toISOString(),
           committedAt: new Date().toISOString(),
