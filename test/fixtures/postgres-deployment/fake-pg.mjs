@@ -173,6 +173,16 @@ export class Client extends EventEmitter {
   }
 
   query(query, values, callback) {
+    if (
+      typeof query === "object" &&
+      query !== null &&
+      typeof query.callback !== "function"
+    ) {
+      // Match pg@8.22 normalizeQueryConfig(): a positional callback is
+      // assigned back onto an object config before Query construction.
+      if (typeof values === "function") query.callback = values;
+      if (typeof callback === "function") query.callback = callback;
+    }
     if (typeof query === "object" && typeof query?.callback === "function") {
       this.#queryCallback(query);
       return undefined;
@@ -299,11 +309,25 @@ export class Client extends EventEmitter {
       });
       return;
     }
-    callback(new Error(`unexpected callback query: ${text}`));
+    let result;
+    try {
+      result = this.#queryResult(text, query.values, false);
+    } catch (error) {
+      callback(error);
+      return;
+    }
+    if (result instanceof PromiseConstructor) {
+      reflectApply(promiseThenIntrinsic, result, [
+        (resolved) => callback(null, markRawQueryResult(resolved)),
+        (error) => callback(error),
+      ]);
+      return;
+    }
+    callback(null, markRawQueryResult(result));
   }
 
-  #queryResult(text, values) {
-    state.events.push(["query", this.pool.role, text]);
+  #queryResult(text, values, recordEvent = true) {
+    if (recordEvent) state.events.push(["query", this.pool.role, text]);
     if (
       text.includes("current_database()") &&
       text.includes("database_user") &&

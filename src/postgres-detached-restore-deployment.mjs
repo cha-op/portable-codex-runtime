@@ -90,6 +90,7 @@ const ERROR_MESSAGES = objectFreeze({
 const MAX_DRIVER_RESULT_KEYS = 16;
 const MAX_DRIVER_RESULT_SET_LENGTH = 256;
 const MAX_DRIVER_ROW_KEYS = 256;
+const MAX_DRIVER_QUERY_CONFIG_KEYS = 16;
 
 const TOP_LEVEL_OPTION_KEYS = objectFreeze(["postgres", "runtime"]);
 const POSTGRES_OPTION_KEYS = objectFreeze([
@@ -686,6 +687,58 @@ function safeDriverRow(value) {
   return objectFreeze(row);
 }
 
+function callbackQueryConfig(value, callback) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !arrayIsArray(value) &&
+      !isProxyValue(value),
+    OUTCOME_ERROR_CODE,
+  );
+  let keys;
+  let prototype;
+  try {
+    keys = reflectOwnKeys(value);
+    prototype = objectGetPrototypeOf(value);
+  } catch {
+    fail(OUTCOME_ERROR_CODE);
+  }
+  ensure(
+    (prototype === objectPrototype || prototype === null) &&
+      keys.length > 0 &&
+      keys.length <= MAX_DRIVER_QUERY_CONFIG_KEYS,
+    OUTCOME_ERROR_CODE,
+  );
+  const copied = objectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    ensure(typeof key === "string" && key !== "callback", OUTCOME_ERROR_CODE);
+    let descriptor;
+    try {
+      descriptor = objectGetOwnPropertyDescriptor(value, key);
+    } catch {
+      fail(OUTCOME_ERROR_CODE);
+    }
+    ensure(
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+      OUTCOME_ERROR_CODE,
+    );
+    objectDefineProperty(copied, key, {
+      configurable: false,
+      enumerable: true,
+      value: descriptor.value,
+      writable: false,
+    });
+  }
+  objectDefineProperty(copied, "callback", {
+    configurable: false,
+    enumerable: true,
+    value: callback,
+    writable: false,
+  });
+  return objectFreeze(copied);
+}
+
 function binding(receiver, name, code = OUTCOME_ERROR_CODE) {
   return objectFreeze({
     method: prototypeDataValue(receiver, name, code),
@@ -1220,13 +1273,14 @@ function createRuntimeClientFacade(client, release) {
 
   const queryClient = function queryClient(...queryArgs) {
     ensure(queryArgs.length === 1 || queryArgs.length === 2, OUTCOME_ERROR_CODE);
-    const config = queryArgs.length === 1 ? queryArgs[0] : null;
+    const first = queryArgs[0];
+    let config = null;
+    if (first !== null && typeof first === "object") {
+      ensure(!isProxyValue(first), OUTCOME_ERROR_CODE);
+      config = first;
+    }
     let callbackDescriptor;
-    if (
-      config !== null &&
-      typeof config === "object" &&
-      !isProxyValue(config)
-    ) {
+    if (config !== null) {
       try {
         callbackDescriptor = objectGetOwnPropertyDescriptor(config, "callback");
       } catch {
@@ -1274,11 +1328,20 @@ function createRuntimeClientFacade(client, release) {
         callIntrinsic(resolve, undefined, [safeResult]);
       };
       objectFreeze(onQuery);
-      const forwarded = [];
-      for (let index = 0; index < queryArgs.length; index += 1) {
-        forwarded[index] = queryArgs[index];
+      let forwarded;
+      if (config !== null) {
+        ensure(queryArgs.length === 1, OUTCOME_ERROR_CODE);
+        // node-postgres writes a positional callback into an object query
+        // config. Copy the caller-owned frozen config and preinstall the
+        // callback so the driver never mutates authority-owned input.
+        forwarded = [callbackQueryConfig(config, onQuery)];
+      } else {
+        forwarded = [];
+        for (let index = 0; index < queryArgs.length; index += 1) {
+          forwarded[index] = queryArgs[index];
+        }
+        forwarded[queryArgs.length] = onQuery;
       }
-      forwarded[queryArgs.length] = onQuery;
       try {
         const returned = callIntrinsic(
           clientQueryIntrinsic,
