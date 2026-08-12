@@ -14,6 +14,9 @@ import {
   isPostgresDetachedRestoreImagePlanReservation,
 } from "../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
+  createPhysicalCollaboratorSettlement,
+} from "../src/physical-collaborator-settlement.mjs";
+import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
@@ -92,6 +95,28 @@ const IMAGE_DESCRIPTOR = Object.freeze({
   mediaType: OCI_MANIFEST_MEDIA_TYPE,
   size: IMAGE_DESCRIPTOR_BYTES.byteLength,
 });
+const ignoreSettlementFatal = Object.freeze(() => undefined);
+
+function createImagePlanProviderSettlement() {
+  const options = Object.freeze({
+    deadlineMilliseconds: 30_000,
+    onFatal: ignoreSettlementFatal,
+    settlementGraceMilliseconds: 1_000,
+  });
+  return Object.freeze({
+    inspectCodex: createPhysicalCollaboratorSettlement(options),
+    resolveImagePlan: createPhysicalCollaboratorSettlement(options),
+  });
+}
+
+function createTestImagePlanBinding(provider) {
+  return createPostgresDetachedRestoreImagePlanBinding(
+    Object.freeze({
+      provider,
+      settlement: createImagePlanProviderSettlement(),
+    }),
+  );
+}
 
 function safeProviderCarrier(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -162,7 +187,7 @@ function manifest() {
 }
 
 function imagePlanBinding({ onResolve = undefined } = {}) {
-  return createPostgresDetachedRestoreImagePlanBinding(
+  return createTestImagePlanBinding(
     Object.freeze({
       contractVersion:
         POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,

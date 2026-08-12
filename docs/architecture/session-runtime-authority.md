@@ -1944,6 +1944,50 @@ registry content, verify publisher or signature trust, pin a concrete runtime
 image, launch a container, implement the supervisor or physical
 provider/storage backend, or fence a writer.
 
+Image-plan provider contract version 2 now carries physical-collaborator
+settlement inputs.
+Deployment requires a separate exact policy for `resolveImagePlan` and
+`inspectCodex`; each policy supplies `deadlineMilliseconds` and
+`settlementGraceMilliseconds`, each an explicit integer from 1 through
+86,400,000. It pre-binds the selected policy around each method so the provider
+cannot choose or exchange its budget. Each call receives a fresh frozen null-
+prototype zero-field opaque invocation identity and a fresh authentic non-
+aborted `AbortSignal`. The exact frozen null-prototype resolver input is
+`{imagePlanId, imagePlanProviderId, invocation, sessionManifest, signal}`; the
+inspector input is
+`{imagePlanId, imagePlanProviderId, inspection, invocation, signal}`. Reaching
+the result deadline aborts that signal and permanently rejects the invocation
+as uncertain. The following grace observes and drains only the original
+Promise; a late fulfilment is never accepted as success and never grants a
+retry. Timer callbacks and provider-settlement reactions both recheck a
+module-captured monotonic clock, so event-loop delay cannot extend either the
+result-acceptance window or the settlement grace.
+
+If that Promise has still not settled when grace expires, the settlement
+foundation invokes a deployment-private fatal hook at most once for that
+invocation. The hook initiates the existing terminal deployment shutdown and
+is not exposed as a provider callback or a public stop capability. A breach
+does not prove that the provider, a child process, a network operation, or a
+physical side effect is quiet. The deployment therefore cannot report a clean
+stopped result or treat attempted dependency cleanup as proof of a safe drain
+merely because the deadline or grace elapsed. It remains failed even if it
+attempts every owned pool closure, while the original provider Promise stays
+observed for any later settlement. Abort is a cooperative request and a timer
+cannot preempt a synchronous callback that blocks the event loop.
+
+The image-plan provider is therefore a trusted deployment collaborator, not an
+arbitrary hostile-code sandbox. It must return a directly observable native
+Promise. The settlement boundary rejects proxies, thenables, Promise
+subclasses, and unsafe own Promise reaction or constructor surfaces without
+executing their traps. A provider that first rejects a Promise and then installs
+an unreplaceable throwing own `constructor` accessor has already made the
+standard JavaScript observation mechanisms (`then` and `await`) unusable; the
+boundary fails that invocation and starts fatal shutdown, but cannot suppress
+the process-level unhandled rejection without a global handler that would
+weaken unrelated failure isolation. Providers that require hostile-code
+isolation must run behind a process boundary with an ordinary observable native
+Promise adapter.
+
 Startup simultaneously checks out one connection from every role before
 migration. Every connection must report the configured database, PostgreSQL
 13 or newer, `transaction_read_only = off`, `pg_is_in_recovery() = false`, and
@@ -1969,10 +2013,11 @@ error. This distinction applies only after the factory returned a deployment;
 construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
-Deployment must next bound physical-collaborator settlement and deadlines,
-admit an explicit operational lease budget, and complete the assembled
-restart/ambiguous-outcome matrix before constructing the final public backend
-or enabling the production entry point.
+Deployment must next extend method-specific settlement to the mutating
+supervisor, storage-lifecycle, and publication collaborators, admit an explicit
+operational lease budget across the resulting critical path, and complete the
+assembled restart/ambiguous-outcome/deadline matrix before constructing the
+final public backend or enabling the production entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2016,7 +2061,9 @@ Production deployment requires:
   WAL, or an equivalent monotonic audit source. If that ordering cannot be
   proved, operators must fence and rekey the affected backend and session
   namespaces before reopening admission;
-- bounded retry and request deadlines at the service boundary; and
+- bounded retry and request deadlines at the service boundary, plus explicit
+  per-method physical-collaborator result deadlines and settlement grace where
+  an in-process Promise fronts an external effect; and
 - deployment scheduling for the bounded recovery enumerator and service loop.
   It must preserve the stable frozen backend and artefact-root configuration,
   enforce statement/request deadlines, and leave guard-busy or unverifiable
@@ -2088,8 +2135,10 @@ object graph, same-launcher writer-start ingress, separately gated durable plan
 provisioning, restart readback, private read-only resolver, deployment-owned
 migration/admission/drain controller, explicit PostgreSQL pool-owning
 deployment, and deployment-owned image-plan binding now exist. The next
-integration slices must bound physical-collaborator settlement and deadlines,
-admit the operational lease budget, cover whole-graph restart/ambiguity, and
-wire the final adapter before production `runRestore()` can open.
+physical-collaborator settlement foundation and its image resolver/inspector
+consumer also exist. The next integration slices must extend that contract to
+mutating supervisor, storage-lifecycle, and publication methods, admit the
+operational lease budget, cover whole-graph restart/ambiguity/deadline cases,
+and wire the final adapter before production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

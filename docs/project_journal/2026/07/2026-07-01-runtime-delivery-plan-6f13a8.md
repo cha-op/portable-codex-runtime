@@ -50,23 +50,30 @@ superseded_by:
   also owns the exact image-plan provider configuration and private binding
   from an authentic plan's `imagePlanId` through exact OCI bytes and trusted
   inspection to an opaque reservation shared by the controller-gated facet,
-  foreground preparation, and launcher revalidation. The production adapter
+  foreground preparation, and launcher revalidation. The physical-collaborator
+  settlement foundation now gives those two provider methods separate result
+  deadlines and post-deadline grace periods, fresh opaque invocation identities
+  and authentic abort signals, and a deployment-private fatal breach route
+  without claiming physical quiet or retry authority. The production adapter
   remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Bound physical-collaborator settlement and deadlines, then admit the
-  operational lease budget.
-- Validate the complete assembled restart and ambiguous-outcome matrix, then
-  construct the final public restore-capable backend and enable the production
-  adapter only if the no-second-writer boundary remains closed.
+- Extend method-specific physical-collaborator settlement to mutating
+  supervisor, storage-lifecycle, and publication calls, then admit the
+  operational lease budget across the complete critical path.
+- Validate the complete assembled restart, ambiguous-outcome, deadline, and
+  grace-breach matrix, then construct the final public restore-capable backend
+  and enable the production adapter only if the no-second-writer boundary
+  remains closed.
 
 ## Evidence
 
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
+- `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - `docs/project_journal/2026/08/2026-08-12-postgres-detached-restore-deployment-7d4a91.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-deployment-lifecycle-3a7f6c.md`

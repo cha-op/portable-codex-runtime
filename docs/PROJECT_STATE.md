@@ -362,11 +362,20 @@
   This is image identity authority only, not fetch, signature verification,
   container-runtime pinning or launch, supervisor/provider/storage execution,
   or a physical writer fence.
+- The physical-collaborator settlement foundation now gives image-plan
+  resolution and trusted Codex inspection separate explicit result deadlines
+  and post-deadline settlement grace periods. Provider contract version 2
+  receives one fresh opaque invocation identity and authentic abort signal per
+  call. Deadline abort permanently rejects the result; grace only observes the
+  original Promise, and failure to settle invokes a private deployment fatal
+  hook. Neither abort nor that hook proves physical quiescence, makes attempted
+  dependency cleanup a clean stopped result, or authorizes another dispatch.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires bounded physical-collaborator settlement/deadline policy,
-  operational lease admission, full assembled restart and ambiguous-outcome
-  validation, and the final public adapter route.
+  requires method-specific settlement for the mutating supervisor, storage-
+  lifecycle, and publication calls, operational lease admission, full
+  assembled restart/ambiguous-outcome/deadline validation, and the final public
+  adapter route.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -375,6 +384,8 @@
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Physical-collaborator settlement:
+  `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
 - Detached-restore image-plan binding:
   `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - Detached-restore stable-plan registry:
@@ -472,7 +483,9 @@
   admitted-call drain, explicit PostgreSQL bootstrap configuration, and pool
   closure now have one deployment owner; its `stop` facet is not distributed
   to injected runtime collaborators. Its image-plan binding now owns exact OCI
-  bytes, trusted inspection, and opaque reservation identity. Production still
-  requires bounded physical-collaborator settlement and deadlines, operational
-  lease admission, whole-graph fail-closed validation, and final public-adapter
-  assembly before `runRestore()` may be enabled.
+  bytes, trusted inspection, opaque reservation identity, and separate bounded
+  settlement policy for provider resolution and inspection. Production still
+  requires settlement coverage for mutating supervisor, storage-lifecycle, and
+  publication collaborators, operational lease admission, whole-graph fail-
+  closed validation, and final public-adapter assembly before `runRestore()` may
+  be enabled.

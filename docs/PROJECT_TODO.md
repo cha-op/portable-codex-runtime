@@ -123,11 +123,17 @@
   closes every pool after controller drain. The deployment-owned image-plan
   binding now resolves an authentic plan's `imagePlanId` to exact OCI bytes,
   trusted inspection, and one opaque reservation shared by foreground
-  preparation and launcher revalidation.
-  Next bound physical-collaborator settlement and deadlines, admit the
-  operational lease budget, run the complete assembled restart/ambiguous-
-  outcome matrix, construct the final public backend, and only then replace
-  the fixed fail-closed `runRestore()` stub.
+  preparation and launcher revalidation. The settlement foundation now applies
+  separate result deadlines and post-deadline grace periods to image resolution
+  and inspection, supplies provider contract version 2 with a fresh authentic
+  abort signal plus opaque invocation identity, and routes a no-settlement
+  breach only to deployment-owned fatal shutdown without claiming physical
+  quiet or retry authority.
+  Next extend method-specific settlement to mutating supervisor, storage-
+  lifecycle, and publication calls, admit the operational lease budget, run the
+  complete assembled restart/ambiguous-outcome/deadline matrix, construct the
+  final public backend, and only then replace the fixed fail-closed
+  `runRestore()` stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

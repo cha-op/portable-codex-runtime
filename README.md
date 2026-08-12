@@ -390,9 +390,10 @@ boundary. Expiry fails closed and never authorizes a second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
 checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
-must bound physical-collaborator settlement and deadlines, admit an explicit
-operational lease budget, run the whole restart/ambiguous-outcome matrix, and
-only then construct the final public backend. A
+must extend method-specific physical-collaborator settlement from the image
+provider to mutating supervisor, storage-lifecycle, and publication calls,
+admit an explicit operational lease budget, run the whole restart/ambiguous-
+outcome/deadline matrix, and only then construct the final public backend. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
 facet plus narrow `stablePlanProvisioning` and `imagePlanReservations` facets
@@ -437,6 +438,15 @@ revalidates that reservation before launch can cross its durable boundary.
 Both provider callbacks must settle their native Promises with exact frozen
 null-prototype records, so result settlement cannot inherit a process-global
 `then` before the binding snapshots and validates the evidence.
+Provider contract version 2 also gives each call one fresh opaque invocation
+identity and one fresh authentic abort signal. Resolution and inspection have
+separate explicit result deadlines and post-deadline settlement grace periods
+selected by deployment, not by the provider. Deadline abort closes result
+acceptance permanently; grace only observes the original Promise, so a late
+success remains uncertain.
+Failure to settle through grace invokes a private deployment fatal hook and
+closes admission, but does not prove that callback, network, process, or
+physical effects are quiet and never authorizes a second dispatch.
 This completes image identity binding, not image fetch, signature verification,
 container-runtime pinning, container launch, supervisor implementation,
 physical storage/provider work, or writer fencing.
@@ -622,10 +632,11 @@ explicit PostgreSQL connection/bootstrap configuration, restore admission,
 shutdown drain, and final closure of four private pools now have one
 deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
 not a callback available to injected runtime collaborators. Production restore
-remains fail-closed until later slices bound physical-collaborator settlement
-and deadlines, admit the operational lease budget, complete assembled
-restart/ambiguity validation, and wire the final adapter. Filesystem-image
-execution and differential backup remain later work.
+remains fail-closed. The settlement foundation and bounded image-provider
+consumer are complete; later slices must cover the mutating physical
+collaborators, admit the operational lease budget, complete assembled
+restart/ambiguity/deadline validation, and wire the final adapter. Filesystem-
+image execution and differential backup remain later work.
 See
 `docs/architecture/stopped-directory-backend.md`.
 

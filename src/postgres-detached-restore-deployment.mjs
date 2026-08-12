@@ -16,6 +16,9 @@ import {
 import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
+import {
+  createPhysicalCollaboratorSettlement,
+} from "./physical-collaborator-settlement.mjs";
 
 const ArrayConstructor = Array;
 const arrayIncludesIntrinsic = Array.prototype.includes;
@@ -77,6 +80,8 @@ const createImagePlanBindingIntrinsic =
   createPostgresDetachedRestoreImagePlanBinding;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
+const createPhysicalSettlementIntrinsic =
+  createPhysicalCollaboratorSettlement;
 
 const OPTION_ERROR_CODE =
   "invalid_postgres_detached_restore_deployment_options";
@@ -96,6 +101,7 @@ const MAX_DRIVER_RESULT_KEYS = 16;
 const MAX_DRIVER_RESULT_SET_LENGTH = 256;
 const MAX_DRIVER_ROW_KEYS = 256;
 const MAX_DRIVER_QUERY_CONFIG_KEYS = 16;
+const MAX_PHYSICAL_SETTLEMENT_MILLISECONDS = 86_400_000;
 
 const TOP_LEVEL_OPTION_KEYS = objectFreeze(["postgres", "runtime"]);
 const POSTGRES_OPTION_KEYS = objectFreeze([
@@ -148,6 +154,7 @@ const AUTHORITY_OPTION_KEYS = objectFreeze([
 const FOREGROUND_OPTION_KEYS = objectFreeze(["fleetCapabilityGate"]);
 const LAUNCH_OPTION_KEYS = objectFreeze([
   "imagePlanProvider",
+  "imagePlanProviderSettlement",
   "stoppedWriterCoordinator",
   "supervisor",
 ]);
@@ -156,6 +163,14 @@ const IMAGE_PLAN_PROVIDER_KEYS = objectFreeze([
   "imagePlanProviderId",
   "inspectCodex",
   "resolveImagePlan",
+]);
+const IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS = objectFreeze([
+  "inspectCodex",
+  "resolveImagePlan",
+]);
+const PHYSICAL_SETTLEMENT_POLICY_KEYS = objectFreeze([
+  "deadlineMilliseconds",
+  "settlementGraceMilliseconds",
 ]);
 const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
   "provisioningFleetCapabilityGate",
@@ -1021,6 +1036,18 @@ function normalizeRuntimeOptions(value) {
     launch.imagePlanProvider,
     IMAGE_PLAN_PROVIDER_KEYS,
   );
+  const imagePlanProviderSettlement = exactDataObject(
+    launch.imagePlanProviderSettlement,
+    IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS,
+  );
+  const inspectCodexSettlement = exactDataObject(
+    imagePlanProviderSettlement.inspectCodex,
+    PHYSICAL_SETTLEMENT_POLICY_KEYS,
+  );
+  const resolveImagePlanSettlement = exactDataObject(
+    imagePlanProviderSettlement.resolveImagePlan,
+    PHYSICAL_SETTLEMENT_POLICY_KEYS,
+  );
   const planRegistry = exactDataObject(
     runtime.planRegistry,
     PLAN_REGISTRY_OPTION_KEYS,
@@ -1040,6 +1067,32 @@ function normalizeRuntimeOptions(value) {
     foreground,
     launch: exactFrozenRecord({
       imagePlanProvider,
+      imagePlanProviderSettlement: exactFrozenRecord({
+        inspectCodex: exactFrozenRecord({
+          deadlineMilliseconds: normalizeInteger(
+            inspectCodexSettlement.deadlineMilliseconds,
+            1,
+            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+          ),
+          settlementGraceMilliseconds: normalizeInteger(
+            inspectCodexSettlement.settlementGraceMilliseconds,
+            1,
+            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+          ),
+        }),
+        resolveImagePlan: exactFrozenRecord({
+          deadlineMilliseconds: normalizeInteger(
+            resolveImagePlanSettlement.deadlineMilliseconds,
+            1,
+            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+          ),
+          settlementGraceMilliseconds: normalizeInteger(
+            resolveImagePlanSettlement.settlementGraceMilliseconds,
+            1,
+            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+          ),
+        }),
+      }),
       stoppedWriterCoordinator: launch.stoppedWriterCoordinator,
       supervisor: launch.supervisor,
     }),
@@ -1702,12 +1755,55 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   const options = exactDataObject(args[0], TOP_LEVEL_OPTION_KEYS);
   const postgres = normalizePostgresOptions(options.postgres);
   const runtimeOptions = normalizeRuntimeOptions(options.runtime);
+  let requestFatalShutdown = null;
+  const handlePhysicalSettlementFatal = objectFreeze(
+    function handlePhysicalSettlementFatal() {
+      if (requestFatalShutdown !== null) requestFatalShutdown();
+    },
+  );
+  let inspectCodexSettlement;
+  let inspectCodexSettlementStop;
+  let resolveImagePlanSettlement;
+  let resolveImagePlanSettlementStop;
   let imagePlanBinding;
   try {
+    inspectCodexSettlement = callIntrinsic(
+      createPhysicalSettlementIntrinsic,
+      undefined,
+      [
+        exactFrozenRecord({
+          ...runtimeOptions.launch.imagePlanProviderSettlement.inspectCodex,
+          onFatal: handlePhysicalSettlementFatal,
+        }),
+      ],
+    );
+    resolveImagePlanSettlement = callIntrinsic(
+      createPhysicalSettlementIntrinsic,
+      undefined,
+      [
+        exactFrozenRecord({
+          ...runtimeOptions.launch.imagePlanProviderSettlement.resolveImagePlan,
+          onFatal: handlePhysicalSettlementFatal,
+        }),
+      ],
+    );
+    inspectCodexSettlementStop = binding(inspectCodexSettlement, "stop");
+    resolveImagePlanSettlementStop = binding(
+      resolveImagePlanSettlement,
+      "stop",
+    );
     imagePlanBinding = callIntrinsic(
       createImagePlanBindingIntrinsic,
       undefined,
-      [runtimeOptions.launch.imagePlanProvider],
+      [
+        exactFrozenRecord({
+          provider: runtimeOptions.launch.imagePlanProvider,
+          settlement: exactFrozenRecord({
+            inspectCodex: inspectCodexSettlement,
+            resolveImagePlan: resolveImagePlanSettlement,
+          }),
+        }),
+      ],
     );
   } catch {
     fail(OPTION_ERROR_CODE);
@@ -1715,7 +1811,6 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   const probeKey = createProbeKey();
   const passwordProvider = createPasswordProvider(postgres.password);
   const poolRecords = [];
-  let requestFatalShutdown = null;
   const handleConnectedClientError = function handleConnectedClientError() {
     if (requestFatalShutdown !== null) requestFatalShutdown();
   };
@@ -1950,19 +2045,35 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       controllerBindings.controllerStop,
       [],
     );
+    const inspectCodexStop = settleInvocation(
+      inspectCodexSettlementStop,
+      [],
+    );
+    const resolveImagePlanStop = settleInvocation(
+      resolveImagePlanSettlementStop,
+      [],
+    );
     const startSettlement =
       activeStart === null
         ? settlement({ error: null, ok: true, value: null })
         : await settlePromise(activeStart);
     void startSettlement;
     const controllerSettlement = await controllerStop;
+    const inspectCodexSettlementResult = await inspectCodexStop;
+    const resolveImagePlanSettlementResult = await resolveImagePlanStop;
     const poolSettlement = await settlePromise(closePools());
     try {
       callIntrinsic(asyncResourceEmitDestroyIntrinsic, fatalScope, []);
     } catch {
       fatalShutdown = true;
     }
-    if (!controllerSettlement.ok || !poolSettlement.ok || fatalShutdown) {
+    if (
+      !controllerSettlement.ok ||
+      !inspectCodexSettlementResult.ok ||
+      !resolveImagePlanSettlementResult.ok ||
+      !poolSettlement.ok ||
+      fatalShutdown
+    ) {
       state = "failed";
       fail(OUTCOME_ERROR_CODE);
     }
@@ -1980,12 +2091,27 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   }
 
   async function cleanupAfterStartFailure() {
-    const controllerSettlement = await settleInvocation(
+    const controllerStop = settleInvocation(
       controllerBindings.controllerStop,
       [],
     );
+    const inspectCodexStop = settleInvocation(
+      inspectCodexSettlementStop,
+      [],
+    );
+    const resolveImagePlanStop = settleInvocation(
+      resolveImagePlanSettlementStop,
+      [],
+    );
+    const controllerSettlement = await controllerStop;
+    const inspectCodexSettlementResult = await inspectCodexStop;
+    const resolveImagePlanSettlementResult = await resolveImagePlanStop;
     const poolSettlement = await settlePromise(closePools());
-    let cleanupFailed = !controllerSettlement.ok || !poolSettlement.ok;
+    let cleanupFailed =
+      !controllerSettlement.ok ||
+      !inspectCodexSettlementResult.ok ||
+      !resolveImagePlanSettlementResult.ok ||
+      !poolSettlement.ok;
     try {
       callIntrinsic(asyncResourceEmitDestroyIntrinsic, fatalScope, []);
     } catch {

@@ -389,10 +389,22 @@ Restore and launcher authority are now split into eight serial pull requests:
      This does not fetch images, verify signatures, pin or launch a container
      runtime, implement a supervisor/provider/storage adapter, or create a
      physical writer fence.
-   - Remaining deployment assembly next bounds physical-collaborator
-     settlement and deadlines, admits the operational lease budget, runs the
-     whole assembled restart/ambiguity matrix, and constructs the final public
-     restore-capable backend in that order.
+   - The physical-collaborator settlement foundation and its first deployment
+     consumer are complete. Image-plan resolution and trusted Codex inspection
+     each receive their own explicit result deadline and post-deadline
+     settlement grace. Provider contract version 2 receives one fresh opaque
+     invocation identity and authentic abort signal per call. A deadline closes
+     result acceptance and asks the collaborator to abort; a settlement during
+     grace is still an uncertain operation, not late success. Failure to settle
+     through grace invokes only the deployment-owned private fatal hook, closes
+     admission, and cannot by itself prove callback, process, network, or
+     physical-effect quiescence or authorize another dispatch.
+   - Remaining deployment assembly next applies method-specific settlement to
+     the mutating supervisor, storage-lifecycle, and publication collaborators,
+     then admits an operational lease budget that covers the complete critical
+     path. After that it runs the whole assembled restart/ambiguity/deadline
+     matrix and constructs the final public restore-capable backend in that
+     order.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation
