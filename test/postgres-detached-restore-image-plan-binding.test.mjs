@@ -195,6 +195,92 @@ function assertProtectedPromise(value) {
   return value;
 }
 
+function deferred() {
+  let reject;
+  let resolve;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    reject = rejectPromise;
+    resolve = resolvePromise;
+  });
+  return { promise, reject, resolve };
+}
+
+const PROVIDER_PROMISE_METHOD_KEYS = Object.freeze([
+  "catch",
+  "constructor",
+  "finally",
+  "then",
+]);
+
+function providerPromiseOwnDescriptorSnapshot(value) {
+  return Object.fromEntries(
+    PROVIDER_PROMISE_METHOD_KEYS.map((key) => [
+      key,
+      Object.getOwnPropertyDescriptor(value, key),
+    ]),
+  );
+}
+
+function assertUnshadowedProviderPromise(value) {
+  assert.deepEqual(providerPromiseOwnDescriptorSnapshot(value), {
+    catch: undefined,
+    constructor: undefined,
+    finally: undefined,
+    then: undefined,
+  });
+}
+
+function assertProtectedProviderPromise(value) {
+  const descriptors = providerPromiseOwnDescriptorSnapshot(value);
+  for (const key of PROVIDER_PROMISE_METHOD_KEYS) {
+    assert.deepEqual(
+      {
+        configurable: descriptors[key]?.configurable,
+        enumerable: descriptors[key]?.enumerable,
+        writable: descriptors[key]?.writable,
+      },
+      {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+      },
+    );
+  }
+  for (const key of ["catch", "finally", "then"]) {
+    assert.equal(typeof descriptors[key].value, "function");
+  }
+  const speciesHolder = descriptors.constructor.value;
+  assert.equal(Object.getPrototypeOf(speciesHolder), null);
+  assert.equal(Object.isFrozen(speciesHolder), true);
+  assert.deepEqual(Reflect.ownKeys(speciesHolder), [Symbol.species]);
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptor(speciesHolder, Symbol.species),
+    {
+      configurable: false,
+      enumerable: false,
+      value: Promise,
+      writable: false,
+    },
+  );
+  return descriptors;
+}
+
+async function assertNoProviderUncertainty(pending) {
+  try {
+    return await pending;
+  } catch (error) {
+    assert.notEqual(
+      error?.code,
+      "postgres_detached_restore_image_plan_resolution_uncertain",
+    );
+    assert.notEqual(
+      error?.code,
+      "postgres_detached_restore_image_plan_inspection_uncertain",
+    );
+    throw error;
+  }
+}
+
 test("constructs one exact frozen branded binding without provider I/O", () => {
   const calls = [];
   const binding = createPostgresDetachedRestoreImagePlanBinding(
@@ -1072,6 +1158,129 @@ test("requires direct plain native Promise provider results", async (t) => {
       );
     });
   }
+});
+
+test("protects and reuses one resolver Promise across sequential and concurrent calls", async () => {
+  const image = imageFixture();
+  const cachedResolution = Promise.resolve(resolvedImage(image));
+  assertUnshadowedProviderPromise(cachedResolution);
+  let resolverCalls = 0;
+  const binding = createPostgresDetachedRestoreImagePlanBinding(
+    provider({
+      image,
+      resolveImagePlan() {
+        resolverCalls += 1;
+        return cachedResolution;
+      },
+    }),
+  );
+
+  const first = await assertNoProviderUncertainty(
+    binding.prepareImageReservation(prepareInput(image)),
+  );
+  const protectedDescriptors = assertProtectedProviderPromise(
+    cachedResolution,
+  );
+  const [second, third] = await assertNoProviderUncertainty(
+    Promise.all([
+      binding.prepareImageReservation(prepareInput(image)),
+      binding.prepareImageReservation(prepareInput(image)),
+    ]),
+  );
+
+  assert.equal(resolverCalls, 3);
+  for (const reservation of [first, second, third]) {
+    assert.equal(
+      isPostgresDetachedRestoreImagePlanReservation(reservation),
+      true,
+    );
+    await assertNoProviderUncertainty(
+      binding.consumeImageReservation(reservation),
+    );
+  }
+  assert.deepEqual(
+    providerPromiseOwnDescriptorSnapshot(cachedResolution),
+    protectedDescriptors,
+  );
+});
+
+test("coalesces concurrent resolver calls on one pending provider Promise", async () => {
+  const image = imageFixture();
+  const pendingResolution = deferred();
+  assertUnshadowedProviderPromise(pendingResolution.promise);
+  const binding = createPostgresDetachedRestoreImagePlanBinding(
+    provider({
+      image,
+      resolveImagePlan() {
+        return pendingResolution.promise;
+      },
+    }),
+  );
+
+  const first = binding.prepareImageReservation(prepareInput(image));
+  const second = binding.prepareImageReservation(prepareInput(image));
+  const protectedDescriptors = assertProtectedProviderPromise(
+    pendingResolution.promise,
+  );
+  pendingResolution.resolve(resolvedImage(image));
+  const reservations = await assertNoProviderUncertainty(
+    Promise.all([first, second]),
+  );
+
+  assert.equal(reservations.length, 2);
+  for (const reservation of reservations) {
+    assert.equal(
+      isPostgresDetachedRestoreImagePlanReservation(reservation),
+      true,
+    );
+  }
+  assert.deepEqual(
+    providerPromiseOwnDescriptorSnapshot(pendingResolution.promise),
+    protectedDescriptors,
+  );
+});
+
+test("protects and reuses one inspector Promise through prepare, revalidate, and consume", async () => {
+  const image = imageFixture();
+  const cachedInspection = Promise.resolve(runtimeMeasurement());
+  assertUnshadowedProviderPromise(cachedInspection);
+  let inspectorCalls = 0;
+  const binding = createPostgresDetachedRestoreImagePlanBinding(
+    provider({
+      image,
+      inspectCodex() {
+        inspectorCalls += 1;
+        return cachedInspection;
+      },
+    }),
+  );
+
+  const reservation = await assertNoProviderUncertainty(
+    binding.prepareImageReservation(prepareInput(image)),
+  );
+  const protectedDescriptors = assertProtectedProviderPromise(
+    cachedInspection,
+  );
+  const revalidated = await assertNoProviderUncertainty(
+    binding.revalidateImageReservation(reservation),
+  );
+  assert.equal(Object.isFrozen(revalidated), true);
+  assert.deepEqual(
+    providerPromiseOwnDescriptorSnapshot(cachedInspection),
+    protectedDescriptors,
+  );
+  const consumed = await assertNoProviderUncertainty(
+    binding.consumeImageReservation(reservation),
+  );
+
+  assert.equal(Object.isFrozen(consumed), true);
+  assert.strictEqual(consumed.projection, revalidated.projection);
+  assert.strictEqual(consumed.runtimeIdentity, revalidated.runtimeIdentity);
+  assert.equal(inspectorCalls, 3);
+  assert.deepEqual(
+    providerPromiseOwnDescriptorSnapshot(cachedInspection),
+    protectedDescriptors,
+  );
 });
 
 test("rejects hostile resolver results without invoking accessors or proxy traps", async () => {

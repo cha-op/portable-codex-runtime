@@ -108,6 +108,7 @@ const ERROR_MESSAGES = objectFreeze({
 
 const bindingBrands = new WeakSetConstructor();
 const errorBrands = new WeakSetConstructor();
+const protectedPromiseBrands = new WeakSetConstructor();
 const reservationBrands = new WeakSetConstructor();
 const promiseSpeciesHolder = objectFreeze(
   objectCreate(null, {
@@ -312,14 +313,35 @@ function exactNativePromise(value, code) {
     code,
   );
   let prototype;
+  let ownCatch;
   let ownConstructor;
+  let ownFinally;
   let ownThen;
   try {
     prototype = objectGetPrototypeOf(value);
+    ownCatch = objectGetOwnPropertyDescriptor(value, "catch");
     ownConstructor = objectGetOwnPropertyDescriptor(value, "constructor");
+    ownFinally = objectGetOwnPropertyDescriptor(value, "finally");
     ownThen = objectGetOwnPropertyDescriptor(value, "then");
   } catch {
     fail(code);
+  }
+  if (weakSetHas(protectedPromiseBrands, value)) {
+    ensure(
+      prototype === promisePrototype &&
+        exactProtectedPromiseDescriptor(ownCatch, protectedPromiseCatch) &&
+        exactProtectedPromiseDescriptor(
+          ownConstructor,
+          promiseSpeciesHolder,
+        ) &&
+        exactProtectedPromiseDescriptor(
+          ownFinally,
+          protectedPromiseFinally,
+        ) &&
+        exactProtectedPromiseDescriptor(ownThen, protectedPromiseThen),
+      code,
+    );
+    return value;
   }
   ensure(
     prototype === promisePrototype &&
@@ -328,6 +350,16 @@ function exactNativePromise(value, code) {
     code,
   );
   return value;
+}
+
+function exactProtectedPromiseDescriptor(descriptor, expectedValue) {
+  return (
+    descriptor !== undefined &&
+    descriptor.configurable === false &&
+    descriptor.enumerable === false &&
+    descriptor.value === expectedValue &&
+    descriptor.writable === false
+  );
 }
 
 function protectPromiseReaction(callback) {
@@ -376,6 +408,12 @@ function protectedPromiseFinally(onFinally) {
 
 function protectPromise(value) {
   if (!isPromiseValue(value)) return value;
+  if (weakSetHas(protectedPromiseBrands, value)) {
+    return exactNativePromise(
+      value,
+      "postgres_detached_restore_image_plan_resolution_uncertain",
+    );
+  }
   try {
     objectDefineProperties(value, {
       catch: {
@@ -403,6 +441,7 @@ function protectPromise(value) {
         writable: false,
       },
     });
+    weakSetAdd(protectedPromiseBrands, value);
   } catch {
     fail("postgres_detached_restore_image_plan_resolution_uncertain");
   }
