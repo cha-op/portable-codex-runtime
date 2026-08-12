@@ -11604,7 +11604,7 @@ test(
       });
     const restartedPlan = await restartedRegistry.resolveStablePlan({
       admission,
-      expectedSession: launched,
+      expectedSession: launched.session,
     });
     assert.notStrictEqual(restartedPlan, stablePlan);
     assert.equal(restartedPlan.planSha256, stablePlan.planSha256);
@@ -11692,7 +11692,7 @@ test(
     const recoveredAcknowledgementLossPlan =
       await restartedRegistry.resolveStablePlan({
         admission: acknowledgementLossAdmission,
-        expectedSession: launched,
+        expectedSession: launched.session,
       });
     assert.equal(
       recoveredAcknowledgementLossPlan.planSha256,
@@ -11734,7 +11734,7 @@ test(
     const planAfterRejectedDelete =
       await restartedRegistry.resolveStablePlan({
         admission,
-        expectedSession: launched,
+        expectedSession: launched.session,
       });
     assert.equal(planAfterRejectedDelete.planSha256, stablePlan.planSha256);
 
