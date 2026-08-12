@@ -12582,6 +12582,20 @@ test(
           );
           await cleanupClient.query(
             [
+              "DELETE FROM session_authority.reservations",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.operation_claims",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query(
+            [
               "DELETE FROM session_authority.operation_id_registry",
               "WHERE session_id = $1::uuid",
             ].join(" "),
@@ -12676,7 +12690,9 @@ test(
     });
     const registered = await inspectionAuthority.registerSession(registration);
     assert.equal(registered.sessionId, sessionId);
-    deploymentSession = registered;
+    const attached = await attachWriter(inspectionAuthority, registered);
+    assert.equal(attached.session.document.lifecycle, "ATTACHED");
+    deploymentSession = attached.session;
     const artifactId = `deployment-artifact-${randomUUID()}`;
     const checkpointId = `deployment-checkpoint-${randomUUID()}`;
     const admission = {
@@ -12739,7 +12755,7 @@ test(
     const imageReservation =
       await deployment.imagePlanReservations.prepareImageReservation({
         plan: provisioned,
-        sessionManifest: registered.document.manifest,
+        sessionManifest: attached.session.document.manifest,
       });
     assert.equal(
       isPostgresDetachedRestoreImagePlanReservation(imageReservation),
