@@ -26,6 +26,7 @@ export const STORAGE_CONTRACT_VERSION = 1;
 export const CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION = 1;
 export const PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION = 1;
 export const RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION = 1;
+export const RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION = 1;
 export const SESSION_WORKER_ROOT = "/session";
 export const SESSION_WORKER_LAYOUT = deepFreeze({
   codexHome: "/session/codex-home",
@@ -1159,6 +1160,34 @@ export function assertRestoreAttachmentActivationBackend(value) {
   return backend;
 }
 
+/**
+ * Optional operator-plane extension for reconciling one exact restore
+ * attachment activation. Reconciliation is read-only physical observation;
+ * it does not replace the activation extension or grant a fresh attach.
+ */
+export function assertRestoreAttachmentReconciliationBackend(value) {
+  const backend = assertRestoreAttachmentActivationBackend(value);
+  const version = plainDataDescriptor(
+    backend,
+    "restoreAttachmentReconciliationContractVersion",
+    "invalid_storage_backend",
+    "restore attachment reconciliation backend",
+  ).value;
+  const reconcile = plainDataDescriptor(
+    backend,
+    "reconcileRestoreAttachment",
+    "invalid_storage_backend",
+    "restore attachment reconciliation backend",
+  ).value;
+  ensure(
+    version === RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION &&
+      typeof reconcile === "function",
+    "invalid_storage_backend",
+    "storage backend does not support restore attachment reconciliation",
+  );
+  return backend;
+}
+
 function assertStorageForceFenceRevokedFence(value) {
   assertExactObject(
     value,
@@ -1823,6 +1852,82 @@ export function assertRestoreAttachmentActivationResult(value, options) {
     contractVersion: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
     mutationResult,
     publication,
+  });
+}
+
+export function assertRestoreAttachmentReconciliationResult(value, options) {
+  const code = "invalid_restore_attachment_reconciliation";
+  const { request } = assertOptionsObject(
+    options,
+    ["request"],
+    ["request"],
+    code,
+    "restore attachment reconciliation result options",
+  );
+  let expected;
+  try {
+    expected = assertRestoreAttachmentActivationRequest(request);
+  } catch {
+    fail(code, "restore attachment reconciliation request is invalid");
+  }
+  inspectPlainDataObject(
+    value,
+    code,
+    "restore attachment reconciliation result",
+  );
+  const contractVersion = plainDataDescriptor(
+    value,
+    "contractVersion",
+    code,
+    "restore attachment reconciliation result",
+  ).value;
+  const outcome = plainDataDescriptor(
+    value,
+    "outcome",
+    code,
+    "restore attachment reconciliation result",
+  ).value;
+  ensure(
+    contractVersion ===
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+    code,
+    "restore attachment reconciliation contract version is unsupported",
+  );
+  if (outcome === "applied") {
+    assertExactObject(
+      value,
+      ["contractVersion", "outcome", "result"],
+      code,
+      "restore attachment reconciliation result",
+    );
+    let result;
+    try {
+      result = assertRestoreAttachmentActivationResult(value.result, {
+        request: expected,
+      });
+    } catch {
+      fail(code, "restore attachment reconciliation result is invalid");
+    }
+    return deepFreeze({
+      contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "applied",
+      result,
+    });
+  }
+  ensure(
+    outcome === "absent-and-quiescent" || outcome === "unknown",
+    code,
+    "restore attachment reconciliation outcome is unsupported",
+  );
+  assertExactObject(
+    value,
+    ["contractVersion", "outcome"],
+    code,
+    "restore attachment reconciliation result",
+  );
+  return deepFreeze({
+    contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+    outcome,
   });
 }
 

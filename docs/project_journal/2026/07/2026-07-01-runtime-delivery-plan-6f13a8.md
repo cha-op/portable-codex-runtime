@@ -54,8 +54,11 @@ superseded_by:
   settlement foundation now gives those two provider methods separate result
   deadlines and post-deadline grace periods, fresh opaque invocation identities
   and authentic abort signals, and a deployment-private fatal breach route
-  without claiming physical quiet or retry authority. The production adapter
-  remains fixed fail-closed.
+  without claiming physical quiet or retry authority. Restore activation now
+  also preserves a definite one-shot claim grant only in the live foreground
+  invocation and requires read-only reconciliation before any attachment.
+  Retained or ambiguous state cannot reconstruct a second physical dispatch.
+  The production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
@@ -74,6 +77,7 @@ superseded_by:
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
+- `docs/project_journal/2026/08/2026-08-12-restore-activation-reconciliation-b6d4e1.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - `docs/project_journal/2026/08/2026-08-12-postgres-detached-restore-deployment-7d4a91.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-deployment-lifecycle-3a7f6c.md`

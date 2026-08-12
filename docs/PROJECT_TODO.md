@@ -128,7 +128,9 @@
   and inspection, supplies provider contract version 2 with a fresh authentic
   abort signal plus opaque invocation identity, and routes a no-settlement
   breach only to deployment-owned fatal shutdown without claiming physical
-  quiet or retry authority.
+  quiet or retry authority. Activation now also preserves the live one-shot
+  dispatch grant and reconciles the stable attachment operation read-only;
+  retained or ambiguous work cannot reconstruct a second attach dispatch.
   Next extend method-specific settlement to mutating supervisor, storage-
   lifecycle, and publication calls, admit the operational lease budget, run the
   complete assembled restart/ambiguous-outcome/deadline matrix, construct the

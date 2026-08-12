@@ -2367,7 +2367,9 @@ function normalizeActivationClaim(value, plan, code) {
   const read = normalizeActivationReceipt(value, plan, code);
   const dispatchGranted = ownDataValue(value, "dispatchGranted", code);
   ensure(
-    typeof dispatchGranted === "boolean" && read.state !== "prepared",
+    typeof dispatchGranted === "boolean" &&
+      read.state !== "prepared" &&
+      (!dispatchGranted || read.state === "starting"),
     code,
   );
   return exactFrozenRecord({ dispatchGranted, read });
@@ -2734,6 +2736,7 @@ async function claimActivation(
     base.operationId,
     async (assertOperationHeld) => {
       let read = existing;
+      let dispatchGranted = false;
       if (read === null) {
         await assertOperationHeld();
         await assertLifecycleHeld(lease, code);
@@ -2760,6 +2763,7 @@ async function claimActivation(
         );
         if (settled.ok) {
           const claim = normalizeActivationClaim(settled.value, plan, code);
+          dispatchGranted = claim.dispatchGranted;
           read = claim.read;
         } else {
           read = await readActivationOptional(bindings.authority, plan, code);
@@ -2772,7 +2776,8 @@ async function claimActivation(
           sameData(read.request, base.request, code),
         code,
       );
-      return read;
+      ensure(!dispatchGranted || read.state === "starting", code);
+      return exactFrozenRecord({ dispatchGranted, read });
     },
     code,
   );
@@ -2957,7 +2962,7 @@ async function runActivationAndLaunch(
     operationId: plan.activationOperationId,
     request,
   });
-  activation = await claimActivation(
+  const activationClaim = await claimActivation(
     bindings,
     base,
     plan,
@@ -2965,20 +2970,27 @@ async function runActivationAndLaunch(
     activation,
     code,
   );
+  activation = activationClaim.read;
   await assertLifecycleHeld(lease, code);
   const candidateState =
     activation.state === "starting" ? "starting" : "uncertain";
+  const candidate = activationClaim.dispatchGranted
+    ? exactFrozenRecord({
+        activationOperationId: plan.activationOperationId,
+        dispatchGranted: true,
+        request: activation.request,
+        state: "starting",
+      })
+    : exactFrozenRecord({
+        activationOperationId: plan.activationOperationId,
+        request: activation.request,
+        state: candidateState,
+      });
   const handoff = normalizeActivationHandoff(
     await invoke(
       bindings.restoreActivationCoordinator,
       "reconcileRestoreAttachmentActivation",
-      [
-        exactFrozenRecord({
-          activationOperationId: plan.activationOperationId,
-          request: activation.request,
-          state: candidateState,
-        }),
-      ],
+      [candidate],
       code,
     ),
     activation,

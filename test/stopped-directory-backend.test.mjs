@@ -32,8 +32,10 @@ import {
 import {
   PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   assertPreparedCheckpointCaptureBackend,
   assertRestoreAttachmentActivationBackend,
+  assertRestoreAttachmentReconciliationBackend,
   assertStorageBackend,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
@@ -542,6 +544,8 @@ function createLifecycleBackend({ restoreActivation = false } = {}) {
   if (restoreActivation) {
     backend.restoreAttachmentActivationContractVersion =
       RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION;
+    backend.restoreAttachmentReconciliationContractVersion =
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION;
     backend.prepareRestoreAttachment = async function delegateRestoreActivation(
       input,
     ) {
@@ -549,6 +553,12 @@ function createLifecycleBackend({ restoreActivation = false } = {}) {
       calls.push({ input, method: "prepareRestoreAttachment" });
       return delegatedResult;
     };
+    backend.reconcileRestoreAttachment =
+      async function reconcileRestoreActivation(input) {
+        assert.strictEqual(this, backend);
+        calls.push({ input, method: "reconcileRestoreAttachment" });
+        return delegatedResult;
+      };
   }
   return { backend, calls, delegatedResult };
 }
@@ -1857,11 +1867,16 @@ test("restore context contract negotiation rejects invalid authority shapes with
   }
 });
 
-test("backend exposes restore attachment activation only when the lifecycle provider supports it", async (t) => {
+test("backend exposes restore attachment activation only with complete reconciliation", async (t) => {
   const base = await createFixture(t);
   assert.equal("prepareRestoreAttachment" in base.backend, false);
+  assert.equal("reconcileRestoreAttachment" in base.backend, false);
   assert.equal(
     "restoreAttachmentActivationContractVersion" in base.backend,
+    false,
+  );
+  assert.equal(
+    "restoreAttachmentReconciliationContractVersion" in base.backend,
     false,
   );
 
@@ -1871,15 +1886,31 @@ test("backend exposes restore attachment activation only when the lifecycle prov
     assertRestoreAttachmentActivationBackend(fixture.backend),
     fixture.backend,
   );
+  assert.strictEqual(
+    assertRestoreAttachmentReconciliationBackend(fixture.backend),
+    fixture.backend,
+  );
   assert.equal(
     fixture.backend.restoreAttachmentActivationContractVersion,
     RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   );
   assert.equal(
+    fixture.backend.restoreAttachmentReconciliationContractVersion,
+    RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  );
+  assert.equal(
     Object.hasOwn(fixture.backend, "prepareRestoreAttachment"),
     true,
   );
+  assert.equal(
+    Object.hasOwn(fixture.backend, "reconcileRestoreAttachment"),
+    true,
+  );
   assert.equal(Object.isFrozen(fixture.backend.prepareRestoreAttachment), true);
+  assert.equal(
+    Object.isFrozen(fixture.backend.reconcileRestoreAttachment),
+    true,
+  );
 
   const input = Object.freeze({ activation: "provider-owned-contract" });
   assert.strictEqual(
@@ -1889,6 +1920,14 @@ test("backend exposes restore attachment activation only when the lifecycle prov
   assert.deepEqual(lifecycle.calls.at(-1), {
     input,
     method: "prepareRestoreAttachment",
+  });
+  assert.strictEqual(
+    await fixture.backend.reconcileRestoreAttachment(input),
+    lifecycle.delegatedResult,
+  );
+  assert.deepEqual(lifecycle.calls.at(-1), {
+    input,
+    method: "reconcileRestoreAttachment",
   });
 
   for (const invalidLifecycle of [
@@ -1900,6 +1939,27 @@ test("backend exposes restore attachment activation only when the lifecycle prov
     (() => {
       const value = createLifecycleBackend({ restoreActivation: true });
       delete value.backend.prepareRestoreAttachment;
+      return value.backend;
+    })(),
+    (() => {
+      const value = createLifecycleBackend({ restoreActivation: true });
+      value.backend.restoreAttachmentReconciliationContractVersion = 2;
+      return value.backend;
+    })(),
+    (() => {
+      const value = createLifecycleBackend({ restoreActivation: true });
+      delete value.backend.reconcileRestoreAttachment;
+      return value.backend;
+    })(),
+    (() => {
+      const value = createLifecycleBackend();
+      value.backend.restoreAttachmentActivationContractVersion =
+        RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION;
+      return value.backend;
+    })(),
+    (() => {
+      const value = createLifecycleBackend();
+      value.backend.reconcileRestoreAttachment = async () => {};
       return value.backend;
     })(),
   ]) {
@@ -1933,6 +1993,24 @@ test("restore attachment activation delegation contains provider errors", async 
   let observed;
   await assert.rejects(
     fixture.backend.prepareRestoreAttachment(Object.freeze({ attempt: 1 })),
+    (error) => {
+      observed = error;
+      return assertBackendError(error);
+    },
+  );
+  assert.equal(observed.message.includes("private provider"), false);
+
+  lifecycle.backend.reconcileRestoreAttachment =
+    async function failReconciliation(input) {
+      assert.strictEqual(this, lifecycle.backend);
+      lifecycle.calls.push({ input, method: "reconcileRestoreAttachment" });
+      throw new Error("private provider reconciliation failure");
+    };
+  const reconciliationFixture = await createFixture(t, { lifecycle });
+  await assert.rejects(
+    reconciliationFixture.backend.reconcileRestoreAttachment(
+      Object.freeze({ attempt: 2 }),
+    ),
     (error) => {
       observed = error;
       return assertBackendError(error);

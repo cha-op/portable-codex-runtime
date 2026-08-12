@@ -18,6 +18,7 @@ import {
 } from "../../../src/postgres-detached-restore-stable-plan-registry.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   createSessionManifest,
 } from "../../../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../../../src/stopped-directory-publication.mjs";
@@ -220,8 +221,11 @@ function lifecycleBackend(calls) {
     prepareRestoreAttachment: provider,
     prepareWritableAttachment: provider,
     provisionSession: provider,
+    reconcileRestoreAttachment: provider,
     restoreAttachmentActivationContractVersion:
       RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    restoreAttachmentReconciliationContractVersion:
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
     restoreCheckpoint: provider,
   });
 }

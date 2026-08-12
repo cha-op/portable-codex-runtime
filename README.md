@@ -313,10 +313,11 @@ any creation gate does not disable exact replay or recovery of existing work.
 The bounded restore recovery service sweeps four independent keyset lanes:
 destination generations, attachment activations, prepared or active launch
 attempts, and current-launch inventory. Recovery may verify committed
-publication, replay an idempotent provider activation, finalize durable state,
-or reconcile stopped-only supervisor evidence. It never republishes, reserves
-or consumes an image, invokes the launch callback, reconstructs an opaque
-writer capability, or treats current-launch inventory as adoptable work.
+publication, reconcile an exact provider activation read-only, finalize
+already-applied durable state, or reconcile stopped-only supervisor evidence.
+It never repeats a provider attachment, republishes, reserves or consumes an
+image, invokes the launch callback, reconstructs an opaque writer capability,
+or treats current-launch inventory as adoptable work.
 
 A database-global restore lifecycle guard now uses one versioned PostgreSQL
 session advisory-lock identity for the complete authority candidate universe.
@@ -450,6 +451,12 @@ physical effects are quiet and never authorizes a second dispatch.
 This completes image identity binding, not image fetch, signature verification,
 container-runtime pinning, container launch, supervisor implementation,
 physical storage/provider work, or writer fencing.
+Restore activation now preserves the authority's one-shot dispatch grant only
+for the live claim invocation. Before attachment, the coordinator always asks
+the same backend for read-only reconciliation. A proved `applied` result is
+finalized without another attach; `absent-and-quiescent` permits the first
+attach only while that live grant is present; `unknown`, retained work, and
+claim-acknowledgement loss never reconstruct dispatch authority.
 
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
@@ -568,7 +575,11 @@ the matching optional contract, it also advertises
 `resumePreparedCheckpointCapture()` for a capture that the V3 stop handoff
 already created as `prepared`. When the validated lifecycle backend declares
 matching support, it delegates the optional version 1
-`prepareRestoreAttachment` provider extension with the same backend ID.
+`prepareRestoreAttachment` provider extension and the separate version 1
+read-only `reconcileRestoreAttachment` extension with the same backend ID.
+Reconciliation reports only `applied`, `absent-and-quiescent`, or `unknown`
+for the activation request's stable operation ID. It is observation, not a
+fresh attach grant.
 Provision, writable attachment preparation, detach, force-fence, and destroy
 operations remain delegated lifecycle work.
 

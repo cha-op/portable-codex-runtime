@@ -41,6 +41,7 @@ import { PostgresSerializableStore } from "./postgres-serializable-store.mjs";
 import { PostgresSessionAuthority } from "./postgres-session-authority.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryBackend } from "./stopped-directory-backend.mjs";
@@ -441,11 +442,21 @@ function preflightLifecycleBackend(backend) {
     backend,
     "prepareRestoreAttachment",
   );
+  const reconciliationVersion = prototypeDataValue(
+    backend,
+    "restoreAttachmentReconciliationContractVersion",
+  );
+  const reconcileRestoreAttachment = prototypeDataValue(
+    backend,
+    "reconcileRestoreAttachment",
+  );
   ensure(
-    activationVersion === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    activationVersion === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION &&
+      reconciliationVersion ===
+        RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   );
   trustedFunction(prepareRestoreAttachment);
-
+  trustedFunction(reconcileRestoreAttachment);
 }
 
 function ownFrozenDataFunction(receiver, name) {

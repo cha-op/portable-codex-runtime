@@ -70,11 +70,14 @@ the legacy restore callback contract. Version `3` selects the full typed
 generation-binding contract described below. Every other value, accessor, or
 extra authority field fails construction before a collaboration is invoked.
 
-When the lifecycle backend exposes both
-`restoreAttachmentActivationContractVersion: 1` and
-`prepareRestoreAttachment()`, the adapter validates and delegates that optional
-extension as an exact pair. Supplying only one member fails construction. The
-extension also leaves the v1 base storage-backend method set unchanged.
+When the lifecycle backend exposes
+`restoreAttachmentActivationContractVersion: 1`,
+`prepareRestoreAttachment()`,
+`restoreAttachmentReconciliationContractVersion: 1`, and
+`reconcileRestoreAttachment()`, the adapter validates and delegates that
+optional surface as an exact quartet. Supplying only part of the surface fails
+construction. Both extensions leave the v1 base storage-backend method set
+unchanged.
 
 ## Lifecycle Delegation
 
@@ -99,7 +102,11 @@ capture-reconciliation extension. When advertised,
 `resumePreparedCheckpointCapture` implements the optional fresh prepared-
 capture extension. If present, `prepareRestoreAttachment` implements only the
 optional detached-destination activation extension; it is not synthesized from
-`prepareWritableAttachment`.
+`prepareWritableAttachment`. The activation extension is exposed only together
+with `reconcileRestoreAttachment`, a separate version 1 read-only contract.
+That observer reports `applied`, `absent-and-quiescent`, or `unknown` for the
+same stable activation request. It neither mutates the attachment nor grants a
+fresh provider dispatch.
 
 ## Trusted Collaborators
 

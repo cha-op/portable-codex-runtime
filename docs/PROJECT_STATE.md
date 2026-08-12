@@ -370,6 +370,14 @@
   original Promise, and failure to settle invokes a private deployment fatal
   hook. Neither abort nor that hook proves physical quiescence, makes attempted
   dependency cleanup a clean stopped result, or authorizes another dispatch.
+- Restore activation now preserves its PostgreSQL one-shot dispatch grant only
+  across the live foreground claim. The storage backend exposes a separate
+  version 1 read-only reconciliation contract keyed by the durable activation
+  request. `applied` can finalize exact existing evidence;
+  `absent-and-quiescent` can reach the first attach only with the live grant;
+  `unknown`, retained `starting`/`uncertain` work, and claim acknowledgement
+  loss remain blocked without a second physical dispatch. Durable activation
+  request/result version 1 and the PostgreSQL schema remain unchanged.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
   requires method-specific settlement for the mutating supervisor, storage-
@@ -386,6 +394,8 @@
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
 - Physical-collaborator settlement:
   `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
+- Restore-activation reconciliation:
+  `docs/project_journal/2026/08/2026-08-12-restore-activation-reconciliation-b6d4e1.md`
 - Detached-restore image-plan binding:
   `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - Detached-restore stable-plan registry:

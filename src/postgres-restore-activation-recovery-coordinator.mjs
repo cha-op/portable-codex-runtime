@@ -18,10 +18,13 @@ import {
   createWriterLaunchAttemptOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   assertCheckpointDescriptor,
   assertRestoreAttachmentActivationBackend,
   assertRestoreAttachmentActivationRequest,
   assertRestoreAttachmentActivationResult,
+  assertRestoreAttachmentReconciliationBackend,
+  assertRestoreAttachmentReconciliationResult,
   assertStorageMutationRequest,
   assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
@@ -115,6 +118,12 @@ const GENERATION_CANDIDATE_V2_KEYS = objectFreeze([
 ]);
 const ACTIVATION_CANDIDATE_KEYS = objectFreeze([
   "activationOperationId",
+  "request",
+  "state",
+]);
+const FRESH_ACTIVATION_CANDIDATE_KEYS = objectFreeze([
+  "activationOperationId",
+  "dispatchGranted",
   "request",
   "state",
 ]);
@@ -2758,9 +2767,23 @@ function normalizeGenerationCandidate(value, code) {
 }
 
 function normalizeActivationCandidate(value, code) {
-  const candidate = exactDataObject(value, ACTIVATION_CANDIDATE_KEYS, code);
+  const dispatchGranted =
+    value !== null &&
+    typeof value === "object" &&
+    !isProxyValue(value) &&
+    objectHasOwn(value, "dispatchGranted");
+  const candidate = exactDataObject(
+    value,
+    dispatchGranted
+      ? FRESH_ACTIVATION_CANDIDATE_KEYS
+      : ACTIVATION_CANDIDATE_KEYS,
+    code,
+  );
   ensure(
-    candidate.state === "starting" || candidate.state === "uncertain",
+    (candidate.state === "starting" || candidate.state === "uncertain") &&
+      (!dispatchGranted ||
+        (candidate.dispatchGranted === true &&
+          candidate.state === "starting")),
     code,
   );
   return exactFrozenRecord({
@@ -2768,6 +2791,7 @@ function normalizeActivationCandidate(value, code) {
       candidate.activationOperationId,
       code,
     ),
+    dispatchGranted,
     request: candidate.request,
     state: candidate.state,
   });
@@ -2963,6 +2987,9 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     storageBackend = assertRestoreAttachmentActivationBackend(
       options.storageBackend,
     );
+    storageBackend = assertRestoreAttachmentReconciliationBackend(
+      storageBackend,
+    );
   } catch {
     fail(optionCode);
   }
@@ -2970,6 +2997,13 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     objectGetOwnPropertyDescriptor(
       storageBackend,
       "prepareRestoreAttachment",
+    )?.value,
+    optionCode,
+  );
+  const reconcileRestoreAttachment = trustedFunction(
+    objectGetOwnPropertyDescriptor(
+      storageBackend,
+      "reconcileRestoreAttachment",
     )?.value,
     optionCode,
   );
@@ -3115,6 +3149,94 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       // completed the operation. The original error is intentionally hidden.
     }
     return null;
+  }
+
+  async function reconcileActivationProvider(activationRequest) {
+    let rawReconciliation;
+    try {
+      rawReconciliation = callIntrinsic(
+        reconcileRestoreAttachment,
+        storageBackend,
+        [activationRequest],
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    rawReconciliation = (
+      await awaitTrustedSettlement(
+        settleTrusted(rawReconciliation, outcomeCode),
+        outcomeCode,
+      )
+    ).value;
+    let reconciliation;
+    try {
+      reconciliation = assertRestoreAttachmentReconciliationResult(
+        rawReconciliation,
+        { request: activationRequest },
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    reconciliation = clonePlainData(
+      canonicalJsonData(reconciliation, outcomeCode),
+      outcomeCode,
+    );
+    ensure(
+      reconciliation.contractVersion ===
+        RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcomeCode,
+    );
+    return reconciliation;
+  }
+
+  async function prepareAndFinalizeFreshActivation(
+    read,
+    candidate,
+    activationRequest,
+    probe,
+  ) {
+    try {
+      let rawActivationResult = callIntrinsic(
+        prepareRestoreAttachment,
+        storageBackend,
+        [activationRequest],
+      );
+      rawActivationResult = (
+        await awaitTrustedSettlement(
+          settleTrusted(rawActivationResult, outcomeCode),
+          outcomeCode,
+        )
+      ).value;
+      let activationResult;
+      try {
+        activationResult = assertRestoreAttachmentActivationResult(
+          rawActivationResult,
+          { request: activationRequest },
+        );
+      } catch {
+        fail(outcomeCode);
+      }
+      activationResult = clonePlainData(
+        canonicalJsonData(activationResult, outcomeCode),
+        outcomeCode,
+      );
+      await probeGuard(probe);
+      return await finalizeActivationHandoff(
+        read,
+        candidate,
+        activationRequest,
+        activationResult,
+        "1",
+      );
+    } catch {
+      try {
+        await markStartingUncertain(read);
+      } catch {
+        // The physical dispatch may have occurred. Failure to persist the
+        // uncertainty marker cannot authorize another prepare attempt.
+      }
+      fail(outcomeCode);
+    }
   }
 
   async function runGuarded(operationId, callback) {
@@ -3263,7 +3385,10 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
           revisionAfter(read.operation.revision, -1, outcomeCode),
         );
       }
-      if (read.operation.state === "starting") {
+      if (
+        read.operation.state === "starting" &&
+        !candidate.dispatchGranted
+      ) {
         await markStartingUncertain(read);
         read = normalizeActivationReadReceipt(
           await invokeAuthority("readRestoreAttachmentActivation", {
@@ -3283,7 +3408,9 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
         }
       }
       ensure(
-        read.operation.state === "uncertain" &&
+        (read.operation.state === "uncertain" ||
+          (candidate.dispatchGranted &&
+            read.operation.state === "starting")) &&
           read.activationRequest !== null &&
           read.generation !== null,
         outcomeCode,
@@ -3332,42 +3459,36 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
         outcomeCode,
       );
       await probeGuard(probe);
-      let rawActivationResult;
-      try {
-        rawActivationResult = callIntrinsic(
-          prepareRestoreAttachment,
-          storageBackend,
-          [activationRequest],
-        );
-      } catch {
-        fail(outcomeCode);
-      }
-      rawActivationResult = (
-        await awaitTrustedSettlement(
-          settleTrusted(rawActivationResult, outcomeCode),
-          outcomeCode,
-        )
-      ).value;
-      let activationResult;
-      try {
-        activationResult = assertRestoreAttachmentActivationResult(
-          rawActivationResult,
-          { request: activationRequest },
-        );
-      } catch {
-        fail(outcomeCode);
-      }
-      activationResult = clonePlainData(
-        canonicalJsonData(activationResult, outcomeCode),
-        outcomeCode,
+      const reconciliation = await reconcileActivationProvider(
+        activationRequest,
       );
       await probeGuard(probe);
-      return finalizeActivationHandoff(
+      if (reconciliation.outcome === "applied") {
+        return finalizeActivationHandoff(
+          read,
+          candidate,
+          activationRequest,
+          reconciliation.result,
+          read.operation.state === "starting" ? "1" : "2",
+        );
+      }
+      ensure(
+        reconciliation.outcome === "absent-and-quiescent" ||
+          reconciliation.outcome === "unknown",
+        outcomeCode,
+      );
+      if (
+        reconciliation.outcome !== "absent-and-quiescent" ||
+        !candidate.dispatchGranted ||
+        read.operation.state !== "starting"
+      ) {
+        fail(outcomeCode);
+      }
+      return prepareAndFinalizeFreshActivation(
         read,
         candidate,
         activationRequest,
-        activationResult,
-        "2",
+        probe,
       );
     });
   }

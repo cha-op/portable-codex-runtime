@@ -88,6 +88,7 @@ import {
 } from "../src/postgres-restore-recovery-cursor-store.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
 import {
@@ -2566,8 +2567,11 @@ function restoreRuntimeIntegrationLifecycleBackend(calls) {
     prepareRestoreAttachment: unexpectedProviderCall,
     prepareWritableAttachment: unexpectedProviderCall,
     provisionSession: unexpectedProviderCall,
+    reconcileRestoreAttachment: unexpectedProviderCall,
     restoreAttachmentActivationContractVersion:
       RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    restoreAttachmentReconciliationContractVersion:
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
     restoreCheckpoint: unexpectedProviderCall,
   });
 }
@@ -7954,6 +7958,18 @@ test(
           });
         assertOperationReceipt(claimed, "starting");
         assert.equal(claimed.dispatchGranted, true);
+        const claimReplay =
+          await authority.claimRestoreAttachmentActivationDispatch({
+            ...structuredClone(activationInput),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(claimReplay, "starting");
+        assert.equal(claimReplay.dispatchGranted, false);
+        assert.deepEqual(claimReplay.operation, claimed.operation);
+        assert.deepEqual(
+          claimReplay.activationRequest,
+          claimed.activationRequest,
+        );
         assert.equal(
           claimed.activationRequest.publication.root.rootPath,
           activationInput.request.destinationRootPath,

@@ -12,11 +12,12 @@ import {
   CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
   PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
   assertCanonicalFenceMatch,
   assertCheckpointDescriptor,
   assertLeaseGrant,
-  assertRestoreAttachmentActivationBackend,
+  assertRestoreAttachmentReconciliationBackend,
   assertSessionAttachment,
   assertSessionStorageRef,
   assertStorageBackend,
@@ -1847,16 +1848,29 @@ export class StoppedDirectoryBackend {
       lifecycleBackend,
       "prepareRestoreAttachment",
     );
+    const hasRestoreReconciliationVersion = objectHasOwn(
+      lifecycleBackend,
+      "restoreAttachmentReconciliationContractVersion",
+    );
+    const hasRestoreReconciliationMethod = objectHasOwn(
+      lifecycleBackend,
+      "reconcileRestoreAttachment",
+    );
     ensureInvalid(
-      hasRestoreActivationVersion === hasRestoreActivationMethod,
+      hasRestoreActivationVersion === hasRestoreActivationMethod &&
+        hasRestoreActivationVersion === hasRestoreReconciliationVersion &&
+        hasRestoreActivationVersion === hasRestoreReconciliationMethod,
     );
     const supportsRestoreActivation = hasRestoreActivationVersion;
     if (supportsRestoreActivation) {
       runContractValidator(() =>
-        assertRestoreAttachmentActivationBackend(lifecycleBackend),
+        assertRestoreAttachmentReconciliationBackend(lifecycleBackend),
       );
       lifecycleMethods.prepareRestoreAttachment = runContractValidator(() =>
         assertTrustedFunction(lifecycleBackend.prepareRestoreAttachment),
+      );
+      lifecycleMethods.reconcileRestoreAttachment = runContractValidator(() =>
+        assertTrustedFunction(lifecycleBackend.reconcileRestoreAttachment),
       );
     }
 
@@ -1909,10 +1923,17 @@ export class StoppedDirectoryBackend {
     if (supportsRestoreActivation) {
       const prepareRestoreAttachment = (...methodArgs) =>
         this.#delegateLifecycle("prepareRestoreAttachment", methodArgs);
+      const reconcileRestoreAttachment = (...methodArgs) =>
+        this.#delegateLifecycle("reconcileRestoreAttachment", methodArgs);
       objectFreeze(prepareRestoreAttachment);
+      objectFreeze(reconcileRestoreAttachment);
       objectDefineProperty(this, "prepareRestoreAttachment", {
         enumerable: true,
         value: prepareRestoreAttachment,
+      });
+      objectDefineProperty(this, "reconcileRestoreAttachment", {
+        enumerable: true,
+        value: reconcileRestoreAttachment,
       });
       objectDefineProperty(
         this,
@@ -1920,6 +1941,14 @@ export class StoppedDirectoryBackend {
         {
           enumerable: true,
           value: RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+        },
+      );
+      objectDefineProperty(
+        this,
+        "restoreAttachmentReconciliationContractVersion",
+        {
+          enumerable: true,
+          value: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
         },
       );
     }
