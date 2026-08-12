@@ -7,6 +7,9 @@ import {
   createPostgresDetachedRestoreImagePlanBinding,
 } from "../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
+  createPhysicalCollaboratorSettlement,
+} from "../src/physical-collaborator-settlement.mjs";
+import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
 } from "../src/postgres-logical-writer-launcher.mjs";
@@ -127,6 +130,29 @@ function ordinaryReceiverWithProxyPrototype(target, traps) {
 
 function exactKeys(value, expected) {
   assert.deepEqual(Reflect.ownKeys(value).sort(), [...expected].sort());
+}
+
+const ignoreSettlementFatal = Object.freeze(() => undefined);
+
+function createImagePlanProviderSettlement() {
+  const options = Object.freeze({
+    deadlineMilliseconds: 30_000,
+    onFatal: ignoreSettlementFatal,
+    settlementGraceMilliseconds: 1_000,
+  });
+  return Object.freeze({
+    inspectCodex: createPhysicalCollaboratorSettlement(options),
+    resolveImagePlan: createPhysicalCollaboratorSettlement(options),
+  });
+}
+
+function createTestImagePlanBinding(provider) {
+  return createPostgresDetachedRestoreImagePlanBinding(
+    Object.freeze({
+      provider,
+      settlement: createImagePlanProviderSettlement(),
+    }),
+  );
 }
 
 function runtimeOptionError(error) {
@@ -266,7 +292,7 @@ function createRuntimeFixture() {
   };
   const lifecycleBackend = createLifecycleBackend(calls);
   const publication = createPublication(calls);
-  const imagePlanBinding = createPostgresDetachedRestoreImagePlanBinding(
+  const imagePlanBinding = createTestImagePlanBinding(
     Object.freeze({
       contractVersion:
         POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,

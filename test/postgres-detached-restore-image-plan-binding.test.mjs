@@ -6,10 +6,13 @@ import {
   POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_BINDING_CONTRACT_VERSION,
   POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
   PostgresDetachedRestoreImagePlanBindingError,
-  createPostgresDetachedRestoreImagePlanBinding,
+  createPostgresDetachedRestoreImagePlanBinding as createRawPostgresDetachedRestoreImagePlanBinding,
   isPostgresDetachedRestoreImagePlanBinding,
   isPostgresDetachedRestoreImagePlanReservation,
 } from "../src/postgres-detached-restore-image-plan-binding.mjs";
+import {
+  createPhysicalCollaboratorSettlement,
+} from "../src/physical-collaborator-settlement.mjs";
 import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
@@ -165,6 +168,35 @@ function provider({
   });
 }
 
+const ignoreFatalSettlement = Object.freeze(() => undefined);
+
+function physicalSettlement(overrides = {}) {
+  return createPhysicalCollaboratorSettlement(
+    Object.freeze({
+      deadlineMilliseconds: 30_000,
+      onFatal: ignoreFatalSettlement,
+      settlementGraceMilliseconds: 1_000,
+      ...overrides,
+    }),
+  );
+}
+
+function imagePlanProviderSettlement(overrides = {}) {
+  return Object.freeze({
+    inspectCodex: physicalSettlement(overrides.inspectCodex),
+    resolveImagePlan: physicalSettlement(overrides.resolveImagePlan),
+  });
+}
+
+function createPostgresDetachedRestoreImagePlanBinding(
+  providerValue,
+  settlement = imagePlanProviderSettlement(),
+) {
+  return createRawPostgresDetachedRestoreImagePlanBinding(
+    Object.freeze({ provider: providerValue, settlement }),
+  );
+}
+
 function prepareInput(image = imageFixture(), overrides = {}) {
   return {
     plan: restorePlan(),
@@ -302,7 +334,7 @@ test("constructs one exact frozen branded binding without provider I/O", () => {
   );
   assert.equal(
     POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
-    1,
+    2,
   );
   assert.deepEqual(Reflect.ownKeys(binding), [
     "consumeImageReservation",
@@ -362,10 +394,17 @@ test("binds one authentic plan and manifest to exact resolver and inspector requ
           "imagePlanId",
           "imagePlanProviderId",
           "inspection",
+          "invocation",
+          "signal",
         ]);
         assert.equal(Object.getPrototypeOf(request), null);
         assert.equal(Object.isFrozen(request), true);
         assert.equal(request.imagePlanId, plan.imagePlanId);
+        assert.equal(Object.getPrototypeOf(request.invocation), null);
+        assert.equal(Object.isFrozen(request.invocation), true);
+        assert.deepEqual(Reflect.ownKeys(request.invocation), []);
+        assert.equal(request.signal instanceof AbortSignal, true);
+        assert.equal(request.signal.aborted, false);
         assert.equal(
           request.imagePlanProviderId,
           "image-provider-exact-001",
@@ -387,10 +426,17 @@ test("binds one authentic plan and manifest to exact resolver and inspector requ
           "imagePlanId",
           "imagePlanProviderId",
           "sessionManifest",
+          "invocation",
+          "signal",
         ]);
         assert.equal(Object.getPrototypeOf(request), null);
         assert.equal(Object.isFrozen(request), true);
         assert.equal(request.imagePlanId, plan.imagePlanId);
+        assert.equal(Object.getPrototypeOf(request.invocation), null);
+        assert.equal(Object.isFrozen(request.invocation), true);
+        assert.deepEqual(Reflect.ownKeys(request.invocation), []);
+        assert.equal(request.signal instanceof AbortSignal, true);
+        assert.equal(request.signal.aborted, false);
         assert.equal(
           request.imagePlanProviderId,
           "image-provider-exact-001",
@@ -431,6 +477,11 @@ test("binds one authentic plan and manifest to exact resolver and inspector requ
   }
   assert.equal(resolverRequests.length, 1);
   assert.equal(inspectorRequests.length, 1);
+  assert.notStrictEqual(
+    resolverRequests[0].invocation,
+    inspectorRequests[0].invocation,
+  );
+  assert.notStrictEqual(resolverRequests[0].signal, inspectorRequests[0].signal);
 
   const revalidated = await binding.revalidateImageReservation(reservation);
   assert.equal(Object.getPrototypeOf(revalidated), null);
@@ -474,11 +525,21 @@ test("binds one authentic plan and manifest to exact resolver and inspector requ
   });
   assert.equal(Object.isFrozen(revalidated), true);
   assert.equal(inspectorRequests.length, 2);
+  assert.notStrictEqual(
+    inspectorRequests[0].invocation,
+    inspectorRequests[1].invocation,
+  );
+  assert.notStrictEqual(inspectorRequests[0].signal, inspectorRequests[1].signal);
 
   const consumed = await binding.consumeImageReservation(reservation);
   assert.strictEqual(consumed.projection, revalidated.projection);
   assert.strictEqual(consumed.runtimeIdentity, revalidated.runtimeIdentity);
   assert.equal(inspectorRequests.length, 3);
+  assert.notStrictEqual(
+    inspectorRequests[1].invocation,
+    inspectorRequests[2].invocation,
+  );
+  assert.notStrictEqual(inspectorRequests[1].signal, inspectorRequests[2].signal);
   await assert.rejects(
     binding.consumeImageReservation(reservation),
     assertBindingError(
@@ -492,6 +553,59 @@ test("binds one authentic plan and manifest to exact resolver and inspector requ
     ),
   );
   assert.equal(inspectorRequests.length, 3);
+});
+
+test("translates resolver and inspector deadline cutoffs while forwarding abort", async (t) => {
+  for (const providerMethod of ["resolveImagePlan", "inspectCodex"]) {
+    await t.test(providerMethod, { timeout: 2_000 }, async () => {
+      const image = imageFixture();
+      const providerPending = deferred();
+      let request;
+      const settlement = imagePlanProviderSettlement({
+        [providerMethod]: {
+          deadlineMilliseconds: 15,
+          settlementGraceMilliseconds: 200,
+        },
+      });
+      const overrides = {
+        [providerMethod](value) {
+          request = value;
+          value.signal.addEventListener(
+            "abort",
+            () => {
+              providerPending.resolve(
+                providerMethod === "resolveImagePlan"
+                  ? resolvedImage(image)
+                  : runtimeMeasurement(),
+              );
+            },
+            { once: true },
+          );
+          return providerPending.promise;
+        },
+      };
+      const binding = createPostgresDetachedRestoreImagePlanBinding(
+        provider({ image, ...overrides }),
+        settlement,
+      );
+
+      await assert.rejects(
+        binding.prepareImageReservation(prepareInput(image)),
+        assertBindingError(
+          providerMethod === "resolveImagePlan"
+            ? "postgres_detached_restore_image_plan_resolution_uncertain"
+            : "postgres_detached_restore_image_plan_inspection_uncertain",
+        ),
+      );
+      assert.equal(request.signal.aborted, true);
+      assert.equal(Object.getPrototypeOf(request.invocation), null);
+      assert.equal(Object.isFrozen(request.invocation), true);
+      await Promise.all([
+        settlement.inspectCodex.stop(),
+        settlement.resolveImagePlan.stop(),
+      ]);
+    });
+  }
 });
 
 test("copies resolver evidence and keeps later caller mutation outside the binding", async () => {
@@ -846,7 +960,7 @@ test("rejects unsafe provider shapes, accessors, proxies, generators, and hostil
     undefined,
     { ...valid },
     Object.freeze({ ...valid, extra: true }),
-    Object.freeze({ ...valid, contractVersion: 2 }),
+    Object.freeze({ ...valid, contractVersion: 1 }),
     Object.freeze({ ...valid, imagePlanProviderId: "bad provider id" }),
     Object.freeze({
       ...valid,
@@ -906,6 +1020,52 @@ test("rejects unsafe provider shapes, accessors, proxies, generators, and hostil
   Object.freeze(inherited);
   assert.throws(
     () => createPostgresDetachedRestoreImagePlanBinding(inherited),
+    assertBindingError(optionCode),
+  );
+  assert.equal(traps, 0);
+});
+
+test("requires two distinct authentic frozen settlement authorities", () => {
+  const validProvider = provider();
+  const authentic = imagePlanProviderSettlement();
+  const optionCode =
+    "invalid_postgres_detached_restore_image_plan_binding_options";
+  const invalidSettlements = [
+    undefined,
+    null,
+    { ...authentic },
+    Object.freeze({ ...authentic, extra: true }),
+    Object.freeze({
+      inspectCodex: authentic.inspectCodex,
+      resolveImagePlan: authentic.inspectCodex,
+    }),
+    Object.freeze({
+      inspectCodex: Object.freeze({ ...authentic.inspectCodex }),
+      resolveImagePlan: authentic.resolveImagePlan,
+    }),
+  ];
+  for (const settlement of invalidSettlements) {
+    assert.throws(
+      () =>
+        createRawPostgresDetachedRestoreImagePlanBinding(
+          Object.freeze({ provider: validProvider, settlement }),
+        ),
+      assertBindingError(optionCode),
+    );
+  }
+
+  let traps = 0;
+  const settlementProxy = new Proxy(authentic, {
+    ownKeys() {
+      traps += 1;
+      throw new Error("must not enumerate settlement proxy");
+    },
+  });
+  assert.throws(
+    () =>
+      createRawPostgresDetachedRestoreImagePlanBinding(
+        Object.freeze({ provider: validProvider, settlement: settlementProxy }),
+      ),
     assertBindingError(optionCode),
   );
   assert.equal(traps, 0);

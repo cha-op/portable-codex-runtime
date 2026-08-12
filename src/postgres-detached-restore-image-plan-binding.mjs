@@ -13,6 +13,9 @@ import {
 import {
   assertSessionManifest,
 } from "./session-storage-contracts.mjs";
+import {
+  isPhysicalCollaboratorSettlement,
+} from "./physical-collaborator-settlement.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -69,14 +72,26 @@ const {
 } = utilTypes;
 
 export const POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION =
-  1;
+  2;
 export const POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_BINDING_CONTRACT_VERSION = 1;
 
 const FACTORY_OPTION_KEYS = objectFreeze([
+  "provider",
+  "settlement",
+]);
+const PROVIDER_KEYS = objectFreeze([
   "contractVersion",
   "imagePlanProviderId",
   "inspectCodex",
   "resolveImagePlan",
+]);
+const SETTLEMENT_KEYS = objectFreeze(["inspectCodex", "resolveImagePlan"]);
+const SETTLEMENT_CONTEXT_KEYS = objectFreeze(["invocation", "signal"]);
+const SETTLEMENT_RESULT_KEYS = objectFreeze([
+  "contractVersion",
+  "invocation",
+  "outcome",
+  "value",
 ]);
 const PREPARE_INPUT_KEYS = objectFreeze(["plan", "sessionManifest"]);
 const RESOLVER_RESULT_KEYS = objectFreeze(["configBytes", "descriptor"]);
@@ -524,7 +539,7 @@ function normalizePrepareInput(value, code) {
 }
 
 function normalizeProvider(value, code) {
-  const provider = exactDataObject(value, FACTORY_OPTION_KEYS, code, true);
+  const provider = exactDataObject(value, PROVIDER_KEYS, code, true);
   ensure(
     provider.contractVersion ===
       POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION &&
@@ -540,27 +555,33 @@ function normalizeProvider(value, code) {
   });
 }
 
-function invokeProvider(callback, input, normalize, code) {
-  let pending;
-  try {
-    pending = callIntrinsic(callback, undefined, [input]);
-  } catch {
-    fail(code);
-  }
-  const protectedPending = protectPromise(exactNativePromise(pending, code));
-  let normalized;
-  try {
-    normalized = callIntrinsic(protectedPromiseThen, protectedPending, [
-      (value) => normalize(value, code),
-      (error) => {
-        void error;
-        fail(code);
-      },
-    ]);
-  } catch {
-    fail(code);
-  }
-  return protectPromise(normalized);
+function normalizeSettlement(value, code) {
+  const settlement = exactDataObject(value, SETTLEMENT_KEYS, code, true);
+  ensure(
+    isPhysicalCollaboratorSettlement(settlement.inspectCodex) &&
+      isPhysicalCollaboratorSettlement(settlement.resolveImagePlan) &&
+      settlement.inspectCodex !== settlement.resolveImagePlan,
+    code,
+  );
+  const inspectCodexInvoke = objectGetOwnPropertyDescriptor(
+    settlement.inspectCodex,
+    "invoke",
+  );
+  const resolveImagePlanInvoke = objectGetOwnPropertyDescriptor(
+    settlement.resolveImagePlan,
+    "invoke",
+  );
+  ensure(
+    inspectCodexInvoke !== undefined &&
+      objectHasOwn(inspectCodexInvoke, "value") &&
+      resolveImagePlanInvoke !== undefined &&
+      objectHasOwn(resolveImagePlanInvoke, "value"),
+    code,
+  );
+  return exactFrozenRecord({
+    inspectCodex: trustedFunction(inspectCodexInvoke.value, code),
+    resolveImagePlan: trustedFunction(resolveImagePlanInvoke.value, code),
+  });
 }
 
 function plainNativePromiseBridge(protectedPending, code) {
@@ -580,6 +601,65 @@ function plainNativePromiseBridge(protectedPending, code) {
     fail(code);
   }
   return exactNativePromise(bridge, code);
+}
+
+function invokeSettledProvider(
+  invokeSettlement,
+  callback,
+  request,
+  normalize,
+  code,
+) {
+  const start = objectFreeze(function start(contextValue) {
+    const context = exactDataObject(
+      contextValue,
+      SETTLEMENT_CONTEXT_KEYS,
+      code,
+      true,
+      true,
+    );
+    const providerRequest = exactFrozenRecord({
+      ...request,
+      invocation: context.invocation,
+      signal: context.signal,
+    });
+    return callIntrinsic(callback, undefined, [providerRequest]);
+  });
+  let pending;
+  try {
+    pending = callIntrinsic(invokeSettlement, undefined, [
+      exactFrozenRecord({ start }),
+    ]);
+  } catch {
+    fail(code);
+  }
+  try {
+    return protectPromise(
+      callIntrinsic(protectedPromiseThen, pending, [
+        (value) => {
+          const result = exactDataObject(
+            value,
+            SETTLEMENT_RESULT_KEYS,
+            code,
+            true,
+            true,
+          );
+          ensure(
+            result.contractVersion === 1 &&
+              result.invocation !== null &&
+              typeof result.invocation === "object" &&
+              !isProxyValue(result.invocation) &&
+              result.outcome === "success",
+            code,
+          );
+          return normalize(result.value, code);
+        },
+        () => fail(code),
+      ]),
+    );
+  } catch {
+    fail(code);
+  }
 }
 
 function normalizeInspectionMeasurement(value, code) {
@@ -651,7 +731,9 @@ export function createPostgresDetachedRestoreImagePlanBinding(...args) {
   const optionCode =
     "invalid_postgres_detached_restore_image_plan_binding_options";
   ensure(args.length === 1, optionCode);
-  const provider = normalizeProvider(args[0], optionCode);
+  const options = exactDataObject(args[0], FACTORY_OPTION_KEYS, optionCode);
+  const provider = normalizeProvider(options.provider, optionCode);
+  const settlement = normalizeSettlement(options.settlement, optionCode);
   const coordinator = reflectConstruct(
     PlatformImageReservationCoordinatorConstructor,
     [],
@@ -671,7 +753,8 @@ export function createPostgresDetachedRestoreImagePlanBinding(...args) {
     });
     let resolvedValue;
     try {
-      resolvedValue = await invokeProvider(
+      resolvedValue = await invokeSettledProvider(
+        settlement.resolveImagePlan,
         provider.resolveImagePlan,
         resolverRequest,
         normalizeResolvedImage,
@@ -687,7 +770,8 @@ export function createPostgresDetachedRestoreImagePlanBinding(...args) {
         const code =
           "postgres_detached_restore_image_plan_inspection_uncertain";
         return plainNativePromiseBridge(
-          invokeProvider(
+          invokeSettledProvider(
+            settlement.inspectCodex,
             provider.inspectCodex,
             exactFrozenRecord({
               imagePlanId,

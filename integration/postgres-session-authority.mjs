@@ -15,6 +15,9 @@ import {
   isPostgresDetachedRestoreImagePlanReservation,
 } from "../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
+  createPhysicalCollaboratorSettlement,
+} from "../src/physical-collaborator-settlement.mjs";
+import {
   PostgresCheckpointMutationAuthorityError,
   createPostgresCheckpointMutationAuthority,
 } from "../src/postgres-checkpoint-mutation-authority.mjs";
@@ -1777,8 +1780,36 @@ function integrationDetachedRestoreImagePlan(session) {
   });
 }
 
+function integrationImagePlanSettlements() {
+  const onFatal = Object.freeze(function onFatal() {
+    assert.fail("integration image-plan provider must settle");
+  });
+  return Object.freeze({
+    inspectCodex: createPhysicalCollaboratorSettlement({
+      deadlineMilliseconds: 30_000,
+      onFatal,
+      settlementGraceMilliseconds: 5_000,
+    }),
+    resolveImagePlan: createPhysicalCollaboratorSettlement({
+      deadlineMilliseconds: 45_000,
+      onFatal,
+      settlementGraceMilliseconds: 10_000,
+    }),
+  });
+}
+
+function assertFreshOpaqueInvocation(invocation, seen) {
+  assert.equal(Object.getPrototypeOf(invocation), null);
+  assert.equal(Object.isFrozen(invocation), true);
+  assert.deepEqual(Reflect.ownKeys(invocation), []);
+  assert.equal(seen.has(invocation), false);
+  seen.add(invocation);
+}
+
 function integrationImagePlanBindingFixture({ image, plan, session }) {
   const providerCalls = { inspect: 0, resolve: 0 };
+  const providerInvocations = new Set();
+  const providerSignals = new Set();
   const imagePlanProviderId = `integration-image-provider-${randomUUID()}`;
   const boundPlan = plan ?? integrationDetachedRestoreImagePlan(session);
   const provider = Object.freeze({
@@ -1793,7 +1824,14 @@ function integrationImagePlanBindingFixture({ image, plan, session }) {
         "imagePlanId",
         "imagePlanProviderId",
         "inspection",
+        "invocation",
+        "signal",
       ]);
+      assertFreshOpaqueInvocation(input.invocation, providerInvocations);
+      assert.equal(input.signal instanceof AbortSignal, true);
+      assert.equal(input.signal.aborted, false);
+      assert.equal(providerSignals.has(input.signal), false);
+      providerSignals.add(input.signal);
       assert.equal(input.imagePlanId, boundPlan.imagePlanId);
       assert.equal(input.imagePlanProviderId, imagePlanProviderId);
       assert.equal(
@@ -1823,8 +1861,15 @@ function integrationImagePlanBindingFixture({ image, plan, session }) {
       assert.deepEqual(Reflect.ownKeys(input).sort(), [
         "imagePlanId",
         "imagePlanProviderId",
+        "invocation",
         "sessionManifest",
+        "signal",
       ]);
+      assertFreshOpaqueInvocation(input.invocation, providerInvocations);
+      assert.equal(input.signal instanceof AbortSignal, true);
+      assert.equal(input.signal.aborted, false);
+      assert.equal(providerSignals.has(input.signal), false);
+      providerSignals.add(input.signal);
       assert.equal(input.imagePlanId, boundPlan.imagePlanId);
       assert.equal(input.imagePlanProviderId, imagePlanProviderId);
       assert.deepEqual(input.sessionManifest, session.document.manifest);
@@ -1835,10 +1880,15 @@ function integrationImagePlanBindingFixture({ image, plan, session }) {
     },
   });
   return Object.freeze({
-    binding: createPostgresDetachedRestoreImagePlanBinding(provider),
+    binding: createPostgresDetachedRestoreImagePlanBinding({
+      provider,
+      settlement: integrationImagePlanSettlements(),
+    }),
     plan: boundPlan,
     provider,
     providerCalls,
+    providerInvocations,
+    providerSignals,
   });
 }
 
@@ -11154,6 +11204,8 @@ test(
     let firstStep = deferred();
     const foregroundGateEntered = deferred();
     const releaseForegroundGate = deferred();
+    const imageProviderInvocations = new Set();
+    const imageProviderSignals = new Set();
     const steps = [];
     const calls = {
       artifactResolver: 0,
@@ -11195,14 +11247,22 @@ test(
         },
       },
       launch: {
-        imagePlanBinding: createPostgresDetachedRestoreImagePlanBinding(
-          Object.freeze({
+        imagePlanBinding: createPostgresDetachedRestoreImagePlanBinding({
+          provider: Object.freeze({
             contractVersion:
               POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
             imagePlanProviderId,
             async inspectCodex(input) {
               calls.image += 1;
               assert.equal(input.imagePlanProviderId, imagePlanProviderId);
+              assertFreshOpaqueInvocation(
+                input.invocation,
+                imageProviderInvocations,
+              );
+              assert.equal(input.signal instanceof AbortSignal, true);
+              assert.equal(input.signal.aborted, false);
+              assert.equal(imageProviderSignals.has(input.signal), false);
+              imageProviderSignals.add(input.signal);
               return frozenNullPrototypeRecord({
                 codexBinaryPath: "/opt/portable-codex/bin/codex",
                 codexBinarySha256: "c".repeat(64),
@@ -11212,13 +11272,22 @@ test(
             async resolveImagePlan(input) {
               calls.image += 1;
               assert.equal(input.imagePlanProviderId, imagePlanProviderId);
+              assertFreshOpaqueInvocation(
+                input.invocation,
+                imageProviderInvocations,
+              );
+              assert.equal(input.signal instanceof AbortSignal, true);
+              assert.equal(input.signal.aborted, false);
+              assert.equal(imageProviderSignals.has(input.signal), false);
+              imageProviderSignals.add(input.signal);
               return frozenNullPrototypeRecord({
                 configBytes: image.configBytes,
                 descriptor: Object.freeze({ ...image.descriptor }),
               });
             },
           }),
-        ),
+          settlement: integrationImagePlanSettlements(),
+        }),
         stoppedWriterCoordinator:
           new StoppedWriterCapabilityCoordinator(),
         supervisor: Object.freeze({
@@ -12380,6 +12449,8 @@ test(
     const deploymentImage = integrationPlatformImageFixture();
     const imagePlanProviderId =
       `deployment-image-provider-${randomUUID()}`;
+    const imageProviderInvocations = new Set();
+    const imageProviderSignals = new Set();
     let deploymentPlan = null;
     let deploymentSession = null;
     let holdProvisioning = false;
@@ -12387,6 +12458,8 @@ test(
     const calls = {
       fleetGate: 0,
       image: 0,
+      imageInspect: 0,
+      imageResolve: 0,
       planGate: 0,
       provider: 0,
       publication: 0,
@@ -12444,6 +12517,7 @@ test(
             imagePlanProviderId,
             async inspectCodex(input) {
               calls.image += 1;
+              calls.imageInspect += 1;
               assert.notEqual(deploymentPlan, null);
               assert.notEqual(deploymentSession, null);
               assert.equal(Object.getPrototypeOf(input), null);
@@ -12452,7 +12526,17 @@ test(
                 "imagePlanId",
                 "imagePlanProviderId",
                 "inspection",
+                "invocation",
+                "signal",
               ]);
+              assertFreshOpaqueInvocation(
+                input.invocation,
+                imageProviderInvocations,
+              );
+              assert.equal(input.signal instanceof AbortSignal, true);
+              assert.equal(input.signal.aborted, false);
+              assert.equal(imageProviderSignals.has(input.signal), false);
+              imageProviderSignals.add(input.signal);
               assert.equal(input.imagePlanId, deploymentPlan.imagePlanId);
               assert.equal(input.imagePlanProviderId, imagePlanProviderId);
               assert.equal(
@@ -12482,6 +12566,7 @@ test(
             },
             async resolveImagePlan(input) {
               calls.image += 1;
+              calls.imageResolve += 1;
               assert.notEqual(deploymentPlan, null);
               assert.notEqual(deploymentSession, null);
               assert.equal(Object.getPrototypeOf(input), null);
@@ -12489,8 +12574,18 @@ test(
               assert.deepEqual(Reflect.ownKeys(input).sort(), [
                 "imagePlanId",
                 "imagePlanProviderId",
+                "invocation",
                 "sessionManifest",
+                "signal",
               ]);
+              assertFreshOpaqueInvocation(
+                input.invocation,
+                imageProviderInvocations,
+              );
+              assert.equal(input.signal instanceof AbortSignal, true);
+              assert.equal(input.signal.aborted, false);
+              assert.equal(imageProviderSignals.has(input.signal), false);
+              imageProviderSignals.add(input.signal);
               assert.equal(input.imagePlanId, deploymentPlan.imagePlanId);
               assert.equal(input.imagePlanProviderId, imagePlanProviderId);
               assert.deepEqual(
@@ -12505,6 +12600,16 @@ test(
               });
             },
           }),
+          imagePlanProviderSettlement: {
+            inspectCodex: {
+              deadlineMilliseconds: 30_000,
+              settlementGraceMilliseconds: 5_000,
+            },
+            resolveImagePlan: {
+              deadlineMilliseconds: 45_000,
+              settlementGraceMilliseconds: 10_000,
+            },
+          },
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: Object.freeze({
@@ -12765,6 +12870,10 @@ test(
     assert.equal(Object.isFrozen(imageReservation), true);
     assert.deepEqual(Reflect.ownKeys(imageReservation), []);
     assert.equal(calls.image, 2);
+    assert.equal(calls.imageInspect, 1);
+    assert.equal(calls.imageResolve, 1);
+    assert.equal(imageProviderInvocations.size, 2);
+    assert.equal(imageProviderSignals.size, 2);
     assert.equal(calls.provider, 0);
     assert.equal(calls.publication, 0);
     assert.equal(calls.supervisor, 0);
@@ -12795,6 +12904,10 @@ test(
       },
     );
     assert.equal(calls.image, 3);
+    assert.equal(calls.imageInspect, 2);
+    assert.equal(calls.imageResolve, 1);
+    assert.equal(imageProviderInvocations.size, 3);
+    assert.equal(imageProviderSignals.size, 3);
     assert.equal(calls.provider, 0);
     assert.equal(calls.publication, 0);
     assert.equal(calls.supervisor, 0);
@@ -12854,6 +12967,13 @@ test(
     assert.equal(calls.planGate, 2);
     assert.equal(calls.fleetGate, 0);
     assert.equal(calls.image, 3);
+    assert.equal(calls.imageInspect, 2);
+    assert.equal(calls.imageResolve, 1);
+    assert.equal(imageProviderInvocations.size, 3);
+    assert.equal(imageProviderSignals.size, 3);
+    for (const signal of imageProviderSignals) {
+      assert.equal(signal.aborted, false);
+    }
     assert.equal(calls.provider, 0);
     assert.equal(calls.publication, 0);
     assert.equal(calls.supervisor, 0);

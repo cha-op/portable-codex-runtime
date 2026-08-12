@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 
 import { FilesystemOperationJournal } from "../../../src/filesystem-operation-journal.mjs";
 import {
-  isPostgresDetachedRestoreImagePlanReservation,
+  PostgresDetachedRestoreImagePlanBindingError,
   POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
 } from "../../../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
@@ -261,6 +261,8 @@ function validOptions() {
     imagePlanBlock: null,
     imagePlanEntered: null,
     imagePlanFixture: imagePlanFixture(),
+    imagePlanInspectorOverride: null,
+    imagePlanResolverOverride: null,
     planGateOverride: null,
   };
   const options = {
@@ -313,16 +315,24 @@ function validOptions() {
           contractVersion:
             POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
           imagePlanProviderId: "deployment-image-provider-001",
-          async inspectCodex() {
+          async inspectCodex(input) {
             calls.image += 1;
+            assertImageProviderRequest(input, "inspect");
+            if (controls.imagePlanInspectorOverride !== null) {
+              return controls.imagePlanInspectorOverride(input);
+            }
             return safeProviderCarrier({
               codexBinaryPath: "/opt/portable-codex/bin/codex",
               codexBinarySha256: "b".repeat(64),
               codexVersion: "codex-cli 0.144.1",
             });
           },
-          async resolveImagePlan() {
+          async resolveImagePlan(input) {
             calls.image += 1;
+            assertImageProviderRequest(input, "resolve");
+            if (controls.imagePlanResolverOverride !== null) {
+              return controls.imagePlanResolverOverride(input);
+            }
             controls.imagePlanEntered?.resolve();
             await controls.imagePlanBlock?.promise;
             return safeProviderCarrier({
@@ -331,6 +341,16 @@ function validOptions() {
             });
           },
         }),
+        imagePlanProviderSettlement: {
+          inspectCodex: {
+            deadlineMilliseconds: 30_000,
+            settlementGraceMilliseconds: 1_000,
+          },
+          resolveImagePlan: {
+            deadlineMilliseconds: 30_000,
+            settlementGraceMilliseconds: 1_000,
+          },
+        },
         stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
         supervisor: Object.freeze({
           contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
@@ -410,6 +430,46 @@ function outcomeError(error) {
     error,
     "postgres_detached_restore_deployment_outcome_uncertain",
   );
+}
+
+function imageResolutionError(error) {
+  assert(error instanceof PostgresDetachedRestoreImagePlanBindingError);
+  assert.equal(
+    error.code,
+    "postgres_detached_restore_image_plan_resolution_uncertain",
+  );
+  assert.equal(error.retryable, false);
+  assert.equal(Object.isFrozen(error), true);
+  assert.equal("cause" in error, false);
+  return true;
+}
+
+function assertImageProviderRequest(input, kind) {
+  exactKeys(
+    input,
+    kind === "resolve"
+      ? [
+          "imagePlanId",
+          "imagePlanProviderId",
+          "invocation",
+          "sessionManifest",
+          "signal",
+        ]
+      : [
+          "imagePlanId",
+          "imagePlanProviderId",
+          "inspection",
+          "invocation",
+          "signal",
+        ],
+  );
+  assert.equal(Object.getPrototypeOf(input), null);
+  assert.equal(Object.isFrozen(input), true);
+  assert.equal(Object.getPrototypeOf(input.invocation), null);
+  assert.equal(Object.isFrozen(input.invocation), true);
+  assert.deepEqual(Reflect.ownKeys(input.invocation), []);
+  assert(input.signal instanceof AbortSignal);
+  assert.equal(input.signal.aborted, false);
 }
 
 function nextTurn() {
@@ -954,6 +1014,25 @@ async function hostileOptions() {
     options.postgres.timeouts.queryMilliseconds = value;
     cases.push(options);
   }
+  for (const method of ["inspectCodex", "resolveImagePlan"]) {
+    for (const field of [
+      "deadlineMilliseconds",
+      "settlementGraceMilliseconds",
+    ]) {
+      for (const value of [0, 86_400_001]) {
+        const { options } = validOptions();
+        options.runtime.launch.imagePlanProviderSettlement[method][field] =
+          value;
+        cases.push(options);
+      }
+    }
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.launch.imagePlanProviderSettlement.inspectCodex.extra =
+      true;
+    cases.push(options);
+  }
   for (const options of cases) {
     const before = fakePgState().pools.length;
     assert.throws(
@@ -1463,20 +1542,103 @@ async function imagePlanReservationIngressIsGatedAndDrained() {
   await nextTurn();
   assert.equal(stopSettled, false);
   controls.imagePlanBlock.resolve();
-  const reservation = await admitted;
-  assert.equal(
-    isPostgresDetachedRestoreImagePlanReservation(reservation),
-    true,
-  );
-  assert.equal(Object.getPrototypeOf(reservation), null);
-  assert.deepEqual(Reflect.ownKeys(reservation), []);
-  assert.equal(Object.isFrozen(reservation), true);
+  await assert.rejects(admitted, imageResolutionError);
   assertStatusReceipt(await stopped, "stopped");
   assert.throws(
     () => deployment.imagePlanReservations.prepareImageReservation(input),
     requestError,
   );
-  assert.equal(calls.image, 2);
+  assert.equal(calls.image, 1);
+}
+
+async function imagePlanStopAbortsAndDrainsActiveProvider() {
+  configureFakePg();
+  const { calls, controls, options } = validOptions();
+  const resolverEntered = deferred();
+  const resolverSettled = deferred();
+  let resolverRequest;
+  controls.imagePlanResolverOverride = function resolveAfterAbort(input) {
+    resolverRequest = input;
+    resolverEntered.resolve();
+    input.signal.addEventListener(
+      "abort",
+      () => resolverSettled.resolve(safeProviderCarrier({
+        configBytes: controls.imagePlanFixture.configBytes,
+        descriptor: controls.imagePlanFixture.descriptor,
+      })),
+      { once: true },
+    );
+    return resolverSettled.promise;
+  };
+  options.runtime.launch.imagePlanProviderSettlement.resolveImagePlan = {
+    deadlineMilliseconds: 30_000,
+    settlementGraceMilliseconds: 100,
+  };
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  assertStatusReceipt(await deployment.start(), "ready");
+  const input = {
+    plan: stablePlan(restoreAdmission("deployment-image-plan-stop-drain-001")),
+    sessionManifest: controls.imagePlanFixture.sessionManifest,
+  };
+  const admitted = deployment.imagePlanReservations.prepareImageReservation(input);
+  await resolverEntered.promise;
+  assert.equal(resolverRequest.signal.aborted, false);
+
+  const stopped = deployment.stop();
+  assert.strictEqual(deployment.stop(), stopped);
+  assert.equal(resolverRequest.signal.aborted, true);
+  await assert.rejects(admitted, imageResolutionError);
+  assertStatusReceipt(await stopped, "stopped");
+  assert.equal(calls.image, 1);
+  assert.deepEqual(fakePgState().endOrder, [
+    "recoveryLifecycle",
+    "foregroundLifecycle",
+    "operation",
+    "authority",
+  ]);
+}
+
+async function imagePlanGraceBreachForcesFatalShutdown() {
+  configureFakePg();
+  const { calls, controls, options } = validOptions();
+  const resolverEntered = deferred();
+  const neverSettles = new Promise(() => {});
+  let resolverRequest;
+  controls.imagePlanResolverOverride = function unresolvedProvider(input) {
+    resolverRequest = input;
+    resolverEntered.resolve();
+    return neverSettles;
+  };
+  options.runtime.launch.imagePlanProviderSettlement.resolveImagePlan = {
+    deadlineMilliseconds: 15,
+    settlementGraceMilliseconds: 15,
+  };
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  assertStatusReceipt(await deployment.start(), "ready");
+  const input = {
+    plan: stablePlan(restoreAdmission("deployment-image-plan-grace-breach-001")),
+    sessionManifest: controls.imagePlanFixture.sessionManifest,
+  };
+  const admitted = deployment.imagePlanReservations.prepareImageReservation(input);
+  await resolverEntered.promise;
+  assert.equal(resolverRequest.signal.aborted, false);
+
+  await assert.rejects(admitted, imageResolutionError);
+  assert.equal(resolverRequest.signal.aborted, true);
+  const stopped = deployment.stop();
+  assert.strictEqual(deployment.stop(), stopped);
+  await assert.rejects(stopped, outcomeError);
+  assert.equal(calls.image, 1);
+  assert.deepEqual(fakePgState().endOrder, [
+    "recoveryLifecycle",
+    "foregroundLifecycle",
+    "operation",
+    "authority",
+  ]);
+  assert.deepEqual(
+    fakePgState().pools.map((pool) => pool.calls.end),
+    [1, 1, 1, 1],
+  );
 }
 
 const scenarios = Object.freeze({
@@ -1499,8 +1661,12 @@ const scenarios = Object.freeze({
     hostileTopologyEvidenceFailsClosed,
   "idle-pool-error-forces-terminal-shutdown":
     idlePoolErrorForcesTerminalShutdown,
+  "image-plan-grace-breach-forces-fatal-shutdown":
+    imagePlanGraceBreachForcesFatalShutdown,
   "image-plan-reservation-ingress-is-gated-and-drained":
     imagePlanReservationIngressIsGatedAndDrained,
+  "image-plan-stop-aborts-and-drains-active-provider":
+    imagePlanStopAbortsAndDrainsActiveProvider,
   "independent-deployments-use-distinct-probe-keys":
     independentDeploymentsUseDistinctProbeKeys,
   "invalid-client-query-still-releases-and-cleans-up":

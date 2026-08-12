@@ -7,6 +7,9 @@ import {
   createPostgresDetachedRestoreImagePlanBinding,
 } from "../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
+  createPhysicalCollaboratorSettlement,
+} from "../src/physical-collaborator-settlement.mjs";
+import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
@@ -79,6 +82,28 @@ const STOP_COMMITTED_TIME = "2026-08-04T12:00:08.000Z";
 const jsonStringify = JSON.stringify;
 const objectCreate = Object.create;
 const objectFreeze = Object.freeze;
+const ignoreSettlementFatal = objectFreeze(() => undefined);
+
+function createImagePlanProviderSettlement() {
+  const options = objectFreeze({
+    deadlineMilliseconds: 30_000,
+    onFatal: ignoreSettlementFatal,
+    settlementGraceMilliseconds: 1_000,
+  });
+  return objectFreeze({
+    inspectCodex: createPhysicalCollaboratorSettlement(options),
+    resolveImagePlan: createPhysicalCollaboratorSettlement(options),
+  });
+}
+
+function createTestImagePlanBinding(provider) {
+  return createPostgresDetachedRestoreImagePlanBinding(
+    objectFreeze({
+      provider,
+      settlement: createImagePlanProviderSettlement(),
+    }),
+  );
+}
 
 function safeProviderCarrier(value) {
   return objectFreeze(Object.assign(objectCreate(null), value));
@@ -1649,8 +1674,7 @@ async function fixture({
       });
     },
   });
-  const imagePlanBinding =
-    createPostgresDetachedRestoreImagePlanBinding(imagePlanProvider);
+  const imagePlanBinding = createTestImagePlanBinding(imagePlanProvider);
   const imageReservation = await imagePlanBinding.prepareImageReservation(
     objectFreeze({
       plan: imagePlan,
@@ -3343,8 +3367,9 @@ test("cold launcher resumes a prepared attempt with a fresh equivalent image res
     supervisor: intent.supervisor,
   });
 
-  const freshImagePlanBinding =
-    createPostgresDetachedRestoreImagePlanBinding(value.imagePlanProvider);
+  const freshImagePlanBinding = createTestImagePlanBinding(
+    value.imagePlanProvider,
+  );
   const freshImageReservation =
     await freshImagePlanBinding.prepareImageReservation(
     objectFreeze({
