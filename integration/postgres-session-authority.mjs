@@ -270,6 +270,78 @@ async function insertDirectOperationIdClaim(
   );
 }
 
+async function insertRawDetachedRestoreStablePlanClaim(
+  queryable,
+  {
+    admission,
+    bindingSha256,
+    operationId,
+    planSha256,
+    sessionId,
+  },
+) {
+  await queryable.query(
+    [
+      "INSERT INTO session_authority.operation_id_registry",
+      "(operation_id, session_id, claim_type, claimant_operation_id,",
+      "binding, claimed_at, materialized_at)",
+      "VALUES ($1, $2::uuid, 'detached-restore-stable-plan-v1', NULL,",
+      "pg_catalog.jsonb_build_object(",
+      "'bindingSha256', $3::text,",
+      "'contractVersion', 1,",
+      "'planSha256', $4::text,",
+      "'request', $5::jsonb),",
+      "pg_catalog.transaction_timestamp(), NULL)",
+    ].join(" "),
+    [
+      operationId,
+      sessionId,
+      bindingSha256,
+      planSha256,
+      JSON.stringify(admission.request),
+    ],
+  );
+}
+
+async function insertRawDetachedRestoreStablePlan(
+  queryable,
+  {
+    admission,
+    backendId,
+    bindingSha256,
+    operationId,
+    planInput,
+    planSha256,
+    sessionId,
+    storageId,
+  },
+) {
+  return queryable.query(
+    [
+      "INSERT INTO session_authority.detached_restore_stable_plans",
+      "(operation_id, session_id, backend_id, storage_id,",
+      "plan_contract_version, admission, plan_input, plan_sha256,",
+      "binding_sha256, provisioned_at)",
+      "VALUES ($1, $2::uuid, $3, $4, 1, $5::jsonb, $6::jsonb,",
+      "$7, $8, (",
+      "SELECT claimed_at",
+      "FROM session_authority.operation_id_registry",
+      "WHERE operation_id = $1 AND session_id = $2::uuid",
+      "))",
+    ].join(" "),
+    [
+      operationId,
+      sessionId,
+      backendId,
+      storageId,
+      JSON.stringify(admission),
+      JSON.stringify(planInput),
+      planSha256,
+      bindingSha256,
+    ],
+  );
+}
+
 async function waitForMigrationOperationTableLock(queryable) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     await queryable.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
@@ -11117,6 +11189,333 @@ test(
     assert.notStrictEqual(provisionedStablePlan, stablePlan);
     assert.equal(provisionedStablePlan.planSha256, stablePlan.planSha256);
     assert.equal(calls.planProvisioningGate, 1);
+
+    const rawStablePlanInput = {
+      captureCreatedAt: stablePlan.captureCreatedAt,
+      destinationDirectory: stablePlan.destinationDirectory,
+      destinationOwnedRoot: stablePlan.destinationOwnedRoot,
+      detachMode: stablePlan.detachMode,
+      holderId: stablePlan.holderId,
+      imagePlanId: stablePlan.imagePlanId,
+      leaseDurationMilliseconds:
+        stablePlan.leaseDurationMilliseconds,
+      sourceArtifactDirectory: stablePlan.sourceArtifactDirectory,
+      sourceArtifactOwnedRoot: stablePlan.sourceArtifactOwnedRoot,
+    };
+    const rawBindingSha256 = "b".repeat(64);
+    const rawPlanSha256 = "a".repeat(64);
+    const hostileDigestClaims = [
+      {
+        bindingSha256Json: "null",
+        label: "null-binding-sha",
+        planSha256Json: JSON.stringify(rawPlanSha256),
+      },
+      {
+        bindingSha256Json: "1".repeat(64),
+        label: "numeric-binding-sha",
+        planSha256Json: JSON.stringify(rawPlanSha256),
+      },
+      {
+        bindingSha256Json: JSON.stringify(rawBindingSha256),
+        label: "null-plan-sha",
+        planSha256Json: "null",
+      },
+      {
+        bindingSha256Json: JSON.stringify(rawBindingSha256),
+        label: "numeric-plan-sha",
+        planSha256Json: "1".repeat(64),
+      },
+    ];
+    for (const hostile of hostileDigestClaims) {
+      const operationId =
+        `hostile-${hostile.label}-${randomUUID()}`;
+      const request = structuredClone(admission.request);
+      request.operationId = operationId;
+      await assert.rejects(
+        authorityPool.query(
+          [
+            "INSERT INTO session_authority.operation_id_registry",
+            "(operation_id, session_id, claim_type, claimant_operation_id,",
+            "binding, claimed_at, materialized_at)",
+            "VALUES ($1, $2::uuid,",
+            "'detached-restore-stable-plan-v1', NULL,",
+            "pg_catalog.jsonb_build_object(",
+            "'bindingSha256', $3::jsonb,",
+            "'contractVersion', 1,",
+            "'planSha256', $4::jsonb,",
+            "'request', $5::jsonb),",
+            "pg_catalog.transaction_timestamp(), NULL)",
+          ].join(" "),
+          [
+            operationId,
+            sessionId,
+            hostile.bindingSha256Json,
+            hostile.planSha256Json,
+            JSON.stringify(request),
+          ],
+        ),
+        (error) => {
+          assert.equal(error.code, "23514");
+          assert.equal(
+            error.constraint,
+            "operation_id_registry_claim_shape",
+          );
+          return true;
+        },
+      );
+    }
+
+    const hostileStablePlans = [
+      {
+        constraint:
+          "detached_restore_stable_plans_request_identity",
+        label: "missing-operation-id",
+        mutateAdmission(candidate) {
+          delete candidate.request.operationId;
+        },
+      },
+      {
+        backendId: "1",
+        constraint:
+          "detached_restore_stable_plans_request_identity",
+        label: "numeric-backend-id",
+        mutateAdmission(candidate) {
+          candidate.request.backendId = 1;
+        },
+      },
+      {
+        constraint: "detached_restore_stable_plans_request_shape",
+        label: "missing-operation",
+        mutateAdmission(candidate) {
+          delete candidate.request.operation;
+        },
+      },
+      {
+        constraint: "detached_restore_stable_plans_request_shape",
+        label: "numeric-target-kind",
+        mutateAdmission(candidate) {
+          candidate.request.target.kind = 1;
+        },
+      },
+      {
+        constraint:
+          "detached_restore_stable_plans_plan_input_object",
+        label: "null-plan-input",
+        planInput: Object.fromEntries(
+          Object.keys(rawStablePlanInput).map((key) => [key, null]),
+        ),
+      },
+      {
+        constraint:
+          "detached_restore_stable_plans_plan_input_object",
+        label: "string-lease-duration",
+        planInput: {
+          ...rawStablePlanInput,
+          leaseDurationMilliseconds: "300000",
+        },
+      },
+    ];
+    const hostilePlanClient = await authorityPool.connect();
+    try {
+      for (const hostile of hostileStablePlans) {
+        const operationId =
+          `hostile-plan-${hostile.label}-${randomUUID()}`;
+        const hostileAdmission = structuredClone(admission);
+        hostileAdmission.request.operationId = operationId;
+        hostile.mutateAdmission?.(hostileAdmission);
+        await hostilePlanClient.query("BEGIN");
+        try {
+          await insertRawDetachedRestoreStablePlanClaim(
+            hostilePlanClient,
+            {
+              admission: hostileAdmission,
+              bindingSha256: rawBindingSha256,
+              operationId,
+              planSha256: rawPlanSha256,
+              sessionId,
+            },
+          );
+          await assert.rejects(
+            insertRawDetachedRestoreStablePlan(hostilePlanClient, {
+              admission: hostileAdmission,
+              backendId:
+                hostile.backendId ??
+                hostileAdmission.request.backendId,
+              bindingSha256: rawBindingSha256,
+              operationId,
+              planInput:
+                hostile.planInput ?? rawStablePlanInput,
+              planSha256: rawPlanSha256,
+              sessionId,
+              storageId: hostileAdmission.request.storageId,
+            }),
+            (error) => {
+              assert.equal(error.code, "23514");
+              assert.equal(error.constraint, hostile.constraint);
+              return true;
+            },
+          );
+        } finally {
+          await hostilePlanClient.query("ROLLBACK");
+        }
+      }
+    } finally {
+      hostilePlanClient.release();
+    }
+
+    const deleteFixtureOperationId =
+      `stable-operation-delete-${randomUUID()}`;
+    const deleteFixtureAdmission = structuredClone(admission);
+    deleteFixtureAdmission.request.operationId =
+      deleteFixtureOperationId;
+    const deleteFixtureClient = await authorityPool.connect();
+    let deleteFixtureTransactionOpen = false;
+    try {
+      await deleteFixtureClient.query("BEGIN");
+      deleteFixtureTransactionOpen = true;
+      await insertRawDetachedRestoreStablePlanClaim(
+        deleteFixtureClient,
+        {
+          admission: deleteFixtureAdmission,
+          bindingSha256: rawBindingSha256,
+          operationId: deleteFixtureOperationId,
+          planSha256: rawPlanSha256,
+          sessionId,
+        },
+      );
+      await insertRawDetachedRestoreStablePlan(deleteFixtureClient, {
+        admission: deleteFixtureAdmission,
+        backendId: deleteFixtureAdmission.request.backendId,
+        bindingSha256: rawBindingSha256,
+        operationId: deleteFixtureOperationId,
+        planInput: rawStablePlanInput,
+        planSha256: rawPlanSha256,
+        sessionId,
+        storageId: deleteFixtureAdmission.request.storageId,
+      });
+      await deleteFixtureClient.query("COMMIT");
+      deleteFixtureTransactionOpen = false;
+
+      await deleteFixtureClient.query("BEGIN");
+      deleteFixtureTransactionOpen = true;
+      const materializedAt = await deleteFixtureClient.query(
+        "SELECT pg_catalog.transaction_timestamp() AS value",
+      );
+      const operationCreatedAt = materializedAt.rows[0].value;
+      await deleteFixtureClient.query(
+        [
+          "UPDATE session_authority.operation_id_registry",
+          "SET materialized_at = $2",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        [deleteFixtureOperationId, operationCreatedAt],
+      );
+      await deleteFixtureClient.query(
+        [
+          "INSERT INTO session_authority.operation_claims",
+          "(operation_id, session_id, kind, request, result, state,",
+          "revision, created_at, updated_at, retired_at)",
+          "VALUES ($1, $2::uuid, 'restore-destination-generation-v1',",
+          "$3::jsonb, NULL, 'committed', 0, $4, $4, $4)",
+        ].join(" "),
+        [
+          deleteFixtureOperationId,
+          sessionId,
+          JSON.stringify({
+            payload: {
+              admission: deleteFixtureAdmission,
+              contractVersion: 1,
+            },
+          }),
+          operationCreatedAt,
+        ],
+      );
+      await deleteFixtureClient.query("COMMIT");
+      deleteFixtureTransactionOpen = false;
+
+      await assert.rejects(
+        deleteFixtureClient.query(
+          [
+            "DELETE FROM session_authority.operation_claims",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [deleteFixtureOperationId],
+        ),
+        (error) => {
+          assert.equal(error.code, "23503");
+          assert.equal(
+            error.constraint,
+            "operation_claims_stable_plan_delete_requires_teardown",
+          );
+          return true;
+        },
+      );
+      const operationAfterRejectedDelete =
+        await deleteFixtureClient.query(
+          [
+            "SELECT operation_id",
+            "FROM session_authority.operation_claims",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [deleteFixtureOperationId],
+        );
+      assert.deepEqual(operationAfterRejectedDelete.rows, [
+        { operation_id: deleteFixtureOperationId },
+      ]);
+
+      await deleteFixtureClient.query("BEGIN");
+      deleteFixtureTransactionOpen = true;
+      await deleteFixtureClient.query(
+        [
+          "DELETE FROM session_authority.detached_restore_stable_plans",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        [deleteFixtureOperationId],
+      );
+      await deleteFixtureClient.query(
+        [
+          "DELETE FROM session_authority.operation_claims",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        [deleteFixtureOperationId],
+      );
+      await deleteFixtureClient.query(
+        [
+          "DELETE FROM session_authority.operation_id_registry",
+          "WHERE operation_id = $1",
+        ].join(" "),
+        [deleteFixtureOperationId],
+      );
+      await deleteFixtureClient.query("COMMIT");
+      deleteFixtureTransactionOpen = false;
+      const teardownState = await deleteFixtureClient.query(
+        [
+          "SELECT",
+          "EXISTS (SELECT 1",
+          "FROM session_authority.detached_restore_stable_plans",
+          "WHERE operation_id = $1) AS stable_plan_exists,",
+          "EXISTS (SELECT 1",
+          "FROM session_authority.operation_claims",
+          "WHERE operation_id = $1) AS operation_exists,",
+          "EXISTS (SELECT 1",
+          "FROM session_authority.operation_id_registry",
+          "WHERE operation_id = $1) AS registry_exists",
+        ].join(" "),
+        [deleteFixtureOperationId],
+      );
+      assert.deepEqual(teardownState.rows, [
+        {
+          operation_exists: false,
+          registry_exists: false,
+          stable_plan_exists: false,
+        },
+      ]);
+    } finally {
+      if (deleteFixtureTransactionOpen) {
+        await deleteFixtureClient.query("ROLLBACK");
+      }
+      deleteFixtureClient.release();
+    }
 
     const crossedStableClaimPlanSha256 =
       stablePlan.planSha256 === "0".repeat(64)

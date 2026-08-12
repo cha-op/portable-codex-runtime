@@ -26,7 +26,7 @@ ALTER TABLE session_authority.operation_id_registry
 
 ALTER TABLE session_authority.operation_id_registry
   ADD CONSTRAINT operation_id_registry_claim_shape
-  CHECK (
+  CHECK ((
     (
       claim_type = 'direct-operation'
       AND claimant_operation_id IS NULL
@@ -56,7 +56,9 @@ ALTER TABLE session_authority.operation_id_registry
       AND binding ? 'planSha256'
       AND binding ? 'request'
       AND binding -> 'contractVersion' = '1'::pg_catalog.jsonb
+      AND pg_catalog.jsonb_typeof(binding -> 'bindingSha256') = 'string'
       AND binding ->> 'bindingSha256' ~ '^[0-9a-f]{64}$'
+      AND pg_catalog.jsonb_typeof(binding -> 'planSha256') = 'string'
       AND binding ->> 'planSha256' ~ '^[0-9a-f]{64}$'
       AND pg_catalog.jsonb_typeof(binding -> 'request') = 'object'
       AND (
@@ -64,7 +66,7 @@ ALTER TABLE session_authority.operation_id_registry
         OR materialized_at >= claimed_at
       )
     )
-  );
+  ) IS TRUE);
 
 CREATE TABLE session_authority.detached_restore_stable_plans (
   operation_id character varying(128) PRIMARY KEY,
@@ -88,16 +90,16 @@ CREATE TABLE session_authority.detached_restore_stable_plans (
   CONSTRAINT detached_restore_stable_plans_contract_version_supported
     CHECK (plan_contract_version = 1),
   CONSTRAINT detached_restore_stable_plans_admission_object
-    CHECK (
+    CHECK ((
       pg_catalog.jsonb_typeof(admission) = 'object'
       AND pg_catalog.jsonb_object_length(admission) = 2
       AND admission ? 'checkpoint'
       AND admission ? 'request'
       AND pg_catalog.jsonb_typeof(admission -> 'checkpoint') = 'object'
       AND pg_catalog.jsonb_typeof(admission -> 'request') = 'object'
-    ),
+    ) IS TRUE),
   CONSTRAINT detached_restore_stable_plans_plan_input_object
-    CHECK (
+    CHECK ((
       pg_catalog.jsonb_typeof(plan_input) = 'object'
       AND pg_catalog.jsonb_object_length(plan_input) = 9
       AND plan_input ? 'captureCreatedAt'
@@ -109,25 +111,70 @@ CREATE TABLE session_authority.detached_restore_stable_plans (
       AND plan_input ? 'leaseDurationMilliseconds'
       AND plan_input ? 'sourceArtifactDirectory'
       AND plan_input ? 'sourceArtifactOwnedRoot'
-    ),
+      AND pg_catalog.jsonb_typeof(
+        plan_input -> 'captureCreatedAt'
+      ) = 'string'
+      AND pg_catalog.jsonb_typeof(
+        plan_input -> 'destinationDirectory'
+      ) = 'string'
+      AND pg_catalog.jsonb_typeof(
+        plan_input -> 'destinationOwnedRoot'
+      ) = 'string'
+      AND pg_catalog.jsonb_typeof(plan_input -> 'detachMode') = 'string'
+      AND pg_catalog.jsonb_typeof(plan_input -> 'holderId') = 'string'
+      AND pg_catalog.jsonb_typeof(plan_input -> 'imagePlanId') = 'string'
+      AND pg_catalog.jsonb_typeof(
+        plan_input -> 'leaseDurationMilliseconds'
+      ) = 'number'
+      AND pg_catalog.jsonb_typeof(
+        plan_input -> 'sourceArtifactDirectory'
+      ) = 'string'
+      AND pg_catalog.jsonb_typeof(
+        plan_input -> 'sourceArtifactOwnedRoot'
+      ) = 'string'
+    ) IS TRUE),
   CONSTRAINT detached_restore_stable_plans_plan_sha256_format
     CHECK (plan_sha256 ~ '^[0-9a-f]{64}$'),
   CONSTRAINT detached_restore_stable_plans_binding_sha256_format
     CHECK (binding_sha256 ~ '^[0-9a-f]{64}$'),
   CONSTRAINT detached_restore_stable_plans_request_identity
-    CHECK (
-      admission #>> '{request,operationId}' = operation_id
+    CHECK ((
+      pg_catalog.jsonb_typeof(
+        admission #> '{request,operationId}'
+      ) = 'string'
+      AND admission #>> '{request,operationId}' = operation_id
+      AND pg_catalog.jsonb_typeof(
+        admission #> '{request,sessionId}'
+      ) = 'string'
       AND admission #>> '{request,sessionId}' =
         session_id::pg_catalog.text
+      AND pg_catalog.jsonb_typeof(
+        admission #> '{request,backendId}'
+      ) = 'string'
       AND admission #>> '{request,backendId}' = backend_id
+      AND pg_catalog.jsonb_typeof(
+        admission #> '{request,storageId}'
+      ) = 'string'
       AND admission #>> '{request,storageId}' = storage_id
-    ),
+    ) IS TRUE),
   CONSTRAINT detached_restore_stable_plans_request_shape
-    CHECK (
-      admission #> '{request,contractVersion}' = '1'::pg_catalog.jsonb
+    CHECK ((
+      pg_catalog.jsonb_typeof(
+        admission #> '{request,contractVersion}'
+      ) = 'number'
+      AND admission #> '{request,contractVersion}' = '1'::pg_catalog.jsonb
+      AND pg_catalog.jsonb_typeof(
+        admission #> '{request,operation}'
+      ) = 'string'
       AND admission #>> '{request,operation}' = 'restore'
+      AND pg_catalog.jsonb_typeof(
+        admission #> '{request,target}'
+      ) = 'object'
+      AND pg_catalog.jsonb_typeof(
+        admission #> '{request,target,kind}'
+      ) = 'string'
       AND admission #>> '{request,target,kind}' = 'checkpoint'
-    ),
+    ) IS TRUE),
   CONSTRAINT detached_restore_stable_plans_operation_registry_fk
     FOREIGN KEY (operation_id, session_id)
     REFERENCES session_authority.operation_id_registry(
@@ -310,6 +357,39 @@ AFTER DELETE ON session_authority.detached_restore_stable_plans
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
 EXECUTE FUNCTION session_authority.enforce_detached_restore_stable_plan_delete();
+
+-- Defer operation deletion validation for the same FK-ordered teardown. A
+-- materialized stable claim is permanent evidence that its exact operation
+-- must remain until the plan and claim are removed in the same transaction.
+CREATE FUNCTION session_authority.enforce_detached_restore_stable_plan_operation_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $enforce_detached_restore_stable_plan_operation_delete$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM session_authority.operation_id_registry AS registry
+    WHERE registry.operation_id = OLD.operation_id
+      AND registry.session_id = OLD.session_id
+      AND registry.claim_type = 'detached-restore-stable-plan-v1'
+  )
+  THEN
+    RAISE EXCEPTION
+      'detached restore stable-plan operation deletion requires complete teardown'
+      USING
+        ERRCODE = '23503',
+        CONSTRAINT = 'operation_claims_stable_plan_delete_requires_teardown';
+  END IF;
+  RETURN OLD;
+END
+$enforce_detached_restore_stable_plan_operation_delete$;
+
+CREATE CONSTRAINT TRIGGER operation_claims_stable_plan_delete_teardown
+AFTER DELETE ON session_authority.operation_claims
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION session_authority.enforce_detached_restore_stable_plan_operation_delete();
 
 CREATE FUNCTION session_authority.enforce_detached_restore_stable_plan_materialization()
 RETURNS trigger

@@ -28,13 +28,15 @@ superseded_by:
   namespace. Crossed session, request, or plan identity fails closed, and a
   lost commit acknowledgement succeeds only after exact durable readback and
   otherwise remains uncertain for exact retry.
-- Direct plan deletion cannot commit while the permanent preclaim remains;
-  complete authority teardown removes both in one transaction. The preclaim's
-  identity and binding are immutable, and its sole materialization transition
-  must prove the exact version 1 operation by transaction commit. Generation
-  dispatch revalidates the full rehydrated plan, permanent plan digest,
-  generation ID, and destination-isolation proof ID before publication can be
-  authorized.
+- Neither the plan nor its materialized operation can be deleted while the
+  permanent preclaim remains; complete authority teardown removes all three in
+  one transaction. The preclaim's identity and binding are immutable, and its
+  sole materialization transition must prove the exact version 1 operation by
+  transaction commit. Database constraints reject missing, null, or
+  type-coerced durable request, digest, and plan-input fields instead of
+  accepting SQL `UNKNOWN`. Generation dispatch revalidates the full rehydrated
+  plan, permanent plan digest, generation ID, and destination-isolation proof
+  ID before publication can be authorized.
 - `resolveStablePlan({admission, expectedSession})` performs read-only durable
   verification and rehydrates the plan from canonical inputs. It never creates
   or repairs state.

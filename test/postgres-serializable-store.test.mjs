@@ -2578,6 +2578,26 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
+    /ADD CONSTRAINT operation_id_registry_claim_shape[\s\S]+jsonb_typeof\(binding -> 'bindingSha256'\) = 'string'[\s\S]+binding ->> 'bindingSha256' ~ '\^\[0-9a-f\]\{64\}\$'[\s\S]+jsonb_typeof\(binding -> 'planSha256'\) = 'string'[\s\S]+binding ->> 'planSha256' ~ '\^\[0-9a-f\]\{64\}\$'[\s\S]+\) IS TRUE\);/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT detached_restore_stable_plans_admission_object[\s\S]+CHECK \(\([\s\S]+jsonb_typeof\(admission -> 'request'\) = 'object'[\s\S]+\) IS TRUE\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT detached_restore_stable_plans_plan_input_object[\s\S]+jsonb_typeof\([\s\S]+plan_input -> 'captureCreatedAt'[\s\S]+\) = 'string'[\s\S]+jsonb_typeof\([\s\S]+plan_input -> 'leaseDurationMilliseconds'[\s\S]+\) = 'number'[\s\S]+plan_input -> 'sourceArtifactOwnedRoot'[\s\S]+\) = 'string'[\s\S]+\) IS TRUE\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT detached_restore_stable_plans_request_identity[\s\S]+jsonb_typeof\([\s\S]+admission #> '\{request,operationId\}'[\s\S]+\) = 'string'[\s\S]+admission #> '\{request,backendId\}'[\s\S]+\) = 'string'[\s\S]+\) IS TRUE\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT detached_restore_stable_plans_request_shape[\s\S]+admission #> '\{request,contractVersion\}'[\s\S]+\) = 'number'[\s\S]+admission #> '\{request,target,kind\}'[\s\S]+\) = 'string'[\s\S]+\) IS TRUE\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
     /operation_id_registry_detached_restore_stable_plan_immutable[\s\S]+CREATE TRIGGER operation_id_registry_stable_plan_update_guard[\s\S]+BEFORE UPDATE ON session_authority\.operation_id_registry/u,
   );
   assert.match(
@@ -2599,6 +2619,18 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.match(
     latestMigration.sql,
     /WHERE registry\.operation_id = OLD\.operation_id[\s\S]+detached_restore_stable_plans_delete_requires_claim_teardown/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE CONSTRAINT TRIGGER operation_claims_stable_plan_delete_teardown[\s\S]+AFTER DELETE ON session_authority\.operation_claims[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /AS \$enforce_detached_restore_stable_plan_operation_delete\$[\s\S]+WHERE registry\.operation_id = OLD\.operation_id[\s\S]+registry\.session_id = OLD\.session_id[\s\S]+registry\.claim_type = 'detached-restore-stable-plan-v1'[\s\S]+operation_claims_stable_plan_delete_requires_teardown[\s\S]+\$enforce_detached_restore_stable_plan_operation_delete\$;/u,
+  );
+  assert.doesNotMatch(
+    latestMigration.sql,
+    /enforce_detached_restore_stable_plan_operation_delete\$[\s\S]+registry\.materialized_at[\s\S]+\$enforce_detached_restore_stable_plan_operation_delete\$/u,
   );
   client.assertExhausted();
 });
