@@ -390,9 +390,9 @@ boundary. Expiry fails closed and never authorizes a second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
 checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
-must supply provider/image, PostgreSQL connection/bootstrap configuration, and
-operational lease-budget bindings plus the final public backend, then add end-
-to-end ambiguous-outcome coverage before enabling that entry point. A
+must supply provider/image and operational lease-budget bindings plus the
+final public backend, then add end-to-end ambiguous-outcome coverage before
+enabling that entry point. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
 facet plus a narrow `stablePlanProvisioning` facet from one internally
@@ -413,6 +413,20 @@ provisioning, and writer-launch facets. Stop closes those facets, stops the
 scheduler, and drains admitted calls; the caller closes the four borrowed pools
 after that barrier. The exclusive scheduler continues bounded no-relaunch
 recovery.
+
+A PostgreSQL deployment factory now owns the production connection boundary
+above that controller. It accepts one exact explicit host, database, user,
+credential, verified-TLS, timeout, application-name, and four-role capacity
+configuration; constructs four distinct private `pg.Pool` instances; proves
+at startup that one simultaneously held connection from every role reaches a
+writable PostgreSQL 13-or-newer database in the same advisory-lock domain; and
+only then lets the controller migrate and complete its initial sweep. This is
+a point-in-time topology proof, not continuous primary-affinity monitoring.
+Shutdown first closes controller admission and drains accepted work, then
+attempts and awaits every owned pool close in fixed dependency order. Neither
+the raw pools, low-level runtime, scheduler, controller, nor capture-only
+backend is exposed through the deployment surface.
+
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -590,11 +604,14 @@ composition, production-neutral runtime assembly, and same-launcher writer-
 start ingress are now complete. The durable stable-plan registry, separately
 gated provisioning facet, and private read-only foreground resolver are also
 complete. Migration-before-serving, the initial complete recovery sweep,
-restore admission, and shutdown drain now have one deployment owner.
-Production restore remains fail-closed until later slices supply provider/
-image, PostgreSQL connection/bootstrap configuration, and operational lease-
-budget bindings, assembled restart/ambiguity validation, and final adapter
-wiring. Filesystem-image execution and differential backup remain later work.
+explicit PostgreSQL connection/bootstrap configuration, restore admission,
+shutdown drain, and final closure of four private pools now have one
+deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
+not a callback available to injected runtime collaborators. Production restore
+remains fail-closed until later slices supply provider/image and operational
+lease-budget bindings, assembled restart/ambiguity validation, and final
+adapter wiring. Filesystem-image execution and differential backup remain
+later work.
 See
 `docs/architecture/stopped-directory-backend.md`.
 
@@ -743,7 +760,10 @@ SESSION_AUTHORITY_DATABASE_URL=postgresql://user@127.0.0.1:5432/portable_codex_r
 
 The GitHub Actions integration job supplies a fresh PostgreSQL 18.4 service and
 this URL. The explicit command fails when the URL is absent, so that gate cannot
-pass by silently skipping the test.
+pass by silently skipping the test. The integration harness accepts only a URL
+without query parameters or a fragment and splits it into explicit connection
+fields at the test boundary. The production deployment factory does not accept
+or parse a DSN or environment variable.
 
 Two external-auth app-server integration tests run when `CODEX_BIN` (or
 `codex` on `PATH`) is executable. The third app-server integration test is the

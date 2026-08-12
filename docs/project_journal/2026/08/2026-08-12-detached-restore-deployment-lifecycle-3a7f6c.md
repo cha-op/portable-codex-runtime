@@ -41,9 +41,11 @@ superseded_by:
   new admission first, asks the scheduler to stop immediately, and then drains
   the scheduler and all already-admitted calls.
 - Each assembled runtime has exactly one controller owner for its lifetime.
-  Calls admitted by that controller, including their asynchronous descendants,
-  cannot invoke the same controller's `stop()` and create a self-waiting drain;
-  an external owner remains able to stop it.
+  Direct and ordinary Promise-descendant attempts by an admitted call to invoke
+  the same controller's `stop()` fail closed. That context check is defensive,
+  not an authorization boundary across arbitrary `AsyncResource` replacement:
+  only the external deployment owner may hold `stop`, and injected collaborators
+  must not invoke it or return a Promise that depends on it.
 - The controller never calls `pool.end()`. Deployment closes the four borrowed
   pools only after its stop completion settles. The raw runtime is a low-level
   assembly capability and must not be distributed as a serving ingress beside

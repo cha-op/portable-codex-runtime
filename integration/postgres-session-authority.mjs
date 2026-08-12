@@ -26,6 +26,9 @@ import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
+  createPostgresDetachedRestoreDeployment,
+} from "../src/postgres-detached-restore-deployment.mjs";
+import {
   POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED,
 } from "../src/postgres-detached-restore-foreground-composition.mjs";
 import {
@@ -155,6 +158,28 @@ if (!databaseConfigured) {
   throw new Error(
     "SESSION_AUTHORITY_DATABASE_URL is required for the PostgreSQL integration gate",
   );
+}
+
+function explicitPostgresConnectionFromDatabaseUrl(value) {
+  const parsed = new URL(value);
+  assert.equal(
+    parsed.protocol === "postgres:" || parsed.protocol === "postgresql:",
+    true,
+  );
+  assert.equal(parsed.hostname.length > 0, true);
+  assert.equal(parsed.username.length > 0, true);
+  assert.equal(parsed.pathname.length > 1, true);
+  assert.equal(parsed.search, "");
+  assert.equal(parsed.hash, "");
+  const port = parsed.port === "" ? 5432 : Number(parsed.port);
+  assert.equal(Number.isSafeInteger(port) && port >= 1 && port <= 65_535, true);
+  return Object.freeze({
+    database: decodeURIComponent(parsed.pathname.slice(1)),
+    host: parsed.hostname,
+    password: decodeURIComponent(parsed.password),
+    port,
+    user: decodeURIComponent(parsed.username),
+  });
 }
 
 async function readTrackedAuthorityMigrations() {
@@ -2117,6 +2142,36 @@ async function waitForApplicationAdvisoryLock(
   }
   throw new Error(
     `timed out waiting for ${mode} advisory lock from ${applicationName}`,
+  );
+}
+
+async function waitForDeploymentApplicationSessions(
+  queryable,
+  applicationNames,
+  expectedCount,
+) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    await queryable.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
+    const result = await queryable.query(
+      [
+        "SELECT application_name, pg_catalog.count(*)::integer AS session_count",
+        "FROM pg_catalog.pg_stat_activity",
+        "WHERE application_name = ANY($1::text[])",
+        "GROUP BY application_name",
+        "ORDER BY application_name",
+      ].join(" "),
+      [applicationNames],
+    );
+    const count = result.rows.reduce(
+      (total, row) => total + row.session_count,
+      0,
+    );
+    if (count === expectedCount) return result.rows;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(
+    `deployment application session count did not reach ${expectedCount}`,
   );
 }
 
@@ -12189,5 +12244,367 @@ test(
         revision: "1",
       },
     ]);
+  },
+);
+
+test(
+  "PostgreSQL detached restore deployment owns topology startup, drain, and pool shutdown",
+  { timeout: 60_000 },
+  async (t) => {
+    const connection = explicitPostgresConnectionFromDatabaseUrl(databaseUrl);
+    const applicationNamePrefix = `pcrd-${randomUUID().slice(0, 8)}`;
+    const applicationNames = [
+      `${applicationNamePrefix}:authority`,
+      `${applicationNamePrefix}:foreground-lifecycle`,
+      `${applicationNamePrefix}:operation`,
+      `${applicationNamePrefix}:recovery-lifecycle`,
+    ].sort();
+    const inspectionPool = new Pool({
+      application_name: `${applicationNamePrefix}:inspection`,
+      connectionString: databaseUrl,
+      max: 1,
+    });
+    const recoveryScopeId = `integration-deployment-${randomUUID()}`;
+    const sessionId = randomUUID();
+    const provisioningEntered = deferred();
+    const releaseProvisioning = deferred();
+    const steps = [];
+    const calls = {
+      fleetGate: 0,
+      image: 0,
+      planGate: 0,
+      provider: 0,
+      publication: 0,
+      supervisor: 0,
+    };
+    const deployment = createPostgresDetachedRestoreDeployment({
+      postgres: {
+        applicationNamePrefix,
+        database: connection.database,
+        host: connection.host,
+        password: connection.password,
+        poolMaximums: {
+          authority: 2,
+          foregroundLifecycle: 1,
+          operation: 1,
+          recoveryLifecycle: 1,
+        },
+        port: connection.port,
+        timeouts: {
+          connectionMilliseconds: 10_000,
+          idleClientMilliseconds: 120_000,
+          idleTransactionMilliseconds: 10_000,
+          lockMilliseconds: 10_000,
+          queryMilliseconds: 10_000,
+          statementMilliseconds: 10_000,
+        },
+        tls: {
+          ca: null,
+          cert: null,
+          key: null,
+          mode: "disable",
+          serverName: null,
+        },
+        user: connection.user,
+      },
+      runtime: {
+        authority: {
+          maxTransactionAttempts: 3,
+          restoreAttachmentActivationV2FleetCompatible: true,
+          restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
+            true,
+          restoreGenerationV2FleetCompatible: true,
+          writerLaunchStopV3FleetCompatible: true,
+        },
+        foreground: {
+          fleetCapabilityGate() {
+            calls.fleetGate += 1;
+            return null;
+          },
+        },
+        launch: {
+          imageReservations: new PlatformImageReservationCoordinator(),
+          prepareImageReservation() {
+            calls.image += 1;
+            throw new Error("deployment image preparation must not run");
+          },
+          stoppedWriterCoordinator:
+            new StoppedWriterCapabilityCoordinator(),
+          supervisor: Object.freeze({
+            contractVersion: 1,
+            async launchWriter() {
+              calls.supervisor += 1;
+              throw new Error("deployment supervisor must not launch");
+            },
+            async reconcileWriterLaunch() {
+              calls.supervisor += 1;
+              throw new Error("deployment supervisor must not reconcile");
+            },
+            supervisorId: `deployment-supervisor-${randomUUID()}`,
+          }),
+        },
+        planRegistry: {
+          async provisioningFleetCapabilityGate() {
+            calls.planGate += 1;
+            provisioningEntered.resolve();
+            await releaseProvisioning.promise;
+            return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
+          },
+        },
+        recovery: {
+          intervalMilliseconds: 60_000,
+          limits: {
+            activation: 10,
+            currentLaunch: 10,
+            generation: 10,
+            launchAttempt: 10,
+          },
+          onStep(receipt) {
+            steps.push(receipt);
+          },
+          recoveryScopeId,
+        },
+        storage: {
+          backendId: "postgres-authority-integration",
+          lifecycleBackend:
+            restoreRuntimeIntegrationLifecycleBackend(calls),
+          publication: restoreRuntimeIntegrationPublication(
+            calls,
+            recoveryScopeId,
+          ),
+          resolveArtifactPaths: integrationArtifactPaths,
+          resolveRestoreDestination() {
+            throw new Error("deployment destination must not resolve");
+          },
+          resolveSourceOwnedRoot: integrationSourceOwnedRoot,
+        },
+      },
+    });
+
+    t.after(async () => {
+      await Promise.allSettled([deployment.stop()]);
+      try {
+        const cleanupClient = await inspectionPool.connect();
+        try {
+          await cleanupClient.query("BEGIN");
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.restore_recovery_cursors",
+              "WHERE recovery_scope_id = $1",
+            ].join(" "),
+            [recoveryScopeId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.detached_restore_stable_plans",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.operation_id_registry",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.sessions",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query("COMMIT");
+        } catch (error) {
+          try {
+            await cleanupClient.query("ROLLBACK");
+          } catch {
+            // Pool shutdown below destroys any connection that cannot reset.
+          }
+          throw error;
+        } finally {
+          cleanupClient.release();
+        }
+      } finally {
+        await inspectionPool.end();
+      }
+    });
+
+    assert.deepEqual(
+      structuredClone(
+        await settleWithin(deployment.start(), "deployment startup"),
+      ),
+      { status: "ready" },
+    );
+    assert.equal(steps.length >= 1, true);
+    assert.equal(steps[0].status, "completed");
+    assert.equal(steps[0].recovery.status, "sweep-complete");
+
+    const ledger = await readMigrationLedger(inspectionPool);
+    assert.deepEqual(
+      ledger.map(({ version }) => version),
+      AUTHORITY_MIGRATIONS.map(({ version }) => version),
+    );
+    const cursors = await inspectionPool.query(
+      [
+        "SELECT lane, cycle::text AS cycle, revision::text AS revision",
+        "FROM session_authority.restore_recovery_cursors",
+        "WHERE recovery_scope_id = $1",
+        "ORDER BY lane",
+      ].join(" "),
+      [recoveryScopeId],
+    );
+    assert.deepEqual(cursors.rows, [
+      { cycle: "1", lane: "activation", revision: "1" },
+      { cycle: "1", lane: "current-launch", revision: "1" },
+      { cycle: "1", lane: "generation", revision: "1" },
+      { cycle: "1", lane: "launch-attempt", revision: "1" },
+    ]);
+    const activeSessions = await waitForDeploymentApplicationSessions(
+      inspectionPool,
+      applicationNames,
+      4,
+    );
+    assert.deepEqual(
+      activeSessions.map(({ application_name: name }) => name),
+      applicationNames,
+    );
+
+    const registration = registrationInput(sessionId);
+    const inspectionAuthority = new PostgresSessionAuthority({
+      restoreAttachmentActivationV2FleetCompatible: true,
+      restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
+        true,
+      restoreGenerationV2FleetCompatible: true,
+      store: new PostgresSerializableStore({
+        dedicatedPool: inspectionPool,
+        maxTransactionAttempts: 3,
+      }),
+      writerLaunchStopV3FleetCompatible: true,
+    });
+    const registered = await inspectionAuthority.registerSession(registration);
+    assert.equal(registered.sessionId, sessionId);
+    const artifactId = `deployment-artifact-${randomUUID()}`;
+    const checkpointId = `deployment-checkpoint-${randomUUID()}`;
+    const admission = {
+      checkpoint: {
+        artifactId,
+        backendId: registration.storageRef.backendId,
+        checkpointClass: "clean",
+        checkpointId,
+        codexSessionId: registration.manifest.codex.sessionId,
+        codexThreadId: registration.manifest.codex.rootThreadId,
+        contractVersion: 1,
+        createdAt: new Date().toISOString(),
+        imageDigest: registration.manifest.runtime.imageDigest,
+        sessionId,
+        sourceFencingEpoch: "1",
+        storageId: registration.storageRef.storageId,
+      },
+      request: {
+        backendId: registration.storageRef.backendId,
+        contractVersion: 1,
+        fencingEpoch: "2",
+        holderId: `deployment-holder-${randomUUID()}`,
+        leaseId: `deployment-lease-${randomUUID()}`,
+        operation: "restore",
+        operationId: `deployment-restore-${randomUUID()}`,
+        sessionId,
+        storageId: registration.storageRef.storageId,
+        target: {
+          artifactId,
+          checkpointId,
+          kind: "checkpoint",
+        },
+      },
+    };
+    const plan = createPostgresDetachedRestorePlan({
+      request: admission.request,
+      plan: {
+        captureCreatedAt: new Date().toISOString(),
+        destinationDirectory:
+          `/var/lib/portable-codex-restores/${sessionId}`,
+        destinationOwnedRoot: "/var/lib/portable-codex-restores",
+        detachMode: "release",
+        holderId: `deployment-restore-holder-${randomUUID()}`,
+        imagePlanId: `deployment-image-plan-${randomUUID()}`,
+        leaseDurationMilliseconds: 300_000,
+        sourceArtifactDirectory:
+          `/var/lib/portable-codex-checkpoints/${artifactId}`,
+        sourceArtifactOwnedRoot: "/var/lib/portable-codex-checkpoints",
+      },
+    });
+    const admitted =
+      deployment.stablePlanProvisioning.provisionStablePlan({
+        admission,
+        plan,
+      });
+    await settleWithin(
+      provisioningEntered.promise,
+      "deployment admitted provisioning",
+    );
+    const stopping = deployment.stop();
+    assert.strictEqual(deployment.stop(), stopping);
+    let stopSettled = false;
+    void stopping.then(
+      () => {
+        stopSettled = true;
+      },
+      () => {
+        stopSettled = true;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopSettled, false);
+    assert.equal(
+      (
+        await waitForDeploymentApplicationSessions(
+          inspectionPool,
+          applicationNames,
+          4,
+        )
+      ).length,
+      4,
+    );
+
+    releaseProvisioning.resolve();
+    const provisioned = await admitted;
+    assert.equal(provisioned.planSha256, plan.planSha256);
+    assert.deepEqual(
+      structuredClone(
+        await settleWithin(stopping, "deployment shutdown drain"),
+      ),
+      { status: "stopped" },
+    );
+    assert.equal(stopSettled, true);
+    assert.deepEqual(
+      await waitForDeploymentApplicationSessions(
+        inspectionPool,
+        applicationNames,
+        0,
+      ),
+      [],
+    );
+    assert.equal(calls.planGate, 1);
+    assert.equal(calls.fleetGate, 0);
+    assert.equal(calls.image, 0);
+    assert.equal(calls.provider, 0);
+    assert.equal(calls.publication, 0);
+    assert.equal(calls.supervisor, 0);
+    assert.throws(
+      () =>
+        deployment.stablePlanProvisioning.provisionStablePlan({
+          admission,
+          plan,
+        }),
+      (error) => {
+        assert.equal(
+          error.code,
+          "invalid_postgres_detached_restore_deployment_request",
+        );
+        return true;
+      },
+    );
   },
 );

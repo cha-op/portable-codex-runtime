@@ -43,17 +43,18 @@ superseded_by:
   PostgreSQL durable stable-plan registry now provides separately gated
   immutable provisioning and a read-only foreground resolver. A deployment-
   owned controller now binds migration-before-serving, an initial complete
-  recovery sweep, restore admission, and shutdown drain while retaining caller
-  ownership of the four pools. The production adapter remains fixed fail-
-  closed.
+  recovery sweep, restore admission, and shutdown drain. A concrete PostgreSQL
+  deployment now accepts explicit connection/bootstrap policy, constructs and
+  owns the four private role pools, performs a point-in-time same-primary
+  topology check, and closes every pool only after controller drain. The
+  production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Supply the remaining physical provider/image, PostgreSQL connection/
-  bootstrap configuration, and operational lease-budget bindings for the
-  assembled runtime.
+- Supply the remaining physical provider/image and operational lease-budget
+  bindings for the assembled runtime.
 - Validate the complete assembled restart and ambiguous-outcome matrix, then
   construct the final public restore-capable backend and enable the production
   adapter only if the no-second-writer boundary remains closed.
@@ -62,6 +63,7 @@ superseded_by:
 
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
+- `docs/project_journal/2026/08/2026-08-12-postgres-detached-restore-deployment-7d4a91.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-deployment-lifecycle-3a7f6c.md`
 - `docs/project_journal/2026/08/2026-08-11-detached-restore-stable-plan-registry-8e4c21.md`
 - `docs/project_journal/2026/07/2026-07-15-pinned-executable-resume-tail-repair-9d813d.md`
