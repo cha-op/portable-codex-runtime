@@ -14,8 +14,9 @@ superseded_by:
 
 ## Summary
 
-- Preserved the authority's one-shot activation dispatch grant through the
-  live foreground claim without adding it to durable operation state.
+- Kept the authority's one-shot activation dispatch grant local to one
+  coordinator-owned per-operation guard without adding it to durable operation
+  state or caller-visible data.
 - Added read-only provider reconciliation so retained or ambiguous activation
   never repeats a physical attach.
 
@@ -26,11 +27,11 @@ superseded_by:
 - The storage backend has a separate reconciliation contract version 1. It
   observes the activation request's stable mutation operation ID and returns
   exactly `applied`, `absent-and-quiescent`, or `unknown`.
-- The coordinator reconciles before physical attachment. `applied` carries an
-  exact activation result that can be finalized without dispatch.
-  `absent-and-quiescent` permits the first `prepareRestoreAttachment()` only
-  when the current foreground invocation still holds the definite one-shot
-  claim grant. `unknown` fails closed.
+- The coordinator claims and reconciles inside one per-operation guard before
+  physical attachment. `applied` carries an exact activation result that can be
+  finalized without dispatch. `absent-and-quiescent` permits the first
+  `prepareRestoreAttachment()` only from that same guarded claim. `unknown`
+  fails closed, and no serialized grant crosses the foreground boundary.
 - Retained `starting` is marked uncertain before read-only recovery. Retained
   `uncertain`, claim replay, claim acknowledgement loss, and process restart do
   not reconstruct the grant and therefore cannot issue a second attach.

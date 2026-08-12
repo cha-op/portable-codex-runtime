@@ -679,6 +679,86 @@ class GuardPool {
   }
 }
 
+class SharedExclusiveGuardClient {
+  constructor(pool, pid) {
+    this.held = false;
+    this.pid = pid;
+    this.pool = pool;
+  }
+
+  query(query) {
+    const callback = query?.callback;
+    const text = query?.text;
+    if (text === "DISCARD ALL") {
+      callback(null, { command: "DISCARD", rows: [] });
+      return undefined;
+    }
+    if (text.includes("pg_try_advisory_lock")) {
+      const acquired = this.pool.holder === null;
+      if (acquired) {
+        this.pool.holder = this;
+        this.held = true;
+      }
+      callback(null, {
+        command: "SELECT",
+        rows: [{ acquired, backend_pid: this.pid }],
+      });
+      return undefined;
+    }
+    if (text.includes("FROM pg_catalog.pg_locks")) {
+      callback(null, {
+        command: "SELECT",
+        rows: [{
+          backend_pid: this.pid,
+          lock_held: this.held && this.pool.holder === this,
+        }],
+      });
+      return undefined;
+    }
+    if (text.includes("pg_advisory_unlock")) {
+      const unlocked = this.held && this.pool.holder === this;
+      if (unlocked) this.pool.holder = null;
+      this.held = false;
+      callback(null, {
+        command: "SELECT",
+        rows: [{ backend_pid: this.pid, unlocked }],
+      });
+      return undefined;
+    }
+    callback(new Error(`unexpected shared guard query: ${text}`));
+    return undefined;
+  }
+
+  release() {
+    if (this.pool.holder === this) this.pool.holder = null;
+    this.held = false;
+    return undefined;
+  }
+}
+
+class SharedExclusiveGuardPool {
+  constructor() {
+    this.connectCalls = 0;
+    this.holder = null;
+  }
+
+  connect(callback) {
+    this.connectCalls += 1;
+    callback(
+      null,
+      new SharedExclusiveGuardClient(
+        this,
+        2000 + this.connectCalls,
+      ),
+    );
+    return undefined;
+  }
+
+  isHeld(holder) {
+    return holder !== null && this.holder === holder && holder.held;
+  }
+}
+
 function sessionManifest() {
   return createSessionManifest({
     codex: {
@@ -1530,13 +1610,35 @@ function activationCandidate(
   fixture,
   state = "uncertain",
   requestContractVersion = 1,
-  dispatchGranted = false,
 ) {
   return {
     activationOperationId: ACTIVATION_OPERATION_ID,
-    ...(dispatchGranted ? { dispatchGranted: true } : {}),
     request: activationOperationRequest(fixture, requestContractVersion),
     state,
+  };
+}
+
+function activationClaimBase(fixture, requestContractVersion = 1) {
+  return {
+    expectedSession: authoritySnapshot(),
+    kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+    operationId: ACTIVATION_OPERATION_ID,
+    request: activationOperationRequest(fixture, requestContractVersion),
+  };
+}
+
+function activationClaimReceipt(
+  fixture,
+  request,
+  { dispatchGranted, state = "starting" },
+) {
+  const read = activationRead(fixture, state, request);
+  return {
+    ...read,
+    ...(dispatchGranted
+      ? { authorityNow: read.operation.updatedAt }
+      : {}),
+    dispatchGranted,
   };
 }
 
@@ -1553,6 +1655,9 @@ function authorityHarness(handlers = {}) {
   return {
     calls,
     authority: {
+      async claimRestoreAttachmentActivationDispatch(input) {
+        return invoke("claim-activation", input);
+      },
       async finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt(
         input,
       ) {
@@ -1631,8 +1736,12 @@ function storageBackendHarness(
   };
 }
 
-function createCoordinator(fixture, authority, storage) {
-  const guardPool = new GuardPool();
+function createCoordinator(
+  fixture,
+  authority,
+  storage,
+  guardPool = new GuardPool(),
+) {
   const destinations = [];
   const coordinator = createPostgresRestoreActivationRecoveryCoordinator({
     authority,
@@ -2170,15 +2279,19 @@ test("fresh activation reconciliation finalizes an already applied attachment wi
   await makeSourceUnavailable(fixture);
   const request = activationRequest(fixture);
   const prepared = activationResult(request);
-  const candidate = activationCandidate(fixture, "starting", 1, true);
+  const base = activationClaimBase(fixture);
   let finalizerInput;
   const authority = authorityHarness({
+    "claim-activation": async (input) => {
+      assert.equal(input.expectedOperationRevision, "0");
+      return activationClaimReceipt(fixture, request, {
+        dispatchGranted: true,
+      });
+    },
     "finalize-activation": async (input) => {
       finalizerInput = input;
       return activationHandoff(fixture, request, "2");
     },
-    "read-activation": async () =>
-      activationRead(fixture, "starting", request),
   });
   const storage = storageBackendHarness(
     async () => assert.fail("applied reconciliation must not prepare"),
@@ -2195,8 +2308,8 @@ test("fresh activation reconciliation finalizes an already applied attachment wi
     storage,
   );
 
-  const result = await coordinator.reconcileRestoreAttachmentActivation(
-    candidate,
+  const result = await coordinator.claimAndReconcileRestoreAttachmentActivation(
+    base,
   );
 
   assert.equal(result.activation.operation.revision, "2");
@@ -2210,7 +2323,7 @@ test("fresh activation reconciliation finalizes an already applied attachment wi
   assert.equal(storage.prepareCalls.length, 0);
   assert.deepEqual(
     authority.calls.map(([name]) => name),
-    ["read-activation", "finalize-activation"],
+    ["claim-activation", "finalize-activation"],
   );
 });
 
@@ -2220,12 +2333,14 @@ test("fresh absent-and-quiescent reconciliation grants the only physical prepare
   const request = activationRequest(fixture);
   const prepared = activationResult(request);
   const authority = authorityHarness({
+    "claim-activation": async () =>
+      activationClaimReceipt(fixture, request, {
+        dispatchGranted: true,
+      }),
     "finalize-activation": async (input) => {
       assert.equal(input.expectedOperationRevision, "1");
       return activationHandoff(fixture, request, "2");
     },
-    "read-activation": async () =>
-      activationRead(fixture, "starting", request),
   });
   const storage = storageBackendHarness(async (input) => {
     assert.deepEqual(input, request);
@@ -2240,8 +2355,8 @@ test("fresh absent-and-quiescent reconciliation grants the only physical prepare
     storage,
   );
 
-  const result = await coordinator.reconcileRestoreAttachmentActivation(
-    activationCandidate(fixture, "starting", 1, true),
+  const result = await coordinator.claimAndReconcileRestoreAttachmentActivation(
+    activationClaimBase(fixture),
   );
 
   assert.equal(result.activation.operation.revision, "2");
@@ -2254,8 +2369,10 @@ test("fresh unknown reconciliation fails without prepare or uncertainty mutation
   await makeSourceUnavailable(fixture);
   const request = activationRequest(fixture);
   const authority = authorityHarness({
-    "read-activation": async () =>
-      activationRead(fixture, "starting", request),
+    "claim-activation": async () =>
+      activationClaimReceipt(fixture, request, {
+        dispatchGranted: true,
+      }),
   });
   const storage = storageBackendHarness(
     async () => assert.fail("unknown reconciliation must not prepare"),
@@ -2270,8 +2387,8 @@ test("fresh unknown reconciliation fails without prepare or uncertainty mutation
   );
 
   await assert.rejects(
-    coordinator.reconcileRestoreAttachmentActivation(
-      activationCandidate(fixture, "starting", 1, true),
+    coordinator.claimAndReconcileRestoreAttachmentActivation(
+      activationClaimBase(fixture),
     ),
     assertCoordinatorCode(
       "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
@@ -2282,7 +2399,7 @@ test("fresh unknown reconciliation fails without prepare or uncertainty mutation
   assert.equal(storage.prepareCalls.length, 0);
   assert.deepEqual(
     authority.calls.map(([name]) => name),
-    ["read-activation"],
+    ["claim-activation"],
   );
 });
 
@@ -2418,13 +2535,23 @@ for (const outcome of ["absent-and-quiescent", "unknown"]) {
   });
 }
 
-test("a stale fresh grant cannot prepare an activation already uncertain", async (t) => {
+test("a fulfilled replay claim has no local grant and cannot prepare", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
   const request = activationRequest(fixture);
+  let state = "starting";
   const authority = authorityHarness({
-    "read-activation": async () =>
-      activationRead(fixture, "uncertain", request),
+    "claim-activation": async () =>
+      activationClaimReceipt(fixture, request, {
+        dispatchGranted: false,
+        state: "starting",
+      }),
+    "mark-uncertain": async (input) => {
+      assert.equal(input.expectedOperationRevision, "1");
+      state = "uncertain";
+      return { marked: true };
+    },
+    "read-activation": async () => activationRead(fixture, state, request),
   });
   const storage = storageBackendHarness(
     async () => assert.fail("an uncertain activation must not prepare"),
@@ -2440,8 +2567,8 @@ test("a stale fresh grant cannot prepare an activation already uncertain", async
   );
 
   await assert.rejects(
-    coordinator.reconcileRestoreAttachmentActivation(
-      activationCandidate(fixture, "starting", 1, true),
+    coordinator.claimAndReconcileRestoreAttachmentActivation(
+      activationClaimBase(fixture),
     ),
     assertCoordinatorCode(
       "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
@@ -2450,6 +2577,211 @@ test("a stale fresh grant cannot prepare an activation already uncertain", async
 
   assert.equal(storage.reconciliationCalls.length, 1);
   assert.equal(storage.prepareCalls.length, 0);
+  assert.deepEqual(
+    authority.calls.map(([name]) => name),
+    ["claim-activation", "mark-uncertain", "read-activation"],
+  );
+});
+
+test("claim acknowledgement loss uses a no-grant readback and cannot prepare", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  let state = "starting";
+  const authority = authorityHarness({
+    "claim-activation": async () => {
+      throw new Error("claim acknowledgement lost");
+    },
+    "mark-uncertain": async () => {
+      state = "uncertain";
+      return { marked: true };
+    },
+    "read-activation": async () => activationRead(fixture, state, request),
+  });
+  const storage = storageBackendHarness(
+    async () => assert.fail("claim readback must not prepare"),
+    {
+      reconcile: async () =>
+        activationReconciliation("absent-and-quiescent"),
+    },
+  );
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await assert.rejects(
+    coordinator.claimAndReconcileRestoreAttachmentActivation(
+      activationClaimBase(fixture),
+    ),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(storage.reconciliationCalls.length, 1);
+  assert.equal(storage.prepareCalls.length, 0);
+  assert.deepEqual(
+    authority.calls.map(([name]) => name),
+    [
+      "claim-activation",
+      "read-activation",
+      "mark-uncertain",
+      "read-activation",
+    ],
+  );
+});
+
+test("claim grant and physical prepare remain in one guarded critical section", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  let claimInFlight = false;
+  let claimSettled = false;
+  const sequence = [];
+  const authority = authorityHarness({
+    "claim-activation": async () => {
+      assert.equal(claimInFlight, false);
+      claimInFlight = true;
+      sequence.push("claim-start");
+      await Promise.resolve();
+      claimSettled = true;
+      sequence.push("claim-end");
+      return activationClaimReceipt(fixture, request, {
+        dispatchGranted: true,
+      });
+    },
+    "finalize-activation": async () => {
+      sequence.push("finalize");
+      claimInFlight = false;
+      return activationHandoff(fixture, request, "2");
+    },
+  });
+  const storage = storageBackendHarness(
+    async () => {
+      assert.equal(claimInFlight, true);
+      assert.equal(claimSettled, true);
+      sequence.push("prepare");
+      return prepared;
+    },
+    {
+      reconcile: async () => {
+        assert.equal(claimInFlight, true);
+        assert.equal(claimSettled, true);
+        sequence.push("reconcile");
+        return activationReconciliation("absent-and-quiescent");
+      },
+    },
+  );
+  const { coordinator, guardPool } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+  );
+
+  await coordinator.claimAndReconcileRestoreAttachmentActivation(
+    activationClaimBase(fixture),
+  );
+
+  assert.deepEqual(sequence, [
+    "claim-start",
+    "claim-end",
+    "reconcile",
+    "prepare",
+    "finalize",
+  ]);
+  assert.equal(guardPool.connectCalls, 1);
+  assert.equal(storage.prepareCalls.length, 1);
+});
+
+test("a concurrent retained recovery cannot race a guarded fresh claim", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const prepared = activationResult(request);
+  let enterReconciliation;
+  let releaseReconciliation;
+  const reconciliationEntered = new Promise((resolve) => {
+    enterReconciliation = resolve;
+  });
+  const reconciliationGate = new Promise((resolve) => {
+    releaseReconciliation = resolve;
+  });
+  const guardPool = new SharedExclusiveGuardPool();
+  let freshHolder = null;
+  const authority = authorityHarness({
+    "claim-activation": async () => {
+      freshHolder = guardPool.holder;
+      assert.equal(guardPool.isHeld(freshHolder), true);
+      return activationClaimReceipt(fixture, request, {
+        dispatchGranted: true,
+      });
+    },
+    "finalize-activation": async () => {
+      assert.equal(guardPool.isHeld(freshHolder), true);
+      return activationHandoff(fixture, request, "2");
+    },
+  });
+  const storage = storageBackendHarness(
+    async () => {
+      assert.equal(guardPool.isHeld(freshHolder), true);
+      return prepared;
+    },
+    {
+      reconcile: async () => {
+        assert.equal(guardPool.isHeld(freshHolder), true);
+        enterReconciliation();
+        await reconciliationGate;
+        assert.equal(guardPool.isHeld(freshHolder), true);
+        return activationReconciliation("absent-and-quiescent");
+      },
+    },
+  );
+  const { coordinator } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+    guardPool,
+  );
+
+  const fresh = coordinator.claimAndReconcileRestoreAttachmentActivation(
+    activationClaimBase(fixture),
+  );
+  await reconciliationEntered;
+
+  let retainedError = null;
+  try {
+    await coordinator.reconcileRestoreAttachmentActivation(
+      activationCandidate(fixture, "starting"),
+    );
+  } catch (error) {
+    retainedError = error;
+  } finally {
+    releaseReconciliation();
+  }
+
+  assertCoordinatorCode(
+    "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+  )(retainedError);
+  assert.deepEqual(
+    authority.calls.map(([name]) => name),
+    ["claim-activation"],
+  );
+  assert.equal(storage.reconciliationCalls.length, 1);
+  assert.equal(storage.prepareCalls.length, 0);
+  assert.equal(guardPool.isHeld(freshHolder), true);
+
+  const result = await fresh;
+  assert.equal(result.activation.operation.state, "committed");
+  assert.deepEqual(
+    authority.calls.map(([name]) => name),
+    ["claim-activation", "finalize-activation"],
+  );
+  assert.equal(storage.prepareCalls.length, 1);
+  assert.equal(guardPool.connectCalls, 2);
+  assert.equal(guardPool.holder, null);
 });
 
 test("post-prepare finalization failure marks uncertainty and recovery never prepares again", async (t) => {
@@ -2459,6 +2791,10 @@ test("post-prepare finalization failure marks uncertainty and recovery never pre
   let state = "starting";
   let reconciliationCalls = 0;
   const authority = authorityHarness({
+    "claim-activation": async () =>
+      activationClaimReceipt(fixture, request, {
+        dispatchGranted: true,
+      }),
     "finalize-activation": async () => {
       throw new Error("finalization acknowledgement remains uncertain");
     },
@@ -2487,8 +2823,8 @@ test("post-prepare finalization failure marks uncertainty and recovery never pre
   );
 
   await assert.rejects(
-    coordinator.reconcileRestoreAttachmentActivation(
-      activationCandidate(fixture, "starting", 1, true),
+    coordinator.claimAndReconcileRestoreAttachmentActivation(
+      activationClaimBase(fixture),
     ),
     assertCoordinatorCode(
       "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
@@ -2508,7 +2844,7 @@ test("post-prepare finalization failure marks uncertainty and recovery never pre
   assert.deepEqual(
     authority.calls.map(([name]) => name),
     [
-      "read-activation",
+      "claim-activation",
       "finalize-activation",
       "finalize-activation",
       "mark-uncertain",
@@ -2532,6 +2868,10 @@ test("every ambiguous prepare settlement marks the fresh activation uncertain", 
   for (const [scenario, prepare] of scenarios) {
     let markCalls = 0;
     const authority = authorityHarness({
+      "claim-activation": async () =>
+        activationClaimReceipt(fixture, request, {
+          dispatchGranted: true,
+        }),
       "mark-uncertain": async (input) => {
         markCalls += 1;
         assert.equal(input.expectedOperationRevision, "1");
@@ -2551,8 +2891,8 @@ test("every ambiguous prepare settlement marks the fresh activation uncertain", 
     );
 
     await assert.rejects(
-      coordinator.reconcileRestoreAttachmentActivation(
-        activationCandidate(fixture, "starting", 1, true),
+      coordinator.claimAndReconcileRestoreAttachmentActivation(
+        activationClaimBase(fixture),
       ),
       assertCoordinatorCode(
         "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
@@ -2566,7 +2906,7 @@ test("every ambiguous prepare settlement marks the fresh activation uncertain", 
   }
 });
 
-test("dispatchGranted is accepted only as true on a starting candidate", async (t) => {
+test("caller-supplied dispatch grants are rejected before authority or provider calls", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);
   await makeSourceUnavailable(fixture);
   const authority = authorityHarness({});
@@ -2580,6 +2920,7 @@ test("dispatchGranted is accepted only as true on a starting candidate", async (
   );
   const invalid = [
     { ...activationCandidate(fixture, "starting"), dispatchGranted: false },
+    { ...activationCandidate(fixture, "starting"), dispatchGranted: true },
     { ...activationCandidate(fixture), dispatchGranted: true },
   ];
 
@@ -2591,9 +2932,83 @@ test("dispatchGranted is accepted only as true on a starting candidate", async (
       ),
     );
   }
+  await assert.rejects(
+    coordinator.claimAndReconcileRestoreAttachmentActivation({
+      ...activationClaimBase(fixture),
+      dispatchGranted: true,
+    }),
+    assertCoordinatorCode(
+      "invalid_postgres_restore_activation_recovery_coordinator_request",
+    ),
+  );
 
   assert.deepEqual(authority.calls, []);
   assert.deepEqual(storage.providerCalls, []);
+});
+
+test("rejects malformed activation claim receipts before provider work", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  await makeSourceUnavailable(fixture);
+  const request = activationRequest(fixture);
+  const scenarios = [
+    {
+      name: "true grant without authority clock",
+      mutate(receipt) {
+        delete receipt.authorityNow;
+      },
+    },
+    {
+      name: "false grant with authority clock",
+      mutate(receipt) {
+        receipt.dispatchGranted = false;
+      },
+    },
+    {
+      name: "true grant for an uncertain operation",
+      create() {
+        return {
+          ...activationClaimReceipt(fixture, request, {
+            dispatchGranted: false,
+            state: "uncertain",
+          }),
+          authorityNow: "2026-08-05T00:03:00.000Z",
+          dispatchGranted: true,
+        };
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const authority = authorityHarness({
+      "claim-activation": async () => {
+        const receipt = scenario.create?.() ??
+          activationClaimReceipt(fixture, request, {
+            dispatchGranted: true,
+          });
+        scenario.mutate?.(receipt);
+        return receipt;
+      },
+    });
+    const storage = storageBackendHarness(async () => {
+      assert.fail("malformed claim must not reach the backend");
+    });
+    const { coordinator } = createCoordinator(
+      fixture,
+      authority.authority,
+      storage,
+    );
+
+    await assert.rejects(
+      coordinator.claimAndReconcileRestoreAttachmentActivation(
+        activationClaimBase(fixture),
+      ),
+      assertCoordinatorCode(
+        "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+      ),
+      scenario.name,
+    );
+    assert.deepEqual(storage.providerCalls, [], scenario.name);
+  }
 });
 
 test("retains version 1 restore attachment activation recovery", async (t) => {

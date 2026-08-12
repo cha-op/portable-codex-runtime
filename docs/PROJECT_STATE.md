@@ -370,14 +370,15 @@
   original Promise, and failure to settle invokes a private deployment fatal
   hook. Neither abort nor that hook proves physical quiescence, makes attempted
   dependency cleanup a clean stopped result, or authorizes another dispatch.
-- Restore activation now preserves its PostgreSQL one-shot dispatch grant only
-  across the live foreground claim. The storage backend exposes a separate
-  version 1 read-only reconciliation contract keyed by the durable activation
-  request. `applied` can finalize exact existing evidence;
-  `absent-and-quiescent` can reach the first attach only with the live grant;
-  `unknown`, retained `starting`/`uncertain` work, and claim acknowledgement
-  loss remain blocked without a second physical dispatch. Durable activation
-  request/result version 1 and the PostgreSQL schema remain unchanged.
+- Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
+  grant entirely inside one coordinator-owned per-operation guard. The storage
+  backend exposes a separate version 1 read-only reconciliation contract keyed
+  by the durable activation request. `applied` can finalize exact existing
+  evidence; `absent-and-quiescent` can reach the first attach only from that
+  same guarded claim; `unknown`, retained `starting`/`uncertain` work, claim
+  acknowledgement loss, and copied caller data remain blocked without a second
+  physical dispatch. Durable activation request/result version 1 and the
+  PostgreSQL schema remain unchanged.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
   requires method-specific settlement for the mutating supervisor, storage-

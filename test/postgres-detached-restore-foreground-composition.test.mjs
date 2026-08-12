@@ -820,9 +820,6 @@ function facadeFixture({
   const calls = { gate: 0, renew: 0, stop: 0 };
   const trace = [];
   const authority = {
-    async claimRestoreAttachmentActivationDispatch() {
-      throw new Error("unexpected activation claim");
-    },
     async claimRestoreDestinationGenerationDispatch() {
       throw new Error("unexpected generation claim");
     },
@@ -901,6 +898,9 @@ function facadeFixture({
       return plan;
     },
     restoreActivationCoordinator: {
+      async claimAndReconcileRestoreAttachmentActivation() {
+        throw new Error("unexpected activation claim and reconciliation");
+      },
       async reconcileRestoreAttachmentActivation() {
         throw new Error("unexpected activation reconciliation");
       },
@@ -919,7 +919,6 @@ function facadeFixture({
 
 function happyFacadeFixture({
   activationClaimAckLoss = null,
-  activationClaimDispatchGranted = true,
   beforeLaunchReturn = null,
   captureColdState = null,
   crossedPreparedGeneration = null,
@@ -1252,45 +1251,6 @@ function happyFacadeFixture({
   }
 
   const authority = {
-    async claimRestoreAttachmentActivationDispatch(input) {
-      events.push("activation-claim");
-      if (activationClaimAckLoss === "missing") {
-        throw new Error("activation claim acknowledgement lost before commit");
-      }
-      const operation = authorityOperation({
-        expectedSession: input.expectedSession,
-        kind: input.kind,
-        operationId: input.operationId,
-        request: input.request,
-        revision: "1",
-        state: "starting",
-        updatedAt: "2026-08-11T09:00:06.000Z",
-      });
-      activationReceipt = deepFreeze({
-        activationRequest: { providerRequestId: "provider-request-001" },
-        dispatchGranted: activationClaimDispatchGranted,
-        generation: generationReceipt.generation,
-        operation,
-        reservation: operationReservation(operation, "starting"),
-        session: sessionDuringOperation(
-          input.expectedSession,
-          operation,
-          revisionAfterOperation(operation),
-          {
-            attachment: null,
-            launch: null,
-            lease: restoredWriterLease,
-            lifecycle: "ATTACHING",
-            writerEpoch: restoredWriterLease.fencingEpoch,
-          },
-        ),
-      });
-      if (activationClaimAckLoss === "persisted") {
-        throw new Error("activation claim acknowledgement lost after persist");
-      }
-      assert.equal(activationClaimAckLoss, null);
-      return activationReceipt;
-    },
     async claimRestoreDestinationGenerationDispatch(input) {
       events.push("generation-claim");
       assert.strictEqual(input.stablePlan, plan);
@@ -1388,17 +1348,7 @@ function happyFacadeFixture({
       return absent("checkpoint_capture_not_authorized");
     },
     async readRestoreAttachmentActivation() {
-      if (activationReceipt !== null) {
-        if (activationClaimAckLoss === "persisted") {
-          const {
-            dispatchGranted: ignoredDispatchGrant,
-            ...readReceipt
-          } = activationReceipt;
-          assert.equal(typeof ignoredDispatchGrant, "boolean");
-          return deepFreeze(readReceipt);
-        }
-        return activationReceipt;
-      }
+      if (activationReceipt !== null) return activationReceipt;
       return absent("restore_attachment_activation_not_authorized");
     },
     async readRestoreDestinationGeneration() {
@@ -1679,9 +1629,57 @@ function happyFacadeFixture({
       return plan;
     },
     restoreActivationCoordinator: {
-      async reconcileRestoreAttachmentActivation(candidate) {
-        events.push("activation-coordinator");
+      async claimAndReconcileRestoreAttachmentActivation(candidate) {
+        events.push("activation-coordinator-claim");
         activationCandidates.push(candidate);
+        if (activationClaimAckLoss === "missing") {
+          throw new Error(
+            "activation claim acknowledgement lost before commit",
+          );
+        }
+        const operation = authorityOperation({
+          expectedSession: candidate.expectedSession,
+          kind: candidate.kind,
+          operationId: candidate.operationId,
+          request: candidate.request,
+          revision: "1",
+          state: "starting",
+          updatedAt: "2026-08-11T09:00:06.000Z",
+        });
+        activationReceipt = deepFreeze({
+          activationRequest: { providerRequestId: "provider-request-001" },
+          generation: generationReceipt.generation,
+          operation,
+          reservation: operationReservation(operation, "starting"),
+          session: sessionDuringOperation(
+            candidate.expectedSession,
+            operation,
+            revisionAfterOperation(operation),
+            {
+              attachment: null,
+              launch: null,
+              lease: restoredWriterLease,
+              lifecycle: "ATTACHING",
+              writerEpoch: restoredWriterLease.fencingEpoch,
+            },
+          ),
+        });
+        if (activationClaimAckLoss === "persisted") {
+          throw new Error(
+            "activation claim acknowledgement lost after persist",
+          );
+        }
+        assert.equal(activationClaimAckLoss, null);
+        return this.reconcileRestoreAttachmentActivation(candidate, true);
+      },
+      async reconcileRestoreAttachmentActivation(
+        candidate,
+        claimedByCoordinator = false,
+      ) {
+        if (!claimedByCoordinator) {
+          events.push("activation-coordinator-reconcile");
+          activationCandidates.push(candidate);
+        }
         assert.equal(candidate.request, activationReceipt.operation.request);
         const operationId = plan.activationOperationId;
         const writerLease = restoredWriterLease;
@@ -2192,33 +2190,38 @@ async function seedCommittedRestore(fixture, publicationId) {
 
 function assertActivationCoordinatorCandidate(
   candidate,
-  { dispatchGranted, state },
+  { mode, state = null },
 ) {
   assert.equal(Object.getPrototypeOf(candidate), null);
   assert.equal(Object.isFrozen(candidate), true);
-  assert.equal(
-    candidate.activationOperationId,
-    fixturePlan().activationOperationId,
-  );
-  assert.equal(candidate.state, state);
   assert.equal(Object.getPrototypeOf(candidate.request), null);
-  if (dispatchGranted) {
+  assert.equal(Object.hasOwn(candidate, "dispatchGranted"), false);
+  if (mode === "claim") {
     assert.deepEqual(Reflect.ownKeys(candidate), [
-      "activationOperationId",
-      "dispatchGranted",
+      "expectedSession",
+      "kind",
+      "operationId",
       "request",
-      "state",
     ]);
-    assert.equal(candidate.dispatchGranted, true);
-    assert.equal(state, "starting");
+    assert.equal(
+      candidate.operationId,
+      fixturePlan().activationOperationId,
+    );
+    assert.equal(candidate.kind, "restore-attachment-activation-v1");
+    assert.equal(Object.hasOwn(candidate, "state"), false);
     return;
   }
+  assert.equal(mode, "reconcile");
   assert.deepEqual(Reflect.ownKeys(candidate), [
     "activationOperationId",
     "request",
     "state",
   ]);
-  assert.equal(Object.hasOwn(candidate, "dispatchGranted"), false);
+  assert.equal(
+    candidate.activationOperationId,
+    fixturePlan().activationOperationId,
+  );
+  assert.equal(candidate.state, state);
 }
 
 async function rejectsWithCode(promise, code) {
@@ -2499,14 +2502,12 @@ test("fresh restore runs every effect once and preserves publication identity", 
     "image",
     "prepare-intent",
     "activation-reserve",
-    "activation-claim",
-    "activation-coordinator",
+    "activation-coordinator-claim",
     "launch",
   ]);
   assert.equal(fixture.activationCandidates.length, 1);
   assertActivationCoordinatorCandidate(fixture.activationCandidates[0], {
-    dispatchGranted: true,
-    state: "starting",
+    mode: "claim",
   });
 });
 
@@ -2817,21 +2818,17 @@ for (const state of ["prepared", "starting", "uncertain", "committed"]) {
     );
     assert.equal(result, completion);
     assert.equal(
-      fixture.events.filter((entry) => entry === "activation-claim").length,
-      state === "prepared" ? 1 : 0,
-    );
-    assert.equal(
-      fixture.events.filter((entry) => entry === "activation-coordinator").length,
+      fixture.events.filter((entry) =>
+        entry.startsWith("activation-coordinator-"),
+      ).length,
       1,
     );
     assertActivationCoordinatorCandidate(
       fixture.activationCandidates[fixture.activationCandidates.length - 1],
       {
-        dispatchGranted: state === "prepared",
+        mode: state === "prepared" ? "claim" : "reconcile",
         state:
-          state === "prepared" || state === "starting"
-            ? "starting"
-            : "uncertain",
+          state === "starting" ? "starting" : "uncertain",
       },
     );
     assert.equal(fixture.events.filter((entry) => entry === "launch").length, 1);
@@ -2845,40 +2842,25 @@ for (const state of ["prepared", "starting", "uncertain", "committed"]) {
   });
 }
 
-test("activation claim replay does not reconstruct a dispatch grant", async () => {
-  const fixture = happyFacadeFixture({
-    activationClaimDispatchGranted: false,
-  });
-
-  await seedCommittedRestore(fixture, "activation-claim-replay-001");
-
-  assert.equal(
-    fixture.events.filter((entry) => entry === "activation-claim").length,
-    1,
-  );
-  assert.equal(fixture.activationCandidates.length, 1);
-  assertActivationCoordinatorCandidate(fixture.activationCandidates[0], {
-    dispatchGranted: false,
-    state: "starting",
-  });
-});
-
-test("activation claim acknowledgement loss readback does not reconstruct a dispatch grant", async () => {
+test("activation claim acknowledgement loss remains coordinator-owned", async () => {
   const fixture = happyFacadeFixture({
     activationClaimAckLoss: "persisted",
   });
 
-  await seedCommittedRestore(fixture, "activation-claim-ack-loss-001");
-
-  assert.equal(
-    fixture.events.filter((entry) => entry === "activation-claim").length,
-    1,
+  await rejectsWithCode(
+    seedCommittedRestore(fixture, "activation-claim-ack-loss-001"),
+    "postgres_detached_restore_foreground_composition_outcome_uncertain",
   );
   assert.equal(fixture.activationCandidates.length, 1);
   assertActivationCoordinatorCandidate(fixture.activationCandidates[0], {
-    dispatchGranted: false,
-    state: "starting",
+    mode: "claim",
   });
+  assert.equal(fixture.events.includes("activation-coordinator-claim"), true);
+  assert.equal(
+    fixture.events.includes("activation-coordinator-reconcile"),
+    false,
+  );
+  assert.equal(fixture.events.includes("launch"), false);
 });
 
 test("activation claim acknowledgement loss without durable readback fails closed", async () => {
@@ -2892,12 +2874,20 @@ test("activation claim acknowledgement loss without durable readback fails close
   );
 
   assert.equal(
-    fixture.events.filter((entry) => entry === "activation-claim").length,
+    fixture.events.filter(
+      (entry) => entry === "activation-coordinator-claim",
+    ).length,
     1,
   );
-  assert.equal(fixture.events.includes("activation-coordinator"), false);
+  assert.equal(
+    fixture.events.includes("activation-coordinator-reconcile"),
+    false,
+  );
   assert.equal(fixture.events.includes("launch"), false);
-  assert.deepEqual(fixture.activationCandidates, []);
+  assert.equal(fixture.activationCandidates.length, 1);
+  assertActivationCoordinatorCandidate(fixture.activationCandidates[0], {
+    mode: "claim",
+  });
 });
 
 for (const state of ["starting", "uncertain"]) {

@@ -55,9 +55,10 @@ superseded_by:
   deadlines and post-deadline grace periods, fresh opaque invocation identities
   and authentic abort signals, and a deployment-private fatal breach route
   without claiming physical quiet or retry authority. Restore activation now
-  also preserves a definite one-shot claim grant only in the live foreground
-  invocation and requires read-only reconciliation before any attachment.
-  Retained or ambiguous state cannot reconstruct a second physical dispatch.
+  also performs claim, read-only reconciliation, optional first attachment,
+  and finalization inside one coordinator-owned per-operation guard. No grant
+  crosses the component boundary, and retained, ambiguous, or copied caller
+  state cannot reconstruct a second physical dispatch.
   The production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.

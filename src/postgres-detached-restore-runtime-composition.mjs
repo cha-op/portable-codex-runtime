@@ -104,6 +104,9 @@ const createWriterDetachIntrinsic = createPostgresWriterDetachComposition;
 const listCurrentWriterLaunchCandidatesIntrinsic =
   PostgresSessionAuthority.prototype
     .listCurrentWriterLaunchRecoveryCandidates;
+const claimRestoreAttachmentActivationDispatchIntrinsic =
+  PostgresSessionAuthority.prototype
+    .claimRestoreAttachmentActivationDispatch;
 const finalizeRestoreAttachmentActivationIntrinsic =
   PostgresSessionAuthority.prototype
     .finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt;
@@ -554,6 +557,10 @@ function receiverCallback(method, receiver) {
 
 function createRestoreActivationAuthority(authority) {
   return exactFrozenRecord({
+    claimRestoreAttachmentActivationDispatch: receiverCallback(
+      claimRestoreAttachmentActivationDispatchIntrinsic,
+      authority,
+    ),
     finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt:
       receiverCallback(
         finalizeRestoreAttachmentActivationIntrinsic,

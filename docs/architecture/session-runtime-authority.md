@@ -1857,17 +1857,18 @@ committed-only or no-relaunch recovery path; an unresolved earlier cut can
 leave the caller-driven sequence blocked rather than being guessed forward.
 
 Restore attachment activation makes that rule explicit at the physical
-provider boundary. The PostgreSQL claim's `dispatchGranted: true` is preserved
-only by the live foreground call and is never reconstructed from durable
-`starting` or `uncertain` state. The activation backend keeps durable request
-and result contract version 1, and adds a separate read-only reconciliation
-contract version 1. Reconciliation is keyed by the activation request's stable
-mutation operation ID and returns exactly `applied` with the original validated
-activation result, `absent-and-quiescent`, or `unknown`. The coordinator always
-reconciles before a possible attach. Exact `applied` evidence is finalized;
-`absent-and-quiescent` permits `prepareRestoreAttachment()` only while the live
-grant is present; every retained, acknowledgement-loss, or `unknown` path
-remains uncertain without a second physical dispatch.
+provider boundary. The coordinator performs the PostgreSQL claim and consumes
+its `dispatchGranted: true` result only inside the same per-operation guard that
+covers reconciliation, optional attachment, and finalization; neither
+foreground nor recovery can submit a serialized grant. The activation backend
+keeps durable request and result contract version 1, and adds a separate
+read-only reconciliation contract version 1. Reconciliation is keyed by the
+activation request's stable mutation operation ID and returns exactly `applied`
+with the original validated activation result, `absent-and-quiescent`, or
+`unknown`. Exact `applied` evidence is finalized; `absent-and-quiescent` permits
+`prepareRestoreAttachment()` only from that same guarded claim; every retained,
+acknowledgement-loss, copied-caller-data, or `unknown` path remains uncertain
+without a second physical dispatch.
 
 Renewal-before-stop narrows but does not remove the database-clock lease
 boundary. On a fresh path, the successful renewal's PostgreSQL `authorityNow`,

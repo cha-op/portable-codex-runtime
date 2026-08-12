@@ -451,12 +451,13 @@ physical effects are quiet and never authorizes a second dispatch.
 This completes image identity binding, not image fetch, signature verification,
 container-runtime pinning, container launch, supervisor implementation,
 physical storage/provider work, or writer fencing.
-Restore activation now preserves the authority's one-shot dispatch grant only
-for the live claim invocation. Before attachment, the coordinator always asks
-the same backend for read-only reconciliation. A proved `applied` result is
-finalized without another attach; `absent-and-quiescent` permits the first
-attach only while that live grant is present; `unknown`, retained work, and
-claim-acknowledgement loss never reconstruct dispatch authority.
+Restore activation now obtains and consumes the authority's one-shot dispatch
+grant entirely inside one coordinator-owned per-operation guard. Before
+attachment, the coordinator always asks the same backend for read-only
+reconciliation. A proved `applied` result is finalized without another attach;
+`absent-and-quiescent` permits the first attach only from that same guarded
+claim; `unknown`, retained work, claim acknowledgement loss, and copied caller
+data never reconstruct dispatch authority.
 
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
