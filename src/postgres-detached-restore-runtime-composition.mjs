@@ -10,6 +10,9 @@ import {
   isPostgresDetachedRestoreImagePlanBinding,
 } from "./postgres-detached-restore-image-plan-binding.mjs";
 import {
+  isPostgresDetachedRestorePublicationBinding,
+} from "./postgres-detached-restore-physical-bindings.mjs";
+import {
   createPostgresDetachedRestoreStablePlanRegistry,
 } from "./postgres-detached-restore-stable-plan-registry.mjs";
 import {
@@ -45,6 +48,7 @@ import {
   STORAGE_CONTRACT_VERSION,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryBackend } from "./stopped-directory-backend.mjs";
+import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs";
 import {
   createPostgresWriterDetachComposition,
 } from "./postgres-writer-detach-composition.mjs";
@@ -462,6 +466,14 @@ function preflightLifecycleBackend(backend) {
   trustedFunction(reconcileRestoreAttachment);
 }
 
+function preflightPublication(publication) {
+  preflightPrototypeChain(publication);
+  ensure(
+    publication instanceof StoppedDirectoryPublication ||
+      isPostgresDetachedRestorePublicationBinding(publication),
+  );
+}
+
 function ownFrozenDataFunction(receiver, name) {
   ensure(
     receiver !== null &&
@@ -687,7 +699,7 @@ function assemble(options) {
     ),
   );
   preflightPrototypeChain(options.launch.stoppedWriterCoordinator);
-  preflightPrototypeChain(options.storage.publication);
+  preflightPublication(options.storage.publication);
 
   const store = construct(
     PostgresSerializableStoreConstructor,

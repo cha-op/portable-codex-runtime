@@ -2002,6 +2002,48 @@ weaken unrelated failure isolation. Providers that require hostile-code
 isolation must run behind a process boundary with an ordinary observable native
 Promise adapter.
 
+Deployment now extends that settlement lifecycle across the complete currently
+assembled physical graph through one private branded binding. Seventeen
+additional method-specific coordinators cover supervisor launch, stopped-only
+launch reconciliation, returned writer stop, nine storage-lifecycle methods,
+four publication methods, and restore-destination resolution. Together with
+image resolution and inspection, shutdown owns nineteen settlement stops.
+Every method has an independent exact deadline/grace policy selected by
+deployment.
+
+The raw supervisor boundary is transient contract version 2: launch,
+reconciliation, and returned stop receive fresh opaque invocation identity and
+authentic abort signal fields. Its adapter exposes the logical launcher's
+existing version 1 facade and translates successful physical receipts without
+changing any durable attempt, operation, reservation, or evidence shape. A
+returned physical stop capability succeeds only with exact transient receipt
+`{ contractVersion: 2, status: "stopped" }`; the adapter maps that receipt to
+the launcher's existing opaque stop sentinel. The capability is itself wrapped
+by the shared stop settlement boundary before it becomes the launcher's
+one-shot local callback.
+
+Storage keeps durable lifecycle contract version 1. Each raw method instead
+receives a separate frozen invocation-context argument with contract version 1,
+`invocation`, and `signal`; that context never enters a lifecycle request,
+activation request/result, operation hash, or terminal evidence. Publication
+and restore-destination resolution are likewise bounded at their lowest
+external Promise. Fresh checkpoint/restore publication remains distinct from
+committed-only verification, and activation preparation remains distinct from
+read-only reconciliation under the same guarded one-shot grant. Settlement
+cannot promote a verifier or reconciler into mutation authority.
+
+Deployment keeps only the aggregate graph stop and two image-binding stop
+capabilities in a private fixed registry. Shutdown first closes controller
+admission and synchronously starts all three without short-circuiting; the graph
+stop starts its seventeen method stops before it awaits any one. Deployment
+then awaits admitted-work and settlement drain before closing any PostgreSQL
+pool. Startup failure, explicit stop, and fatal shutdown use the same drain
+rule; construction failure best-effort starts cleanup because no deployment
+handle exists. Every stop and pool close is attempted; one failure makes the
+memoized deployment stop outcome uncertain permanently. Neither a successful
+abort request nor a completed cleanup attempt proves an external collaborator
+or physical effect is quiet.
+
 Startup simultaneously checks out one connection from every role before
 migration. Every connection must report the configured database, PostgreSQL
 13 or newer, `transaction_read_only = off`, `pg_is_in_recovery() = false`, and
@@ -2027,11 +2069,10 @@ error. This distinction applies only after the factory returned a deployment;
 construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
-Deployment must next extend method-specific settlement to the mutating
-supervisor, storage-lifecycle, and publication collaborators, admit an explicit
-operational lease budget across the resulting critical path, and complete the
-assembled restart/ambiguous-outcome/deadline matrix before constructing the
-final public backend or enabling the production entry point.
+Deployment must next admit an explicit operational lease budget across the
+bounded critical path and complete the assembled restart/ambiguous-outcome/
+deadline matrix before constructing the final public backend or enabling the
+production entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2148,10 +2189,10 @@ predetermined committed result. The invocation-time gate, production-neutral
 object graph, same-launcher writer-start ingress, separately gated durable plan
 provisioning, restart readback, private read-only resolver, deployment-owned
 migration/admission/drain controller, explicit PostgreSQL pool-owning
-deployment, and deployment-owned image-plan binding now exist. The next
-physical-collaborator settlement foundation and its image resolver/inspector
-consumer also exist. The next integration slices must extend that contract to
-mutating supervisor, storage-lifecycle, and publication methods, admit the
+deployment, and deployment-owned image-plan binding now exist. The physical-
+collaborator settlement foundation and the complete assembled image,
+supervisor, storage-lifecycle, publication, and restore-destination resolver
+binding graph also exist. The next integration slices must admit the
 operational lease budget, cover whole-graph restart/ambiguity/deadline cases,
 and wire the final adapter before production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,

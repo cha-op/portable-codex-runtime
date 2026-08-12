@@ -12,6 +12,10 @@ import {
   createPhysicalCollaboratorSettlement,
 } from "../src/physical-collaborator-settlement.mjs";
 import {
+  createPostgresDetachedRestorePhysicalBindings,
+  isPostgresDetachedRestorePublicationBinding,
+} from "../src/postgres-detached-restore-physical-bindings.mjs";
+import {
   PostgresDetachedRestoreRuntimeControllerError,
   createPostgresDetachedRestoreRuntimeController,
   isPostgresDetachedRestoreRuntimeController,
@@ -60,6 +64,28 @@ const LANES = Object.freeze([
   "launch-attempt",
   "current-launch",
 ]);
+const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const PHYSICAL_LIFECYCLE_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const PHYSICAL_SUPERVISOR_METHODS = Object.freeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
+]);
 const OPTION_CODE =
   "invalid_postgres_detached_restore_runtime_controller_options";
 const REQUEST_CODE =
@@ -92,6 +118,48 @@ function createTestImagePlanBinding(provider) {
       settlement: createImagePlanProviderSettlement(),
     }),
   );
+}
+
+function physicalPolicies(methods) {
+  return Object.fromEntries(
+    methods.map((method) => [
+      method,
+      Object.freeze({
+        deadlineMilliseconds: 30_000,
+        settlementGraceMilliseconds: 1_000,
+      }),
+    ]),
+  );
+}
+
+function createTestPhysicalBindings(fixture, rawPublication, rawLifecycle) {
+  const unexpected = async function unexpectedPhysicalProvider() {
+    fixture.calls.provider += 1;
+    throw new Error("physical provider must not run in controller tests");
+  };
+  return createPostgresDetachedRestorePhysicalBindings({
+    lifecycleBackend: Object.freeze({
+      ...rawLifecycle,
+      physicalInvocationContractVersion: 1,
+    }),
+    lifecycleSettlement: physicalPolicies(PHYSICAL_LIFECYCLE_METHODS),
+    onFatal: ignoreSettlementFatal,
+    publication: rawPublication,
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestination: unexpected,
+    resolveRestoreDestinationContractVersion: 1,
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisor: Object.freeze({
+      contractVersion: 2,
+      launchWriter: unexpected,
+      reconcileWriterLaunch: unexpected,
+      supervisorId: "controller-physical-supervisor-001",
+    }),
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  });
 }
 
 function deferred() {
@@ -588,6 +656,19 @@ async function createFixture({
       },
     }),
   );
+  const lifecycleBackend = createLifecycleBackend(fixture);
+  const rawPublication = createPublication(fixture);
+  const physicalBindings = createTestPhysicalBindings(
+    fixture,
+    rawPublication,
+    lifecycleBackend,
+  );
+  assert.equal(
+    isPostgresDetachedRestorePublicationBinding(
+      physicalBindings.publication,
+    ),
+    true,
+  );
   const runtime = createPostgresDetachedRestoreRuntimeComposition({
     authority: {
       maxTransactionAttempts: 1,
@@ -645,8 +726,8 @@ async function createFixture({
     },
     storage: {
       backendId: BACKEND_ID,
-      lifecycleBackend: createLifecycleBackend(fixture),
-      publication: createPublication(fixture),
+      lifecycleBackend,
+      publication: physicalBindings.publication,
       resolveArtifactPaths() {
         fixture.calls.resolver += 1;
         throw new Error("artifact resolver must not run");

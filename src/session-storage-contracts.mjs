@@ -1035,7 +1035,8 @@ export function assertStorageBackend(value) {
   );
   assertOpaqueId(value.backendId, "invalid_storage_backend", "storage backend ID");
   assertStorageBackendCapabilities(value.capabilities);
-  for (const method of STORAGE_BACKEND_METHODS) {
+  for (let index = 0; index < STORAGE_BACKEND_METHODS.length; index += 1) {
+    const method = STORAGE_BACKEND_METHODS[index];
     ensure(
       typeof value[method] === "function",
       "invalid_storage_backend",

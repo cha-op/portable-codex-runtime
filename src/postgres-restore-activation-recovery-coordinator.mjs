@@ -29,6 +29,9 @@ import {
   assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs";
+import {
+  isPostgresDetachedRestorePublicationBinding,
+} from "./postgres-detached-restore-physical-bindings.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -778,6 +781,34 @@ function trustedFunction(value, code) {
     code,
   );
   return value;
+}
+
+function captureCommittedRestoreVerifier(publication, code) {
+  const legacy =
+    !isProxyValue(publication) &&
+    publication instanceof StoppedDirectoryPublication;
+  const binding = isPostgresDetachedRestorePublicationBinding(publication);
+  ensure(legacy || binding, code);
+  if (legacy) return verifyCommittedRestoreDestinationIntrinsic;
+  ensure(objectIsFrozen(publication), code);
+  let descriptor;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(
+      publication,
+      "verifyCommittedRestoreDestination",
+    );
+  } catch {
+    fail(code);
+  }
+  ensure(
+    descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+    code,
+  );
+  return trustedFunction(descriptor.value, code);
+}
+
+function invokeCommittedRestoreVerifier(publication, verifier, input) {
+  return callIntrinsic(verifier, publication, [input]);
 }
 
 function isSafePromiseSpeciesHolder(value) {
@@ -3055,9 +3086,8 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       options.operationGuard instanceof PostgresOperationGuard,
     optionCode,
   );
-  ensure(
-    !isProxyValue(options.publication) &&
-      options.publication instanceof StoppedDirectoryPublication,
+  const verifyCommittedRestoreDestination = captureCommittedRestoreVerifier(
+    options.publication,
     optionCode,
   );
   let storageBackend;
@@ -3391,10 +3421,10 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       await probeGuard(probe);
       let completion;
       try {
-        completion = await callIntrinsic(
-          verifyCommittedRestoreDestinationIntrinsic,
+        completion = await invokeCommittedRestoreVerifier(
           options.publication,
-          [generationVerifierInput(read, destination, outcomeCode)],
+          verifyCommittedRestoreDestination,
+          generationVerifierInput(read, destination, outcomeCode),
         );
       } catch {
         fail(outcomeCode);
@@ -3502,10 +3532,10 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     await probeGuard(probe);
     let completion;
     try {
-      completion = await callIntrinsic(
-        verifyCommittedRestoreDestinationIntrinsic,
+      completion = await invokeCommittedRestoreVerifier(
         options.publication,
-        [activationVerifierInput(read, destination, outcomeCode)],
+        verifyCommittedRestoreDestination,
+        activationVerifierInput(read, destination, outcomeCode),
       );
     } catch {
       fail(outcomeCode);

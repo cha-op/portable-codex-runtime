@@ -390,9 +390,8 @@ the safety-capture-to-generation boundary and the activation-to-launch
 boundary. Expiry fails closed and never authorizes a second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
-checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
-must extend method-specific physical-collaborator settlement from the image
-provider to mutating supervisor, storage-lifecycle, and publication calls,
+checkpoint adapter's `runRestore()` stub is unchanged. The complete assembled
+physical graph now has method-specific settlement; remaining phase-B work must
 admit an explicit operational lease budget, run the whole restart/ambiguous-
 outcome/deadline matrix, and only then construct the final public backend. A
 production-neutral runtime factory now constructs the capture-only backend,
@@ -458,6 +457,20 @@ reconciliation. A proved `applied` result is finalized without another attach;
 `absent-and-quiescent` permits the first attach only from that same guarded
 claim; `unknown`, retained work, claim acknowledgement loss, and copied caller
 data never reconstruct dispatch authority.
+
+Deployment also owns a private physical-binding graph for the three supervisor
+methods, nine storage-lifecycle methods, four publication methods, and restore-
+destination resolution. Each method has its own result deadline and settlement
+grace. Transient invocation identities and abort signals reach only the raw
+physical collaborator; the runtime keeps its existing durable request, result,
+hash, and version contracts. Fresh launch, dynamic writer stop, detach/fence,
+activation, and publication still require their existing durable grants, while
+reconciliation and committed-only verification remain read-only. A deadline,
+late settlement, or grace breach therefore cannot authorize a retry or a
+second physical dispatch. Shutdown closes admission, requests every one of the
+nineteen deployment-owned settlement stops, drains them and admitted work, and
+only then closes the four PostgreSQL pools; any failure remains a sticky failed
+deployment rather than a clean stop.
 
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
@@ -644,10 +657,10 @@ explicit PostgreSQL connection/bootstrap configuration, restore admission,
 shutdown drain, and final closure of four private pools now have one
 deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
 not a callback available to injected runtime collaborators. Production restore
-remains fail-closed. The settlement foundation and bounded image-provider
-consumer are complete; later slices must cover the mutating physical
-collaborators, admit the operational lease budget, complete assembled
-restart/ambiguity/deadline validation, and wire the final adapter. Filesystem-
+remains fail-closed. The settlement foundation and complete deployment-owned
+physical binding graph are now assembled; later slices must admit the
+operational lease budget, complete assembled restart/ambiguity/deadline
+validation, and wire the final adapter. Filesystem-
 image execution and differential backup remain later work.
 See
 `docs/architecture/stopped-directory-backend.md`.

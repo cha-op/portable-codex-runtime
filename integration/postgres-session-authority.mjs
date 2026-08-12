@@ -34,6 +34,9 @@ import {
   createPostgresDetachedRestoreDeployment,
 } from "../src/postgres-detached-restore-deployment.mjs";
 import {
+  createPostgresDetachedRestorePhysicalBindings,
+} from "../src/postgres-detached-restore-physical-bindings.mjs";
+import {
   POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED,
 } from "../src/postgres-detached-restore-foreground-composition.mjs";
 import {
@@ -1799,6 +1802,40 @@ function integrationImagePlanSettlements() {
   });
 }
 
+function integrationDeploymentPhysicalSettlementPolicies() {
+  const policy = () => ({
+    deadlineMilliseconds: 120_000,
+    settlementGraceMilliseconds: 30_000,
+  });
+  const group = (methods) =>
+    Object.fromEntries(methods.map((method) => [method, policy()]));
+  return {
+    lifecycleBackendSettlement: group([
+      "captureCheckpoint",
+      "destroySession",
+      "detachAttachment",
+      "forceFence",
+      "prepareRestoreAttachment",
+      "prepareWritableAttachment",
+      "provisionSession",
+      "reconcileRestoreAttachment",
+      "restoreCheckpoint",
+    ]),
+    publicationSettlement: group([
+      "publishFreshCheckpointArtifact",
+      "publishRestoreDestination",
+      "verifyCommittedCheckpointArtifact",
+      "verifyCommittedRestoreDestination",
+    ]),
+    resolveRestoreDestinationSettlement: policy(),
+    supervisorSettlement: group([
+      "launchWriter",
+      "reconcileWriterLaunch",
+      "stopWriter",
+    ]),
+  };
+}
+
 function assertFreshOpaqueInvocation(invocation, seen) {
   assert.equal(Object.getPrototypeOf(invocation), null);
   assert.equal(Object.isFrozen(invocation), true);
@@ -2546,9 +2583,34 @@ function writerDetachIntegrationBackend({
   });
 }
 
-function restoreRuntimeIntegrationLifecycleBackend(calls) {
-  const unexpectedProviderCall = async function unexpectedProviderCall() {
+function restoreRuntimeIntegrationLifecycleBackend(
+  calls,
+  physicalInvocations = null,
+  physicalSignals = null,
+) {
+  const unexpectedProviderCall = async function unexpectedProviderCall(
+    input,
+    physicalContext,
+  ) {
     calls.provider += 1;
+    void input;
+    if (physicalInvocations !== null) {
+      assert.equal(arguments.length, 2);
+      assert.deepEqual(Reflect.ownKeys(physicalContext).sort(), [
+        "contractVersion",
+        "invocation",
+        "signal",
+      ]);
+      assert.equal(physicalContext.contractVersion, 1);
+      assertFreshOpaqueInvocation(
+        physicalContext.invocation,
+        physicalInvocations,
+      );
+      assert.equal(physicalContext.signal instanceof AbortSignal, true);
+      assert.equal(physicalContext.signal.aborted, false);
+      assert.equal(physicalSignals.has(physicalContext.signal), false);
+      physicalSignals.add(physicalContext.signal);
+    }
     throw new Error("restore runtime lifecycle provider must not run");
   };
   return Object.freeze({
@@ -2564,6 +2626,7 @@ function restoreRuntimeIntegrationLifecycleBackend(calls) {
     destroySession: unexpectedProviderCall,
     detachAttachment: unexpectedProviderCall,
     forceFence: unexpectedProviderCall,
+    physicalInvocationContractVersion: 1,
     prepareRestoreAttachment: unexpectedProviderCall,
     prepareWritableAttachment: unexpectedProviderCall,
     provisionSession: unexpectedProviderCall,
@@ -11049,6 +11112,7 @@ test(
       `runtime-image-provider-${randomUUID()}`;
     const supervisorId = `runtime-supervisor-${randomUUID()}`;
     let controller = null;
+    let physicalBindings = null;
     let runtime = null;
     let foregroundTeardown = null;
     t.after(async () => {
@@ -11065,6 +11129,9 @@ test(
       }
       if (teardownToAwait !== null) {
         await Promise.allSettled([teardownToAwait]);
+      }
+      if (physicalBindings !== null) {
+        await Promise.allSettled([physicalBindings.stop()]);
       }
       try {
         const cleanupClient = await authorityPool.connect();
@@ -11240,6 +11307,121 @@ test(
     let foregroundAllowed = false;
     let holdForegroundGate = false;
     let stablePlan = null;
+    const physicalInvocations = new Set();
+    const physicalSignals = new Set();
+    const physicalPolicies =
+      integrationDeploymentPhysicalSettlementPolicies();
+    const rawLifecycleBackend =
+      restoreRuntimeIntegrationLifecycleBackend(
+        calls,
+        physicalInvocations,
+        physicalSignals,
+      );
+    const rawPublication = restoreRuntimeIntegrationPublication(
+      calls,
+      recoveryScopeId,
+    );
+    physicalBindings = createPostgresDetachedRestorePhysicalBindings({
+      lifecycleBackend: rawLifecycleBackend,
+      lifecycleSettlement: physicalPolicies.lifecycleBackendSettlement,
+      onFatal() {
+        assert.fail("integration physical collaborator must settle");
+      },
+      publication: rawPublication,
+      publicationSettlement: physicalPolicies.publicationSettlement,
+      async resolveRestoreDestination(input) {
+        calls.destinationResolver += 1;
+        assert.equal(arguments.length, 1);
+        assert.equal(input.contractVersion, 1);
+        assertFreshOpaqueInvocation(input.invocation, physicalInvocations);
+        assert.equal(input.signal instanceof AbortSignal, true);
+        assert.equal(input.signal.aborted, false);
+        assert.equal(physicalSignals.has(input.signal), false);
+        physicalSignals.add(input.signal);
+        throw new Error("restore runtime destination must not resolve");
+      },
+      resolveRestoreDestinationContractVersion: 1,
+      resolveRestoreDestinationSettlement:
+        physicalPolicies.resolveRestoreDestinationSettlement,
+      supervisor: Object.freeze({
+        contractVersion: 2,
+        async launchWriter(context) {
+          calls.supervisorLaunch += 1;
+          assert.equal(arguments.length, 1);
+          assert.equal(context.contractVersion, 2);
+          assertFreshOpaqueInvocation(
+            context.invocation,
+            physicalInvocations,
+          );
+          assert.equal(context.signal instanceof AbortSignal, true);
+          assert.equal(context.signal.aborted, false);
+          assert.equal(physicalSignals.has(context.signal), false);
+          physicalSignals.add(context.signal);
+          assert.equal(
+            context.attempt.request.supervisor.supervisorId,
+            supervisorId,
+          );
+          return frozenNullPrototypeRecord({
+            receiptVersion: 1,
+            evidence: frozenNullPrototypeRecord({
+              ...writerLaunchEvidence(
+                {
+                  operationId: context.attempt.launchAttemptId,
+                  request: context.attempt.request,
+                },
+                "started",
+              ),
+              contractVersion: 2,
+            }),
+            stopWriter: async function stopWriter(stopInput) {
+              calls.supervisorStop += 1;
+              assert.equal(arguments.length, 1);
+              assert.deepEqual(Reflect.ownKeys(stopInput).sort(), [
+                "attachment",
+                "contractVersion",
+                "invocation",
+                "processIncarnationId",
+                "signal",
+                "stopOperationId",
+                "writerFence",
+                "writerIncarnationId",
+              ]);
+              assert.equal(stopInput.contractVersion, 2);
+              assertFreshOpaqueInvocation(
+                stopInput.invocation,
+                physicalInvocations,
+              );
+              assert.equal(stopInput.signal instanceof AbortSignal, true);
+              assert.equal(stopInput.signal.aborted, false);
+              assert.equal(physicalSignals.has(stopInput.signal), false);
+              physicalSignals.add(stopInput.signal);
+              return frozenNullPrototypeRecord({
+                contractVersion: 2,
+                status: "stopped",
+              });
+            },
+          });
+        },
+        async reconcileWriterLaunch(context) {
+          calls.supervisorReconcile += 1;
+          assert.equal(arguments.length, 1);
+          assert.equal(context.contractVersion, 2);
+          assertFreshOpaqueInvocation(
+            context.invocation,
+            physicalInvocations,
+          );
+          assert.equal(context.signal instanceof AbortSignal, true);
+          assert.equal(context.signal.aborted, false);
+          assert.equal(physicalSignals.has(context.signal), false);
+          physicalSignals.add(context.signal);
+          throw new Error(
+            "same-process runtime launch must not reconcile",
+          );
+        },
+        supervisorId,
+      }),
+      supervisorSettlement: physicalPolicies.supervisorSettlement,
+    });
     const runtimeOptions = {
       authority: {
         maxTransactionAttempts: 3,
@@ -11306,37 +11488,7 @@ test(
         }),
         stoppedWriterCoordinator:
           new StoppedWriterCapabilityCoordinator(),
-        supervisor: Object.freeze({
-          contractVersion: 1,
-          async launchWriter(context) {
-            calls.supervisorLaunch += 1;
-            assert.equal(
-              context.attempt.request.supervisor.supervisorId,
-              supervisorId,
-            );
-            return {
-              receiptVersion: 1,
-              evidence: writerLaunchEvidence(
-                {
-                  operationId: context.attempt.launchAttemptId,
-                  request: context.attempt.request,
-                },
-                "started",
-              ),
-              stopWriter: async function stopWriter() {
-                calls.supervisorStop += 1;
-                return STOPPED_WRITER_STOP_CONFIRMED;
-              },
-            };
-          },
-          async reconcileWriterLaunch() {
-            calls.supervisorReconcile += 1;
-            throw new Error(
-              "same-process runtime launch must not reconcile",
-            );
-          },
-          supervisorId,
-        }),
+        supervisor: physicalBindings.supervisor,
       },
       pools: {
         authority: authorityPool,
@@ -11368,22 +11520,14 @@ test(
       },
       storage: {
         backendId: "postgres-authority-integration",
-        lifecycleBackend:
-          restoreRuntimeIntegrationLifecycleBackend(calls),
-        publication: restoreRuntimeIntegrationPublication(
-          calls,
-          recoveryScopeId,
-        ),
+        lifecycleBackend: physicalBindings.lifecycleBackend,
+        publication: physicalBindings.publication,
         resolveArtifactPaths(options) {
           calls.artifactResolver += 1;
           return integrationArtifactPaths(options);
         },
-        resolveRestoreDestination() {
-          calls.destinationResolver += 1;
-          throw new Error(
-            "restore runtime destination must not resolve",
-          );
-        },
+        resolveRestoreDestination:
+          physicalBindings.resolveRestoreDestination,
         resolveSourceOwnedRoot(options) {
           calls.sourceResolver += 1;
           return integrationSourceOwnedRoot(options);
@@ -12392,6 +12536,11 @@ test(
     assert.equal(calls.supervisorLaunch, 1);
     assert.equal(calls.supervisorReconcile, 0);
     assert.equal(calls.supervisorStop, 1);
+    assert.equal(physicalInvocations.size, 2);
+    assert.equal(physicalSignals.size, 2);
+    for (const signal of physicalSignals) {
+      assert.equal(signal.aborted, false);
+    }
 
     assert.strictEqual(teardown.stoppedCompletion, completion);
     assert.deepEqual(
@@ -12481,6 +12630,8 @@ test(
       publication: 0,
       supervisor: 0,
     };
+    const physicalPolicies =
+      integrationDeploymentPhysicalSettlementPolicies();
     const deployment = createPostgresDetachedRestoreDeployment({
       postgres: {
         applicationNamePrefix,
@@ -12629,17 +12780,20 @@ test(
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: Object.freeze({
-            contractVersion: 1,
-            async launchWriter() {
+            contractVersion: 2,
+            async launchWriter(input) {
               calls.supervisor += 1;
+              void input;
               throw new Error("deployment supervisor must not launch");
             },
-            async reconcileWriterLaunch() {
+            async reconcileWriterLaunch(input) {
               calls.supervisor += 1;
+              void input;
               throw new Error("deployment supervisor must not reconcile");
             },
             supervisorId: `deployment-supervisor-${randomUUID()}`,
           }),
+          supervisorSettlement: physicalPolicies.supervisorSettlement,
         },
         planRegistry: {
           async provisioningFleetCapabilityGate() {
@@ -12668,14 +12822,21 @@ test(
           backendId: "postgres-authority-integration",
           lifecycleBackend:
             restoreRuntimeIntegrationLifecycleBackend(calls),
+          lifecycleBackendSettlement:
+            physicalPolicies.lifecycleBackendSettlement,
           publication: restoreRuntimeIntegrationPublication(
             calls,
             recoveryScopeId,
           ),
+          publicationSettlement: physicalPolicies.publicationSettlement,
           resolveArtifactPaths: integrationArtifactPaths,
-          resolveRestoreDestination() {
+          async resolveRestoreDestination(input) {
+            void input;
             throw new Error("deployment destination must not resolve");
           },
+          resolveRestoreDestinationContractVersion: 1,
+          resolveRestoreDestinationSettlement:
+            physicalPolicies.resolveRestoreDestinationSettlement,
           resolveSourceOwnedRoot: integrationSourceOwnedRoot,
         },
       },

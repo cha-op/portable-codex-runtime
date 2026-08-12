@@ -26,6 +26,9 @@ import {
   assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs";
+import {
+  isPostgresDetachedRestorePublicationBinding,
+} from "./postgres-detached-restore-physical-bindings.mjs";
 import { StoppedWriterCapabilityCoordinator } from "./stopped-writer-capability.mjs";
 
 const arrayEveryIntrinsic = Array.prototype.every;
@@ -44,6 +47,7 @@ const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
+const objectIsFrozen = Object.isFrozen;
 const objectKeys = Object.keys;
 const objectPrototype = Object.prototype;
 const pathBasename = pathBasenameExport;
@@ -76,9 +80,62 @@ const verifyCommittedCheckpointArtifactIntrinsic =
   StoppedDirectoryPublication.prototype.verifyCommittedCheckpointArtifact;
 const verifyCommittedRestoreDestinationIntrinsic =
   StoppedDirectoryPublication.prototype.verifyCommittedRestoreDestination;
+const PUBLICATION_METHOD_KEYS = objectFreeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApply(intrinsic, receiver, args);
+}
+
+function legacyPublicationMethod(name) {
+  switch (name) {
+    case "publishFreshCheckpointArtifact":
+      return publishFreshCheckpointArtifactIntrinsic;
+    case "publishRestoreDestination":
+      return publishRestoreDestinationIntrinsic;
+    case "verifyCommittedCheckpointArtifact":
+      return verifyCommittedCheckpointArtifactIntrinsic;
+    case "verifyCommittedRestoreDestination":
+      return verifyCommittedRestoreDestinationIntrinsic;
+    default:
+      failInvalid();
+  }
+}
+
+function capturePublicationMethods(publication) {
+  const legacy =
+    !isProxyValue(publication) &&
+    publication instanceof StoppedDirectoryPublication;
+  const binding = isPostgresDetachedRestorePublicationBinding(publication);
+  ensureInvalid(legacy || binding);
+  const methods = objectCreate(null);
+  for (let index = 0; index < PUBLICATION_METHOD_KEYS.length; index += 1) {
+    const name = PUBLICATION_METHOD_KEYS[index];
+    if (legacy) {
+      methods[name] = legacyPublicationMethod(name);
+      continue;
+    }
+    ensureInvalid(objectIsFrozen(publication));
+    let descriptor;
+    try {
+      descriptor = objectGetOwnPropertyDescriptor(publication, name);
+    } catch {
+      failInvalid();
+    }
+    ensureInvalid(
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+    );
+    methods[name] = assertTrustedFunction(descriptor.value);
+  }
+  return objectFreeze(methods);
+}
+
+function invokePublication(publication, methods, name, options) {
+  return callIntrinsic(methods[name], publication, [options]);
 }
 
 function arrayEvery(value, callback) {
@@ -1749,6 +1806,8 @@ export class StoppedDirectoryBackend {
 
   #publication;
 
+  #publicationMethods;
+
   #resolveStoppedWriter;
 
   constructor(...args) {
@@ -1766,10 +1825,7 @@ export class StoppedDirectoryBackend {
       !isProxyValue(options.coordinator) &&
         options.coordinator instanceof StoppedWriterCapabilityCoordinator,
     );
-    ensureInvalid(
-      !isProxyValue(options.publication) &&
-        options.publication instanceof StoppedDirectoryPublication,
-    );
+    const publicationMethods = capturePublicationMethods(options.publication);
     ensureInvalid(
       options.lifecycleBackend !== null &&
         typeof options.lifecycleBackend === "object" &&
@@ -1879,6 +1935,7 @@ export class StoppedDirectoryBackend {
     this.#lifecycleBackend = lifecycleBackend;
     this.#lifecycleMethods = exactFrozenRecord(lifecycleMethods);
     this.#publication = options.publication;
+    this.#publicationMethods = publicationMethods;
     this.#resolveStoppedWriter = assertTrustedSynchronousFunction(
       options.resolveStoppedWriter,
     );
@@ -2043,11 +2100,11 @@ export class StoppedDirectoryBackend {
                     request,
                     resolved,
                   );
-                  const publicationOutcome = await callIntrinsic(
-                    publishFreshCheckpointArtifactIntrinsic,
+                  const publicationOutcome = await invokePublication(
                     this.#publication,
-                    [
-                      exactFrozenRecord({
+                    this.#publicationMethods,
+                    "publishFreshCheckpointArtifact",
+                    exactFrozenRecord({
                         artifactDirectory: context.artifact.directory,
                         artifactOwnedRoot: context.artifact.ownedRoot,
                         binding: bindingRecord,
@@ -2056,8 +2113,7 @@ export class StoppedDirectoryBackend {
                         result: context.result,
                         sourceDirectory: context.source.directory,
                         sourceOwnedRoot: context.source.ownedRoot,
-                      }),
-                    ],
+                    }),
                   );
                   const outcome = normalizePublicationOutcome(
                     publicationOutcome,
@@ -2122,11 +2178,11 @@ export class StoppedDirectoryBackend {
             request,
           );
           const captureAttempt = context.captureAttempt;
-          const publicationOutcome = await callIntrinsic(
-            publishFreshCheckpointArtifactIntrinsic,
+          const publicationOutcome = await invokePublication(
             this.#publication,
-            [
-              exactFrozenRecord({
+            this.#publicationMethods,
+            "publishFreshCheckpointArtifact",
+            exactFrozenRecord({
                 artifactDirectory: context.artifact.directory,
                 artifactOwnedRoot: context.artifact.ownedRoot,
                 binding: captureAttempt.binding,
@@ -2135,8 +2191,7 @@ export class StoppedDirectoryBackend {
                 result: captureAttempt.result,
                 sourceDirectory: context.source.directory,
                 sourceOwnedRoot: context.source.ownedRoot,
-              }),
-            ],
+            }),
           );
           const outcome = normalizePublicationOutcome(
             publicationOutcome,
@@ -2186,19 +2241,18 @@ export class StoppedDirectoryBackend {
             rawContext,
             request,
           );
-          const publicationOutcome = await callIntrinsic(
-            verifyCommittedCheckpointArtifactIntrinsic,
+          const publicationOutcome = await invokePublication(
             this.#publication,
-            [
-              exactFrozenRecord({
+            this.#publicationMethods,
+            "verifyCommittedCheckpointArtifact",
+            exactFrozenRecord({
                 artifactDirectory: context.artifact.directory,
                 artifactOwnedRoot: context.artifact.ownedRoot,
                 binding: context.captureAttempt.binding,
                 operationId: context.captureAttempt.operationId,
                 request: context.captureAttempt.request,
                 result: context.captureAttempt.result,
-              }),
-            ],
+            }),
           );
           const outcome = normalizePublicationOutcome(
             publicationOutcome,
@@ -2277,12 +2331,13 @@ export class StoppedDirectoryBackend {
                 });
           const publicationMethod =
             productionContext && context.publicationMode === "committed-only"
-              ? verifyCommittedRestoreDestinationIntrinsic
-              : publishRestoreDestinationIntrinsic;
-          const publicationOutcome = await callIntrinsic(
-            publicationMethod,
+              ? "verifyCommittedRestoreDestination"
+              : "publishRestoreDestination";
+          const publicationOutcome = await invokePublication(
             this.#publication,
-            [publicationOptions],
+            this.#publicationMethods,
+            publicationMethod,
+            publicationOptions,
           );
           const outcome = normalizePublicationOutcome(
             publicationOutcome,

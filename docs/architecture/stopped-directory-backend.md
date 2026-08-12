@@ -79,6 +79,15 @@ optional surface as an exact quartet. Supplying only part of the surface fails
 construction. Both extensions leave the v1 base storage-backend method set
 unchanged.
 
+Production runtime assembly may supply either an authentic
+`StoppedDirectoryPublication` or the deployment's branded publication binding.
+The latter exposes the same four capture/restore publication methods after
+applying independent physical-collaborator deadline and settlement-grace
+policies. The backend captures frozen own binding methods rather than applying
+class prototype intrinsics to that record; arbitrary duck-typed publication
+objects remain invalid. This wrapper changes neither publication request/
+result shapes nor the fresh-versus-committed-only authority split.
+
 ## Lifecycle Delegation
 
 The adapter delegates these five base operations to the validated lifecycle
@@ -438,12 +447,12 @@ authority. The adapter's v1 coordinator projection is sufficient only for
 legacy adapter replay; it is not the complete typed generation binding required
 by PostgreSQL generation document v2. Version 3 now transports that complete
 binding without enabling production restore by itself. The production mutation
-authority's `runRestore()` still fails closed until the cross-process
-shared/exclusive lifecycle guard, production recovery scheduler,
-invocation-time detached-production gate, and adapter wiring land. Once
-enabled, the authority must durably finalize launcher-visible destination state
-and return the same completion object before the backend reports success. A
-published path or journal record alone is not writable-launch authority.
+authority's `runRestore()` still fails closed while operational lease admission,
+the assembled restart/ambiguity/deadline matrix, and the immutable final public
+backend remain unfinished. Once enabled, the authority must durably finalize
+launcher-visible destination state and return the same completion object before
+the backend reports success. A published path or journal record alone is not
+writable-launch authority.
 
 ## Detached Restore Attachment Activation
 

@@ -14,6 +14,9 @@ import {
   createPostgresDetachedRestoreImagePlanBinding,
 } from "./postgres-detached-restore-image-plan-binding.mjs";
 import {
+  createPostgresDetachedRestorePhysicalBindings,
+} from "./postgres-detached-restore-physical-bindings.mjs";
+import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
 import {
@@ -78,6 +81,8 @@ const createRuntimeCompositionIntrinsic =
   createPostgresDetachedRestoreRuntimeComposition;
 const createImagePlanBindingIntrinsic =
   createPostgresDetachedRestoreImagePlanBinding;
+const createPhysicalBindingsIntrinsic =
+  createPostgresDetachedRestorePhysicalBindings;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
 const createPhysicalSettlementIntrinsic =
@@ -157,6 +162,7 @@ const LAUNCH_OPTION_KEYS = objectFreeze([
   "imagePlanProviderSettlement",
   "stoppedWriterCoordinator",
   "supervisor",
+  "supervisorSettlement",
 ]);
 const IMAGE_PLAN_PROVIDER_KEYS = objectFreeze([
   "contractVersion",
@@ -167,6 +173,17 @@ const IMAGE_PLAN_PROVIDER_KEYS = objectFreeze([
 const IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS = objectFreeze([
   "inspectCodex",
   "resolveImagePlan",
+]);
+const SUPERVISOR_KEYS = objectFreeze([
+  "contractVersion",
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "supervisorId",
+]);
+const SUPERVISOR_SETTLEMENT_KEYS = objectFreeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
 ]);
 const PHYSICAL_SETTLEMENT_POLICY_KEYS = objectFreeze([
   "deadlineMilliseconds",
@@ -184,11 +201,34 @@ const RECOVERY_OPTION_KEYS = objectFreeze([
 const STORAGE_OPTION_KEYS = objectFreeze([
   "backendId",
   "lifecycleBackend",
+  "lifecycleBackendSettlement",
   "publication",
+  "publicationSettlement",
   "resolveArtifactPaths",
   "resolveRestoreDestination",
+  "resolveRestoreDestinationContractVersion",
+  "resolveRestoreDestinationSettlement",
   "resolveSourceOwnedRoot",
 ]);
+const LIFECYCLE_BACKEND_METHOD_KEYS = objectFreeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const LIFECYCLE_BACKEND_SETTLEMENT_KEYS = LIFECYCLE_BACKEND_METHOD_KEYS;
+const PUBLICATION_METHOD_KEYS = objectFreeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const PUBLICATION_SETTLEMENT_KEYS = PUBLICATION_METHOD_KEYS;
 const CONTROLLER_KEYS = objectFreeze([
   "foreground",
   "imagePlanReservations",
@@ -208,6 +248,14 @@ const STABLE_PLAN_PROVISIONING_KEYS = objectFreeze(["provisionStablePlan"]);
 const WRITER_LAUNCH_KEYS = objectFreeze([
   "reconcileLaunchAttempt",
   "runLaunch",
+]);
+const PHYSICAL_BINDINGS_KEYS = objectFreeze([
+  "contractVersion",
+  "lifecycleBackend",
+  "publication",
+  "resolveRestoreDestination",
+  "stop",
+  "supervisor",
 ]);
 const STATUS_KEYS = objectFreeze(["status"]);
 const TOPOLOGY_ROW_KEYS = objectFreeze([
@@ -911,9 +959,7 @@ function protectPromise(value) {
   ) {
     return value;
   }
-  const constructorIsPromise =
-    constructorDescriptor === undefined ||
-    frozenDataDescriptor(constructorDescriptor, PromiseConstructor);
+  const constructorIsPromise = constructorDescriptor === undefined;
   const constructorIsSafeSpecies =
     constructorDescriptor !== undefined &&
     safePromiseSpeciesHolder(constructorDescriptor.value);
@@ -1027,6 +1073,46 @@ function normalizeInteger(value, minimum, maximum) {
   return value;
 }
 
+function normalizePhysicalSettlementPolicy(value) {
+  const policy = exactDataObject(value, PHYSICAL_SETTLEMENT_POLICY_KEYS);
+  return exactFrozenRecord({
+    deadlineMilliseconds: normalizeInteger(
+      policy.deadlineMilliseconds,
+      1,
+      MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+    ),
+    settlementGraceMilliseconds: normalizeInteger(
+      policy.settlementGraceMilliseconds,
+      1,
+      MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+    ),
+  });
+}
+
+function normalizePhysicalSettlementPolicies(value, expectedKeys) {
+  const policies = exactDataObject(value, expectedKeys);
+  const normalized = objectCreate(null);
+  for (let index = 0; index < expectedKeys.length; index += 1) {
+    const key = expectedKeys[index];
+    objectDefineProperty(normalized, key, {
+      configurable: false,
+      enumerable: true,
+      value: normalizePhysicalSettlementPolicy(policies[key]),
+      writable: false,
+    });
+  }
+  return objectFreeze(normalized);
+}
+
+function preflightPhysicalMethods(value, methodKeys) {
+  for (let index = 0; index < methodKeys.length; index += 1) {
+    trustedFunction(
+      prototypeDataValue(value, methodKeys[index], OPTION_ERROR_CODE),
+    );
+  }
+  return value;
+}
+
 function normalizeRuntimeOptions(value) {
   const runtime = exactDataObject(value, RUNTIME_OPTION_KEYS);
   const authority = exactDataObject(runtime.authority, AUTHORITY_OPTION_KEYS);
@@ -1040,13 +1126,10 @@ function normalizeRuntimeOptions(value) {
     launch.imagePlanProviderSettlement,
     IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS,
   );
-  const inspectCodexSettlement = exactDataObject(
-    imagePlanProviderSettlement.inspectCodex,
-    PHYSICAL_SETTLEMENT_POLICY_KEYS,
-  );
-  const resolveImagePlanSettlement = exactDataObject(
-    imagePlanProviderSettlement.resolveImagePlan,
-    PHYSICAL_SETTLEMENT_POLICY_KEYS,
+  const supervisor = exactDataObject(launch.supervisor, SUPERVISOR_KEYS);
+  const supervisorSettlement = normalizePhysicalSettlementPolicies(
+    launch.supervisorSettlement,
+    SUPERVISOR_SETTLEMENT_KEYS,
   );
   const planRegistry = exactDataObject(
     runtime.planRegistry,
@@ -1054,9 +1137,41 @@ function normalizeRuntimeOptions(value) {
   );
   const recovery = exactDataObject(runtime.recovery, RECOVERY_OPTION_KEYS);
   const storage = exactDataObject(runtime.storage, STORAGE_OPTION_KEYS);
+  const lifecycleBackendSettlement = normalizePhysicalSettlementPolicies(
+    storage.lifecycleBackendSettlement,
+    LIFECYCLE_BACKEND_SETTLEMENT_KEYS,
+  );
+  const publicationSettlement = normalizePhysicalSettlementPolicies(
+    storage.publicationSettlement,
+    PUBLICATION_SETTLEMENT_KEYS,
+  );
+  const resolveRestoreDestinationSettlement =
+    normalizePhysicalSettlementPolicy(
+      storage.resolveRestoreDestinationSettlement,
+    );
   trustedFunction(foreground.fleetCapabilityGate);
   trustedFunction(imagePlanProvider.inspectCodex);
   trustedFunction(imagePlanProvider.resolveImagePlan);
+  ensure(supervisor.contractVersion === 2, OPTION_ERROR_CODE);
+  trustedFunction(supervisor.launchWriter);
+  trustedFunction(supervisor.reconcileWriterLaunch);
+  ensure(
+    ownDataValue(
+      storage.lifecycleBackend,
+      "physicalInvocationContractVersion",
+      OPTION_ERROR_CODE,
+    ) === 1,
+    OPTION_ERROR_CODE,
+  );
+  preflightPhysicalMethods(
+    storage.lifecycleBackend,
+    LIFECYCLE_BACKEND_METHOD_KEYS,
+  );
+  preflightPhysicalMethods(storage.publication, PUBLICATION_METHOD_KEYS);
+  ensure(
+    storage.resolveRestoreDestinationContractVersion === 1,
+    OPTION_ERROR_CODE,
+  );
   trustedFunction(planRegistry.provisioningFleetCapabilityGate);
   trustedFunction(recovery.onStep);
   trustedFunction(storage.resolveArtifactPaths);
@@ -1067,38 +1182,29 @@ function normalizeRuntimeOptions(value) {
     foreground,
     launch: exactFrozenRecord({
       imagePlanProvider,
-      imagePlanProviderSettlement: exactFrozenRecord({
-        inspectCodex: exactFrozenRecord({
-          deadlineMilliseconds: normalizeInteger(
-            inspectCodexSettlement.deadlineMilliseconds,
-            1,
-            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
-          ),
-          settlementGraceMilliseconds: normalizeInteger(
-            inspectCodexSettlement.settlementGraceMilliseconds,
-            1,
-            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
-          ),
-        }),
-        resolveImagePlan: exactFrozenRecord({
-          deadlineMilliseconds: normalizeInteger(
-            resolveImagePlanSettlement.deadlineMilliseconds,
-            1,
-            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
-          ),
-          settlementGraceMilliseconds: normalizeInteger(
-            resolveImagePlanSettlement.settlementGraceMilliseconds,
-            1,
-            MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
-          ),
-        }),
-      }),
+      imagePlanProviderSettlement: normalizePhysicalSettlementPolicies(
+        imagePlanProviderSettlement,
+        IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS,
+      ),
       stoppedWriterCoordinator: launch.stoppedWriterCoordinator,
-      supervisor: launch.supervisor,
+      supervisor,
+      supervisorSettlement,
     }),
     planRegistry,
     recovery,
-    storage,
+    storage: exactFrozenRecord({
+      backendId: storage.backendId,
+      lifecycleBackend: storage.lifecycleBackend,
+      lifecycleBackendSettlement,
+      publication: storage.publication,
+      publicationSettlement,
+      resolveArtifactPaths: storage.resolveArtifactPaths,
+      resolveRestoreDestination: storage.resolveRestoreDestination,
+      resolveRestoreDestinationContractVersion:
+        storage.resolveRestoreDestinationContractVersion,
+      resolveRestoreDestinationSettlement,
+      resolveSourceOwnedRoot: storage.resolveSourceOwnedRoot,
+    }),
   });
 }
 
@@ -1537,7 +1643,15 @@ function validateOwnedPool(records, index) {
   }
 }
 
-function startConstructionCleanup(records) {
+function startConstructionCleanup(stopRegistry, records) {
+  for (let index = 0; index < stopRegistry.length; index += 1) {
+    try {
+      void settleInvocation(stopRegistry[index], []);
+    } catch {
+      // Construction already failed. Every already-created settlement group
+      // is still attempted and its asynchronous result is observed.
+    }
+  }
   for (let index = records.length - 1; index >= 0; index -= 1) {
     try {
       void settlePromise(endPool(records[index]));
@@ -1762,10 +1876,11 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     },
   );
   let inspectCodexSettlement;
-  let inspectCodexSettlementStop;
   let resolveImagePlanSettlement;
-  let resolveImagePlanSettlementStop;
   let imagePlanBinding;
+  let physicalBindings;
+  const createdSettlementStops = [];
+  let settlementStopRegistry;
   try {
     inspectCodexSettlement = callIntrinsic(
       createPhysicalSettlementIntrinsic,
@@ -1777,6 +1892,10 @@ export function createPostgresDetachedRestoreDeployment(...args) {
         }),
       ],
     );
+    createdSettlementStops[createdSettlementStops.length] = binding(
+      inspectCodexSettlement,
+      "stop",
+    );
     resolveImagePlanSettlement = callIntrinsic(
       createPhysicalSettlementIntrinsic,
       undefined,
@@ -1787,8 +1906,7 @@ export function createPostgresDetachedRestoreDeployment(...args) {
         }),
       ],
     );
-    inspectCodexSettlementStop = binding(inspectCodexSettlement, "stop");
-    resolveImagePlanSettlementStop = binding(
+    createdSettlementStops[createdSettlementStops.length] = binding(
       resolveImagePlanSettlement,
       "stop",
     );
@@ -1805,11 +1923,55 @@ export function createPostgresDetachedRestoreDeployment(...args) {
         }),
       ],
     );
+    physicalBindings = callIntrinsic(
+      createPhysicalBindingsIntrinsic,
+      undefined,
+      [
+        exactFrozenRecord({
+          lifecycleBackend: runtimeOptions.storage.lifecycleBackend,
+          lifecycleSettlement:
+            runtimeOptions.storage.lifecycleBackendSettlement,
+          onFatal: handlePhysicalSettlementFatal,
+          publication: runtimeOptions.storage.publication,
+          publicationSettlement:
+            runtimeOptions.storage.publicationSettlement,
+          resolveRestoreDestination:
+            runtimeOptions.storage.resolveRestoreDestination,
+          resolveRestoreDestinationContractVersion:
+            runtimeOptions.storage.resolveRestoreDestinationContractVersion,
+          resolveRestoreDestinationSettlement:
+            runtimeOptions.storage.resolveRestoreDestinationSettlement,
+          supervisor: runtimeOptions.launch.supervisor,
+          supervisorSettlement: runtimeOptions.launch.supervisorSettlement,
+        }),
+      ],
+    );
+    createdSettlementStops[createdSettlementStops.length] = binding(
+      physicalBindings,
+      "stop",
+      OPTION_ERROR_CODE,
+    );
+    const normalizedPhysicalBindings = exactDataObject(
+      physicalBindings,
+      PHYSICAL_BINDINGS_KEYS,
+      OPTION_ERROR_CODE,
+    );
+    ensure(
+      normalizedPhysicalBindings.contractVersion === 1,
+      OPTION_ERROR_CODE,
+    );
+    physicalBindings = normalizedPhysicalBindings;
+    settlementStopRegistry = objectFreeze([
+      createdSettlementStops[0],
+      createdSettlementStops[1],
+      createdSettlementStops[2],
+    ]);
   } catch {
+    startConstructionCleanup(createdSettlementStops, []);
     fail(OPTION_ERROR_CODE);
   }
-  const probeKey = createProbeKey();
-  const passwordProvider = createPasswordProvider(postgres.password);
+  let probeKey;
+  let passwordProvider;
   const poolRecords = [];
   const handleConnectedClientError = function handleConnectedClientError() {
     if (requestFatalShutdown !== null) requestFatalShutdown();
@@ -1826,6 +1988,8 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   let controller;
   let controllerBindings;
   try {
+    probeKey = createProbeKey();
+    passwordProvider = createPasswordProvider(postgres.password);
     for (let index = 0; index < ROLE_NAMES.length; index += 1) {
       const pool = reflectConstruct(PoolConstructor, [
         poolConfig(postgres, index, passwordProvider),
@@ -1854,7 +2018,7 @@ export function createPostgresDetachedRestoreDeployment(...args) {
           imagePlanBinding,
           stoppedWriterCoordinator:
             runtimeOptions.launch.stoppedWriterCoordinator,
-          supervisor: runtimeOptions.launch.supervisor,
+          supervisor: physicalBindings.supervisor,
         }),
         planRegistry: runtimeOptions.planRegistry,
         pools: exactFrozenRecord({
@@ -1864,7 +2028,16 @@ export function createPostgresDetachedRestoreDeployment(...args) {
           recoveryLifecycle: runtimePools[3],
         }),
         recovery: runtimeOptions.recovery,
-        storage: runtimeOptions.storage,
+        storage: exactFrozenRecord({
+          backendId: runtimeOptions.storage.backendId,
+          lifecycleBackend: physicalBindings.lifecycleBackend,
+          publication: physicalBindings.publication,
+          resolveArtifactPaths: runtimeOptions.storage.resolveArtifactPaths,
+          resolveRestoreDestination:
+            physicalBindings.resolveRestoreDestination,
+          resolveSourceOwnedRoot:
+            runtimeOptions.storage.resolveSourceOwnedRoot,
+        }),
       }),
     ]);
     controller = callIntrinsic(createRuntimeControllerIntrinsic, undefined, [
@@ -1918,7 +2091,7 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       runRestore: binding(controllerForeground, "runRestore"),
     });
   } catch {
-    startConstructionCleanup(poolRecords);
+    startConstructionCleanup(settlementStopRegistry, poolRecords);
     fail(OUTCOME_ERROR_CODE);
   }
 
@@ -2040,27 +2213,44 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     return poolClosePromise;
   }
 
-  async function stopInternal(activeStart) {
+  function beginControllerAndSettlementStops() {
     const controllerStop = settleInvocation(
       controllerBindings.controllerStop,
       [],
     );
-    const inspectCodexStop = settleInvocation(
-      inspectCodexSettlementStop,
-      [],
+    const settlementStops = new ArrayConstructor(
+      settlementStopRegistry.length,
     );
-    const resolveImagePlanStop = settleInvocation(
-      resolveImagePlanSettlementStop,
-      [],
-    );
+    for (let index = 0; index < settlementStopRegistry.length; index += 1) {
+      settlementStops[index] = settleInvocation(
+        settlementStopRegistry[index],
+        [],
+      );
+    }
+    return objectFreeze({ controllerStop, settlementStops });
+  }
+
+  async function awaitControllerAndSettlementStops(startedStops) {
+    const controllerSettlement = await startedStops.controllerStop;
+    let failed = !controllerSettlement.ok;
+    for (let index = 0; index < startedStops.settlementStops.length; index += 1) {
+      const result = await startedStops.settlementStops[index];
+      if (!result.ok) failed = true;
+    }
+    return failed;
+  }
+
+  async function stopInternal(activeStart) {
+    const startedStops = beginControllerAndSettlementStops();
     const startSettlement =
       activeStart === null
         ? settlement({ error: null, ok: true, value: null })
         : await settlePromise(activeStart);
     void startSettlement;
-    const controllerSettlement = await controllerStop;
-    const inspectCodexSettlementResult = await inspectCodexStop;
-    const resolveImagePlanSettlementResult = await resolveImagePlanStop;
+    const lifecycleStopFailed =
+      await protectPromise(
+        awaitControllerAndSettlementStops(startedStops),
+      );
     const poolSettlement = await settlePromise(closePools());
     try {
       callIntrinsic(asyncResourceEmitDestroyIntrinsic, fatalScope, []);
@@ -2068,9 +2258,7 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       fatalShutdown = true;
     }
     if (
-      !controllerSettlement.ok ||
-      !inspectCodexSettlementResult.ok ||
-      !resolveImagePlanSettlementResult.ok ||
+      lifecycleStopFailed ||
       !poolSettlement.ok ||
       fatalShutdown
     ) {
@@ -2081,36 +2269,57 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     return STOPPED_RESULT;
   }
 
+  function beginStopOperation(operation) {
+    if (stopPromise !== null) return stopPromise;
+    let rejectStop;
+    let resolveStop;
+    stopPromise = protectPromise(
+      new PromiseConstructor((resolve, reject) => {
+        rejectStop = reject;
+        resolveStop = resolve;
+      }),
+    );
+    void callIntrinsic(promiseThenIntrinsic, stopPromise, [
+      () => {},
+      () => {},
+    ]);
+    let pending;
+    try {
+      pending = protectPromise(callIntrinsic(operation, undefined, []));
+    } catch {
+      rejectStop(makeError(OUTCOME_ERROR_CODE));
+      return stopPromise;
+    }
+    try {
+      void callIntrinsic(promiseThenIntrinsic, pending, [
+        resolveStop,
+        () => rejectStop(makeError(OUTCOME_ERROR_CODE)),
+      ]);
+    } catch {
+      rejectStop(makeError(OUTCOME_ERROR_CODE));
+    }
+    return stopPromise;
+  }
+
   function beginStop(fatal) {
     if (state !== "stopped") fatalShutdown = fatalShutdown || fatal;
     if (stopPromise !== null) return stopPromise;
     const activeStart = startPromise;
     state = "stopping";
-    stopPromise = protectPromise(stopInternal(activeStart));
-    return stopPromise;
+    const stopOperation = () => stopInternal(activeStart);
+    objectFreeze(stopOperation);
+    return beginStopOperation(stopOperation);
   }
 
   async function cleanupAfterStartFailure() {
-    const controllerStop = settleInvocation(
-      controllerBindings.controllerStop,
-      [],
-    );
-    const inspectCodexStop = settleInvocation(
-      inspectCodexSettlementStop,
-      [],
-    );
-    const resolveImagePlanStop = settleInvocation(
-      resolveImagePlanSettlementStop,
-      [],
-    );
-    const controllerSettlement = await controllerStop;
-    const inspectCodexSettlementResult = await inspectCodexStop;
-    const resolveImagePlanSettlementResult = await resolveImagePlanStop;
+    const startedStops = beginControllerAndSettlementStops();
+    const lifecycleStopFailed =
+      await protectPromise(
+        awaitControllerAndSettlementStops(startedStops),
+      );
     const poolSettlement = await settlePromise(closePools());
     let cleanupFailed =
-      !controllerSettlement.ok ||
-      !inspectCodexSettlementResult.ok ||
-      !resolveImagePlanSettlementResult.ok ||
+      lifecycleStopFailed ||
       !poolSettlement.ok;
     try {
       callIntrinsic(asyncResourceEmitDestroyIntrinsic, fatalScope, []);
@@ -2137,8 +2346,9 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     } catch {
       if (state === "starting") {
         state = "stopping";
-        stopPromise = protectPromise(cleanupAfterStartFailure());
-        await settlePromise(stopPromise);
+        const cleanupOperation = () => cleanupAfterStartFailure();
+        objectFreeze(cleanupOperation);
+        await settlePromise(beginStopOperation(cleanupOperation));
       }
       fail(OUTCOME_ERROR_CODE);
     }

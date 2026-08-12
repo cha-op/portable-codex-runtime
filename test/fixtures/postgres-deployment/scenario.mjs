@@ -8,9 +8,6 @@ import {
   POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
 } from "../../../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
-  LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
-} from "../../../src/postgres-logical-writer-launcher.mjs";
-import {
   createPostgresDetachedRestorePlan,
 } from "../../../src/postgres-detached-restore-plan.mjs";
 import {
@@ -54,6 +51,28 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../../../migrations/authority/005-restore-recovery-cursors.sql", import.meta.url),
   new URL("../../../migrations/authority/006-writer-stop-capture-handoff.sql", import.meta.url),
   new URL("../../../migrations/authority/007-detached-restore-stable-plans.sql", import.meta.url),
+]);
+const LIFECYCLE_PHYSICAL_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const PUBLICATION_PHYSICAL_METHODS = Object.freeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const SUPERVISOR_PHYSICAL_METHODS = Object.freeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
 ]);
 
 function exactKeys(value, expected) {
@@ -196,6 +215,84 @@ function deferred() {
   return { promise, resolve };
 }
 
+function physicalPolicy(
+  deadlineMilliseconds = 30_000,
+  settlementGraceMilliseconds = 1_000,
+) {
+  return {
+    deadlineMilliseconds,
+    settlementGraceMilliseconds,
+  };
+}
+
+function physicalPolicyGroup(methods) {
+  return Object.fromEntries(methods.map((method) => [method, physicalPolicy()]));
+}
+
+function physicalPolicyFixture() {
+  const fixture = {
+    imagePlanProviderSettlement: physicalPolicyGroup([
+      "inspectCodex",
+      "resolveImagePlan",
+    ]),
+    lifecycleBackendSettlement: physicalPolicyGroup(
+      LIFECYCLE_PHYSICAL_METHODS,
+    ),
+    publicationSettlement: physicalPolicyGroup(PUBLICATION_PHYSICAL_METHODS),
+    resolveRestoreDestinationSettlement: physicalPolicy(),
+    supervisorSettlement: physicalPolicyGroup(SUPERVISOR_PHYSICAL_METHODS),
+  };
+  assert.equal(
+    Object.values(fixture)
+      .flatMap((group) =>
+        "deadlineMilliseconds" in group ? [group] : Object.values(group),
+      ).length,
+    19,
+  );
+  return fixture;
+}
+
+function deploymentPhysicalPolicyLeaves(options) {
+  return [
+    ...Object.values(options.runtime.launch.imagePlanProviderSettlement),
+    ...Object.values(options.runtime.launch.supervisorSettlement),
+    ...Object.values(options.runtime.storage.lifecycleBackendSettlement),
+    ...Object.values(options.runtime.storage.publicationSettlement),
+    options.runtime.storage.resolveRestoreDestinationSettlement,
+  ];
+}
+
+function assertPhysicalInvocationContext(context, seen) {
+  exactKeys(context, ["contractVersion", "invocation", "signal"]);
+  assert.equal(Object.getPrototypeOf(context), null);
+  assert.equal(Object.isFrozen(context), true);
+  assert.equal(context.contractVersion, 1);
+  assert.equal(Object.getPrototypeOf(context.invocation), null);
+  assert.equal(Object.isFrozen(context.invocation), true);
+  assert.deepEqual(Reflect.ownKeys(context.invocation), []);
+  assert(context.signal instanceof AbortSignal);
+  assert.equal(context.signal.aborted, false);
+  assert.equal(seen.has(context), false);
+  assert.equal(seen.has(context.invocation), false);
+  seen.add(context);
+  seen.add(context.invocation);
+}
+
+function assertSupervisorPhysicalRequest(input, seen) {
+  assert.equal(Object.getPrototypeOf(input), null);
+  assert.equal(Object.isFrozen(input), true);
+  assert.equal(input.contractVersion, 2);
+  assert.equal(Object.getPrototypeOf(input.invocation), null);
+  assert.equal(Object.isFrozen(input.invocation), true);
+  assert.deepEqual(Reflect.ownKeys(input.invocation), []);
+  assert(input.signal instanceof AbortSignal);
+  assert.equal(input.signal.aborted, false);
+  assert.equal(seen.has(input.invocation), false);
+  assert.equal(seen.has(input.signal), false);
+  seen.add(input.invocation);
+  seen.add(input.signal);
+}
+
 function unexpected(calls, key) {
   return async function unexpectedEffect() {
     calls[key] += 1;
@@ -203,8 +300,22 @@ function unexpected(calls, key) {
   };
 }
 
-function lifecycleBackend(calls) {
-  const provider = unexpected(calls, "provider");
+function lifecycleBackend(calls, controls) {
+  const methods = {};
+  for (const method of LIFECYCLE_PHYSICAL_METHODS) {
+    methods[method] = async function lifecyclePhysicalMethod(
+      input,
+      physicalContext,
+    ) {
+      calls.provider += 1;
+      assertPhysicalInvocationContext(
+        physicalContext,
+        controls.physicalInvocationContexts,
+      );
+      controls.lifecycleContexts.push({ input, method, physicalContext });
+      throw new Error(`${method} must not run`);
+    };
+  }
   return Object.freeze({
     backendId: BACKEND_ID,
     capabilities: Object.freeze({
@@ -213,20 +324,13 @@ function lifecycleBackend(calls) {
       fencing: "epoch-enforced",
       normalDirectoryAttachment: true,
     }),
-    captureCheckpoint: provider,
     contractVersion: 1,
-    destroySession: provider,
-    detachAttachment: provider,
-    forceFence: provider,
-    prepareRestoreAttachment: provider,
-    prepareWritableAttachment: provider,
-    provisionSession: provider,
-    reconcileRestoreAttachment: provider,
+    physicalInvocationContractVersion: 1,
     restoreAttachmentActivationContractVersion:
       RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
     restoreAttachmentReconciliationContractVersion:
       RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
-    restoreCheckpoint: provider,
+    ...methods,
   });
 }
 
@@ -267,8 +371,16 @@ function validOptions() {
     imagePlanFixture: imagePlanFixture(),
     imagePlanInspectorOverride: null,
     imagePlanResolverOverride: null,
+    lifecycleContexts: [],
+    physicalInvocationContexts: new Set(),
     planGateOverride: null,
+    resolverInputs: [],
+    resolveRestoreDestinationOverride: null,
+    supervisorContexts: [],
+    supervisorLaunchOverride: null,
+    supervisorReconcileOverride: null,
   };
+  const policies = physicalPolicyFixture();
   const options = {
     postgres: {
       applicationNamePrefix: "pcr-deployment-test",
@@ -345,29 +457,45 @@ function validOptions() {
             });
           },
         }),
-        imagePlanProviderSettlement: {
-          inspectCodex: {
-            deadlineMilliseconds: 30_000,
-            settlementGraceMilliseconds: 1_000,
-          },
-          resolveImagePlan: {
-            deadlineMilliseconds: 30_000,
-            settlementGraceMilliseconds: 1_000,
-          },
-        },
+        imagePlanProviderSettlement: policies.imagePlanProviderSettlement,
         stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
         supervisor: Object.freeze({
-          contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
-          async launchWriter() {
+          contractVersion: 2,
+          async launchWriter(input) {
             calls.supervisor += 1;
+            assert.equal(arguments.length, 1);
+            assertSupervisorPhysicalRequest(
+              input,
+              controls.physicalInvocationContexts,
+            );
+            controls.supervisorContexts.push({
+              input,
+              method: "launchWriter",
+            });
+            if (controls.supervisorLaunchOverride !== null) {
+              return controls.supervisorLaunchOverride(input);
+            }
             throw new Error("supervisor launch must not run");
           },
-          async reconcileWriterLaunch() {
+          async reconcileWriterLaunch(input) {
             calls.supervisor += 1;
+            assert.equal(arguments.length, 1);
+            assertSupervisorPhysicalRequest(
+              input,
+              controls.physicalInvocationContexts,
+            );
+            controls.supervisorContexts.push({
+              input,
+              method: "reconcileWriterLaunch",
+            });
+            if (controls.supervisorReconcileOverride !== null) {
+              return controls.supervisorReconcileOverride(input);
+            }
             throw new Error("supervisor reconcile must not run");
           },
           supervisorId: "deployment-supervisor-001",
         }),
+        supervisorSettlement: policies.supervisorSettlement,
       },
       planRegistry: {
         provisioningFleetCapabilityGate(input) {
@@ -393,16 +521,42 @@ function validOptions() {
       },
       storage: {
         backendId: BACKEND_ID,
-        lifecycleBackend: lifecycleBackend(calls),
+        lifecycleBackend: lifecycleBackend(calls, controls),
+        lifecycleBackendSettlement: policies.lifecycleBackendSettlement,
         publication: publication(calls),
+        publicationSettlement: policies.publicationSettlement,
         resolveArtifactPaths() {
           calls.resolver += 1;
           throw new Error("artifact resolver must not run");
         },
-        resolveRestoreDestination() {
+        async resolveRestoreDestination(input) {
           calls.resolver += 1;
+          exactKeys(input, [
+            "attachment",
+            "checkpoint",
+            "contractVersion",
+            "invocation",
+            "request",
+            "signal",
+          ]);
+          assert.equal(Object.getPrototypeOf(input), null);
+          assert.equal(Object.isFrozen(input), true);
+          assert.equal(input.contractVersion, 1);
+          assert.equal(Object.getPrototypeOf(input.invocation), null);
+          assert.equal(Object.isFrozen(input.invocation), true);
+          assert.deepEqual(Reflect.ownKeys(input.invocation), []);
+          assert(input.signal instanceof AbortSignal);
+          assert.equal(input.signal.aborted, false);
+          assert.equal(controls.resolverInputs.includes(input), false);
+          controls.resolverInputs.push(input);
+          if (controls.resolveRestoreDestinationOverride !== null) {
+            return controls.resolveRestoreDestinationOverride(input);
+          }
           throw new Error("destination resolver must not run");
         },
+        resolveRestoreDestinationContractVersion: 1,
+        resolveRestoreDestinationSettlement:
+          policies.resolveRestoreDestinationSettlement,
         resolveSourceOwnedRoot() {
           calls.resolver += 1;
           throw new Error("source resolver must not run");
@@ -1018,15 +1172,14 @@ async function hostileOptions() {
     options.postgres.timeouts.queryMilliseconds = value;
     cases.push(options);
   }
-  for (const method of ["inspectCodex", "resolveImagePlan"]) {
+  for (let leafIndex = 0; leafIndex < 19; leafIndex += 1) {
     for (const field of [
       "deadlineMilliseconds",
       "settlementGraceMilliseconds",
     ]) {
       for (const value of [0, 86_400_001]) {
         const { options } = validOptions();
-        options.runtime.launch.imagePlanProviderSettlement[method][field] =
-          value;
+        deploymentPhysicalPolicyLeaves(options)[leafIndex][field] = value;
         cases.push(options);
       }
     }
@@ -1067,6 +1220,90 @@ async function hostileOptions() {
       ),
   );
   assert.equal(getterCalls, 0);
+}
+
+async function exactPhysicalConfigRejection() {
+  configureFakePg();
+  const cases = [];
+  {
+    const { options } = validOptions();
+    options.runtime.launch.extra = true;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    delete options.runtime.launch.supervisorSettlement.stopWriter;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.launch.supervisorSettlement.stopWriter.extra = true;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.launch.supervisor = Object.freeze({
+      ...options.runtime.launch.supervisor,
+      contractVersion: 1,
+    });
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.launch.supervisor = Object.freeze({
+      ...options.runtime.launch.supervisor,
+      launchWriter: null,
+    });
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.storage.extra = true;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    delete options.runtime.storage.lifecycleBackendSettlement.restoreCheckpoint;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.storage.publicationSettlement.extra = physicalPolicy();
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.storage.resolveRestoreDestinationContractVersion = 2;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.storage.resolveRestoreDestinationSettlement.extra = true;
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    const inherited = Object.create(
+      options.runtime.storage.lifecycleBackend,
+    );
+    delete inherited.physicalInvocationContractVersion;
+    options.runtime.storage.lifecycleBackend = inherited;
+    cases.push(options);
+  }
+
+  for (let index = 0; index < cases.length; index += 1) {
+    const before = fakePgState().pools.length;
+    assert.throws(
+      () => createPostgresDetachedRestoreDeployment(cases[index]),
+      (error) =>
+        assertDeploymentError(
+          error,
+          "invalid_postgres_detached_restore_deployment_options",
+        ),
+      `case ${index}`,
+    );
+    assert.equal(fakePgState().pools.length, before, `case ${index}`);
+  }
 }
 
 async function applicationNameBudget() {
@@ -1454,6 +1691,76 @@ async function afterImportPromiseConstructorGetterIsIgnored() {
   }
 }
 
+async function afterImportPromiseSpeciesGetterFailsClosed() {
+  configureFakePg();
+  const deployment = createPostgresDetachedRestoreDeployment(
+    validOptions().options,
+  );
+  assertStatusReceipt(await deployment.start(), "ready");
+  const stopped = deployment.stop();
+  assertStatusReceipt(await stopped, "stopped");
+
+  const candidate = Promise.resolve("candidate-value");
+  let reactionCalls = 0;
+  const untrustedReaction = Object.freeze(function untrustedReaction() {
+    reactionCalls += 1;
+    throw new Error("untrusted Promise reaction must not run");
+  });
+  Object.defineProperties(candidate, {
+    catch: {
+      configurable: false,
+      enumerable: false,
+      value: untrustedReaction,
+      writable: false,
+    },
+    constructor: {
+      configurable: false,
+      enumerable: false,
+      value: Promise,
+      writable: false,
+    },
+    finally: {
+      configurable: false,
+      enumerable: false,
+      value: untrustedReaction,
+      writable: false,
+    },
+    then: {
+      configurable: false,
+      enumerable: false,
+      value: untrustedReaction,
+      writable: false,
+    },
+  });
+  const speciesDescriptor = Object.getOwnPropertyDescriptor(
+    Promise,
+    Symbol.species,
+  );
+  let speciesReads = 0;
+  let failure;
+  Object.defineProperty(Promise, Symbol.species, {
+    configurable: speciesDescriptor.configurable,
+    enumerable: speciesDescriptor.enumerable,
+    get() {
+      speciesReads += 1;
+      throw new Error("Promise species must not be read");
+    },
+  });
+  try {
+    try {
+      await stopped.then(() => candidate);
+    } catch (error) {
+      failure = error;
+    }
+  } finally {
+    Object.defineProperty(Promise, Symbol.species, speciesDescriptor);
+  }
+
+  outcomeError(failure);
+  assert.equal(speciesReads, 0);
+  assert.equal(reactionCalls, 0);
+}
+
 async function objectPrototypeThenCannotForgeDriverEvidence() {
   configureFakePg({ inRecovery: true });
   await nextTurn();
@@ -1602,6 +1909,53 @@ async function imagePlanStopAbortsAndDrainsActiveProvider() {
   ]);
 }
 
+async function allSettlementStopsStartBeforeAwait() {
+  configureFakePg();
+  const { controls, options } = validOptions();
+  const resolverEntered = deferred();
+  const releaseResolver = deferred();
+  let resolverRequest;
+  controls.imagePlanResolverOverride = function heldResolver(input) {
+    resolverRequest = input;
+    resolverEntered.resolve();
+    return releaseResolver.promise.then(() =>
+      safeProviderCarrier({
+        configBytes: controls.imagePlanFixture.configBytes,
+        descriptor: controls.imagePlanFixture.descriptor,
+      }),
+    );
+  };
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  assertStatusReceipt(await deployment.start(), "ready");
+
+  const firstAdmission = restoreAdmission(
+    "deployment-stop-order-resolver-001",
+  );
+  const first = deployment.imagePlanReservations.prepareImageReservation({
+    plan: stablePlan(firstAdmission),
+    sessionManifest: controls.imagePlanFixture.sessionManifest,
+  });
+  await resolverEntered.promise;
+  assert.equal(resolverRequest.signal.aborted, false);
+
+  const stopped = deployment.stop();
+  // stop() synchronously starts every fixed registry stop before it awaits
+  // any one result. The active provider is therefore aborted immediately.
+  assert.equal(resolverRequest.signal.aborted, true);
+  await nextTurn();
+  assert.deepEqual(fakePgState().endOrder, []);
+
+  releaseResolver.resolve();
+  await assert.rejects(first, imageResolutionError);
+  assertStatusReceipt(await stopped, "stopped");
+  assert.deepEqual(fakePgState().endOrder, [
+    "recoveryLifecycle",
+    "foregroundLifecycle",
+    "operation",
+    "authority",
+  ]);
+}
+
 async function imagePlanGraceBreachForcesFatalShutdown() {
   configureFakePg();
   const { calls, controls, options } = validOptions();
@@ -1629,6 +1983,14 @@ async function imagePlanGraceBreachForcesFatalShutdown() {
 
   await assert.rejects(admitted, imageResolutionError);
   assert.equal(resolverRequest.signal.aborted, true);
+  assert.throws(
+    () => deployment.imagePlanReservations.prepareImageReservation(input),
+    requestError,
+  );
+  assert.throws(
+    () => deployment.stablePlanProvisioning.provisionStablePlan({}),
+    requestError,
+  );
   const stopped = deployment.stop();
   assert.strictEqual(deployment.stop(), stopped);
   await assert.rejects(stopped, outcomeError);
@@ -1652,14 +2014,19 @@ const scenarios = Object.freeze({
     admittedIngressCannotStopItsDeployment,
   "after-import-promise-constructor-getter-is-ignored":
     afterImportPromiseConstructorGetterIsIgnored,
+  "after-import-promise-species-getter-fails-closed":
+    afterImportPromiseSpeciesGetterFailsClosed,
   "after-import-promise-try-poison-is-ignored":
     afterImportPromiseTryPoisonIsIgnored,
   "all-pool-ends-attempted": allPoolEndsAttempted,
+  "all-settlement-stops-start-before-await":
+    allSettlementStopsStartBeforeAwait,
   "application-name-budget": applicationNameBudget,
   "checked-out-client-error-forces-fatal-shutdown":
     checkedOutClientErrorForcesFatalShutdown,
   "empty-password-blocks-ambient-fallback":
     emptyPasswordBlocksAmbientFallback,
+  "exact-physical-config-rejection": exactPhysicalConfigRejection,
   "hostile-options": hostileOptions,
   "hostile-topology-evidence-fails-closed":
     hostileTopologyEvidenceFailsClosed,

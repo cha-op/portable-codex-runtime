@@ -10,6 +10,10 @@ import {
   createPhysicalCollaboratorSettlement,
 } from "../src/physical-collaborator-settlement.mjs";
 import {
+  createPostgresDetachedRestorePhysicalBindings,
+  isPostgresDetachedRestorePublicationBinding,
+} from "../src/postgres-detached-restore-physical-bindings.mjs";
+import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
 } from "../src/postgres-logical-writer-launcher.mjs";
@@ -54,6 +58,28 @@ const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
 const RUNTIME_OPTION_ERROR =
   "invalid_postgres_detached_restore_runtime_composition_options";
+const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const PHYSICAL_LIFECYCLE_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const PHYSICAL_SUPERVISOR_METHODS = Object.freeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
+]);
 
 class NoIoPool {
   constructor(role) {
@@ -155,6 +181,49 @@ function createTestImagePlanBinding(provider) {
       settlement: createImagePlanProviderSettlement(),
     }),
   );
+}
+
+function physicalPolicies(methods) {
+  return Object.fromEntries(
+    methods.map((method) => [
+      method,
+      Object.freeze({
+        deadlineMilliseconds: 30_000,
+        settlementGraceMilliseconds: 1_000,
+      }),
+    ]),
+  );
+}
+
+function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
+  const lifecycleBackend = Object.freeze({
+    ...rawLifecycle,
+    physicalInvocationContractVersion: 1,
+  });
+  const unexpected = async function unexpectedPhysicalProvider() {
+    calls.provider += 1;
+    throw new Error("physical provider must not run");
+  };
+  return createPostgresDetachedRestorePhysicalBindings({
+    lifecycleBackend,
+    lifecycleSettlement: physicalPolicies(PHYSICAL_LIFECYCLE_METHODS),
+    onFatal: ignoreSettlementFatal,
+    publication: rawPublication,
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestination: unexpected,
+    resolveRestoreDestinationContractVersion: 1,
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisor: Object.freeze({
+      contractVersion: 2,
+      launchWriter: unexpected,
+      reconcileWriterLaunch: unexpected,
+      supervisorId: "runtime-physical-supervisor-001",
+    }),
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  });
 }
 
 function runtimeOptionError(error) {
@@ -296,7 +365,13 @@ function createRuntimeFixture() {
     recoveryLifecycle: new NoIoPool("recovery-lifecycle"),
   };
   const lifecycleBackend = createLifecycleBackend(calls);
-  const publication = createPublication(calls);
+  const rawPublication = createPublication(calls);
+  const physicalBindings = createTestPhysicalBindings(
+    calls,
+    rawPublication,
+    lifecycleBackend,
+  );
+  const publication = physicalBindings.publication;
   const imagePlanBinding = createTestImagePlanBinding(
     Object.freeze({
       contractVersion:
@@ -449,6 +524,12 @@ function restoreAdmission() {
 
 test("runtime composition constructs a frozen branded capture-only surface without I/O", () => {
   const fixture = createRuntimeFixture();
+  assert.equal(
+    isPostgresDetachedRestorePublicationBinding(
+      fixture.collaborators.publication,
+    ),
+    true,
+  );
   const runtime = createPostgresDetachedRestoreRuntimeComposition(
     fixture.options,
   );
@@ -772,6 +853,30 @@ test("runtime leaves lifecycle and pool shutdown ownership with the caller", asy
 });
 
 test("runtime composition rejects hostile options without leaking hostile behavior", async (t) => {
+  await t.test("forged publication duck", () => {
+    const fixture = createRuntimeFixture();
+    const publication = Object.freeze(
+      Object.fromEntries(
+        PHYSICAL_PUBLICATION_METHODS.map((method) => [
+          method,
+          Object.freeze(async function forgedPublicationMethod() {
+            throw new Error("forged publication must not run");
+          }),
+        ]),
+      ),
+    );
+    assert.equal(isPostgresDetachedRestorePublicationBinding(publication), false);
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          storage: { ...fixture.options.storage, publication },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
   await t.test("extra top-level field", () => {
     const fixture = createRuntimeFixture();
     assert.throws(
