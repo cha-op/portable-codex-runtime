@@ -93,6 +93,10 @@ const IMAGE_DESCRIPTOR = Object.freeze({
   size: IMAGE_DESCRIPTOR_BYTES.byteLength,
 });
 
+function safeProviderCarrier(value) {
+  return Object.freeze(Object.assign(Object.create(null), value));
+}
+
 function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
     return value;
@@ -164,7 +168,7 @@ function imagePlanBinding({ onResolve = undefined } = {}) {
         POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
       imagePlanProviderId: "foreground-image-provider-001",
       async inspectCodex() {
-        return Object.freeze({
+        return safeProviderCarrier({
           codexBinaryPath: "/usr/local/bin/codex",
           codexBinarySha256: "c".repeat(64),
           codexVersion: "codex-cli 0.142.4",
@@ -172,7 +176,7 @@ function imagePlanBinding({ onResolve = undefined } = {}) {
       },
       async resolveImagePlan() {
         onResolve?.();
-        return Object.freeze({
+        return safeProviderCarrier({
           configBytes: IMAGE_CONFIG_BYTES,
           descriptor: IMAGE_DESCRIPTOR,
         });

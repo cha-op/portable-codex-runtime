@@ -434,6 +434,9 @@ plan's `imagePlanId` to exact OCI manifest/config bytes, trusted Codex
 inspection, and an opaque process-local reservation without exposing those
 bytes, the provider, or the reservation coordinator. The same binding later
 revalidates that reservation before launch can cross its durable boundary.
+Both provider callbacks must settle their native Promises with exact frozen
+null-prototype records, so result settlement cannot inherit a process-global
+`then` before the binding snapshots and validates the evidence.
 This completes image identity binding, not image fetch, signature verification,
 container-runtime pinning, container launch, supervisor implementation,
 physical storage/provider work, or writer fencing.

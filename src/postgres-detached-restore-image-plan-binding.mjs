@@ -234,12 +234,18 @@ function exactFrozenRecord(value) {
   return objectFreeze(result);
 }
 
-function exactDataObject(value, expectedKeys, code, frozen = false) {
+function exactDataObject(
+  value,
+  expectedKeys,
+  code,
+  frozen = false,
+  nullPrototype = false,
+) {
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !arrayIsArray(value) &&
-      !isProxyValue(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
     code,
   );
   let prototype;
@@ -251,7 +257,9 @@ function exactDataObject(value, expectedKeys, code, frozen = false) {
     fail(code);
   }
   ensure(
-    (prototype === objectPrototype || prototype === null) &&
+    (nullPrototype
+      ? prototype === null
+      : prototype === objectPrototype || prototype === null) &&
       (!frozen || objectIsFrozen(value)) &&
       keys.length === expectedKeys.length,
     code,
@@ -431,7 +439,13 @@ function copyBoundedBytes(value, maximum, code) {
 }
 
 function normalizeResolvedImage(value, code) {
-  const result = exactDataObject(value, RESOLVER_RESULT_KEYS, code, true);
+  const result = exactDataObject(
+    value,
+    RESOLVER_RESULT_KEYS,
+    code,
+    true,
+    true,
+  );
   const descriptor = exactDataObject(
     result.descriptor,
     DESCRIPTOR_KEYS,
@@ -534,6 +548,8 @@ function normalizeInspectionMeasurement(value, code) {
     value,
     INSPECTION_MEASUREMENT_KEYS,
     code,
+    true,
+    true,
   );
   return exactFrozenRecord({
     codexBinaryPath: measurement.codexBinaryPath,

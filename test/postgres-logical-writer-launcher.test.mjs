@@ -80,6 +80,10 @@ const jsonStringify = JSON.stringify;
 const objectCreate = Object.create;
 const objectFreeze = Object.freeze;
 
+function safeProviderCarrier(value) {
+  return objectFreeze(Object.assign(objectCreate(null), value));
+}
+
 function detachedRestorePlan() {
   return createPostgresDetachedRestorePlan({
     request: {
@@ -1627,11 +1631,11 @@ async function fixture({
     if (inspectionCount === inspectionFailureAt) {
       throw new Error("image inspection unavailable");
     }
-    return {
+    return safeProviderCarrier({
       codexBinaryPath: "/opt/portable-codex/bin/codex",
       codexBinarySha256: "b".repeat(64),
       codexVersion: CODEX_VERSION,
-    };
+    });
   };
   const imagePlanProvider = objectFreeze({
     contractVersion:
@@ -1639,7 +1643,7 @@ async function fixture({
     imagePlanProviderId: "launcher-image-provider-001",
     inspectCodex,
     async resolveImagePlan() {
-      return objectFreeze({
+      return safeProviderCarrier({
         configBytes: image.configBytes,
         descriptor: objectFreeze({ ...image.descriptor }),
       });

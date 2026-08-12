@@ -355,8 +355,10 @@
 - Deployment now accepts one exact image-plan provider configuration and owns
   the private binding that maps an authentic plan's `imagePlanId` to exact OCI
   manifest/config bytes, trusted Codex inspection, and an opaque process-local
-  reservation. Its gated reservation facet exposes only preparation; the
-  foreground and logical launcher share the binding for later revalidation.
+  reservation. Provider results settle only as exact frozen null-prototype
+  records, closing inherited-`then` assimilation before binding validation.
+  Its gated reservation facet exposes only preparation; the foreground and
+  logical launcher share the binding for later revalidation.
   This is image identity authority only, not fetch, signature verification,
   container-runtime pinning or launch, supervisor/provider/storage execution,
   or a physical writer fence.

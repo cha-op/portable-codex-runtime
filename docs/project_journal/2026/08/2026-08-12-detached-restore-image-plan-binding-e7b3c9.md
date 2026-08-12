@@ -25,7 +25,8 @@ superseded_by:
 - One exact provider configuration names the image-plan provider and its
   resolver and trusted inspector. Deployment constructs the binding privately;
   the low-level runtime accepts the authentic binding directly for controlled
-  assembly and tests.
+  assembly and tests. Both callbacks settle exact frozen null-prototype records,
+  preventing inherited-`then` assimilation before binding validation.
 - Preparation resolves an authentic plan's `imagePlanId` to exact OCI
   platform-manifest and config bytes, verifies their bounded runnable-image
   projection against the session manifest and trusted inspection, and returns

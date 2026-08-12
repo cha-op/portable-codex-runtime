@@ -130,8 +130,12 @@ function restorePlan({
   });
 }
 
+function safeProviderCarrier(value) {
+  return Object.freeze(Object.assign(Object.create(null), value));
+}
+
 function runtimeMeasurement(overrides = {}) {
-  return Object.freeze({
+  return safeProviderCarrier({
     codexBinaryPath: "/opt/portable-codex/bin/codex",
     codexBinarySha256: "b".repeat(64),
     codexVersion: CODEX_VERSION,
@@ -140,7 +144,7 @@ function runtimeMeasurement(overrides = {}) {
 }
 
 function resolvedImage(image) {
-  return Object.freeze({
+  return safeProviderCarrier({
     configBytes: image.configBytes,
     descriptor: image.descriptor,
   });
@@ -422,36 +426,52 @@ test("copies resolver evidence and keeps later caller mutation outside the bindi
   assert.equal(measured.projection.platformImage.digest, digest(originalDescriptor));
 });
 
-test("accepts and snapshots ordinary exact inspector measurements", async () => {
+test("rejects provider fulfillments outside the safe data-carrier contract", async (t) => {
   const image = imageFixture();
-  const expectedMeasurement = {
+  const measurement = {
     codexBinaryPath: "/opt/portable-codex/bin/codex",
     codexBinarySha256: "b".repeat(64),
     codexVersion: CODEX_VERSION,
   };
-  const firstMeasurement = { ...expectedMeasurement };
-  let inspections = 0;
-  const binding = createPostgresDetachedRestoreImagePlanBinding(
-    provider({
-      image,
-      async inspectCodex() {
-        inspections += 1;
-        return inspections === 1
-          ? firstMeasurement
-          : { ...expectedMeasurement };
-      },
-    }),
-  );
-  const reservation = await binding.prepareImageReservation(
-    prepareInput(image),
-  );
-
-  firstMeasurement.codexVersion = "codex-cli caller-mutated";
-  const revalidated = await binding.revalidateImageReservation(reservation);
-  assert.equal(revalidated.runtimeIdentity.codexVersion, CODEX_VERSION);
-  const consumed = await binding.consumeImageReservation(reservation);
-  assert.equal(consumed.runtimeIdentity.codexVersion, CODEX_VERSION);
-  assert.equal(inspections, 3);
+  const resolution = {
+    configBytes: image.configBytes,
+    descriptor: image.descriptor,
+  };
+  for (const [providerMethod, value, code] of [
+    [
+      "resolveImagePlan",
+      resolution,
+      "postgres_detached_restore_image_plan_resolution_uncertain",
+    ],
+    [
+      "inspectCodex",
+      measurement,
+      "postgres_detached_restore_image_plan_inspection_uncertain",
+    ],
+  ]) {
+    for (const [name, fulfillment] of [
+      ["mutable ordinary record", { ...value }],
+      ["frozen ordinary record", Object.freeze({ ...value })],
+      [
+        "mutable null-prototype record",
+        Object.assign(Object.create(null), value),
+      ],
+    ]) {
+      await t.test(`${providerMethod}: ${name}`, async () => {
+        const callback = async function unsafeProviderFulfillment() {
+          return fulfillment;
+        };
+        const overrides = { [providerMethod]: callback };
+        const binding = createPostgresDetachedRestoreImagePlanBinding(
+          provider({ image, ...overrides }),
+        );
+        await assert.rejects(
+          binding.prepareImageReservation(prepareInput(image)),
+          assertBindingError(code),
+        );
+      });
+    }
+  }
 });
 
 test("rejects structural plans, crossed sessions, inexact requests, and hostile input", async (t) => {
@@ -888,70 +908,43 @@ test("protects raw provider promises before synchronously polluted Promise proto
   }
 });
 
-test("callback-time Object.prototype.then cannot forge prepare, revalidate, or consume results", async () => {
+test("async safe provider carriers bypass inherited then before callback return", async () => {
   const image = imageFixture();
   const thenDescriptor = Object.getOwnPropertyDescriptor(
     Object.prototype,
     "then",
   );
-  let poisonEnabled = false;
   let poisonCalls = 0;
   let resolverCalls = 0;
+  let inspectorCalls = 0;
   const forgedThen = Object.freeze(function forgedThen(resolve) {
     poisonCalls += 1;
     resolve("forged-image-plan-result");
   });
   const restore = () => {
-    poisonEnabled = false;
     if (thenDescriptor === undefined) delete Object.prototype.then;
     else Object.defineProperty(Object.prototype, "then", thenDescriptor);
   };
   const poison = () => {
-    poisonEnabled = true;
     Object.defineProperty(Object.prototype, "then", {
       configurable: true,
       enumerable: false,
-      get() {
-        if (!poisonEnabled || this === null || typeof this !== "object") {
-          return undefined;
-        }
-        const keys = Reflect.ownKeys(this);
-        const target =
-          (keys.length === 2 &&
-            keys.includes("configBytes") &&
-            keys.includes("descriptor")) ||
-          (keys.length === 3 &&
-            keys.includes("codexBinaryPath") &&
-            keys.includes("codexBinarySha256") &&
-            keys.includes("codexVersion")) ||
-          (keys.length === 3 &&
-            keys.includes("projection") &&
-            keys.includes("reservation") &&
-            keys.includes("runtimeIdentity")) ||
-          (keys.length === 2 &&
-            keys.includes("projection") &&
-            keys.includes("runtimeIdentity"));
-        return target ? forgedThen : undefined;
-      },
+      value: forgedThen,
+      writable: true,
     });
   };
   const binding = createPostgresDetachedRestoreImagePlanBinding(
     provider({
       image,
-      resolveImagePlan() {
+      async resolveImagePlan() {
         resolverCalls += 1;
-        const pending = Promise.resolve(resolvedImage(image));
         poison();
-        return pending;
+        return resolvedImage(image);
       },
-      inspectCodex() {
-        // Isolate each provider callback boundary: a provider cannot safely
-        // construct its own Promise while poison deliberately left by the
-        // preceding resolver callback remains active.
-        restore();
-        const pending = Promise.resolve(runtimeMeasurement());
+      async inspectCodex() {
+        inspectorCalls += 1;
         poison();
-        return pending;
+        return runtimeMeasurement();
       },
     }),
   );
@@ -964,6 +957,7 @@ test("callback-time Object.prototype.then cannot forge prepare, revalidate, or c
   }
   assert.equal(isPostgresDetachedRestoreImagePlanReservation(reservation), true);
   assert.equal(resolverCalls, 1);
+  assert.equal(inspectorCalls, 1);
   assert.equal(poisonCalls, 0);
 
   let revalidated;
@@ -975,6 +969,7 @@ test("callback-time Object.prototype.then cannot forge prepare, revalidate, or c
   assert.equal(Object.isFrozen(revalidated), true);
   assert.equal(revalidated.runtimeIdentity.codexVersion, CODEX_VERSION);
   assert.equal(resolverCalls, 1);
+  assert.equal(inspectorCalls, 2);
   assert.equal(poisonCalls, 0);
 
   let consumed;
@@ -986,6 +981,7 @@ test("callback-time Object.prototype.then cannot forge prepare, revalidate, or c
   assert.equal(Object.isFrozen(consumed), true);
   assert.equal(consumed.projection.platformImage.digest, image.descriptor.digest);
   assert.equal(resolverCalls, 1);
+  assert.equal(inspectorCalls, 3);
   assert.equal(poisonCalls, 0);
 });
 

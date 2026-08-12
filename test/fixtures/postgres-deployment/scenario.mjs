@@ -59,6 +59,10 @@ function exactKeys(value, expected) {
   assert.deepEqual(Reflect.ownKeys(value).sort(), [...expected].sort());
 }
 
+function safeProviderCarrier(value) {
+  return Object.freeze(Object.assign(Object.create(null), value));
+}
+
 function assertStatusReceipt(value, expected) {
   exactKeys(value, ["status"]);
   assert.equal(Object.getPrototypeOf(value), null);
@@ -311,7 +315,7 @@ function validOptions() {
           imagePlanProviderId: "deployment-image-provider-001",
           async inspectCodex() {
             calls.image += 1;
-            return Object.freeze({
+            return safeProviderCarrier({
               codexBinaryPath: "/opt/portable-codex/bin/codex",
               codexBinarySha256: "b".repeat(64),
               codexVersion: "codex-cli 0.144.1",
@@ -321,7 +325,7 @@ function validOptions() {
             calls.image += 1;
             controls.imagePlanEntered?.resolve();
             await controls.imagePlanBlock?.promise;
-            return Object.freeze({
+            return safeProviderCarrier({
               configBytes: controls.imagePlanFixture.configBytes,
               descriptor: controls.imagePlanFixture.descriptor,
             });

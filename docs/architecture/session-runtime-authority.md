@@ -1931,10 +1931,13 @@ constructs one private binding for the assembled graph. The binding resolves
 an authentic plan's `imagePlanId` through that named provider to exact OCI
 platform-manifest and config bytes, passes those bytes through trusted Codex
 inspection and the existing bounded image verifier, and returns only an opaque
-process-local reservation. The gated deployment facet exposes preparation,
-not the bytes, provider, coordinator, or raw binding. Foreground preparation
-and the logical launcher's later reservation revalidation use that same
-binding, so a caller cannot substitute a resolver, inspector, or second
+process-local reservation. Each provider callback must return a direct native
+Promise that settles an exact frozen null-prototype record; this excludes an
+inherited `then` from Promise settlement before the binding can snapshot and
+validate resolver or inspection evidence. The gated deployment facet exposes
+preparation, not the bytes, provider, coordinator, or raw binding. Foreground
+preparation and the logical launcher's later reservation revalidation use that
+same binding, so a caller cannot substitute a resolver, inspector, or second
 reservation coordinator at the handoff. This authority covers exact image
 bytes, trusted inspection, and reservation identity. It does not fetch
 registry content, verify publisher or signature trust, pin a concrete runtime

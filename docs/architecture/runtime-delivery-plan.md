@@ -382,6 +382,8 @@ Restore and launcher authority are now split into eight serial pull requests:
      configuration maps an authentic plan's `imagePlanId` to exact OCI
      manifest/config bytes and trusted Codex inspection, then returns an opaque
      process-local reservation through a gated preparation-only facet.
+     Resolver and inspector Promises must settle exact frozen null-prototype
+     records so inherited `then` cannot replace evidence before validation.
      Foreground and the logical launcher use the same private binding for later
      revalidation.
      This does not fetch images, verify signatures, pin or launch a container

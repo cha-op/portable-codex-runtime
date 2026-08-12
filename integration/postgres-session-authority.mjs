@@ -210,6 +210,10 @@ async function readMigrationLedger(pool) {
   return result.rows;
 }
 
+function frozenNullPrototypeRecord(entries) {
+  return Object.freeze(Object.assign(Object.create(null), entries));
+}
+
 async function readSessionAuthorityMutationSnapshot(pool, sessionId) {
   const relations = [
     "sessions",
@@ -1806,7 +1810,7 @@ function integrationImagePlanBindingFixture({ image, plan, session }) {
         input.inspection.codexVersion,
         session.document.manifest.runtime.codexVersion,
       );
-      return Object.freeze({
+      return frozenNullPrototypeRecord({
         codexBinaryPath: "/opt/portable-codex/bin/codex",
         codexBinarySha256: "c".repeat(64),
         codexVersion: session.document.manifest.runtime.codexVersion,
@@ -1824,7 +1828,7 @@ function integrationImagePlanBindingFixture({ image, plan, session }) {
       assert.equal(input.imagePlanId, boundPlan.imagePlanId);
       assert.equal(input.imagePlanProviderId, imagePlanProviderId);
       assert.deepEqual(input.sessionManifest, session.document.manifest);
-      return Object.freeze({
+      return frozenNullPrototypeRecord({
         configBytes: image.configBytes,
         descriptor: Object.freeze({ ...image.descriptor }),
       });
@@ -11199,7 +11203,7 @@ test(
             async inspectCodex(input) {
               calls.image += 1;
               assert.equal(input.imagePlanProviderId, imagePlanProviderId);
-              return Object.freeze({
+              return frozenNullPrototypeRecord({
                 codexBinaryPath: "/opt/portable-codex/bin/codex",
                 codexBinarySha256: "c".repeat(64),
                 codexVersion: input.inspection.codexVersion,
@@ -11208,7 +11212,7 @@ test(
             async resolveImagePlan(input) {
               calls.image += 1;
               assert.equal(input.imagePlanProviderId, imagePlanProviderId);
-              return Object.freeze({
+              return frozenNullPrototypeRecord({
                 configBytes: image.configBytes,
                 descriptor: Object.freeze({ ...image.descriptor }),
               });
@@ -12469,7 +12473,7 @@ test(
                 input.inspection.platformImage.digest,
                 deploymentImage.descriptor.digest,
               );
-              return Object.freeze({
+              return frozenNullPrototypeRecord({
                 codexBinaryPath: "/opt/portable-codex/bin/codex",
                 codexBinarySha256: "c".repeat(64),
                 codexVersion:
@@ -12493,7 +12497,7 @@ test(
                 input.sessionManifest,
                 deploymentSession.document.manifest,
               );
-              return Object.freeze({
+              return frozenNullPrototypeRecord({
                 configBytes: deploymentImage.configBytes,
                 descriptor: Object.freeze({
                   ...deploymentImage.descriptor,
