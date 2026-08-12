@@ -19,6 +19,10 @@ import {
 } from "../src/filesystem-operation-journal.mjs";
 import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
 import {
+  createPostgresDetachedRestorePhysicalBindings,
+  isPostgresDetachedRestorePublicationBinding,
+} from "../src/postgres-detached-restore-physical-bindings.mjs";
+import {
   PostgresRestoreActivationRecoveryCoordinatorError,
   createPostgresRestoreActivationRecoveryCoordinator,
 } from "../src/postgres-restore-activation-recovery-coordinator.mjs";
@@ -60,6 +64,29 @@ const ACTIVATION_LEASE_ID = `lease-${createHash("sha256")
   .update(`writer-lease:${ACTIVATION_OPERATION_ID}`, "utf8")
   .digest("hex")}`;
 const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
+const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const PHYSICAL_LIFECYCLE_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const PHYSICAL_SUPERVISOR_METHODS = Object.freeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
+]);
+const ignorePhysicalFatal = Object.freeze(() => undefined);
 
 function serializedSha256(value) {
   return createHash("sha256")
@@ -1736,17 +1763,59 @@ function storageBackendHarness(
   };
 }
 
+function physicalPolicies(methods) {
+  return Object.fromEntries(
+    methods.map((method) => [
+      method,
+      Object.freeze({
+        deadlineMilliseconds: 30_000,
+        settlementGraceMilliseconds: 1_000,
+      }),
+    ]),
+  );
+}
+
+function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
+  const unexpected = async function unexpectedPhysicalProvider() {
+    throw new Error("unrelated physical provider must not run");
+  };
+  return createPostgresDetachedRestorePhysicalBindings({
+    lifecycleBackend: Object.freeze({
+      ...rawLifecycle,
+      physicalInvocationContractVersion: 1,
+    }),
+    lifecycleSettlement: physicalPolicies(PHYSICAL_LIFECYCLE_METHODS),
+    onFatal: ignorePhysicalFatal,
+    publication: rawPublication,
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestination: unexpected,
+    resolveRestoreDestinationContractVersion: 1,
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisor: Object.freeze({
+      contractVersion: 2,
+      launchWriter: unexpected,
+      reconcileWriterLaunch: unexpected,
+      supervisorId: "coordinator-physical-supervisor-001",
+    }),
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  }).publication;
+}
+
 function createCoordinator(
   fixture,
   authority,
   storage,
   guardPool = new GuardPool(),
+  publication = fixture.publication,
 ) {
   const destinations = [];
   const coordinator = createPostgresRestoreActivationRecoveryCoordinator({
     authority,
     operationGuard: new PostgresOperationGuard({ dedicatedPool: guardPool }),
-    publication: fixture.publication,
+    publication,
     resolveRestoreDestination: async (input) => {
       destinations.push(input);
       return {
@@ -1797,6 +1866,159 @@ test("uses the authority's fixed operation-envelope serialization order", () => 
     "9f129ee7ec8f27ce24f9e1e751d7ffaba48c8fa434f5a82bca58e7ba3d38b772",
   );
 });
+
+test(
+  "coordinator accepts only authentic legacy or branded publication verifiers",
+  { concurrency: false },
+  async (t) => {
+    await t.test("rejects a forged four-method publication duck", async (t) => {
+      const fixture = await createPublishedRestoreFixture(t);
+      const authority = authorityHarness({});
+      const storage = storageBackendHarness(async () => {
+        throw new Error("storage provider must not run");
+      });
+      const forged = Object.freeze(
+        Object.fromEntries(
+          PHYSICAL_PUBLICATION_METHODS.map((method) => [
+            method,
+            Object.freeze(async function forgedPublicationMethod() {
+              throw new Error("forged publication must not run");
+            }),
+          ]),
+        ),
+      );
+      assert.equal(isPostgresDetachedRestorePublicationBinding(forged), false);
+      assert.throws(
+        () =>
+          createCoordinator(
+            fixture,
+            authority.authority,
+            storage,
+            new GuardPool(),
+            forged,
+          ),
+        assertCoordinatorCode(
+          "invalid_postgres_restore_activation_recovery_coordinator_options",
+        ),
+      );
+      assert.deepEqual(authority.calls, []);
+      assert.deepEqual(storage.providerCalls, []);
+    });
+
+    await t.test("delegates generation verification through a real binding", async (t) => {
+      const fixture = await createPublishedRestoreFixture(t);
+      await makeSourceUnavailable(fixture);
+      const committed = generationRead(fixture, "committed", true);
+      const authority = authorityHarness({
+        "finalize-generation": async () => committed,
+        "read-generation": async () => generationRead(fixture, "uncertain"),
+      });
+      const storage = storageBackendHarness(async () => {
+        throw new Error("generation replay must not attach");
+      });
+      const publication = createPhysicalPublicationBinding(
+        fixture.publication,
+        storage.backend,
+      );
+      const { coordinator } = createCoordinator(
+        fixture,
+        authority.authority,
+        storage,
+        new GuardPool(),
+        publication,
+      );
+
+      const result = await coordinator.reconcileRestoreGeneration(
+        generationCandidate(fixture),
+      );
+
+      assert.equal(result.operation.state, "committed");
+      assert.deepEqual(storage.providerCalls, []);
+    });
+
+    await t.test("delegates activation verification through a real binding", async (t) => {
+      const fixture = await createPublishedRestoreFixture(t);
+      await makeSourceUnavailable(fixture);
+      const request = activationRequest(fixture);
+      const prepared = activationResult(request);
+      const authority = authorityHarness({
+        "finalize-activation": async () =>
+          activationHandoff(fixture, request),
+        "read-activation": async () =>
+          activationRead(fixture, "uncertain", request),
+      });
+      const storage = storageBackendHarness(async () => prepared);
+      const publication = createPhysicalPublicationBinding(
+        fixture.publication,
+        storage.backend,
+      );
+      const { coordinator } = createCoordinator(
+        fixture,
+        authority.authority,
+        storage,
+        new GuardPool(),
+        publication,
+      );
+
+      const result = await coordinator.reconcileRestoreAttachmentActivation(
+        activationCandidate(fixture),
+      );
+
+      assert.equal(result.activation.operation.state, "committed");
+      assert.equal(storage.providerCalls.length, 1);
+    });
+
+    await t.test("maps branded verifier rejection to coordinator uncertainty", async (t) => {
+      const fixture = await createPublishedRestoreFixture(t);
+      await makeSourceUnavailable(fixture);
+      const rejectingPublication = new StoppedDirectoryPublication({
+        acquireLock: async () => {
+          throw new Error("physical verification rejected");
+        },
+        inspectFilesystem: async () => ({
+          durability: "local-fsync-rename",
+          filesystemId: "test-filesystem-001",
+          objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+          type: "test-local",
+        }),
+        inspectPersistentObjectIdentity,
+        journal: fixture.journal,
+        ...TRUSTED_PUBLICATION_INSPECTORS,
+      });
+      const authority = authorityHarness({
+        "finalize-generation": async () => {
+          throw new Error("rejected verification must not finalize");
+        },
+        "read-generation": async () => generationRead(fixture, "uncertain"),
+      });
+      const storage = storageBackendHarness(async () => {
+        throw new Error("generation replay must not attach");
+      });
+      const publication = createPhysicalPublicationBinding(
+        rejectingPublication,
+        storage.backend,
+      );
+      const { coordinator } = createCoordinator(
+        fixture,
+        authority.authority,
+        storage,
+        new GuardPool(),
+        publication,
+      );
+
+      await assert.rejects(
+        coordinator.reconcileRestoreGeneration(generationCandidate(fixture)),
+        assertCoordinatorCode(
+          "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+        ),
+      );
+      assert.deepEqual(
+        authority.calls.map(([name]) => name),
+        ["read-generation"],
+      );
+    });
+  },
+);
 
 test("reconciles one committed restore generation without source, image, or launch work", async (t) => {
   const fixture = await createPublishedRestoreFixture(t);

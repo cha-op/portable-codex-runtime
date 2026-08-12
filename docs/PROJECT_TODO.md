@@ -131,12 +131,13 @@
   quiet or retry authority. Activation now also keeps claim, reconciliation,
   optional first attach, and finalization inside one coordinator-owned
   per-operation guard; retained, ambiguous, or copied caller state cannot
-  reconstruct a second attach dispatch.
-  Next extend method-specific settlement to mutating supervisor, storage-
-  lifecycle, and publication calls, admit the operational lease budget, run the
-  complete assembled restart/ambiguous-outcome/deadline matrix, construct the
-  final public backend, and only then replace the fixed fail-closed
-  `runRestore()` stub.
+  reconstruct a second attach dispatch. A deployment-private physical binding
+  graph now gives the three supervisor methods, nine storage-lifecycle methods,
+  four publication methods, and restore-destination resolver independent
+  deadlines and grace periods while preserving existing durable authority.
+  Next admit the operational lease budget, run the complete assembled restart/
+  ambiguous-outcome/deadline matrix, construct the final public backend, and
+  only then replace the fixed fail-closed `runRestore()` stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

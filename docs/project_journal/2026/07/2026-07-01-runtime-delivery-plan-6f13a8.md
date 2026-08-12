@@ -58,16 +58,20 @@ superseded_by:
   also performs claim, read-only reconciliation, optional first attachment,
   and finalization inside one coordinator-owned per-operation guard. No grant
   crosses the component boundary, and retained, ambiguous, or copied caller
-  state cannot reconstruct a second physical dispatch.
+  state cannot reconstruct a second physical dispatch. Deployment now also
+  owns the complete assembled physical binding graph: three supervisor, nine
+  storage-lifecycle, four publication, and one restore-destination resolver
+  boundary, plus the two existing image-provider boundaries. All retain their
+  durable grants and readback/reconciliation rules while sharing one private
+  shutdown registry.
   The production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Extend method-specific physical-collaborator settlement to mutating
-  supervisor, storage-lifecycle, and publication calls, then admit the
-  operational lease budget across the complete critical path.
+- Admit the operational lease budget across the now-bounded complete critical
+  path.
 - Validate the complete assembled restart, ambiguous-outcome, deadline, and
   grace-breach matrix, then construct the final public restore-capable backend
   and enable the production adapter only if the no-second-writer boundary
@@ -78,6 +82,7 @@ superseded_by:
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
+- `docs/project_journal/2026/08/2026-08-12-physical-settlement-graph-f4c8a1.md`
 - `docs/project_journal/2026/08/2026-08-12-restore-activation-reconciliation-b6d4e1.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - `docs/project_journal/2026/08/2026-08-12-postgres-detached-restore-deployment-7d4a91.md`

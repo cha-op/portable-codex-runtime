@@ -407,12 +407,17 @@ Restore and launcher authority are now split into eight serial pull requests:
      finalizes, `absent-and-quiescent` permits the first attach only from that
      same guarded claim, and `unknown` or retained work stays blocked. Durable
      activation request/result version 1 and the schema are unchanged.
-   - Remaining deployment assembly next applies method-specific settlement to
-     the mutating supervisor, storage-lifecycle, and publication collaborators,
-     then admits an operational lease budget that covers the complete critical
-     path. After that it runs the whole assembled restart/ambiguity/deadline
-     matrix and constructs the final public restore-capable backend in that
-     order.
+   - The complete currently assembled physical graph now has deployment-owned
+     method-specific settlement: supervisor launch/reconcile/returned stop,
+     nine storage-lifecycle calls, four publication calls, and restore-
+     destination resolution, in addition to the two image-provider calls.
+     Transient invocation context never enters durable records. Deployment
+     stops all nineteen boundaries before pool closure, and any failed drain is
+     a sticky failed deployment rather than proof of physical quiescence.
+   - Remaining deployment assembly next admits an operational lease budget that
+     covers the complete critical path. After that it runs the whole assembled
+     restart/ambiguity/deadline matrix and constructs the final public restore-
+     capable backend in that order.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

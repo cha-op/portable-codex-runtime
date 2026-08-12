@@ -370,6 +370,15 @@
   original Promise, and failure to settle invokes a private deployment fatal
   hook. Neither abort nor that hook proves physical quiescence, makes attempted
   dependency cleanup a clean stopped result, or authorizes another dispatch.
+- A deployment-private physical-binding graph now extends the same contract to
+  three supervisor methods, nine storage-lifecycle methods, four publication
+  methods, and restore-destination resolution. Together with image resolution
+  and inspection, deployment owns nineteen method-specific settlement stops.
+  Transient invocation identities and abort signals remain outside durable
+  requests/results; all existing grants, readbacks, stopped-only reconciliation,
+  committed-only verification, and no-second-dispatch rules remain authoritative.
+  Stop requests every settlement drain before awaiting them and closes pools
+  only after controller and settlement drain; any failure is sticky.
 - Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
   grant entirely inside one coordinator-owned per-operation guard. The storage
   backend exposes a separate version 1 read-only reconciliation contract keyed
@@ -381,10 +390,8 @@
   PostgreSQL schema remain unchanged.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires method-specific settlement for the mutating supervisor, storage-
-  lifecycle, and publication calls, operational lease admission, full
-  assembled restart/ambiguous-outcome/deadline validation, and the final public
-  adapter route.
+  requires operational lease admission, full assembled restart/ambiguous-
+  outcome/deadline validation, and the final public adapter route.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -395,6 +402,8 @@
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
 - Physical-collaborator settlement:
   `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
+- Physical settlement graph:
+  `docs/project_journal/2026/08/2026-08-12-physical-settlement-graph-f4c8a1.md`
 - Restore-activation reconciliation:
   `docs/project_journal/2026/08/2026-08-12-restore-activation-reconciliation-b6d4e1.md`
 - Detached-restore image-plan binding:
@@ -493,10 +502,11 @@
   the initial recovery sweep, controlled restore admission, scheduler stop,
   admitted-call drain, explicit PostgreSQL bootstrap configuration, and pool
   closure now have one deployment owner; its `stop` facet is not distributed
-  to injected runtime collaborators. Its image-plan binding now owns exact OCI
+  to injected runtime collaborators. Its image-plan binding owns exact OCI
   bytes, trusted inspection, opaque reservation identity, and separate bounded
-  settlement policy for provider resolution and inspection. Production still
-  requires settlement coverage for mutating supervisor, storage-lifecycle, and
-  publication collaborators, operational lease admission, whole-graph fail-
+  settlement policy for provider resolution and inspection. The same owner now
+  binds every assembled supervisor, storage-lifecycle, publication, and
+  restore-destination resolver Promise into the common settlement lifecycle.
+  Production still requires operational lease admission, whole-graph fail-
   closed validation, and final public-adapter assembly before `runRestore()` may
   be enabled.

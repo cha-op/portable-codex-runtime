@@ -30,6 +30,10 @@ import {
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
 import {
+  createPostgresDetachedRestorePhysicalBindings,
+  isPostgresDetachedRestorePublicationBinding,
+} from "../src/postgres-detached-restore-physical-bindings.mjs";
+import {
   PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
@@ -73,6 +77,29 @@ const TEST_OBJECT_IDENTITY_SCHEME = "test-object-generation-v1";
 const CAPTURE_JOURNAL_BINDING_CONTRACT_VERSION = 2;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const PHYSICAL_LIFECYCLE_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const PHYSICAL_SUPERVISOR_METHODS = Object.freeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
+]);
+const ignorePhysicalFatal = Object.freeze(() => undefined);
 
 const TRUSTED_JOURNAL_ACL_INSPECTORS = Object.freeze({
   inspectAncestorAcl: async () => false,
@@ -561,6 +588,48 @@ function createLifecycleBackend({ restoreActivation = false } = {}) {
       };
   }
   return { backend, calls, delegatedResult };
+}
+
+function physicalPolicies(methods) {
+  return Object.fromEntries(
+    methods.map((method) => [
+      method,
+      Object.freeze({
+        deadlineMilliseconds: 30_000,
+        settlementGraceMilliseconds: 1_000,
+      }),
+    ]),
+  );
+}
+
+function createPhysicalPublicationBinding(rawPublication) {
+  const rawLifecycle = createLifecycleBackend({ restoreActivation: true }).backend;
+  const unexpected = async function unexpectedPhysicalProvider() {
+    throw new Error("unrelated physical provider must not run");
+  };
+  return createPostgresDetachedRestorePhysicalBindings({
+    lifecycleBackend: Object.freeze({
+      ...rawLifecycle,
+      physicalInvocationContractVersion: 1,
+    }),
+    lifecycleSettlement: physicalPolicies(PHYSICAL_LIFECYCLE_METHODS),
+    onFatal: ignorePhysicalFatal,
+    publication: rawPublication,
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestination: unexpected,
+    resolveRestoreDestinationContractVersion: 1,
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisor: Object.freeze({
+      contractVersion: 2,
+      launchWriter: unexpected,
+      reconcileWriterLaunch: unexpected,
+      supervisorId: "backend-physical-supervisor-001",
+    }),
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  }).publication;
 }
 
 function assertBackendError(error, code = "stopped_directory_backend_outcome_uncertain") {
@@ -1391,7 +1460,7 @@ function createRuntime(fixture, options = {}) {
     coordinator,
     lifecycleBackend: lifecycle.backend,
     mutationAuthority: mutation.authority,
-    publication: fixture.publication,
+    publication: options.publication ?? fixture.publication,
     resolveStoppedWriter,
   });
   Object.assign(fixture, {
@@ -1776,6 +1845,91 @@ test("backend exposes the fixed directory surface and delegates lifecycle operat
       assertBackendError(error, "invalid_stopped_directory_backend_request"),
   );
 });
+
+test(
+  "backend accepts only authentic legacy or branded publication collaborators",
+  { concurrency: false },
+  async (t) => {
+    await t.test("rejects a forged four-method publication duck", async (t) => {
+      const fixture = await createFixture(t);
+      const forged = Object.freeze(
+        Object.fromEntries(
+          PHYSICAL_PUBLICATION_METHODS.map((method) => [
+            method,
+            Object.freeze(async function forgedPublicationMethod() {
+              throw new Error("forged publication must not run");
+            }),
+          ]),
+        ),
+      );
+      assert.equal(isPostgresDetachedRestorePublicationBinding(forged), false);
+      assert.throws(
+        () => createRuntime(fixture, { publication: forged }),
+        (error) =>
+          assertBackendError(
+            error,
+            "invalid_stopped_directory_backend_request",
+          ),
+      );
+    });
+
+    await t.test("delegates all four operations through one real binding", async (t) => {
+      let publicationMode = "fresh-or-exact-replay";
+      const runtimeOptions = {
+        captureFinalizationFailure: true,
+        restoreContext: () => ({ publicationMode }),
+        restoreContextContractVersion: 3,
+      };
+      const fixture = await createFixture(t, runtimeOptions);
+      const binding = createPhysicalPublicationBinding(fixture.publication);
+      assert.equal(isPostgresDetachedRestorePublicationBinding(binding), true);
+      createRuntime(fixture, { ...runtimeOptions, publication: binding });
+      const capability = await issueCapability(fixture);
+
+      await assert.rejects(
+        () => captureCleanCheckpoint(captureCoreOptions(fixture, capability)),
+        (error) => assertCoreError(error, "checkpoint_outcome_uncertain"),
+      );
+      const reconciliation = captureReconciliationInput(fixture);
+      await reconcileCleanCheckpointCapture({
+        backend: fixture.backend,
+        checkpoint: reconciliation.checkpoint,
+        manifest: manifest(),
+        request: reconciliation.request,
+        storageRef: storageRef(),
+      });
+      const restoreOptions = restoreCoreOptions(fixture);
+      const fresh = await restoreCleanCheckpoint(restoreOptions);
+      publicationMode = "committed-only";
+      assert.deepEqual(await restoreCleanCheckpoint(restoreOptions), fresh);
+    });
+
+    await t.test("maps binding rejection to backend uncertainty", async (t) => {
+      const fixture = await createFixture(t, {
+        publicationFaults: {
+          async afterJournalPrepared() {
+            throw new Error("physical publication rejected");
+          },
+        },
+      });
+      const binding = createPhysicalPublicationBinding(fixture.publication);
+      createRuntime(fixture, { publication: binding });
+      const capability = await issueCapability(fixture);
+      await assert.rejects(
+        () =>
+          fixture.backend.captureCheckpoint(
+            captureDispatchInput(fixture, capability),
+          ),
+        (error) =>
+          assertBackendError(
+            error,
+            "stopped_directory_backend_outcome_uncertain",
+          ),
+      );
+      assert.equal(fixture.mutation.state.captureFinalizations.length, 0);
+    });
+  },
+);
 
 test("restore context contract negotiation rejects invalid authority shapes without collaboration", async (t) => {
   const cases = [
