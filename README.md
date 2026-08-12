@@ -390,8 +390,9 @@ boundary. Expiry fails closed and never authorizes a second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
 checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
-must supply the deployment-owned bindings and final public backend, then add
-end-to-end ambiguous-outcome coverage before enabling that entry point. A
+must supply provider/image, PostgreSQL connection/bootstrap configuration, and
+operational lease-budget bindings plus the final public backend, then add end-
+to-end ambiguous-outcome coverage before enabling that entry point. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
 facet plus a narrow `stablePlanProvisioning` facet from one internally
@@ -403,10 +404,15 @@ the backend and foreground composition. The provisioning facet exposes only
 receiver-preserving read-only resolver is private to foreground execution.
 This makes the original opaque writer handle reachable by later stop/capture
 without making a committed database row or another launcher authoritative.
-The factory does not migrate, start, stop, or close pools, replace the
-capture-only backend's fixed restore route, or wire foreground restore into
-the production adapter. The exclusive scheduler continues bounded
-no-relaunch recovery.
+The low-level factory does not migrate, start, stop, or close pools, replace
+the capture-only backend's fixed restore route, or wire foreground restore
+into the production adapter. A deployment controller now invokes its narrow
+same-store migration facet, requires the scheduler's immediate pass to prove a
+complete recovery sweep, and then opens only gated foreground, plan-
+provisioning, and writer-launch facets. Stop closes those facets, stops the
+scheduler, and drains admitted calls; the caller closes the four borrowed pools
+after that barrier. The exclusive scheduler continues bounded no-relaunch
+recovery.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -583,9 +589,11 @@ recovery scheduler, invocation-time detached-production gate, foreground
 composition, production-neutral runtime assembly, and same-launcher writer-
 start ingress are now complete. The durable stable-plan registry, separately
 gated provisioning facet, and private read-only foreground resolver are also
-complete.
-Production restore remains fail-closed until later slices supply deployment-
-owned bindings, assembled restart/ambiguity validation, and final adapter
+complete. Migration-before-serving, the initial complete recovery sweep,
+restore admission, and shutdown drain now have one deployment owner.
+Production restore remains fail-closed until later slices supply provider/
+image, PostgreSQL connection/bootstrap configuration, and operational lease-
+budget bindings, assembled restart/ambiguity validation, and final adapter
 wiring. Filesystem-image execution and differential backup remain later work.
 See
 `docs/architecture/stopped-directory-backend.md`.

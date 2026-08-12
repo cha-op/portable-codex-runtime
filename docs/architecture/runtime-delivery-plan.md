@@ -360,12 +360,17 @@ Restore and launcher authority are now split into eight serial pull requests:
    - The runtime constructs that registry with its existing internal store,
      exposes only a frozen null-prototype `stablePlanProvisioning` facet, and
      passes a private receiver-preserving resolver to foreground execution.
-     The runtime surface is exactly `backend`, `foreground`, `scheduler`,
-     `stablePlanProvisioning`, and `writerLaunch`.
+     Its low-level surface also exposes a narrow same-store `bootstrap.migrate`
+     capability for the deployment lifecycle owner.
+   - The deployment controller now performs migration before serving, starts
+     the scheduler, requires its immediate coalesced pass to prove a complete
+     four-lane sweep, and only then opens the gated foreground, stable-plan,
+     and writer-launch facets. Stop closes admission, stops the scheduler, and
+     drains all accepted calls without closing the four borrowed pools.
    - Remaining deployment assembly then owns physical provider/image and
-     PostgreSQL bootstrap bindings, lease budgets and admission/drain
-     ownership, complete assembled restart/ambiguity validation, and
-     construction of the final public restore-capable backend.
+     PostgreSQL connection/bootstrap configuration, the operational lease
+     budget, complete assembled restart/ambiguity validation, and construction
+     of the final public restore-capable backend.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

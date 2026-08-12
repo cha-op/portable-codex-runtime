@@ -1888,13 +1888,31 @@ or a durable committed-started row cannot reconstruct that handle. Stop,
 retire, prepared-launch, handle-resolution, read-only plan resolution, and
 internal map capabilities remain private.
 
-The assembly still does not migrate the store, own scheduler or pool
-lifecycle, resolve deployment configuration, inject foreground restore into
-the backend, or construct the final public restore-capable backend. The
+The low-level assembly itself does not migrate the store, own scheduler or
+pool lifecycle, resolve deployment configuration, inject foreground restore
+into the backend, or construct the final public restore-capable backend. The
 production checkpoint adapter therefore still rejects restore through its
-fixed fail-closed `runRestore()` implementation. Deployment assembly must next
-supply the remaining provider/bootstrap bindings and complete assembled
-ambiguous-outcome matrix before enabling that entry point.
+fixed fail-closed `runRestore()` implementation.
+
+The deployment controller owns the next lifecycle boundary without changing
+that backend. It invokes the low-level runtime's same-store bootstrap migration,
+starts the scheduler, and coalesces with the scheduler's immediate pass. It
+opens foreground, stable-plan-provisioning, and writer-launch admission only
+after an exact completed receipt proves a full four-lane sweep. A failed,
+busy, uncertain, or malformed initial result leaves the controller permanently
+closed. Exactly one controller claims each assembled runtime for its lifetime,
+so one shutdown barrier cannot race a second admission ledger over the same
+scheduler and pools. Stop first closes those facets, requests scheduler
+shutdown, and then drains the scheduler plus every already-admitted call. An
+admitted call and its asynchronous descendants cannot invoke that same
+controller's stop operation, which prevents the stop barrier from waiting on a
+call that is itself waiting on stop. The four pools remain borrowed; deployment
+closes them only after that barrier settles. The raw runtime is a low-level
+assembly capability and is not a second serving ingress.
+Deployment must next supply the remaining provider/image, PostgreSQL
+connection/bootstrap configuration, and operational lease-budget bindings and
+complete the assembled ambiguous-outcome matrix before enabling the production
+entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2003,9 +2021,11 @@ prepared-only fresh dispatch, source-free active recovery, no second
 publication after ambiguity, and retained local identity until the exact
 predetermined committed result. The invocation-time gate, production-neutral
 object graph, same-launcher writer-start ingress, separately gated durable plan
-provisioning, restart readback, and private read-only resolver now exist. The
-next integration slices must add the remaining deployment-owned bindings,
-whole-graph restart/ambiguity validation, and final adapter wiring before
-production `runRestore()` can open.
+provisioning, restart readback, private read-only resolver, and deployment-
+owned migration/admission/drain controller now exist. The next integration
+slices must add the remaining provider/image, PostgreSQL connection/bootstrap
+configuration, and operational lease-budget bindings, whole-graph restart/
+ambiguity validation, and final adapter wiring before production `runRestore()`
+can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

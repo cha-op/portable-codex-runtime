@@ -32,6 +32,9 @@ import {
   createPostgresDetachedRestoreRuntimeComposition,
 } from "../src/postgres-detached-restore-runtime-composition.mjs";
 import {
+  createPostgresDetachedRestoreRuntimeController,
+} from "../src/postgres-detached-restore-runtime-controller.mjs";
+import {
   POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED,
   PostgresDetachedRestoreStablePlanRegistryError,
   createPostgresDetachedRestoreStablePlanRegistry,
@@ -2088,6 +2091,33 @@ async function settleWithin(promise, label, timeoutMs = 10_000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function waitForApplicationAdvisoryLock(
+  queryable,
+  { applicationName, mode },
+) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const result = await queryable.query(
+      [
+        "SELECT pg_catalog.count(*)::integer AS lock_count",
+        "FROM pg_catalog.pg_locks AS locks",
+        "JOIN pg_catalog.pg_stat_activity AS activity",
+        "ON activity.pid = locks.pid",
+        "WHERE locks.locktype = 'advisory'",
+        "AND locks.granted",
+        "AND locks.mode = $2",
+        "AND activity.application_name = $1",
+      ].join(" "),
+      [applicationName, mode],
+    );
+    if (result.rows[0].lock_count > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(
+    `timed out waiting for ${mode} advisory lock from ${applicationName}`,
+  );
 }
 
 function operationInput(
@@ -10770,9 +10800,11 @@ test(
 );
 
 test(
-  "production-neutral restore runtime shares one local writer handle with fresh V3 stop/capture",
+  "restore runtime controller bootstraps and drains before same-runtime V3 stop/capture",
   { timeout: 60_000 },
   async (t) => {
+    const foregroundLifecycleApplicationName =
+      `pcr-restore-foreground-${randomUUID()}`;
     const authorityPool = new Pool({
       application_name:
         "portable-codex-runtime-restore-authority-integration-test",
@@ -10786,8 +10818,7 @@ test(
       max: 1,
     });
     const foregroundLifecyclePool = new Pool({
-      application_name:
-        "portable-codex-runtime-restore-lifecycle-foreground-integration-test",
+      application_name: foregroundLifecycleApplicationName,
       connectionString: databaseUrl,
       max: 1,
     });
@@ -10798,15 +10829,22 @@ test(
       max: 1,
     });
     const recoveryScopeId = `integration-restore-${randomUUID()}`;
+    const controllerRecoveryScopeId =
+      `integration-restore-controller-${randomUUID()}`;
     const sessionId = randomUUID();
-    const sessionIds = [sessionId];
+    const blockedSessionId = randomUUID();
+    const sessionIds = [sessionId, blockedSessionId];
     const image = integrationPlatformImageFixture();
     const imageReservations =
       new PlatformImageReservationCoordinator();
     const supervisorId = `runtime-supervisor-${randomUUID()}`;
+    let controller = null;
     let runtime = null;
     let foregroundTeardown = null;
     t.after(async () => {
+      if (controller !== null) {
+        await Promise.allSettled([controller.stop()]);
+      }
       let teardownToAwait = foregroundTeardown;
       if (teardownToAwait === null && runtime !== null) {
         try {
@@ -10825,9 +10863,9 @@ test(
           await cleanupClient.query(
             [
               "DELETE FROM session_authority.restore_recovery_cursors",
-              "WHERE recovery_scope_id = $1",
+              "WHERE recovery_scope_id = ANY($1::text[])",
             ].join(" "),
-            [recoveryScopeId],
+            [[recoveryScopeId, controllerRecoveryScopeId]],
           );
           await cleanupClient.query(
             [
@@ -10952,7 +10990,6 @@ test(
       dedicatedPool: authorityPool,
       maxTransactionAttempts: 3,
     });
-    await store.migrate();
     const authority = new PostgresSessionAuthority({
       restoreAttachmentActivationV2FleetCompatible: true,
       restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
@@ -10970,7 +11007,7 @@ test(
       resolveSourceOwnedRoot: integrationSourceOwnedRoot,
     });
 
-    const firstStep = deferred();
+    let firstStep = deferred();
     const foregroundGateEntered = deferred();
     const releaseForegroundGate = deferred();
     const steps = [];
@@ -10991,7 +11028,7 @@ test(
     let foregroundAllowed = false;
     let holdForegroundGate = false;
     let stablePlan = null;
-    runtime = createPostgresDetachedRestoreRuntimeComposition({
+    const runtimeOptions = {
       authority: {
         maxTransactionAttempts: 3,
         restoreAttachmentActivationV2FleetCompatible: true,
@@ -11079,7 +11116,7 @@ test(
           steps.push(receipt);
           if (steps.length === 1) firstStep.resolve(receipt);
         },
-        recoveryScopeId,
+        recoveryScopeId: controllerRecoveryScopeId,
       },
       storage: {
         backendId: "postgres-authority-integration",
@@ -11103,6 +11140,223 @@ test(
           calls.sourceResolver += 1;
           return integrationSourceOwnedRoot(options);
         },
+      },
+    };
+    const controlledRuntime =
+      createPostgresDetachedRestoreRuntimeComposition(runtimeOptions);
+    controller = createPostgresDetachedRestoreRuntimeController({
+      runtime: controlledRuntime,
+    });
+
+    const blockedRegistration = registrationInput(blockedSessionId);
+    const blockedArtifactId = `controller-artifact-${randomUUID()}`;
+    const blockedCheckpointId = `controller-checkpoint-${randomUUID()}`;
+    const blockedAdmission = {
+      checkpoint: {
+        artifactId: blockedArtifactId,
+        backendId: blockedRegistration.storageRef.backendId,
+        checkpointClass: "clean",
+        checkpointId: blockedCheckpointId,
+        codexSessionId: blockedRegistration.manifest.codex.sessionId,
+        codexThreadId: blockedRegistration.manifest.codex.rootThreadId,
+        contractVersion: 1,
+        createdAt: new Date().toISOString(),
+        imageDigest: blockedRegistration.manifest.runtime.imageDigest,
+        sessionId: blockedSessionId,
+        sourceFencingEpoch: "1",
+        storageId: blockedRegistration.storageRef.storageId,
+      },
+      request: {
+        backendId: blockedRegistration.storageRef.backendId,
+        contractVersion: 1,
+        fencingEpoch: "2",
+        holderId: `controller-holder-${randomUUID()}`,
+        leaseId: `controller-lease-${randomUUID()}`,
+        operation: "restore",
+        operationId: `controller-restore-${randomUUID()}`,
+        sessionId: blockedSessionId,
+        storageId: blockedRegistration.storageRef.storageId,
+        target: {
+          artifactId: blockedArtifactId,
+          checkpointId: blockedCheckpointId,
+          kind: "checkpoint",
+        },
+      },
+    };
+    const controllerPublish = async function controllerPublish() {
+      calls.publish += 1;
+      throw new Error("runtime controller must not publish");
+    };
+    const controllerRequestError = (error) => {
+      assert.equal(
+        error.code,
+        "invalid_postgres_detached_restore_runtime_controller_request",
+      );
+      return true;
+    };
+    const assertControllerIngressClosed = async () => {
+      await Promise.all([
+        assert.rejects(
+          controller.foreground.runRestore(
+            blockedAdmission,
+            controllerPublish,
+          ),
+          controllerRequestError,
+        ),
+        assert.rejects(
+          controller.stablePlanProvisioning.provisionStablePlan({}),
+          controllerRequestError,
+        ),
+        assert.rejects(
+          controller.writerLaunch.reconcileLaunchAttempt({}),
+          controllerRequestError,
+        ),
+        assert.rejects(
+          controller.writerLaunch.runLaunch({}),
+          controllerRequestError,
+        ),
+      ]);
+    };
+
+    await assertControllerIngressClosed();
+    const controllerStarting = controller.start();
+    await assertControllerIngressClosed();
+    const controllerReady = await settleWithin(
+      controllerStarting,
+      "restore runtime controller startup",
+    );
+    assert.deepEqual(structuredClone(controllerReady), { status: "ready" });
+    const controllerFirst = await settleWithin(
+      firstStep.promise,
+      "restore runtime controller initial recovery step",
+    );
+    assert.equal(controllerFirst.status, "completed");
+    assert.equal(controllerFirst.errorCode, null);
+    assert.equal(controllerFirst.recovery.status, "sweep-complete");
+    for (const field of [
+      "generation",
+      "activation",
+      "launchAttempt",
+      "currentLaunch",
+    ]) {
+      assert.equal(
+        controllerFirst.recovery[field].batch.status,
+        "sweep-complete",
+      );
+      assert.equal(controllerFirst.recovery[field].batch.results.length, 0);
+    }
+    await assert.rejects(
+      controlledRuntime.backend.restoreCheckpoint(blockedAdmission),
+      (error) => {
+        assert.equal(error.code, "stopped_directory_backend_outcome_uncertain");
+        return true;
+      },
+    );
+    for (const field of [
+      "image",
+      "provider",
+      "publication",
+      "publish",
+      "supervisorLaunch",
+      "supervisorReconcile",
+      "supervisorStop",
+    ]) {
+      assert.equal(calls[field], 0);
+    }
+
+    const blockingClient = await authorityPool.connect();
+    let blockingTransactionOpen = false;
+    try {
+      await blockingClient.query("BEGIN");
+      blockingTransactionOpen = true;
+      await blockingClient.query(
+        "LOCK TABLE session_authority.sessions IN ACCESS EXCLUSIVE MODE",
+      );
+      const admittedForeground = controller.foreground.runRestore(
+        blockedAdmission,
+        controllerPublish,
+      );
+      const admittedForegroundSettlement = assert.rejects(
+        admittedForeground,
+        (error) => {
+          assert.equal(
+            error.code,
+            "postgres_detached_restore_foreground_composition_outcome_uncertain",
+          );
+          return true;
+        },
+      );
+      await waitForApplicationAdvisoryLock(operationPool, {
+        applicationName: foregroundLifecycleApplicationName,
+        mode: "ShareLock",
+      });
+
+      const controllerStopping = controller.stop();
+      let controllerStopSettled = false;
+      controllerStopping.then(
+        () => {
+          controllerStopSettled = true;
+        },
+        () => {
+          controllerStopSettled = true;
+        },
+      );
+      await assertControllerIngressClosed();
+      const schedulerStopped = await settleWithin(
+        controlledRuntime.scheduler.stop(),
+        "restore runtime controller immediate scheduler stop",
+      );
+      assert.deepEqual(structuredClone(schedulerStopped), {
+        status: "stopped",
+      });
+      assert.equal(controllerStopSettled, false);
+
+      await blockingClient.query("ROLLBACK");
+      blockingTransactionOpen = false;
+      await admittedForegroundSettlement;
+      const controllerStopped = await settleWithin(
+        controllerStopping,
+        "restore runtime controller shutdown drain",
+      );
+      assert.deepEqual(structuredClone(controllerStopped), {
+        status: "stopped",
+      });
+      assert.equal(controllerStopSettled, true);
+    } finally {
+      if (blockingTransactionOpen) {
+        await blockingClient.query("ROLLBACK");
+      }
+      blockingClient.release();
+    }
+
+    for (const pool of [
+      authorityPool,
+      operationPool,
+      foregroundLifecyclePool,
+      recoveryLifecyclePool,
+    ]) {
+      const alive = await pool.query("SELECT 1::integer AS alive");
+      assert.deepEqual(alive.rows, [{ alive: 1 }]);
+    }
+    for (const field of [
+      "image",
+      "provider",
+      "publication",
+      "publish",
+      "supervisorLaunch",
+      "supervisorReconcile",
+      "supervisorStop",
+    ]) {
+      assert.equal(calls[field], 0);
+    }
+
+    steps.length = 0;
+    firstStep = deferred();
+    runtime = createPostgresDetachedRestoreRuntimeComposition({
+      ...runtimeOptions,
+      recovery: {
+        ...runtimeOptions.recovery,
+        recoveryScopeId,
       },
     });
     const completion = runtime.scheduler.start();

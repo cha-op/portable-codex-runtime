@@ -336,9 +336,16 @@
   private receiver-preserving resolver to foreground execution. External
   callers cannot replace the foreground resolver or obtain it from the runtime
   surface.
+- A deployment-owned runtime controller now uses that same store's narrow
+  bootstrap facet. It completes migration and one exact full recovery sweep
+  before opening foreground, plan-provisioning, or writer-launch admission.
+  Shutdown closes those facets first, stops the scheduler, and drains every
+  admitted call before the caller may close the four borrowed pools. The raw
+  runtime remains a low-level capability and is not a parallel serving route.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires the remaining deployment-owned provider/bootstrap bindings, full
+  requires the remaining deployment-owned provider/image, PostgreSQL
+  connection/bootstrap configuration, and lease-budget bindings, full
   assembled restart and ambiguous-outcome validation, and the final public
   adapter route.
   No published path, generation row, serialized measurement, attempt record,
@@ -439,6 +446,9 @@
   gate, foreground composition seam, production-neutral runtime assembly, and
   same-launcher writer-start ingress are implemented. The durable stable-plan
   registry, separately gated provisioning surface, and private read-only
-  foreground resolver are now implemented as well. Production still requires
-  the remaining deployment-owned bindings, final public-adapter assembly, and
-  end-to-end fail-closed validation before `runRestore()` may be enabled.
+  foreground resolver are now implemented as well. Migration-before-serving,
+  the initial recovery sweep, controlled restore admission, scheduler stop,
+  and admitted-call drain now have one deployment owner. Production still
+  requires provider/image, PostgreSQL connection/bootstrap configuration, and
+  operational lease-budget bindings, final public-adapter assembly, and end-
+  to-end fail-closed validation before `runRestore()` may be enabled.

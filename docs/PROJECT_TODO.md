@@ -113,11 +113,14 @@
   guard pools, authority/store pool, idle bounded no-relaunch scheduler, and a
   narrow same-launcher writer-start ingress without opening the adapter. The
   PostgreSQL durable plan registry, separately gated provisioning facet, and
-  private read-only foreground resolver are now complete. Supply the remaining
-  provider, image, PostgreSQL bootstrap, lease-budget, admission/drain, and
-  lifecycle bindings. Run the complete assembled restart/ambiguous-outcome
-  matrix, construct the final public backend, and only then replace the fixed
-  fail-closed `runRestore()` stub.
+  private read-only foreground resolver are now complete. The deployment
+  controller now owns migration-before-serving, the initial complete recovery
+  sweep, restore admission, scheduler shutdown, and admitted-call drain while
+  leaving the four pools caller-owned. Supply the remaining provider/image,
+  PostgreSQL connection/bootstrap configuration, and operational lease-budget
+  bindings. Run the complete assembled restart/ambiguous-outcome matrix,
+  construct the final public backend, and only then replace the fixed fail-
+  closed `runRestore()` stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.
