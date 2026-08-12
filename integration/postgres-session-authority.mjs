@@ -34,6 +34,9 @@ import {
   createPostgresDetachedRestoreDeployment,
 } from "../src/postgres-detached-restore-deployment.mjs";
 import {
+  createPostgresDetachedRestoreOperationalLeaseBudget,
+} from "../src/postgres-detached-restore-operational-lease-budget.mjs";
+import {
   createPostgresDetachedRestorePhysicalBindings,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
 import {
@@ -108,6 +111,9 @@ const CHECKPOINT_GUARD_APPLICATION_NAME =
   "portable-codex-runtime-checkpoint-guard-integration-test";
 const SESSION_AUTHORITY_APPLICATION_NAME =
   "portable-codex-runtime-session-registry-integration-test";
+const OPERATIONAL_LEASE_DATABASE_REQUEST_MILLISECONDS = 30_000;
+const OPERATIONAL_LEASE_DURATION_MILLISECONDS = 5_000_000;
+const OPERATIONAL_LEASE_SAFETY_MARGIN_MILLISECONDS = 30_000;
 const databaseUrl = process.env.SESSION_AUTHORITY_DATABASE_URL;
 const databaseConfigured =
   typeof databaseUrl === "string" && databaseUrl.length > 0;
@@ -1784,20 +1790,37 @@ function integrationDetachedRestoreImagePlan(session) {
   });
 }
 
-function integrationImagePlanSettlements() {
+function integrationImagePlanSettlementPolicies() {
+  return {
+    inspectCodex: {
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 5_000,
+    },
+    resolveImagePlan: {
+      deadlineMilliseconds: 45_000,
+      settlementGraceMilliseconds: 10_000,
+    },
+  };
+}
+
+function integrationImagePlanSettlements(
+  policies = integrationImagePlanSettlementPolicies(),
+) {
   const onFatal = Object.freeze(function onFatal() {
     assert.fail("integration image-plan provider must settle");
   });
   return Object.freeze({
     inspectCodex: createPhysicalCollaboratorSettlement({
-      deadlineMilliseconds: 30_000,
+      deadlineMilliseconds: policies.inspectCodex.deadlineMilliseconds,
       onFatal,
-      settlementGraceMilliseconds: 5_000,
+      settlementGraceMilliseconds:
+        policies.inspectCodex.settlementGraceMilliseconds,
     }),
     resolveImagePlan: createPhysicalCollaboratorSettlement({
-      deadlineMilliseconds: 45_000,
+      deadlineMilliseconds: policies.resolveImagePlan.deadlineMilliseconds,
       onFatal,
-      settlementGraceMilliseconds: 10_000,
+      settlementGraceMilliseconds:
+        policies.resolveImagePlan.settlementGraceMilliseconds,
     }),
   });
 }
@@ -11311,6 +11334,24 @@ test(
     const physicalSignals = new Set();
     const physicalPolicies =
       integrationDeploymentPhysicalSettlementPolicies();
+    const imagePlanProviderSettlement =
+      integrationImagePlanSettlementPolicies();
+    const operationalLeaseBudget =
+      createPostgresDetachedRestoreOperationalLeaseBudget({
+        databaseRequestMilliseconds:
+          OPERATIONAL_LEASE_DATABASE_REQUEST_MILLISECONDS,
+        imagePlanProviderSettlement,
+        leaseDurationMilliseconds:
+          OPERATIONAL_LEASE_DURATION_MILLISECONDS,
+        lifecycleBackendSettlement:
+          physicalPolicies.lifecycleBackendSettlement,
+        publicationSettlement: physicalPolicies.publicationSettlement,
+        resolveRestoreDestinationSettlement:
+          physicalPolicies.resolveRestoreDestinationSettlement,
+        safetyMarginMilliseconds:
+          OPERATIONAL_LEASE_SAFETY_MARGIN_MILLISECONDS,
+        supervisorSettlement: physicalPolicies.supervisorSettlement,
+      });
     const rawLifecycleBackend =
       restoreRuntimeIntegrationLifecycleBackend(
         calls,
@@ -11484,7 +11525,9 @@ test(
               });
             },
           }),
-          settlement: integrationImagePlanSettlements(),
+          settlement: integrationImagePlanSettlements(
+            imagePlanProviderSettlement,
+          ),
         }),
         stoppedWriterCoordinator:
           new StoppedWriterCapabilityCoordinator(),
@@ -11497,6 +11540,7 @@ test(
         recoveryLifecycle: recoveryLifecyclePool,
       },
       planRegistry: {
+        operationalLeaseBudget,
         provisioningFleetCapabilityGate({ admission, plan }) {
           calls.planProvisioningGate += 1;
           assert.equal(admission.request.sessionId, sessionId);
@@ -11824,7 +11868,8 @@ test(
         detachMode: "release",
         holderId: `restore-holder-${randomUUID()}`,
         imagePlanId: `image-plan-${randomUUID()}`,
-        leaseDurationMilliseconds: 300_000,
+        leaseDurationMilliseconds:
+          operationalLeaseBudget.leaseDurationMilliseconds,
         sourceArtifactDirectory: sourceArtifact.artifactDirectory,
         sourceArtifactOwnedRoot: sourceArtifact.artifactOwnedRoot,
       },
@@ -12240,6 +12285,7 @@ test(
     let restartedRegistryGateCalls = 0;
     const restartedRegistry =
       createPostgresDetachedRestoreStablePlanRegistry({
+        operationalLeaseBudget,
         provisioningFleetCapabilityGate() {
           restartedRegistryGateCalls += 1;
           return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
@@ -12317,6 +12363,7 @@ test(
     let acknowledgementLossGateCalls = 0;
     const acknowledgementLossRegistry =
       createPostgresDetachedRestoreStablePlanRegistry({
+        operationalLeaseBudget,
         provisioningFleetCapabilityGate() {
           acknowledgementLossGateCalls += 1;
           return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
@@ -12795,6 +12842,14 @@ test(
           }),
           supervisorSettlement: physicalPolicies.supervisorSettlement,
         },
+        operationalLease: {
+          databaseRequestMilliseconds:
+            OPERATIONAL_LEASE_DATABASE_REQUEST_MILLISECONDS,
+          leaseDurationMilliseconds:
+            OPERATIONAL_LEASE_DURATION_MILLISECONDS,
+          safetyMarginMilliseconds:
+            OPERATIONAL_LEASE_SAFETY_MARGIN_MILLISECONDS,
+        },
         planRegistry: {
           async provisioningFleetCapabilityGate() {
             calls.planGate += 1;
@@ -13009,22 +13064,61 @@ test(
         },
       },
     };
-    const plan = createPostgresDetachedRestorePlan({
-      request: admission.request,
-      plan: {
-        captureCreatedAt: new Date().toISOString(),
-        destinationDirectory:
-          `/var/lib/portable-codex-restores/${sessionId}`,
-        destinationOwnedRoot: "/var/lib/portable-codex-restores",
-        detachMode: "release",
-        holderId: `deployment-restore-holder-${randomUUID()}`,
-        imagePlanId: `deployment-image-plan-${randomUUID()}`,
-        leaseDurationMilliseconds: 300_000,
-        sourceArtifactDirectory:
-          `/var/lib/portable-codex-checkpoints/${artifactId}`,
-        sourceArtifactOwnedRoot: "/var/lib/portable-codex-checkpoints",
+    const createDeploymentPlan = (leaseDurationMilliseconds) =>
+      createPostgresDetachedRestorePlan({
+        request: admission.request,
+        plan: {
+          captureCreatedAt: new Date().toISOString(),
+          destinationDirectory:
+            `/var/lib/portable-codex-restores/${sessionId}`,
+          destinationOwnedRoot: "/var/lib/portable-codex-restores",
+          detachMode: "release",
+          holderId: `deployment-restore-holder-${randomUUID()}`,
+          imagePlanId: `deployment-image-plan-${randomUUID()}`,
+          leaseDurationMilliseconds,
+          sourceArtifactDirectory:
+            `/var/lib/portable-codex-checkpoints/${artifactId}`,
+          sourceArtifactOwnedRoot: "/var/lib/portable-codex-checkpoints",
+        },
+      });
+    const beforeTooShortPlan =
+      await readSessionAuthorityMutationSnapshot(inspectionPool, sessionId);
+    await assert.rejects(
+      deployment.stablePlanProvisioning.provisionStablePlan({
+        admission,
+        plan: createDeploymentPlan(
+          OPERATIONAL_LEASE_DURATION_MILLISECONDS - 1,
+        ),
+      }),
+      (error) => {
+        assert(
+          error instanceof PostgresDetachedRestoreStablePlanRegistryError,
+        );
+        assert.equal(
+          error.code,
+          "postgres_detached_restore_stable_plan_registry_operational_lease_required",
+        );
+        return true;
       },
+    );
+    assert.deepEqual(
+      await readSessionAuthorityMutationSnapshot(inspectionPool, sessionId),
+      beforeTooShortPlan,
+    );
+    assert.deepEqual(calls, {
+      fleetGate: 0,
+      image: 0,
+      imageInspect: 0,
+      imageResolve: 0,
+      planGate: 0,
+      provider: 0,
+      publication: 0,
+      supervisor: 0,
     });
+
+    const plan = createDeploymentPlan(
+      OPERATIONAL_LEASE_DURATION_MILLISECONDS,
+    );
     deploymentPlan = plan;
     const provisioned =
       await deployment.stablePlanProvisioning.provisionStablePlan({

@@ -6,6 +6,9 @@ import {
   isPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
+  createPostgresDetachedRestoreOperationalLeaseBudget,
+} from "../src/postgres-detached-restore-operational-lease-budget.mjs";
+import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
@@ -22,6 +25,28 @@ const SOURCE_STORAGE_ID = "source-storage-001";
 const DESTINATION_STORAGE_ID = "destination-storage-001";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const NOW = "2026-08-11T12:00:00.000Z";
+const PHYSICAL_LIFECYCLE_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "destroySession",
+  "detachAttachment",
+  "forceFence",
+  "prepareRestoreAttachment",
+  "prepareWritableAttachment",
+  "provisionSession",
+  "reconcileRestoreAttachment",
+  "restoreCheckpoint",
+]);
+const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
+  "publishFreshCheckpointArtifact",
+  "publishRestoreDestination",
+  "verifyCommittedCheckpointArtifact",
+  "verifyCommittedRestoreDestination",
+]);
+const PHYSICAL_SUPERVISOR_METHODS = Object.freeze([
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "stopWriter",
+]);
 
 const harnesses = new WeakMap();
 const runSerializableDescriptor = Object.getOwnPropertyDescriptor(
@@ -227,6 +252,39 @@ function stablePlan(value = admission(), overrides = {}) {
   });
 }
 
+function physicalPolicies(methods) {
+  return Object.fromEntries(
+    methods.map((method) => [
+      method,
+      Object.freeze({
+        deadlineMilliseconds: 1,
+        settlementGraceMilliseconds: 1,
+      }),
+    ]),
+  );
+}
+
+function operationalLeaseBudget(leaseDurationMilliseconds = 600_000) {
+  return createPostgresDetachedRestoreOperationalLeaseBudget({
+    databaseRequestMilliseconds: 1,
+    imagePlanProviderSettlement: physicalPolicies([
+      "inspectCodex",
+      "resolveImagePlan",
+    ]),
+    leaseDurationMilliseconds,
+    lifecycleBackendSettlement: physicalPolicies(
+      PHYSICAL_LIFECYCLE_METHODS,
+    ),
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 1,
+      settlementGraceMilliseconds: 1,
+    }),
+    safetyMarginMilliseconds: 1,
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  });
+}
+
 function createHarness() {
   const harness = {
     claims: new Map(),
@@ -334,6 +392,7 @@ function createHarness() {
 
 function createFixture({
   gateResult = POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED,
+  leaseBudget = operationalLeaseBudget(),
 } = {}) {
   const harness = createHarness();
   const store = new PostgresSerializableStore({
@@ -343,6 +402,7 @@ function createFixture({
   let gateCalls = 0;
   let lastGateInput;
   const registry = createPostgresDetachedRestoreStablePlanRegistry({
+    operationalLeaseBudget: leaseBudget,
     provisioningFleetCapabilityGate(input) {
       gateCalls += 1;
       lastGateInput = input;
@@ -358,7 +418,9 @@ function createFixture({
       return lastGateInput;
     },
     harness,
+    leaseBudget,
     registry,
+    store,
   };
 }
 
@@ -423,6 +485,42 @@ test("stable plan registry exposes one exact frozen branded facade", () => {
   assert.deepEqual(fixture.harness.trace, []);
 });
 
+test("stable plan registry rejects a forged operational lease budget", () => {
+  const fixture = createFixture();
+  assert.throws(
+    () =>
+      createPostgresDetachedRestoreStablePlanRegistry({
+        operationalLeaseBudget: Object.freeze({}),
+        provisioningFleetCapabilityGate() {
+          assert.fail("forged budget must fail before the fleet gate");
+        },
+        store: fixture.store,
+      }),
+    registryError(
+      "invalid_postgres_detached_restore_stable_plan_registry_options",
+    ),
+  );
+  assert.equal(fixture.gateCalls, 0);
+  assert.deepEqual(fixture.harness.trace, []);
+});
+
+test("a short plan lease fails before the provisioning gate or PostgreSQL", async () => {
+  const fixture = createFixture();
+  const value = admission("restore-operation-short-lease-001");
+  await assert.rejects(
+    fixture.registry.provisionStablePlan({
+      admission: value,
+      plan: stablePlan(value, { leaseDurationMilliseconds: 599_999 }),
+    }),
+    registryError(
+      "postgres_detached_restore_stable_plan_registry_operational_lease_required",
+    ),
+  );
+  assert.equal(fixture.gateCalls, 0);
+  assert.equal(fixture.harness.transactionCount, 0);
+  assert.deepEqual(fixture.harness.trace, []);
+});
+
 test("provisioning gate denies before the first PostgreSQL command", async () => {
   const fixture = createFixture({ gateResult: null });
   const value = admission();
@@ -467,6 +565,22 @@ test("fresh provision and exact replay return a durable rehydrated plan", async 
   assert.equal(writesAfterFirst, 2);
 });
 
+test("a plan lease exactly equal to the configured duration is admitted", async () => {
+  const leaseDurationMilliseconds = 600_000;
+  const fixture = createFixture({
+    leaseBudget: operationalLeaseBudget(leaseDurationMilliseconds),
+  });
+  const value = admission("restore-operation-exact-lease-001");
+  const result = await fixture.registry.provisionStablePlan({
+    admission: value,
+    plan: stablePlan(value, { leaseDurationMilliseconds }),
+  });
+  assert.equal(isPostgresDetachedRestorePlan(result), true);
+  assert.equal(result.leaseDurationMilliseconds, leaseDurationMilliseconds);
+  assert.equal(fixture.gateCalls, 1);
+  assert.equal(traceCount(fixture.harness, "insert-plan"), 1);
+});
+
 test("resolver performs only read commands and reports a missing plan", async () => {
   const fixture = createFixture();
   const value = admission();
@@ -502,6 +616,37 @@ test("resolver rehydrates the exact persisted plan without writes", async () => 
     fixture.harness.trace.every((entry) => entry.text.startsWith("SELECT ")),
     true,
   );
+});
+
+test("every resolution rejects a durable plan after operational lease drift", async () => {
+  const fixture = createFixture();
+  const value = admission("restore-operation-lease-drift-001");
+  await fixture.registry.provisionStablePlan({
+    admission: value,
+    plan: stablePlan(value),
+  });
+  fixture.harness.trace.length = 0;
+  const driftedRegistry = createPostgresDetachedRestoreStablePlanRegistry({
+    operationalLeaseBudget: operationalLeaseBudget(600_001),
+    provisioningFleetCapabilityGate() {
+      assert.fail("resolution must not invoke the provisioning gate");
+    },
+    store: fixture.store,
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await assert.rejects(
+      driftedRegistry.resolveStablePlan({
+        admission: value,
+        expectedSession: expectedSession(),
+      }),
+      registryError(
+        "postgres_detached_restore_stable_plan_registry_operational_lease_required",
+      ),
+    );
+  }
+  assert.equal(traceCount(fixture.harness, "read"), 2);
+  assert.equal(traceCount(fixture.harness, "insert-claim"), 0);
+  assert.equal(traceCount(fixture.harness, "insert-plan"), 0);
 });
 
 test("commit acknowledgement loss succeeds only through exact authoritative readback", async () => {

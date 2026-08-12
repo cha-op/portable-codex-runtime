@@ -14,6 +14,9 @@ import {
   createPostgresDetachedRestoreImagePlanBinding,
 } from "./postgres-detached-restore-image-plan-binding.mjs";
 import {
+  createPostgresDetachedRestoreOperationalLeaseBudget,
+} from "./postgres-detached-restore-operational-lease-budget.mjs";
+import {
   createPostgresDetachedRestorePhysicalBindings,
 } from "./postgres-detached-restore-physical-bindings.mjs";
 import {
@@ -81,6 +84,8 @@ const createRuntimeCompositionIntrinsic =
   createPostgresDetachedRestoreRuntimeComposition;
 const createImagePlanBindingIntrinsic =
   createPostgresDetachedRestoreImagePlanBinding;
+const createOperationalLeaseBudgetIntrinsic =
+  createPostgresDetachedRestoreOperationalLeaseBudget;
 const createPhysicalBindingsIntrinsic =
   createPostgresDetachedRestorePhysicalBindings;
 const createRuntimeControllerIntrinsic =
@@ -145,6 +150,7 @@ const RUNTIME_OPTION_KEYS = objectFreeze([
   "authority",
   "foreground",
   "launch",
+  "operationalLease",
   "planRegistry",
   "recovery",
   "storage",
@@ -188,6 +194,11 @@ const SUPERVISOR_SETTLEMENT_KEYS = objectFreeze([
 const PHYSICAL_SETTLEMENT_POLICY_KEYS = objectFreeze([
   "deadlineMilliseconds",
   "settlementGraceMilliseconds",
+]);
+const OPERATIONAL_LEASE_OPTION_KEYS = objectFreeze([
+  "databaseRequestMilliseconds",
+  "leaseDurationMilliseconds",
+  "safetyMarginMilliseconds",
 ]);
 const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
   "provisioningFleetCapabilityGate",
@@ -1131,6 +1142,10 @@ function normalizeRuntimeOptions(value) {
     launch.supervisorSettlement,
     SUPERVISOR_SETTLEMENT_KEYS,
   );
+  const operationalLease = exactDataObject(
+    runtime.operationalLease,
+    OPERATIONAL_LEASE_OPTION_KEYS,
+  );
   const planRegistry = exactDataObject(
     runtime.planRegistry,
     PLAN_REGISTRY_OPTION_KEYS,
@@ -1189,6 +1204,23 @@ function normalizeRuntimeOptions(value) {
       stoppedWriterCoordinator: launch.stoppedWriterCoordinator,
       supervisor,
       supervisorSettlement,
+    }),
+    operationalLease: exactFrozenRecord({
+      databaseRequestMilliseconds: normalizeInteger(
+        operationalLease.databaseRequestMilliseconds,
+        1,
+        MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+      ),
+      leaseDurationMilliseconds: normalizeInteger(
+        operationalLease.leaseDurationMilliseconds,
+        1,
+        MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+      ),
+      safetyMarginMilliseconds: normalizeInteger(
+        operationalLease.safetyMarginMilliseconds,
+        1,
+        MAX_PHYSICAL_SETTLEMENT_MILLISECONDS,
+      ),
     }),
     planRegistry,
     recovery,
@@ -1869,6 +1901,34 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   const options = exactDataObject(args[0], TOP_LEVEL_OPTION_KEYS);
   const postgres = normalizePostgresOptions(options.postgres);
   const runtimeOptions = normalizeRuntimeOptions(options.runtime);
+  let operationalLeaseBudget;
+  try {
+    operationalLeaseBudget = callIntrinsic(
+      createOperationalLeaseBudgetIntrinsic,
+      undefined,
+      [
+        exactFrozenRecord({
+          databaseRequestMilliseconds:
+            runtimeOptions.operationalLease.databaseRequestMilliseconds,
+          imagePlanProviderSettlement:
+            runtimeOptions.launch.imagePlanProviderSettlement,
+          leaseDurationMilliseconds:
+            runtimeOptions.operationalLease.leaseDurationMilliseconds,
+          lifecycleBackendSettlement:
+            runtimeOptions.storage.lifecycleBackendSettlement,
+          publicationSettlement:
+            runtimeOptions.storage.publicationSettlement,
+          resolveRestoreDestinationSettlement:
+            runtimeOptions.storage.resolveRestoreDestinationSettlement,
+          safetyMarginMilliseconds:
+            runtimeOptions.operationalLease.safetyMarginMilliseconds,
+          supervisorSettlement: runtimeOptions.launch.supervisorSettlement,
+        }),
+      ],
+    );
+  } catch {
+    fail(OPTION_ERROR_CODE);
+  }
   let requestFatalShutdown = null;
   const handlePhysicalSettlementFatal = objectFreeze(
     function handlePhysicalSettlementFatal() {
@@ -2020,7 +2080,11 @@ export function createPostgresDetachedRestoreDeployment(...args) {
             runtimeOptions.launch.stoppedWriterCoordinator,
           supervisor: physicalBindings.supervisor,
         }),
-        planRegistry: runtimeOptions.planRegistry,
+        planRegistry: exactFrozenRecord({
+          operationalLeaseBudget,
+          provisioningFleetCapabilityGate:
+            runtimeOptions.planRegistry.provisioningFleetCapabilityGate,
+        }),
         pools: exactFrozenRecord({
           authority: runtimePools[0],
           foregroundLifecycle: runtimePools[2],

@@ -26,6 +26,7 @@ const SCENARIOS = Object.freeze([
   "all-pool-ends-attempted",
   "all-settlement-stops-start-before-await",
   "empty-password-blocks-ambient-fallback",
+  "exact-operational-lease-config-rejection",
   "exact-physical-config-rejection",
   "idle-pool-error-forces-terminal-shutdown",
   "image-plan-grace-breach-forces-fatal-shutdown",
@@ -34,11 +35,13 @@ const SCENARIOS = Object.freeze([
   "independent-deployments-use-distinct-probe-keys",
   "invalid-client-query-still-releases-and-cleans-up",
   "object-prototype-then-cannot-forge-driver-evidence",
+  "operational-lease-aggregate-overflow-rejection",
   "hostile-options",
   "hostile-topology-evidence-fails-closed",
   "stop-during-topology-never-reopens-ingress",
   "synchronous-connect-pool-error-uses-assigned-start-promise",
   "topology-failure-with-pool-close-failure",
+  "too-short-operational-lease-rejection",
   "verify-full-tls-configuration",
 ]);
 const MAX_OUTPUT_BYTES = 64 * 1024;

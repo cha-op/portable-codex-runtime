@@ -1881,11 +1881,64 @@ clock independently in its dispatch-claim transaction; the preceding generic
 reserve does not read that clock. `captureCreatedAt` and every derived ID stay
 stable if a long safety capture crosses that boundary, but expiry discovered
 after capture fails closed and does not authorize another stop or fresh
-capture. Phase B must supply an operational lease budget/deadline and explicit
-recovery policy rather than silently renewing through active capture state.
-Activation V2 creates the prepared launch under a new bounded lease; expiry
-before the launch claim also fails closed and never authorizes relaunch. The
-phase-B budget must cover long capture and activation windows.
+capture. Activation V2 creates the prepared launch under a new bounded lease;
+expiry before the launch claim also fails closed and never authorizes
+relaunch.
+
+The deployment-owned operational lease policy now binds those two independent
+database-clock windows without silently renewing through active physical work.
+The renewal-to-generation-claim window sums the returned-writer stop boundary,
+fresh checkpoint publication, and committed checkpoint verification. The last
+term remains necessary because a fresh publication ambiguity can fall through
+to source-free verification in the same admitted capture call. The activation-
+to-launch-claim window shares destination resolution, committed destination
+verification, and read-only attachment reconciliation. Its longest executable
+path is the retained prepared continuation: that path obtains the fresh
+dispatch grant, performs the guarded attach, resolves and inspects a new image
+reservation, and reinspects it before the launch claim. Because every boundary
+has a positive duration, this path strictly subsumes the shorter fresh and
+retained-starting/uncertain branches without an additional branch maximum.
+Each physical term is its complete result deadline plus settlement grace. The
+window also includes the deployment's explicit aggregate database-request
+allowance and a positive safety margin. Because renewal and activation mint
+separate leases from separate PostgreSQL clock observations, the minimum
+accepted duration is the maximum of the two complete windows, not their sum.
+
+All arithmetic is checked and the derived minimum must fit the authority's
+24-hour lease ceiling. The configured duration may exceed that minimum, but a
+stable plan is admitted only when its already-hashed
+`leaseDurationMilliseconds` exactly equals the deployment value. Provisioning
+checks before its fleet gate or registry write, and every read-only resolution
+checks the rehydrated authentic plan again before foreground physical work.
+The database allowance is an operator-declared aggregate latency bound, not a
+reinterpretation of one connection, query, statement, or lock timeout. The
+runtime does not use it as mutation authority: the generation and launch claim
+transactions still read the PostgreSQL clock after their locks and reject an
+expired lease. Underestimating database time therefore fails progress closed;
+it cannot authorize a second stop, publication, attachment, image dispatch, or
+launch.
+
+The fresh activation claim entry point repeats the exact-duration check before
+it acquires the operation guard or asks PostgreSQL for the dispatch grant. A
+retained activation or writer-launch recovery record is deliberately different:
+it is settling an ambiguity created under an earlier grant, not admitting a new
+critical path. Retained starting or uncertain activation has no local
+attachment-dispatch grant and may only verify or reconcile. A retained prepared
+activation is different: its durable request retains the original duration, so
+the fresh claim entry point rechecks that duration before it can mint the one
+local grant covered by the prepared-continuation branch above. Prepared launch
+recovery may only cancel after database-confirmed expiry, while starting or
+uncertain launch recovery may only reconcile the existing supervisor outcome.
+Those launch recovery paths therefore do not compare an old durable record with
+the current deployment policy, do not infer an original duration from
+`expiresAt - authorityNow`, and never regain a physical launch grant.
+
+Settlement grace remains a failure-drain window, not a late-success window.
+Including it in the lease budget makes the configured bound cover observation
+of the original physical Promise through its terminal settlement or fatal
+no-settlement boundary when the database allowance holds. It does not prove
+physical quiescence, extend a lease, permit retry, or replace a storage or
+writer fence.
 
 The production-neutral phase-B assembly foundation now constructs one
 capture-only backend, standalone foreground facade, idle scheduler, and narrow
@@ -2069,8 +2122,8 @@ error. This distinction applies only after the factory returned a deployment;
 construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
-Deployment must next admit an explicit operational lease budget across the
-bounded critical path and complete the assembled restart/ambiguous-outcome/
+Deployment now admits the explicit operational lease budget across the bounded
+critical path. It must next complete the assembled restart/ambiguous-outcome/
 deadline matrix before constructing the final public backend or enabling the
 production entry point.
 A database row, published directory, restore journal record, checkpoint
@@ -2192,8 +2245,8 @@ migration/admission/drain controller, explicit PostgreSQL pool-owning
 deployment, and deployment-owned image-plan binding now exist. The physical-
 collaborator settlement foundation and the complete assembled image,
 supervisor, storage-lifecycle, publication, and restore-destination resolver
-binding graph also exist. The next integration slices must admit the
-operational lease budget, cover whole-graph restart/ambiguity/deadline cases,
-and wire the final adapter before production `runRestore()` can open.
+binding graph and operational lease admission also exist. The next integration
+slices must cover whole-graph restart/ambiguity/deadline cases and wire the
+final adapter before production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

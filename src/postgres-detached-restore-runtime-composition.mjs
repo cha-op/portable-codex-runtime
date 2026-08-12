@@ -10,6 +10,9 @@ import {
   isPostgresDetachedRestoreImagePlanBinding,
 } from "./postgres-detached-restore-image-plan-binding.mjs";
 import {
+  isPostgresDetachedRestoreOperationalLeaseBudget,
+} from "./postgres-detached-restore-operational-lease-budget.mjs";
+import {
   isPostgresDetachedRestorePublicationBinding,
 } from "./postgres-detached-restore-physical-bindings.mjs";
 import {
@@ -173,6 +176,7 @@ const LAUNCH_OPTION_KEYS = objectFreeze([
 ]);
 const FOREGROUND_OPTION_KEYS = objectFreeze(["fleetCapabilityGate"]);
 const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
+  "operationalLeaseBudget",
   "provisioningFleetCapabilityGate",
 ]);
 const RECOVERY_OPTION_KEYS = objectFreeze([
@@ -691,6 +695,11 @@ function createRecoveryService(authority, coordinator, launcher) {
 }
 
 function assemble(options) {
+  ensure(
+    isPostgresDetachedRestoreOperationalLeaseBudget(
+      options.planRegistry.operationalLeaseBudget,
+    ),
+  );
   preflightDistinctPools(options.pools);
   preflightLifecycleBackend(options.storage.lifecycleBackend);
   ensure(
@@ -714,6 +723,7 @@ function assemble(options) {
   const stablePlanRegistry = callFactory(
     createDetachedRestoreStablePlanRegistryIntrinsic,
     exactFrozenRecord({
+      operationalLeaseBudget: options.planRegistry.operationalLeaseBudget,
       provisioningFleetCapabilityGate:
         options.planRegistry.provisioningFleetCapabilityGate,
       store,
@@ -815,6 +825,7 @@ function assemble(options) {
     exactFrozenRecord({
       authority: createRestoreActivationAuthority(authority),
       operationGuard,
+      operationalLeaseBudget: options.planRegistry.operationalLeaseBudget,
       publication: options.storage.publication,
       resolveRestoreDestination: options.storage.resolveRestoreDestination,
       storageBackend: backend,

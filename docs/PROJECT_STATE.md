@@ -390,8 +390,10 @@
   PostgreSQL schema remain unchanged.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires operational lease admission, full assembled restart/ambiguous-
-  outcome/deadline validation, and the final public adapter route.
+  requires full assembled restart/ambiguous-outcome/deadline validation and
+  the final public adapter route. Operational lease admission is now enforced
+  at stable-plan provision and every resolution from one deployment-owned
+  policy derived from the two database-clock critical windows.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -507,6 +509,8 @@
   settlement policy for provider resolution and inspection. The same owner now
   binds every assembled supervisor, storage-lifecycle, publication, and
   restore-destination resolver Promise into the common settlement lifecycle.
-  Production still requires operational lease admission, whole-graph fail-
-  closed validation, and final public-adapter assembly before `runRestore()` may
-  be enabled.
+  The deployment now also derives and admits one exact operational lease
+  policy across the two database-clock windows, including physical deadline/
+  grace bounds, an aggregate database allowance, and a safety margin.
+  Production still requires whole-graph fail-closed validation and final
+  public-adapter assembly before `runRestore()` may be enabled.

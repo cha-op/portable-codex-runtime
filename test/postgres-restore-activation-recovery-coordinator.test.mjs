@@ -19,6 +19,9 @@ import {
 } from "../src/filesystem-operation-journal.mjs";
 import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
 import {
+  createPostgresDetachedRestoreOperationalLeaseBudget,
+} from "../src/postgres-detached-restore-operational-lease-budget.mjs";
+import {
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -1775,6 +1778,27 @@ function physicalPolicies(methods) {
   );
 }
 
+function createTestOperationalLeaseBudget() {
+  return createPostgresDetachedRestoreOperationalLeaseBudget({
+    databaseRequestMilliseconds: 30_000,
+    imagePlanProviderSettlement: physicalPolicies([
+      "inspectCodex",
+      "resolveImagePlan",
+    ]),
+    leaseDurationMilliseconds: 600_000,
+    lifecycleBackendSettlement: physicalPolicies(
+      PHYSICAL_LIFECYCLE_METHODS,
+    ),
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    safetyMarginMilliseconds: 30_000,
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  });
+}
+
 function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
   const unexpected = async function unexpectedPhysicalProvider() {
     throw new Error("unrelated physical provider must not run");
@@ -1815,6 +1839,7 @@ function createCoordinator(
   const coordinator = createPostgresRestoreActivationRecoveryCoordinator({
     authority,
     operationGuard: new PostgresOperationGuard({ dedicatedPool: guardPool }),
+    operationalLeaseBudget: createTestOperationalLeaseBudget(),
     publication,
     resolveRestoreDestination: async (input) => {
       destinations.push(input);
@@ -2493,6 +2518,42 @@ test("rejects a conflicting committed generation readback after lost finalizatio
   assert.equal(finalizeCalls, 1);
   assert.deepEqual(storage.providerCalls, []);
   assert.deepEqual(storage.forbiddenCalls, []);
+  assert.deepEqual(fixture.transitionGuard.calls, []);
+});
+
+test("a short fresh activation lease fails before claim or physical work", async (t) => {
+  const fixture = await createPublishedRestoreFixture(t);
+  const authority = authorityHarness({});
+  const storage = storageBackendHarness(
+    async () => assert.fail("a short lease must not prepare"),
+    {
+      reconcile: async () =>
+        assert.fail("a short lease must not reconcile"),
+    },
+  );
+  const guardPool = new GuardPool();
+  const { coordinator, destinations } = createCoordinator(
+    fixture,
+    authority.authority,
+    storage,
+    guardPool,
+  );
+  const base = structuredClone(activationClaimBase(fixture));
+  base.request.leaseDurationMilliseconds = 599_999;
+
+  await assert.rejects(
+    coordinator.claimAndReconcileRestoreAttachmentActivation(base),
+    assertCoordinatorCode(
+      "postgres_restore_activation_recovery_coordinator_outcome_uncertain",
+    ),
+  );
+
+  assert.equal(guardPool.connectCalls, 0);
+  assert.deepEqual(authority.calls, []);
+  assert.deepEqual(destinations, []);
+  assert.deepEqual(storage.reconciliationCalls, []);
+  assert.deepEqual(storage.prepareCalls, []);
+  assert.deepEqual(storage.providerCalls, []);
   assert.deepEqual(fixture.transitionGuard.calls, []);
 });
 
