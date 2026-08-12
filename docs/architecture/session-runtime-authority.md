@@ -68,8 +68,10 @@ pointer. Both paths retain local writer exclusion until exact capture success.
 Detached-destination activation can now materialize an executable prepared
 launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
-bounded recovery scheduler. Production `runRestore()` integration still
-requires the invocation-time detached-production gate and adapter wiring.
+bounded recovery scheduler. The invocation-time detached-production gate and
+durable read-only stable-plan lookup now exist, but production `runRestore()`
+integration still requires the remaining deployment bindings and adapter
+wiring.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -886,8 +888,9 @@ identities rather than session-volume data:
 - `operation_id_registry` permanently assigns every operation ID to exactly
   one session and claim provenance before any external effect;
 - a registry claim is a materialized `direct-operation`, a restore or
-  activation launch intent owned by its claimant operation, or a V3 capture
-  intent owned by its writer-stop operation;
+  activation launch intent owned by its claimant operation, a V3 capture
+  intent owned by its writer-stop operation, or an immutable detached-restore
+  stable-plan claim owned directly by its restore operation identity;
 - reusing an operation ID with a different session, claim type, claimant,
   binding, kind, or request fails closed;
 - an active reservation is unique for the operation and session conflict
@@ -909,7 +912,7 @@ database migration cannot silently invent a new lifecycle.
 
 `session_authority.operation_id_registry` is the one global namespace shared
 by every direct operation, pre-publication restore/activation launch intent,
-and pre-stop V3 capture intent.
+pre-stop V3 capture intent, and detached-restore stable plan.
 Its relational fields retain the operation ID, session ID, `claim_type`,
 optional `claimant_operation_id`, `claimed_at`, and optional
 `materialized_at`. A direct claim has no separate `binding`; intent claims
@@ -921,7 +924,9 @@ A V3 writer-stop claim is created in the stop dispatch transaction before
 physical stop and remains unmaterialized until the atomic stop finalizer
 creates the matching capture operation. The primary key prevents cross-type
 ID reuse, and same-session claimant relations prevent an intent from escaping
-its owning operation. Registry rows are never deleted or released.
+its owning operation. A stable-plan claim has no claimant operation and remains
+unmaterialized until the matching version 1 restore-generation reservation
+creates that operation. Registry rows are never deleted or released.
 
 Writer acquisition, renewal, release, force-fence, blocked finalization, and
 checkpoint capture use those existing structures without DDL. The canonical
@@ -990,6 +995,42 @@ claim-free exception is exact pre-dispatch cancellation. A claimed
 its committed claimant stop, and the byte-equivalent capture request all
 agree. These triggers constrain old or direct SQL writers as well as the
 runtime finalizer.
+
+Migration version 7 adds
+`session_authority.detached_restore_stable_plans` and the
+`detached-restore-stable-plan-v1` operation-ID claim type. The immutable row
+stores the exact clean-checkpoint admission, the nine canonical plan inputs,
+the recomputed plan and binding digests, and the database provisioning time.
+The claim and row share the restore operation ID and session ID; relational
+checks bind the backend, destination storage, request identity, contract
+version, digests, and timestamp. Updates are rejected. A deferred delete
+constraint rejects any commit that removes the plan while its permanent stable-
+plan claim remains, so an ordinary delete cannot strand an unrepairable
+preclaim; complete authority teardown must remove the plan and claim in one
+transaction. The stable claim is likewise immutable except for its single
+`materialized_at: null -> timestamp` transition; a deferred reverse check
+requires that transition's exact version 1 operation to exist by commit. The
+shared operation-ID namespace prevents the same ID from being
+reused by a different session, plan, or authority operation. The first
+matching restore-generation reservation atomically materializes that exact
+claim and creates the prepared operation; a mismatched admission cannot adopt
+the reserved identity. Before that prepared operation may grant generation
+dispatch, the caller must present the complete rehydrated stable plan. The
+authority rechecks its `planSha256` against the permanent claim and requires
+the plan's generation and destination-isolation identities to equal the typed
+claim input.
+
+`createPostgresDetachedRestoreStablePlanRegistry()` exposes two deliberately
+different boundaries. `provisionStablePlan({admission, plan})` first requires
+its separate deployment capability, then atomically inserts the claim and plan
+or accepts canonically identical durable replay. A crossed identity fails
+closed; a commit whose acknowledgement is lost returns success only when
+exact durable readback proves the inserted plan, and otherwise reports an
+uncertain outcome.
+`resolveStablePlan({admission, expectedSession})` performs only serializable
+reads, checks the canonical session and every stored identity/digest, and
+rehydrates the authentic in-process plan from its canonical inputs. It never
+provisions, repairs, updates, or materializes a missing plan.
 
 These constraints are necessary but not sufficient authority. The typed
 restore-generation layer now retains the backend's exact
@@ -1803,9 +1844,10 @@ recovery-exclusive lifecycle pools. This protects callback-bound lock lifetime
 from a max-one-pool self-deadlock; it proves pool-object separation, not DSN,
 capacity, or primary identity.
 
-This is a foreground composition seam, not a new monolithic saga journal. The
-caller must durably retain the exact plan and resubmit it on retry. Each typed
-authority remains the source of truth for its own subordinate phase. A lost
+This is a foreground composition seam, not a new monolithic saga journal. Its
+resolver must return the exact durable plan on retry; the assembled runtime
+binds that resolver privately to the PostgreSQL registry. Each typed authority
+remains the source of truth for its own subordinate phase. A lost
 database-finalization acknowledgement may replay exact readback/finalization,
 but a stop, capture publication, generation publication, detach, provider
 activation, or launch that may have crossed its dispatch boundary never gains
@@ -1833,24 +1875,26 @@ phase-B budget must cover long capture and activation windows.
 
 The production-neutral phase-B assembly foundation now constructs one
 capture-only backend, standalone foreground facade, idle scheduler, and narrow
-writer-launch facet from one internally consistent authority graph and four
-pairwise-distinct borrowed pool objects. The facet exposes only `runLaunch()`
-and `reconcileLaunchAttempt()` through receiver-preserving wrappers bound to
-the same internal logical launcher. A successful same-process start therefore
-registers the opaque writer handle that the capture backend later resolves;
-another launcher or a durable committed-started row cannot reconstruct that
-handle. Stop, retire, prepared-launch, handle-resolution, and internal map
-capabilities remain private.
+writer-launch and stable-plan-provisioning facets from one internally
+consistent authority graph and four pairwise-distinct borrowed pool objects.
+The launch facet exposes only `runLaunch()` and `reconcileLaunchAttempt()`
+through receiver-preserving wrappers bound to the same internal logical
+launcher. The frozen null-prototype provisioning facet exposes only
+`provisionStablePlan()` from the registry built on that same internal store;
+its receiver-preserving `resolveStablePlan()` wrapper remains private to the
+foreground facade. A successful same-process start therefore registers the
+opaque writer handle that the capture backend later resolves; another launcher
+or a durable committed-started row cannot reconstruct that handle. Stop,
+retire, prepared-launch, handle-resolution, read-only plan resolution, and
+internal map capabilities remain private.
 
 The assembly still does not migrate the store, own scheduler or pool
 lifecycle, resolve deployment configuration, inject foreground restore into
 the backend, or construct the final public restore-capable backend. The
 production checkpoint adapter therefore still rejects restore through its
 fixed fail-closed `runRestore()` implementation. Deployment assembly must next
-supply a durable plan registry whose provisioning is separately gated and
-whose foreground resolver is read-only, then the remaining provider/bootstrap
-bindings and complete assembled ambiguous-outcome matrix before enabling that
-entry point.
+supply the remaining provider/bootstrap bindings and complete assembled
+ambiguous-outcome matrix before enabling that entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -1958,10 +2002,10 @@ preclaim before stop, atomic committed-stop-to-prepared-capture handoff,
 prepared-only fresh dispatch, source-free active recovery, no second
 publication after ambiguity, and retained local identity until the exact
 predetermined committed result. The invocation-time gate, production-neutral
-object graph, and same-launcher writer-start ingress now exist. The next
-integration slices must add the gated-provision/read-only-resolver durable plan
-registry, remaining deployment-owned bindings, whole-graph restart/ambiguity
-validation, and final adapter wiring before production `runRestore()` can
-open.
+object graph, same-launcher writer-start ingress, separately gated durable plan
+provisioning, restart readback, and private read-only resolver now exist. The
+next integration slices must add the remaining deployment-owned bindings,
+whole-graph restart/ambiguity validation, and final adapter wiring before
+production `runRestore()` can open.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

@@ -37,6 +37,7 @@ import {
   assertCheckpointCaptureReconciliationBackend,
   assertCheckpointDescriptor,
   assertPreparedCheckpointCaptureBackend,
+  assertRestoreCheckpointAdmission,
   assertStorageMutationRequest,
   assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
@@ -97,7 +98,6 @@ const OPTION_KEYS = objectFreeze([
   "restoreActivationCoordinator",
   "writerDetach",
 ]);
-const ADMISSION_KEYS = objectFreeze(["checkpoint", "request"]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 const AUTHORITY_METHODS = objectFreeze([
   "claimRestoreAttachmentActivationDispatch",
@@ -1009,26 +1009,15 @@ function sameData(left, right, code) {
 }
 
 function normalizeAdmission(value, code) {
-  const input = exactDataObject(value, ADMISSION_KEYS, code);
-  let checkpoint;
-  let request;
   try {
-    checkpoint = assertCheckpointDescriptor(input.checkpoint);
-    request = assertStorageMutationRequest(input.request);
+    const admission = assertRestoreCheckpointAdmission(value);
+    return exactFrozenRecord({
+      checkpoint: admission.checkpoint,
+      request: admission.request,
+    });
   } catch {
     fail(code);
   }
-  ensure(
-    checkpoint.checkpointClass === "clean" &&
-      request.operation === "restore" &&
-      request.sessionId === checkpoint.sessionId &&
-      request.backendId === checkpoint.backendId &&
-      request.target.kind === "checkpoint" &&
-      request.target.checkpointId === checkpoint.checkpointId &&
-      request.target.artifactId === checkpoint.artifactId,
-    code,
-  );
-  return exactFrozenRecord({ checkpoint, request });
 }
 
 function captureSafetyTuple(plan, session, admission, code) {
@@ -1966,6 +1955,7 @@ async function runGeneration(
           destinationIsolationProofId: plan.destinationIsolationProofId,
           expectedOperationRevision: "0",
           generationId: plan.generationId,
+          stablePlan: plan,
         });
         const claimSettlement = await invokeForRead(
           bindings.authority,

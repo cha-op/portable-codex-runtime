@@ -298,10 +298,12 @@
   capture-attempt identities.
 - The foreground order is renewal-before-stop, V3 stop/prepared capture,
   generation V1 publication, exact release or force-fence detach with no mode
-  fallback, activation V2, and prepared launch. The caller must persist and
-  resubmit the same plan; the facade does not add an autonomous cross-stage
-  saga. The plan's source checkpoint artefact path is distinct from the fresh
-  safety-capture path selected by the capture backend from derived IDs.
+  fallback, activation V2, and prepared launch. The standalone facade still
+  depends on an exact stable resolver, while the assembled runtime now obtains
+  that plan from its private durable read-only registry binding; neither adds
+  an autonomous cross-stage saga. The plan's source checkpoint artefact path
+  is distinct from the fresh safety-capture path selected by the capture
+  backend from derived IDs.
 - The facade requires its nested per-operation guard pool to be distinct from
   both lifecycle pools before any connection is acquired. This prevents a
   max-one foreground lifecycle pool from self-deadlocking while its shared
@@ -318,9 +320,25 @@
   opaque handle. Stop, retire, prepared-launch, handle-resolution, and internal
   launcher maps remain private; a committed row alone still cannot recover a
   cold handle.
+- Migration 7 and the detached-restore stable-plan registry now durably bind
+  one canonical admission and plan to the restore operation ID. Provisioning
+  is separately fleet-gated and supports only immutable insert or exact
+  replay; crossed identity fails closed and commit-acknowledgement loss is
+  accepted only when exact durable readback proves the inserted plan.
+  Resolution is read-only, checks the expected canonical session, and
+  rehydrates the authentic plan capability without creating or repairing
+  state. Generation dispatch revalidates that complete plan against the
+  permanent claim digest and its exact generation and destination-isolation
+  identities before it can grant publication authority.
+- The production-neutral runtime constructs that registry from the same
+  internal serializable store, exposes only the receiver-preserving
+  `stablePlanProvisioning.provisionStablePlan()` wrapper, and passes the
+  private receiver-preserving resolver to foreground execution. External
+  callers cannot replace the foreground resolver or obtain it from the runtime
+  surface.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires deployment-owned stable-plan/provider/bootstrap bindings, full
+  requires the remaining deployment-owned provider/bootstrap bindings, full
   assembled restart and ambiguous-outcome validation, and the final public
   adapter route.
   No published path, generation row, serialized measurement, attempt record,
@@ -331,6 +349,8 @@
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Detached-restore stable-plan registry:
+  `docs/project_journal/2026/08/2026-08-11-detached-restore-stable-plan-registry-8e4c21.md`
 - Auth refresh authority spike:
   `docs/project_journal/2026/07/2026-07-01-auth-refresh-authority-8b2e41.md`
 - Interrupted-turn recovery spike:
@@ -417,7 +437,8 @@
   now exist, the stop-to-prepared-capture handoff is durable, and the cross-
   process lifecycle guard, scheduler, stable root plan, invocation-time fleet
   gate, foreground composition seam, production-neutral runtime assembly, and
-  same-launcher writer-start ingress are implemented. Production still
-  requires a durable stable-plan registry, the remaining deployment-owned
-  bindings, final public-adapter assembly, and end-to-end fail-closed
-  validation before `runRestore()` may be enabled.
+  same-launcher writer-start ingress are implemented. The durable stable-plan
+  registry, separately gated provisioning surface, and private read-only
+  foreground resolver are now implemented as well. Production still requires
+  the remaining deployment-owned bindings, final public-adapter assembly, and
+  end-to-end fail-closed validation before `runRestore()` may be enabled.

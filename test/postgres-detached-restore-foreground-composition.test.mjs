@@ -796,6 +796,8 @@ function facadeFixture({
     },
     resolveStablePlan({ admission: observed }) {
       trace.push("plan-resolve");
+      assert.equal(Object.getPrototypeOf(observed), null);
+      assert.equal(Object.isFrozen(observed), true);
       assert.equal(observed.request.operationId, admission().request.operationId);
       return plan;
     },
@@ -1182,6 +1184,7 @@ function happyFacadeFixture({
     },
     async claimRestoreDestinationGenerationDispatch(input) {
       events.push("generation-claim");
+      assert.strictEqual(input.stablePlan, plan);
       if (generationClaimAckLoss === "missing") {
         throw new Error("generation claim acknowledgement lost before commit");
       }
@@ -2088,6 +2091,47 @@ test("factory returns an exact branded frozen V3 facade", () => {
     ),
     false,
   );
+});
+
+test("shared restore admission rejects malformed or crossed identities before effects", async (t) => {
+  const cases = [
+    ["extra admission field", { ...admission(), extra: true }],
+    [
+      "non-clean checkpoint",
+      deepFreeze({
+        ...admission(),
+        checkpoint: { ...admission().checkpoint, checkpointClass: "crash" },
+      }),
+    ],
+    [
+      "crossed session identity",
+      deepFreeze({
+        ...admission(),
+        request: {
+          ...admission().request,
+          sessionId: "019f7f40-0000-7000-8000-000000000099",
+        },
+      }),
+    ],
+  ];
+
+  for (const [name, invalidAdmission] of cases) {
+    await t.test(name, async () => {
+      const { calls, facade, guardQueries, trace } = facadeFixture({
+        gate: () => null,
+      });
+      await rejectsWithCode(
+        facade.runRestore(
+          invalidAdmission,
+          async () => assert.fail("invalid admission must not publish"),
+        ),
+        "invalid_postgres_detached_restore_foreground_composition_request",
+      );
+      assert.deepEqual(calls, { gate: 0, renew: 0, stop: 0 });
+      assert.deepEqual(trace, []);
+      assert.deepEqual(guardQueries, []);
+    });
+  }
 });
 
 test("factory rejects a proxy in a collaborator prototype chain without traps", () => {

@@ -7,6 +7,9 @@ import {
   createPostgresDetachedRestoreForegroundComposition,
 } from "./postgres-detached-restore-foreground-composition.mjs";
 import {
+  createPostgresDetachedRestoreStablePlanRegistry,
+} from "./postgres-detached-restore-stable-plan-registry.mjs";
+import {
   createPostgresDurableStopCaptureComposition,
 } from "./postgres-durable-stop-capture-composition.mjs";
 import {
@@ -72,6 +75,8 @@ const createCheckpointMutationAuthorityIntrinsic =
   createPostgresCheckpointMutationAuthority;
 const createDetachedRestoreForegroundIntrinsic =
   createPostgresDetachedRestoreForegroundComposition;
+const createDetachedRestoreStablePlanRegistryIntrinsic =
+  createPostgresDetachedRestoreStablePlanRegistry;
 const createDurableStopCaptureIntrinsic =
   createPostgresDurableStopCaptureComposition;
 const createLogicalWriterLauncherIntrinsic =
@@ -122,6 +127,7 @@ const TOP_LEVEL_OPTION_KEYS = objectFreeze([
   "authority",
   "foreground",
   "launch",
+  "planRegistry",
   "pools",
   "recovery",
   "storage",
@@ -153,9 +159,9 @@ const LAUNCH_OPTION_KEYS = objectFreeze([
   "stoppedWriterCoordinator",
   "supervisor",
 ]);
-const FOREGROUND_OPTION_KEYS = objectFreeze([
-  "fleetCapabilityGate",
-  "resolveStablePlan",
+const FOREGROUND_OPTION_KEYS = objectFreeze(["fleetCapabilityGate"]);
+const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
+  "provisioningFleetCapabilityGate",
 ]);
 const RECOVERY_OPTION_KEYS = objectFreeze([
   "intervalMilliseconds",
@@ -476,6 +482,10 @@ function normalizeOptions(args) {
     authority: exactDataObject(options.authority, AUTHORITY_OPTION_KEYS),
     foreground: exactDataObject(options.foreground, FOREGROUND_OPTION_KEYS),
     launch: exactDataObject(options.launch, LAUNCH_OPTION_KEYS),
+    planRegistry: exactDataObject(
+      options.planRegistry,
+      PLAN_REGISTRY_OPTION_KEYS,
+    ),
     pools: exactDataObject(options.pools, POOL_OPTION_KEYS),
     recovery: exactDataObject(options.recovery, RECOVERY_OPTION_KEYS),
     storage: exactDataObject(options.storage, STORAGE_OPTION_KEYS),
@@ -648,6 +658,24 @@ function assemble(options) {
       maxTransactionAttempts: options.authority.maxTransactionAttempts,
     }),
   );
+  const stablePlanRegistry = callFactory(
+    createDetachedRestoreStablePlanRegistryIntrinsic,
+    exactFrozenRecord({
+      provisioningFleetCapabilityGate:
+        options.planRegistry.provisioningFleetCapabilityGate,
+      store,
+    }),
+  );
+  const resolveStablePlan = receiverCallback(
+    ownFrozenDataFunction(stablePlanRegistry, "resolveStablePlan"),
+    stablePlanRegistry,
+  );
+  const stablePlanProvisioning = exactFrozenRecord({
+    provisionStablePlan: receiverCallback(
+      ownFrozenDataFunction(stablePlanRegistry, "provisionStablePlan"),
+      stablePlanRegistry,
+    ),
+  });
   const authority = construct(
     PostgresSessionAuthorityConstructor,
     exactFrozenRecord({
@@ -750,7 +778,7 @@ function assemble(options) {
       lifecycleGuard,
       operationGuard,
       prepareImageReservation: options.launch.prepareImageReservation,
-      resolveStablePlan: options.foreground.resolveStablePlan,
+      resolveStablePlan,
       restoreActivationCoordinator,
       writerDetach,
     }),
@@ -788,6 +816,7 @@ function assemble(options) {
     backend,
     foreground,
     scheduler,
+    stablePlanProvisioning,
     writerLaunch,
   });
   weakSetAdd(runtimeCompositions, runtime);

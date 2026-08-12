@@ -355,6 +355,21 @@ authority still mint the formal stop-operation and capture-attempt identities.
 The source checkpoint paths are not the fresh safety-capture paths: the
 capture backend resolves the latter from the derived capture identities.
 
+Migration 7 adds an immutable PostgreSQL stable-plan registry. Provisioning is
+a separately gated insert-or-exact-replay operation that permanently claims
+the restore operation ID in the shared operation-ID namespace before storing
+the canonical admission and plan inputs. A crossed session, request, or plan
+identity fails closed; a lost commit acknowledgement is reported as uncertain
+until exact durable readback proves the inserted plan, in which case the
+provisioning call returns that reconstructed plan. Resolution accepts the
+expected canonical session, performs read-only exact-identity verification,
+and rehydrates the authentic in-process plan capability without creating or
+repairing a row. When the reserved restore operation reaches generation
+dispatch, the authority revalidates that complete rehydrated plan against the
+permanent claim's `planSha256` and requires its generation and destination-
+isolation identities to match the typed claim before publication authority can
+be granted.
+
 Each facade invocation first distinguishes fresh work from an exact typed
 durable continuation. Fresh work must pass the default-deny detached-production
 fleet gate; an already-materialized V3 stop-to-capture handoff or later typed
@@ -364,8 +379,10 @@ lifecycle lease spans:
 lease renewal before stop, V3 stop-to-prepared-capture, version 1 target-
 generation publication, canonical release or force-fence detach without
 fallback, activation version 2, and prepared launch. Exact retries reuse the
-same caller-persisted plan and durable subordinate identities; there is no
-autonomous cross-stage saga that guesses progress after restart.
+same persisted plan and durable subordinate identities; the standalone facade
+accepts that resolver as a collaborator, while the assembled runtime binds its
+private resolver to the PostgreSQL registry. There is no autonomous
+cross-stage saga that guesses progress after restart.
 
 The configured lease duration must cover both database-clock claim windows:
 the safety-capture-to-generation boundary and the activation-to-launch
@@ -377,15 +394,19 @@ must supply the deployment-owned bindings and final public backend, then add
 end-to-end ambiguous-outcome coverage before enabling that entry point. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
-facet from one internally consistent graph and four caller-owned pool objects
-that must be pairwise distinct. The facet exposes only `runLaunch()` and
+facet plus a narrow `stablePlanProvisioning` facet from one internally
+consistent graph and four caller-owned pool objects that must be pairwise
+distinct. The launch facet exposes only `runLaunch()` and
 `reconcileLaunchAttempt()` from the same process-local logical launcher used by
-the backend and foreground composition. This makes the original opaque writer
-handle reachable by later stop/capture without making a committed database row
-or another launcher authoritative. The factory does not migrate, start, stop,
-or close pools, replace the capture-only backend's fixed restore route, or wire
-foreground restore into the production adapter. The exclusive scheduler
-continues bounded no-relaunch recovery.
+the backend and foreground composition. The provisioning facet exposes only
+`provisionStablePlan()`; the same internally constructed registry's
+receiver-preserving read-only resolver is private to foreground execution.
+This makes the original opaque writer handle reachable by later stop/capture
+without making a committed database row or another launcher authoritative.
+The factory does not migrate, start, stop, or close pools, replace the
+capture-only backend's fixed restore route, or wire foreground restore into
+the production adapter. The exclusive scheduler continues bounded
+no-relaunch recovery.
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
 work; neither a database lease nor a higher epoch is a physical writer fence.
@@ -560,7 +581,9 @@ publication or committed-only verification without changing the legacy version
 2 callback. The database-global shared/exclusive lifecycle guard, bounded
 recovery scheduler, invocation-time detached-production gate, foreground
 composition, production-neutral runtime assembly, and same-launcher writer-
-start ingress are now complete.
+start ingress are now complete. The durable stable-plan registry, separately
+gated provisioning facet, and private read-only foreground resolver are also
+complete.
 Production restore remains fail-closed until later slices supply deployment-
 owned bindings, assembled restart/ambiguity validation, and final adapter
 wiring. Filesystem-image execution and differential backup remain later work.

@@ -13,6 +13,9 @@ import {
   isPostgresDetachedRestoreRuntimeComposition,
 } from "../src/postgres-detached-restore-runtime-composition.mjs";
 import {
+  PostgresDetachedRestoreStablePlanRegistryError,
+} from "../src/postgres-detached-restore-stable-plan-registry.mjs";
+import {
   PostgresRestoreRecoverySchedulerError,
   isPostgresRestoreRecoveryScheduler,
 } from "../src/postgres-restore-recovery-scheduler.mjs";
@@ -148,6 +151,17 @@ function launcherRequestError(error) {
   return true;
 }
 
+function stablePlanRegistryRequestError(error) {
+  assert(error instanceof PostgresDetachedRestoreStablePlanRegistryError);
+  assert.equal(
+    error.code,
+    "invalid_postgres_detached_restore_stable_plan_registry_request",
+  );
+  assert.equal(error.retryable, false);
+  assert.equal(Object.isFrozen(error), true);
+  return true;
+}
+
 function createLifecycleBackend(calls) {
   const invoke = async function invokeProvider() {
     calls.provider += 1;
@@ -235,7 +249,7 @@ function createRuntimeFixture() {
     fleetGate: 0,
     image: 0,
     onStep: 0,
-    plan: 0,
+    planProvisioningGate: 0,
     provider: 0,
     publication: 0,
     storageResolver: 0,
@@ -276,10 +290,6 @@ function createRuntimeFixture() {
         calls.fleetGate += 1;
         throw new Error("foreground fleet gate must not run");
       },
-      resolveStablePlan() {
-        calls.plan += 1;
-        throw new Error("foreground stable plan resolver must not run");
-      },
     },
     launch: {
       imageReservations,
@@ -291,6 +301,12 @@ function createRuntimeFixture() {
       supervisor,
     },
     pools,
+    planRegistry: {
+      provisioningFleetCapabilityGate() {
+        calls.planProvisioningGate += 1;
+        throw new Error("stable-plan provisioning gate must not run");
+      },
+    },
     recovery: {
       intervalMilliseconds: 60_000,
       limits: {
@@ -344,7 +360,7 @@ function assertNoActivity(fixture) {
     fleetGate: 0,
     image: 0,
     onStep: 0,
-    plan: 0,
+    planProvisioningGate: 0,
     provider: 0,
     publication: 0,
     storageResolver: 0,
@@ -393,10 +409,11 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     fixture.options,
   );
 
-  exactKeys(runtime, [
+  assert.deepEqual(Reflect.ownKeys(runtime), [
     "backend",
     "foreground",
     "scheduler",
+    "stablePlanProvisioning",
     "writerLaunch",
   ]);
   assert.equal(Object.isFrozen(runtime), true);
@@ -407,6 +424,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
         backend: runtime.backend,
         foreground: runtime.foreground,
         scheduler: runtime.scheduler,
+        stablePlanProvisioning: runtime.stablePlanProvisioning,
         writerLaunch: runtime.writerLaunch,
       }),
     ),
@@ -448,6 +466,33 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   exactKeys(runtime.scheduler, ["runStep", "start", "stop"]);
   assert.equal(Object.isFrozen(runtime.scheduler), true);
 
+  exactKeys(runtime.stablePlanProvisioning, ["provisionStablePlan"]);
+  assert.equal(Object.getPrototypeOf(runtime.stablePlanProvisioning), null);
+  assert.equal(Object.isFrozen(runtime.stablePlanProvisioning), true);
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptor(
+      runtime.stablePlanProvisioning,
+      "provisionStablePlan",
+    ),
+    {
+      configurable: false,
+      enumerable: true,
+      value: runtime.stablePlanProvisioning.provisionStablePlan,
+      writable: false,
+    },
+  );
+  assert.equal(
+    typeof runtime.stablePlanProvisioning.provisionStablePlan,
+    "function",
+  );
+  assert.equal(
+    Object.isFrozen(runtime.stablePlanProvisioning.provisionStablePlan),
+    true,
+  );
+  for (const name of ["resolveStablePlan", "store"]) {
+    assert.equal(name in runtime.stablePlanProvisioning, false);
+  }
+
   exactKeys(runtime.writerLaunch, ["reconcileLaunchAttempt", "runLaunch"]);
   assert.equal(Object.getPrototypeOf(runtime.writerLaunch), null);
   assert.equal(Object.isFrozen(runtime.writerLaunch), true);
@@ -488,7 +533,7 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   assertNoActivity(fixture);
 });
 
-test("writer-launch facet keeps per-runtime identity and its captured receiver", async () => {
+test("runtime facets keep per-runtime identity and captured receivers", async () => {
   const firstFixture = createRuntimeFixture();
   const secondFixture = createRuntimeFixture();
   const first = createPostgresDetachedRestoreRuntimeComposition(
@@ -506,6 +551,14 @@ test("writer-launch facet keeps per-runtime identity and its captured receiver",
   assert.notStrictEqual(
     first.writerLaunch.runLaunch,
     second.writerLaunch.runLaunch,
+  );
+  assert.notStrictEqual(
+    first.stablePlanProvisioning,
+    second.stablePlanProvisioning,
+  );
+  assert.notStrictEqual(
+    first.stablePlanProvisioning.provisionStablePlan,
+    second.stablePlanProvisioning.provisionStablePlan,
   );
   assertNoActivity(firstFixture);
   assertNoActivity(secondFixture);
@@ -539,6 +592,13 @@ test("writer-launch facet keeps per-runtime identity and its captured receiver",
     assert(pending instanceof Promise);
     await assert.rejects(pending, launcherRequestError);
   }
+  const invalidProvision = Reflect.apply(
+    first.stablePlanProvisioning.provisionStablePlan,
+    hostileReceiver,
+    [],
+  );
+  assert(invalidProvision instanceof Promise);
+  await assert.rejects(invalidProvision, stablePlanRegistryRequestError);
   assert.deepEqual(traps, {
     get: 0,
     getOwnPropertyDescriptor: 0,
@@ -607,6 +667,8 @@ test("runtime leaves lifecycle and pool shutdown ownership with the caller", asy
   for (const name of [
     "close",
     "migrate",
+    "planRegistry",
+    "resolveStablePlan",
     "runner",
     "shutdown",
     "start",
@@ -634,6 +696,35 @@ test("runtime composition rejects hostile options without leaking hostile behavi
           ...fixture.options,
           extra: true,
         }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
+  await t.test("legacy external stable-plan resolver", () => {
+    const fixture = createRuntimeFixture();
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          foreground: {
+            ...fixture.options.foreground,
+            resolveStablePlan() {
+              throw new Error("legacy stable-plan resolver must not run");
+            },
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
+  await t.test("missing stable-plan registry options", () => {
+    const fixture = createRuntimeFixture();
+    const { planRegistry: ignored, ...options } = fixture.options;
+    void ignored;
+    assert.throws(
+      () => createPostgresDetachedRestoreRuntimeComposition(options),
       runtimeOptionError,
     );
     assertNoActivity(fixture);

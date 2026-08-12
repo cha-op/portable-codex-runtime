@@ -7,6 +7,7 @@ import {
   PostgresDetachedRestorePlanError,
   createPostgresDetachedRestorePlan,
   isPostgresDetachedRestorePlan,
+  rehydratePostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 
 const SESSION_ID = "018f8475-7c55-7a11-8a88-001122334455";
@@ -208,6 +209,107 @@ test("equivalent property order produces one stable branded plan", () => {
   );
   assert.equal(isPostgresDetachedRestorePlan(canonical, canonical), false);
   assert.equal(isPostgresDetachedRestorePlan(), false);
+});
+
+test("durable detached restore plan documents rehydrate only by recomputing the full contract", () => {
+  const original = createPostgresDetachedRestorePlan(fixture());
+  const durable = JSON.parse(JSON.stringify(original));
+  const rehydrated = rehydratePostgresDetachedRestorePlan(
+    reverseRecord(durable),
+  );
+
+  assert.notStrictEqual(rehydrated, original);
+  assert.equal(isPostgresDetachedRestorePlan(durable), false);
+  assert.equal(isPostgresDetachedRestorePlan(rehydrated), true);
+  assert.equal(JSON.stringify(rehydrated), JSON.stringify(original));
+  assert.equal(Object.getPrototypeOf(rehydrated), null);
+  assert.equal(Object.isFrozen(rehydrated), true);
+  assert.equal(Object.isFrozen(rehydrated.request), true);
+  assert.equal(Object.isFrozen(rehydrated.request.target), true);
+});
+
+test("detached restore plan rehydration rejects any persisted identity drift", () => {
+  const original = createPostgresDetachedRestorePlan(fixture());
+  const mutations = [
+    (value) => {
+      value.contractVersion = 2;
+    },
+    (value) => {
+      value.request.leaseId = "restore-lease-002";
+    },
+    (value) => {
+      value.captureCreatedAt = "2026-08-11T09:00:01.000Z";
+    },
+    (value) => {
+      value.captureOperationId = `restore-capture:${"0".repeat(64)}`;
+    },
+    (value) => {
+      value.planSha256 = "0".repeat(64);
+    },
+  ];
+
+  for (const mutate of mutations) {
+    const durable = JSON.parse(JSON.stringify(original));
+    mutate(durable);
+    assertPlanError(() => rehydratePostgresDetachedRestorePlan(durable));
+  }
+});
+
+test("detached restore plan rehydration rejects hostile and inexact document shapes", () => {
+  const original = JSON.parse(
+    JSON.stringify(createPostgresDetachedRestorePlan(fixture())),
+  );
+  assertPlanError(() => rehydratePostgresDetachedRestorePlan());
+  assertPlanError(() =>
+    rehydratePostgresDetachedRestorePlan(original, original),
+  );
+  assertPlanError(() =>
+    rehydratePostgresDetachedRestorePlan(new Proxy(original, {})),
+  );
+  assertPlanError(() =>
+    rehydratePostgresDetachedRestorePlan({ ...original, extra: true }),
+  );
+  const missing = { ...original };
+  delete missing.planSha256;
+  assertPlanError(() => rehydratePostgresDetachedRestorePlan(missing));
+
+  let getterCalls = 0;
+  const accessor = { ...original };
+  Object.defineProperty(accessor, "planSha256", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error("persisted plan accessor must not run");
+    },
+  });
+  assertPlanError(() => rehydratePostgresDetachedRestorePlan(accessor));
+  assert.equal(getterCalls, 0);
+});
+
+test("detached restore plan rehydration never consults inherited toJSON", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    Object.prototype,
+    "toJSON",
+  );
+  const durable = JSON.parse(
+    JSON.stringify(createPostgresDetachedRestorePlan(fixture())),
+  );
+  let calls = 0;
+  try {
+    Object.defineProperty(Object.prototype, "toJSON", {
+      configurable: true,
+      value() {
+        calls += 1;
+        throw new Error("inherited toJSON must not run during rehydration");
+      },
+    });
+    const rehydrated = rehydratePostgresDetachedRestorePlan(durable);
+    assert.equal(isPostgresDetachedRestorePlan(rehydrated), true);
+  } finally {
+    if (descriptor === undefined) delete Object.prototype.toJSON;
+    else Object.defineProperty(Object.prototype, "toJSON", descriptor);
+  }
+  assert.equal(calls, 0);
 });
 
 test("request drift changes every subordinate identity despite a stable root operation ID", () => {
