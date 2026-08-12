@@ -120,6 +120,27 @@ test("operational lease budget derives two exact database-clock windows", () => 
   assert.equal(budget.leaseDurationMilliseconds, 29);
 });
 
+test("renewal window can independently determine the minimum lease", () => {
+  const exact = options(49);
+  exact.supervisorSettlement.stopWriter = policy(20, 10);
+  const budget = createPostgresDetachedRestoreOperationalLeaseBudget(exact);
+  assert.deepEqual({ ...budget.windows }, {
+    activationToLaunchClaimMilliseconds: 29,
+    renewalToGenerationClaimMilliseconds: 49,
+  });
+  assert.equal(budget.minimumLeaseDurationMilliseconds, 49);
+  assert.equal(budget.leaseDurationMilliseconds, 49);
+
+  const short = options(48);
+  short.supervisorSettlement.stopWriter = policy(20, 10);
+  assert.throws(
+    () => createPostgresDetachedRestoreOperationalLeaseBudget(short),
+    budgetError(
+      "invalid_postgres_detached_restore_operational_lease_budget_options",
+    ),
+  );
+});
+
 test("critical paths count every distinguishable sequential boundary exactly once", () => {
   const value = options(183);
   value.databaseRequestMilliseconds = 25;
