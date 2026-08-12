@@ -1814,6 +1814,23 @@ entire sequence:
    capture-bound activation request version 2; and
 6. consume only the activation-materialized prepared launch attempt.
 
+The assembled matrix drives this seam through
+`deployment.foreground.runRestore(admission, publish)`, not through the still
+disabled production checkpoint adapter. `publish` receives one exact frozen
+null-prototype context with exactly `artifactDirectory`, `artifactOwnedRoot`,
+`artifactProof`, `canonicalLease`, `destinationDirectory`,
+`destinationIsolationProofId`, `destinationOwnedRoot`, `destinationState`,
+`generationBinding`, `now`, `publicationMode`, `reservationId`, `result`, and
+`storageRef`.
+It must return an exact frozen
+`{materialization, replayed, result}` completion whose result matches that
+predetermined result. `committed-only` requires `replayed: true`. The foreground
+composition does not silently choose a raw publication method behind this
+callback: the safety harness, and later the final public backend, must route
+fresh publication to `publishRestoreDestination()` and committed replay to
+`verifyCommittedRestoreDestination()` without turning verification into a new
+grant.
+
 One narrow pre-dispatch retry cut is reconstructable without a new saga row.
 The current session must expose the exact revision-zero `prepared` generation
 active pointer, request and reservation identities derived from the stable
@@ -2085,6 +2102,34 @@ committed-only verification, and activation preparation remains distinct from
 read-only reconciliation under the same guarded one-shot grant. Settlement
 cannot promote a verifier or reconciler into mutation authority.
 
+The safety matrix classifies these contracts before measuring reachability.
+The fourteen leaves on the private assembled protocol surface are:
+
+- grant-bearing mutators: supervisor `stopWriter()`, publication
+  `publishFreshCheckpointArtifact()` and `publishRestoreDestination()`,
+  lifecycle `detachAttachment()`, `forceFence()`, and
+  `prepareRestoreAttachment()`, and supervisor `launchWriter()`;
+- repeatable observations: supervisor `reconcileWriterLaunch()`, lifecycle
+  `reconcileRestoreAttachment()`, publication
+  `verifyCommittedCheckpointArtifact()` and
+  `verifyCommittedRestoreDestination()`, restore-destination resolution,
+  image-plan resolution, and trusted Codex inspection.
+
+The five remaining lifecycle leaves, `captureCheckpoint()`, `destroySession()`,
+`prepareWritableAttachment()`, `provisionSession()`, and `restoreCheckpoint()`,
+are still settled production contracts but are not called by the private
+assembled restore protocol. In particular, raw lifecycle capture and restore are
+not aliases for the stopped-directory publication paths.
+
+"No second dispatch" is not a ban on every later physical observation. The
+same settlement invocation is never automatically reissued after deadline,
+and each durable mutator remains at-most-once for the exact operation grant.
+A later recovery attempt may repeat a trusted read-only resolver, verifier,
+inspector, or reconciler, including image resolution and inspection that mint a
+new process-local reservation for one fixed prepared plan. Those observations
+must not change durable state, reconstruct a writer handle, or authorize a
+mutator.
+
 Deployment keeps only the aggregate graph stop and two image-binding stop
 capabilities in a private fixed registry. Shutdown first closes controller
 admission and synchronously starts all three without short-circuiting; the graph
@@ -2123,9 +2168,14 @@ construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
 Deployment now admits the explicit operational lease budget across the bounded
-critical path. It must next complete the assembled restart/ambiguous-outcome/
-deadline matrix before constructing the final public backend or enabling the
-production entry point.
+critical path. The completed assembled matrix binds seven real-PostgreSQL
+durable cuts to their existing acknowledgement-loss/replay evidence, adds a
+same-database/stable-plan retry through fresh physical bindings, image binding,
+runtime, and controller, references separate stable-plan-registry rehydration,
+and layers representative settlement-foundation/deployment timer and drain
+evidence. It does not claim one whole-saga deployment restart or operating-
+system crash. The final public backend remains the next implementation boundary
+before enabling the production entry point.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2245,8 +2295,12 @@ migration/admission/drain controller, explicit PostgreSQL pool-owning
 deployment, and deployment-owned image-plan binding now exist. The physical-
 collaborator settlement foundation and the complete assembled image,
 supervisor, storage-lifecycle, publication, and restore-destination resolver
-binding graph and operational lease admission also exist. The next integration
-slices must cover whole-graph restart/ambiguity/deadline cases and wire the
-final adapter before production `runRestore()` can open.
+binding graph and operational lease admission also exist. The completed safety
+matrix has an exact nineteen-contract/fourteen-protocol-surface scope and binds its
+seven durable-cut aggregation, same-database/stable-plan fresh-object retry,
+separate registry rehydration, and representative settlement timer/drain
+evidence. The final public backend is the next implementation boundary; the
+production checkpoint adapter's `runRestore()` remains closed until that
+backend is wired.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

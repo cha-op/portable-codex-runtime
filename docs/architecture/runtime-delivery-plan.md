@@ -420,10 +420,34 @@ Restore and launcher authority are now split into eight serial pull requests:
      aggregate database-request allowance, and a positive safety margin. The
      two independently minted leases use the maximum window rather than a sum;
      stable-plan provisioning and every resolution enforce the same exact
-     configured duration before physical work. The remaining assembly order is
-     the whole restart/ambiguity/deadline matrix followed by the final public
-     restore-capable backend.
-   - Enable `runRestore()` only after the whole protocol preserves the
+     configured duration before physical work.
+   - The completed assembled safety-matrix slice classifies the nineteen physical
+     contracts before claiming coverage. Fourteen belong to the private
+     protocol surface: seven grant-bearing mutators and seven repeatable read-only
+     resolver, verifier, inspector, or reconciler observations. The other five
+     generic lifecycle methods remain contract-only in this saga. Its evidence
+     combines seven real-PostgreSQL durable-cut/commit-acknowledgement-loss paths
+     with a same-database/stable-plan retry through fresh physical bindings,
+     image binding, runtime, and controller plus separate stable-plan-registry
+     rehydration. Settlement evidence remains layered: the foundation
+     proves aggregate stop ownership and representative deadline/grace
+     semantics, while deployment fake-PostgreSQL scenarios exercise the image
+     boundary, late settlement, abort/drain, fatal grace breach, and zero calls
+     to the durable families they cannot reach. A test-only callback router
+     locks the exact fresh-publication versus committed-verification choice at
+     the explicit foreground seam; it is not the final public adapter. This does
+     not claim one
+     whole-saga deployment restart, operating-system `SIGKILL`, or fake-
+     PostgreSQL execution of all five collaborator families.
+   - The no-second-dispatch property is scoped by authority. One settlement
+     invocation is never automatically retried; a durable mutator is dispatched
+     at most once for its operation grant. Trusted image observations,
+     destination resolution, committed verifiers, and stopped-only
+     reconciliation may repeat in a separate recovery attempt, but cannot mint
+     a grant. A fresh image reservation is therefore permitted for the same
+     fixed prepared plan and is not mutation replay.
+   - The remaining assembly step is the final public restore-capable backend.
+   - Enable `runRestore()` only after the final public backend preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation
      outcomes.

@@ -379,6 +379,21 @@
   committed-only verification, and no-second-dispatch rules remain authoritative.
   Stop requests every settlement drain before awaiting them and closes pools
   only after controller and settlement drain; any failure is sticky.
+- The completed assembled-restore safety matrix fixes the distinction
+  between all nineteen settlement contracts and the fourteen leaves on the
+  private restore protocol surface. Seven grant-bearing mutators remain at-most-
+  once per durable operation; seven resolver, verifier, inspector, or
+  reconciler observations may repeat across independent recovery attempts but
+  cannot manufacture a grant. The five remaining generic lifecycle contracts
+  stay outside the current saga. The evidence shape combines seven existing
+  real-PostgreSQL durable-cut and commit-acknowledgement-loss paths, separate
+  same-database/stable-plan retry through fresh physical bindings, image
+  binding, runtime, and controller, stable-plan-registry rehydration, and
+  representative settlement-foundation/deployment timer and drain cases. A
+  test-only router separately locks the explicit fresh/committed publication
+  callback seam while the final public adapter remains absent. It
+  does not claim one whole-saga deployment restart or operating-system crash
+  coverage.
 - Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
   grant entirely inside one coordinator-owned per-operation guard. The storage
   backend exposes a separate version 1 read-only reconciliation contract keyed
@@ -390,10 +405,10 @@
   PostgreSQL schema remain unchanged.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires full assembled restart/ambiguous-outcome/deadline validation and
-  the final public adapter route. Operational lease admission is now enforced
-  at stable-plan provision and every resolution from one deployment-owned
-  policy derived from the two database-clock critical windows.
+  requires the final public backend and adapter route; the scoped assembled
+  evidence matrix is complete. Operational lease admission is now enforced at
+  stable-plan provision and every resolution from one deployment-owned policy
+  derived from the two database-clock critical windows.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -402,6 +417,8 @@
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Assembled restore safety matrix:
+  `docs/project_journal/2026/08/2026-08-12-assembled-restore-safety-matrix-6d3a91.md`
 - Physical-collaborator settlement:
   `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
 - Physical settlement graph:
@@ -512,5 +529,6 @@
   The deployment now also derives and admits one exact operational lease
   policy across the two database-clock windows, including physical deadline/
   grace bounds, an aggregate database allowance, and a safety margin.
-  Production still requires whole-graph fail-closed validation and final
-  public-adapter assembly before `runRestore()` may be enabled.
+  The scoped assembled safety matrix is complete. Production still requires the
+  final public backend and adapter assembly before the checkpoint adapter's
+  `runRestore()` stub may be enabled.

@@ -3895,6 +3895,7 @@ test(
       max: 2,
     });
     const sessionIds = [];
+    const assembledDurableCutEvidence = new Map();
     t.after(async () => {
       try {
         if (sessionIds.length > 0) {
@@ -5807,11 +5808,13 @@ test(
           readBack.document.writerEpoch,
         );
 
+        let finalReplay = null;
         for (let replayIndex = 0; replayIndex < 2; replayIndex += 1) {
           const replayed =
             await restarted.claimWriterForceFenceDispatch(
               structuredClone(transition),
             );
+          finalReplay = replayed;
           assertOperationReceipt(replayed, "starting");
           assert.equal(replayed.dispatchGranted, false);
           assert.equal(
@@ -5834,6 +5837,14 @@ test(
             },
           );
         }
+        assembledDurableCutEvidence.set("writer-force-fence", {
+          acknowledgementBoundary: "dispatch",
+          kind: input.kind,
+          operationId: input.operationId,
+          replayGranted: finalReplay.dispatchGranted,
+          sessionId,
+          state: reconciled.operation.state,
+        });
       },
     );
 
@@ -6296,6 +6307,14 @@ test(
           finalizeReplay.session,
           finalizeReconciled.session,
         );
+        assembledDurableCutEvidence.set("writer-release", {
+          acknowledgementBoundary: "dispatch-and-finalize",
+          kind: input.kind,
+          operationId: input.operationId,
+          replayGranted: dispatchReplay.dispatchGranted,
+          sessionId,
+          state: finalizeReconciled.operation.state,
+        });
       },
     );
 
@@ -7445,6 +7464,15 @@ test(
         assertOperationReceipt(terminal, "committed");
         assert.equal(terminal.operation.revision, "2");
         assert.deepEqual(terminal.operation, committed.operation);
+        assembledDurableCutEvidence.set("checkpoint-capture", {
+          acknowledgementBoundary: "finalize",
+          kind: terminal.operation.kind,
+          operationId: admission.request.operationId,
+          publicationCount,
+          sessionId,
+          state: terminal.operation.state,
+          verificationCount,
+        });
       },
     );
 
@@ -7959,6 +7987,14 @@ test(
           ),
           finalizeLossRead,
         );
+        assembledDurableCutEvidence.set("restore-generation", {
+          acknowledgementBoundary: "dispatch-and-finalize",
+          kind: uncertainInput.kind,
+          operationId: uncertainInput.operationId,
+          replayGranted: claimReplay.dispatchGranted,
+          sessionId: uncertainSessionId,
+          state: finalizeLossRead.operation.state,
+        });
       },
     );
 
@@ -9104,6 +9140,14 @@ test(
           active.session.document.launch.generation.generationId,
           targetGeneration.generationId,
         );
+        assembledDurableCutEvidence.set("restore-activation", {
+          acknowledgementBoundary: "finalize",
+          finalizedAgain: finalizationReplay.activation.finalized,
+          kind: activationInput.kind,
+          operationId: activationInput.operationId,
+          sessionId,
+          state: finalized.activation.operation.state,
+        });
       },
     );
 
@@ -10473,6 +10517,14 @@ test(
         assertOperationReceipt(finalizeReplay, "committed");
         assert.equal(finalizeReplay.finalized, false);
         assert.deepEqual(finalizeReplay.launch, committed.launch);
+        assembledDurableCutEvidence.set("writer-launch", {
+          acknowledgementBoundary: "dispatch-and-finalize",
+          kind: input.kind,
+          operationId: input.operationId,
+          replayGranted: claimReplay.dispatchGranted,
+          sessionId,
+          state: committed.operation.state,
+        });
       },
     );
 
@@ -10692,6 +10744,14 @@ test(
           }),
           assertAuthorityCode("operation_transition_conflict"),
         );
+        assembledDurableCutEvidence.set("writer-stop", {
+          acknowledgementBoundary: "dispatch-and-finalize",
+          kind: stopInput.kind,
+          operationId: stopInput.operationId,
+          replayGranted: claimReplay.dispatchGranted,
+          sessionId: launchedSessionId,
+          state: committed.operation.state,
+        });
 
         const originalAfter = await pool.query(
           [
@@ -11092,11 +11152,139 @@ test(
         );
       },
     );
+
+    await t.test(
+      "assembled durable-cut matrix binds seven acknowledgement-loss paths to persisted authority rows",
+      async () => {
+        const cutMatrix = [
+          {
+            acknowledgementBoundary: "dispatch-and-finalize",
+            cutName: "writer-stop",
+            kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+            state: "committed",
+          },
+          {
+            acknowledgementBoundary: "finalize",
+            cutName: "checkpoint-capture",
+            kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+            state: "committed",
+          },
+          {
+            acknowledgementBoundary: "dispatch-and-finalize",
+            cutName: "restore-generation",
+            kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+            state: "committed",
+          },
+          {
+            acknowledgementBoundary: "dispatch-and-finalize",
+            cutName: "writer-release",
+            kind: WRITER_RELEASE_OPERATION_KIND,
+            state: "committed",
+          },
+          {
+            acknowledgementBoundary: "dispatch",
+            cutName: "writer-force-fence",
+            kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+            state: "starting",
+          },
+          {
+            acknowledgementBoundary: "finalize",
+            cutName: "restore-activation",
+            kind: RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND,
+            state: "committed",
+          },
+          {
+            acknowledgementBoundary: "dispatch-and-finalize",
+            cutName: "writer-launch",
+            kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+            state: "committed",
+          },
+        ];
+        const cutNames = cutMatrix.map(({ cutName }) => cutName);
+        assert.deepEqual(
+          [...assembledDurableCutEvidence.keys()].sort(),
+          [...cutNames].sort(),
+        );
+
+        const evidenceByOperationId = new Map(
+          cutMatrix.map((specification) => {
+            const { cutName } = specification;
+            const evidence = assembledDurableCutEvidence.get(cutName);
+            assert.notEqual(evidence, undefined);
+            assert.equal(
+              evidence.acknowledgementBoundary,
+              specification.acknowledgementBoundary,
+            );
+            assert.equal(evidence.kind, specification.kind);
+            assert.equal(evidence.state, specification.state);
+            return [
+              evidence.operationId,
+              { cutName, evidence, specification },
+            ];
+          }),
+        );
+        assert.equal(evidenceByOperationId.size, cutNames.length);
+        const persisted = await pool.query(
+          [
+            "SELECT o.operation_id, o.session_id::text AS session_id,",
+            "o.kind, o.state,",
+            "count(r.reservation_id)::integer AS reservation_count",
+            "FROM session_authority.operation_claims AS o",
+            "LEFT JOIN session_authority.reservations AS r",
+            "ON r.operation_id = o.operation_id",
+            "WHERE o.operation_id = ANY($1::character varying[])",
+            "GROUP BY o.operation_id, o.session_id, o.kind, o.state",
+            "ORDER BY o.operation_id",
+          ].join(" "),
+          [[...evidenceByOperationId.keys()]],
+        );
+        assert.equal(persisted.rows.length, cutNames.length);
+        for (const row of persisted.rows) {
+          const bound = evidenceByOperationId.get(row.operation_id);
+          assert.notEqual(bound, undefined);
+          assert.equal(row.session_id, bound.evidence.sessionId);
+          assert.equal(row.kind, bound.specification.kind);
+          assert.equal(row.state, bound.specification.state);
+          assert.equal(row.reservation_count, 1);
+          evidenceByOperationId.delete(row.operation_id);
+        }
+        assert.equal(evidenceByOperationId.size, 0);
+
+        for (const cutName of [
+          "writer-stop",
+          "restore-generation",
+          "writer-release",
+          "writer-force-fence",
+          "writer-launch",
+        ]) {
+          assert.equal(
+            assembledDurableCutEvidence.get(cutName).replayGranted,
+            false,
+          );
+        }
+        assert.deepEqual(
+          {
+            publicationCount:
+              assembledDurableCutEvidence.get("checkpoint-capture")
+                .publicationCount,
+            verificationCount:
+              assembledDurableCutEvidence.get("checkpoint-capture")
+                .verificationCount,
+          },
+          { publicationCount: 1, verificationCount: 1 },
+        );
+        assert.equal(
+          assembledDurableCutEvidence.get("restore-activation")
+            .finalizedAgain,
+          false,
+        );
+      },
+    );
   },
 );
 
 test(
-  "restore runtime controller bootstraps and drains before same-runtime V3 stop/capture",
+  "restore runtime controller bootstraps, drains, and retries uncertain capture with fresh assembled objects",
   { timeout: 60_000 },
   async (t) => {
     const foregroundLifecycleApplicationName =
@@ -11127,6 +11315,8 @@ test(
     const recoveryScopeId = `integration-restore-${randomUUID()}`;
     const controllerRecoveryScopeId =
       `integration-restore-controller-${randomUUID()}`;
+    const restartedRecoveryScopeId =
+      `integration-restore-restarted-${randomUUID()}`;
     const sessionId = randomUUID();
     const blockedSessionId = randomUUID();
     const sessionIds = [sessionId, blockedSessionId];
@@ -11136,11 +11326,16 @@ test(
     const supervisorId = `runtime-supervisor-${randomUUID()}`;
     let controller = null;
     let physicalBindings = null;
+    let restartedController = null;
+    let restartedPhysicalBindings = null;
     let runtime = null;
     let foregroundTeardown = null;
     t.after(async () => {
       if (controller !== null) {
         await Promise.allSettled([controller.stop()]);
+      }
+      if (restartedController !== null) {
+        await Promise.allSettled([restartedController.stop()]);
       }
       let teardownToAwait = foregroundTeardown;
       if (teardownToAwait === null && runtime !== null) {
@@ -11156,6 +11351,9 @@ test(
       if (physicalBindings !== null) {
         await Promise.allSettled([physicalBindings.stop()]);
       }
+      if (restartedPhysicalBindings !== null) {
+        await Promise.allSettled([restartedPhysicalBindings.stop()]);
+      }
       try {
         const cleanupClient = await authorityPool.connect();
         try {
@@ -11165,7 +11363,11 @@ test(
               "DELETE FROM session_authority.restore_recovery_cursors",
               "WHERE recovery_scope_id = ANY($1::text[])",
             ].join(" "),
-            [[recoveryScopeId, controllerRecoveryScopeId]],
+            [[
+              recoveryScopeId,
+              controllerRecoveryScopeId,
+              restartedRecoveryScopeId,
+            ]],
           );
           await cleanupClient.query(
             [
@@ -12634,6 +12836,247 @@ test(
         revision: "1",
       },
     ]);
+
+    assert.deepEqual(
+      structuredClone(await physicalBindings.stop()),
+      { status: "stopped" },
+    );
+
+    const restartedCalls = {
+      artifactResolver: 0,
+      destinationResolver: 0,
+      fleetGate: 0,
+      image: 0,
+      planProvisioningGate: 0,
+      provider: 0,
+      publication: 0,
+      publish: 0,
+      sourceResolver: 0,
+      supervisorLaunch: 0,
+      supervisorReconcile: 0,
+    };
+    const restartedPhysicalInvocations = new Set();
+    const restartedPhysicalSignals = new Set();
+    const restartedLifecycleBackend =
+      restoreRuntimeIntegrationLifecycleBackend(
+        restartedCalls,
+        restartedPhysicalInvocations,
+        restartedPhysicalSignals,
+      );
+    const restartedPublication = restoreRuntimeIntegrationPublication(
+      restartedCalls,
+      restartedRecoveryScopeId,
+    );
+    restartedPhysicalBindings =
+      createPostgresDetachedRestorePhysicalBindings({
+        lifecycleBackend: restartedLifecycleBackend,
+        lifecycleSettlement:
+          physicalPolicies.lifecycleBackendSettlement,
+        onFatal() {
+          assert.fail(
+            "restarted integration physical collaborator must settle",
+          );
+        },
+        publication: restartedPublication,
+        publicationSettlement: physicalPolicies.publicationSettlement,
+        async resolveRestoreDestination(input) {
+          restartedCalls.destinationResolver += 1;
+          void input;
+          throw new Error(
+            "capture reconciliation must finish before destination resolution",
+          );
+        },
+        resolveRestoreDestinationContractVersion: 1,
+        resolveRestoreDestinationSettlement:
+          physicalPolicies.resolveRestoreDestinationSettlement,
+        supervisor: Object.freeze({
+          contractVersion: 2,
+          async launchWriter(input) {
+            restartedCalls.supervisorLaunch += 1;
+            void input;
+            throw new Error(
+              "capture reconciliation restart must not launch a writer",
+            );
+          },
+          async reconcileWriterLaunch(input) {
+            restartedCalls.supervisorReconcile += 1;
+            void input;
+            throw new Error(
+              "capture reconciliation restart must not reconcile a writer",
+            );
+          },
+          supervisorId: `restarted-supervisor-${randomUUID()}`,
+        }),
+        supervisorSettlement: physicalPolicies.supervisorSettlement,
+      });
+    const restartedImagePlanProviderId =
+      `restarted-image-provider-${randomUUID()}`;
+    const restartedRuntime =
+      createPostgresDetachedRestoreRuntimeComposition({
+        ...runtimeOptions,
+        foreground: {
+          fleetCapabilityGate() {
+            restartedCalls.fleetGate += 1;
+            return POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED;
+          },
+        },
+        launch: {
+          imagePlanBinding:
+            createPostgresDetachedRestoreImagePlanBinding({
+              provider: Object.freeze({
+                contractVersion:
+                  POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+                imagePlanProviderId: restartedImagePlanProviderId,
+                async inspectCodex(input) {
+                  restartedCalls.image += 1;
+                  void input;
+                  throw new Error(
+                    "capture reconciliation restart must not inspect Codex",
+                  );
+                },
+                async resolveImagePlan(input) {
+                  restartedCalls.image += 1;
+                  void input;
+                  throw new Error(
+                    "capture reconciliation restart must not resolve an image",
+                  );
+                },
+              }),
+              settlement: integrationImagePlanSettlements(
+                imagePlanProviderSettlement,
+              ),
+            }),
+          stoppedWriterCoordinator:
+            new StoppedWriterCapabilityCoordinator(),
+          supervisor: restartedPhysicalBindings.supervisor,
+        },
+        planRegistry: {
+          operationalLeaseBudget,
+          provisioningFleetCapabilityGate() {
+            restartedCalls.planProvisioningGate += 1;
+            return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
+          },
+        },
+        recovery: {
+          ...runtimeOptions.recovery,
+          onStep() {},
+          recoveryScopeId: restartedRecoveryScopeId,
+        },
+        storage: {
+          backendId: "postgres-authority-integration",
+          lifecycleBackend: restartedPhysicalBindings.lifecycleBackend,
+          publication: restartedPhysicalBindings.publication,
+          resolveArtifactPaths(options) {
+            restartedCalls.artifactResolver += 1;
+            return integrationArtifactPaths(options);
+          },
+          resolveRestoreDestination:
+            restartedPhysicalBindings.resolveRestoreDestination,
+          resolveSourceOwnedRoot(options) {
+            restartedCalls.sourceResolver += 1;
+            return integrationSourceOwnedRoot(options);
+          },
+        },
+      });
+    assert.notStrictEqual(restartedPhysicalBindings, physicalBindings);
+    assert.notStrictEqual(restartedRuntime, runtime);
+    restartedController = createPostgresDetachedRestoreRuntimeController({
+      runtime: restartedRuntime,
+    });
+    assert.deepEqual(
+      structuredClone(
+        await settleWithin(
+          restartedController.start(),
+          "restarted restore runtime controller startup",
+        ),
+      ),
+      { status: "ready" },
+    );
+
+    // This boundary proves complete in-process object replacement. A
+    // process-level SIGKILL remains separate evidence for the child harness.
+    const durableStateBeforeRestart =
+      await readSessionAuthorityMutationSnapshot(
+        authorityPool,
+        sessionId,
+      );
+    const firstRuntimeCountsBeforeRestart = {
+      publication: calls.publication,
+      sourceResolver: calls.sourceResolver,
+      supervisorStop: calls.supervisorStop,
+    };
+    await assert.rejects(
+      restartedController.foreground.runRestore(
+        admission,
+        async function restartedPublish() {
+          restartedCalls.publish += 1;
+          throw new Error("restarted foreground must not publish");
+        },
+      ),
+      (error) => {
+        assert.equal(
+          error.code,
+          "postgres_detached_restore_foreground_composition_outcome_uncertain",
+        );
+        return true;
+      },
+    );
+    assert.deepEqual(
+      await readSessionAuthorityMutationSnapshot(
+        authorityPool,
+        sessionId,
+      ),
+      durableStateBeforeRestart,
+    );
+    assert.deepEqual(
+      {
+        publication: calls.publication,
+        sourceResolver: calls.sourceResolver,
+        supervisorStop: calls.supervisorStop,
+      },
+      firstRuntimeCountsBeforeRestart,
+    );
+    assert.equal(restartedCalls.artifactResolver > 0, true);
+    assert.equal(restartedCalls.publication > 0, true);
+    for (const field of [
+      "destinationResolver",
+      "fleetGate",
+      "image",
+      "planProvisioningGate",
+      "provider",
+      "publish",
+      "sourceResolver",
+      "supervisorLaunch",
+      "supervisorReconcile",
+    ]) {
+      assert.equal(restartedCalls[field], 0);
+    }
+    assert.equal(restartedPhysicalInvocations.size, 0);
+    assert.equal(restartedPhysicalSignals.size, 0);
+    const captureAfterRestart = await authorityPool.query(
+      [
+        "SELECT kind, state, revision::text AS revision",
+        "FROM session_authority.operation_claims",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [stablePlan.captureOperationId],
+    );
+    assert.deepEqual(captureAfterRestart.rows, [
+      {
+        kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+        revision: "2",
+        state: "uncertain",
+      },
+    ]);
+    assert.deepEqual(
+      structuredClone(
+        await settleWithin(
+          restartedController.stop(),
+          "restarted restore runtime controller shutdown",
+        ),
+      ),
+      { status: "stopped" },
+    );
   },
 );
 

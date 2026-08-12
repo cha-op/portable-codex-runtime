@@ -402,8 +402,18 @@ second physical dispatch.
 Production restore nevertheless remains fail-closed. The production
 checkpoint adapter's `runRestore()` stub is unchanged. The complete assembled
 physical graph now has method-specific settlement and operational lease
-admission; remaining phase-B work must run the whole restart/ambiguous-outcome/
-deadline matrix and only then construct the final public backend. A
+admission. The completed safety-matrix slice classifies all
+nineteen deployment-owned settlement leaves, divides the fourteen leaves on
+the private protocol surface into seven mutators and seven observations, binds the seven
+mutators to existing real-PostgreSQL durable-cut and acknowledgement-loss
+evidence, and combines a same-database/stable-plan retry through fresh physical
+bindings, image binding, runtime, and controller with separate registry
+rehydration plus representative settlement timer and drain cases. The other
+five lifecycle leaves remain contract-only. A test-only callback router proves
+the explicit fresh-publication/committed-verification seam without claiming
+that the final public adapter already exists. This evidence is not one whole-
+saga deployment restart or an operating-system crash test. The final public
+backend is the remaining phase-B implementation. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
 facet plus narrow `stablePlanProvisioning` and `imagePlanReservations` facets
@@ -481,6 +491,22 @@ second physical dispatch. Shutdown closes admission, requests every one of the
 nineteen deployment-owned settlement stops, drains them and admitted work, and
 only then closes the four PostgreSQL pools; any failure remains a sticky failed
 deployment rather than a clean stop.
+
+The fourteen private protocol-surface leaves divide into seven grant-bearing
+mutators and seven repeatable observations. The mutators are returned writer
+stop, fresh checkpoint publication, fresh restore-destination publication,
+release detach, force fence, restore-attachment preparation, and writer launch.
+Each durable operation can authorize its mutator at most once. Launch and
+attachment reconciliation, committed checkpoint and restore-destination
+verification, restore-destination resolution, image-plan resolution, and Codex
+inspection may run again in a distinct recovery attempt, but they remain
+read-only and cannot create a durable grant. A deadline never automatically
+redispatches the same settlement invocation. Preparing an image again creates
+a new process-local observation and opaque reservation for the same fixed plan;
+it is not replay of a durable mutation. The generic lifecycle methods
+`captureCheckpoint()`, `destroySession()`, `prepareWritableAttachment()`,
+`provisionSession()`, and `restoreCheckpoint()` remain outside the currently
+assembled restore saga even though deployment settles their contracts.
 
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
@@ -669,9 +695,11 @@ deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
 not a callback available to injected runtime collaborators. Production restore
 remains fail-closed. The settlement foundation, complete deployment-owned
 physical binding graph, and operational lease admission are now assembled;
-later slices must complete assembled restart/ambiguity/deadline validation and
-wire the final adapter. Filesystem-
-image execution and differential backup remain later work.
+the safety matrix now binds the seven real-PostgreSQL durable cuts, separate
+new-object physical/runtime/controller retry and registry rehydration, and
+representative settlement timer/drain evidence. The final public backend is
+next. Filesystem-image
+execution and differential backup remain later work.
 See
 `docs/architecture/stopped-directory-backend.md`.
 
