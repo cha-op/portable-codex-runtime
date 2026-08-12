@@ -1699,11 +1699,11 @@ original atomic handoff and are rejected by this coordinator so they cannot be
 activated against the old attachment.
 
 For a retained activation, the same guard spans committed destination
-verification, the idempotent provider attachment call, and atomic
-activation-to-launch finalization. Every authority and provider result crosses
-an exact bounded data boundary; unsafe Promises, generators, Proxies,
-accessors, malformed receipts, object replacement, changed content, or changed
-access policy fail closed as an uncertain outcome.
+verification, read-only provider reconciliation, and atomic activation-to-
+launch finalization. It never repeats the attachment call. Every authority and
+provider result crosses an exact bounded data boundary; unsafe Promises,
+generators, Proxies, accessors, malformed receipts, object replacement,
+changed content, or changed access policy fail closed as an uncertain outcome.
 
 `PostgresRestoreActivationRecoveryService` runs four independently paginated
 keyset lanes in fixed order: generation reconciliation, activation
@@ -1855,6 +1855,20 @@ a second physical dispatch merely because the facade is called again. In
 particular, retained `starting` or `uncertain` work stays on its existing
 committed-only or no-relaunch recovery path; an unresolved earlier cut can
 leave the caller-driven sequence blocked rather than being guessed forward.
+
+Restore attachment activation makes that rule explicit at the physical
+provider boundary. The coordinator performs the PostgreSQL claim and consumes
+its `dispatchGranted: true` result only inside the same per-operation guard that
+covers reconciliation, optional attachment, and finalization; neither
+foreground nor recovery can submit a serialized grant. The activation backend
+keeps durable request and result contract version 1, and adds a separate
+read-only reconciliation contract version 1. Reconciliation is keyed by the
+activation request's stable mutation operation ID and returns exactly `applied`
+with the original validated activation result, `absent-and-quiescent`, or
+`unknown`. Exact `applied` evidence is finalized; `absent-and-quiescent` permits
+`prepareRestoreAttachment()` only from that same guarded claim; every retained,
+acknowledgement-loss, copied-caller-data, or `unknown` path remains uncertain
+without a second physical dispatch.
 
 Renewal-before-stop narrows but does not remove the database-clock lease
 boundary. On a fresh path, the successful renewal's PostgreSQL `authorityNow`,

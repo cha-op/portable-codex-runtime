@@ -104,7 +104,6 @@ const OPTION_KEYS = objectFreeze([
 ]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
 const AUTHORITY_METHODS = objectFreeze([
-  "claimRestoreAttachmentActivationDispatch",
   "claimRestoreDestinationGenerationDispatch",
   "finalizeRestoreDestinationGeneration",
   "readCheckpointCaptureAttempt",
@@ -140,6 +139,7 @@ const LAUNCHER_METHODS = objectFreeze([
   "runPreparedLaunch",
 ]);
 const ACTIVATION_COORDINATOR_METHODS = objectFreeze([
+  "claimAndReconcileRestoreAttachmentActivation",
   "reconcileRestoreAttachmentActivation",
 ]);
 const WRITER_DETACH_METHODS = objectFreeze([
@@ -2363,16 +2363,6 @@ function activationOperationRequest(
   return request;
 }
 
-function normalizeActivationClaim(value, plan, code) {
-  const read = normalizeActivationReceipt(value, plan, code);
-  const dispatchGranted = ownDataValue(value, "dispatchGranted", code);
-  ensure(
-    typeof dispatchGranted === "boolean" && read.state !== "prepared",
-    code,
-  );
-  return exactFrozenRecord({ dispatchGranted, read });
-}
-
 function committedOperationTerminalRevision(operation, code) {
   try {
     return StringConstructor(
@@ -2550,7 +2540,7 @@ function validateActivationLaunchTransitionChain(
 
 function normalizeActivationHandoff(
   value,
-  activation,
+  activationRequest,
   generation,
   plan,
   code,
@@ -2567,7 +2557,7 @@ function normalizeActivationHandoff(
     ownDataValue(activationOperation, "state", code) === "committed" &&
       sameData(
         ownDataValue(activationOperation, "request", code),
-        activation.request,
+        activationRequest,
         code,
       ) &&
       sameData(ownDataValue(receipt, "generation", code), generation.generation, code),
@@ -2602,7 +2592,7 @@ function normalizeActivationHandoff(
   validateActivationLaunchTransitionChain(
     activationOperation,
     ownDataValue(activationPart, "reservation", code),
-    activation.request,
+    activationRequest,
     generation,
     launchOperation,
     launchAttempt,
@@ -2724,7 +2714,6 @@ function normalizeLaunchRunResult(value, expected, plan, code) {
 async function claimActivation(
   bindings,
   base,
-  plan,
   lease,
   existing,
   code,
@@ -2733,8 +2722,7 @@ async function claimActivation(
     bindings.operationGuard,
     base.operationId,
     async (assertOperationHeld) => {
-      let read = existing;
-      if (read === null) {
+      if (existing === null) {
         await assertOperationHeld();
         await assertLifecycleHeld(lease, code);
         normalizeReservedOperation(
@@ -2742,37 +2730,18 @@ async function claimActivation(
           base,
           code,
         );
-        read = null;
       }
-      if (read === null || read.state === "prepared") {
-        await assertOperationHeld();
-        await assertLifecycleHeld(lease, code);
-        const settled = await invokeForRead(
-          bindings.authority,
-          "claimRestoreAttachmentActivationDispatch",
-          [
-            exactFrozenRecord({
-              ...base,
-              expectedOperationRevision: "0",
-            }),
-          ],
+      if (existing !== null) {
+        ensure(
+          sameData(
+            existing.operation.expectedSession,
+            base.expectedSession,
+            code,
+          ) && sameData(existing.request, base.request, code),
           code,
         );
-        if (settled.ok) {
-          const claim = normalizeActivationClaim(settled.value, plan, code);
-          read = claim.read;
-        } else {
-          read = await readActivationOptional(bindings.authority, plan, code);
-          ensure(read !== null && read.state !== "prepared", code);
-        }
       }
-      ensure(
-        read !== null &&
-          sameData(read.operation.expectedSession, base.expectedSession, code) &&
-          sameData(read.request, base.request, code),
-        code,
-      );
-      return read;
+      return exactFrozenRecord({ base, read: existing });
     },
     code,
   );
@@ -2957,31 +2926,33 @@ async function runActivationAndLaunch(
     operationId: plan.activationOperationId,
     request,
   });
-  activation = await claimActivation(
+  const activationClaim = await claimActivation(
     bindings,
     base,
-    plan,
     lease,
     activation,
     code,
   );
+  activation = activationClaim.read;
   await assertLifecycleHeld(lease, code);
-  const candidateState =
-    activation.state === "starting" ? "starting" : "uncertain";
+  const claimRequired = activation === null || activation.state === "prepared";
+  const candidate = claimRequired
+    ? activationClaim.base
+    : exactFrozenRecord({
+        activationOperationId: plan.activationOperationId,
+        request: activation.request,
+        state: activation.state === "starting" ? "starting" : "uncertain",
+      });
   const handoff = normalizeActivationHandoff(
     await invoke(
       bindings.restoreActivationCoordinator,
-      "reconcileRestoreAttachmentActivation",
-      [
-        exactFrozenRecord({
-          activationOperationId: plan.activationOperationId,
-          request: activation.request,
-          state: candidateState,
-        }),
-      ],
+      claimRequired
+        ? "claimAndReconcileRestoreAttachmentActivation"
+        : "reconcileRestoreAttachmentActivation",
+      [candidate],
       code,
     ),
-    activation,
+    base.request,
     generation,
     plan,
     code,

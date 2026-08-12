@@ -12,6 +12,7 @@ import {
   PLATFORM_IMAGE_MEDIA_TYPES,
   PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   SESSION_AUTH_MODE,
   SESSION_WORKER_LAYOUT,
   SESSION_WORKER_ROOT,
@@ -28,6 +29,8 @@ import {
   assertRestoreAttachmentActivationBackend,
   assertRestoreAttachmentActivationRequest,
   assertRestoreAttachmentActivationResult,
+  assertRestoreAttachmentReconciliationBackend,
+  assertRestoreAttachmentReconciliationResult,
   assertSessionAttachment,
   assertSessionAttachmentMatches,
   assertSessionManifest,
@@ -1174,6 +1177,87 @@ test("restore attachment activation is an optional versioned backend extension",
   assert.equal(traps, 0);
 });
 
+test("restore attachment reconciliation requires the complete activation extension", () => {
+  const base = storageBackend();
+  const activation = {
+    ...base,
+    restoreAttachmentActivationContractVersion:
+      RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    prepareRestoreAttachment: async () => {},
+  };
+  assert.equal(RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION, 1);
+  assert.throws(
+    () => assertRestoreAttachmentReconciliationBackend(base),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.throws(
+    () => assertRestoreAttachmentReconciliationBackend(activation),
+    assertCode("invalid_storage_backend"),
+  );
+
+  const extended = {
+    ...activation,
+    reconcileRestoreAttachment: async () => {},
+    restoreAttachmentReconciliationContractVersion:
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  };
+  assert.equal(
+    assertRestoreAttachmentReconciliationBackend(extended),
+    extended,
+  );
+
+  for (const invalid of [
+    { ...extended, restoreAttachmentActivationContractVersion: 2 },
+    { ...extended, prepareRestoreAttachment: undefined },
+    { ...extended, restoreAttachmentReconciliationContractVersion: 2 },
+    { ...extended, reconcileRestoreAttachment: undefined },
+  ]) {
+    assert.throws(
+      () => assertRestoreAttachmentReconciliationBackend(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+
+  let reads = 0;
+  const accessor = { ...extended };
+  Object.defineProperty(accessor, "reconcileRestoreAttachment", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return async () => {};
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentReconciliationBackend(accessor),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(reads, 0);
+
+  const inherited = Object.create({
+    reconcileRestoreAttachment: async () => {},
+    restoreAttachmentReconciliationContractVersion:
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  });
+  Object.assign(inherited, activation);
+  assert.throws(
+    () => assertRestoreAttachmentReconciliationBackend(inherited),
+    assertCode("invalid_storage_backend"),
+  );
+
+  let traps = 0;
+  const hostile = new Proxy(extended, {
+    get() {
+      traps += 1;
+      throw new Error("proxy trap must not run");
+    },
+  });
+  assert.throws(
+    () => assertRestoreAttachmentReconciliationBackend(hostile),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
+});
+
 test("restore attachment activation binds publication, attach mutation, and writer fence", () => {
   const request = restoreAttachmentActivationRequest();
   const result = restoreAttachmentActivationResult(request);
@@ -1383,6 +1467,175 @@ test("restore attachment activation result requires exact provider proof echoes"
       ),
     assertCode("invalid_storage_mutation"),
   );
+});
+
+test("restore attachment reconciliation has three exact read-only outcomes", () => {
+  const request = restoreAttachmentActivationRequest();
+  const result = restoreAttachmentActivationResult(request);
+  const appliedInput = {
+    contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "applied",
+    result,
+  };
+  const absentInput = {
+    contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "absent-and-quiescent",
+  };
+  const unknownInput = {
+    contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "unknown",
+  };
+
+  const applied = assertRestoreAttachmentReconciliationResult(appliedInput, {
+    request,
+  });
+  const absent = assertRestoreAttachmentReconciliationResult(absentInput, {
+    request,
+  });
+  const unknown = assertRestoreAttachmentReconciliationResult(unknownInput, {
+    request,
+  });
+
+  assert.deepEqual(applied, appliedInput);
+  assert.deepEqual(absent, absentInput);
+  assert.deepEqual(unknown, unknownInput);
+  assert.equal(Object.isFrozen(applied), true);
+  assert.equal(Object.isFrozen(applied.result), true);
+  assert.equal(Object.isFrozen(applied.result.attachment), true);
+  assert.equal(Object.isFrozen(absent), true);
+  assert.equal(Object.isFrozen(unknown), true);
+
+  result.attachment.proofId = "mutated-proof";
+  result.mutationResult.proofId = "mutated-proof";
+  assert.equal(applied.result.attachment.proofId, "proof-attachment-001");
+  assert.equal(applied.result.mutationResult.proofId, "proof-attachment-001");
+
+  const invalidAppliedResult = restoreAttachmentActivationResult(request, {
+    attachment: { proofId: "crossed-proof" },
+  });
+  for (const invalid of [
+    { ...appliedInput, contractVersion: 2 },
+    { ...appliedInput, outcome: "unknown" },
+    { ...appliedInput, extra: true },
+    {
+      contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "applied",
+    },
+    { ...absentInput, result: restoreAttachmentActivationResult(request) },
+    { ...unknownInput, result: restoreAttachmentActivationResult(request) },
+    {
+      contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "applied",
+      result: invalidAppliedResult,
+    },
+    {
+      contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "unsupported",
+    },
+  ]) {
+    assert.throws(
+      () =>
+        assertRestoreAttachmentReconciliationResult(invalid, { request }),
+      assertCode("invalid_restore_attachment_reconciliation"),
+    );
+  }
+});
+
+test("restore attachment reconciliation rejects executable shapes without observation", () => {
+  const request = restoreAttachmentActivationRequest();
+  let reads = 0;
+  const accessor = {
+    contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "unknown",
+  };
+  Object.defineProperty(accessor, "outcome", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "unknown";
+    },
+  });
+  assert.throws(
+    () =>
+      assertRestoreAttachmentReconciliationResult(accessor, { request }),
+    assertCode("invalid_restore_attachment_reconciliation"),
+  );
+  assert.equal(reads, 0);
+
+  const options = { request };
+  Object.defineProperty(options, "request", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return request;
+    },
+  });
+  assert.throws(
+    () =>
+      assertRestoreAttachmentReconciliationResult(
+        {
+          contractVersion:
+            RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+          outcome: "unknown",
+        },
+        options,
+      ),
+    assertCode("invalid_restore_attachment_reconciliation"),
+  );
+  assert.equal(reads, 0);
+
+  let inheritedReads = 0;
+  Object.defineProperty(Object.prototype, "outcome", {
+    configurable: true,
+    get() {
+      inheritedReads += 1;
+      return "unknown";
+    },
+  });
+  try {
+    assert.throws(
+      () =>
+        assertRestoreAttachmentReconciliationResult(
+          {
+            contractVersion:
+              RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+          },
+          { request },
+        ),
+      assertCode("invalid_restore_attachment_reconciliation"),
+    );
+  } finally {
+    delete Object.prototype.outcome;
+  }
+  assert.equal(inheritedReads, 0);
+
+  let traps = 0;
+  const hostile = new Proxy(
+    {
+      contractVersion: RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "unknown",
+    },
+    {
+      get() {
+        traps += 1;
+        throw new Error("proxy trap must not run");
+      },
+      getPrototypeOf() {
+        traps += 1;
+        throw new Error("proxy trap must not run");
+      },
+      ownKeys() {
+        traps += 1;
+        throw new Error("proxy trap must not run");
+      },
+    },
+  );
+  assert.throws(
+    () =>
+      assertRestoreAttachmentReconciliationResult(hostile, { request }),
+    assertCode("invalid_restore_attachment_reconciliation"),
+  );
+  assert.equal(traps, 0);
 });
 
 test("restore attachment activation rejects accessors and proxies before observation", () => {

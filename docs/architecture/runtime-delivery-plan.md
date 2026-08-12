@@ -399,6 +399,14 @@ Restore and launcher authority are now split into eight serial pull requests:
      through grace invokes only the deployment-owned private fatal hook, closes
      admission, and cannot by itself prove callback, process, network, or
      physical-effect quiescence or authorize another dispatch.
+   - Restore activation now closes its duplicate-dispatch gap before the rest
+     of the physical graph receives settlement. The coordinator performs the
+     PostgreSQL claim, read-only reconciliation, optional first attach, and
+     finalization inside one per-operation guard, and never accepts a serialized
+     grant from foreground or recovery callers. Exact `applied` evidence
+     finalizes, `absent-and-quiescent` permits the first attach only from that
+     same guarded claim, and `unknown` or retained work stays blocked. Durable
+     activation request/result version 1 and the schema are unchanged.
    - Remaining deployment assembly next applies method-specific settlement to
      the mutating supervisor, storage-lifecycle, and publication collaborators,
      then admits an operational lease budget that covers the complete critical

@@ -18,10 +18,13 @@ import {
   createWriterLaunchAttemptOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   assertCheckpointDescriptor,
   assertRestoreAttachmentActivationBackend,
   assertRestoreAttachmentActivationRequest,
   assertRestoreAttachmentActivationResult,
+  assertRestoreAttachmentReconciliationBackend,
+  assertRestoreAttachmentReconciliationResult,
   assertStorageMutationRequest,
   assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
@@ -92,6 +95,7 @@ const OPTION_KEYS = objectFreeze([
   "storageBackend",
 ]);
 const AUTHORITY_KEYS = objectFreeze([
+  "claimRestoreAttachmentActivationDispatch",
   "finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt",
   "finalizeRestoreDestinationGeneration",
   "markOperationUncertain",
@@ -117,6 +121,12 @@ const ACTIVATION_CANDIDATE_KEYS = objectFreeze([
   "activationOperationId",
   "request",
   "state",
+]);
+const ACTIVATION_CLAIM_BASE_KEYS = objectFreeze([
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
 ]);
 const OPERATION_GUARD_PROBE_KEYS = objectFreeze(["assertHeld"]);
 const OPERATION_KEYS = objectFreeze([
@@ -291,6 +301,14 @@ const ACTIVATION_READ_RECEIPT_KEYS = objectFreeze([
   "reservation",
   "session",
   "status",
+]);
+const ACTIVATION_CLAIM_RECEIPT_KEYS = objectFreeze([
+  ...ACTIVATION_READ_RECEIPT_KEYS,
+  "dispatchGranted",
+]);
+const ACTIVATION_GRANTED_CLAIM_RECEIPT_KEYS = objectFreeze([
+  ...ACTIVATION_CLAIM_RECEIPT_KEYS,
+  "authorityNow",
 ]);
 const ACTIVATION_HANDOFF_RECEIPT_KEYS = objectFreeze([
   "activation",
@@ -2526,6 +2544,59 @@ function normalizeActivationReadReceipt(value, candidate, code) {
   });
 }
 
+function normalizeActivationClaimReceipt(
+  value,
+  candidate,
+  expectedSession,
+  code,
+) {
+  const hasAuthorityNow =
+    value !== null &&
+    typeof value === "object" &&
+    !isProxyValue(value) &&
+    objectHasOwn(value, "authorityNow");
+  const receipt = exactDataObject(
+    value,
+    hasAuthorityNow
+      ? ACTIVATION_GRANTED_CLAIM_RECEIPT_KEYS
+      : ACTIVATION_CLAIM_RECEIPT_KEYS,
+    code,
+  );
+  ensure(
+    typeof receipt.dispatchGranted === "boolean" &&
+      hasAuthorityNow === receipt.dispatchGranted,
+    code,
+  );
+  const read = normalizeActivationReadReceipt(
+    exactFrozenRecord({
+      activationRequest: receipt.activationRequest,
+      generation: receipt.generation,
+      operation: receipt.operation,
+      reservation: receipt.reservation,
+      session: receipt.session,
+      status: receipt.status,
+    }),
+    candidate,
+    code,
+  );
+  ensure(
+    sameJson(read.operation.expectedSession, expectedSession, code) &&
+      (!receipt.dispatchGranted || read.operation.state === "starting"),
+    code,
+  );
+  if (receipt.dispatchGranted) {
+    ensure(
+      timestampMilliseconds(receipt.authorityNow, code) >=
+        timestampMilliseconds(read.operation.updatedAt, code),
+      code,
+    );
+  }
+  return exactFrozenRecord({
+    dispatchGranted: receipt.dispatchGranted,
+    read,
+  });
+}
+
 function normalizeActivationHandoffReceipt(
   value,
   candidate,
@@ -2758,7 +2829,11 @@ function normalizeGenerationCandidate(value, code) {
 }
 
 function normalizeActivationCandidate(value, code) {
-  const candidate = exactDataObject(value, ACTIVATION_CANDIDATE_KEYS, code);
+  const candidate = exactDataObject(
+    value,
+    ACTIVATION_CANDIDATE_KEYS,
+    code,
+  );
   ensure(
     candidate.state === "starting" || candidate.state === "uncertain",
     code,
@@ -2770,6 +2845,29 @@ function normalizeActivationCandidate(value, code) {
     ),
     request: candidate.request,
     state: candidate.state,
+  });
+}
+
+function normalizeActivationClaimBase(value, code) {
+  const base = exactDataObject(value, ACTIVATION_CLAIM_BASE_KEYS, code);
+  ensure(base.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND, code);
+  let binding;
+  try {
+    binding = assertSessionOperationBinding({
+      expectedSession: base.expectedSession,
+      kind: base.kind,
+      operationId: base.operationId,
+      request: base.request,
+    });
+  } catch {
+    fail(code);
+  }
+  const operationId = opaqueId(binding.operationId, code);
+  return exactFrozenRecord({
+    expectedSession: binding.expectedSession,
+    kind: binding.kind,
+    operationId,
+    request: binding.request,
   });
 }
 
@@ -2925,6 +3023,10 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
   );
   const authority = exactFrozenRecord({
     receiver: options.authority,
+    claimRestoreAttachmentActivationDispatch: trustedFunction(
+      authorityValue.claimRestoreAttachmentActivationDispatch,
+      optionCode,
+    ),
     finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt:
       trustedFunction(
         authorityValue
@@ -2963,6 +3065,9 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     storageBackend = assertRestoreAttachmentActivationBackend(
       options.storageBackend,
     );
+    storageBackend = assertRestoreAttachmentReconciliationBackend(
+      storageBackend,
+    );
   } catch {
     fail(optionCode);
   }
@@ -2970,6 +3075,13 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     objectGetOwnPropertyDescriptor(
       storageBackend,
       "prepareRestoreAttachment",
+    )?.value,
+    optionCode,
+  );
+  const reconcileRestoreAttachment = trustedFunction(
+    objectGetOwnPropertyDescriptor(
+      storageBackend,
+      "reconcileRestoreAttachment",
     )?.value,
     optionCode,
   );
@@ -3117,6 +3229,94 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     return null;
   }
 
+  async function reconcileActivationProvider(activationRequest) {
+    let rawReconciliation;
+    try {
+      rawReconciliation = callIntrinsic(
+        reconcileRestoreAttachment,
+        storageBackend,
+        [activationRequest],
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    rawReconciliation = (
+      await awaitTrustedSettlement(
+        settleTrusted(rawReconciliation, outcomeCode),
+        outcomeCode,
+      )
+    ).value;
+    let reconciliation;
+    try {
+      reconciliation = assertRestoreAttachmentReconciliationResult(
+        rawReconciliation,
+        { request: activationRequest },
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    reconciliation = clonePlainData(
+      canonicalJsonData(reconciliation, outcomeCode),
+      outcomeCode,
+    );
+    ensure(
+      reconciliation.contractVersion ===
+        RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+      outcomeCode,
+    );
+    return reconciliation;
+  }
+
+  async function prepareAndFinalizeFreshActivation(
+    read,
+    candidate,
+    activationRequest,
+    probe,
+  ) {
+    try {
+      let rawActivationResult = callIntrinsic(
+        prepareRestoreAttachment,
+        storageBackend,
+        [activationRequest],
+      );
+      rawActivationResult = (
+        await awaitTrustedSettlement(
+          settleTrusted(rawActivationResult, outcomeCode),
+          outcomeCode,
+        )
+      ).value;
+      let activationResult;
+      try {
+        activationResult = assertRestoreAttachmentActivationResult(
+          rawActivationResult,
+          { request: activationRequest },
+        );
+      } catch {
+        fail(outcomeCode);
+      }
+      activationResult = clonePlainData(
+        canonicalJsonData(activationResult, outcomeCode),
+        outcomeCode,
+      );
+      await probeGuard(probe);
+      return await finalizeActivationHandoff(
+        read,
+        candidate,
+        activationRequest,
+        activationResult,
+        "1",
+      );
+    } catch {
+      try {
+        await markStartingUncertain(read);
+      } catch {
+        // The physical dispatch may have occurred. Failure to persist the
+        // uncertainty marker cannot authorize another prepare attempt.
+      }
+      fail(outcomeCode);
+    }
+  }
+
   async function runGuarded(operationId, callback) {
     let pending;
     try {
@@ -3243,11 +3443,34 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     });
   }
 
-  async function reconcileRestoreActivationInternal(candidateValue) {
-    const candidate = normalizeActivationCandidate(candidateValue, requestCode);
-    return runGuarded(candidate.activationOperationId, async (probe) => {
-      await probeGuard(probe);
-      let read = normalizeActivationReadReceipt(
+  async function reconcileRestoreActivationCore(
+    candidate,
+    localDispatchGranted,
+    probe,
+    initialRead = null,
+  ) {
+    await probeGuard(probe);
+    let read =
+      initialRead ??
+      normalizeActivationReadReceipt(
+        await invokeAuthority("readRestoreAttachmentActivation", {
+          operationId: candidate.activationOperationId,
+        }),
+        candidate,
+        outcomeCode,
+      );
+    if (read.operation.state === "committed") {
+      return finalizeActivationHandoff(
+        read,
+        candidate,
+        read.activationRequest,
+        read.operation.result.activationResult,
+        revisionAfter(read.operation.revision, -1, outcomeCode),
+      );
+    }
+    if (read.operation.state === "starting" && !localDispatchGranted) {
+      await markStartingUncertain(read);
+      read = normalizeActivationReadReceipt(
         await invokeAuthority("readRestoreAttachmentActivation", {
           operationId: candidate.activationOperationId,
         }),
@@ -3263,111 +3486,152 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
           revisionAfter(read.operation.revision, -1, outcomeCode),
         );
       }
-      if (read.operation.state === "starting") {
-        await markStartingUncertain(read);
-        read = normalizeActivationReadReceipt(
-          await invokeAuthority("readRestoreAttachmentActivation", {
-            operationId: candidate.activationOperationId,
-          }),
-          candidate,
-          outcomeCode,
-        );
-        if (read.operation.state === "committed") {
-          return finalizeActivationHandoff(
-            read,
-            candidate,
-            read.activationRequest,
-            read.operation.result.activationResult,
-            revisionAfter(read.operation.revision, -1, outcomeCode),
-          );
-        }
-      }
-      ensure(
-        read.operation.state === "uncertain" &&
-          read.activationRequest !== null &&
-          read.generation !== null,
+    }
+    ensure(
+      (read.operation.state === "uncertain" ||
+        (localDispatchGranted && read.operation.state === "starting")) &&
+        read.activationRequest !== null &&
+        read.generation !== null,
+      outcomeCode,
+    );
+    const destination = await resolveDestination(
+      "activation",
+      candidate,
+      read,
+    );
+    await probeGuard(probe);
+    let completion;
+    try {
+      completion = await callIntrinsic(
+        verifyCommittedRestoreDestinationIntrinsic,
+        options.publication,
+        [activationVerifierInput(read, destination, outcomeCode)],
+      );
+    } catch {
+      fail(outcomeCode);
+    }
+    const completionMaterialization = normalizePublicationMaterialization(
+      completion.materialization,
+      read.generation.document.artifactProof,
+      "restore-destination",
+      read.generation.binding,
+      outcomeCode,
+      false,
+    );
+    ensure(
+      sameJson(
+        completionMaterialization,
+        read.generation.document.materialization,
         outcomeCode,
-      );
-      const destination = await resolveDestination(
-        "activation",
-        candidate,
-        read,
-      );
-      await probeGuard(probe);
-      let completion;
-      try {
-        completion = await callIntrinsic(
-          verifyCommittedRestoreDestinationIntrinsic,
-          options.publication,
-          [activationVerifierInput(read, destination, outcomeCode)],
-        );
-      } catch {
-        fail(outcomeCode);
-      }
-      const completionMaterialization = normalizePublicationMaterialization(
-        completion.materialization,
-        read.generation.document.artifactProof,
-        "restore-destination",
-        read.generation.binding,
-        outcomeCode,
-        false,
-      );
-      ensure(
+      ) &&
         sameJson(
-          completionMaterialization,
-          read.generation.document.materialization,
+          completion.result,
+          read.generation.document.result,
           outcomeCode,
-        ) &&
-          sameJson(
-            completion.result,
-            read.generation.document.result,
-            outcomeCode,
-          ),
-        outcomeCode,
-      );
-      const activationRequest = validateActivationPublication(
-        read.activationRequest,
-        completion,
-        destination,
-        outcomeCode,
-      );
-      await probeGuard(probe);
-      let rawActivationResult;
-      try {
-        rawActivationResult = callIntrinsic(
-          prepareRestoreAttachment,
-          storageBackend,
-          [activationRequest],
-        );
-      } catch {
-        fail(outcomeCode);
-      }
-      rawActivationResult = (
-        await awaitTrustedSettlement(
-          settleTrusted(rawActivationResult, outcomeCode),
-          outcomeCode,
-        )
-      ).value;
-      let activationResult;
-      try {
-        activationResult = assertRestoreAttachmentActivationResult(
-          rawActivationResult,
-          { request: activationRequest },
-        );
-      } catch {
-        fail(outcomeCode);
-      }
-      activationResult = clonePlainData(
-        canonicalJsonData(activationResult, outcomeCode),
-        outcomeCode,
-      );
-      await probeGuard(probe);
+        ),
+      outcomeCode,
+    );
+    const activationRequest = validateActivationPublication(
+      read.activationRequest,
+      completion,
+      destination,
+      outcomeCode,
+    );
+    await probeGuard(probe);
+    const reconciliation = await reconcileActivationProvider(
+      activationRequest,
+    );
+    await probeGuard(probe);
+    if (reconciliation.outcome === "applied") {
       return finalizeActivationHandoff(
         read,
         candidate,
         activationRequest,
-        activationResult,
-        "2",
+        reconciliation.result,
+        read.operation.state === "starting" ? "1" : "2",
+      );
+    }
+    ensure(
+      reconciliation.outcome === "absent-and-quiescent" ||
+        reconciliation.outcome === "unknown",
+      outcomeCode,
+    );
+    if (
+      reconciliation.outcome !== "absent-and-quiescent" ||
+      !localDispatchGranted ||
+      read.operation.state !== "starting"
+    ) {
+      fail(outcomeCode);
+    }
+    return prepareAndFinalizeFreshActivation(
+      read,
+      candidate,
+      activationRequest,
+      probe,
+    );
+  }
+
+  async function reconcileRestoreActivationInternal(candidateValue) {
+    const candidate = normalizeActivationCandidate(candidateValue, requestCode);
+    return runGuarded(candidate.activationOperationId, async (probe) => {
+      return reconcileRestoreActivationCore(candidate, false, probe);
+    });
+  }
+
+  async function claimAndReconcileRestoreActivationInternal(baseValue) {
+    const base = normalizeActivationClaimBase(baseValue, requestCode);
+    const candidate = exactFrozenRecord({
+      activationOperationId: base.operationId,
+      request: base.request,
+      state: "starting",
+    });
+    return runGuarded(base.operationId, async (probe) => {
+      await probeGuard(probe);
+      let claimSettlement;
+      try {
+        claimSettlement = await invokeAuthoritySettlement(
+          "claimRestoreAttachmentActivationDispatch",
+          exactFrozenRecord({
+            ...base,
+            expectedOperationRevision: "0",
+          }),
+        );
+      } catch (error) {
+        if (error !== authorityInvocationUncertain) throw error;
+      }
+      let localDispatchGranted = false;
+      let read;
+      if (claimSettlement === undefined) {
+        read = normalizeActivationReadReceipt(
+          await invokeAuthority("readRestoreAttachmentActivation", {
+            operationId: base.operationId,
+          }),
+          candidate,
+          outcomeCode,
+        );
+        ensure(
+          sameJson(
+            read.operation.expectedSession,
+            base.expectedSession,
+            outcomeCode,
+          ),
+          outcomeCode,
+        );
+      } else {
+        const claim = normalizeActivationClaimReceipt(
+          cloneAuthoritySettlement(claimSettlement.value),
+          candidate,
+          base.expectedSession,
+          outcomeCode,
+        );
+        localDispatchGranted = claim.dispatchGranted;
+        read = claim.read;
+      }
+      return reconcileRestoreActivationCore(
+        candidate,
+        localDispatchGranted,
+        probe,
+        read,
       );
     });
   }
@@ -3383,9 +3647,16 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
       ensure(reconcileArgs.length === 1, requestCode);
       return reconcileRestoreActivationInternal(reconcileArgs[0]);
     };
+  const claimAndReconcileRestoreAttachmentActivation =
+    function claimAndReconcileRestoreAttachmentActivation(...claimArgs) {
+      ensure(claimArgs.length === 1, requestCode);
+      return claimAndReconcileRestoreActivationInternal(claimArgs[0]);
+    };
   objectFreeze(reconcileRestoreGeneration);
   objectFreeze(reconcileRestoreAttachmentActivation);
+  objectFreeze(claimAndReconcileRestoreAttachmentActivation);
   return exactFrozenRecord({
+    claimAndReconcileRestoreAttachmentActivation,
     reconcileRestoreAttachmentActivation,
     reconcileRestoreGeneration,
   });

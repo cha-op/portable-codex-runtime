@@ -7,7 +7,7 @@ updated: 2026-08-06
 branch: wip/detached-restore-activation
 pr: 30
 supersedes: []
-superseded_by:
+superseded_by: 20260812-b6d4e1
 ---
 
 # Detached Restore Activation and Recovery Composition
@@ -52,6 +52,11 @@ reports unreadable or failed revalidation separately from absence.
 > its exact historical replay contract. The capture-bound request version 2
 > correction is tracked in
 > `docs/project_journal/2026/08/2026-08-06-capture-bound-restore-activation-c4a2d8.md`.
+>
+> The original recovery wording below also predates the no-second-attach
+> boundary. Current recovery uses the read-only reconciliation contract in
+> `docs/project_journal/2026/08/2026-08-12-restore-activation-reconciliation-b6d4e1.md`;
+> it never repeats provider attachment for retained work.
 
 - `verifyCommittedRestoreDestination()` is source-free and read-only. It
   accepts only the exact committed restore journal/publication identity,
@@ -101,8 +106,9 @@ reports unreadable or failed revalidation separately from absence.
 5. The bounded recovery service uses independent cursors for generation,
    attachment activation, prepared/active launch attempts, and current-launch
    inventory.
-   It may verify, attach idempotently, finalize, cancel an expired prepared
-   attempt, or reconcile stopped-only evidence. It must never publish, copy,
+   It may verify, reconcile an exact attachment read-only, finalize an already-
+   applied result, cancel an expired prepared attempt, or reconcile stopped-
+   only evidence. It must never repeat provider attachment, publish, copy,
    rename, reserve or consume an image, call the launch callback, adopt an
    opaque writer handle, or synthesize a capability.
 

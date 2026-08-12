@@ -28,8 +28,10 @@ import {
 import {
   PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   assertPreparedCheckpointCaptureBackend,
   assertRestoreAttachmentActivationBackend,
+  assertRestoreAttachmentReconciliationBackend,
   assertStorageBackend,
 } from "../src/session-storage-contracts.mjs";
 import {
@@ -212,8 +214,11 @@ function createLifecycleBackend(calls) {
     prepareRestoreAttachment: invoke,
     prepareWritableAttachment: invoke,
     provisionSession: invoke,
+    reconcileRestoreAttachment: invoke,
     restoreAttachmentActivationContractVersion:
       RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    restoreAttachmentReconciliationContractVersion:
+      RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
     restoreCheckpoint: invoke,
   });
 }
@@ -484,6 +489,10 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     assertRestoreAttachmentActivationBackend(runtime.backend),
     runtime.backend,
   );
+  assert.strictEqual(
+    assertRestoreAttachmentReconciliationBackend(runtime.backend),
+    runtime.backend,
+  );
   assert.equal(runtime.backend.backendId, BACKEND_ID);
   assert.equal(runtime.backend.contractVersion, 1);
   assert.equal(runtime.backend.captureReconciliationContractVersion, 1);
@@ -494,6 +503,10 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   assert.equal(
     runtime.backend.restoreAttachmentActivationContractVersion,
     RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  );
+  assert.equal(
+    runtime.backend.restoreAttachmentReconciliationContractVersion,
+    RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   );
   assert.equal(Object.isFrozen(runtime.backend), true);
 
@@ -989,6 +1002,27 @@ test("runtime composition rejects hostile options without leaking hostile behavi
       runtimeOptionError,
     );
     assert.equal(getterCalls, 0);
+    assertNoActivity(fixture);
+  });
+
+  await t.test("lifecycle backend restore reconciliation method", () => {
+    const fixture = createRuntimeFixture();
+    const lifecycleBackend = cloneWithDataProperty(
+      fixture.options.storage.lifecycleBackend,
+      "reconcileRestoreAttachment",
+      undefined,
+    );
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          storage: {
+            ...fixture.options.storage,
+            lifecycleBackend,
+          },
+        }),
+      runtimeOptionError,
+    );
     assertNoActivity(fixture);
   });
 

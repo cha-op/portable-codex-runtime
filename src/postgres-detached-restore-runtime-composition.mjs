@@ -41,6 +41,7 @@ import { PostgresSerializableStore } from "./postgres-serializable-store.mjs";
 import { PostgresSessionAuthority } from "./postgres-session-authority.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryBackend } from "./stopped-directory-backend.mjs";
@@ -103,6 +104,9 @@ const createWriterDetachIntrinsic = createPostgresWriterDetachComposition;
 const listCurrentWriterLaunchCandidatesIntrinsic =
   PostgresSessionAuthority.prototype
     .listCurrentWriterLaunchRecoveryCandidates;
+const claimRestoreAttachmentActivationDispatchIntrinsic =
+  PostgresSessionAuthority.prototype
+    .claimRestoreAttachmentActivationDispatch;
 const finalizeRestoreAttachmentActivationIntrinsic =
   PostgresSessionAuthority.prototype
     .finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt;
@@ -441,11 +445,21 @@ function preflightLifecycleBackend(backend) {
     backend,
     "prepareRestoreAttachment",
   );
+  const reconciliationVersion = prototypeDataValue(
+    backend,
+    "restoreAttachmentReconciliationContractVersion",
+  );
+  const reconcileRestoreAttachment = prototypeDataValue(
+    backend,
+    "reconcileRestoreAttachment",
+  );
   ensure(
-    activationVersion === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+    activationVersion === RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION &&
+      reconciliationVersion ===
+        RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   );
   trustedFunction(prepareRestoreAttachment);
-
+  trustedFunction(reconcileRestoreAttachment);
 }
 
 function ownFrozenDataFunction(receiver, name) {
@@ -543,6 +557,10 @@ function receiverCallback(method, receiver) {
 
 function createRestoreActivationAuthority(authority) {
   return exactFrozenRecord({
+    claimRestoreAttachmentActivationDispatch: receiverCallback(
+      claimRestoreAttachmentActivationDispatchIntrinsic,
+      authority,
+    ),
     finalizeRestoreAttachmentActivationAndReserveWriterLaunchAttempt:
       receiverCallback(
         finalizeRestoreAttachmentActivationIntrinsic,
