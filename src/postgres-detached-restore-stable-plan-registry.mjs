@@ -7,6 +7,10 @@ import {
   isPostgresDetachedRestorePlan,
 } from "./postgres-detached-restore-plan.mjs";
 import {
+  assertPostgresDetachedRestoreOperationalLeasePlan,
+  isPostgresDetachedRestoreOperationalLeaseBudget,
+} from "./postgres-detached-restore-operational-lease-budget.mjs";
+import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
 } from "./postgres-serializable-store.mjs";
@@ -87,6 +91,7 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 const FACTORY_OPTION_KEYS = objectFreeze([
+  "operationalLeaseBudget",
   "provisioningFleetCapabilityGate",
   "store",
 ]);
@@ -200,6 +205,8 @@ const ERROR_MESSAGES = objectFreeze({
     "PostgreSQL detached restore stable-plan identity conflicts with durable state",
   postgres_detached_restore_stable_plan_registry_not_found:
     "PostgreSQL detached restore stable plan was not found",
+  postgres_detached_restore_stable_plan_registry_operational_lease_required:
+    "PostgreSQL detached restore stable plan does not satisfy the operational lease budget",
   postgres_detached_restore_stable_plan_registry_outcome_uncertain:
     "PostgreSQL detached restore stable-plan outcome is uncertain",
   postgres_detached_restore_stable_plan_provisioning_capability_required:
@@ -1047,6 +1054,20 @@ function compareObserved(observed, input) {
   return observed.plan;
 }
 
+function assertOperationalLeasePlan(operationalLeaseBudget, plan) {
+  try {
+    assertPostgresDetachedRestoreOperationalLeasePlan(
+      operationalLeaseBudget,
+      plan,
+    );
+  } catch {
+    fail(
+      "postgres_detached_restore_stable_plan_registry_operational_lease_required",
+    );
+  }
+  return plan;
+}
+
 function provisionTransaction(store, input) {
   return runSerializable(store, (transaction) =>
     protectPromise(
@@ -1211,6 +1232,13 @@ export function createPostgresDetachedRestoreStablePlanRegistry(...args) {
     "invalid_postgres_detached_restore_stable_plan_registry_options";
   ensure(args.length === 1, optionCode);
   const options = exactDataObject(args[0], FACTORY_OPTION_KEYS, optionCode);
+  ensure(
+    isPostgresDetachedRestoreOperationalLeaseBudget(
+      options.operationalLeaseBudget,
+    ),
+    optionCode,
+  );
+  const operationalLeaseBudget = options.operationalLeaseBudget;
   const store = storeFromValue(options.store, optionCode);
   const provisioningFleetCapabilityGate = trustedFunction(
     options.provisioningFleetCapabilityGate,
@@ -1222,6 +1250,7 @@ export function createPostgresDetachedRestoreStablePlanRegistry(...args) {
   const provisionStablePlanInternal = async (...methodArgs) => {
     ensure(methodArgs.length === 1, requestCode);
     const input = normalizeProvisionRequest(methodArgs[0], requestCode);
+    assertOperationalLeasePlan(operationalLeaseBudget, input.plan);
     await protectPromise(
       invokeProvisioningGate(provisioningFleetCapabilityGate, input),
     );
@@ -1246,7 +1275,10 @@ export function createPostgresDetachedRestoreStablePlanRegistry(...args) {
     if (observed === null) {
       fail("postgres_detached_restore_stable_plan_registry_not_found");
     }
-    return compareObserved(observed, input);
+    return assertOperationalLeasePlan(
+      operationalLeaseBudget,
+      compareObserved(observed, input),
+    );
   };
   const resolveStablePlan = function resolveStablePlan(...methodArgs) {
     return protectPromise(resolveStablePlanInternal(...methodArgs));

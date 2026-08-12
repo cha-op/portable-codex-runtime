@@ -414,10 +414,15 @@ Restore and launcher authority are now split into eight serial pull requests:
      Transient invocation context never enters durable records. Deployment
      stops all nineteen boundaries before pool closure, and any failed drain is
      a sticky failed deployment rather than proof of physical quiescence.
-   - Remaining deployment assembly next admits an operational lease budget that
-     covers the complete critical path. After that it runs the whole assembled
-     restart/ambiguity/deadline matrix and constructs the final public restore-
-     capable backend in that order.
+   - Operational lease admission is now complete. Deployment derives separate
+     renewal-to-generation-claim and activation-to-launch-claim bounds from the
+     applicable method-specific deadline plus grace periods, an explicit
+     aggregate database-request allowance, and a positive safety margin. The
+     two independently minted leases use the maximum window rather than a sum;
+     stable-plan provisioning and every resolution enforce the same exact
+     configured duration before physical work. The remaining assembly order is
+     the whole restart/ambiguity/deadline matrix followed by the final public
+     restore-capable backend.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

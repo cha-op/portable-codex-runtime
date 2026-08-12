@@ -32,6 +32,10 @@ import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs
 import {
   isPostgresDetachedRestorePublicationBinding,
 } from "./postgres-detached-restore-physical-bindings.mjs";
+import {
+  assertPostgresDetachedRestoreOperationalLeaseDuration,
+  isPostgresDetachedRestoreOperationalLeaseBudget,
+} from "./postgres-detached-restore-operational-lease-budget.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -93,6 +97,7 @@ const MAX_DATA_STRING_LENGTH = 1_048_576;
 const OPTION_KEYS = objectFreeze([
   "authority",
   "operationGuard",
+  "operationalLeaseBudget",
   "publication",
   "resolveRestoreDestination",
   "storageBackend",
@@ -585,6 +590,21 @@ function fail(code) {
 
 function ensure(condition, code) {
   if (!condition) fail(code);
+}
+
+function requireOperationalLeaseDuration(
+  operationalLeaseBudget,
+  leaseDurationMilliseconds,
+  code,
+) {
+  try {
+    assertPostgresDetachedRestoreOperationalLeaseDuration(
+      operationalLeaseBudget,
+      leaseDurationMilliseconds,
+    );
+  } catch {
+    fail(code);
+  }
 }
 
 function exactDataObject(value, expectedKeys, code) {
@@ -3047,6 +3067,13 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
     "invalid_postgres_restore_activation_recovery_coordinator_options";
   ensure(args.length === 1, optionCode);
   const options = exactDataObject(args[0], OPTION_KEYS, optionCode);
+  ensure(
+    isPostgresDetachedRestoreOperationalLeaseBudget(
+      options.operationalLeaseBudget,
+    ),
+    optionCode,
+  );
+  const operationalLeaseBudget = options.operationalLeaseBudget;
   const authorityValue = exactDataObject(
     options.authority,
     AUTHORITY_KEYS,
@@ -3610,6 +3637,11 @@ export function createPostgresRestoreActivationRecoveryCoordinator(...args) {
 
   async function claimAndReconcileRestoreActivationInternal(baseValue) {
     const base = normalizeActivationClaimBase(baseValue, requestCode);
+    requireOperationalLeaseDuration(
+      operationalLeaseBudget,
+      base.request.leaseDurationMilliseconds,
+      outcomeCode,
+    );
     const candidate = exactFrozenRecord({
       activationOperationId: base.operationId,
       request: base.request,

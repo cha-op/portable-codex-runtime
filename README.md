@@ -385,15 +385,25 @@ accepts that resolver as a collaborator, while the assembled runtime binds its
 private resolver to the PostgreSQL registry. There is no autonomous
 cross-stage saga that guesses progress after restart.
 
-The configured lease duration must cover both database-clock claim windows:
-the safety-capture-to-generation boundary and the activation-to-launch
-boundary. Expiry fails closed and never authorizes a second physical dispatch.
+The deployment now admits one explicit operational lease duration against both
+database-clock claim windows: the safety-capture-to-generation boundary and
+the activation-to-launch boundary. Each window adds the applicable physical
+result deadlines and settlement graces in execution order, uses the retained-
+prepared activation continuation as the strict positive-term upper bound for
+the shorter fresh and in-flight branches, and includes an explicit aggregate
+database-request allowance plus a positive safety margin.
+The two leases are minted from separate PostgreSQL clock observations, so admission
+takes the maximum of the two window bounds rather than adding them. Stable-plan
+provisioning and every read-only resolution require the plan's hashed lease
+duration to equal the deployment policy and meet the derived minimum before
+physical work can begin. Expiry still fails closed and never authorizes a
+second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
 checkpoint adapter's `runRestore()` stub is unchanged. The complete assembled
-physical graph now has method-specific settlement; remaining phase-B work must
-admit an explicit operational lease budget, run the whole restart/ambiguous-
-outcome/deadline matrix, and only then construct the final public backend. A
+physical graph now has method-specific settlement and operational lease
+admission; remaining phase-B work must run the whole restart/ambiguous-outcome/
+deadline matrix and only then construct the final public backend. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
 facet plus narrow `stablePlanProvisioning` and `imagePlanReservations` facets
@@ -657,10 +667,10 @@ explicit PostgreSQL connection/bootstrap configuration, restore admission,
 shutdown drain, and final closure of four private pools now have one
 deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
 not a callback available to injected runtime collaborators. Production restore
-remains fail-closed. The settlement foundation and complete deployment-owned
-physical binding graph are now assembled; later slices must admit the
-operational lease budget, complete assembled restart/ambiguity/deadline
-validation, and wire the final adapter. Filesystem-
+remains fail-closed. The settlement foundation, complete deployment-owned
+physical binding graph, and operational lease admission are now assembled;
+later slices must complete assembled restart/ambiguity/deadline validation and
+wire the final adapter. Filesystem-
 image execution and differential backup remain later work.
 See
 `docs/architecture/stopped-directory-backend.md`.

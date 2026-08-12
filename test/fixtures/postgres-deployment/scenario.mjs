@@ -125,7 +125,7 @@ function restoreAdmission(operationId = "deployment-restore-operation-001") {
   };
 }
 
-function stablePlan(admission) {
+function stablePlan(admission, leaseDurationMilliseconds = 600_000) {
   return createPostgresDetachedRestorePlan({
     request: admission.request,
     plan: {
@@ -135,7 +135,7 @@ function stablePlan(admission) {
       detachMode: "release",
       holderId: "deployment-restored-writer-001",
       imagePlanId: "deployment-image-plan-001",
-      leaseDurationMilliseconds: 600_000,
+      leaseDurationMilliseconds,
       sourceArtifactDirectory:
         "/var/lib/portable-codex/artifacts/deployment-source-001",
       sourceArtifactOwnedRoot: "/var/lib/portable-codex/artifacts",
@@ -497,6 +497,11 @@ function validOptions() {
         }),
         supervisorSettlement: policies.supervisorSettlement,
       },
+      operationalLease: {
+        databaseRequestMilliseconds: 30_000,
+        leaseDurationMilliseconds: 600_000,
+        safetyMarginMilliseconds: 30_000,
+      },
       planRegistry: {
         provisioningFleetCapabilityGate(input) {
           calls.planGate += 1;
@@ -565,6 +570,34 @@ function validOptions() {
     },
   };
   return { calls, controls, options };
+}
+
+function assertNoConstructionEffects(calls, poolCount) {
+  assert.equal(fakePgState().pools.length, poolCount);
+  assert.deepEqual(calls, {
+    fleetGate: 0,
+    image: 0,
+    onStep: 0,
+    planGate: 0,
+    provider: 0,
+    publication: 0,
+    resolver: 0,
+    supervisor: 0,
+  });
+}
+
+function assertOperationalLeaseOptionRejection(options, calls) {
+  const poolCount = fakePgState().pools.length;
+  assert.equal(poolCount, 0);
+  assert.throws(
+    () => createPostgresDetachedRestoreDeployment(options),
+    (error) =>
+      assertDeploymentError(
+        error,
+        "invalid_postgres_detached_restore_deployment_options",
+      ),
+  );
+  assertNoConstructionEffects(calls, poolCount);
 }
 
 function assertDeploymentError(error, code) {
@@ -1306,6 +1339,83 @@ async function exactPhysicalConfigRejection() {
   }
 }
 
+async function exactOperationalLeaseConfigRejection() {
+  configureFakePg();
+  const cases = [];
+  {
+    const fixture = validOptions();
+    delete fixture.options.runtime.operationalLease;
+    cases.push(fixture);
+  }
+  {
+    const fixture = validOptions();
+    fixture.options.runtime.operationalLease.extra = true;
+    cases.push(fixture);
+  }
+  for (const field of [
+    "databaseRequestMilliseconds",
+    "leaseDurationMilliseconds",
+    "safetyMarginMilliseconds",
+  ]) {
+    {
+      const fixture = validOptions();
+      delete fixture.options.runtime.operationalLease[field];
+      cases.push(fixture);
+    }
+    for (const value of [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      86_400_001,
+    ]) {
+      const fixture = validOptions();
+      fixture.options.runtime.operationalLease[field] = value;
+      cases.push(fixture);
+    }
+  }
+  for (const { calls, options } of cases) {
+    assertOperationalLeaseOptionRejection(options, calls);
+  }
+
+  const { calls, options } = validOptions();
+  let getterCalls = 0;
+  Object.defineProperty(
+    options.runtime.operationalLease,
+    "databaseRequestMilliseconds",
+    {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return 30_000;
+      },
+    },
+  );
+  assertOperationalLeaseOptionRejection(options, calls);
+  assert.equal(getterCalls, 0);
+}
+
+async function tooShortOperationalLeaseRejection() {
+  configureFakePg();
+  const { calls, options } = validOptions();
+  options.runtime.operationalLease.leaseDurationMilliseconds = 1;
+  assertOperationalLeaseOptionRejection(options, calls);
+}
+
+async function operationalLeaseAggregateOverflowRejection() {
+  configureFakePg();
+  const { calls, options } = validOptions();
+  for (const policy of deploymentPhysicalPolicyLeaves(options)) {
+    policy.deadlineMilliseconds = 86_400_000;
+    policy.settlementGraceMilliseconds = 86_400_000;
+  }
+  options.runtime.operationalLease.databaseRequestMilliseconds = 86_400_000;
+  options.runtime.operationalLease.leaseDurationMilliseconds = 86_400_000;
+  options.runtime.operationalLease.safetyMarginMilliseconds = 86_400_000;
+  assertOperationalLeaseOptionRejection(options, calls);
+}
+
 async function applicationNameBudget() {
   configureFakePg();
   const { options } = validOptions();
@@ -2026,6 +2136,8 @@ const scenarios = Object.freeze({
     checkedOutClientErrorForcesFatalShutdown,
   "empty-password-blocks-ambient-fallback":
     emptyPasswordBlocksAmbientFallback,
+  "exact-operational-lease-config-rejection":
+    exactOperationalLeaseConfigRejection,
   "exact-physical-config-rejection": exactPhysicalConfigRejection,
   "hostile-options": hostileOptions,
   "hostile-topology-evidence-fails-closed":
@@ -2044,6 +2156,8 @@ const scenarios = Object.freeze({
     invalidClientQueryStillReleasesAndCleansUp,
   "object-prototype-then-cannot-forge-driver-evidence":
     objectPrototypeThenCannotForgeDriverEvidence,
+  "operational-lease-aggregate-overflow-rejection":
+    operationalLeaseAggregateOverflowRejection,
   "partial-construction-failure": partialConstructionFailure,
   "stop-waits-for-pool-acknowledgements":
     stopWaitsForPoolAcknowledgements,
@@ -2054,6 +2168,8 @@ const scenarios = Object.freeze({
   "topology-failure": topologyFailure,
   "topology-failure-with-pool-close-failure":
     topologyFailureWithPoolCloseFailure,
+  "too-short-operational-lease-rejection":
+    tooShortOperationalLeaseRejection,
   "verify-full-tls-configuration": verifyFullTlsConfiguration,
   "zero-io-and-lifecycle": zeroIoAndLifecycle,
 });

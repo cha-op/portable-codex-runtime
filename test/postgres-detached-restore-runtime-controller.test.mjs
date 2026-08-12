@@ -12,6 +12,10 @@ import {
   createPhysicalCollaboratorSettlement,
 } from "../src/physical-collaborator-settlement.mjs";
 import {
+  createPostgresDetachedRestoreOperationalLeaseBudget,
+  isPostgresDetachedRestoreOperationalLeaseBudget,
+} from "../src/postgres-detached-restore-operational-lease-budget.mjs";
+import {
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -21,6 +25,7 @@ import {
   isPostgresDetachedRestoreRuntimeController,
 } from "../src/postgres-detached-restore-runtime-controller.mjs";
 import {
+  PostgresDetachedRestoreRuntimeCompositionError,
   createPostgresDetachedRestoreRuntimeComposition,
 } from "../src/postgres-detached-restore-runtime-composition.mjs";
 import {
@@ -132,6 +137,27 @@ function physicalPolicies(methods) {
   );
 }
 
+function createTestOperationalLeaseBudget() {
+  return createPostgresDetachedRestoreOperationalLeaseBudget({
+    databaseRequestMilliseconds: 30_000,
+    imagePlanProviderSettlement: physicalPolicies([
+      "inspectCodex",
+      "resolveImagePlan",
+    ]),
+    leaseDurationMilliseconds: 600_000,
+    lifecycleBackendSettlement: physicalPolicies(
+      PHYSICAL_LIFECYCLE_METHODS,
+    ),
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    safetyMarginMilliseconds: 1_000,
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  });
+}
+
 function createTestPhysicalBindings(fixture, rawPublication, rawLifecycle) {
   const unexpected = async function unexpectedPhysicalProvider() {
     fixture.calls.provider += 1;
@@ -193,6 +219,17 @@ function controllerError(code) {
     assert.equal("cause" in error, false);
     return true;
   };
+}
+
+function runtimeCompositionOptionError(error) {
+  assert(error instanceof PostgresDetachedRestoreRuntimeCompositionError);
+  assert.equal(
+    error.code,
+    "invalid_postgres_detached_restore_runtime_composition_options",
+  );
+  assert.equal(error.retryable, false);
+  assert.equal(Object.isFrozen(error), true);
+  return true;
 }
 
 function provisioningCapabilityError(error) {
@@ -595,6 +632,7 @@ function createPublication(fixture) {
 async function createFixture({
   holdMigration = false,
   onStep = () => undefined,
+  operationalLeaseBudget = createTestOperationalLeaseBudget(),
   recoveryLockAcquired = true,
 } = {}) {
   const migrationSql = new Set(
@@ -700,6 +738,7 @@ async function createFixture({
       }),
     },
     planRegistry: {
+      operationalLeaseBudget,
       async provisioningFleetCapabilityGate(input) {
         fixture.calls.planGate += 1;
         if (fixture.planGateOverride !== undefined) {
@@ -743,7 +782,12 @@ async function createFixture({
     },
   });
   const controller = createPostgresDetachedRestoreRuntimeController({ runtime });
-  return Object.assign(fixture, { controller, pools, runtime });
+  return Object.assign(fixture, {
+    controller,
+    operationalLeaseBudget,
+    pools,
+    runtime,
+  });
 }
 
 function assertNoPhysicalEffects(fixture) {
@@ -761,6 +805,12 @@ function assertNoPhysicalEffects(fixture) {
 test("controller exposes only exact frozen admission and lifecycle facets", async () => {
   const fixture = await createFixture();
   const { controller } = fixture;
+  assert.equal(
+    isPostgresDetachedRestoreOperationalLeaseBudget(
+      fixture.operationalLeaseBudget,
+    ),
+    true,
+  );
   assert.deepEqual(Reflect.ownKeys(controller), [
     "foreground",
     "imagePlanReservations",
@@ -827,6 +877,13 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
   );
   assertNoPhysicalEffects(fixture);
   await controller.stop();
+});
+
+test("controller fixture rejects a forged operational lease budget", async () => {
+  await assert.rejects(
+    createFixture({ operationalLeaseBudget: Object.freeze({}) }),
+    runtimeCompositionOptionError,
+  );
 });
 
 test("one authentic runtime has exactly one controller owner without construction I/O", async () => {

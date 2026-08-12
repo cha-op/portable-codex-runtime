@@ -10,6 +10,10 @@ import {
   createPhysicalCollaboratorSettlement,
 } from "../src/physical-collaborator-settlement.mjs";
 import {
+  createPostgresDetachedRestoreOperationalLeaseBudget,
+  isPostgresDetachedRestoreOperationalLeaseBudget,
+} from "../src/postgres-detached-restore-operational-lease-budget.mjs";
+import {
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -193,6 +197,27 @@ function physicalPolicies(methods) {
       }),
     ]),
   );
+}
+
+function createTestOperationalLeaseBudget() {
+  return createPostgresDetachedRestoreOperationalLeaseBudget({
+    databaseRequestMilliseconds: 30_000,
+    imagePlanProviderSettlement: physicalPolicies([
+      "inspectCodex",
+      "resolveImagePlan",
+    ]),
+    leaseDurationMilliseconds: 600_000,
+    lifecycleBackendSettlement: physicalPolicies(
+      PHYSICAL_LIFECYCLE_METHODS,
+    ),
+    publicationSettlement: physicalPolicies(PHYSICAL_PUBLICATION_METHODS),
+    resolveRestoreDestinationSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    safetyMarginMilliseconds: 1_000,
+    supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+  });
 }
 
 function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
@@ -421,6 +446,7 @@ function createRuntimeFixture() {
     },
     pools,
     planRegistry: {
+      operationalLeaseBudget: createTestOperationalLeaseBudget(),
       provisioningFleetCapabilityGate() {
         calls.planProvisioningGate += 1;
         throw new Error("stable-plan provisioning gate must not run");
@@ -524,6 +550,12 @@ function restoreAdmission() {
 
 test("runtime composition constructs a frozen branded capture-only surface without I/O", () => {
   const fixture = createRuntimeFixture();
+  assert.equal(
+    isPostgresDetachedRestoreOperationalLeaseBudget(
+      fixture.options.planRegistry.operationalLeaseBudget,
+    ),
+    true,
+  );
   assert.equal(
     isPostgresDetachedRestorePublicationBinding(
       fixture.collaborators.publication,
@@ -853,6 +885,22 @@ test("runtime leaves lifecycle and pool shutdown ownership with the caller", asy
 });
 
 test("runtime composition rejects hostile options without leaking hostile behavior", async (t) => {
+  await t.test("forged operational lease budget", () => {
+    const fixture = createRuntimeFixture();
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          planRegistry: {
+            ...fixture.options.planRegistry,
+            operationalLeaseBudget: Object.freeze({}),
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
   await t.test("forged publication duck", () => {
     const fixture = createRuntimeFixture();
     const publication = Object.freeze(

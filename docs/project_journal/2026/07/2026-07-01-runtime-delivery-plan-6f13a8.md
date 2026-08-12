@@ -63,15 +63,17 @@ superseded_by:
   storage-lifecycle, four publication, and one restore-destination resolver
   boundary, plus the two existing image-provider boundaries. All retain their
   durable grants and readback/reconciliation rules while sharing one private
-  shutdown registry.
+  shutdown registry. Deployment now also derives one operational lease policy
+  from the two database-clock critical windows, the applicable physical
+  deadline-plus-grace bounds, an explicit aggregate database allowance, and a
+  positive safety margin. Stable-plan provisioning and every resolution
+  enforce that exact lease before physical work.
   The production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Admit the operational lease budget across the now-bounded complete critical
-  path.
 - Validate the complete assembled restart, ambiguous-outcome, deadline, and
   grace-breach matrix, then construct the final public restore-capable backend
   and enable the production adapter only if the no-second-writer boundary
@@ -83,6 +85,7 @@ superseded_by:
 - `docs/architecture/stopped-directory-publication.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-settlement-graph-f4c8a1.md`
+- `docs/project_journal/2026/08/2026-08-12-operational-lease-budget-c2e7b4.md`
 - `docs/project_journal/2026/08/2026-08-12-restore-activation-reconciliation-b6d4e1.md`
 - `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - `docs/project_journal/2026/08/2026-08-12-postgres-detached-restore-deployment-7d4a91.md`
