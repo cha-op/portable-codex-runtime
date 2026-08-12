@@ -2,8 +2,9 @@ import { Hash, createHash, randomUUID } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
 import {
-  PlatformImageReservationCoordinator,
-} from "./platform-image-reservation.mjs";
+  isPostgresDetachedRestoreImagePlanBinding,
+  isPostgresDetachedRestoreImagePlanReservation,
+} from "./postgres-detached-restore-image-plan-binding.mjs";
 import {
   PostgresOperationGuard,
   isPostgresOperationGuard,
@@ -50,10 +51,6 @@ const DateConstructor = Date;
 const functionToStringIntrinsic = Function.prototype.toString;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
-const imageConsumeReservationIntrinsic =
-  PlatformImageReservationCoordinator.prototype.consumeReservation;
-const imageRevalidateReservationIntrinsic =
-  PlatformImageReservationCoordinator.prototype.revalidateReservation;
 const JsonObject = JSON;
 const jsonStringifyIntrinsic = JSON.stringify;
 const mapDeleteIntrinsic = Map.prototype.delete;
@@ -125,7 +122,7 @@ const UUID_PATTERN =
 
 const OPTION_KEYS = objectFreeze([
   "authority",
-  "imageReservations",
+  "imagePlanBinding",
   "operationGuard",
   "stoppedWriterCoordinator",
   "supervisor",
@@ -163,12 +160,6 @@ const RUN_INPUT_KEYS = objectFreeze([
 const PREPARED_RUN_INPUT_KEYS = objectFreeze([
   "imageReservation",
   "launchAttemptId",
-]);
-const IMAGE_RESERVATION_KEYS = objectFreeze([
-  "configBytes",
-  "descriptor",
-  "inspectCodex",
-  "reservation",
 ]);
 const RECONCILE_INPUT_KEYS = objectFreeze(["launchAttemptId"]);
 const RESOLVER_INPUT_KEYS = objectFreeze([
@@ -2821,21 +2812,8 @@ export function derivePostgresLogicalWriterStopOperationId(...args) {
 }
 
 function normalizeImageReservation(value, code) {
-  const image = exactDataObject(value, IMAGE_RESERVATION_KEYS, code);
-  ensure(
-    typeof image.inspectCodex === "function" &&
-      !isProxyValue(image.inspectCodex) &&
-      image.reservation !== null &&
-      typeof image.reservation === "object" &&
-      !isProxyValue(image.reservation),
-    code,
-  );
-  return exactFrozenRecord({
-    configBytes: image.configBytes,
-    descriptor: image.descriptor,
-    inspectCodex: image.inspectCodex,
-    reservation: image.reservation,
-  });
+  ensure(isPostgresDetachedRestoreImagePlanReservation(value), code);
+  return value;
 }
 
 function ensureMeasuredImageMatchesSession(
@@ -3045,8 +3023,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
     optionCode,
   );
   ensure(
-    !isProxyValue(options.imageReservations) &&
-      options.imageReservations instanceof PlatformImageReservationCoordinator,
+    isPostgresDetachedRestoreImagePlanBinding(options.imagePlanBinding),
     optionCode,
   );
   ensure(
@@ -3077,7 +3054,20 @@ export function createPostgresLogicalWriterLauncher(...args) {
     ),
     supervisorId: assertOpaqueId(supervisorOptions.supervisorId, optionCode),
   });
-  const imageReservations = options.imageReservations;
+  const imagePlanBinding = options.imagePlanBinding;
+  const imageConsumeReservation = objectGetOwnPropertyDescriptor(
+    imagePlanBinding,
+    "consumeImageReservation",
+  )?.value;
+  const imageRevalidateReservation = objectGetOwnPropertyDescriptor(
+    imagePlanBinding,
+    "revalidateImageReservation",
+  )?.value;
+  ensure(
+    typeof imageConsumeReservation === "function" &&
+      typeof imageRevalidateReservation === "function",
+    optionCode,
+  );
   const stoppedWriterCoordinator = options.stoppedWriterCoordinator;
   const recordsByAttempt = new MapConstructor();
   const recordsByAttachmentId = new MapConstructor();
@@ -3130,8 +3120,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
   async function revalidateImageReservation(imageReservation, code) {
     return normalizeMeasuredImage(
       await invokeImageCoordinator(
-        imageReservations,
-        imageRevalidateReservationIntrinsic,
+        imagePlanBinding,
+        imageRevalidateReservation,
         imageReservation,
         code,
       ),
@@ -3526,8 +3516,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
     );
     const consumedImage = normalizeMeasuredImage(
       await invokeImageCoordinator(
-        imageReservations,
-        imageConsumeReservationIntrinsic,
+        imagePlanBinding,
+        imageConsumeReservation,
         imageReservation,
         outcomeCode,
       ),

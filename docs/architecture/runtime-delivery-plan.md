@@ -340,13 +340,14 @@ Restore and launcher authority are now split into eight serial pull requests:
      repeat a physical side effect.
    - The production-neutral phase-B assembly foundation is complete. One
      strict factory constructs the capture-only backend, standalone foreground
-     facade, idle scheduler, and narrow writer-launch ingress from a single
-     internal authority graph, one authority/store pool, and three pairwise-
-     distinct nested/foreground/recovery guard pools. The ingress exposes only
-     `runLaunch()` and `reconcileLaunchAttempt()` from the same process-local
-     launcher used by capture and foreground restore. Construction performs no
-     migration, scheduler lifecycle action, provider action, pool close, or
-     production restore routing.
+     facade, idle scheduler, and narrow writer-launch plus image-plan-
+     reservation ingress from a single internal authority graph, one
+     authority/store pool, and three pairwise-distinct nested/foreground/
+     recovery guard pools. The launch ingress exposes only `runLaunch()` and
+     `reconcileLaunchAttempt()` from the same process-local launcher used by
+     capture and foreground restore. Construction performs no migration,
+     scheduler lifecycle action, provider action, pool close, or production
+     restore routing.
    - The PostgreSQL durable stable-plan registry slice is complete. Migration
      7 adds immutable canonical admission and plan storage plus a permanent
      operation-ID claim. Separately gated provisioning performs insert or
@@ -364,9 +365,10 @@ Restore and launcher authority are now split into eight serial pull requests:
      capability for the deployment lifecycle owner.
    - The deployment controller now performs migration before serving, starts
      the scheduler, requires its immediate coalesced pass to prove a complete
-     four-lane sweep, and only then opens the gated foreground, stable-plan,
-     and writer-launch facets. Stop closes admission, stops the scheduler, and
-     drains all accepted calls without closing the four borrowed pools.
+     four-lane sweep, and only then opens the gated foreground, image-plan-
+     reservation, stable-plan, and writer-launch facets. Stop closes
+     admission, stops the scheduler, and drains all accepted calls without
+     closing the four borrowed pools.
    - The PostgreSQL deployment boundary now accepts exact explicit connection,
      verified-TLS, timeout, application-name, and per-role capacity
      configuration and constructs the four private pools. Before controller
@@ -376,9 +378,21 @@ Restore and launcher authority are now split into eight serial pull requests:
      point-in-time startup evidence, not continuous topology monitoring. Stop
      drains the controller before it attempts and awaits closure of all four
      pools; none of those internals is exposed.
-   - Remaining deployment assembly then owns physical provider/image, the
-     operational lease budget, complete assembled restart/ambiguity
-     validation, and construction of the final public restore-capable backend.
+   - The deployment-owned image-plan binding is complete. One exact provider
+     configuration maps an authentic plan's `imagePlanId` to exact OCI
+     manifest/config bytes and trusted Codex inspection, then returns an opaque
+     process-local reservation through a gated preparation-only facet.
+     Resolver and inspector Promises must settle exact frozen null-prototype
+     records so inherited `then` cannot replace evidence before validation.
+     Foreground and the logical launcher use the same private binding for later
+     revalidation.
+     This does not fetch images, verify signatures, pin or launch a container
+     runtime, implement a supervisor/provider/storage adapter, or create a
+     physical writer fence.
+   - Remaining deployment assembly next bounds physical-collaborator
+     settlement and deadlines, admits the operational lease budget, runs the
+     whole assembled restart/ambiguity matrix, and constructs the final public
+     restore-capable backend in that order.
    - Enable `runRestore()` only after the whole protocol preserves the
      no-second-writer boundary across acknowledgement loss, restart, and
      ambiguous publication, launch, registration, stop, or finalisation

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import { FilesystemOperationJournal } from "../../../src/filesystem-operation-journal.mjs";
-import { PlatformImageReservationCoordinator } from "../../../src/platform-image-reservation.mjs";
+import {
+  isPostgresDetachedRestoreImagePlanReservation,
+  POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+} from "../../../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
 } from "../../../src/postgres-logical-writer-launcher.mjs";
@@ -14,6 +18,7 @@ import {
 } from "../../../src/postgres-detached-restore-stable-plan-registry.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  createSessionManifest,
 } from "../../../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../../../src/stopped-directory-publication.mjs";
 import { StoppedWriterCapabilityCoordinator } from "../../../src/stopped-writer-capability.mjs";
@@ -36,6 +41,10 @@ const BACKEND_ID = "deployment-capture-only-backend";
 const SESSION_ID = "019f8800-0000-7000-8000-000000000001";
 const THREAD_ID = "019f8800-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const OCI_MANIFEST_MEDIA_TYPE =
+  "application/vnd.oci.image.manifest.v1+json";
+const OCI_CONFIG_MEDIA_TYPE =
+  "application/vnd.oci.image.config.v1+json";
 const MIGRATION_URLS = Object.freeze([
   new URL("../../../migrations/authority/001-session-authority.sql", import.meta.url),
   new URL("../../../migrations/authority/002-restore-destination-generations.sql", import.meta.url),
@@ -48,6 +57,10 @@ const MIGRATION_URLS = Object.freeze([
 
 function exactKeys(value, expected) {
   assert.deepEqual(Reflect.ownKeys(value).sort(), [...expected].sort());
+}
+
+function safeProviderCarrier(value) {
+  return Object.freeze(Object.assign(Object.create(null), value));
 }
 
 function assertStatusReceipt(value, expected) {
@@ -108,6 +121,78 @@ function stablePlan(admission) {
       sourceArtifactOwnedRoot: "/var/lib/portable-codex/artifacts",
     },
   });
+}
+
+function digest(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function imagePlanFixture() {
+  const configBytes = Buffer.from(
+    JSON.stringify({
+      architecture: "arm64",
+      config: { Env: ["PATH=/usr/local/bin:/usr/bin:/bin"] },
+      os: "linux",
+      rootfs: {
+        diff_ids: [`sha256:${"d".repeat(64)}`],
+        type: "layers",
+      },
+    }),
+    "utf8",
+  );
+  const descriptorBytes = Buffer.from(
+    JSON.stringify({
+      config: {
+        digest: digest(configBytes),
+        mediaType: OCI_CONFIG_MEDIA_TYPE,
+        size: configBytes.byteLength,
+      },
+      layers: [
+        {
+          digest: `sha256:${"c".repeat(64)}`,
+          mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+          size: 1024,
+        },
+      ],
+      mediaType: OCI_MANIFEST_MEDIA_TYPE,
+      schemaVersion: 2,
+    }),
+    "utf8",
+  );
+  const descriptor = Object.freeze({
+    bytes: descriptorBytes,
+    digest: digest(descriptorBytes),
+    mediaType: OCI_MANIFEST_MEDIA_TYPE,
+    size: descriptorBytes.byteLength,
+  });
+  return Object.freeze({
+    configBytes,
+    descriptor,
+    sessionManifest: createSessionManifest({
+      sessionId: SESSION_ID,
+      codex: {
+        ephemeral: false,
+        historyMode: "paginated",
+        rootThreadId: THREAD_ID,
+        sessionId: THREAD_ID,
+      },
+      runtime: {
+        codexSandbox: "danger-full-access",
+        codexVersion: "codex-cli 0.144.1",
+        imageDigest: descriptor.digest,
+        imageMediaType: OCI_MANIFEST_MEDIA_TYPE,
+        platform: "linux/arm64",
+      },
+    }),
+  });
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function unexpected(calls, key) {
@@ -172,7 +257,12 @@ function validOptions() {
     resolver: 0,
     supervisor: 0,
   };
-  const controls = { planGateOverride: null };
+  const controls = {
+    imagePlanBlock: null,
+    imagePlanEntered: null,
+    imagePlanFixture: imagePlanFixture(),
+    planGateOverride: null,
+  };
   const options = {
     postgres: {
       applicationNamePrefix: "pcr-deployment-test",
@@ -219,11 +309,28 @@ function validOptions() {
         },
       },
       launch: {
-        imageReservations: new PlatformImageReservationCoordinator(),
-        prepareImageReservation() {
-          calls.image += 1;
-          throw new Error("image preparation must not run");
-        },
+        imagePlanProvider: Object.freeze({
+          contractVersion:
+            POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+          imagePlanProviderId: "deployment-image-provider-001",
+          async inspectCodex() {
+            calls.image += 1;
+            return safeProviderCarrier({
+              codexBinaryPath: "/opt/portable-codex/bin/codex",
+              codexBinarySha256: "b".repeat(64),
+              codexVersion: "codex-cli 0.144.1",
+            });
+          },
+          async resolveImagePlan() {
+            calls.image += 1;
+            controls.imagePlanEntered?.resolve();
+            await controls.imagePlanBlock?.promise;
+            return safeProviderCarrier({
+              configBytes: controls.imagePlanFixture.configBytes,
+              descriptor: controls.imagePlanFixture.descriptor,
+            });
+          },
+        }),
         stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
         supervisor: Object.freeze({
           contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
@@ -331,6 +438,7 @@ async function zeroIoAndLifecycle() {
   const deployment = createPostgresDetachedRestoreDeployment(options);
   exactKeys(deployment, [
     "foreground",
+    "imagePlanReservations",
     "stablePlanProvisioning",
     "start",
     "stop",
@@ -339,6 +447,15 @@ async function zeroIoAndLifecycle() {
   assert.equal(Object.getPrototypeOf(deployment), null);
   assert.equal(Object.isFrozen(deployment), true);
   assert.equal(isPostgresDetachedRestoreDeployment(deployment), true);
+  exactKeys(deployment.imagePlanReservations, ["prepareImageReservation"]);
+  assert.equal(Object.getPrototypeOf(deployment.imagePlanReservations), null);
+  assert.equal(Object.isFrozen(deployment.imagePlanReservations), true);
+  assert.equal(
+    Object.isFrozen(
+      deployment.imagePlanReservations.prepareImageReservation,
+    ),
+    true,
+  );
   for (const hidden of [
     "backend",
     "bootstrap",
@@ -1308,6 +1425,60 @@ async function objectPrototypeThenCannotForgeDriverEvidence() {
   }
 }
 
+async function imagePlanReservationIngressIsGatedAndDrained() {
+  configureFakePg();
+  const { calls, controls, options } = validOptions();
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  const admission = restoreAdmission("deployment-image-plan-ingress-001");
+  const input = {
+    plan: stablePlan(admission),
+    sessionManifest: controls.imagePlanFixture.sessionManifest,
+  };
+
+  assert.throws(
+    () => deployment.imagePlanReservations.prepareImageReservation(input),
+    requestError,
+  );
+  const starting = deployment.start();
+  assert.throws(
+    () => deployment.imagePlanReservations.prepareImageReservation(input),
+    requestError,
+  );
+  assertStatusReceipt(await starting, "ready");
+
+  controls.imagePlanEntered = deferred();
+  controls.imagePlanBlock = deferred();
+  const admitted =
+    deployment.imagePlanReservations.prepareImageReservation(input);
+  await controls.imagePlanEntered.promise;
+  const stopped = deployment.stop();
+  let stopSettled = false;
+  void stopped.then(() => {
+    stopSettled = true;
+  });
+  assert.throws(
+    () => deployment.imagePlanReservations.prepareImageReservation(input),
+    requestError,
+  );
+  await nextTurn();
+  assert.equal(stopSettled, false);
+  controls.imagePlanBlock.resolve();
+  const reservation = await admitted;
+  assert.equal(
+    isPostgresDetachedRestoreImagePlanReservation(reservation),
+    true,
+  );
+  assert.equal(Object.getPrototypeOf(reservation), null);
+  assert.deepEqual(Reflect.ownKeys(reservation), []);
+  assert.equal(Object.isFrozen(reservation), true);
+  assertStatusReceipt(await stopped, "stopped");
+  assert.throws(
+    () => deployment.imagePlanReservations.prepareImageReservation(input),
+    requestError,
+  );
+  assert.equal(calls.image, 2);
+}
+
 const scenarios = Object.freeze({
   "abnormal-pool-end-results-still-attempt-every-pool":
     abnormalPoolEndResultsStillAttemptEveryPool,
@@ -1328,6 +1499,8 @@ const scenarios = Object.freeze({
     hostileTopologyEvidenceFailsClosed,
   "idle-pool-error-forces-terminal-shutdown":
     idlePoolErrorForcesTerminalShutdown,
+  "image-plan-reservation-ingress-is-gated-and-drained":
+    imagePlanReservationIngressIsGatedAndDrained,
   "independent-deployments-use-distinct-probe-keys":
     independentDeploymentsUseDistinctProbeKeys,
   "invalid-client-query-still-releases-and-cleans-up":

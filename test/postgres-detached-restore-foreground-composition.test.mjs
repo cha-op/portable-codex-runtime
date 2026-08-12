@@ -9,6 +9,11 @@ import {
   isPostgresDetachedRestoreForegroundComposition,
 } from "../src/postgres-detached-restore-foreground-composition.mjs";
 import {
+  POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+  createPostgresDetachedRestoreImagePlanBinding,
+  isPostgresDetachedRestoreImagePlanReservation,
+} from "../src/postgres-detached-restore-image-plan-binding.mjs";
+import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
@@ -43,7 +48,54 @@ import {
 const SESSION_ID = "019f7f40-0000-7000-8000-000000000001";
 const THREAD_ID = "019f7f40-0000-7000-8000-000000000002";
 const BASE_TIME = "2026-08-11T08:00:00.000Z";
-const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const OCI_MANIFEST_MEDIA_TYPE =
+  "application/vnd.oci.image.manifest.v1+json";
+const OCI_CONFIG_MEDIA_TYPE =
+  "application/vnd.oci.image.config.v1+json";
+const IMAGE_CONFIG_BYTES = Buffer.from(
+  JSON.stringify({
+    architecture: "arm64",
+    config: { Env: ["PATH=/usr/local/bin:/usr/bin:/bin"] },
+    os: "linux",
+    rootfs: { type: "layers", diff_ids: [`sha256:${"d".repeat(64)}`] },
+  }),
+  "utf8",
+);
+const IMAGE_CONFIG_DIGEST = `sha256:${createHash("sha256")
+  .update(IMAGE_CONFIG_BYTES)
+  .digest("hex")}`;
+const IMAGE_DESCRIPTOR_BYTES = Buffer.from(
+  JSON.stringify({
+    schemaVersion: 2,
+    mediaType: OCI_MANIFEST_MEDIA_TYPE,
+    config: {
+      digest: IMAGE_CONFIG_DIGEST,
+      mediaType: OCI_CONFIG_MEDIA_TYPE,
+      size: IMAGE_CONFIG_BYTES.byteLength,
+    },
+    layers: [
+      {
+        digest: `sha256:${"c".repeat(64)}`,
+        mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+        size: 1024,
+      },
+    ],
+  }),
+  "utf8",
+);
+const IMAGE_DIGEST = `sha256:${createHash("sha256")
+  .update(IMAGE_DESCRIPTOR_BYTES)
+  .digest("hex")}`;
+const IMAGE_DESCRIPTOR = Object.freeze({
+  bytes: IMAGE_DESCRIPTOR_BYTES,
+  digest: IMAGE_DIGEST,
+  mediaType: OCI_MANIFEST_MEDIA_TYPE,
+  size: IMAGE_DESCRIPTOR_BYTES.byteLength,
+});
+
+function safeProviderCarrier(value) {
+  return Object.freeze(Object.assign(Object.create(null), value));
+}
 
 function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
@@ -107,6 +159,30 @@ function manifest() {
       platform: "linux/arm64",
     },
   });
+}
+
+function imagePlanBinding({ onResolve = undefined } = {}) {
+  return createPostgresDetachedRestoreImagePlanBinding(
+    Object.freeze({
+      contractVersion:
+        POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+      imagePlanProviderId: "foreground-image-provider-001",
+      async inspectCodex() {
+        return safeProviderCarrier({
+          codexBinaryPath: "/usr/local/bin/codex",
+          codexBinarySha256: "c".repeat(64),
+          codexVersion: "codex-cli 0.142.4",
+        });
+      },
+      async resolveImagePlan() {
+        onResolve?.();
+        return safeProviderCarrier({
+          configBytes: IMAGE_CONFIG_BYTES,
+          descriptor: IMAGE_DESCRIPTOR,
+        });
+      },
+    }),
+  );
 }
 
 function lease(expiresAt = "2027-08-11T08:00:00.000Z") {
@@ -776,6 +852,7 @@ function facadeFixture({
       return gate?.(input);
     },
     lifecycleGuard: guardFixture.lifecycleGuard,
+    imagePlanBinding: imagePlanBinding(),
     launcher: {
       async prepareLaunchIntent() {
         throw new Error("unexpected launch intent");
@@ -791,9 +868,6 @@ function facadeFixture({
       selectOperationGuard === undefined
         ? guardFixture.operationGuard
         : selectOperationGuard(guardFixture),
-    prepareImageReservation() {
-      throw new Error("unexpected image preparation");
-    },
     resolveStablePlan({ admission: observed }) {
       trace.push("plan-resolve");
       assert.equal(Object.getPrototypeOf(observed), null);
@@ -1359,11 +1433,11 @@ function happyFacadeFixture({
   };
 
   const guardFixture = guards();
-  const imageReservation = deepFreeze({
-    configBytes: "config-bytes",
-    descriptor: { digest: IMAGE_DIGEST },
-    inspectCodex: Object.freeze(async () => undefined),
-    reservation: Object.freeze(Object.create(null)),
+  let imageReservation = null;
+  const boundImagePlan = imagePlanBinding({
+    onResolve() {
+      events.push("image");
+    },
   });
   const launchIntent = deepFreeze({
     launchAttemptId: plan.launchAttemptId,
@@ -1481,10 +1555,7 @@ function happyFacadeFixture({
       });
     }
     if (prepared) {
-      assert.equal(
-        input.imageReservation.reservation,
-        imageReservation.reservation,
-      );
+      assert.strictEqual(input.imageReservation, imageReservation);
       if (beforeLaunchReturn !== null) beforeLaunchReturn();
     }
     return deepFreeze({
@@ -1526,11 +1597,19 @@ function happyFacadeFixture({
       events.push("gate");
       return POSTGRES_DETACHED_RESTORE_FLEET_CONFIRMED;
     },
+    imagePlanBinding: boundImagePlan,
     lifecycleGuard: guardFixture.lifecycleGuard,
     launcher: {
       async prepareLaunchIntent(input) {
         events.push("prepare-intent");
         assert.equal(input.launchAttemptId, plan.launchAttemptId);
+        assert.equal(
+          isPostgresDetachedRestoreImagePlanReservation(
+            input.imageReservation,
+          ),
+          true,
+        );
+        imageReservation = input.imageReservation;
         return launchIntent;
       },
       async reconcileLaunchAttempt(input) {
@@ -1540,14 +1619,17 @@ function happyFacadeFixture({
       },
       async runPreparedLaunch(input) {
         events.push("launch");
+        assert.equal(
+          isPostgresDetachedRestoreImagePlanReservation(
+            input.imageReservation,
+          ),
+          true,
+        );
+        imageReservation = input.imageReservation;
         return completeLaunchAttempt(input, true);
       },
     },
     operationGuard: guardFixture.operationGuard,
-    prepareImageReservation() {
-      events.push("image");
-      return imageReservation;
-    },
     resolveStablePlan() {
       return plan;
     },

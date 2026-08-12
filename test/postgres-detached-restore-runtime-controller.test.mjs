@@ -4,7 +4,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { FilesystemOperationJournal } from "../src/filesystem-operation-journal.mjs";
-import { PlatformImageReservationCoordinator } from "../src/platform-image-reservation.mjs";
+import {
+  POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+  createPostgresDetachedRestoreImagePlanBinding,
+} from "../src/postgres-detached-restore-image-plan-binding.mjs";
 import {
   PostgresDetachedRestoreRuntimeControllerError,
   createPostgresDetachedRestoreRuntimeController,
@@ -25,6 +28,7 @@ import {
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
+  createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../src/stopped-directory-publication.mjs";
 import { StoppedWriterCapabilityCoordinator } from "../src/stopped-writer-capability.mjs";
@@ -156,6 +160,25 @@ function stablePlan(admission = restoreAdmission()) {
       sourceArtifactDirectory:
         "/var/lib/portable-codex/artifacts/controller-source-001",
       sourceArtifactOwnedRoot: "/var/lib/portable-codex/artifacts",
+    },
+  });
+}
+
+function runtimeManifest() {
+  return createSessionManifest({
+    sessionId: SESSION_ID,
+    codex: {
+      ephemeral: false,
+      historyMode: "paginated",
+      rootThreadId: THREAD_ID,
+      sessionId: THREAD_ID,
+    },
+    runtime: {
+      codexSandbox: "danger-full-access",
+      codexVersion: "codex-cli 0.144.1",
+      imageDigest: IMAGE_DIGEST,
+      imageMediaType: "application/vnd.oci.image.manifest.v1+json",
+      platform: "linux/arm64",
     },
   });
 }
@@ -498,6 +521,8 @@ async function createFixture({
     ]),
     guardConnectReleases: new Map(),
     holdMigration: holdMigration ? deferred() : null,
+    imagePlanBlock: null,
+    imagePlanEntered: deferred(),
     lastGuardError: null,
     lastUnexpectedQuery: null,
     migrationEntered: deferred(),
@@ -516,7 +541,23 @@ async function createFixture({
       "recovery-lifecycle",
     ),
   };
-  const imageReservations = new PlatformImageReservationCoordinator();
+  const imagePlanBinding = createPostgresDetachedRestoreImagePlanBinding(
+    Object.freeze({
+      contractVersion:
+        POSTGRES_DETACHED_RESTORE_IMAGE_PLAN_PROVIDER_CONTRACT_VERSION,
+      imagePlanProviderId: "controller-image-provider-001",
+      async inspectCodex() {
+        fixture.calls.image += 1;
+        throw new Error("image inspection must not run");
+      },
+      async resolveImagePlan() {
+        fixture.calls.image += 1;
+        fixture.imagePlanEntered.resolve();
+        await fixture.imagePlanBlock?.promise;
+        throw new Error("controlled image plan resolution failure");
+      },
+    }),
+  );
   const runtime = createPostgresDetachedRestoreRuntimeComposition({
     authority: {
       maxTransactionAttempts: 1,
@@ -532,11 +573,7 @@ async function createFixture({
       },
     },
     launch: {
-      imageReservations,
-      prepareImageReservation() {
-        fixture.calls.image += 1;
-        throw new Error("image preparation must not run");
-      },
+      imagePlanBinding,
       stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
       supervisor: Object.freeze({
         contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
@@ -615,6 +652,7 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
   const { controller } = fixture;
   assert.deepEqual(Reflect.ownKeys(controller), [
     "foreground",
+    "imagePlanReservations",
     "stablePlanProvisioning",
     "start",
     "stop",
@@ -627,6 +665,9 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
   assert.deepEqual(Reflect.ownKeys(controller.foreground), [
     "restoreContextContractVersion",
     "runRestore",
+  ]);
+  assert.deepEqual(Reflect.ownKeys(controller.imagePlanReservations), [
+    "prepareImageReservation",
   ]);
   assert.deepEqual(Reflect.ownKeys(controller.stablePlanProvisioning), [
     "provisionStablePlan",
@@ -641,17 +682,23 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
   for (const value of [
     controller,
     controller.foreground,
+    controller.imagePlanReservations,
     controller.stablePlanProvisioning,
     controller.writerLaunch,
     controller.start,
     controller.stop,
     controller.foreground.runRestore,
+    controller.imagePlanReservations.prepareImageReservation,
     controller.stablePlanProvisioning.provisionStablePlan,
     controller.writerLaunch.reconcileLaunchAttempt,
     controller.writerLaunch.runLaunch,
   ]) {
     assert.equal(Object.isFrozen(value), true);
   }
+  await assert.rejects(
+    controller.imagePlanReservations.prepareImageReservation({}),
+    controllerError(REQUEST_CODE),
+  );
   await assert.rejects(
     controller.foreground.runRestore(restoreAdmission(), async () => null),
     controllerError(REQUEST_CODE),
@@ -729,6 +776,10 @@ test("start migrates and completes one coalesced initial sweep before opening in
   assert.strictEqual(fixture.controller.start(), first);
   await fixture.migrationEntered.promise;
   await assert.rejects(
+    fixture.controller.imagePlanReservations.prepareImageReservation({}),
+    controllerError(REQUEST_CODE),
+  );
+  await assert.rejects(
     fixture.controller.stablePlanProvisioning.provisionStablePlan({
       admission: restoreAdmission(),
       plan: stablePlan(),
@@ -792,6 +843,7 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   const fixture = await createFixture();
   await fixture.controller.start();
   fixture.planGateBlock = deferred();
+  fixture.imagePlanBlock = deferred();
   fixture.blockedGuardRoles.add("foreground-lifecycle");
   fixture.blockedGuardRoles.add("operation");
   const foreground = fixture.controller.foreground.runRestore(
@@ -801,6 +853,11 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   const launch = fixture.controller.writerLaunch.reconcileLaunchAttempt({
     launchAttemptId: "controller-launch-drain-001",
   });
+  const imagePlanReservation =
+    fixture.controller.imagePlanReservations.prepareImageReservation({
+      plan: stablePlan(),
+      sessionManifest: runtimeManifest(),
+    });
   const provisionAdmission = restoreAdmission("controller-provision-drain-001");
   const provision = fixture.controller.stablePlanProvisioning.provisionStablePlan({
     admission: provisionAdmission,
@@ -809,6 +866,7 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   await Promise.all([
     fixture.guardConnectEntered.get("foreground-lifecycle").promise,
     fixture.guardConnectEntered.get("operation").promise,
+    fixture.imagePlanEntered.promise,
   ]);
   assert.equal(fixture.calls.planGate, 1);
   const stop = fixture.controller.stop();
@@ -816,6 +874,10 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   void stop.then(() => {
     stopSettled = true;
   });
+  await assert.rejects(
+    fixture.controller.imagePlanReservations.prepareImageReservation({}),
+    controllerError(REQUEST_CODE),
+  );
   await assert.rejects(
     fixture.controller.stablePlanProvisioning.provisionStablePlan({
       admission: restoreAdmission("controller-provision-after-stop-001"),
@@ -842,18 +904,26 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   assert.equal(stopSettled, false);
   fixture.planGateReject = new Error("controlled admitted rejection");
   fixture.planGateBlock.resolve();
+  fixture.imagePlanBlock.resolve();
   fixture.guardConnectReleases.get("foreground-lifecycle")();
   fixture.guardConnectReleases.get("operation")();
   const settlements = await Promise.allSettled([
     foreground,
+    imagePlanReservation,
     provision,
     launch,
   ]);
   assert.deepEqual(
     settlements.map(({ status }) => status),
-    ["rejected", "rejected", "rejected"],
+    ["rejected", "rejected", "rejected", "rejected"],
   );
   assert.deepEqual(await stop, freezeRecord({ status: "stopped" }));
+  assert.equal(fixture.calls.image, 1);
+  fixture.calls.image = 0;
+  await assert.rejects(
+    fixture.controller.imagePlanReservations.prepareImageReservation({}),
+    controllerError(REQUEST_CODE),
+  );
   assertNoPhysicalEffects(fixture);
 });
 

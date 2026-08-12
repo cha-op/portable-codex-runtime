@@ -11,6 +11,9 @@ import {
   createPostgresDetachedRestoreRuntimeComposition,
 } from "./postgres-detached-restore-runtime-composition.mjs";
 import {
+  createPostgresDetachedRestoreImagePlanBinding,
+} from "./postgres-detached-restore-image-plan-binding.mjs";
+import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
 
@@ -70,6 +73,8 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 
 const createRuntimeCompositionIntrinsic =
   createPostgresDetachedRestoreRuntimeComposition;
+const createImagePlanBindingIntrinsic =
+  createPostgresDetachedRestoreImagePlanBinding;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
 
@@ -142,10 +147,15 @@ const AUTHORITY_OPTION_KEYS = objectFreeze([
 ]);
 const FOREGROUND_OPTION_KEYS = objectFreeze(["fleetCapabilityGate"]);
 const LAUNCH_OPTION_KEYS = objectFreeze([
-  "imageReservations",
-  "prepareImageReservation",
+  "imagePlanProvider",
   "stoppedWriterCoordinator",
   "supervisor",
+]);
+const IMAGE_PLAN_PROVIDER_KEYS = objectFreeze([
+  "contractVersion",
+  "imagePlanProviderId",
+  "inspectCodex",
+  "resolveImagePlan",
 ]);
 const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
   "provisioningFleetCapabilityGate",
@@ -166,6 +176,7 @@ const STORAGE_OPTION_KEYS = objectFreeze([
 ]);
 const CONTROLLER_KEYS = objectFreeze([
   "foreground",
+  "imagePlanReservations",
   "stablePlanProvisioning",
   "start",
   "stop",
@@ -174,6 +185,9 @@ const CONTROLLER_KEYS = objectFreeze([
 const FOREGROUND_KEYS = objectFreeze([
   "restoreContextContractVersion",
   "runRestore",
+]);
+const IMAGE_PLAN_RESERVATIONS_KEYS = objectFreeze([
+  "prepareImageReservation",
 ]);
 const STABLE_PLAN_PROVISIONING_KEYS = objectFreeze(["provisionStablePlan"]);
 const WRITER_LAUNCH_KEYS = objectFreeze([
@@ -1003,6 +1017,10 @@ function normalizeRuntimeOptions(value) {
   const authority = exactDataObject(runtime.authority, AUTHORITY_OPTION_KEYS);
   const foreground = exactDataObject(runtime.foreground, FOREGROUND_OPTION_KEYS);
   const launch = exactDataObject(runtime.launch, LAUNCH_OPTION_KEYS);
+  const imagePlanProvider = exactDataObject(
+    launch.imagePlanProvider,
+    IMAGE_PLAN_PROVIDER_KEYS,
+  );
   const planRegistry = exactDataObject(
     runtime.planRegistry,
     PLAN_REGISTRY_OPTION_KEYS,
@@ -1010,7 +1028,8 @@ function normalizeRuntimeOptions(value) {
   const recovery = exactDataObject(runtime.recovery, RECOVERY_OPTION_KEYS);
   const storage = exactDataObject(runtime.storage, STORAGE_OPTION_KEYS);
   trustedFunction(foreground.fleetCapabilityGate);
-  trustedFunction(launch.prepareImageReservation);
+  trustedFunction(imagePlanProvider.inspectCodex);
+  trustedFunction(imagePlanProvider.resolveImagePlan);
   trustedFunction(planRegistry.provisioningFleetCapabilityGate);
   trustedFunction(recovery.onStep);
   trustedFunction(storage.resolveArtifactPaths);
@@ -1019,7 +1038,11 @@ function normalizeRuntimeOptions(value) {
   return exactFrozenRecord({
     authority,
     foreground,
-    launch,
+    launch: exactFrozenRecord({
+      imagePlanProvider,
+      stoppedWriterCoordinator: launch.stoppedWriterCoordinator,
+      supervisor: launch.supervisor,
+    }),
     planRegistry,
     recovery,
     storage,
@@ -1679,6 +1702,16 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   const options = exactDataObject(args[0], TOP_LEVEL_OPTION_KEYS);
   const postgres = normalizePostgresOptions(options.postgres);
   const runtimeOptions = normalizeRuntimeOptions(options.runtime);
+  let imagePlanBinding;
+  try {
+    imagePlanBinding = callIntrinsic(
+      createImagePlanBindingIntrinsic,
+      undefined,
+      [runtimeOptions.launch.imagePlanProvider],
+    );
+  } catch {
+    fail(OPTION_ERROR_CODE);
+  }
   const probeKey = createProbeKey();
   const passwordProvider = createPasswordProvider(postgres.password);
   const poolRecords = [];
@@ -1722,7 +1755,12 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       exactFrozenRecord({
         authority: runtimeOptions.authority,
         foreground: runtimeOptions.foreground,
-        launch: runtimeOptions.launch,
+        launch: exactFrozenRecord({
+          imagePlanBinding,
+          stoppedWriterCoordinator:
+            runtimeOptions.launch.stoppedWriterCoordinator,
+          supervisor: runtimeOptions.launch.supervisor,
+        }),
         planRegistry: runtimeOptions.planRegistry,
         pools: exactFrozenRecord({
           authority: runtimePools[0],
@@ -1752,6 +1790,11 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       STABLE_PLAN_PROVISIONING_KEYS,
       OUTCOME_ERROR_CODE,
     );
+    const controllerImagePlanReservations = exactDataObject(
+      normalizedController.imagePlanReservations,
+      IMAGE_PLAN_RESERVATIONS_KEYS,
+      OUTCOME_ERROR_CODE,
+    );
     const controllerWriterLaunch = exactDataObject(
       normalizedController.writerLaunch,
       WRITER_LAUNCH_KEYS,
@@ -1764,6 +1807,10 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     controllerBindings = exactFrozenRecord({
       controllerStart: binding(normalizedController, "start"),
       controllerStop: binding(normalizedController, "stop"),
+      prepareImageReservation: binding(
+        controllerImagePlanReservations,
+        "prepareImageReservation",
+      ),
       provisionStablePlan: binding(
         controllerProvisioning,
         "provisionStablePlan",
@@ -2060,6 +2107,11 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     foreground: exactFrozenRecord({
       restoreContextContractVersion: 3,
       runRestore: ingress(controllerBindings.runRestore),
+    }),
+    imagePlanReservations: exactFrozenRecord({
+      prepareImageReservation: ingress(
+        controllerBindings.prepareImageReservation,
+      ),
     }),
     stablePlanProvisioning: exactFrozenRecord({
       provisionStablePlan: ingress(controllerBindings.provisionStablePlan),

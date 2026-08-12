@@ -338,10 +338,11 @@
   surface.
 - A deployment-owned runtime controller now uses that same store's narrow
   bootstrap facet. It completes migration and one exact full recovery sweep
-  before opening foreground, plan-provisioning, or writer-launch admission.
-  Shutdown closes those facets first, stops the scheduler, and drains every
-  admitted call before the caller may close the four borrowed pools. The raw
-  runtime remains a low-level capability and is not a parallel serving route.
+  before opening foreground, image-plan-reservation, plan-provisioning, or
+  writer-launch admission. Shutdown closes those facets first, stops the
+  scheduler, and drains every admitted call before the caller may close the
+  four borrowed pools. The raw runtime remains a low-level capability and is
+  not a parallel serving route.
 - A higher PostgreSQL deployment factory now owns those four pools. It accepts
   only explicit connection, verified-TLS, timeout, role-capacity, and
   application-name configuration; constructs one private pool per authority,
@@ -351,11 +352,21 @@
   startup check is point-in-time evidence, not continuous primary-affinity
   monitoring. Stop drains the controller before attempting and awaiting all
   four pool closures; no pool or low-level runtime capability is exposed.
+- Deployment now accepts one exact image-plan provider configuration and owns
+  the private binding that maps an authentic plan's `imagePlanId` to exact OCI
+  manifest/config bytes, trusted Codex inspection, and an opaque process-local
+  reservation. Provider results settle only as exact frozen null-prototype
+  records, closing inherited-`then` assimilation before binding validation.
+  Its gated reservation facet exposes only preparation; the foreground and
+  logical launcher share the binding for later revalidation.
+  This is image identity authority only, not fetch, signature verification,
+  container-runtime pinning or launch, supervisor/provider/storage execution,
+  or a physical writer fence.
 - The production checkpoint adapter remains capture-only. Restore fails closed
   because its `runRestore()` stub is unchanged. Production enablement still
-  requires the remaining deployment-owned provider/image and lease-budget
-  bindings, full assembled restart and ambiguous-outcome validation, and the
-  final public adapter route.
+  requires bounded physical-collaborator settlement/deadline policy,
+  operational lease admission, full assembled restart and ambiguous-outcome
+  validation, and the final public adapter route.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -364,6 +375,8 @@
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Detached-restore image-plan binding:
+  `docs/project_journal/2026/08/2026-08-12-detached-restore-image-plan-binding-e7b3c9.md`
 - Detached-restore stable-plan registry:
   `docs/project_journal/2026/08/2026-08-11-detached-restore-stable-plan-registry-8e4c21.md`
 - Auth refresh authority spike:
@@ -458,6 +471,8 @@
   the initial recovery sweep, controlled restore admission, scheduler stop,
   admitted-call drain, explicit PostgreSQL bootstrap configuration, and pool
   closure now have one deployment owner; its `stop` facet is not distributed
-  to injected runtime collaborators. Production still requires provider/
-  image and operational lease-budget bindings, final public-adapter assembly,
-  and end-to-end fail-closed validation before `runRestore()` may be enabled.
+  to injected runtime collaborators. Its image-plan binding now owns exact OCI
+  bytes, trusted inspection, and opaque reservation identity. Production still
+  requires bounded physical-collaborator settlement and deadlines, operational
+  lease admission, whole-graph fail-closed validation, and final public-adapter
+  assembly before `runRestore()` may be enabled.

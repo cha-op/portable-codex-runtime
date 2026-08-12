@@ -25,6 +25,7 @@ const SCENARIOS = Object.freeze([
   "all-pool-ends-attempted",
   "empty-password-blocks-ambient-fallback",
   "idle-pool-error-forces-terminal-shutdown",
+  "image-plan-reservation-ingress-is-gated-and-drained",
   "independent-deployments-use-distinct-probe-keys",
   "invalid-client-query-still-releases-and-cleans-up",
   "object-prototype-then-cannot-forge-driver-evidence",

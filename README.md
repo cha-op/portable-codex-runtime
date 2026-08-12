@@ -390,14 +390,14 @@ boundary. Expiry fails closed and never authorizes a second physical dispatch.
 
 Production restore nevertheless remains fail-closed. The production
 checkpoint adapter's `runRestore()` stub is unchanged. Remaining phase-B work
-must supply provider/image and operational lease-budget bindings plus the
-final public backend, then add end-to-end ambiguous-outcome coverage before
-enabling that entry point. A
+must bound physical-collaborator settlement and deadlines, admit an explicit
+operational lease budget, run the whole restart/ambiguous-outcome matrix, and
+only then construct the final public backend. A
 production-neutral runtime factory now constructs the capture-only backend,
 standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
-facet plus a narrow `stablePlanProvisioning` facet from one internally
-consistent graph and four caller-owned pool objects that must be pairwise
-distinct. The launch facet exposes only `runLaunch()` and
+facet plus narrow `stablePlanProvisioning` and `imagePlanReservations` facets
+from one internally consistent graph and four caller-owned pool objects that
+must be pairwise distinct. The launch facet exposes only `runLaunch()` and
 `reconcileLaunchAttempt()` from the same process-local logical launcher used by
 the backend and foreground composition. The provisioning facet exposes only
 `provisionStablePlan()`; the same internally constructed registry's
@@ -408,11 +408,11 @@ The low-level factory does not migrate, start, stop, or close pools, replace
 the capture-only backend's fixed restore route, or wire foreground restore
 into the production adapter. A deployment controller now invokes its narrow
 same-store migration facet, requires the scheduler's immediate pass to prove a
-complete recovery sweep, and then opens only gated foreground, plan-
-provisioning, and writer-launch facets. Stop closes those facets, stops the
-scheduler, and drains admitted calls; the caller closes the four borrowed pools
-after that barrier. The exclusive scheduler continues bounded no-relaunch
-recovery.
+complete recovery sweep, and then opens only gated foreground, image-plan-
+reservation, plan-provisioning, and writer-launch facets. Stop closes those
+facets, stops the scheduler, and drains admitted calls; the caller closes the
+four borrowed pools after that barrier. The exclusive scheduler continues
+bounded no-relaunch recovery.
 
 A PostgreSQL deployment factory now owns the production connection boundary
 above that controller. It accepts one exact explicit host, database, user,
@@ -426,6 +426,20 @@ Shutdown first closes controller admission and drains accepted work, then
 attempts and awaits every owned pool close in fixed dependency order. Neither
 the raw pools, low-level runtime, scheduler, controller, nor capture-only
 backend is exposed through the deployment surface.
+
+That deployment now also owns one exact image-plan provider configuration and
+constructs the private image-plan binding used by foreground preparation and
+logical-launcher revalidation. Its gated reservation facet maps an authentic
+plan's `imagePlanId` to exact OCI manifest/config bytes, trusted Codex
+inspection, and an opaque process-local reservation without exposing those
+bytes, the provider, or the reservation coordinator. The same binding later
+revalidates that reservation before launch can cross its durable boundary.
+Both provider callbacks must settle their native Promises with exact frozen
+null-prototype records, so result settlement cannot inherit a process-global
+`then` before the binding snapshots and validates the evidence.
+This completes image identity binding, not image fetch, signature verification,
+container-runtime pinning, container launch, supervisor implementation,
+physical storage/provider work, or writer fencing.
 
 Crash-consistent ext4 or filesystem-image backend execution, differential
 compression, periodic backup, and cross-host restore verification remain later
@@ -608,10 +622,10 @@ explicit PostgreSQL connection/bootstrap configuration, restore admission,
 shutdown drain, and final closure of four private pools now have one
 deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
 not a callback available to injected runtime collaborators. Production restore
-remains fail-closed until later slices supply provider/image and operational
-lease-budget bindings, assembled restart/ambiguity validation, and final
-adapter wiring. Filesystem-image execution and differential backup remain
-later work.
+remains fail-closed until later slices bound physical-collaborator settlement
+and deadlines, admit the operational lease budget, complete assembled
+restart/ambiguity validation, and wire the final adapter. Filesystem-image
+execution and differential backup remain later work.
 See
 `docs/architecture/stopped-directory-backend.md`.
 
