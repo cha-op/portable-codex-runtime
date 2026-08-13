@@ -1068,14 +1068,23 @@ export function assertCheckpointBackend(value) {
       depth += 1
     ) {
       ensure(
-        cursor !== objectPrototype,
-        "invalid_storage_backend",
-        "checkpoint backend fields must not come from the shared object prototype",
-      );
-      ensure(
         !isProxyValue(cursor),
         "invalid_storage_backend",
         "checkpoint backend prototype chain must not contain a proxy",
+      );
+      let nextPrototype;
+      try {
+        nextPrototype = objectGetPrototypeOf(cursor);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "checkpoint backend prototype chain is invalid",
+        );
+      }
+      ensure(
+        cursor !== objectPrototype && !(depth > 0 && nextPrototype === null),
+        "invalid_storage_backend",
+        "checkpoint backend fields must not come from the shared object prototype",
       );
       let descriptor;
       try {
@@ -1094,14 +1103,7 @@ export function assertCheckpointBackend(value) {
         );
         return descriptor.value;
       }
-      try {
-        cursor = objectGetPrototypeOf(cursor);
-      } catch {
-        fail(
-          "invalid_storage_backend",
-          "checkpoint backend prototype chain is invalid",
-        );
-      }
+      cursor = nextPrototype;
     }
     ensure(
       cursor === null,

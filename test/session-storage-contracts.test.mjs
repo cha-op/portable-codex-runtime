@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { types as utilTypes } from "node:util";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 import {
   CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
@@ -1208,7 +1209,7 @@ test("checkpoint backend projection rejects hostile access and captures methods 
   assert.equal(replacementCalls, 0);
 });
 
-test("checkpoint backend projection rejects shared prototype pollution but accepts custom prototypes", () => {
+test("checkpoint backend projection rejects shared prototype pollution across realms", () => {
   const validBackend = storageBackend();
   const keys = [
     "backendId",
@@ -1270,15 +1271,77 @@ test("checkpoint backend projection rejects shared prototype pollution but accep
   assert.equal(assertCode("invalid_storage_backend")(caught), true);
   assert.equal(inheritedCalls, 0);
 
-  const customPrototype = Object.assign(
+  let foreignInheritedCalls = 0;
+  const foreignCandidate = runInNewContext(
+    `(() => {
+      Object.defineProperties(Object.prototype, {
+        backendId: { configurable: true, value: "foreign-checkpoint-backend" },
+        capabilities: { configurable: true, value: validCapabilities },
+        captureCheckpoint: { configurable: true, value: recordInheritedCall },
+        contractVersion: { configurable: true, value: 1 },
+        restoreCheckpoint: { configurable: true, value: recordInheritedCall },
+      });
+      return {};
+    })()`,
+    {
+      recordInheritedCall() {
+        foreignInheritedCalls += 1;
+      },
+      validCapabilities: validBackend.capabilities,
+    },
+  );
+  assert.throws(
+    () => assertCheckpointBackend(foreignCandidate),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(foreignInheritedCalls, 0);
+
+  let foreignOwnCalls = 0;
+  const foreignOwnCandidate = runInNewContext(
+    `({
+      backendId: "foreign-own-checkpoint-backend",
+      capabilities: validCapabilities,
+      captureCheckpoint: recordOwnCall,
+      contractVersion: 1,
+      restoreCheckpoint: recordOwnCall,
+    })`,
+    {
+      recordOwnCall() {
+        foreignOwnCalls += 1;
+        return "foreign-own-result";
+      },
+      validCapabilities: validBackend.capabilities,
+    },
+  );
+  const foreignProjection = assertCheckpointBackend(foreignOwnCandidate);
+  assert.equal(
+    foreignProjection.captureCheckpoint("foreign-input"),
+    "foreign-own-result",
+  );
+  assert.equal(foreignOwnCalls, 1);
+
+  const nullPrototypeCandidate = Object.assign(
     Object.create(null),
     validBackend,
   );
-  const projected = assertCheckpointBackend(
-    Object.create(customPrototype),
+  const nullPrototypeProjection = assertCheckpointBackend(
+    nullPrototypeCandidate,
   );
+  assert.equal(nullPrototypeProjection.backendId, validBackend.backendId);
+
+  const customPrototype = { ...validBackend };
+  const projected = assertCheckpointBackend(Object.create(customPrototype));
   assert.equal(projected.backendId, validBackend.backendId);
   assert.equal(projected.contractVersion, validBackend.contractVersion);
+
+  const terminalCustomPrototype = Object.assign(
+    Object.create(null),
+    validBackend,
+  );
+  assert.throws(
+    () => assertCheckpointBackend(Object.create(terminalCustomPrototype)),
+    assertCode("invalid_storage_backend"),
+  );
 });
 
 test("checkpoint capture reconciliation is an optional versioned backend extension", () => {

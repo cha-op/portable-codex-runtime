@@ -68,10 +68,11 @@ pointer. Both paths retain local writer exclusion until exact capture success.
 Detached-destination activation can now materialize an executable prepared
 launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
-bounded recovery scheduler. The invocation-time detached-production gate and
-durable read-only stable-plan lookup now exist, but production `runRestore()`
-integration still requires the remaining deployment bindings and adapter
-wiring.
+bounded recovery scheduler. The invocation-time detached-production gate,
+durable read-only stable-plan lookup, deployment bindings, and final immutable
+public checkpoint backend are now complete. Only the concrete filesystem/ext4
+physical backend and its crash, detach/fence, container-launch, and cross-host
+conformance validation remain.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -1089,17 +1090,17 @@ Bounded recovery enumerates only retained `starting` or `uncertain`
 restore-generation operations whose exact authorised generation and source
 catalogue still validate. The generation relation has no deletion or
 retirement path. These transitions neither invoke publication inside a
-database transaction nor require launch-specific DDL. Production restore
-remains disabled until exact publication finalisation is wired to the
-implemented launcher and recovery facade without weakening the
-no-second-writer boundary.
+database transaction nor require launch-specific DDL. At that typed-authority
+slice boundary, production restore remained disabled until exact publication
+finalisation was wired to the implemented launcher and recovery facade without
+weakening the no-second-writer boundary.
 
-The current capture-oriented stopped-directory backend still constructs its
+The then-current capture-oriented stopped-directory backend constructed its
 legacy restore journal binding from only checkpoint, isolation-proof, and
-reservation context. Production composition must instead pass the exact
+reservation context. Production composition therefore had to pass the exact
 claimed generation binding as the publisher's coordinator binding before it
-can produce a materialisation accepted by generation document v2. Restore
-remains fail-closed until that composition exists.
+could produce a materialisation accepted by generation document v2. The final
+public checkpoint backend now supplies that composition.
 
 ## Implemented Durable Launch-Attempt Lifecycle
 
@@ -1775,7 +1776,7 @@ executes in the interval between a successful probe and a later external side
 effect. Typed authority transitions, exact provider idempotency, and the
 per-operation guard remain the physical-dispatch safety boundary.
 
-## Detached Restore Foreground Composition and Remaining Assembly
+## Detached Restore Foreground Composition and Final Assembly
 
 Foreground phase A introduces a caller-persisted contract version 1 root plan.
 It binds the exact outer restore request, the source checkpoint's
