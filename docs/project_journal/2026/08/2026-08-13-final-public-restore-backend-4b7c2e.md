@@ -24,10 +24,12 @@ superseded_by:
 
 ## Current State
 
-- Runtime assembly first constructs one private capture backend. The durable
-  stop/capture composition, writer-detach composition, activation coordinator,
-  and foreground restore composition continue to use that exact backend and
-  its operator/provider extensions.
+- Runtime assembly first constructs one private capture backend. Durable
+  stop/capture, the activation coordinator, and foreground restore continue to
+  use that exact backend and its operator/provider extensions. Writer detach
+  instead uses the settled session lifecycle backend so its capability check
+  matches the capabilities persisted on the durable session rather than the
+  stopped-directory checkpoint overlay.
 - After the foreground composition exists, runtime assembly constructs a
   second immutable `StoppedDirectoryBackend`. Its capture operations reuse the
   original mutation authority, while its restore authority is fixed to the
