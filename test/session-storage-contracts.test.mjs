@@ -1296,6 +1296,32 @@ test("checkpoint backend projection rejects shared prototype pollution across re
   );
   assert.equal(foreignInheritedCalls, 0);
 
+  let foreignPrototypeCalls = 0;
+  const foreignPrototypeCandidate = runInNewContext(
+    `(() => {
+      delete Object.prototype.constructor;
+      Object.defineProperties(Object.prototype, {
+        backendId: { configurable: true, value: "foreign-prototype-backend" },
+        capabilities: { configurable: true, value: validCapabilities },
+        captureCheckpoint: { configurable: true, value: recordPrototypeCall },
+        contractVersion: { configurable: true, value: 1 },
+        restoreCheckpoint: { configurable: true, value: recordPrototypeCall },
+      });
+      return Object.prototype;
+    })()`,
+    {
+      recordPrototypeCall() {
+        foreignPrototypeCalls += 1;
+      },
+      validCapabilities: validBackend.capabilities,
+    },
+  );
+  assert.throws(
+    () => assertCheckpointBackend(foreignPrototypeCandidate),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(foreignPrototypeCalls, 0);
+
   let foreignOwnCalls = 0;
   const foreignOwnCandidate = runInNewContext(
     `({

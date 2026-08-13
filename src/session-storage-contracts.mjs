@@ -98,6 +98,20 @@ const CHECKPOINT_BACKEND_METHODS = Object.freeze([
   "captureCheckpoint",
   "restoreCheckpoint",
 ]);
+const SHARED_OBJECT_PROTOTYPE_SENTINEL_KEYS = Object.freeze([
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+  "__proto__",
+  "constructor",
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable",
+  "toLocaleString",
+  "toString",
+  "valueOf",
+]);
 const MAX_BACKEND_PROTOTYPE_DEPTH = 64;
 
 export class SessionStorageContractError extends Error {
@@ -1080,6 +1094,31 @@ export function assertCheckpointBackend(value) {
           "invalid_storage_backend",
           "checkpoint backend prototype chain is invalid",
         );
+      }
+      if (depth === 0 && nextPrototype === null) {
+        for (
+          let index = 0;
+          index < SHARED_OBJECT_PROTOTYPE_SENTINEL_KEYS.length;
+          index += 1
+        ) {
+          let sentinelDescriptor;
+          try {
+            sentinelDescriptor = objectGetOwnPropertyDescriptor(
+              cursor,
+              SHARED_OBJECT_PROTOTYPE_SENTINEL_KEYS[index],
+            );
+          } catch {
+            fail(
+              "invalid_storage_backend",
+              "checkpoint backend prototype chain is invalid",
+            );
+          }
+          ensure(
+            sentinelDescriptor === undefined,
+            "invalid_storage_backend",
+            "checkpoint backend must not be a shared object prototype",
+          );
+        }
       }
       ensure(
         cursor !== objectPrototype && !(depth > 0 && nextPrototype === null),
