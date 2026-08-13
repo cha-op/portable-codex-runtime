@@ -586,6 +586,25 @@ function assertNoConstructionEffects(calls, poolCount) {
   });
 }
 
+function assertOnlyImagePhysicalCalls(calls, image) {
+  assert.deepEqual(
+    {
+      image: calls.image,
+      lifecycle: calls.provider,
+      publication: calls.publication,
+      resolver: calls.resolver,
+      supervisor: calls.supervisor,
+    },
+    {
+      image,
+      lifecycle: 0,
+      publication: 0,
+      resolver: 0,
+      supervisor: 0,
+    },
+  );
+}
+
 function assertOperationalLeaseOptionRejection(options, calls) {
   const poolCount = fakePgState().pools.length;
   assert.equal(poolCount, 0);
@@ -1969,7 +1988,7 @@ async function imagePlanReservationIngressIsGatedAndDrained() {
     () => deployment.imagePlanReservations.prepareImageReservation(input),
     requestError,
   );
-  assert.equal(calls.image, 1);
+  assertOnlyImagePhysicalCalls(calls, 1);
 }
 
 async function imagePlanStopAbortsAndDrainsActiveProvider() {
@@ -2010,7 +2029,67 @@ async function imagePlanStopAbortsAndDrainsActiveProvider() {
   assert.equal(resolverRequest.signal.aborted, true);
   await assert.rejects(admitted, imageResolutionError);
   assertStatusReceipt(await stopped, "stopped");
-  assert.equal(calls.image, 1);
+  assertOnlyImagePhysicalCalls(calls, 1);
+  assert.deepEqual(fakePgState().endOrder, [
+    "recoveryLifecycle",
+    "foregroundLifecycle",
+    "operation",
+    "authority",
+  ]);
+}
+
+async function imagePlanDeadlineLateSettlementKeepsIngressOpen() {
+  configureFakePg();
+  const { calls, controls, options } = validOptions();
+  const resolverEntered = deferred();
+  const lateResolver = deferred();
+  let resolverRequest;
+  controls.imagePlanResolverOverride = function resolveAfterDeadline(input) {
+    resolverRequest = input;
+    resolverEntered.resolve();
+    input.signal.addEventListener(
+      "abort",
+      () => lateResolver.resolve(safeProviderCarrier({
+        configBytes: controls.imagePlanFixture.configBytes,
+        descriptor: controls.imagePlanFixture.descriptor,
+      })),
+      { once: true },
+    );
+    return lateResolver.promise;
+  };
+  options.runtime.launch.imagePlanProviderSettlement.resolveImagePlan = {
+    deadlineMilliseconds: 15,
+    settlementGraceMilliseconds: 200,
+  };
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  assertStatusReceipt(await deployment.start(), "ready");
+  const input = {
+    plan: stablePlan(
+      restoreAdmission("deployment-image-plan-late-settlement-001"),
+    ),
+    sessionManifest: controls.imagePlanFixture.sessionManifest,
+  };
+
+  const late = deployment.imagePlanReservations.prepareImageReservation(input);
+  await resolverEntered.promise;
+  assert.equal(resolverRequest.signal.aborted, false);
+  await assert.rejects(late, imageResolutionError);
+  assert.equal(resolverRequest.signal.aborted, true);
+  assertOnlyImagePhysicalCalls(calls, 1);
+
+  // A fulfillment after the deadline only settles the first provider call; it
+  // cannot turn that invocation into success. A separate read-only image-plan
+  // observation remains admissible because no fatal grace breach occurred.
+  controls.imagePlanResolverOverride = null;
+  const retried =
+    await deployment.imagePlanReservations.prepareImageReservation(input);
+  assert.equal(Object.getPrototypeOf(retried), null);
+  assert.equal(Object.isFrozen(retried), true);
+  assert.deepEqual(Reflect.ownKeys(retried), []);
+  // The retry performs a new resolution and its independent Codex inspection.
+  assertOnlyImagePhysicalCalls(calls, 3);
+
+  assertStatusReceipt(await deployment.stop(), "stopped");
   assert.deepEqual(fakePgState().endOrder, [
     "recoveryLifecycle",
     "foregroundLifecycle",
@@ -2104,7 +2183,7 @@ async function imagePlanGraceBreachForcesFatalShutdown() {
   const stopped = deployment.stop();
   assert.strictEqual(deployment.stop(), stopped);
   await assert.rejects(stopped, outcomeError);
-  assert.equal(calls.image, 1);
+  assertOnlyImagePhysicalCalls(calls, 1);
   assert.deepEqual(fakePgState().endOrder, [
     "recoveryLifecycle",
     "foregroundLifecycle",
@@ -2146,6 +2225,8 @@ const scenarios = Object.freeze({
     idlePoolErrorForcesTerminalShutdown,
   "image-plan-grace-breach-forces-fatal-shutdown":
     imagePlanGraceBreachForcesFatalShutdown,
+  "image-plan-deadline-late-settlement-keeps-ingress-open":
+    imagePlanDeadlineLateSettlementKeepsIngressOpen,
   "image-plan-reservation-ingress-is-gated-and-drained":
     imagePlanReservationIngressIsGatedAndDrained,
   "image-plan-stop-aborts-and-drains-active-provider":

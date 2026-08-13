@@ -68,21 +68,33 @@ superseded_by:
   deadline-plus-grace bounds, an explicit aggregate database allowance, and a
   positive safety margin. Stable-plan provisioning and every resolution
   enforce that exact lease before physical work.
+  The completed assembled safety-matrix slice has an exact scope: all nineteen
+  settlement contracts are classified, the fourteen leaves on the private
+  protocol surface are divided into seven grant-bearing mutators and seven
+  repeatable observations, and the remaining five lifecycle leaves stay
+  contract-only. Evidence combines seven existing real-PostgreSQL durable-cut
+  and commit-acknowledgement-loss paths, a same-database/stable-plan retry
+  through fresh physical bindings, image binding, runtime, and controller,
+  separate stable-plan-registry rehydration, a test-only router for the explicit
+  fresh/committed publication callback seam, and representative settlement-
+  foundation/deployment timer and drain cases. It does not claim a single whole-
+  saga deployment restart, operating-system crash, or fake-PostgreSQL coverage
+  of every physical family, and it does not enable the production adapter.
   The production adapter remains fixed fail-closed.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Validate the complete assembled restart, ambiguous-outcome, deadline, and
-  grace-breach matrix, then construct the final public restore-capable backend
-  and enable the production adapter only if the no-second-writer boundary
-  remains closed.
+- Construct the final public restore-capable backend and enable the production
+  adapter only if the no-second-writer boundary remains closed. Filesystem/ext4
+  execution follows as a later physical-backend slice.
 
 ## Evidence
 
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
+- `docs/project_journal/2026/08/2026-08-12-assembled-restore-safety-matrix-6d3a91.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-settlement-graph-f4c8a1.md`
 - `docs/project_journal/2026/08/2026-08-12-operational-lease-budget-c2e7b4.md`

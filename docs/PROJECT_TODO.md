@@ -138,9 +138,14 @@
   Deployment now derives the two database-clock critical-window bounds from
   those method policies, an explicit aggregate database allowance, and a
   positive safety margin; stable-plan provision and every resolution enforce
-  the exact admitted lease. Next run the complete assembled restart/ambiguous-
-  outcome/deadline matrix, construct the final public backend, and only then
-  replace the fixed fail-closed `runRestore()` stub.
+  the exact admitted lease. The completed safety matrix classifies all nineteen
+  settlement leaves, maps the seven protocol-surface mutators to seven real-PostgreSQL
+  acknowledgement-loss paths, and binds a same-database/stable-plan retry
+  through fresh physical bindings, image binding, runtime, and controller plus
+  separate registry rehydration, an explicit test-only publication-seam router,
+  and representative settlement timer/drain evidence. Next construct the final
+  public backend and only then replace the
+  fixed fail-closed `runRestore()` stub.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

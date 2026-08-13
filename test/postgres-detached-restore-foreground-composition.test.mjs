@@ -47,6 +47,9 @@ import {
   assertRestoreAttachmentActivationResult,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
+import {
+  createAssembledRestorePublicationCallback,
+} from "./fixtures/postgres-assembled-restore-safety-matrix/contract.mjs";
 
 const SESSION_ID = "019f7f40-0000-7000-8000-000000000001";
 const THREAD_ID = "019f7f40-0000-7000-8000-000000000002";
@@ -128,6 +131,10 @@ function deepFreeze(value) {
   }
   for (const key of Reflect.ownKeys(value)) deepFreeze(value[key]);
   return Object.freeze(value);
+}
+
+function exactRecord(value) {
+  return Object.freeze(Object.assign(Object.create(null), value));
 }
 
 function sha256Json(value) {
@@ -1187,6 +1194,15 @@ function happyFacadeFixture({
       binding: {
         attachment: initial.document.attachment,
         captureAttemptId: "019f7f40-0000-7000-8000-000000000003",
+        captureOperationId: plan.captureOperationId,
+        catalogueSha256: sha256Json(catalogue.document),
+        checkpoint: admission().checkpoint,
+        contractVersion: 1,
+        destinationIsolationProofId: plan.destinationIsolationProofId,
+        destinationState: "detached",
+        generationId: plan.generationId,
+        request: admission().request,
+        reservationId: operationReservation(operation).reservationId,
       },
       checkpointId: admission().checkpoint.checkpointId,
       claimedAt: "2026-08-11T09:00:03.000Z",
@@ -2469,25 +2485,34 @@ test("factory rejects a different operation guard backed by the lifecycle pool",
 test("fresh restore runs every effect once and preserves publication identity", async () => {
   const fixture = happyFacadeFixture();
   let completion;
-  const result = await fixture.facade.runRestore(admission(), async (context) => {
-    fixture.events.push("publish");
-    assert.equal(context.publicationMode, "fresh-or-exact-replay");
-    assert.equal(
-      context.artifactDirectory,
-      "/var/lib/portable-codex/artifacts/source-001",
-    );
-    assert.equal(
-      context.destinationDirectory,
-      "/var/lib/portable-codex/restores/restore-001",
-    );
-    completion = deepFreeze({
-      materialization: restoreMaterialization("materialization-001"),
-      replayed: false,
-      result: context.result,
-    });
-    fixture.publishCompletion = completion;
-    return completion;
-  });
+  const result = await fixture.facade.runRestore(
+    admission(),
+    createAssembledRestorePublicationCallback(
+      exactRecord({
+        async publishRestoreDestination(options) {
+          fixture.events.push("publish");
+          assert.equal(
+            options.artifactDirectory,
+            "/var/lib/portable-codex/artifacts/source-001",
+          );
+          assert.equal(
+            options.destinationDirectory,
+            "/var/lib/portable-codex/restores/restore-001",
+          );
+          completion = deepFreeze({
+            materialization: restoreMaterialization("materialization-001"),
+            replayed: false,
+            result: options.result,
+          });
+          fixture.publishCompletion = completion;
+          return completion;
+        },
+        async verifyCommittedRestoreDestination() {
+          assert.fail("fresh restore must not invoke the committed verifier");
+        },
+      }),
+    ),
+  );
 
   assert.equal(result, completion);
   assert.deepEqual(fixture.events, [
@@ -2692,29 +2717,39 @@ test("launcher reservation binding ignores callback-time iterator poisoning", as
 test("gate-closed committed replay verifies publication and adopts the durable launch", async () => {
   const fixture = happyFacadeFixture();
   let firstCompletion;
-  await fixture.facade.runRestore(admission(), async (context) => {
-    fixture.events.push("publish");
-    firstCompletion = deepFreeze({
-      materialization: restoreMaterialization("committed-replay-001"),
-      replayed: false,
-      result: context.result,
-    });
-    fixture.publishCompletion = firstCompletion;
-    return firstCompletion;
-  });
+  let replayCompletion;
+  const publish = createAssembledRestorePublicationCallback(
+    exactRecord({
+      async publishRestoreDestination(options) {
+        fixture.events.push("publish");
+        firstCompletion = deepFreeze({
+          materialization: restoreMaterialization("committed-replay-001"),
+          replayed: false,
+          result: options.result,
+        });
+        fixture.publishCompletion = firstCompletion;
+        return firstCompletion;
+      },
+      async verifyCommittedRestoreDestination(options) {
+        fixture.events.push("publish");
+        assert.equal(
+          Object.hasOwn(options, "artifactDirectory"),
+          false,
+        );
+        assert.equal(Object.hasOwn(options, "artifactOwnedRoot"), false);
+        replayCompletion = deepFreeze({
+          materialization: firstCompletion.materialization,
+          replayed: true,
+          result: options.result,
+        });
+        return replayCompletion;
+      },
+    }),
+  );
+  await fixture.facade.runRestore(admission(), publish);
 
   fixture.events.length = 0;
-  let replayCompletion;
-  const result = await fixture.facade.runRestore(admission(), async (context) => {
-    fixture.events.push("publish");
-    assert.equal(context.publicationMode, "committed-only");
-    replayCompletion = deepFreeze({
-      materialization: firstCompletion.materialization,
-      replayed: true,
-      result: context.result,
-    });
-    return replayCompletion;
-  });
+  const result = await fixture.facade.runRestore(admission(), publish);
 
   assert.equal(result, replayCompletion);
   assert.deepEqual(fixture.events, ["publish", "launch-reconcile"]);

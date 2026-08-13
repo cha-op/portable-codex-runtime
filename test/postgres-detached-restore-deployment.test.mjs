@@ -29,6 +29,7 @@ const SCENARIOS = Object.freeze([
   "exact-operational-lease-config-rejection",
   "exact-physical-config-rejection",
   "idle-pool-error-forces-terminal-shutdown",
+  "image-plan-deadline-late-settlement-keeps-ingress-open",
   "image-plan-grace-breach-forces-fatal-shutdown",
   "image-plan-reservation-ingress-is-gated-and-drained",
   "image-plan-stop-aborts-and-drains-active-provider",
