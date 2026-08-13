@@ -13298,7 +13298,9 @@ test(
     );
     assert.equal(publicationObservation.captureFailureCount, 1);
     assert.equal(calls.publishFreshCheckpointArtifact, 1);
-    assert.equal(calls.verifyCommittedCheckpointArtifact, 1);
+    // The failed fresh invocation reads the absent journal before preparing,
+    // then its same-call committed-only fallback reads the prepared record.
+    assert.equal(calls.verifyCommittedCheckpointArtifact, 2);
     const recoveryCaptureBeforeRestart = await authorityPool.query(
       [
         "SELECT kind, state, revision::text AS revision",
