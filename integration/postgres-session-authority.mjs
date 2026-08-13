@@ -13451,11 +13451,95 @@ test(
       });
     const restartedImagePlanProviderId =
       `restarted-image-provider-${randomUUID()}`;
+    const restartedAuthorityReads = {
+      activation: 0,
+      generation: 0,
+      launch: 0,
+    };
+    const restartedAuthorityPool = Object.freeze({
+      async connect() {
+        const client = await authorityPool.connect();
+        return {
+          connection: client.connection,
+          query(...args) {
+            const input = args[0];
+            const text =
+              typeof input === "string" ? input : input?.text;
+            const values =
+              typeof input === "string" ? args[1] : input?.values;
+            if (
+              typeof text === "string" &&
+              text.startsWith("SELECT") &&
+              text.includes(
+                "FROM session_authority.restore_destination_generations",
+              ) &&
+              text.includes("WHERE generation_id = $1") &&
+              Array.isArray(values) &&
+              values[0] === stablePlan.generationId
+            ) {
+              restartedAuthorityReads.generation += 1;
+            }
+            if (
+              typeof text === "string" &&
+              text.startsWith("SELECT") &&
+              text.includes(
+                "FROM session_authority.operation_claims",
+              ) &&
+              text.includes("WHERE operation_id = $1") &&
+              Array.isArray(values)
+            ) {
+              if (values[0] === stablePlan.activationOperationId) {
+                restartedAuthorityReads.activation += 1;
+              }
+              if (values[0] === stablePlan.launchAttemptId) {
+                restartedAuthorityReads.launch += 1;
+              }
+            }
+            return Reflect.apply(client.query, client, args);
+          },
+          release(...args) {
+            return Reflect.apply(client.release, client, args);
+          },
+        };
+      },
+    });
     let restartedOperationGuardConnects = 0;
+    const restartedOperationGuardTraces = [];
     const restartedOperationPool = Object.freeze({
       connect(callback) {
         restartedOperationGuardConnects += 1;
-        return operationPool.connect(callback);
+        const trace = [];
+        restartedOperationGuardTraces.push(trace);
+        return operationPool.connect((error, client, release) => {
+          if (error !== null && error !== undefined) {
+            return callback(error, client, release);
+          }
+          const query = client.query;
+          const tracedClient = Object.freeze({
+            connection: client.connection,
+            query(...args) {
+              const input = args[0];
+              const text =
+                typeof input === "string" ? input : input?.text;
+              if (text === "DISCARD ALL") {
+                trace.push("discard");
+              } else if (text?.includes("pg_try_advisory_lock")) {
+                trace.push("acquire");
+              } else if (text?.includes("FROM pg_catalog.pg_locks")) {
+                trace.push("assert-held");
+              } else if (text?.includes("pg_advisory_unlock")) {
+                trace.push("unlock");
+              } else {
+                trace.push("unexpected-query");
+              }
+              return Reflect.apply(query, client, args);
+            },
+            release(...args) {
+              return Reflect.apply(release, client, args);
+            },
+          });
+          return callback(null, tracedClient, tracedClient.release);
+        });
       },
     });
     const restartedRuntime =
@@ -13506,7 +13590,7 @@ test(
         },
         pools: {
           ...runtimeOptions.pools,
-          authority: authorityPool,
+          authority: restartedAuthorityPool,
           operation: restartedOperationPool,
         },
         recovery: {
@@ -13800,6 +13884,11 @@ test(
       restartedPhysicalSignals.size;
     const restoreRetryOperationGuardConnectsBefore =
       restartedOperationGuardConnects;
+    const restoreRetryOperationGuardTracesBefore =
+      restartedOperationGuardTraces.length;
+    const restoreRetryAuthorityReadsBefore = {
+      ...restartedAuthorityReads,
+    };
     await assert.rejects(
       restartedController.backend.restoreCheckpoint(admission),
       (error) => {
@@ -13830,6 +13919,21 @@ test(
       {
         detach: detachAfterRetry.rows,
         events: publicationObservation.events,
+        authorityReads: {
+          activation:
+            restartedAuthorityReads.activation -
+            restoreRetryAuthorityReadsBefore.activation,
+          generation:
+            restartedAuthorityReads.generation -
+            restoreRetryAuthorityReadsBefore.generation,
+          launch:
+            restartedAuthorityReads.launch -
+            restoreRetryAuthorityReadsBefore.launch,
+        },
+        generationGuardTrace:
+          restartedOperationGuardTraces[
+            restoreRetryOperationGuardTracesBefore
+          ],
         physicalInvocations:
           restartedPhysicalInvocations.size -
           restoreRetryPhysicalInvocationsBefore,
@@ -13846,6 +13950,11 @@ test(
           restoreRetryVerificationBefore,
       },
       {
+        authorityReads: {
+          activation: 1,
+          generation: 2,
+          launch: 1,
+        },
         detach: [
           {
             kind: WRITER_RELEASE_OPERATION_KIND,
@@ -13859,6 +13968,16 @@ test(
           },
         ],
         events: ["verifyCommittedRestoreDestination"],
+        generationGuardTrace: [
+          "discard",
+          "acquire",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "unlock",
+          "discard",
+        ],
         operationGuardConnects: 2,
         physicalInvocations: 1,
         physicalSignals: 1,
