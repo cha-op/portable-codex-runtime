@@ -13733,8 +13733,12 @@ test(
     );
     assert.equal(directGenerationRead.session.document.launch, null);
     assert.deepEqual(
-      directGenerationRead.generation.binding.attachment,
-      directGenerationRead.session.document.attachment,
+      structuredClone(
+        directGenerationRead.generation.binding.attachment,
+      ),
+      structuredClone(
+        directGenerationRead.session.document.attachment,
+      ),
     );
     assert.notEqual(publicationObservation.restoreVerificationInput, null);
     // Prove the complete raw verifier succeeds after the artifact source is
