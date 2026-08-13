@@ -93,6 +93,7 @@ import {
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
+  assertSessionOperationTransitionProof,
   assertWriterLaunchStopCaptureHandoffProof,
 } from "../src/postgres-session-authority.mjs";
 import {
@@ -13450,6 +13451,13 @@ test(
       });
     const restartedImagePlanProviderId =
       `restarted-image-provider-${randomUUID()}`;
+    let restartedOperationGuardConnects = 0;
+    const restartedOperationPool = Object.freeze({
+      connect(callback) {
+        restartedOperationGuardConnects += 1;
+        return operationPool.connect(callback);
+      },
+    });
     const restartedRuntime =
       createPostgresDetachedRestoreRuntimeComposition({
         ...runtimeOptions,
@@ -13499,6 +13507,7 @@ test(
         pools: {
           ...runtimeOptions.pools,
           authority: authorityPool,
+          operation: restartedOperationPool,
         },
         recovery: {
           ...runtimeOptions.recovery,
@@ -13651,6 +13660,16 @@ test(
       [stablePlan.detachOperationId],
     );
     assert.deepEqual(detachBeforeRetry.rows, []);
+    const activationAndLaunchBeforeRetry = await authorityPool.query(
+      [
+        "SELECT operation_id, kind",
+        "FROM session_authority.operation_claims",
+        "WHERE operation_id = ANY($1::text[])",
+        "ORDER BY operation_id",
+      ].join(" "),
+      [[stablePlan.activationOperationId, stablePlan.launchAttemptId]],
+    );
+    assert.deepEqual(activationAndLaunchBeforeRetry.rows, []);
     const sessionBeforeRestoreRetry = await authorityPool.query(
       [
         "SELECT document->>'lifecycle' AS lifecycle,",
@@ -13676,16 +13695,69 @@ test(
         lifecycle: "ATTACHED",
       },
     ]);
+    const directGenerationRead =
+      await authority.readRestoreDestinationGeneration({
+        checkpoint: admission.checkpoint,
+        generationId: stablePlan.generationId,
+        request: admission.request,
+      });
+    assert.equal(directGenerationRead.status, "committed");
+    assert.equal(directGenerationRead.operation.state, "committed");
+    assert.equal(directGenerationRead.reservation.state, "released");
+    assertSessionOperationTransitionProof({
+      operation: directGenerationRead.operation,
+      reservation: directGenerationRead.reservation,
+      session: directGenerationRead.session,
+    });
+    const directGenerationLast =
+      directGenerationRead.session.document.lastOperation;
+    assert.deepEqual(
+      {
+        expectedSessionRevision:
+          directGenerationLast.expectedSessionRevision,
+        operationId: directGenerationLast.operationId,
+        operationRevision: directGenerationLast.operationRevision,
+        requestSha256: directGenerationLast.requestSha256,
+        reservationId: directGenerationLast.reservationId,
+        state: directGenerationLast.state,
+      },
+      {
+        expectedSessionRevision:
+          directGenerationRead.reservation.expectedSessionRevision,
+        operationId: admission.request.operationId,
+        operationRevision: directGenerationRead.operation.revision,
+        requestSha256: directGenerationRead.operation.requestSha256,
+        reservationId: directGenerationRead.reservation.reservationId,
+        state: "committed",
+      },
+    );
+    assert.equal(directGenerationRead.session.document.launch, null);
+    assert.deepEqual(
+      directGenerationRead.generation.binding.attachment,
+      directGenerationRead.session.document.attachment,
+    );
     assert.notEqual(publicationObservation.restoreVerificationInput, null);
     // Prove the complete raw verifier succeeds after the artifact source is
     // gone before attributing any later failure to the assembled facade.
-    const directVerification =
-      await restartedPublication.verifyCommittedRestoreDestination({
+    const directVerificationRequest = frozenNullPrototypeRecord({
         ...publicationObservation.restoreVerificationInput,
         destinationDirectory: publicationTree.destinationDirectory,
         destinationOwnedRoot: publicationTree.destinationOwnedRoot,
       });
+    const directVerification =
+      await restartedPublication.verifyCommittedRestoreDestination(
+        directVerificationRequest,
+      );
     assert.equal(directVerification.replayed, true);
+    // Prove the deployment-owned settlement wrapper accepts and returns the
+    // same committed verification before exercising the private router.
+    const directBoundVerification =
+      await restartedPhysicalBindings.publication
+        .verifyCommittedRestoreDestination(directVerificationRequest);
+    assert.deepEqual(
+      structuredClone(directBoundVerification),
+      structuredClone(directVerification),
+    );
 
     // This boundary proves complete in-process object replacement over the
     // same PostgreSQL and stopped-directory journal state.
@@ -13708,6 +13780,8 @@ test(
       restartedPhysicalInvocations.size;
     const restoreRetryPhysicalSignalsBefore =
       restartedPhysicalSignals.size;
+    const restoreRetryOperationGuardConnectsBefore =
+      restartedOperationGuardConnects;
     await assert.rejects(
       restartedController.backend.restoreCheckpoint(admission),
       (error) => {
@@ -13720,7 +13794,8 @@ test(
     );
     const detachAfterRetry = await authorityPool.query(
       [
-        "SELECT o.kind, o.state, o.revision::text AS revision,",
+        "SELECT o.operation_id, o.kind, o.state,",
+        "o.revision::text AS revision,",
         "o.result->>'outcome' AS outcome,",
         "o.result->>'reason' AS reason,",
         "r.state AS reservation_state,",
@@ -13733,17 +13808,47 @@ test(
       ].join(" "),
       [stablePlan.detachOperationId],
     );
-    assert.deepEqual(detachAfterRetry.rows, [
+    assert.deepEqual(
       {
-        kind: WRITER_RELEASE_OPERATION_KIND,
-        outcome: "writer-blocked",
-        reason: "provider-outcome-unresolved",
-        reservation_released: true,
-        reservation_state: "released",
-        revision: "3",
-        state: "committed",
+        detach: detachAfterRetry.rows,
+        events: publicationObservation.events,
+        physicalInvocations:
+          restartedPhysicalInvocations.size -
+          restoreRetryPhysicalInvocationsBefore,
+        physicalSignals:
+          restartedPhysicalSignals.size - restoreRetryPhysicalSignalsBefore,
+        operationGuardConnects:
+          restartedOperationGuardConnects -
+          restoreRetryOperationGuardConnectsBefore,
+        provider: restartedCalls.provider,
+        publicationAdvanced:
+          restartedCalls.publication > restoreRetryPublicationBefore,
+        verification:
+          restartedCalls.verifyCommittedRestoreDestination -
+          restoreRetryVerificationBefore,
       },
-    ]);
+      {
+        detach: [
+          {
+            kind: WRITER_RELEASE_OPERATION_KIND,
+            operation_id: stablePlan.detachOperationId,
+            outcome: "writer-blocked",
+            reason: "provider-outcome-unresolved",
+            reservation_released: true,
+            reservation_state: "released",
+            revision: "3",
+            state: "committed",
+          },
+        ],
+        events: ["verifyCommittedRestoreDestination"],
+        operationGuardConnects: 2,
+        physicalInvocations: 1,
+        physicalSignals: 1,
+        provider: 1,
+        publicationAdvanced: true,
+        verification: 1,
+      },
+    );
     assert.deepEqual(
       {
         publication: calls.publication,
