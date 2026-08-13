@@ -13503,6 +13503,45 @@ test(
         };
       },
     });
+    const restartedForegroundLifecycleTraces = [];
+    const restartedForegroundLifecyclePool = Object.freeze({
+      connect(callback) {
+        const trace = [];
+        restartedForegroundLifecycleTraces.push(trace);
+        return foregroundLifecyclePool.connect(
+          (error, client, release) => {
+            if (error !== null && error !== undefined) {
+              return callback(error, client, release);
+            }
+            const query = client.query;
+            const tracedClient = Object.freeze({
+              connection: client.connection,
+              query(...args) {
+                const input = args[0];
+                const text =
+                  typeof input === "string" ? input : input?.text;
+                if (text === "DISCARD ALL") {
+                  trace.push("discard");
+                } else if (text?.includes("pg_try_advisory_lock")) {
+                  trace.push("acquire");
+                } else if (text?.includes("FROM pg_catalog.pg_locks")) {
+                  trace.push("assert-held");
+                } else if (text?.includes("pg_advisory_unlock")) {
+                  trace.push("unlock");
+                } else {
+                  trace.push("unexpected-query");
+                }
+                return Reflect.apply(query, client, args);
+              },
+              release(...args) {
+                return Reflect.apply(release, client, args);
+              },
+            });
+            return callback(null, tracedClient, tracedClient.release);
+          },
+        );
+      },
+    });
     let restartedOperationGuardConnects = 0;
     const restartedOperationGuardTraces = [];
     const restartedOperationPool = Object.freeze({
@@ -13591,6 +13630,7 @@ test(
         pools: {
           ...runtimeOptions.pools,
           authority: restartedAuthorityPool,
+          foregroundLifecycle: restartedForegroundLifecyclePool,
           operation: restartedOperationPool,
         },
         recovery: {
@@ -13860,6 +13900,46 @@ test(
         directGenerationRead.operation.request.predeterminedResult,
       ),
     );
+    let directDetachGuardConnects = 0;
+    const directDetachProbe = createPostgresWriterDetachComposition({
+      authority,
+      operationGuard: new PostgresOperationGuard({
+        dedicatedPool: Object.freeze({
+          connect(callback) {
+            directDetachGuardConnects += 1;
+            callback(
+              new Error("synthetic direct detach guard failure"),
+              null,
+              undefined,
+            );
+            return undefined;
+          },
+        }),
+      }),
+      storageBackend: restartedPhysicalBindings.lifecycleBackend,
+    });
+    await assert.rejects(
+      directDetachProbe.detachWriter(
+        frozenNullPrototypeRecord({
+          expectedSession: directGenerationRead.session,
+          operationId: stablePlan.detachOperationId,
+          target: frozenNullPrototypeRecord({
+            attachmentId:
+              directGenerationRead.generation.binding.attachment
+                .attachmentId,
+            kind: "attachment",
+          }),
+        }),
+      ),
+      (error) => {
+        assert.equal(
+          error.code,
+          "postgres_writer_detach_composition_outcome_uncertain",
+        );
+        return true;
+      },
+    );
+    assert.equal(directDetachGuardConnects, 1);
 
     // This boundary proves complete in-process object replacement over the
     // same PostgreSQL and stopped-directory journal state.
@@ -13886,6 +13966,8 @@ test(
       restartedOperationGuardConnects;
     const restoreRetryOperationGuardTracesBefore =
       restartedOperationGuardTraces.length;
+    const restoreRetryForegroundLifecycleTracesBefore =
+      restartedForegroundLifecycleTraces.length;
     const restoreRetryAuthorityReadsBefore = {
       ...restartedAuthorityReads,
     };
@@ -13934,6 +14016,10 @@ test(
           restartedOperationGuardTraces[
             restoreRetryOperationGuardTracesBefore
           ],
+        foregroundLifecycleTrace:
+          restartedForegroundLifecycleTraces[
+            restoreRetryForegroundLifecycleTracesBefore
+          ],
         physicalInvocations:
           restartedPhysicalInvocations.size -
           restoreRetryPhysicalInvocationsBefore,
@@ -13968,6 +14054,19 @@ test(
           },
         ],
         events: ["verifyCommittedRestoreDestination"],
+        foregroundLifecycleTrace: [
+          "discard",
+          "acquire",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "assert-held",
+          "unlock",
+          "discard",
+        ],
         generationGuardTrace: [
           "discard",
           "acquire",
