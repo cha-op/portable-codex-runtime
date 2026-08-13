@@ -878,7 +878,9 @@ function assemble(options) {
     exactFrozenRecord({
       authority,
       operationGuard,
-      storageBackend: captureBackend,
+      // Detach authority must match the capabilities persisted on the
+      // session, not the stopped-directory checkpoint overlay.
+      storageBackend: options.storage.lifecycleBackend,
     }),
   );
   const restoreActivationCoordinator = callFactory(
