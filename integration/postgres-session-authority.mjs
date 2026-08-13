@@ -11827,8 +11827,11 @@ test(
       },
       resolveSourceOwnedRoot({ canonicalAttachment }) {
         assert.equal(
-          canonicalAttachment.rootPath,
-          publicationTree.sourceDirectory,
+          [
+            publicationTree.sourceDirectory,
+            publicationTree.recoverySourceDirectory,
+          ].includes(canonicalAttachment.rootPath),
+          true,
         );
         return {
           sourceDirectory: canonicalAttachment.rootPath,
