@@ -49,6 +49,7 @@ import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
+  createCheckpointBackendFacade,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryBackend } from "./stopped-directory-backend.mjs";
 import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs";
@@ -90,6 +91,7 @@ const migrateSerializableStoreIntrinsic =
   PostgresSerializableStore.prototype.migrate;
 const createCheckpointMutationAuthorityIntrinsic =
   createPostgresCheckpointMutationAuthority;
+const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 const createDetachedRestoreForegroundIntrinsic =
   createPostgresDetachedRestoreForegroundComposition;
 const createDetachedRestoreStablePlanRegistryIntrinsic =
@@ -472,6 +474,7 @@ function preflightLifecycleBackend(backend) {
   );
   trustedFunction(prepareRestoreAttachment);
   trustedFunction(reconcileRestoreAttachment);
+  return exactFrozenRecord(normalizedCapabilities);
 }
 
 function preflightPublication(publication) {
@@ -606,31 +609,6 @@ function createPublicBackendMutationAuthority(
   });
 }
 
-function createCheckpointBackendFacade(backend) {
-  const capabilities = exactDataObject(
-    backend.capabilities,
-    STORAGE_CAPABILITY_KEYS,
-  );
-  let facade;
-  const checkpointMethod = (method) => {
-    const callback = function checkpointBackendMethod(...args) {
-      if (!objectIs(this, facade)) {
-        throw new TypeErrorConstructor("Invalid checkpoint backend receiver");
-      }
-      return callIntrinsic(method, backend, args);
-    };
-    return objectFreeze(callback);
-  };
-  facade = exactFrozenRecord({
-    backendId: backend.backendId,
-    capabilities: exactFrozenRecord(capabilities),
-    contractVersion: backend.contractVersion,
-    captureCheckpoint: checkpointMethod(captureCheckpointBackendIntrinsic),
-    restoreCheckpoint: checkpointMethod(restoreCheckpointBackendIntrinsic),
-  });
-  return facade;
-}
-
 function createRestoreActivationAuthority(authority) {
   return exactFrozenRecord({
     claimRestoreAttachmentActivationDispatch: receiverCallback(
@@ -761,7 +739,9 @@ function assemble(options) {
     ),
   );
   preflightDistinctPools(options.pools);
-  preflightLifecycleBackend(options.storage.lifecycleBackend);
+  const lifecycleBackendCapabilities = preflightLifecycleBackend(
+    options.storage.lifecycleBackend,
+  );
   ensure(
     isPostgresDetachedRestoreImagePlanBinding(
       options.launch.imagePlanBinding,
@@ -924,7 +904,22 @@ function assemble(options) {
       resolveStoppedWriter,
     }),
   );
-  const backend = createCheckpointBackendFacade(restoreBackend);
+  const backend = callFactory(
+    createCheckpointBackendFacadeIntrinsic,
+    objectFreeze({
+      backendId: options.storage.backendId,
+      capabilities: lifecycleBackendCapabilities,
+      contractVersion: STORAGE_CONTRACT_VERSION,
+      captureCheckpoint: receiverCallback(
+        captureCheckpointBackendIntrinsic,
+        restoreBackend,
+      ),
+      restoreCheckpoint: receiverCallback(
+        restoreCheckpointBackendIntrinsic,
+        restoreBackend,
+      ),
+    }),
+  );
 
   const recoveryService = createRecoveryService(
     authority,

@@ -7,6 +7,9 @@ import {
 import {
   SESSION_AUTHORITY_MIGRATION_VERSION,
 } from "./postgres-serializable-store.mjs";
+import {
+  createCheckpointBackendFacade,
+} from "./session-storage-contracts.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -43,6 +46,7 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 
 const isRuntimeCompositionIntrinsic =
   isPostgresDetachedRestoreRuntimeComposition;
+const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 
 const OPTION_KEYS = objectFreeze(["runtime"]);
 const RUNTIME_KEYS = objectFreeze([
@@ -706,7 +710,6 @@ export function createPostgresDetachedRestoreRuntimeController(...args) {
 
   function backendIngress(bindingValue) {
     const method = function controlledBackendIngress(...invocationArgs) {
-      ensure(this === backendFacade, REQUEST_ERROR_CODE);
       const invokeAdmittedIngress = () =>
         protectPromise(runIngress(bindingValue, invocationArgs));
       objectFreeze(invokeAdmittedIngress);
@@ -839,13 +842,19 @@ export function createPostgresDetachedRestoreRuntimeController(...args) {
 
   objectFreeze(start);
   objectFreeze(stop);
-  backendFacade = exactFrozenRecord({
-    backendId: bindings.backendId,
-    capabilities: bindings.backendCapabilities,
-    contractVersion: bindings.backendContractVersion,
-    captureCheckpoint: backendIngress(bindings.captureCheckpoint),
-    restoreCheckpoint: backendIngress(bindings.restoreCheckpoint),
-  });
+  backendFacade = callIntrinsic(
+    createCheckpointBackendFacadeIntrinsic,
+    undefined,
+    [
+      objectFreeze({
+        backendId: bindings.backendId,
+        capabilities: bindings.backendCapabilities,
+        contractVersion: bindings.backendContractVersion,
+        captureCheckpoint: backendIngress(bindings.captureCheckpoint),
+        restoreCheckpoint: backendIngress(bindings.restoreCheckpoint),
+      }),
+    ],
+  );
   const controller = exactFrozenRecord({
     backend: backendFacade,
     imagePlanReservations: exactFrozenRecord({

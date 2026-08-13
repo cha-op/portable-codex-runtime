@@ -299,9 +299,9 @@ function createLifecycleBackend(calls) {
   return Object.freeze({
     backendId: BACKEND_ID,
     capabilities: Object.freeze({
-      atomicPointInTimeCheckpoint: false,
+      atomicPointInTimeCheckpoint: true,
       exclusiveWriterAttachment: true,
-      fencing: "manual",
+      fencing: "epoch-enforced",
       normalDirectoryAttachment: true,
     }),
     captureCheckpoint: invoke,
@@ -649,6 +649,19 @@ test("runtime composition constructs a frozen branded restore-capable surface wi
   ]);
   assert.equal(Object.getPrototypeOf(runtime.backend.capabilities), null);
   assert.equal(Object.isFrozen(runtime.backend.capabilities), true);
+  assert.deepEqual(
+    { ...runtime.backend.capabilities },
+    { ...fixture.options.storage.lifecycleBackend.capabilities },
+  );
+  assert.deepEqual(
+    { ...runtime.backend.capabilities },
+    {
+      atomicPointInTimeCheckpoint: true,
+      exclusiveWriterAttachment: true,
+      fencing: "epoch-enforced",
+      normalDirectoryAttachment: true,
+    },
+  );
   for (const name of Reflect.ownKeys(runtime.backend)) {
     assert.deepEqual(Object.getOwnPropertyDescriptor(runtime.backend, name), {
       configurable: false,

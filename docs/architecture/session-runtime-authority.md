@@ -1982,9 +1982,13 @@ pool lifecycle, or resolve deployment configuration. It keeps the original
 capture backend private, constructs the foreground composition over that
 backend, then constructs a second immutable stopped-directory implementation
 whose restore authority is the foreground composition. That implementation
-also remains private. Runtime returns only a frozen checkpoint facade with
-metadata, `captureCheckpoint()`, and `restoreCheckpoint()`; raw lifecycle and
-operator/provider extension methods cannot bypass the later controller.
+also remains private. Runtime returns only a branded frozen checkpoint facade
+with metadata, `captureCheckpoint()`, and `restoreCheckpoint()`. Its advertised
+capabilities are copied from the settled session lifecycle backend so
+registration and writer-detach validation use one exact tuple; the private
+stopped-directory checkpoint overlay's manual-fencing tuple is not served.
+Raw lifecycle and operator/provider extension methods cannot bypass the later
+controller.
 
 The deployment controller owns the next lifecycle boundary. It invokes the
 low-level runtime's same-store bootstrap migration,

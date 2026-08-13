@@ -48,6 +48,7 @@ import {
   assertStorageMutationResult,
   checkpointClassPolicy,
   compareFencingEpochs,
+  createCheckpointBackendFacade,
   createRootlessWorkerTemplate,
   createSessionManifest,
   parseFencingEpoch,
@@ -1299,7 +1300,10 @@ test("checkpoint backend projection rejects shared prototype pollution across re
   let foreignPrototypeCalls = 0;
   const foreignPrototypeCandidate = runInNewContext(
     `(() => {
-      delete Object.prototype.constructor;
+      for (const key of Reflect.ownKeys(Object.prototype)) {
+        const descriptor = Object.getOwnPropertyDescriptor(Object.prototype, key);
+        if (descriptor.configurable) delete Object.prototype[key];
+      }
       Object.defineProperties(Object.prototype, {
         backendId: { configurable: true, value: "foreign-prototype-backend" },
         capabilities: { configurable: true, value: validCapabilities },
@@ -1350,10 +1354,29 @@ test("checkpoint backend projection rejects shared prototype pollution across re
     Object.create(null),
     validBackend,
   );
-  const nullPrototypeProjection = assertCheckpointBackend(
-    nullPrototypeCandidate,
+  assert.throws(
+    () => assertCheckpointBackend(nullPrototypeCandidate),
+    assertCode("invalid_storage_backend"),
   );
-  assert.equal(nullPrototypeProjection.backendId, validBackend.backendId);
+  assert.throws(
+    () => createCheckpointBackendFacade(nullPrototypeCandidate),
+    assertCode("invalid_storage_backend"),
+  );
+  const checkpointFacade = createCheckpointBackendFacade(
+    validBackend,
+  );
+  assert.equal(checkpointFacade.backendId, validBackend.backendId);
+  assert.strictEqual(
+    assertCheckpointBackend(checkpointFacade),
+    checkpointFacade,
+  );
+  assert.throws(
+    () =>
+      assertCheckpointBackend(
+        Object.freeze(Object.assign(Object.create(null), checkpointFacade)),
+      ),
+    assertCode("invalid_storage_backend"),
+  );
 
   const customPrototype = { ...validBackend };
   const projected = assertCheckpointBackend(Object.create(customPrototype));

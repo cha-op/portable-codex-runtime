@@ -41,6 +41,7 @@ import {
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  assertCheckpointBackend,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../src/stopped-directory-publication.mjs";
@@ -831,6 +832,10 @@ test("controller exposes only the exact frozen backend and lifecycle facets", as
     "restoreCheckpoint",
   ]);
   assert.equal(Object.getPrototypeOf(controller.backend), null);
+  assert.strictEqual(
+    assertCheckpointBackend(controller.backend),
+    controller.backend,
+  );
   assert.equal(controller.backend.backendId, BACKEND_ID);
   assert.equal(controller.backend.contractVersion, 1);
   assert.deepEqual(Reflect.ownKeys(controller.backend.capabilities), [
@@ -840,6 +845,12 @@ test("controller exposes only the exact frozen backend and lifecycle facets", as
     "normalDirectoryAttachment",
   ]);
   assert.equal(Object.getPrototypeOf(controller.backend.capabilities), null);
+  assert.deepEqual({ ...controller.backend.capabilities }, {
+    atomicPointInTimeCheckpoint: true,
+    exclusiveWriterAttachment: true,
+    fencing: "epoch-enforced",
+    normalDirectoryAttachment: true,
+  });
   assert.deepEqual(Reflect.ownKeys(controller.imagePlanReservations), [
     "prepareImageReservation",
   ]);
@@ -1262,7 +1273,7 @@ test("controller backend accepts only its authentic receiver", async () => {
       () => Reflect.apply(backend.restoreCheckpoint, receiver, [
         restoreAdmission("controller-wrong-backend-receiver-001"),
       ]),
-      controllerError(REQUEST_CODE),
+      TypeError,
     );
   }
   await fixture.controller.start();

@@ -16,6 +16,7 @@ import {
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  assertCheckpointBackend,
   createSessionManifest,
 } from "../../../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../../../src/stopped-directory-publication.mjs";
@@ -726,6 +727,10 @@ async function zeroIoAndLifecycle() {
   ]);
   assert.equal(Object.getPrototypeOf(deployment.backend), null);
   assert.equal(Object.isFrozen(deployment.backend), true);
+  assert.strictEqual(
+    assertCheckpointBackend(deployment.backend),
+    deployment.backend,
+  );
   assert.equal(deployment.backend.backendId, BACKEND_ID);
   assert.equal(deployment.backend.contractVersion, 1);
   exactKeys(deployment.backend.capabilities, [
@@ -736,6 +741,12 @@ async function zeroIoAndLifecycle() {
   ]);
   assert.equal(Object.getPrototypeOf(deployment.backend.capabilities), null);
   assert.equal(Object.isFrozen(deployment.backend.capabilities), true);
+  assert.deepEqual({ ...deployment.backend.capabilities }, {
+    atomicPointInTimeCheckpoint: true,
+    exclusiveWriterAttachment: true,
+    fencing: "epoch-enforced",
+    normalDirectoryAttachment: true,
+  });
   for (const method of [
     "captureCheckpoint",
     "restoreCheckpoint",
@@ -1614,7 +1625,7 @@ async function backendIngressIsExactAndGated() {
   for (const receiver of [undefined, null, {}, clone, hostileReceiver]) {
     assert.throws(
       () => Reflect.apply(backend.restoreCheckpoint, receiver, [input]),
-      requestError,
+      TypeError,
     );
   }
   assert.throws(() => backend.restoreCheckpoint(input), requestError);

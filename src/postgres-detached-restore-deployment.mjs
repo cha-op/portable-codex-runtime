@@ -23,6 +23,9 @@ import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
 import {
+  createCheckpointBackendFacade,
+} from "./session-storage-contracts.mjs";
+import {
   createPhysicalCollaboratorSettlement,
 } from "./physical-collaborator-settlement.mjs";
 
@@ -90,6 +93,7 @@ const createPhysicalBindingsIntrinsic =
   createPostgresDetachedRestorePhysicalBindings;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
+const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 const createPhysicalSettlementIntrinsic =
   createPhysicalCollaboratorSettlement;
 
@@ -2478,7 +2482,6 @@ export function createPostgresDetachedRestoreDeployment(...args) {
 
   function backendIngress(bindingValue) {
     const method = function deploymentBackendIngress(...invocationArgs) {
-      ensure(this === backendFacade, REQUEST_ERROR_CODE);
       return runIngress(bindingValue, invocationArgs);
     };
     return objectFreeze(method);
@@ -2552,13 +2555,21 @@ export function createPostgresDetachedRestoreDeployment(...args) {
 
   objectFreeze(start);
   objectFreeze(stop);
-  backendFacade = exactFrozenRecord({
-    backendId: controllerBindings.backendId,
-    capabilities: controllerBindings.backendCapabilities,
-    contractVersion: controllerBindings.backendContractVersion,
-    captureCheckpoint: backendIngress(controllerBindings.captureCheckpoint),
-    restoreCheckpoint: backendIngress(controllerBindings.restoreCheckpoint),
-  });
+  backendFacade = callIntrinsic(
+    createCheckpointBackendFacadeIntrinsic,
+    undefined,
+    [
+      objectFreeze({
+        backendId: controllerBindings.backendId,
+        capabilities: controllerBindings.backendCapabilities,
+        contractVersion: controllerBindings.backendContractVersion,
+        captureCheckpoint: backendIngress(controllerBindings.captureCheckpoint),
+        restoreCheckpoint: backendIngress(
+          controllerBindings.restoreCheckpoint,
+        ),
+      }),
+    ],
+  );
   const deployment = exactFrozenRecord({
     backend: backendFacade,
     imagePlanReservations: exactFrozenRecord({

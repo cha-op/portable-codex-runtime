@@ -409,7 +409,10 @@ the version 3 foreground composition. Runtime, controller, and deployment
 expose only the checkpoint facade—metadata plus `captureCheckpoint()` and
 `restoreCheckpoint()`—through their ready/in-flight admission ledgers;
 callers cannot supply the internal publication callback, invoke raw lifecycle
-mutations, or reach operator/provider extensions. The complete assembled
+mutations, or reach operator/provider extensions. The facade advertises the
+settled session lifecycle backend's capability tuple used by registration and
+writer detach, not the private stopped-directory checkpoint overlay's tuple.
+The complete assembled
 physical graph has method-specific settlement and operational lease admission.
 The completed safety-matrix slice classifies all
 nineteen deployment-owned settlement leaves, divides the fourteen leaves on

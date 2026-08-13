@@ -1899,6 +1899,12 @@ function assertPublicCheckpointBackendSurface(backend) {
     "fencing",
     "normalDirectoryAttachment",
   ]);
+  assert.deepEqual({ ...backend.capabilities }, {
+    atomicPointInTimeCheckpoint: true,
+    exclusiveWriterAttachment: true,
+    fencing: "epoch-enforced",
+    normalDirectoryAttachment: true,
+  });
   assert.equal(typeof backend.captureCheckpoint, "function");
   assert.equal(typeof backend.restoreCheckpoint, "function");
   assert.equal(Object.isFrozen(backend.captureCheckpoint), true);
@@ -14564,9 +14570,21 @@ test(
       applicationNames,
     );
 
-    const registration = registrationInput(sessionId, {
-      imageDigest: deploymentImage.descriptor.digest,
+    const advertisedBackendCapabilities = {
+      ...deployment.backend.capabilities,
+    };
+    assert.deepEqual(advertisedBackendCapabilities, {
+      atomicPointInTimeCheckpoint: true,
+      exclusiveWriterAttachment: true,
+      fencing: "epoch-enforced",
+      normalDirectoryAttachment: true,
     });
+    const registration = {
+      ...registrationInput(sessionId, {
+        imageDigest: deploymentImage.descriptor.digest,
+      }),
+      backendCapabilities: advertisedBackendCapabilities,
+    };
     const inspectionAuthority = new PostgresSessionAuthority({
       restoreAttachmentActivationV2FleetCompatible: true,
       restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:

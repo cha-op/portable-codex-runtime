@@ -73,9 +73,13 @@ contain the deeply frozen validated checkpoint descriptor and exact storage
 mutation result; neither result gains new authority fields.
 
 Capture and restore require only the checkpoint projection validated by
-`assertCheckpointBackend()`. The separately versioned capture-reconciliation
-entry point still requires the full backend extension because that private
-operator path is not part of the public checkpoint facade.
+`assertCheckpointBackend()`. An unbranded null-prototype implementation must
+instead expose its operations through an ordinary or class implementation and
+pass that implementation to `createCheckpointBackendFacade()`; this prevents a
+stripped shared prototype from another realm from masquerading as an
+implementation. The separately versioned capture-reconciliation entry point
+still requires the full backend extension because that private operator path
+is not part of the public checkpoint facade.
 
 ## Orchestration Boundary
 

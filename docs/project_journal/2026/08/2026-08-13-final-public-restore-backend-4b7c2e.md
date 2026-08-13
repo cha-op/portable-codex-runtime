@@ -41,6 +41,15 @@ superseded_by:
   restore-attachment dispatch, and attachment reconciliation remain private to
   the runtime graph because exposing them at serving ingress would bypass their
   durable coordinator or control/operator-plane admission.
+- The public facade advertises the settled session lifecycle backend's exact
+  capability tuple, which is also the tuple persisted at registration and
+  validated by writer detach. The private stopped-directory implementation's
+  fixed manual-fencing checkpoint overlay is not exposed as session metadata.
+- The explicit facade constructor consumes only an ordinary or class
+  checkpoint implementation and returns the supported branded null-prototype
+  facade. Generic validation accepts candidate-owned fields and explicit
+  non-terminal prototypes but never treats an unbranded terminal root from
+  another realm as a backend.
 - The runtime controller and deployment expose the public backend through
   receiver-preserving admission wrappers. Every admitted backend Promise is
   retained by the controller's in-flight ledger. Stop closes new ingress and

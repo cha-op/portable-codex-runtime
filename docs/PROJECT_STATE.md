@@ -409,8 +409,10 @@
   capture backend private and constructs a second immutable backend whose
   restore authority is the version 3 foreground composition. Runtime,
   controller, and deployment expose only its checkpoint facade through
-  ready/in-flight admission; raw lifecycle mutations, foreground callbacks,
-  and operator/provider extensions stay private. Operational lease admission
+  ready/in-flight admission. Its metadata carries the same settled lifecycle
+  capability tuple persisted on sessions and enforced by writer detach; raw
+  lifecycle mutations, foreground callbacks, and operator/provider extensions
+  stay private. Operational lease admission
   is enforced at stable-plan provision and every resolution from one
   deployment-owned policy derived from the two database-clock critical
   windows.
