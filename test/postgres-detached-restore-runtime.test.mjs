@@ -34,28 +34,26 @@ import {
   isPostgresRestoreRecoveryScheduler,
 } from "../src/postgres-restore-recovery-scheduler.mjs";
 import {
-  PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  SessionStorageContractError,
+  assertCheckpointBackend,
+  assertCheckpointCaptureReconciliationBackend,
   assertPreparedCheckpointCaptureBackend,
   assertRestoreAttachmentActivationBackend,
   assertRestoreAttachmentReconciliationBackend,
   assertStorageBackend,
 } from "../src/session-storage-contracts.mjs";
 import {
-  StoppedDirectoryBackend,
   StoppedDirectoryBackendError,
 } from "../src/stopped-directory-backend.mjs";
 import { StoppedDirectoryPublication } from "../src/stopped-directory-publication.mjs";
 import { StoppedWriterCapabilityCoordinator } from "../src/stopped-writer-capability.mjs";
-import {
-  isPostgresDetachedRestoreForegroundComposition,
-} from "../src/postgres-detached-restore-foreground-composition.mjs";
 
 const SESSION_ID = "019f8500-0000-7000-8000-000000000001";
 const THREAD_ID = "019f8500-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
-const BACKEND_ID = "runtime-capture-only-backend";
+const BACKEND_ID = "runtime-stopped-directory-backend";
 const SOURCE_STORAGE_ID = "source-storage-001";
 const DESTINATION_STORAGE_ID = "destination-storage-001";
 const CHECKPOINT_ID = "checkpoint-001";
@@ -287,6 +285,12 @@ function stablePlanRegistryRequestError(error) {
   return true;
 }
 
+function storageBackendError(error) {
+  assert(error instanceof SessionStorageContractError);
+  assert.equal(error.code, "invalid_storage_backend");
+  return true;
+}
+
 function createLifecycleBackend(calls) {
   const invoke = async function invokeProvider() {
     calls.provider += 1;
@@ -501,6 +505,10 @@ function assertNoActivity(fixture) {
   for (const pool of new Set(Object.values(fixture.pools))) {
     assert.deepEqual(pool.calls, { connect: 0, end: 0, query: 0 });
   }
+  assertNoCollaboratorActivity(fixture);
+}
+
+function assertNoCollaboratorActivity(fixture) {
   assert.deepEqual(fixture.calls, {
     fleetGate: 0,
     image: 0,
@@ -548,7 +556,7 @@ function restoreAdmission() {
   };
 }
 
-test("runtime composition constructs a frozen branded capture-only surface without I/O", () => {
+test("runtime composition constructs a frozen branded restore-capable surface without I/O", () => {
   const fixture = createRuntimeFixture();
   assert.equal(
     isPostgresDetachedRestoreOperationalLeaseBudget(
@@ -569,7 +577,6 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   assert.deepEqual(Reflect.ownKeys(runtime), [
     "backend",
     "bootstrap",
-    "foreground",
     "imagePlanReservations",
     "scheduler",
     "stablePlanProvisioning",
@@ -582,7 +589,6 @@ test("runtime composition constructs a frozen branded capture-only surface witho
       Object.freeze({
         backend: runtime.backend,
         bootstrap: runtime.bootstrap,
-        foreground: runtime.foreground,
         imagePlanReservations: runtime.imagePlanReservations,
         scheduler: runtime.scheduler,
         stablePlanProvisioning: runtime.stablePlanProvisioning,
@@ -592,36 +598,88 @@ test("runtime composition constructs a frozen branded capture-only surface witho
     false,
   );
 
-  assert(runtime.backend instanceof StoppedDirectoryBackend);
-  assert.strictEqual(assertStorageBackend(runtime.backend), runtime.backend);
-  assert.strictEqual(
-    assertPreparedCheckpointCaptureBackend(runtime.backend),
-    runtime.backend,
+  exactKeys(runtime.backend, [
+    "backendId",
+    "capabilities",
+    "captureCheckpoint",
+    "contractVersion",
+    "restoreCheckpoint",
+  ]);
+  assert.equal(Object.getPrototypeOf(runtime.backend), null);
+  assert.equal(Object.isFrozen(runtime.backend), true);
+  const checkpointProjection = assertCheckpointBackend(runtime.backend);
+  exactKeys(checkpointProjection, [
+    "backendId",
+    "capabilities",
+    "captureCheckpoint",
+    "contractVersion",
+    "restoreCheckpoint",
+  ]);
+  assert.equal(Object.getPrototypeOf(checkpointProjection), null);
+  assert.equal(Object.isFrozen(checkpointProjection), true);
+  assert.equal(checkpointProjection.backendId, runtime.backend.backendId);
+  assert.deepEqual(
+    { ...checkpointProjection.capabilities },
+    { ...runtime.backend.capabilities },
   );
-  assert.strictEqual(
-    assertRestoreAttachmentActivationBackend(runtime.backend),
-    runtime.backend,
+  assert.equal(
+    checkpointProjection.contractVersion,
+    runtime.backend.contractVersion,
   );
-  assert.strictEqual(
-    assertRestoreAttachmentReconciliationBackend(runtime.backend),
-    runtime.backend,
-  );
+  for (const name of ["captureCheckpoint", "restoreCheckpoint"]) {
+    assert.equal(typeof checkpointProjection[name], "function");
+    assert.equal(Object.isFrozen(checkpointProjection[name]), true);
+  }
+  for (const validator of [
+    assertStorageBackend,
+    assertCheckpointCaptureReconciliationBackend,
+    assertPreparedCheckpointCaptureBackend,
+    assertRestoreAttachmentActivationBackend,
+    assertRestoreAttachmentReconciliationBackend,
+  ]) {
+    assert.throws(() => validator(runtime.backend), storageBackendError);
+  }
   assert.equal(runtime.backend.backendId, BACKEND_ID);
   assert.equal(runtime.backend.contractVersion, 1);
-  assert.equal(runtime.backend.captureReconciliationContractVersion, 1);
-  assert.equal(
-    runtime.backend.preparedCheckpointCaptureContractVersion,
-    PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION,
-  );
-  assert.equal(
-    runtime.backend.restoreAttachmentActivationContractVersion,
-    RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
-  );
-  assert.equal(
-    runtime.backend.restoreAttachmentReconciliationContractVersion,
-    RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
-  );
-  assert.equal(Object.isFrozen(runtime.backend), true);
+  exactKeys(runtime.backend.capabilities, [
+    "atomicPointInTimeCheckpoint",
+    "exclusiveWriterAttachment",
+    "fencing",
+    "normalDirectoryAttachment",
+  ]);
+  assert.equal(Object.getPrototypeOf(runtime.backend.capabilities), null);
+  assert.equal(Object.isFrozen(runtime.backend.capabilities), true);
+  for (const name of Reflect.ownKeys(runtime.backend)) {
+    assert.deepEqual(Object.getOwnPropertyDescriptor(runtime.backend, name), {
+      configurable: false,
+      enumerable: true,
+      value: runtime.backend[name],
+      writable: false,
+    });
+  }
+  for (const name of ["captureCheckpoint", "restoreCheckpoint"]) {
+    assert.equal(typeof runtime.backend[name], "function");
+    assert.equal(Object.isFrozen(runtime.backend[name]), true);
+  }
+  for (const name of [
+    "captureReconciliationContractVersion",
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "physicalInvocationContractVersion",
+    "prepareRestoreAttachment",
+    "prepareWritableAttachment",
+    "preparedCheckpointCaptureContractVersion",
+    "provisionSession",
+    "reconcileCheckpointCapture",
+    "reconcileRestoreAttachment",
+    "restoreAttachmentActivationContractVersion",
+    "restoreAttachmentReconciliationContractVersion",
+    "resumePreparedCheckpointCapture",
+  ]) {
+    assert.equal(name in runtime.backend, false);
+  }
+  assert.equal("foreground" in runtime, false);
 
   exactKeys(runtime.bootstrap, ["migrate"]);
   assert.equal(Object.getPrototypeOf(runtime.bootstrap), null);
@@ -640,14 +698,6 @@ test("runtime composition constructs a frozen branded capture-only surface witho
   for (const name of ["close", "pool", "runSerializable", "store"]) {
     assert.equal(name in runtime.bootstrap, false);
   }
-
-  assert.equal(
-    isPostgresDetachedRestoreForegroundComposition(runtime.foreground),
-    true,
-  );
-  exactKeys(runtime.foreground, ["restoreContextContractVersion", "runRestore"]);
-  assert.equal(runtime.foreground.restoreContextContractVersion, 3);
-  assert.equal(Object.isFrozen(runtime.foreground), true);
 
   exactKeys(runtime.imagePlanReservations, ["prepareImageReservation"]);
   assert.equal(Object.getPrototypeOf(runtime.imagePlanReservations), null);
@@ -805,6 +855,56 @@ test("runtime facets keep per-runtime identity and captured receivers", async ()
   assertNoActivity(secondFixture);
 });
 
+test("public backend methods reject wrong, detached, and cloned receivers without I/O", () => {
+  const firstFixture = createRuntimeFixture();
+  const secondFixture = createRuntimeFixture();
+  const first = createPostgresDetachedRestoreRuntimeComposition(
+    firstFixture.options,
+  );
+  const second = createPostgresDetachedRestoreRuntimeComposition(
+    secondFixture.options,
+  );
+  const clone = Object.freeze(
+    Object.create(
+      null,
+      Object.getOwnPropertyDescriptors(first.backend),
+    ),
+  );
+  const proxy = new Proxy(first.backend, {
+    get() {
+      assert.fail("wrong receiver Proxy must not be read");
+    },
+    getOwnPropertyDescriptor() {
+      assert.fail("wrong receiver Proxy descriptor must not be read");
+    },
+    getPrototypeOf() {
+      assert.fail("wrong receiver Proxy prototype must not be read");
+    },
+  });
+
+  assert.notStrictEqual(first.backend, second.backend);
+  assert.notStrictEqual(first.backend, clone);
+  assert.deepEqual(Reflect.ownKeys(clone), Reflect.ownKeys(first.backend));
+  for (const name of ["captureCheckpoint", "restoreCheckpoint"]) {
+    const detached = first.backend[name];
+    assert.throws(() => detached({}), TypeError);
+    assert.throws(
+      () => Reflect.apply(first.backend[name], second.backend, [{}]),
+      TypeError,
+    );
+    assert.throws(
+      () => Reflect.apply(first.backend[name], clone, [{}]),
+      TypeError,
+    );
+    assert.throws(
+      () => Reflect.apply(first.backend[name], proxy, [{}]),
+      TypeError,
+    );
+  }
+  assertNoActivity(firstFixture);
+  assertNoActivity(secondFixture);
+});
+
 test("runtime composition rejects every pairwise pool alias before I/O", async (t) => {
   const roles = [
     "authority",
@@ -833,14 +933,16 @@ test("runtime composition rejects every pairwise pool alias before I/O", async (
   }
 });
 
-test("capture-only backend maps the fixed unavailable restore authority to uncertain", async () => {
+test("public backend delegates restore through the private foreground composition", async () => {
   const fixture = createRuntimeFixture();
   const runtime = createPostgresDetachedRestoreRuntimeComposition(
     fixture.options,
   );
 
+  const restore = runtime.backend.restoreCheckpoint(restoreAdmission());
+  assert(restore instanceof Promise);
   await assert.rejects(
-    () => runtime.backend.restoreCheckpoint(restoreAdmission()),
+    restore,
     (error) => {
       assert(error instanceof StoppedDirectoryBackendError);
       assert.equal(error.code, "stopped_directory_backend_outcome_uncertain");
@@ -850,8 +952,37 @@ test("capture-only backend maps the fixed unavailable restore authority to uncer
     },
   );
 
-  assert.equal(runtime.foreground.restoreContextContractVersion, 3);
-  assert.notStrictEqual(runtime.backend.restoreCheckpoint, runtime.foreground.runRestore);
+  assert.deepEqual(fixture.pools.foregroundLifecycle.calls, {
+    connect: 1,
+    end: 0,
+    query: 0,
+  });
+  for (const name of ["authority", "operation", "recoveryLifecycle"]) {
+    assert.deepEqual(fixture.pools[name].calls, {
+      connect: 0,
+      end: 0,
+      query: 0,
+    });
+  }
+  assertNoCollaboratorActivity(fixture);
+});
+
+test("public backend retains the checkpoint capture authority without exposing reconciliation", async () => {
+  const fixture = createRuntimeFixture();
+  const runtime = createPostgresDetachedRestoreRuntimeComposition(
+    fixture.options,
+  );
+
+  const capture = runtime.backend.captureCheckpoint({});
+  assert(capture instanceof Promise);
+  await assert.rejects(capture, (error) => {
+    assert(error instanceof StoppedDirectoryBackendError);
+    assert.equal(error.code, "invalid_stopped_directory_backend_request");
+    assert.equal(error.retryable, false);
+    assert.equal(Object.isFrozen(error), true);
+    return true;
+  });
+  assert.equal("reconcileCheckpointCapture" in runtime.backend, false);
   assertNoActivity(fixture);
 });
 

@@ -82,6 +82,10 @@ const PostgresSerializableStoreConstructor = PostgresSerializableStore;
 const PostgresSessionAuthorityConstructor = PostgresSessionAuthority;
 const PostgresOperationGuardConstructor = PostgresOperationGuard;
 const StoppedDirectoryBackendConstructor = StoppedDirectoryBackend;
+const captureCheckpointBackendIntrinsic =
+  StoppedDirectoryBackend.prototype.captureCheckpoint;
+const restoreCheckpointBackendIntrinsic =
+  StoppedDirectoryBackend.prototype.restoreCheckpoint;
 const migrateSerializableStoreIntrinsic =
   PostgresSerializableStore.prototype.migrate;
 const createCheckpointMutationAuthorityIntrinsic =
@@ -571,6 +575,62 @@ function receiverCallback(method, receiver) {
   return objectFreeze(callback);
 }
 
+function createPublicBackendMutationAuthority(
+  checkpointMutationAuthority,
+  foreground,
+) {
+  return exactFrozenRecord({
+    restoreContextContractVersion: 3,
+    runCapture: receiverCallback(
+      ownFrozenDataFunction(checkpointMutationAuthority, "runCapture"),
+      checkpointMutationAuthority,
+    ),
+    runCaptureReconciliation: receiverCallback(
+      ownFrozenDataFunction(
+        checkpointMutationAuthority,
+        "runCaptureReconciliation",
+      ),
+      checkpointMutationAuthority,
+    ),
+    runPreparedCapture: receiverCallback(
+      ownFrozenDataFunction(
+        checkpointMutationAuthority,
+        "runPreparedCapture",
+      ),
+      checkpointMutationAuthority,
+    ),
+    runRestore: receiverCallback(
+      ownFrozenDataFunction(foreground, "runRestore"),
+      foreground,
+    ),
+  });
+}
+
+function createCheckpointBackendFacade(backend) {
+  const capabilities = exactDataObject(
+    backend.capabilities,
+    STORAGE_CAPABILITY_KEYS,
+  );
+  let facade;
+  const checkpointMethod = (method) => {
+    const callback = function checkpointBackendMethod(...args) {
+      if (!objectIs(this, facade)) {
+        throw new TypeErrorConstructor("Invalid checkpoint backend receiver");
+      }
+      return callIntrinsic(method, backend, args);
+    };
+    return objectFreeze(callback);
+  };
+  facade = exactFrozenRecord({
+    backendId: backend.backendId,
+    capabilities: exactFrozenRecord(capabilities),
+    contractVersion: backend.contractVersion,
+    captureCheckpoint: checkpointMethod(captureCheckpointBackendIntrinsic),
+    restoreCheckpoint: checkpointMethod(restoreCheckpointBackendIntrinsic),
+  });
+  return facade;
+}
+
 function createRestoreActivationAuthority(authority) {
   return exactFrozenRecord({
     claimRestoreAttachmentActivationDispatch: receiverCallback(
@@ -797,7 +857,8 @@ function assemble(options) {
       resolveSourceOwnedRoot: options.storage.resolveSourceOwnedRoot,
     }),
   );
-  const backend = construct(
+  const resolveStoppedWriter = createResolveStoppedWriter(launcher);
+  const captureBackend = construct(
     StoppedDirectoryBackendConstructor,
     exactFrozenRecord({
       backendId: options.storage.backendId,
@@ -805,7 +866,7 @@ function assemble(options) {
       lifecycleBackend: options.storage.lifecycleBackend,
       mutationAuthority: checkpointMutationAuthority,
       publication: options.storage.publication,
-      resolveStoppedWriter: createResolveStoppedWriter(launcher),
+      resolveStoppedWriter,
     }),
   );
   const durableStopCapture = callFactory(
@@ -817,7 +878,7 @@ function assemble(options) {
     exactFrozenRecord({
       authority,
       operationGuard,
-      storageBackend: backend,
+      storageBackend: captureBackend,
     }),
   );
   const restoreActivationCoordinator = callFactory(
@@ -828,14 +889,14 @@ function assemble(options) {
       operationalLeaseBudget: options.planRegistry.operationalLeaseBudget,
       publication: options.storage.publication,
       resolveRestoreDestination: options.storage.resolveRestoreDestination,
-      storageBackend: backend,
+      storageBackend: captureBackend,
     }),
   );
   const foreground = callFactory(
     createDetachedRestoreForegroundIntrinsic,
     exactFrozenRecord({
       authority,
-      captureBackend: backend,
+      captureBackend,
       durableStopCapture,
       fleetCapabilityGate: options.foreground.fleetCapabilityGate,
       imagePlanBinding: options.launch.imagePlanBinding,
@@ -847,6 +908,21 @@ function assemble(options) {
       writerDetach,
     }),
   );
+  const restoreBackend = construct(
+    StoppedDirectoryBackendConstructor,
+    exactFrozenRecord({
+      backendId: options.storage.backendId,
+      coordinator: options.launch.stoppedWriterCoordinator,
+      lifecycleBackend: options.storage.lifecycleBackend,
+      mutationAuthority: createPublicBackendMutationAuthority(
+        checkpointMutationAuthority,
+        foreground,
+      ),
+      publication: options.storage.publication,
+      resolveStoppedWriter,
+    }),
+  );
+  const backend = createCheckpointBackendFacade(restoreBackend);
 
   const recoveryService = createRecoveryService(
     authority,
@@ -879,7 +955,6 @@ function assemble(options) {
   const runtime = exactFrozenRecord({
     backend,
     bootstrap,
-    foreground,
     imagePlanReservations: createImagePlanReservationsFacet(
       options.launch.imagePlanBinding,
     ),

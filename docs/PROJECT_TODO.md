@@ -55,7 +55,7 @@
   generations.
 - [done] Implement typed canonical restore destination generation claim,
   dispatch, finalisation, exact replay, and recovery authority while keeping
-  production restore fail-closed.
+  production restore fail-closed in that authority-only slice.
 - [done] Implement the durable launch-attempt lifecycle around exact
   generation, lease, attachment, fencing, measured-image, process, writer, and
   supervisor bindings without invoking a launcher inside that slice.
@@ -86,7 +86,8 @@
 - [done] Persist one independent generation, activation, launch-attempt, and
   current-launch recovery cursor per configured scope, and add a bounded
   single-flight runner that durably advances each settled lane before admitting
-  the next. Keep the runner unscheduled and production restore fail-closed.
+  the next. That slice kept the runner unscheduled and production restore
+  fail-closed pending later assembly.
 - [done] Add a version 3 stopped-directory restore callback that passes the
   complete authority-issued generation binding to fresh publication or
   committed-only verification while preserving the legacy version 2 callback.
@@ -104,19 +105,20 @@
 - [done] Add a cross-process shared/exclusive restore lifecycle guard and a
   bounded production recovery scheduler so foreground prepared launch cannot
   race recovery cancellation.
-- [pending] Complete production restore adapter enablement. Phase A now
+- [done] Complete production restore adapter enablement. Phase A
   provides the caller-persisted stable plan, invocation-time default-deny fleet
   gate, and shared-lifecycle foreground composition seam across committed
   publication, durable stop/capture, canonical detach, activation, and
-  prepared launch. The production-neutral assembly foundation now constructs
-  that facade, its capture-only backend, three distinct lifecycle/operation
-  guard pools, authority/store pool, idle bounded no-relaunch scheduler, and a
-  narrow same-launcher writer-start ingress without opening the adapter. The
+  prepared launch. The production-neutral assembly now constructs that private
+  facade, its private capture backend, an immutable public backend, three
+  distinct lifecycle/operation guard pools, authority/store pool, idle bounded
+  no-relaunch scheduler, and a narrow same-launcher writer-start ingress. The
   PostgreSQL durable plan registry, separately gated provisioning facet, and
   private read-only foreground resolver are now complete. The deployment
   controller now owns migration-before-serving, the initial complete recovery
-  sweep, restore and image-reservation admission, scheduler shutdown, and
-  admitted-call drain while leaving the four low-level pools borrowed. The
+  sweep, checkpoint-backend and image-reservation admission, scheduler
+  shutdown, and admitted-call drain while leaving the four low-level pools
+  borrowed. The
   production deployment factory now owns explicit PostgreSQL connection/
   bootstrap configuration, constructs those four private pools, performs a
   point-in-time same-primary topology check before controller startup, and
@@ -139,13 +141,16 @@
   those method policies, an explicit aggregate database allowance, and a
   positive safety margin; stable-plan provision and every resolution enforce
   the exact admitted lease. The completed safety matrix classifies all nineteen
-  settlement leaves, maps the seven protocol-surface mutators to seven real-PostgreSQL
-  acknowledgement-loss paths, and binds a same-database/stable-plan retry
+  settlement leaves, maps the seven protocol-surface mutators to seven
+  real-PostgreSQL acknowledgement-loss paths, and binds a
+  same-database/stable-plan retry
   through fresh physical bindings, image binding, runtime, and controller plus
   separate registry rehydration, an explicit test-only publication-seam router,
-  and representative settlement timer/drain evidence. Next construct the final
-  public backend and only then replace the
-  fixed fail-closed `runRestore()` stub.
+  and representative settlement timer/drain evidence. The final immutable
+  public checkpoint backend is now assembled over a second private stopped-
+  directory backend and exposed only through controller/deployment admission.
+  Callers cannot inject the internal generation-publication callback, invoke
+  raw lifecycle mutations, or reach operator/provider extensions.
 - [pending] Implement an ext4 or filesystem-image physical backend, followed by
   differential compression, content-addressed storage, encryption, retention,
   periodic long-goal snapshots, and cross-host restore verification.

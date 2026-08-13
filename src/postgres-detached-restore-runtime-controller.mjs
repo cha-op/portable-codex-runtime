@@ -48,17 +48,29 @@ const OPTION_KEYS = objectFreeze(["runtime"]);
 const RUNTIME_KEYS = objectFreeze([
   "backend",
   "bootstrap",
-  "foreground",
   "imagePlanReservations",
   "scheduler",
   "stablePlanProvisioning",
   "writerLaunch",
 ]);
-const BOOTSTRAP_KEYS = objectFreeze(["migrate"]);
-const FOREGROUND_KEYS = objectFreeze([
-  "restoreContextContractVersion",
-  "runRestore",
+const BACKEND_KEYS = objectFreeze([
+  "backendId",
+  "capabilities",
+  "contractVersion",
+  "captureCheckpoint",
+  "restoreCheckpoint",
 ]);
+const BACKEND_CAPABILITY_KEYS = objectFreeze([
+  "atomicPointInTimeCheckpoint",
+  "exclusiveWriterAttachment",
+  "fencing",
+  "normalDirectoryAttachment",
+]);
+const BACKEND_METHOD_KEYS = objectFreeze([
+  "captureCheckpoint",
+  "restoreCheckpoint",
+]);
+const BOOTSTRAP_KEYS = objectFreeze(["migrate"]);
 const IMAGE_PLAN_RESERVATIONS_KEYS = objectFreeze([
   "prepareImageReservation",
 ]);
@@ -506,9 +518,15 @@ function runtimeBindings(runtime) {
     BOOTSTRAP_KEYS,
     OPTION_ERROR_CODE,
   );
-  const foreground = exactFrozenSurface(
-    normalizedRuntime.foreground,
-    FOREGROUND_KEYS,
+  const authenticBackend = normalizedRuntime.backend;
+  const backend = exactFrozenSurface(
+    authenticBackend,
+    BACKEND_KEYS,
+    OPTION_ERROR_CODE,
+  );
+  const backendCapabilities = exactFrozenSurface(
+    backend.capabilities,
+    BACKEND_CAPABILITY_KEYS,
     OPTION_ERROR_CODE,
   );
   const imagePlanReservations = exactFrozenSurface(
@@ -531,8 +549,14 @@ function runtimeBindings(runtime) {
     WRITER_LAUNCH_KEYS,
     OPTION_ERROR_CODE,
   );
-  ensure(foreground.restoreContextContractVersion === 3, OPTION_ERROR_CODE);
-  return exactFrozenRecord({
+  ensure(
+    typeof backend.backendId === "string" && backend.contractVersion === 1,
+    OPTION_ERROR_CODE,
+  );
+  const normalizedBindings = {
+    backendCapabilities: exactFrozenRecord(backendCapabilities),
+    backendContractVersion: backend.contractVersion,
+    backendId: backend.backendId,
     migrate: binding(bootstrap, "migrate", OPTION_ERROR_CODE),
     prepareImageReservation: binding(
       imagePlanReservations,
@@ -545,7 +569,6 @@ function runtimeBindings(runtime) {
       OPTION_ERROR_CODE,
     ),
     runLaunch: binding(writerLaunch, "runLaunch", OPTION_ERROR_CODE),
-    runRestore: binding(foreground, "runRestore", OPTION_ERROR_CODE),
     runStep: binding(scheduler, "runStep", OPTION_ERROR_CODE),
     schedulerStart: binding(scheduler, "start", OPTION_ERROR_CODE),
     schedulerStop: binding(scheduler, "stop", OPTION_ERROR_CODE),
@@ -554,7 +577,16 @@ function runtimeBindings(runtime) {
       "provisionStablePlan",
       OPTION_ERROR_CODE,
     ),
-  });
+  };
+  for (let index = 0; index < BACKEND_METHOD_KEYS.length; index += 1) {
+    const name = BACKEND_METHOD_KEYS[index];
+    normalizedBindings[name] = binding(
+      authenticBackend,
+      name,
+      OPTION_ERROR_CODE,
+    );
+  }
+  return exactFrozenRecord(normalizedBindings);
 }
 
 function validateMigrationResult(value) {
@@ -658,6 +690,23 @@ export function createPostgresDetachedRestoreRuntimeController(...args) {
 
   function ingress(bindingValue) {
     const method = function controlledIngress(...invocationArgs) {
+      const invokeAdmittedIngress = () =>
+        protectPromise(runIngress(bindingValue, invocationArgs));
+      objectFreeze(invokeAdmittedIngress);
+      return callIntrinsic(
+        asyncLocalStorageRunIntrinsic,
+        admittedIngressContexts,
+        [admittedIngressContext, invokeAdmittedIngress],
+      );
+    };
+    return objectFreeze(method);
+  }
+
+  let backendFacade = null;
+
+  function backendIngress(bindingValue) {
+    const method = function controlledBackendIngress(...invocationArgs) {
+      ensure(this === backendFacade, REQUEST_ERROR_CODE);
       const invokeAdmittedIngress = () =>
         protectPromise(runIngress(bindingValue, invocationArgs));
       objectFreeze(invokeAdmittedIngress);
@@ -790,11 +839,15 @@ export function createPostgresDetachedRestoreRuntimeController(...args) {
 
   objectFreeze(start);
   objectFreeze(stop);
+  backendFacade = exactFrozenRecord({
+    backendId: bindings.backendId,
+    capabilities: bindings.backendCapabilities,
+    contractVersion: bindings.backendContractVersion,
+    captureCheckpoint: backendIngress(bindings.captureCheckpoint),
+    restoreCheckpoint: backendIngress(bindings.restoreCheckpoint),
+  });
   const controller = exactFrozenRecord({
-    foreground: exactFrozenRecord({
-      restoreContextContractVersion: 3,
-      runRestore: ingress(bindings.runRestore),
-    }),
+    backend: backendFacade,
     imagePlanReservations: exactFrozenRecord({
       prepareImageReservation: ingress(bindings.prepareImageReservation),
     }),

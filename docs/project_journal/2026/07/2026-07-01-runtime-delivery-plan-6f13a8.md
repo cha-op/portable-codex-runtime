@@ -3,7 +3,7 @@ id: 20260701-6f13a8
 title: Portable Runtime Delivery Plan
 status: active
 created: 2026-07-01
-updated: 2026-08-12
+updated: 2026-08-13
 branch:
 pr:
 supersedes: []
@@ -80,21 +80,28 @@ superseded_by:
   foundation/deployment timer and drain cases. It does not claim a single whole-
   saga deployment restart, operating-system crash, or fake-PostgreSQL coverage
   of every physical family, and it does not enable the production adapter.
-  The production adapter remains fixed fail-closed.
+  The final public restore backend is now complete. Runtime assembly keeps its
+  capture backend private, constructs a second immutable stopped-directory
+  backend after the foreground composition, and binds restore without a
+  mutable placeholder. Runtime, controller, and deployment expose only its
+  checkpoint facade through their admission/drain ledgers; raw lifecycle
+  mutations, the foreground callback, and operator/provider extensions remain
+  private.
 - The complete dependency order and delivery invariants are recorded in
   `docs/architecture/runtime-delivery-plan.md`.
 
 ## Next Steps
 
-- Construct the final public restore-capable backend and enable the production
-  adapter only if the no-second-writer boundary remains closed. Filesystem/ext4
-  execution follows as a later physical-backend slice.
+- Implement filesystem/ext4 execution as the next independent physical-
+  backend slice while preserving the public adapter's no-second-writer
+  boundary.
 
 ## Evidence
 
 - `docs/architecture/runtime-delivery-plan.md`
 - `docs/architecture/stopped-directory-publication.md`
 - `docs/project_journal/2026/08/2026-08-12-assembled-restore-safety-matrix-6d3a91.md`
+- `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-collaborator-settlement-a3f9c2.md`
 - `docs/project_journal/2026/08/2026-08-12-physical-settlement-graph-f4c8a1.md`
 - `docs/project_journal/2026/08/2026-08-12-operational-lease-budget-c2e7b4.md`

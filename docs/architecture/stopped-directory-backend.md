@@ -445,13 +445,15 @@ fresh legacy output and for every version 3 callback. This read-only physical
 replay does not make the legacy result admissible to a typed generation
 authority. The adapter's v1 coordinator projection is sufficient only for
 legacy adapter replay; it is not the complete typed generation binding required
-by PostgreSQL generation document v2. Version 3 now transports that complete
-binding without enabling production restore by itself. The production mutation
-authority's `runRestore()` still fails closed while operational lease admission,
-the assembled restart/ambiguity/deadline matrix, and the immutable final public
-backend remain unfinished. Once enabled, the authority must durably finalize
-launcher-visible destination state and return the same completion object before
-the backend reports success. A published path or journal record alone is not
+by PostgreSQL generation document v2. Version 3 transports that complete
+binding. The final runtime keeps the capture-only mutation authority private,
+then constructs a second immutable backend whose restore authority is the
+version 3 foreground composition. Controller and deployment admit and wrap
+only its checkpoint facade, retaining each complete Promise in the shutdown
+ledger; callers cannot inject the publication callback. The authority must
+durably finalize launcher-visible destination state and return the same
+completion object before the backend reports success. A published path or
+journal record alone is not
 writable-launch authority.
 
 ## Detached Restore Attachment Activation

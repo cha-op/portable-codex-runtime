@@ -123,9 +123,9 @@ The six-item follow-on sequence does not preallocate GitHub PR numbers:
    - Retain claims permanently, reject pre-existing tombstones, and reconcile
      only an exact already committed artefact without a source, writer, lease,
      attachment, clock, or stopped-writer capability.
-   - Keep the production adapter capture-only. Restore fails closed until a
-     later slice binds one canonical detached destination generation to
-     launcher admission.
+   - Keep the private checkpoint-mutation adapter capture-only. Restore stays
+     outside this adapter; the later completed public checkpoint facade binds
+     one canonical detached destination generation to launcher admission.
 6. **Bounded checkpoint recovery service (complete)**
    - Enumerate retained `starting` or `uncertain` capture operations, plus only
      the exact materialized V3 handoff operations still in `prepared`, in
@@ -338,16 +338,17 @@ Restore and launcher authority are now split into eight serial pull requests:
      Retained or ambiguous subordinate state is interpreted only by the
      existing typed authorities; the facade does not infer completion or
      repeat a physical side effect.
-   - The production-neutral phase-B assembly foundation is complete. One
-     strict factory constructs the capture-only backend, standalone foreground
-     facade, idle scheduler, and narrow writer-launch plus image-plan-
-     reservation ingress from a single internal authority graph, one
+   - The production-neutral phase-B assembly is complete. One strict factory
+     constructs a private capture backend, private foreground composition,
+     immutable public backend, idle scheduler, and narrow writer-launch plus
+     image-plan-reservation ingress from a single internal authority graph, one
      authority/store pool, and three pairwise-distinct nested/foreground/
      recovery guard pools. The launch ingress exposes only `runLaunch()` and
      `reconcileLaunchAttempt()` from the same process-local launcher used by
      capture and foreground restore. Construction performs no migration,
-     scheduler lifecycle action, provider action, pool close, or production
-     restore routing.
+     scheduler lifecycle action, provider action, or pool close. Its public
+     backend remains a low-level uncontrolled capability until claimed by the
+     controller.
    - The PostgreSQL durable stable-plan registry slice is complete. Migration
      7 adds immutable canonical admission and plan storage plus a permanent
      operation-ID claim. Separately gated provisioning performs insert or
@@ -365,7 +366,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      capability for the deployment lifecycle owner.
    - The deployment controller now performs migration before serving, starts
      the scheduler, requires its immediate coalesced pass to prove a complete
-     four-lane sweep, and only then opens the gated foreground, image-plan-
+     four-lane sweep, and only then opens the gated checkpoint backend, image-plan-
      reservation, stable-plan, and writer-launch facets. Stop closes
      admission, stops the scheduler, and drains all accepted calls without
      closing the four borrowed pools.
@@ -435,8 +436,8 @@ Restore and launcher authority are now split into eight serial pull requests:
      boundary, late settlement, abort/drain, fatal grace breach, and zero calls
      to the durable families they cannot reach. A test-only callback router
      locks the exact fresh-publication versus committed-verification choice at
-     the explicit foreground seam; it is not the final public adapter. This does
-     not claim one
+     the explicit foreground seam; the final public backend now owns that same
+     closed choice without exposing the callback. This does not claim one
      whole-saga deployment restart, operating-system `SIGKILL`, or fake-
      PostgreSQL execution of all five collaborator families.
    - The no-second-dispatch property is scoped by authority. One settlement
@@ -446,13 +447,19 @@ Restore and launcher authority are now split into eight serial pull requests:
      reconciliation may repeat in a separate recovery attempt, but cannot mint
      a grant. A fresh image reservation is therefore permitted for the same
      fixed prepared plan and is not mutation replay.
-   - The remaining assembly step is the final public restore-capable backend.
-   - Enable `runRestore()` only after the final public backend preserves the
-     no-second-writer boundary across acknowledgement loss, restart, and
-     ambiguous publication, launch, registration, stop, or finalisation
-     outcomes.
+   - The final public restore-capable backend is complete. Runtime assembly
+     keeps the capture backend private, constructs a second immutable backend
+     after foreground composition, and binds its restore authority without a
+     mutable placeholder or method swap.
+   - Runtime, controller, and deployment expose only the checkpoint facade
+     through ready and in-flight admission. The raw lifecycle methods, the
+     two-argument `runRestore()` callback seam, operator reconciliation, and
+     provider attachment methods remain private,
+     preserving the no-second-writer boundary across acknowledgement loss,
+     restart, and ambiguous publication, launch, registration, stop, or
+     finalisation outcomes.
 
-Later pull requests own an ext4 or filesystem-image backend, differential
+The next pull request owns an ext4 or filesystem-image backend. Later slices own differential
 export and content-addressed storage, cross-host migration, and operational
 hardening.
 

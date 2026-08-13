@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1869,6 +1879,40 @@ function assertFreshOpaqueInvocation(invocation, seen) {
   seen.add(invocation);
 }
 
+function assertPublicCheckpointBackendSurface(backend) {
+  assert.equal(Object.getPrototypeOf(backend), null);
+  assert.equal(Object.isFrozen(backend), true);
+  assert.deepEqual(Reflect.ownKeys(backend).sort(), [
+    "backendId",
+    "capabilities",
+    "captureCheckpoint",
+    "contractVersion",
+    "restoreCheckpoint",
+  ]);
+  assert.equal(backend.backendId, "postgres-authority-integration");
+  assert.equal(backend.contractVersion, 1);
+  assert.equal(Object.isFrozen(backend.capabilities), true);
+  assert.deepEqual(Reflect.ownKeys(backend.capabilities).sort(), [
+    "atomicPointInTimeCheckpoint",
+    "exclusiveWriterAttachment",
+    "fencing",
+    "normalDirectoryAttachment",
+  ]);
+  assert.equal(typeof backend.captureCheckpoint, "function");
+  assert.equal(typeof backend.restoreCheckpoint, "function");
+  assert.equal(Object.isFrozen(backend.captureCheckpoint), true);
+  assert.equal(Object.isFrozen(backend.restoreCheckpoint), true);
+  for (const hidden of [
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "prepareWritableAttachment",
+    "provisionSession",
+  ]) {
+    assert.equal(hidden in backend, false);
+  }
+}
+
 function integrationImagePlanBindingFixture({ image, plan, session }) {
   const providerCalls = { inspect: 0, resolve: 0 };
   const providerInvocations = new Set();
@@ -2228,6 +2272,9 @@ function firstMatchingQueryResultFailurePool(pool, label, matches) {
         },
       };
     },
+    didFail() {
+      return failed;
+    },
   });
 }
 
@@ -2432,9 +2479,14 @@ function writerAttachmentInput(
   };
 }
 
-function attachmentEvidence(mutationRequest) {
+function attachmentEvidence(
+  mutationRequest,
+  {
+    rootPath =
+      `/var/lib/portable-codex/${mutationRequest.sessionId}`,
+  } = {},
+) {
   const proofId = `proof-${randomUUID()}`;
-  const rootPath = `/var/lib/portable-codex/${mutationRequest.sessionId}`;
   return {
     mutationResult: {
       ...structuredClone(mutationRequest),
@@ -2470,7 +2522,7 @@ async function attachWriter(authority, registered, options) {
   return authority.finalizeWriterAttachment({
     ...structuredClone(input),
     expectedOperationRevision: "1",
-    ...attachmentEvidence(starting.mutationRequest),
+    ...attachmentEvidence(starting.mutationRequest, options),
   });
 }
 
@@ -2687,6 +2739,194 @@ function restoreRuntimeIntegrationPublication(calls, recoveryScopeId) {
     inspectPersistentObjectIdentity: controlledPublicationFailure,
     journal,
     listMountPoints: controlledPublicationFailure,
+  });
+}
+
+function integrationPublicationDestinationChangedError() {
+  const error = new Error("integration publication destination changed");
+  error.code = "destination_changed";
+  Object.defineProperty(error, "renameOutcome", {
+    value: "not-committed",
+  });
+  return error;
+}
+
+function integrationPublicationLockProvider() {
+  return async () => ({
+    async assertHeld() {},
+    async release() {},
+    async renameWhileHeld(source, destination, expectedDestination) {
+      if (expectedDestination?.kind === "absent") {
+        try {
+          await lstat(destination);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+          await rename(source, destination);
+          return;
+        }
+        throw integrationPublicationDestinationChangedError();
+      }
+      await rename(source, destination);
+    },
+  });
+}
+
+async function inspectIntegrationPersistentObjectIdentity(path) {
+  const metadata = await lstat(path, { bigint: true });
+  return {
+    device: metadata.dev.toString(),
+    inode: metadata.ino.toString(),
+    objectId:
+      `integration-object-${metadata.dev}-${metadata.ino}-${metadata.birthtimeNs}`,
+  };
+}
+
+async function createRestoreRuntimePublicationTree() {
+  const root = await realpath(
+    await mkdtemp(
+      join(tmpdir(), "portable-codex-runtime-publication-"),
+    ),
+  );
+  try {
+    const sourceOwnedRoot = join(root, "source-root");
+    const artifactOwnedRoot = join(root, "artifact-root");
+    const destinationOwnedRoot = join(root, "destination-root");
+    const journalDirectory = join(root, "journal");
+    for (const directory of [
+      sourceOwnedRoot,
+      artifactOwnedRoot,
+      destinationOwnedRoot,
+      journalDirectory,
+    ]) {
+      await mkdir(directory, { mode: 0o700 });
+    }
+    const sourceDirectory = join(sourceOwnedRoot, "session");
+    const recoverySourceDirectory = join(
+      sourceOwnedRoot,
+      "recovery-session",
+    );
+    for (const directory of [sourceDirectory, recoverySourceDirectory]) {
+      await mkdir(join(directory, "workspace", "nested"), {
+        mode: 0o700,
+        recursive: true,
+      });
+      await writeFile(
+        join(directory, "workspace", "README.md"),
+        "portable runtime integration\n",
+        { mode: 0o640 },
+      );
+      await writeFile(
+        join(directory, "workspace", "nested", "state.jsonl"),
+        '{"type":"turn","state":"completed"}\n',
+        { mode: 0o600 },
+      );
+      await symlink(
+        "README.md",
+        join(directory, "workspace", "current"),
+      );
+    }
+    return Object.freeze({
+      artifactOwnedRoot,
+      destinationDirectory: join(
+        destinationOwnedRoot,
+        "restored-session",
+      ),
+      destinationOwnedRoot,
+      journalDirectory,
+      recoveryDestinationDirectory: join(
+        destinationOwnedRoot,
+        "recovery-session",
+      ),
+      recoverySourceDirectory,
+      root,
+      sourceDirectory,
+      sourceOwnedRoot,
+    });
+  } catch (error) {
+    await rm(root, { force: true, recursive: true });
+    throw error;
+  }
+}
+
+function restoreRuntimePublicationEvidence(
+  calls,
+  observation,
+  journalDirectory,
+) {
+  class RestoreRuntimeOperationJournal extends FilesystemOperationJournal {
+    async prepare(options) {
+      if (
+        options.operationId === observation.captureFailureOperationId
+      ) {
+        calls.publishFreshCheckpointArtifact += 1;
+        if (observation.captureFailureCount === 0) {
+          observation.captureFailureCount += 1;
+          throw new Error(
+            "synthetic uncertain checkpoint publication",
+          );
+        }
+      }
+      if (options.operationId === observation.restoreOperationId) {
+        calls.publishRestoreDestination += 1;
+        assert.deepEqual(Reflect.ownKeys(options).sort(), [
+          "binding",
+          "operationId",
+          "request",
+          "result",
+        ]);
+        assert.equal(Object.isFrozen(options), true);
+        assert.equal(
+          options.binding.publication.publicationKind,
+          "restore-destination",
+        );
+        assert.equal(options.request.operation, "restore");
+        assert.equal(options.result.mutation.operation, "restore");
+        observation.events.push("publishRestoreDestination");
+      }
+      return super.prepare(options);
+    }
+
+    async read(options) {
+      const result = await super.read(options);
+      if (options.operationId === observation.captureFailureOperationId) {
+        calls.verifyCommittedCheckpointArtifact += 1;
+      }
+      if (
+        options.operationId === observation.restoreOperationId &&
+        result.record?.state === "committed"
+      ) {
+        calls.verifyCommittedRestoreDestination += 1;
+        assert.deepEqual(Reflect.ownKeys(options), ["operationId"]);
+        observation.events.push("verifyCommittedRestoreDestination");
+      }
+      return result;
+    }
+  }
+
+  const journal = new RestoreRuntimeOperationJournal({
+    acquireLock: integrationPublicationLockProvider(),
+    directory: journalDirectory,
+    inspectAncestorAcl: async () => false,
+    inspectDirectoryAcl: async () => false,
+  });
+  return new StoppedDirectoryPublication({
+    acquireLock: integrationPublicationLockProvider(),
+    inspectFilesystem: async () => ({
+      durability: "local-fsync-rename",
+      filesystemId: "integration-test-filesystem",
+      objectIdentityScheme: "integration-test-object-generation-v1",
+      type: "integration-test-local",
+    }),
+    inspectOwnedRootAcl: async (path) => {
+      calls.publication += 1;
+      observation.ownedRootInspections.push(path);
+      return false;
+    },
+    inspectOwnedRootAncestorAcl: async () => false,
+    inspectPersistentObjectIdentity:
+      inspectIntegrationPersistentObjectIdentity,
+    journal,
+    listMountPoints: async () => ["/"],
   });
 }
 
@@ -3045,8 +3285,11 @@ async function prepareRestoreGenerationFixture(
   checkpointAuthority,
   sessionId,
   {
+    capturePublication,
     finalAttachmentLeaseDurationMilliseconds = 300_000,
+    finalAttachmentRootPath,
     imageDigest = IMAGE_DIGEST,
+    sourceAttachmentRootPath,
   } = {},
 ) {
   const registered = await authority.registerSession(
@@ -3054,11 +3297,17 @@ async function prepareRestoreGenerationFixture(
   );
   const sourceAttachment = await attachWriter(authority, registered, {
     leaseDurationMilliseconds: 300_000,
+    ...(sourceAttachmentRootPath === undefined
+      ? {}
+      : { rootPath: sourceAttachmentRootPath }),
   });
   const captureAdmission = checkpointCaptureAdmission(sourceAttachment);
   const captureCompletion = await checkpointAuthority.runCapture(
     captureAdmission,
-    async (context) => checkpointCompletion(context, false),
+    capturePublication === undefined
+      ? async (context) => checkpointCompletion(context, false)
+      : async (context) =>
+          capturePublication(context, captureAdmission),
   );
   const captureTerminal = await authority.reconcileOperation(
     checkpointOperationInput(
@@ -3071,6 +3320,9 @@ async function prepareRestoreGenerationFixture(
   const attached = await attachWriter(authority, released.session, {
     leaseDurationMilliseconds:
       finalAttachmentLeaseDurationMilliseconds,
+    ...(finalAttachmentRootPath === undefined
+      ? {}
+      : { rootPath: finalAttachmentRootPath }),
   });
   assert.equal(
     BigInt(attached.session.document.lease.fencingEpoch) >
@@ -3279,6 +3531,47 @@ function checkpointCompletion(context, replayed) {
     }),
     replayed,
     result,
+  });
+}
+
+async function publishIntegrationCheckpointArtifact(
+  publication,
+  context,
+  admission,
+) {
+  const binding = Object.freeze({
+    attachmentId: context.canonicalAttachment.attachmentId,
+    attachmentOperationId: context.canonicalAttachment.operationId,
+    attachmentProofId: context.canonicalAttachment.proofId,
+    captureAttemptId: context.captureAttemptId,
+    checkpoint: admission.checkpoint,
+    contractVersion: 2,
+    processIncarnationId: admission.processIncarnationId,
+    reservationId: context.reservationId,
+    stopOperationId: admission.stopOperationId,
+    writerIncarnationId: admission.writerIncarnationId,
+  });
+  const outcome = await publication.publishFreshCheckpointArtifact({
+    artifactDirectory: context.artifactDirectory,
+    artifactOwnedRoot: context.artifactOwnedRoot,
+    binding,
+    operationId: admission.request.operationId,
+    request: admission.request,
+    result: context.result,
+    sourceDirectory: context.sourceDirectory,
+    sourceOwnedRoot: context.sourceOwnedRoot,
+  });
+  assert.equal(outcome.replayed, false);
+  return Object.freeze({
+    artifactProof: Object.freeze({
+      artifactManifestDigest:
+        outcome.materialization.artifactManifestDigest,
+      captureOperationId: admission.request.operationId,
+      modeledDigest: outcome.materialization.modeledDigest,
+    }),
+    materialization: outcome.materialization,
+    replayed: outcome.replayed,
+    result: context.result,
   });
 }
 
@@ -11286,7 +11579,7 @@ test(
 );
 
 test(
-  "restore runtime controller bootstraps, drains, and retries uncertain capture with fresh assembled objects",
+  "restore runtime controller drains and verifies a committed restore after acknowledgement-loss readback interruption with fresh assembled objects",
   { timeout: 60_000 },
   async (t) => {
     const foregroundLifecycleApplicationName =
@@ -11330,9 +11623,17 @@ test(
     let physicalBindings = null;
     let restartedController = null;
     let restartedPhysicalBindings = null;
-    let restartedArtifactOwnedRoot = null;
     let runtime = null;
     let foregroundTeardown = null;
+    const publicationTree =
+      await createRestoreRuntimePublicationTree();
+    const publicationObservation = {
+      captureFailureCount: 0,
+      captureFailureOperationId: null,
+      events: [],
+      ownedRootInspections: [],
+      restoreOperationId: null,
+    };
     t.after(async () => {
       if (controller !== null) {
         await Promise.allSettled([controller.stop()]);
@@ -11490,12 +11791,10 @@ test(
             }
           }
         } finally {
-          if (restartedArtifactOwnedRoot !== null) {
-            await rm(restartedArtifactOwnedRoot, {
-              force: true,
-              recursive: true,
-            });
-          }
+          await rm(publicationTree.root, {
+            force: true,
+            recursive: true,
+          });
         }
       }
     });
@@ -11517,8 +11816,25 @@ test(
       operationGuard: new PostgresOperationGuard({
         dedicatedPool: operationPool,
       }),
-      resolveArtifactPaths: integrationArtifactPaths,
-      resolveSourceOwnedRoot: integrationSourceOwnedRoot,
+      resolveArtifactPaths({ checkpoint }) {
+        return {
+          artifactDirectory: join(
+            publicationTree.artifactOwnedRoot,
+            checkpoint.artifactId,
+          ),
+          artifactOwnedRoot: publicationTree.artifactOwnedRoot,
+        };
+      },
+      resolveSourceOwnedRoot({ canonicalAttachment }) {
+        assert.equal(
+          canonicalAttachment.rootPath,
+          publicationTree.sourceDirectory,
+        );
+        return {
+          sourceDirectory: canonicalAttachment.rootPath,
+          sourceOwnedRoot: publicationTree.sourceOwnedRoot,
+        };
+      },
     });
 
     let firstStep = deferred();
@@ -11535,14 +11851,18 @@ test(
       planProvisioningGate: 0,
       provider: 0,
       publication: 0,
-      publish: 0,
+      publishFreshCheckpointArtifact: 0,
+      publishRestoreDestination: 0,
       sourceResolver: 0,
       supervisorLaunch: 0,
       supervisorReconcile: 0,
       supervisorStop: 0,
+      verifyCommittedCheckpointArtifact: 0,
+      verifyCommittedRestoreDestination: 0,
     };
     let foregroundAllowed = false;
     let holdForegroundGate = false;
+    let recoveryStablePlan = null;
     let stablePlan = null;
     const physicalInvocations = new Set();
     const physicalSignals = new Set();
@@ -11572,10 +11892,33 @@ test(
         physicalInvocations,
         physicalSignals,
       );
-    const rawPublication = restoreRuntimeIntegrationPublication(
+    const rawPublication = restoreRuntimePublicationEvidence(
       calls,
-      recoveryScopeId,
+      publicationObservation,
+      publicationTree.journalDirectory,
     );
+    const generationCommitAcknowledgementLossPool =
+      commitAcknowledgementLossAfterQueryPool(
+        authorityPool,
+        "runtime restore generation finalize",
+        (text) =>
+          text.startsWith(
+            "UPDATE session_authority.restore_destination_generations",
+          ),
+      );
+    // Lose the finalize acknowledgement, then interrupt the same runtime's
+    // committed readback so only a fresh assembly can adopt the durable row.
+    const interruptedAuthorityPool =
+      firstMatchingQueryResultFailurePool(
+        generationCommitAcknowledgementLossPool,
+        "runtime restore generation committed readback",
+        (text) =>
+          generationCommitAcknowledgementLossPool.didLoseAcknowledgement() &&
+          text.startsWith("SELECT") &&
+          text.includes(
+            "FROM session_authority.restore_destination_generations",
+          ),
+      );
     physicalBindings = createPostgresDetachedRestorePhysicalBindings({
       lifecycleBackend: rawLifecycleBackend,
       lifecycleSettlement: physicalPolicies.lifecycleBackendSettlement,
@@ -11689,8 +12032,15 @@ test(
       foreground: {
         async fleetCapabilityGate({ admission, plan }) {
           calls.fleetGate += 1;
-          assert.equal(admission.request.sessionId, sessionId);
-          assert.equal(plan.planSha256, stablePlan?.planSha256);
+          const expectedPlan =
+            admission.request.sessionId === sessionId
+              ? stablePlan
+              : recoveryStablePlan;
+          assert.equal(
+            sessionIds.includes(admission.request.sessionId),
+            true,
+          );
+          assert.equal(plan.planSha256, expectedPlan?.planSha256);
           if (!foregroundAllowed) return null;
           if (holdForegroundGate) {
             foregroundGateEntered.resolve();
@@ -11748,7 +12098,7 @@ test(
         supervisor: physicalBindings.supervisor,
       },
       pools: {
-        authority: authorityPool,
+        authority: interruptedAuthorityPool,
         foregroundLifecycle: foregroundLifecyclePool,
         operation: operationPool,
         recoveryLifecycle: recoveryLifecyclePool,
@@ -11757,8 +12107,15 @@ test(
         operationalLeaseBudget,
         provisioningFleetCapabilityGate({ admission, plan }) {
           calls.planProvisioningGate += 1;
-          assert.equal(admission.request.sessionId, sessionId);
-          assert.equal(plan.planSha256, stablePlan?.planSha256);
+          const expectedPlan =
+            admission.request.sessionId === sessionId
+              ? stablePlan
+              : recoveryStablePlan;
+          assert.equal(
+            sessionIds.includes(admission.request.sessionId),
+            true,
+          );
+          assert.equal(plan.planSha256, expectedPlan?.planSha256);
           return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
         },
       },
@@ -11780,23 +12137,45 @@ test(
         backendId: "postgres-authority-integration",
         lifecycleBackend: physicalBindings.lifecycleBackend,
         publication: physicalBindings.publication,
-        resolveArtifactPaths(options) {
+        resolveArtifactPaths({ checkpoint }) {
           calls.artifactResolver += 1;
-          return integrationArtifactPaths(options);
+          return {
+            artifactDirectory: join(
+              publicationTree.artifactOwnedRoot,
+              checkpoint.artifactId,
+            ),
+            artifactOwnedRoot: publicationTree.artifactOwnedRoot,
+          };
         },
         resolveRestoreDestination:
           physicalBindings.resolveRestoreDestination,
-        resolveSourceOwnedRoot(options) {
+        resolveSourceOwnedRoot({ canonicalAttachment }) {
           calls.sourceResolver += 1;
-          return integrationSourceOwnedRoot(options);
+          assert.equal(
+            [
+              publicationTree.sourceDirectory,
+              publicationTree.recoverySourceDirectory,
+            ].includes(canonicalAttachment.rootPath),
+            true,
+          );
+          return {
+            sourceDirectory: canonicalAttachment.rootPath,
+            sourceOwnedRoot: publicationTree.sourceOwnedRoot,
+          };
         },
       },
     };
     const controlledRuntime =
       createPostgresDetachedRestoreRuntimeComposition(runtimeOptions);
+    assertPublicCheckpointBackendSurface(controlledRuntime.backend);
+    assert.equal("foreground" in controlledRuntime, false);
+    assert.equal("runRestore" in controlledRuntime, false);
     controller = createPostgresDetachedRestoreRuntimeController({
       runtime: controlledRuntime,
     });
+    assertPublicCheckpointBackendSurface(controller.backend);
+    assert.equal("foreground" in controller, false);
+    assert.equal("runRestore" in controller, false);
 
     const blockedRegistration = registrationInput(blockedSessionId);
     const blockedArtifactId = `controller-artifact-${randomUUID()}`;
@@ -11833,10 +12212,6 @@ test(
         },
       },
     };
-    const controllerPublish = async function controllerPublish() {
-      calls.publish += 1;
-      throw new Error("runtime controller must not publish");
-    };
     const controllerRequestError = (error) => {
       assert.equal(
         error.code,
@@ -11847,10 +12222,7 @@ test(
     const assertControllerIngressClosed = async () => {
       await Promise.all([
         assert.rejects(
-          controller.foreground.runRestore(
-            blockedAdmission,
-            controllerPublish,
-          ),
+          controller.backend.restoreCheckpoint(blockedAdmission),
           controllerRequestError,
         ),
         assert.rejects(
@@ -11900,7 +12272,7 @@ test(
       assert.equal(controllerFirst.recovery[field].batch.results.length, 0);
     }
     await assert.rejects(
-      controlledRuntime.backend.restoreCheckpoint(blockedAdmission),
+      controller.backend.restoreCheckpoint(blockedAdmission),
       (error) => {
         assert.equal(error.code, "stopped_directory_backend_outcome_uncertain");
         return true;
@@ -11910,10 +12282,11 @@ test(
       "image",
       "provider",
       "publication",
-      "publish",
+      "publishRestoreDestination",
       "supervisorLaunch",
       "supervisorReconcile",
       "supervisorStop",
+      "verifyCommittedRestoreDestination",
     ]) {
       assert.equal(calls[field], 0);
     }
@@ -11926,16 +12299,14 @@ test(
       await blockingClient.query(
         "LOCK TABLE session_authority.sessions IN ACCESS EXCLUSIVE MODE",
       );
-      const admittedForeground = controller.foreground.runRestore(
-        blockedAdmission,
-        controllerPublish,
-      );
-      const admittedForegroundSettlement = assert.rejects(
-        admittedForeground,
+      const admittedRestore =
+        controller.backend.restoreCheckpoint(blockedAdmission);
+      const admittedRestoreSettlement = assert.rejects(
+        admittedRestore,
         (error) => {
           assert.equal(
             error.code,
-            "postgres_detached_restore_foreground_composition_outcome_uncertain",
+            "stopped_directory_backend_outcome_uncertain",
           );
           return true;
         },
@@ -11967,7 +12338,7 @@ test(
 
       await blockingClient.query("ROLLBACK");
       blockingTransactionOpen = false;
-      await admittedForegroundSettlement;
+      await admittedRestoreSettlement;
       const controllerStopped = await settleWithin(
         controllerStopping,
         "restore runtime controller shutdown drain",
@@ -11996,10 +12367,11 @@ test(
       "image",
       "provider",
       "publication",
-      "publish",
+      "publishRestoreDestination",
       "supervisorLaunch",
       "supervisorReconcile",
       "supervisorStop",
+      "verifyCommittedRestoreDestination",
     ]) {
       assert.equal(calls[field], 0);
     }
@@ -12035,7 +12407,17 @@ test(
       authority,
       checkpointAuthority,
       sessionId,
-      { imageDigest: image.descriptor.digest },
+      {
+        capturePublication: (context, captureAdmission) =>
+          publishIntegrationCheckpointArtifact(
+            physicalBindings.publication,
+            context,
+            captureAdmission,
+          ),
+        finalAttachmentRootPath: publicationTree.sourceDirectory,
+        imageDigest: image.descriptor.digest,
+        sourceAttachmentRootPath: publicationTree.sourceDirectory,
+      },
     );
     const launchImagePlan = integrationDetachedRestoreImagePlan(
       fixture.finalized.session,
@@ -12069,16 +12451,19 @@ test(
       launched,
       fixture.checkpoint,
     );
-    const sourceArtifact = integrationArtifactPaths({
-      checkpoint: fixture.checkpoint,
-    });
+    const sourceArtifact = {
+      artifactDirectory: join(
+        publicationTree.artifactOwnedRoot,
+        fixture.checkpoint.artifactId,
+      ),
+      artifactOwnedRoot: publicationTree.artifactOwnedRoot,
+    };
     stablePlan = createPostgresDetachedRestorePlan({
       request: admission.request,
       plan: {
         captureCreatedAt: new Date().toISOString(),
-        destinationDirectory:
-          `/var/lib/portable-codex-restores/${sessionId}`,
-        destinationOwnedRoot: "/var/lib/portable-codex-restores",
+        destinationDirectory: publicationTree.destinationDirectory,
+        destinationOwnedRoot: publicationTree.destinationOwnedRoot,
         detachMode: "release",
         holderId: `restore-holder-${randomUUID()}`,
         imagePlanId: `image-plan-${randomUUID()}`,
@@ -12651,17 +13036,21 @@ test(
       sessionId,
     );
     await assert.rejects(
-      runtime.foreground.runRestore(
-        admission,
-        async () => {
-          calls.publish += 1;
-          throw new Error("default-deny restore must not publish");
-        },
-      ),
+      runtime.backend.restoreCheckpoint(admission, async () => null),
       (error) => {
         assert.equal(
           error.code,
-          "postgres_detached_restore_fleet_capability_required",
+          "invalid_stopped_directory_backend_request",
+        );
+        return true;
+      },
+    );
+    await assert.rejects(
+      runtime.backend.restoreCheckpoint(admission),
+      (error) => {
+        assert.equal(
+          error.code,
+          "stopped_directory_backend_outcome_uncertain",
         );
         return true;
       },
@@ -12672,19 +13061,16 @@ test(
     );
     assert.equal(calls.fleetGate, 1);
     assert.equal(calls.provider, 0);
-    assert.equal(calls.publish, 0);
+    assert.equal(calls.publishRestoreDestination, 0);
+    assert.equal(calls.verifyCommittedRestoreDestination, 0);
 
     foregroundAllowed = true;
     holdForegroundGate = true;
 
     const beforeSession = await authority.readSession({ sessionId });
-    const foreground = runtime.foreground.runRestore(
-      admission,
-      async () => {
-        calls.publish += 1;
-        throw new Error("restore runtime publish callback must not run");
-      },
-    );
+    publicationObservation.restoreOperationId =
+      admission.request.operationId;
+    const restore = runtime.backend.restoreCheckpoint(admission);
     let busyStep = null;
     let primaryFailure = null;
     try {
@@ -12710,13 +13096,13 @@ test(
         const stoppedCompletion = runtime.scheduler.stop();
         const effects =
           busyStep === null
-            ? [foreground, completion]
-            : [foreground, busyStep, completion];
+            ? [restore, completion]
+            : [restore, busyStep, completion];
         const settlements = await Promise.allSettled(effects);
         return {
+          backendSettlement: settlements[0],
           busySettlement:
             busyStep === null ? null : settlements[1],
-          foregroundSettlement: settlements[0],
           schedulerSettlement:
             settlements[busyStep === null ? 1 : 2],
           stoppedCompletion,
@@ -12728,7 +13114,7 @@ test(
     try {
       teardown = await settleWithin(
         foregroundTeardown,
-        "restore runtime foreground and scheduler shutdown",
+        "restore runtime backend and scheduler shutdown",
       );
     } catch (error) {
       if (primaryFailure === null) primaryFailure = error;
@@ -12741,67 +13127,187 @@ test(
     if (teardown.schedulerSettlement.status === "rejected") {
       throw teardown.schedulerSettlement.reason;
     }
-    assert.equal(teardown.foregroundSettlement.status, "rejected");
+    assert.equal(teardown.backendSettlement.status, "rejected");
     assert.equal(
-      teardown.foregroundSettlement.reason.code,
-      "postgres_detached_restore_foreground_composition_outcome_uncertain",
+      teardown.backendSettlement.reason.code,
+      "stopped_directory_backend_outcome_uncertain",
     );
     const afterSession = await authority.readSession({ sessionId });
     assert.notEqual(beforeSession.document.launch, null);
     assert.equal(afterSession.document.launch, null);
     assert.equal(
       afterSession.document.lastOperation?.kind,
-      WRITER_LAUNCH_STOP_OPERATION_KIND,
+      RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+    );
+    assert.equal(
+      afterSession.document.lastOperation?.operationId,
+      admission.request.operationId,
     );
     assert.equal(afterSession.document.lastOperation?.state, "committed");
-    const stopContract = await authorityPool.query(
-      [
-        "SELECT request #>> '{payload,contractVersion}' AS contract_version",
-        "FROM session_authority.operation_claims",
-        "WHERE operation_id = $1",
-      ].join(" "),
-      [afterSession.document.lastOperation.operationId],
-    );
-    assert.deepEqual(stopContract.rows, [{ contract_version: "3" }]);
-    assert.equal(
-      afterSession.document.activeOperation?.kind,
-      CHECKPOINT_CAPTURE_OPERATION_KIND,
-    );
-    assert.equal(
-      afterSession.document.activeOperation?.operationId,
-      stablePlan.captureOperationId,
-    );
-    assert.equal(afterSession.document.activeOperation?.state, "uncertain");
+    assert.equal(afterSession.document.activeOperation, null);
     const captureOperation = await authorityPool.query(
       [
         "SELECT kind, state",
         "FROM session_authority.operation_claims",
         "WHERE operation_id = $1",
       ].join(" "),
-      [afterSession.document.activeOperation.operationId],
+      [stablePlan.captureOperationId],
     );
     assert.deepEqual(captureOperation.rows, [
       {
         kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
-        state: "uncertain",
+        state: "committed",
       },
     ]);
+    assert.equal(
+      generationCommitAcknowledgementLossPool.didLoseAcknowledgement(),
+      true,
+    );
+    assert.equal(interruptedAuthorityPool.didFail(), true);
+    const committedGenerationBeforeRestart = await authorityPool.query(
+      [
+        "SELECT g.state, g.document, g.committed_at,",
+        "o.state AS operation_state,",
+        "o.revision::text AS operation_revision, o.result",
+        "FROM session_authority.restore_destination_generations AS g",
+        "JOIN session_authority.operation_claims AS o",
+        "ON o.operation_id = g.operation_id",
+        "WHERE g.operation_id = $1",
+      ].join(" "),
+      [admission.request.operationId],
+    );
+    assert.equal(committedGenerationBeforeRestart.rows.length, 1);
+    assert.equal(committedGenerationBeforeRestart.rows[0].state, "committed");
+    assert.equal(
+      committedGenerationBeforeRestart.rows[0].operation_state,
+      "committed",
+    );
+    const destinationBeforeRestart = await lstat(
+      publicationTree.destinationDirectory,
+      { bigint: true },
+    );
     assert.equal(calls.artifactResolver > 0, true);
     assert.equal(calls.destinationResolver, 0);
     assert.equal(calls.fleetGate, 2);
     assert.equal(calls.image, 4);
     assert.equal(calls.planProvisioningGate, 1);
     assert.equal(calls.provider, 0);
-    assert.equal(calls.publish, 0);
+    assert.equal(calls.publishRestoreDestination, 1);
+    assert.equal(calls.verifyCommittedRestoreDestination, 0);
     assert.equal(calls.sourceResolver > 0, true);
     assert.equal(calls.supervisorLaunch, 1);
     assert.equal(calls.supervisorReconcile, 0);
     assert.equal(calls.supervisorStop, 1);
     assert.equal(physicalInvocations.size, 2);
     assert.equal(physicalSignals.size, 2);
+    assert.deepEqual(publicationObservation.events, [
+      "publishRestoreDestination",
+    ]);
+    assert.equal(
+      publicationObservation.ownedRootInspections.includes(
+        publicationTree.artifactOwnedRoot,
+      ),
+      true,
+    );
+    assert.equal(
+      publicationObservation.ownedRootInspections.includes(
+        publicationTree.destinationOwnedRoot,
+      ),
+      true,
+    );
     for (const signal of physicalSignals) {
       assert.equal(signal.aborted, false);
     }
+
+    const recoveryFixture = await prepareCommittedRestoreGenerationFixture(
+      authority,
+      checkpointAuthority,
+      blockedSessionId,
+      {
+        capturePublication: (context, captureAdmission) =>
+          publishIntegrationCheckpointArtifact(
+            physicalBindings.publication,
+            context,
+            captureAdmission,
+          ),
+        finalAttachmentRootPath:
+          publicationTree.recoverySourceDirectory,
+        imageDigest: image.descriptor.digest,
+        sourceAttachmentRootPath:
+          publicationTree.recoverySourceDirectory,
+      },
+    );
+    const recoveryImageReservation =
+      await runtime.imagePlanReservations.prepareImageReservation({
+        plan: integrationDetachedRestoreImagePlan(
+          recoveryFixture.finalized.session,
+        ),
+        sessionManifest:
+          recoveryFixture.finalized.session.document.manifest,
+      });
+    const recoveryLaunched = await runtime.writerLaunch.runLaunch({
+      generation: recoveryFixture.finalized.generation,
+      imageReservation: recoveryImageReservation,
+      launchAttemptId: `writer-launch-${randomUUID()}`,
+    });
+    assert.equal(recoveryLaunched.status, "started");
+    const recoveryAdmission = restoreGenerationAdmission(
+      recoveryLaunched,
+      recoveryFixture.checkpoint,
+    );
+    recoveryStablePlan = createPostgresDetachedRestorePlan({
+      request: recoveryAdmission.request,
+      plan: {
+        captureCreatedAt: new Date().toISOString(),
+        destinationDirectory:
+          publicationTree.recoveryDestinationDirectory,
+        destinationOwnedRoot: publicationTree.destinationOwnedRoot,
+        detachMode: "release",
+        holderId: `restore-holder-${randomUUID()}`,
+        imagePlanId: `image-plan-${randomUUID()}`,
+        leaseDurationMilliseconds:
+          operationalLeaseBudget.leaseDurationMilliseconds,
+        sourceArtifactDirectory: join(
+          publicationTree.artifactOwnedRoot,
+          recoveryFixture.checkpoint.artifactId,
+        ),
+        sourceArtifactOwnedRoot: publicationTree.artifactOwnedRoot,
+      },
+    });
+    await runtime.stablePlanProvisioning.provisionStablePlan({
+      admission: recoveryAdmission,
+      plan: recoveryStablePlan,
+    });
+    publicationObservation.captureFailureOperationId =
+      recoveryStablePlan.captureOperationId;
+    await assert.rejects(
+      runtime.backend.restoreCheckpoint(recoveryAdmission),
+      (error) => {
+        assert.equal(
+          error.code,
+          "stopped_directory_backend_outcome_uncertain",
+        );
+        return true;
+      },
+    );
+    assert.equal(publicationObservation.captureFailureCount, 1);
+    assert.equal(calls.publishFreshCheckpointArtifact, 1);
+    assert.equal(calls.verifyCommittedCheckpointArtifact, 1);
+    const recoveryCaptureBeforeRestart = await authorityPool.query(
+      [
+        "SELECT kind, state, revision::text AS revision",
+        "FROM session_authority.operation_claims",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [recoveryStablePlan.captureOperationId],
+    );
+    assert.deepEqual(recoveryCaptureBeforeRestart.rows, [
+      {
+        kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
+        revision: "2",
+        state: "uncertain",
+      },
+    ]);
 
     assert.strictEqual(teardown.stoppedCompletion, completion);
     assert.deepEqual(
@@ -12862,10 +13368,13 @@ test(
       planProvisioningGate: 0,
       provider: 0,
       publication: 0,
-      publish: 0,
+      publishFreshCheckpointArtifact: 0,
+      publishRestoreDestination: 0,
       sourceResolver: 0,
       supervisorLaunch: 0,
       supervisorReconcile: 0,
+      verifyCommittedCheckpointArtifact: 0,
+      verifyCommittedRestoreDestination: 0,
     };
     const restartedPhysicalInvocations = new Set();
     const restartedPhysicalSignals = new Set();
@@ -12875,12 +13384,10 @@ test(
         restartedPhysicalInvocations,
         restartedPhysicalSignals,
       );
-    const restartedPublication = restoreRuntimeIntegrationPublication(
+    const restartedPublication = restoreRuntimePublicationEvidence(
       restartedCalls,
-      restartedRecoveryScopeId,
-    );
-    restartedArtifactOwnedRoot = await mkdtemp(
-      join(tmpdir(), "portable-codex-assembled-restart-"),
+      publicationObservation,
+      publicationTree.journalDirectory,
     );
     restartedPhysicalBindings =
       createPostgresDetachedRestorePhysicalBindings({
@@ -12898,7 +13405,7 @@ test(
           restartedCalls.destinationResolver += 1;
           void input;
           throw new Error(
-            "capture reconciliation must finish before destination resolution",
+            "committed restore retry must not resolve a destination",
           );
         },
         resolveRestoreDestinationContractVersion: 1,
@@ -12910,14 +13417,14 @@ test(
             restartedCalls.supervisorLaunch += 1;
             void input;
             throw new Error(
-              "capture reconciliation restart must not launch a writer",
+              "committed restore retry must not launch a writer",
             );
           },
           async reconcileWriterLaunch(input) {
             restartedCalls.supervisorReconcile += 1;
             void input;
             throw new Error(
-              "capture reconciliation restart must not reconcile a writer",
+              "committed restore retry must not reconcile a writer",
             );
           },
           supervisorId: `restarted-supervisor-${randomUUID()}`,
@@ -12946,14 +13453,14 @@ test(
                   restartedCalls.image += 1;
                   void input;
                   throw new Error(
-                    "capture reconciliation restart must not inspect Codex",
+                    "committed restore retry must not inspect Codex",
                   );
                 },
                 async resolveImagePlan(input) {
                   restartedCalls.image += 1;
                   void input;
                   throw new Error(
-                    "capture reconciliation restart must not resolve an image",
+                    "committed restore retry must not resolve an image",
                   );
                 },
               }),
@@ -12972,6 +13479,10 @@ test(
             return POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED;
           },
         },
+        pools: {
+          ...runtimeOptions.pools,
+          authority: authorityPool,
+        },
         recovery: {
           ...runtimeOptions.recovery,
           onStep() {},
@@ -12981,29 +13492,38 @@ test(
           backendId: "postgres-authority-integration",
           lifecycleBackend: restartedPhysicalBindings.lifecycleBackend,
           publication: restartedPhysicalBindings.publication,
-          resolveArtifactPaths(options) {
+          resolveArtifactPaths({ checkpoint }) {
             restartedCalls.artifactResolver += 1;
             return {
               artifactDirectory: join(
-                restartedArtifactOwnedRoot,
-                options.checkpoint.artifactId,
+                publicationTree.artifactOwnedRoot,
+                checkpoint.artifactId,
               ),
-              artifactOwnedRoot: restartedArtifactOwnedRoot,
+              artifactOwnedRoot: publicationTree.artifactOwnedRoot,
             };
           },
           resolveRestoreDestination:
             restartedPhysicalBindings.resolveRestoreDestination,
-          resolveSourceOwnedRoot(options) {
+          resolveSourceOwnedRoot({ canonicalAttachment }) {
             restartedCalls.sourceResolver += 1;
-            return integrationSourceOwnedRoot(options);
+            return {
+              sourceDirectory: canonicalAttachment.rootPath,
+              sourceOwnedRoot: publicationTree.sourceOwnedRoot,
+            };
           },
         },
       });
+    assertPublicCheckpointBackendSurface(restartedRuntime.backend);
+    assert.equal("foreground" in restartedRuntime, false);
+    assert.equal("runRestore" in restartedRuntime, false);
     assert.notStrictEqual(restartedPhysicalBindings, physicalBindings);
     assert.notStrictEqual(restartedRuntime, runtime);
     restartedController = createPostgresDetachedRestoreRuntimeController({
       runtime: restartedRuntime,
     });
+    assertPublicCheckpointBackendSurface(restartedController.backend);
+    assert.equal("foreground" in restartedController, false);
+    assert.equal("runRestore" in restartedController, false);
     assert.deepEqual(
       structuredClone(
         await settleWithin(
@@ -13014,81 +13534,215 @@ test(
       { status: "ready" },
     );
 
-    // This boundary proves complete in-process object replacement. A
-    // process-level SIGKILL remains separate evidence for the child harness.
-    const durableStateBeforeRestart =
-      await readSessionAuthorityMutationSnapshot(
-        authorityPool,
-        sessionId,
-      );
-    const firstRuntimeCountsBeforeRestart = {
-      publication: calls.publication,
-      sourceResolver: calls.sourceResolver,
-      supervisorStop: calls.supervisorStop,
+    const captureRecoveryCountsBefore = {
+      artifactResolver: restartedCalls.artifactResolver,
+      publication: restartedCalls.publication,
+      verifyCommittedCheckpointArtifact:
+        restartedCalls.verifyCommittedCheckpointArtifact,
     };
+    const captureRecoveryPhysicalInvocationsBefore =
+      restartedPhysicalInvocations.size;
+    const captureRecoveryPhysicalSignalsBefore =
+      restartedPhysicalSignals.size;
+    const captureRecoverySourceResolverBefore =
+      restartedCalls.sourceResolver;
+    const captureRecoveryPublicationBefore =
+      restartedCalls.publishFreshCheckpointArtifact;
     await assert.rejects(
-      restartedController.foreground.runRestore(
-        admission,
-        async function restartedPublish() {
-          restartedCalls.publish += 1;
-          throw new Error("restarted foreground must not publish");
-        },
-      ),
+      restartedController.backend.restoreCheckpoint(recoveryAdmission),
       (error) => {
         assert.equal(
           error.code,
-          "postgres_detached_restore_foreground_composition_outcome_uncertain",
+          "stopped_directory_backend_outcome_uncertain",
         );
         return true;
       },
     );
-    assert.deepEqual(
-      await readSessionAuthorityMutationSnapshot(
-        authorityPool,
-        sessionId,
-      ),
-      durableStateBeforeRestart,
+    assert.equal(
+      restartedCalls.artifactResolver,
+      captureRecoveryCountsBefore.artifactResolver + 1,
     );
-    assert.deepEqual(
-      {
-        publication: calls.publication,
-        sourceResolver: calls.sourceResolver,
-        supervisorStop: calls.supervisorStop,
-      },
-      firstRuntimeCountsBeforeRestart,
+    assert.equal(
+      restartedCalls.publication > captureRecoveryCountsBefore.publication,
+      true,
     );
-    assert.equal(restartedCalls.artifactResolver > 0, true);
-    assert.equal(restartedCalls.publication > 0, true);
+    assert.equal(
+      restartedCalls.verifyCommittedCheckpointArtifact,
+      captureRecoveryCountsBefore.verifyCommittedCheckpointArtifact + 1,
+    );
+    assert.equal(
+      restartedCalls.publishFreshCheckpointArtifact,
+      captureRecoveryPublicationBefore,
+    );
+    assert.equal(
+      restartedCalls.sourceResolver,
+      captureRecoverySourceResolverBefore,
+    );
+    assert.equal(
+      restartedPhysicalInvocations.size,
+      captureRecoveryPhysicalInvocationsBefore,
+    );
+    assert.equal(
+      restartedPhysicalSignals.size,
+      captureRecoveryPhysicalSignalsBefore,
+    );
     for (const field of [
       "destinationResolver",
       "fleetGate",
       "image",
       "planProvisioningGate",
       "provider",
-      "publish",
-      "sourceResolver",
+      "publishRestoreDestination",
       "supervisorLaunch",
       "supervisorReconcile",
+      "verifyCommittedRestoreDestination",
     ]) {
       assert.equal(restartedCalls[field], 0);
     }
-    assert.equal(restartedPhysicalInvocations.size, 0);
-    assert.equal(restartedPhysicalSignals.size, 0);
-    const captureAfterRestart = await authorityPool.query(
+    const recoveryCaptureAfterRestart = await authorityPool.query(
       [
         "SELECT kind, state, revision::text AS revision",
         "FROM session_authority.operation_claims",
         "WHERE operation_id = $1",
       ].join(" "),
-      [stablePlan.captureOperationId],
+      [recoveryStablePlan.captureOperationId],
     );
-    assert.deepEqual(captureAfterRestart.rows, [
+    assert.deepEqual(recoveryCaptureAfterRestart.rows, [
       {
         kind: CHECKPOINT_CAPTURE_OPERATION_KIND,
         revision: "2",
         state: "uncertain",
       },
     ]);
+
+    await rm(publicationTree.artifactOwnedRoot, {
+      force: true,
+      recursive: true,
+    });
+    await assert.rejects(
+      lstat(publicationTree.artifactOwnedRoot),
+      (error) => error?.code === "ENOENT",
+    );
+
+    // This boundary proves complete in-process object replacement over the
+    // same PostgreSQL and stopped-directory journal state.
+    publicationObservation.events.length = 0;
+    publicationObservation.ownedRootInspections.length = 0;
+    const firstRuntimeCountsBeforeRestart = {
+      publication: calls.publication,
+      publishRestoreDestination: calls.publishRestoreDestination,
+      sourceResolver: calls.sourceResolver,
+      supervisorStop: calls.supervisorStop,
+      verifyCommittedRestoreDestination:
+        calls.verifyCommittedRestoreDestination,
+    };
+    const restoreRetryArtifactResolverBefore =
+      restartedCalls.artifactResolver;
+    const restoreRetryPublicationBefore = restartedCalls.publication;
+    const restoreRetryPhysicalInvocationsBefore =
+      restartedPhysicalInvocations.size;
+    const restoreRetryPhysicalSignalsBefore =
+      restartedPhysicalSignals.size;
+    await assert.rejects(
+      restartedController.backend.restoreCheckpoint(admission),
+      (error) => {
+        assert.equal(
+          error.code,
+          "stopped_directory_backend_outcome_uncertain",
+        );
+        return true;
+      },
+    );
+    assert.deepEqual(
+      {
+        publication: calls.publication,
+        publishRestoreDestination: calls.publishRestoreDestination,
+        sourceResolver: calls.sourceResolver,
+        supervisorStop: calls.supervisorStop,
+        verifyCommittedRestoreDestination:
+          calls.verifyCommittedRestoreDestination,
+      },
+      firstRuntimeCountsBeforeRestart,
+    );
+    assert.equal(
+      restartedCalls.artifactResolver,
+      restoreRetryArtifactResolverBefore,
+    );
+    assert.equal(
+      restartedCalls.publication > restoreRetryPublicationBefore,
+      true,
+    );
+    for (const field of [
+      "destinationResolver",
+      "fleetGate",
+      "image",
+      "planProvisioningGate",
+      "publishRestoreDestination",
+      "sourceResolver",
+      "supervisorLaunch",
+      "supervisorReconcile",
+    ]) {
+      assert.equal(restartedCalls[field], 0);
+    }
+    // Verification authorizes progress to the distinct detach operation; it
+    // never authorizes a second destination-publication mutation.
+    assert.equal(restartedCalls.provider, 1);
+    assert.equal(restartedCalls.verifyCommittedRestoreDestination, 1);
+    assert.deepEqual(publicationObservation.events, [
+      "verifyCommittedRestoreDestination",
+    ]);
+    assert.equal(
+      publicationObservation.ownedRootInspections.includes(
+        publicationTree.destinationOwnedRoot,
+      ),
+      true,
+    );
+    assert.equal(
+      publicationObservation.ownedRootInspections.includes(
+        publicationTree.artifactOwnedRoot,
+      ),
+      false,
+    );
+    assert.equal(
+      publicationObservation.ownedRootInspections.includes(
+        publicationTree.sourceOwnedRoot,
+      ),
+      false,
+    );
+    assert.equal(
+      restartedPhysicalInvocations.size,
+      restoreRetryPhysicalInvocationsBefore + 1,
+    );
+    assert.equal(
+      restartedPhysicalSignals.size,
+      restoreRetryPhysicalSignalsBefore + 1,
+    );
+    const committedGenerationAfterRestart = await authorityPool.query(
+      [
+        "SELECT g.state, g.document, g.committed_at,",
+        "o.state AS operation_state,",
+        "o.revision::text AS operation_revision, o.result",
+        "FROM session_authority.restore_destination_generations AS g",
+        "JOIN session_authority.operation_claims AS o",
+        "ON o.operation_id = g.operation_id",
+        "WHERE g.operation_id = $1",
+      ].join(" "),
+      [admission.request.operationId],
+    );
+    assert.deepEqual(
+      committedGenerationAfterRestart.rows,
+      committedGenerationBeforeRestart.rows,
+    );
+    const destinationAfterRestart = await lstat(
+      publicationTree.destinationDirectory,
+      { bigint: true },
+    );
+    assert.equal(destinationAfterRestart.dev, destinationBeforeRestart.dev);
+    assert.equal(destinationAfterRestart.ino, destinationBeforeRestart.ino);
+    assert.equal(
+      destinationAfterRestart.birthtimeNs,
+      destinationBeforeRestart.birthtimeNs,
+    );
     assert.deepEqual(
       structuredClone(
         await settleWithin(
@@ -13612,7 +14266,8 @@ test(
     assert.equal(calls.provider, 0);
     assert.equal(calls.publication, 0);
     assert.equal(calls.supervisor, 0);
-    assert.equal("backend" in deployment, false);
+    assertPublicCheckpointBackendSurface(deployment.backend);
+    assert.equal("foreground" in deployment, false);
     assert.equal("runRestore" in deployment, false);
     await assert.rejects(
       deployment.writerLaunch.runLaunch({

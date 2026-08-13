@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import {
   SessionStorageContractError,
+  assertCheckpointBackend,
   assertCheckpointCaptureReconciliationBackend,
   assertCheckpointClass,
   assertCheckpointDescriptor,
@@ -9,7 +10,6 @@ import {
   assertSessionAttachmentMatches,
   assertSessionManifest,
   assertSessionStorageRef,
-  assertStorageBackend,
   assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
   assertStorageMutationResult,
@@ -179,7 +179,7 @@ function assertCleanCheckpointClass(value) {
 
 function checkedBackend(value) {
   return validateExternalOperation(
-    () => assertStorageBackend(value),
+    () => assertCheckpointBackend(value),
     "invalid_storage_backend",
     "storage backend is invalid",
   );
@@ -371,7 +371,7 @@ export function prepareCleanCheckpointCapture(options) {
   const capture = checkedBackendMethod(storageBackend, "captureCheckpoint");
   const prepared = objectFreeze({
     attachment: matched.attachment,
-    backend: storageBackend,
+    backend,
     checkpoint,
     manifest: matched.manifest,
     request: mutationRequest,

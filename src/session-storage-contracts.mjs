@@ -94,6 +94,11 @@ const STORAGE_BACKEND_METHODS = Object.freeze([
   "provisionSession",
   "restoreCheckpoint",
 ]);
+const CHECKPOINT_BACKEND_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "restoreCheckpoint",
+]);
+const MAX_BACKEND_PROTOTYPE_DEPTH = 64;
 
 export class SessionStorageContractError extends Error {
   constructor(code, message) {
@@ -1044,6 +1049,99 @@ export function assertStorageBackend(value) {
     );
   }
   return value;
+}
+
+export function assertCheckpointBackend(value) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !arrayIsArray(value) &&
+      !isProxyValue(value),
+    "invalid_storage_backend",
+    "checkpoint backend must be an object",
+  );
+  const dataValue = (key) => {
+    let cursor = value;
+    for (
+      let depth = 0;
+      cursor !== null && depth < MAX_BACKEND_PROTOTYPE_DEPTH;
+      depth += 1
+    ) {
+      ensure(
+        !isProxyValue(cursor),
+        "invalid_storage_backend",
+        "checkpoint backend prototype chain must not contain a proxy",
+      );
+      let descriptor;
+      try {
+        descriptor = objectGetOwnPropertyDescriptor(cursor, key);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "checkpoint backend fields must be data properties",
+        );
+      }
+      if (descriptor !== undefined) {
+        ensure(
+          objectHasOwn(descriptor, "value"),
+          "invalid_storage_backend",
+          "checkpoint backend fields must be data properties",
+        );
+        return descriptor.value;
+      }
+      try {
+        cursor = objectGetPrototypeOf(cursor);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "checkpoint backend prototype chain is invalid",
+        );
+      }
+    }
+    ensure(
+      cursor === null,
+      "invalid_storage_backend",
+      "checkpoint backend prototype chain is too deep",
+    );
+    fail(
+      "invalid_storage_backend",
+      "checkpoint backend is missing a required field",
+    );
+  };
+  const contractVersion = dataValue("contractVersion");
+  ensure(
+    contractVersion === STORAGE_CONTRACT_VERSION,
+    "invalid_storage_backend",
+    "checkpoint backend contract version is unsupported",
+  );
+  const backendId = dataValue("backendId");
+  assertOpaqueId(
+    backendId,
+    "invalid_storage_backend",
+    "checkpoint backend ID",
+  );
+  const capabilities = assertStorageBackendCapabilities(
+    dataValue("capabilities"),
+  );
+  const projection = objectCreate(null);
+  projection.backendId = backendId;
+  projection.capabilities = capabilities;
+  projection.contractVersion = contractVersion;
+  for (let index = 0; index < CHECKPOINT_BACKEND_METHODS.length; index += 1) {
+    const method = CHECKPOINT_BACKEND_METHODS[index];
+    const operation = dataValue(method);
+    ensure(
+      typeof operation === "function" && !isProxyValue(operation),
+      "invalid_storage_backend",
+      "checkpoint backend is missing a required operation",
+    );
+    const captured = function checkpointBackendOperation(...args) {
+      return reflectApply(operation, value, args);
+    };
+    objectFreeze(captured);
+    projection[method] = captured;
+  }
+  return objectFreeze(projection);
 }
 
 export function assertStorageBackendCapabilities(value) {

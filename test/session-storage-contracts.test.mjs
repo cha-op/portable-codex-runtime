@@ -18,6 +18,7 @@ import {
   SESSION_WORKER_ROOT,
   SessionStorageContractError,
   assertCanonicalFenceMatch,
+  assertCheckpointBackend,
   assertCheckpointCaptureReconciliationBackend,
   assertCheckpointClass,
   assertCheckpointDescriptor,
@@ -1028,6 +1029,183 @@ test("storage backend contract requires directory, exclusivity, fencing, and all
       }),
     assertCode("invalid_storage_backend"),
   );
+});
+
+test("checkpoint backend contract accepts full and exact five-field surfaces", async () => {
+  const full = storageBackend();
+  const calls = [];
+  const checkpointOnly = {
+    backendId: full.backendId,
+    capabilities: full.capabilities,
+    async captureCheckpoint(value) {
+      calls.push({ method: "captureCheckpoint", receiver: this, value });
+      return "captured";
+    },
+    contractVersion: full.contractVersion,
+    async restoreCheckpoint(value) {
+      calls.push({ method: "restoreCheckpoint", receiver: this, value });
+      return "restored";
+    },
+  };
+
+  let checkpointProjection;
+  for (const candidate of [full, checkpointOnly]) {
+    const checked = assertCheckpointBackend(candidate);
+    if (candidate === checkpointOnly) checkpointProjection = checked;
+    assert.deepEqual(Reflect.ownKeys(checked), [
+      "backendId",
+      "capabilities",
+      "contractVersion",
+      "captureCheckpoint",
+      "restoreCheckpoint",
+    ]);
+    assert.equal(Object.getPrototypeOf(checked), null);
+    assert.equal(Object.isFrozen(checked), true);
+    assert.equal(checked.backendId, candidate.backendId);
+    assert.equal(checked.contractVersion, candidate.contractVersion);
+    assert.deepEqual(checked.capabilities, candidate.capabilities);
+    assert.equal(Object.isFrozen(checked.capabilities), true);
+    assert.equal(Object.isFrozen(checked.captureCheckpoint), true);
+    assert.equal(Object.isFrozen(checked.restoreCheckpoint), true);
+    assert.notStrictEqual(checked, candidate);
+  }
+  const capturedMethod = checkpointOnly.captureCheckpoint;
+  checkpointOnly.captureCheckpoint = async function replacedCapture() {
+    assert.fail("post-validation method replacement must not run");
+  };
+  checkpointOnly.capabilities.fencing = "manual";
+  assert.equal(checkpointProjection.capabilities.fencing, "epoch-enforced");
+  assert.equal(
+    await Reflect.apply(
+      checkpointProjection.captureCheckpoint,
+      Object.freeze({ wrong: "receiver" }),
+      ["capture-input"],
+    ),
+    "captured",
+  );
+  assert.equal(
+    await checkpointProjection.restoreCheckpoint("restore-input"),
+    "restored",
+  );
+  assert.deepEqual(calls, [
+    {
+      method: "captureCheckpoint",
+      receiver: checkpointOnly,
+      value: "capture-input",
+    },
+    {
+      method: "restoreCheckpoint",
+      receiver: checkpointOnly,
+      value: "restore-input",
+    },
+  ]);
+  assert.notStrictEqual(capturedMethod, checkpointOnly.captureCheckpoint);
+  assert.throws(
+    () => assertStorageBackend(checkpointOnly),
+    assertCode("invalid_storage_backend"),
+  );
+  for (const method of ["captureCheckpoint", "restoreCheckpoint"]) {
+    assert.throws(
+      () => assertCheckpointBackend({ ...checkpointOnly, [method]: undefined }),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+});
+
+test("checkpoint backend projection rejects hostile access and captures methods once", async () => {
+  const full = storageBackend();
+  let traps = 0;
+  const proxy = new Proxy(full, {
+    get() {
+      traps += 1;
+      throw new Error("checkpoint backend Proxy get must not run");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error("checkpoint backend Proxy descriptor must not run");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("checkpoint backend Proxy prototype must not run");
+    },
+  });
+  assert.throws(
+    () => assertCheckpointBackend(proxy),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
+
+  const inheritedProxy = Object.create(proxy);
+  assert.throws(
+    () => assertCheckpointBackend(inheritedProxy),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
+
+  let getterReads = 0;
+  const accessor = { ...full };
+  Object.defineProperty(accessor, "captureCheckpoint", {
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      throw new Error("checkpoint backend accessor must not run");
+    },
+  });
+  assert.throws(
+    () => assertCheckpointBackend(accessor),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(getterReads, 0);
+
+  const inheritedAccessorPrototype = { ...full };
+  Object.defineProperty(
+    inheritedAccessorPrototype,
+    "captureCheckpoint",
+    {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error(
+          "inherited checkpoint backend accessor must not run",
+        );
+      },
+    },
+  );
+  assert.throws(
+    () =>
+      assertCheckpointBackend(
+        Object.create(inheritedAccessorPrototype),
+      ),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(getterReads, 0);
+
+  let overdeepPrototype = full;
+  for (let depth = 0; depth < 65; depth += 1) {
+    overdeepPrototype = Object.create(overdeepPrototype);
+  }
+  assert.throws(
+    () => assertCheckpointBackend(overdeepPrototype),
+    assertCode("invalid_storage_backend"),
+  );
+
+  let originalCalls = 0;
+  let replacementCalls = 0;
+  const candidate = {
+    ...full,
+    async captureCheckpoint(value) {
+      originalCalls += 1;
+      return value;
+    },
+  };
+  const checked = assertCheckpointBackend(candidate);
+  candidate.captureCheckpoint = async () => {
+    replacementCalls += 1;
+  };
+  const input = Object.freeze({ operation: "capture" });
+  assert.strictEqual(await checked.captureCheckpoint(input), input);
+  assert.equal(originalCalls, 1);
+  assert.equal(replacementCalls, 0);
 });
 
 test("checkpoint capture reconciliation is an optional versioned backend extension", () => {
