@@ -13758,6 +13758,20 @@ test(
       structuredClone(directBoundVerification),
       structuredClone(directVerification),
     );
+    assert.deepEqual(
+      structuredClone(directBoundVerification.materialization),
+      committedGenerationBeforeRestart.rows[0].document.materialization,
+    );
+    assert.deepEqual(
+      structuredClone(directBoundVerification.result),
+      committedGenerationBeforeRestart.rows[0].document.result,
+    );
+    assert.deepEqual(
+      structuredClone(directBoundVerification.result),
+      structuredClone(
+        directGenerationRead.operation.request.predeterminedResult,
+      ),
+    );
 
     // This boundary proves complete in-process object replacement over the
     // same PostgreSQL and stopped-directory journal state.
