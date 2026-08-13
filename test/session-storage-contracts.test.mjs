@@ -1208,6 +1208,79 @@ test("checkpoint backend projection rejects hostile access and captures methods 
   assert.equal(replacementCalls, 0);
 });
 
+test("checkpoint backend projection rejects shared prototype pollution but accepts custom prototypes", () => {
+  const validBackend = storageBackend();
+  const keys = [
+    "backendId",
+    "capabilities",
+    "captureCheckpoint",
+    "contractVersion",
+    "restoreCheckpoint",
+  ];
+  const originalDescriptors = new Map(
+    keys.map((key) => [
+      key,
+      Object.getOwnPropertyDescriptor(Object.prototype, key),
+    ]),
+  );
+  let inheritedCalls = 0;
+  let caught = null;
+  try {
+    Object.defineProperties(Object.prototype, {
+      backendId: {
+        configurable: true,
+        value: "polluted-checkpoint-backend",
+      },
+      capabilities: {
+        configurable: true,
+        value: validBackend.capabilities,
+      },
+      captureCheckpoint: {
+        configurable: true,
+        value: async () => {
+          inheritedCalls += 1;
+        },
+      },
+      contractVersion: {
+        configurable: true,
+        value: validBackend.contractVersion,
+      },
+      restoreCheckpoint: {
+        configurable: true,
+        value: async () => {
+          inheritedCalls += 1;
+        },
+      },
+    });
+    try {
+      assertCheckpointBackend({});
+    } catch (error) {
+      caught = error;
+    }
+  } finally {
+    for (const key of keys) {
+      const descriptor = originalDescriptors.get(key);
+      if (descriptor === undefined) {
+        delete Object.prototype[key];
+      } else {
+        Object.defineProperty(Object.prototype, key, descriptor);
+      }
+    }
+  }
+  assert.equal(assertCode("invalid_storage_backend")(caught), true);
+  assert.equal(inheritedCalls, 0);
+
+  const customPrototype = Object.assign(
+    Object.create(null),
+    validBackend,
+  );
+  const projected = assertCheckpointBackend(
+    Object.create(customPrototype),
+  );
+  assert.equal(projected.backendId, validBackend.backendId);
+  assert.equal(projected.contractVersion, validBackend.contractVersion);
+});
+
 test("checkpoint capture reconciliation is an optional versioned backend extension", () => {
   const base = storageBackend();
   assert.equal(CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION, 1);

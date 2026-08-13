@@ -2855,17 +2855,6 @@ function restoreRuntimePublicationEvidence(
 ) {
   class RestoreRuntimeOperationJournal extends FilesystemOperationJournal {
     async prepare(options) {
-      if (
-        options.operationId === observation.captureFailureOperationId
-      ) {
-        calls.publishFreshCheckpointArtifact += 1;
-        if (observation.captureFailureCount === 0) {
-          observation.captureFailureCount += 1;
-          throw new Error(
-            "synthetic uncertain checkpoint publication",
-          );
-        }
-      }
       if (options.operationId === observation.restoreOperationId) {
         calls.publishRestoreDestination += 1;
         assert.deepEqual(Reflect.ownKeys(options).sort(), [
@@ -2911,6 +2900,18 @@ function restoreRuntimePublicationEvidence(
   });
   return new StoppedDirectoryPublication({
     acquireLock: integrationPublicationLockProvider(),
+    faults: {
+      async afterJournalPrepared() {
+        if (!observation.captureFailureArmed) return;
+        calls.publishFreshCheckpointArtifact += 1;
+        if (observation.captureFailureCount === 0) {
+          observation.captureFailureCount += 1;
+          throw new Error(
+            "synthetic uncertain checkpoint publication",
+          );
+        }
+      },
+    },
     inspectFilesystem: async () => ({
       durability: "local-fsync-rename",
       filesystemId: "integration-test-filesystem",
@@ -11628,6 +11629,7 @@ test(
     const publicationTree =
       await createRestoreRuntimePublicationTree();
     const publicationObservation = {
+      captureFailureArmed: false,
       captureFailureCount: 0,
       captureFailureOperationId: null,
       events: [],
@@ -13283,6 +13285,7 @@ test(
     });
     publicationObservation.captureFailureOperationId =
       recoveryStablePlan.captureOperationId;
+    publicationObservation.captureFailureArmed = true;
     await assert.rejects(
       runtime.backend.restoreCheckpoint(recoveryAdmission),
       (error) => {
@@ -13617,6 +13620,7 @@ test(
         state: "uncertain",
       },
     ]);
+    publicationObservation.captureFailureArmed = false;
 
     await rm(publicationTree.artifactOwnedRoot, {
       force: true,

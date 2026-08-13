@@ -1068,6 +1068,11 @@ export function assertCheckpointBackend(value) {
       depth += 1
     ) {
       ensure(
+        cursor !== objectPrototype,
+        "invalid_storage_backend",
+        "checkpoint backend fields must not come from the shared object prototype",
+      );
+      ensure(
         !isProxyValue(cursor),
         "invalid_storage_backend",
         "checkpoint backend prototype chain must not contain a proxy",
