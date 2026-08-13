@@ -2870,6 +2870,14 @@ function restoreRuntimePublicationEvidence(
         );
         assert.equal(options.request.operation, "restore");
         assert.equal(options.result.mutation.operation, "restore");
+        observation.restoreVerificationInput = Object.freeze({
+          artifactProof:
+            options.binding.publication.source.artifactProof,
+          binding: options.binding.coordinator,
+          operationId: options.operationId,
+          request: options.request,
+          result: options.result,
+        });
         observation.events.push("publishRestoreDestination");
       }
       return super.prepare(options);
@@ -11635,6 +11643,7 @@ test(
       events: [],
       ownedRootInspections: [],
       restoreOperationId: null,
+      restoreVerificationInput: null,
     };
     t.after(async () => {
       if (controller !== null) {
@@ -13633,6 +13642,51 @@ test(
       (error) => error?.code === "ENOENT",
     );
 
+    const detachBeforeRetry = await authorityPool.query(
+      [
+        "SELECT operation_id",
+        "FROM session_authority.operation_claims",
+        "WHERE operation_id = $1",
+      ].join(" "),
+      [stablePlan.detachOperationId],
+    );
+    assert.deepEqual(detachBeforeRetry.rows, []);
+    const sessionBeforeRestoreRetry = await authorityPool.query(
+      [
+        "SELECT document->>'lifecycle' AS lifecycle,",
+        "document->'activeOperation' AS active_operation,",
+        "document->'lastOperation'->>'kind' AS last_kind,",
+        "document->'lastOperation'->>'operationId' AS last_operation_id,",
+        "document->'lastOperation'->>'state' AS last_state,",
+        "document->'lease' <> 'null'::jsonb AS has_lease,",
+        "document->'attachment' <> 'null'::jsonb AS has_attachment",
+        "FROM session_authority.sessions",
+        "WHERE session_id = $1",
+      ].join(" "),
+      [sessionId],
+    );
+    assert.deepEqual(sessionBeforeRestoreRetry.rows, [
+      {
+        active_operation: null,
+        has_attachment: true,
+        has_lease: true,
+        last_kind: RESTORE_DESTINATION_GENERATION_OPERATION_KIND,
+        last_operation_id: admission.request.operationId,
+        last_state: "committed",
+        lifecycle: "ATTACHED",
+      },
+    ]);
+    assert.notEqual(publicationObservation.restoreVerificationInput, null);
+    // Prove the complete raw verifier succeeds after the artifact source is
+    // gone before attributing any later failure to the assembled facade.
+    const directVerification =
+      await restartedPublication.verifyCommittedRestoreDestination({
+        ...publicationObservation.restoreVerificationInput,
+        destinationDirectory: publicationTree.destinationDirectory,
+        destinationOwnedRoot: publicationTree.destinationOwnedRoot,
+      });
+    assert.equal(directVerification.replayed, true);
+
     // This boundary proves complete in-process object replacement over the
     // same PostgreSQL and stopped-directory journal state.
     publicationObservation.events.length = 0;
@@ -13648,6 +13702,8 @@ test(
     const restoreRetryArtifactResolverBefore =
       restartedCalls.artifactResolver;
     const restoreRetryPublicationBefore = restartedCalls.publication;
+    const restoreRetryVerificationBefore =
+      restartedCalls.verifyCommittedRestoreDestination;
     const restoreRetryPhysicalInvocationsBefore =
       restartedPhysicalInvocations.size;
     const restoreRetryPhysicalSignalsBefore =
@@ -13662,6 +13718,32 @@ test(
         return true;
       },
     );
+    const detachAfterRetry = await authorityPool.query(
+      [
+        "SELECT o.kind, o.state, o.revision::text AS revision,",
+        "o.result->>'outcome' AS outcome,",
+        "o.result->>'reason' AS reason,",
+        "r.state AS reservation_state,",
+        "r.released_at IS NOT NULL AS reservation_released",
+        "FROM session_authority.operation_claims AS o",
+        "LEFT JOIN session_authority.reservations AS r",
+        "ON r.operation_id = o.operation_id",
+        "AND r.session_id = o.session_id",
+        "WHERE o.operation_id = $1",
+      ].join(" "),
+      [stablePlan.detachOperationId],
+    );
+    assert.deepEqual(detachAfterRetry.rows, [
+      {
+        kind: WRITER_RELEASE_OPERATION_KIND,
+        outcome: "writer-blocked",
+        reason: "provider-outcome-unresolved",
+        reservation_released: true,
+        reservation_state: "released",
+        revision: "3",
+        state: "committed",
+      },
+    ]);
     assert.deepEqual(
       {
         publication: calls.publication,
@@ -13696,7 +13778,10 @@ test(
     // Verification authorizes progress to the distinct detach operation; it
     // never authorizes a second destination-publication mutation.
     assert.equal(restartedCalls.provider, 1);
-    assert.equal(restartedCalls.verifyCommittedRestoreDestination, 1);
+    assert.equal(
+      restartedCalls.verifyCommittedRestoreDestination,
+      restoreRetryVerificationBefore + 1,
+    );
     assert.deepEqual(publicationObservation.events, [
       "verifyCommittedRestoreDestination",
     ]);
