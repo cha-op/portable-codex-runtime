@@ -269,7 +269,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      launch inventory. The service is sequential and no-relaunch: it never
      republishes, reserves or consumes an image, invokes a launcher, or
      reconstructs an opaque writer capability.
-8. **Production restore adapter enablement (pending)**
+8. **Production restore adapter enablement (complete)**
    - The durable four-lane recovery cursor prerequisite is complete: one
      PostgreSQL row per recovery scope and lane persists keyset position,
      cycle, revision, and exact transition replay evidence. A bounded runner
@@ -281,7 +281,8 @@ Restore and launcher authority are now split into eight serial pull requests:
      force-fence admission, provider execution, proof validation, and durable
      finalization. Retained ambiguous dispatch cannot replay a storage call,
      while a valid proof can replay only its database finalizer after
-     acknowledgement loss. The facade is not scheduled yet.
+     acknowledgement loss. The facade is caller-driven and intentionally not
+     scheduled as an autonomous saga.
    - The full publication-binding transport prerequisite is complete: stopped
      backend contract version 3 carries the complete authority-issued
      generation binding to fresh publication or committed-only verification,
