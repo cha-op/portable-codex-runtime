@@ -531,19 +531,32 @@ assembled restore saga even though deployment settles their contracts.
 
 Production-injectable Linux components now provide sparse raw ext4-image
 creation, FD-bound format/mount/sync/unmount/loop-detach settlement, an
-append-only provider ledger checked against an external PostgreSQL head,
-separate persistent publication-control identities, and a rootless Podman
-writer supervisor. Their two-host Ubuntu conformance flow runs each Node
-process and helper in one long-lived private mount namespace with dedicated
-`rprivate` archive and session roots. A live-mount barrier proves the
-producer's ext4 mounts are visible in that child namespace and absent from its
-parent when the privileged workflow gate runs. The flow then cleanly detaches
-and transfers both images. On the
-consumer host, the externally anchored archive mount-root tuple makes the
-first remount
-verification-only; the distinct artifact-child tuple then authorizes
-publication verification for that exact owned root. The default Podman
-filesystem authority protects the object selected for a call; a trusted
+versioned provider-state checkpoint plus bounded active delta log checked
+against an external PostgreSQL v2 head, separate persistent publication-
+control identities, and a rootless Podman writer supervisor. Provider-state
+rotation first durably creates and syncs the next checkpoint and empty log,
+then advances the external head with a pure-maintenance CAS that preserves the
+logical state revision. The default soft rotation watermarks are 8 MiB or
+8,192 active frames; the hard per-generation envelope remains 64 MiB and
+65,535 frames, so ordinary active-log growth no longer requires a manual reset
+at that envelope. The provider-state checkpoint is a control-plane exact-
+replay snapshot, not a physical ext4 image checkpoint or content root. It
+retains every prepared and committed operation, current storage state, and
+destroyed tombstone; exact replay therefore makes checkpoint and aggregate
+provider-state storage grow with unique operations. This slice supplies no
+retention or garbage collection, so hosts must monitor `inspectCapacity()` and
+the provider-state directory until a retention floor or PostgreSQL-indexed
+history is designed.
+
+The two-host Ubuntu conformance flow runs each Node process and helper in one
+long-lived private mount namespace with dedicated `rprivate` archive and
+session roots. A live-mount barrier proves the producer's ext4 mounts are
+visible in that child namespace and absent from its parent when the privileged
+workflow gate runs. The flow then cleanly detaches and transfers both images.
+On the consumer host, the externally anchored archive mount-root tuple makes
+the first remount verification-only; the distinct artifact-child tuple then
+authorizes publication verification for that exact owned root. The default
+Podman filesystem authority protects the object selected for a call; a trusted
 adapter that binds the provider's committed ext4 identity into that authority,
 and same-process evidence for the combined components, remain pending.
 

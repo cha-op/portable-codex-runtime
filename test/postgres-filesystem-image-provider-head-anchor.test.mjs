@@ -4,8 +4,10 @@ import test from "node:test";
 
 import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  filesystemImageProviderStateHeadChecksum,
 } from "../src/filesystem-image-provider-state.mjs";
 import {
+  POSTGRES_FILESYSTEM_IMAGE_PROVIDER_HEAD_ANCHOR_CONTRACT_VERSION,
   PostgresFilesystemImageProviderHeadAnchorError,
   createPostgresFilesystemImageProviderHeadAnchor,
 } from "../src/postgres-filesystem-image-provider-head-anchor.mjs";
@@ -17,17 +19,62 @@ import {
 
 const GENESIS = Object.freeze({
   contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-  sequence: 0,
+  anchorRevision: "0",
+  generation: "0",
+  stateRevision: "0",
+  baseHeadChecksum: null,
+  checkpointStateRevision: "0",
+  checkpointFrameCount: 0,
+  checkpointChecksum: null,
+  checkpointBytes: 0,
+  frameCount: 0,
   lastChecksum: null,
   ledgerBytes: 0,
 });
 
-function head(sequence, checksumCharacter, ledgerBytes) {
+function successor(value) {
+  return (BigInt(value) + 1n).toString();
+}
+
+function appendHead(expectedHead, checksumCharacter, ledgerBytes) {
   return {
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-    sequence,
+    contractVersion: expectedHead.contractVersion,
+    anchorRevision: successor(expectedHead.anchorRevision),
+    generation: expectedHead.generation,
+    stateRevision: successor(expectedHead.stateRevision),
+    baseHeadChecksum: expectedHead.baseHeadChecksum,
+    checkpointStateRevision: expectedHead.checkpointStateRevision,
+    checkpointFrameCount: expectedHead.checkpointFrameCount,
+    checkpointChecksum: expectedHead.checkpointChecksum,
+    checkpointBytes: expectedHead.checkpointBytes,
+    frameCount: expectedHead.frameCount + 1,
     lastChecksum: checksumCharacter.repeat(64),
     ledgerBytes,
+  };
+}
+
+function rotationHead(
+  expectedHead,
+  {
+    checkpointBytes = 768,
+    checkpointFrameCount = 2,
+    checksumCharacter = "c",
+  } = {},
+) {
+  const checkpointChecksum = checksumCharacter.repeat(64);
+  return {
+    contractVersion: expectedHead.contractVersion,
+    anchorRevision: successor(expectedHead.anchorRevision),
+    generation: successor(expectedHead.generation),
+    stateRevision: expectedHead.stateRevision,
+    baseHeadChecksum: filesystemImageProviderStateHeadChecksum(expectedHead),
+    checkpointStateRevision: expectedHead.stateRevision,
+    checkpointFrameCount,
+    checkpointChecksum,
+    checkpointBytes,
+    frameCount: 0,
+    lastChecksum: checkpointChecksum,
+    ledgerBytes: 0,
   };
 }
 
@@ -40,9 +87,37 @@ function copyRow(row) {
     provider_id: row.provider_id,
     anchor_id: row.anchor_id,
     contract_version: row.contract_version,
-    sequence: row.sequence,
+    anchor_revision: row.anchor_revision,
+    generation: row.generation,
+    state_revision: row.state_revision,
+    base_head_checksum: row.base_head_checksum,
+    checkpoint_state_revision: row.checkpoint_state_revision,
+    checkpoint_frame_count: row.checkpoint_frame_count,
+    checkpoint_checksum: row.checkpoint_checksum,
+    checkpoint_bytes: row.checkpoint_bytes,
+    frame_count: row.frame_count,
     last_checksum: row.last_checksum,
     ledger_bytes: row.ledger_bytes,
+  };
+}
+
+function storedRow(head, overrides = {}) {
+  return {
+    provider_id: "filesystem-image-ext4",
+    anchor_id: "host-primary",
+    contract_version: head.contractVersion,
+    anchor_revision: head.anchorRevision,
+    generation: head.generation,
+    state_revision: head.stateRevision,
+    base_head_checksum: head.baseHeadChecksum,
+    checkpoint_state_revision: head.checkpointStateRevision,
+    checkpoint_frame_count: String(head.checkpointFrameCount),
+    checkpoint_checksum: head.checkpointChecksum,
+    checkpoint_bytes: String(head.checkpointBytes),
+    frame_count: String(head.frameCount),
+    last_checksum: head.lastChecksum,
+    ledger_bytes: String(head.ledgerBytes),
+    ...overrides,
   };
 }
 
@@ -138,9 +213,17 @@ class FakeHeadClient {
           provider_id: providerId,
           anchor_id: anchorId,
           contract_version: values[2],
-          sequence: values[3],
-          last_checksum: values[4],
-          ledger_bytes: values[5],
+          anchor_revision: values[3],
+          generation: values[4],
+          state_revision: values[5],
+          base_head_checksum: values[6],
+          checkpoint_state_revision: values[7],
+          checkpoint_frame_count: values[8],
+          checkpoint_checksum: values[9],
+          checkpoint_bytes: values[10],
+          frame_count: values[11],
+          last_checksum: values[12],
+          ledger_bytes: values[13],
         };
         this.database.heads.set(identity, stored);
         return result("INSERT", [copyRow(stored)]);
@@ -149,10 +232,18 @@ class FakeHeadClient {
         const stored = this.database.heads.get(identity);
         if (
           stored === undefined ||
-          stored.contract_version !== values[6] ||
-          stored.sequence !== values[7] ||
-          stored.last_checksum !== values[8] ||
-          stored.ledger_bytes !== values[9]
+          stored.contract_version !== values[14] ||
+          stored.anchor_revision !== values[15] ||
+          stored.generation !== values[16] ||
+          stored.state_revision !== values[17] ||
+          stored.base_head_checksum !== values[18] ||
+          stored.checkpoint_state_revision !== values[19] ||
+          stored.checkpoint_frame_count !== values[20] ||
+          stored.checkpoint_checksum !== values[21] ||
+          stored.checkpoint_bytes !== values[22] ||
+          stored.frame_count !== values[23] ||
+          stored.last_checksum !== values[24] ||
+          stored.ledger_bytes !== values[25]
         ) {
           return result("UPDATE");
         }
@@ -160,9 +251,17 @@ class FakeHeadClient {
           provider_id: providerId,
           anchor_id: anchorId,
           contract_version: values[2],
-          sequence: values[3],
-          last_checksum: values[4],
-          ledger_bytes: values[5],
+          anchor_revision: values[3],
+          generation: values[4],
+          state_revision: values[5],
+          base_head_checksum: values[6],
+          checkpoint_state_revision: values[7],
+          checkpoint_frame_count: values[8],
+          checkpoint_checksum: values[9],
+          checkpoint_bytes: values[10],
+          frame_count: values[11],
+          last_checksum: values[12],
+          ledger_bytes: values[13],
         };
         this.database.heads.set(identity, updated);
         return result("UPDATE", [copyRow(updated)]);
@@ -202,6 +301,10 @@ function anchorError(code) {
 
 test("reads canonical genesis and exposes an exact receiver-safe native-Promise surface", async () => {
   const { anchor, database } = createFixture();
+  assert.equal(
+    POSTGRES_FILESYSTEM_IMAGE_PROVIDER_HEAD_ANCHOR_CONTRACT_VERSION,
+    2,
+  );
   assert.equal(database.queries.length, 0);
   assert.deepEqual(Reflect.ownKeys(anchor), ["readHead", "compareAndAdvance"]);
   assert.equal(Object.isFrozen(anchor), true);
@@ -213,11 +316,73 @@ test("reads canonical genesis and exposes an exact receiver-safe native-Promise 
   const observed = await promise;
   assert.deepEqual(observed, GENESIS);
   assert.equal(Object.isFrozen(observed), true);
+  const readQuery = database.queries.find(
+    ([text]) =>
+      text.startsWith("SELECT ") &&
+      text.includes("session_authority.filesystem_image_provider_heads"),
+  );
+  for (const column of [
+    "anchor_revision",
+    "generation",
+    "state_revision",
+    "checkpoint_state_revision",
+    "checkpoint_frame_count",
+    "checkpoint_bytes",
+    "frame_count",
+    "ledger_bytes",
+  ]) {
+    assert.match(
+      readQuery[0],
+      new RegExp(`${column}::pg_catalog\\.text AS ${column}`, "u"),
+    );
+  }
+});
+
+test("round-trips uint64 head revisions as canonical decimal strings", async () => {
+  const { anchor, database } = createFixture();
+  const maximumRevisionHead = {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    anchorRevision: "18446744073709551615",
+    generation: "18446744073709551614",
+    stateRevision: "1",
+    baseHeadChecksum: "a".repeat(64),
+    checkpointStateRevision: "1",
+    checkpointFrameCount: 2,
+    checkpointChecksum: "b".repeat(64),
+    checkpointBytes: 512,
+    frameCount: 0,
+    lastChecksum: "b".repeat(64),
+    ledgerBytes: 0,
+  };
+  database.malformedReadRow = storedRow(maximumRevisionHead);
+  assert.deepEqual(await anchor.readHead(), maximumRevisionHead);
+});
+
+test("treats row absence only as exact v2 genesis", async () => {
+  const { anchor, database } = createFixture();
+  const first = appendHead(GENESIS, "a", 512);
+  const second = appendHead(first, "b", 1024);
+  assert.equal(
+    await anchor.compareAndAdvance({
+      expectedHead: first,
+      nextHead: second,
+    }),
+    false,
+  );
+  assert.equal(
+    database.queries.some(([text]) => text.startsWith("INSERT ")),
+    false,
+  );
+  assert.equal(
+    database.queries.some(([text]) => text.startsWith("UPDATE ")),
+    true,
+  );
+  assert.deepEqual(await anchor.readHead(), GENESIS);
 });
 
 test("inserts genesis, reads across adapter restart, and advances by exact CAS", async () => {
   const { anchor, createAnchor, database } = createFixture();
-  const first = head(1, "a", 512);
+  const first = appendHead(GENESIS, "a", 512);
   assert.equal(
     await anchor.compareAndAdvance({ expectedHead: GENESIS, nextHead: first }),
     true,
@@ -229,8 +394,16 @@ test("inserts genesis, reads across adapter restart, and advances by exact CAS",
   assert.deepEqual(insertQuery[1], [
     "filesystem-image-ext4",
     "host-primary",
-    1,
-    1,
+    2,
+    "1",
+    "0",
+    "1",
+    null,
+    "0",
+    "0",
+    null,
+    "0",
+    "1",
     "a".repeat(64),
     "512",
   ]);
@@ -240,7 +413,7 @@ test("inserts genesis, reads across adapter restart, and advances by exact CAS",
   assert.equal(Object.isFrozen(observedFirst), true);
   assert.deepEqual(await createAnchor().readHead(), first);
 
-  const staleNext = head(2, "b", 1024);
+  const staleNext = appendHead(first, "b", 1024);
   assert.equal(
     await anchor.compareAndAdvance({
       expectedHead: { ...first, lastChecksum: "f".repeat(64) },
@@ -258,32 +431,76 @@ test("inserts genesis, reads across adapter restart, and advances by exact CAS",
     text.startsWith("UPDATE "),
   );
   assert.equal(updateQueries.length, 2);
-  assert.match(
-    updateQueries[0][0],
-    /contract_version = \$7 AND sequence = \$8 AND last_checksum IS NOT DISTINCT FROM \$9 AND ledger_bytes = \$10::pg_catalog\.int8/u,
-  );
+  for (const predicate of [
+    /contract_version = \$15/u,
+    /anchor_revision = \$16::pg_catalog\.numeric/u,
+    /generation = \$17::pg_catalog\.numeric/u,
+    /state_revision = \$18::pg_catalog\.numeric/u,
+    /base_head_checksum IS NOT DISTINCT FROM \$19/u,
+    /checkpoint_state_revision = \$20::pg_catalog\.numeric/u,
+    /checkpoint_frame_count = \$21::pg_catalog\.int8/u,
+    /checkpoint_checksum IS NOT DISTINCT FROM \$22/u,
+    /checkpoint_bytes = \$23::pg_catalog\.int8/u,
+    /frame_count = \$24::pg_catalog\.int4/u,
+    /last_checksum IS NOT DISTINCT FROM \$25/u,
+    /ledger_bytes = \$26::pg_catalog\.int8/u,
+  ]) {
+    assert.match(updateQueries[0][0], predicate);
+  }
   assert.deepEqual(updateQueries.map(([, values]) => values), [
     [
       "filesystem-image-ext4",
       "host-primary",
-      1,
       2,
+      "2",
+      "0",
+      "2",
+      null,
+      "0",
+      "0",
+      null,
+      "0",
+      "2",
       "b".repeat(64),
       "1024",
-      1,
-      1,
+      2,
+      "1",
+      "0",
+      "1",
+      null,
+      "0",
+      "0",
+      null,
+      "0",
+      "1",
       "f".repeat(64),
       "512",
     ],
     [
       "filesystem-image-ext4",
       "host-primary",
-      1,
       2,
+      "2",
+      "0",
+      "2",
+      null,
+      "0",
+      "0",
+      null,
+      "0",
+      "2",
       "b".repeat(64),
       "1024",
-      1,
-      1,
+      2,
+      "1",
+      "0",
+      "1",
+      null,
+      "0",
+      "0",
+      null,
+      "0",
+      "1",
       "a".repeat(64),
       "512",
     ],
@@ -293,72 +510,167 @@ test("inserts genesis, reads across adapter restart, and advances by exact CAS",
   assert.equal(
     await anchor.compareAndAdvance({
       expectedHead: GENESIS,
-      nextHead: head(1, "c", 900),
+      nextHead: appendHead(GENESIS, "c", 900),
     }),
     false,
   );
 });
 
-test("rejects non-consecutive, non-growing, and checksum-free advances before SQL", async () => {
-  const { anchor, database } = createFixture();
-  const before = database.queries.length;
-  await assert.rejects(
-    anchor.compareAndAdvance({
-      expectedHead: GENESIS,
-      nextHead: head(2, "a", 512),
-    }),
-    anchorError(
-      "invalid_postgres_filesystem_image_provider_head_anchor_request",
-    ),
-  );
-  await assert.rejects(
-    anchor.compareAndAdvance({
-      expectedHead: head(1, "a", 512),
-      nextHead: head(2, "b", 512),
-    }),
-    anchorError(
-      "invalid_postgres_filesystem_image_provider_head_anchor_request",
-    ),
-  );
-  await assert.rejects(
-    anchor.compareAndAdvance({
-      expectedHead: GENESIS,
-      nextHead: {
-        contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-        sequence: 1,
-        lastChecksum: null,
-        ledgerBytes: 512,
-      },
-    }),
-    anchorError(
-      "invalid_postgres_filesystem_image_provider_head_anchor_request",
-    ),
-  );
-  assert.equal(database.queries.length, before);
-});
-
-test("concurrent advances from one exact head have one CAS winner", async () => {
+test("rotates only to a checkpoint bound to the exact old head and then appends", async () => {
   const { anchor, createAnchor } = createFixture();
-  const first = head(1, "a", 512);
-  const candidates = [head(2, "b", 1024), head(2, "c", 1536)];
+  const first = appendHead(GENESIS, "a", 512);
+  const rotation = rotationHead(first, {
+    checkpointBytes: 1024,
+    checkpointFrameCount: 3,
+    checksumCharacter: "b",
+  });
+  const afterRotation = appendHead(rotation, "c", 640);
+
   assert.equal(
     await anchor.compareAndAdvance({ expectedHead: GENESIS, nextHead: first }),
     true,
   );
+  assert.equal(
+    await createAnchor().compareAndAdvance({
+      expectedHead: first,
+      nextHead: rotation,
+    }),
+    true,
+  );
+  assert.deepEqual(await createAnchor().readHead(), rotation);
+  assert.equal(
+    await anchor.compareAndAdvance({
+      expectedHead: rotation,
+      nextHead: afterRotation,
+    }),
+    true,
+  );
+  assert.deepEqual(await createAnchor().readHead(), afterRotation);
+});
 
-  const outcomes = await Promise.all(
-    candidates.map((nextHead) =>
-      createAnchor().compareAndAdvance({
-        expectedHead: first,
-        nextHead,
+test("rejects mixed, drifting, empty, and malformed transitions before SQL", async () => {
+  const { anchor, database } = createFixture();
+  const before = database.queries.length;
+  const first = appendHead(GENESIS, "a", 512);
+  const second = appendHead(first, "b", 1024);
+  const rotation = rotationHead(first);
+  const invalidTransitions = [
+    {
+      expectedHead: GENESIS,
+      nextHead: { ...first, anchorRevision: "2" },
+    },
+    {
+      expectedHead: first,
+      nextHead: { ...second, ledgerBytes: first.ledgerBytes },
+    },
+    {
+      expectedHead: first,
+      nextHead: { ...second, generation: "1", anchorRevision: "3" },
+    },
+    {
+      expectedHead: first,
+      nextHead: {
+        ...second,
+        checkpointFrameCount: 2,
+        checkpointChecksum: "e".repeat(64),
+        checkpointBytes: 256,
+      },
+    },
+    {
+      expectedHead: GENESIS,
+      nextHead: rotationHead(GENESIS),
+    },
+    {
+      expectedHead: first,
+      nextHead: { ...rotation, baseHeadChecksum: "f".repeat(64) },
+    },
+    {
+      expectedHead: first,
+      nextHead: {
+        ...rotation,
+        anchorRevision: "3",
+        stateRevision: "2",
+        checkpointStateRevision: "2",
+      },
+    },
+    {
+      expectedHead: first,
+      nextHead: { ...rotation, checkpointFrameCount: 1 },
+    },
+    {
+      expectedHead: first,
+      nextHead: appendHead(rotation, "d", 256),
+    },
+  ];
+  for (const request of invalidTransitions) {
+    await assert.rejects(
+      anchor.compareAndAdvance(request),
+      anchorError(
+        "invalid_postgres_filesystem_image_provider_head_anchor_request",
+      ),
+    );
+  }
+  assert.equal(database.queries.length, before);
+});
+
+test("concurrent appends and rotations from one exact head each have one CAS winner", async (t) => {
+  await t.test("append", async () => {
+    const { anchor, createAnchor } = createFixture();
+    const first = appendHead(GENESIS, "a", 512);
+    const candidates = [
+      appendHead(first, "b", 1024),
+      appendHead(first, "c", 1536),
+    ];
+    assert.equal(
+      await anchor.compareAndAdvance({ expectedHead: GENESIS, nextHead: first }),
+      true,
+    );
+
+    const outcomes = await Promise.all(
+      candidates.map((nextHead) =>
+        createAnchor().compareAndAdvance({
+          expectedHead: first,
+          nextHead,
+        }),
+      ),
+    );
+    assert.deepEqual([...outcomes].sort(), [false, true]);
+    assert.deepEqual(
+      await anchor.readHead(),
+      candidates[outcomes.indexOf(true)],
+    );
+  });
+
+  await t.test("rotation", async () => {
+    const { anchor, createAnchor } = createFixture();
+    const first = appendHead(GENESIS, "a", 512);
+    const candidates = [
+      rotationHead(first, { checksumCharacter: "b" }),
+      rotationHead(first, {
+        checkpointBytes: 1024,
+        checkpointFrameCount: 3,
+        checksumCharacter: "c",
       }),
-    ),
-  );
-  assert.deepEqual([...outcomes].sort(), [false, true]);
-  assert.deepEqual(
-    await anchor.readHead(),
-    candidates[outcomes.indexOf(true)],
-  );
+    ];
+    assert.equal(
+      await anchor.compareAndAdvance({ expectedHead: GENESIS, nextHead: first }),
+      true,
+    );
+
+    const outcomes = await Promise.all(
+      candidates.map((nextHead) =>
+        createAnchor().compareAndAdvance({
+          expectedHead: first,
+          nextHead,
+        }),
+      ),
+    );
+    assert.deepEqual([...outcomes].sort(), [false, true]);
+    assert.deepEqual(
+      await anchor.readHead(),
+      candidates[outcomes.indexOf(true)],
+    );
+  });
 });
 
 test("requires the store brand and rejects proxy or accessor options without execution", () => {
@@ -455,7 +767,7 @@ test("requires the store brand and rejects proxy or accessor options without exe
 test("rejects proxy or accessor advance requests without executing traps", async () => {
   const { anchor } = createFixture();
   let getterCalls = 0;
-  const accessorRequest = { nextHead: head(1, "a", 512) };
+  const accessorRequest = { nextHead: appendHead(GENESIS, "a", 512) };
   Object.defineProperty(accessorRequest, "expectedHead", {
     enumerable: true,
     get() {
@@ -479,7 +791,7 @@ test("rejects proxy or accessor advance requests without executing traps", async
 
   let proxyTrapCalls = 0;
   const proxyRequest = new Proxy(
-    { expectedHead: GENESIS, nextHead: head(1, "a", 512) },
+    { expectedHead: GENESIS, nextHead: appendHead(GENESIS, "a", 512) },
     {
       ownKeys() {
         proxyTrapCalls += 1;
@@ -496,50 +808,41 @@ test("rejects proxy or accessor advance requests without executing traps", async
   assert.equal(proxyTrapCalls, 0);
 });
 
-test("malformed durable rows reject without exposing database contents", async () => {
+test("malformed durable rows reject without exposing database contents", async (t) => {
   const { anchor, database } = createFixture();
-  database.malformedReadRow = {
-    provider_id: "filesystem-image-ext4",
-    anchor_id: "host-primary",
-    contract_version: 1,
-    sequence: 1,
-    last_checksum: "a".repeat(64),
-    ledger_bytes: String(64 * 1024 * 1024 + 1),
-  };
-  await assert.rejects(
-    anchor.readHead(),
-    anchorError(
-      "postgres_filesystem_image_provider_head_anchor_state_invalid",
-    ),
-  );
-
-  database.malformedReadRow = {
-    provider_id: "filesystem-image-ext4",
-    anchor_id: "host-primary",
-    contract_version: 1,
-    sequence: 0,
-    last_checksum: null,
-    ledger_bytes: "0",
-  };
-  await assert.rejects(
-    anchor.readHead(),
-    anchorError(
-      "postgres_filesystem_image_provider_head_anchor_state_invalid",
-    ),
-  );
+  const first = appendHead(GENESIS, "a", 512);
+  const malformedRows = [
+    storedRow(first, {
+      ledger_bytes: String(64 * 1024 * 1024 + 1),
+    }),
+    storedRow(first, { anchor_revision: "01" }),
+    storedRow(first, { anchor_revision: 1 }),
+    storedRow(first, { anchor_revision: "18446744073709551616" }),
+    storedRow(first, { frame_count: 1 }),
+    storedRow(first, { frame_count: "65536" }),
+    storedRow(first, { checkpoint_frame_count: "4294967296" }),
+    storedRow(first, { checkpoint_bytes: "9007199254740992" }),
+    storedRow(first, { state_revision: "2" }),
+    storedRow(GENESIS),
+    { ...storedRow(first), unexpected: true },
+  ];
+  for (const [index, row] of malformedRows.entries()) {
+    await t.test(String(index), async () => {
+      database.malformedReadRow = row;
+      await assert.rejects(
+        anchor.readHead(),
+        anchorError(
+          "postgres_filesystem_image_provider_head_anchor_state_invalid",
+        ),
+      );
+    });
+  }
 });
 
 test("rejects write results that do not report exactly one canonical row", async () => {
   const { anchor, database } = createFixture();
-  const first = head(1, "a", 512);
-  const stored = {
-    provider_id: "filesystem-image-ext4",
-    anchor_id: "host-primary",
-    contract_version: 1,
-    sequence: 1,
-    last_checksum: "a".repeat(64),
-    ledger_bytes: "512",
-  };
+  const first = appendHead(GENESIS, "a", 512);
+  const stored = storedRow(first);
   database.headQueryResultOverride = {
     command: "INSERT",
     rowCount: 2,
@@ -575,13 +878,14 @@ test("store query and COMMIT uncertainty reject through the adapter unchanged", 
     });
   });
 
-  await t.test("commit acknowledgement loss", async () => {
-    const { anchor, database } = createFixture();
+  await t.test("first append COMMIT acknowledgement loss", async () => {
+    const { anchor, createAnchor, database } = createFixture();
+    const first = appendHead(GENESIS, "a", 512);
     database.failCommitOnce = true;
     await assert.rejects(
       anchor.compareAndAdvance({
         expectedHead: GENESIS,
-        nextHead: head(1, "a", 512),
+        nextHead: first,
       }),
       (error) => {
         assert.equal(error instanceof PostgresSerializableStoreError, true);
@@ -590,5 +894,30 @@ test("store query and COMMIT uncertainty reject through the adapter unchanged", 
         return true;
       },
     );
+    assert.deepEqual(await createAnchor().readHead(), first);
+  });
+
+  await t.test("rotation COMMIT acknowledgement loss", async () => {
+    const { anchor, createAnchor, database } = createFixture();
+    const first = appendHead(GENESIS, "a", 512);
+    const rotation = rotationHead(first, { checksumCharacter: "b" });
+    assert.equal(
+      await anchor.compareAndAdvance({ expectedHead: GENESIS, nextHead: first }),
+      true,
+    );
+    database.failCommitOnce = true;
+    await assert.rejects(
+      anchor.compareAndAdvance({
+        expectedHead: first,
+        nextHead: rotation,
+      }),
+      (error) => {
+        assert.equal(error instanceof PostgresSerializableStoreError, true);
+        assert.equal(error.code, "transaction_commit_outcome_uncertain");
+        assert.equal(error.commitState, "uncertain");
+        return true;
+      },
+    );
+    assert.deepEqual(await createAnchor().readHead(), rotation);
   });
 });

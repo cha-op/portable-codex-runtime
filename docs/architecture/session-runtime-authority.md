@@ -2202,9 +2202,21 @@ image format, mount, sync, and loop-detach work bound to pinned descriptor
 authority below host-owned `rprivate` carriers; clean unmount closes the
 mounted-root descriptor before its non-lazy dispatch while retaining the
 pinned parent/direct-child authority;
-provider mutations require an append-only ledger head anchored outside the
-replaceable image; and publication checks separately authorized persistent
-control identities.
+provider mutations and maintenance rotation require a version 2 generation
+head anchored outside the replaceable image; and publication checks separately
+authorized persistent control identities. That head binds monotonic anchor and
+logical state revisions, generation and previous-head digest, a streamed
+provider-state checkpoint boundary/digest, and the bounded active delta log.
+Rotation syncs the new checkpoint, empty log, and parent directory before its
+pure-maintenance CAS, preserving the logical state revision while advancing
+the anchor revision and generation. Default soft rotation occurs at 8 MiB or
+8,192 active frames, before the 64 MiB and 65,535-frame hard envelope.
+The hot-path cache is not authority: only an exact head and pinned unchanged
+metadata can reuse it, while metadata change triggers content revalidation and
+does not alone prove mutation. The checkpoint retains every prepared and
+committed operation for exact replay, current storage records, and destroyed
+tombstones; a committed delta references its prepared operation instead of
+repeating the request.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2217,6 +2229,15 @@ shutdown order.
 Binding the provider's committed ext4 root identity into a trusted Podman
 filesystem authority, together with same-process conformance evidence, remains
 required before describing those components as one production graph.
+
+The provider-state checkpoint above is a control-plane replay snapshot, not a
+physical image checkpoint, published checkpoint artifact, or content root.
+Automatic rotation bounds only the active delta log. Permanent exact replay
+makes later provider-state checkpoints and aggregate persistent storage grow
+with unique operations. This slice has no retention floor or garbage
+collection: deployment hosts must monitor `inspectCapacity()` and the backing
+directory until an authority-safe retention floor or PostgreSQL-indexed history
+is designed.
 
 The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child
@@ -2256,6 +2277,9 @@ Production deployment requires:
   proof;
 - migration application before serving authority requests;
 - durable database backups independent of session-volume snapshots;
+- provider-state capacity monitoring through `inspectCapacity()` plus backing-
+  directory byte monitoring; active-log rotation is automatic, but retained
+  exact operation history and checkpoint bytes are not bounded by this slice;
 - authority-ledger promotion and recovery that never admits mutations from a
   database state older than any retained artefact or session-volume
   generation. Recovery must preserve or replay every later operation,

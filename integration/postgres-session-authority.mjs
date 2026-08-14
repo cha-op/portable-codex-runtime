@@ -105,6 +105,10 @@ import {
   createPostgresFilesystemImageProviderHeadAnchor,
 } from "../src/postgres-filesystem-image-provider-head-anchor.mjs";
 import {
+  FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  filesystemImageProviderStateHeadChecksum,
+} from "../src/filesystem-image-provider-state.mjs";
+import {
   PostgresRestoreRecoveryCursorStoreError,
   createPostgresRestoreRecoveryCursorStore,
 } from "../src/postgres-restore-recovery-cursor-store.mjs";
@@ -262,23 +266,58 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
       anchorId: selectedAnchorId,
     });
   const genesis = {
-    contractVersion: 1,
-    sequence: 0,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    baseHeadChecksum: null,
+    checkpointStateRevision: "0",
+    checkpointFrameCount: 0,
+    checkpointChecksum: null,
+    checkpointBytes: 0,
+    frameCount: 0,
     lastChecksum: null,
     ledgerBytes: 0,
   };
-  const first = {
-    contractVersion: 1,
-    sequence: 1,
-    lastChecksum: "a".repeat(64),
-    ledgerBytes: 512,
+  const appendHead = (expectedHead, checksumCharacter, ledgerBytes) => ({
+    contractVersion: expectedHead.contractVersion,
+    anchorRevision: (BigInt(expectedHead.anchorRevision) + 1n).toString(),
+    generation: expectedHead.generation,
+    stateRevision: (BigInt(expectedHead.stateRevision) + 1n).toString(),
+    baseHeadChecksum: expectedHead.baseHeadChecksum,
+    checkpointStateRevision: expectedHead.checkpointStateRevision,
+    checkpointFrameCount: expectedHead.checkpointFrameCount,
+    checkpointChecksum: expectedHead.checkpointChecksum,
+    checkpointBytes: expectedHead.checkpointBytes,
+    frameCount: expectedHead.frameCount + 1,
+    lastChecksum: checksumCharacter.repeat(64),
+    ledgerBytes,
+  });
+  const rotationHead = (
+    expectedHead,
+    checksumCharacter,
+    checkpointFrameCount,
+    checkpointBytes,
+  ) => {
+    const checkpointChecksum = checksumCharacter.repeat(64);
+    return {
+      contractVersion: expectedHead.contractVersion,
+      anchorRevision: (BigInt(expectedHead.anchorRevision) + 1n).toString(),
+      generation: (BigInt(expectedHead.generation) + 1n).toString(),
+      stateRevision: expectedHead.stateRevision,
+      baseHeadChecksum:
+        filesystemImageProviderStateHeadChecksum(expectedHead),
+      checkpointStateRevision: expectedHead.stateRevision,
+      checkpointFrameCount,
+      checkpointChecksum,
+      checkpointBytes,
+      frameCount: 0,
+      lastChecksum: checkpointChecksum,
+      ledgerBytes: 0,
+    };
   };
-  const second = {
-    contractVersion: 1,
-    sequence: 2,
-    lastChecksum: "b".repeat(64),
-    ledgerBytes: 1024,
-  };
+  const first = appendHead(genesis, "a", 512);
+  const second = appendHead(first, "b", 1024);
   const anchor = createAnchor();
   assert.deepEqual(await anchor.readHead(), genesis);
   assert.equal(
@@ -309,18 +348,8 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
   );
   assert.deepEqual(await createAnchor().readHead(), second);
   const concurrentHeads = [
-    {
-      contractVersion: 1,
-      sequence: 3,
-      lastChecksum: "c".repeat(64),
-      ledgerBytes: 1536,
-    },
-    {
-      contractVersion: 1,
-      sequence: 3,
-      lastChecksum: "d".repeat(64),
-      ledgerBytes: 2048,
-    },
+    appendHead(second, "c", 1536),
+    appendHead(second, "d", 2048),
   ];
   const concurrentResults = await Promise.all(
     concurrentHeads.map((nextHead) =>
@@ -336,10 +365,44 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
   ];
   assert.deepEqual(await createAnchor().readHead(), concurrentWinner);
 
+  const rotationHeads = [
+    rotationHead(concurrentWinner, "e", 2, 1536),
+    rotationHead(concurrentWinner, "f", 3, 2048),
+  ];
+  const rotationResults = await Promise.all(
+    rotationHeads.map((nextHead) =>
+      createAnchor().compareAndAdvance({
+        expectedHead: concurrentWinner,
+        nextHead,
+      }),
+    ),
+  );
+  assert.deepEqual([...rotationResults].sort(), [false, true]);
+  const rotationWinner = rotationHeads[rotationResults.indexOf(true)];
+  assert.deepEqual(await createAnchor().readHead(), rotationWinner);
+  const afterRotation = appendHead(rotationWinner, "0", 640);
+  assert.equal(
+    await createAnchor().compareAndAdvance({
+      expectedHead: rotationWinner,
+      nextHead: afterRotation,
+    }),
+    true,
+  );
+  assert.deepEqual(await createAnchor().readHead(), afterRotation);
+
   const stored = await pool.query(
     [
-      "SELECT provider_id, anchor_id, contract_version, sequence,",
-      "last_checksum, ledger_bytes::pg_catalog.text AS ledger_bytes",
+      "SELECT provider_id, anchor_id, contract_version,",
+      "anchor_revision::pg_catalog.text AS anchor_revision,",
+      "generation::pg_catalog.text AS generation,",
+      "state_revision::pg_catalog.text AS state_revision,",
+      "base_head_checksum,",
+      "checkpoint_state_revision::pg_catalog.text AS checkpoint_state_revision,",
+      "checkpoint_frame_count::pg_catalog.text AS checkpoint_frame_count,",
+      "checkpoint_checksum,",
+      "checkpoint_bytes::pg_catalog.text AS checkpoint_bytes,",
+      "frame_count::pg_catalog.text AS frame_count, last_checksum,",
+      "ledger_bytes::pg_catalog.text AS ledger_bytes",
       "FROM session_authority.filesystem_image_provider_heads",
       "WHERE provider_id = $1 AND anchor_id = $2",
     ].join(" "),
@@ -349,12 +412,53 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
     {
       provider_id: providerId,
       anchor_id: anchorId,
-      contract_version: 1,
-      sequence: concurrentWinner.sequence,
-      last_checksum: concurrentWinner.lastChecksum,
-      ledger_bytes: String(concurrentWinner.ledgerBytes),
+      contract_version: afterRotation.contractVersion,
+      anchor_revision: afterRotation.anchorRevision,
+      generation: afterRotation.generation,
+      state_revision: afterRotation.stateRevision,
+      base_head_checksum: afterRotation.baseHeadChecksum,
+      checkpoint_state_revision: afterRotation.checkpointStateRevision,
+      checkpoint_frame_count: String(afterRotation.checkpointFrameCount),
+      checkpoint_checksum: afterRotation.checkpointChecksum,
+      checkpoint_bytes: String(afterRotation.checkpointBytes),
+      frame_count: String(afterRotation.frameCount),
+      last_checksum: afterRotation.lastChecksum,
+      ledger_bytes: String(afterRotation.ledgerBytes),
     },
   ]);
+
+  await assert.rejects(
+    pool.query(
+      [
+        "INSERT INTO session_authority.filesystem_image_provider_heads",
+        "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
+        "state_revision, base_head_checksum, checkpoint_state_revision,",
+        "checkpoint_frame_count, checkpoint_checksum, checkpoint_bytes,",
+        "frame_count, last_checksum, ledger_bytes)",
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+      ].join(" "),
+      [
+        providerId,
+        `malformed-${randomUUID()}`,
+        2,
+        "1",
+        "0",
+        "1",
+        null,
+        "0",
+        "0",
+        null,
+        "0",
+        1,
+        "a".repeat(64),
+        "0",
+      ],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      return true;
+    },
+  );
 
   const acknowledgementLossAnchorId = `ack-loss-${randomUUID()}`;
   const acknowledgementLossPool =
@@ -386,6 +490,51 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
     first,
   );
 
+  const rotationAcknowledgementLossAnchorId =
+    `rotation-ack-loss-${randomUUID()}`;
+  assert.equal(
+    await createAnchor(
+      store,
+      rotationAcknowledgementLossAnchorId,
+    ).compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: first,
+    }),
+    true,
+  );
+  const rotationAcknowledgementLossPool =
+    commitAcknowledgementLossAfterQueryPool(
+      pool,
+      "filesystem image provider head anchor rotation",
+      (text) =>
+        text.startsWith(
+          "UPDATE session_authority.filesystem_image_provider_heads",
+        ),
+    );
+  const rotationAcknowledgementLossStore = new PostgresSerializableStore({
+    dedicatedPool: rotationAcknowledgementLossPool,
+    maxTransactionAttempts: 1,
+  });
+  const acknowledgementLossRotation = rotationHead(first, "9", 2, 768);
+  await assert.rejects(
+    createAnchor(
+      rotationAcknowledgementLossStore,
+      rotationAcknowledgementLossAnchorId,
+    ).compareAndAdvance({
+      expectedHead: first,
+      nextHead: acknowledgementLossRotation,
+    }),
+    assertCommitOutcomeUncertain,
+  );
+  assert.equal(rotationAcknowledgementLossPool.didLoseAcknowledgement(), true);
+  assert.deepEqual(
+    await createAnchor(
+      store,
+      rotationAcknowledgementLossAnchorId,
+    ).readHead(),
+    acknowledgementLossRotation,
+  );
+
   const resultLossAnchorId = `result-loss-${randomUUID()}`;
   const resultLossPool = firstMatchingQueryResultFailurePool(
     pool,
@@ -409,9 +558,14 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
   await pool.query(
     [
       "DELETE FROM session_authority.filesystem_image_provider_heads",
-      "WHERE provider_id = $1 AND anchor_id IN ($2, $3)",
+      "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4)",
     ].join(" "),
-    [providerId, anchorId, acknowledgementLossAnchorId],
+    [
+      providerId,
+      anchorId,
+      acknowledgementLossAnchorId,
+      rotationAcknowledgementLossAnchorId,
+    ],
   );
 }
 

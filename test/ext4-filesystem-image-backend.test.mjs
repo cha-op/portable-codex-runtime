@@ -159,17 +159,34 @@ function createLockProvider() {
 function createHeadAnchor() {
   let head = normalizeFilesystemImageProviderStateHead({
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    baseHeadChecksum: null,
+    checkpointStateRevision: "0",
+    checkpointFrameCount: 0,
+    checkpointChecksum: null,
+    checkpointBytes: 0,
+    frameCount: 0,
     lastChecksum: null,
     ledgerBytes: 0,
-    sequence: 0,
   });
   return Object.freeze({
     async compareAndAdvance({ expectedHead, nextHead }) {
       if (
         expectedHead.contractVersion !== head.contractVersion ||
+        expectedHead.anchorRevision !== head.anchorRevision ||
+        expectedHead.generation !== head.generation ||
+        expectedHead.stateRevision !== head.stateRevision ||
+        expectedHead.baseHeadChecksum !== head.baseHeadChecksum ||
+        expectedHead.checkpointStateRevision !==
+          head.checkpointStateRevision ||
+        expectedHead.checkpointFrameCount !== head.checkpointFrameCount ||
+        expectedHead.checkpointChecksum !== head.checkpointChecksum ||
+        expectedHead.checkpointBytes !== head.checkpointBytes ||
+        expectedHead.frameCount !== head.frameCount ||
         expectedHead.lastChecksum !== head.lastChecksum ||
-        expectedHead.ledgerBytes !== head.ledgerBytes ||
-        expectedHead.sequence !== head.sequence
+        expectedHead.ledgerBytes !== head.ledgerBytes
       ) {
         return false;
       }

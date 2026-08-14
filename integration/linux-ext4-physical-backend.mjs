@@ -104,7 +104,15 @@ if (
 }
 const GENESIS_PROVIDER_STATE_HEAD = exact({
   contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-  sequence: 0,
+  anchorRevision: "0",
+  generation: "0",
+  stateRevision: "0",
+  baseHeadChecksum: null,
+  checkpointStateRevision: "0",
+  checkpointFrameCount: 0,
+  checkpointChecksum: null,
+  checkpointBytes: 0,
+  frameCount: 0,
   lastChecksum: null,
   ledgerBytes: 0,
 });
@@ -143,7 +151,15 @@ function publicationControlIdentity(value) {
 function sameCanonicalValue(left, right) {
   return (
     left.contractVersion === right.contractVersion &&
-    left.sequence === right.sequence &&
+    left.anchorRevision === right.anchorRevision &&
+    left.generation === right.generation &&
+    left.stateRevision === right.stateRevision &&
+    left.baseHeadChecksum === right.baseHeadChecksum &&
+    left.checkpointStateRevision === right.checkpointStateRevision &&
+    left.checkpointFrameCount === right.checkpointFrameCount &&
+    left.checkpointChecksum === right.checkpointChecksum &&
+    left.checkpointBytes === right.checkpointBytes &&
+    left.frameCount === right.frameCount &&
     left.lastChecksum === right.lastChecksum &&
     left.ledgerBytes === right.ledgerBytes
   );
@@ -799,6 +815,8 @@ async function produce() {
 
 async function consume({ destroy }) {
   const receipt = JSON.parse(await readFile(TRANSFER_PATH, "utf8"));
+  const receiptProviderStateHead =
+    normalizeFilesystemImageProviderStateHead(receipt.providerStateHead);
   assert.equal(Number.isSafeInteger(receipt.serviceUid), true);
   assert.equal(receipt.serviceUid > 0, true);
   assert.equal(
@@ -817,7 +835,7 @@ async function consume({ destroy }) {
     );
   assert.deepEqual(
     JSON.parse(JSON.stringify(providerStateHead)),
-    receipt.providerStateHead,
+    JSON.parse(JSON.stringify(receiptProviderStateHead)),
   );
   if (EXTERNAL_ARCHIVE_PUBLICATION_CONTROL_IDENTITY !== null) {
     assert.deepEqual(

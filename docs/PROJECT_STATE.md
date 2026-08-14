@@ -421,9 +421,19 @@
 - Production-injectable Linux ext4 physical components now supply sparse raw-
   image lifecycle through native operations below host-owned `rprivate` mount
   carriers, exact close-before-unmount and loop-detach settlement, an
-  append-only provider ledger checked against an external PostgreSQL head, two
-  distinct persistent archive control identities, and a rootless digest-pinned
-  Podman writer supervisor. Producer outputs bind
+  automatically rotated provider-state checkpoint and bounded active delta log
+  checked against an external PostgreSQL v2 generation head, two distinct
+  persistent archive control identities, and a rootless digest-pinned Podman
+  writer supervisor. The head binds monotonic anchor/state revisions, the
+  generation and previous-head digest, checkpoint boundary/digest, and active-
+  log boundary/digest. Rotation syncs the next checkpoint, empty log, and
+  parent directory before a pure-maintenance CAS. Default 8 MiB/8,192-frame
+  soft watermarks rotate before the 64 MiB/65,535-frame hard envelope, and
+  `inspectCapacity()` exposes both boundaries. The control-plane checkpoint
+  retains all operations for exact replay plus current storage and destroyed
+  tombstones; it is not a physical image checkpoint. Consequently its size and
+  aggregate provider-state bytes grow with unique operations, and this slice
+  has no retention/GC path; hosts must monitor it. Producer outputs bind
   the archive mount-root and artifact-child tuples separately; on the consumer,
   the former makes the first remount verification-only and the latter
   authorizes verification for the exact publication root. Two hosted Ubuntu

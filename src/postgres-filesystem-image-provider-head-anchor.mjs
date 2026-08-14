@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  filesystemImageProviderStateHeadChecksum,
   normalizeFilesystemImageProviderStateHead,
 } from "./filesystem-image-provider-state.mjs";
 import {
@@ -36,8 +37,11 @@ const StringConstructor = String;
 const TypeErrorConstructor = TypeError;
 
 export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_HEAD_ANCHOR_CONTRACT_VERSION =
-  1;
+  2;
 
+const MAX_CHECKPOINT_FRAME_COUNT = 4_294_967_295;
+const MAX_CHECKPOINT_BYTES = 9_007_199_254_740_991;
+const MAX_FRAME_COUNT = 65_535;
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
@@ -47,7 +51,15 @@ const HEAD_ROW_KEYS = Object.freeze([
   "provider_id",
   "anchor_id",
   "contract_version",
-  "sequence",
+  "anchor_revision",
+  "generation",
+  "state_revision",
+  "base_head_checksum",
+  "checkpoint_state_revision",
+  "checkpoint_frame_count",
+  "checkpoint_checksum",
+  "checkpoint_bytes",
+  "frame_count",
   "last_checksum",
   "ledger_bytes",
 ]);
@@ -64,7 +76,15 @@ const HEAD_COLUMNS = [
   "provider_id",
   "anchor_id",
   "contract_version",
-  "sequence",
+  "anchor_revision::pg_catalog.text AS anchor_revision",
+  "generation::pg_catalog.text AS generation",
+  "state_revision::pg_catalog.text AS state_revision",
+  "base_head_checksum",
+  "checkpoint_state_revision::pg_catalog.text AS checkpoint_state_revision",
+  "checkpoint_frame_count::pg_catalog.text AS checkpoint_frame_count",
+  "checkpoint_checksum",
+  "checkpoint_bytes::pg_catalog.text AS checkpoint_bytes",
+  "frame_count::pg_catalog.text AS frame_count",
   "last_checksum",
   "ledger_bytes::pg_catalog.text AS ledger_bytes",
 ].join(", ");
@@ -75,20 +95,38 @@ const READ_QUERY = [
 ].join(" ");
 const INSERT_QUERY = [
   "INSERT INTO session_authority.filesystem_image_provider_heads",
-  "(provider_id, anchor_id, contract_version, sequence,",
-  "last_checksum, ledger_bytes)",
-  "VALUES ($1, $2, $3, $4, $5, $6::pg_catalog.int8)",
+  "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
+  "state_revision, base_head_checksum, checkpoint_state_revision,",
+  "checkpoint_frame_count, checkpoint_checksum, checkpoint_bytes,",
+  "frame_count, last_checksum, ledger_bytes)",
+  "VALUES ($1, $2, $3, $4::pg_catalog.numeric, $5::pg_catalog.numeric,",
+  "$6::pg_catalog.numeric, $7, $8::pg_catalog.numeric, $9::pg_catalog.int8,",
+  "$10, $11::pg_catalog.int8, $12::pg_catalog.int4, $13,",
+  "$14::pg_catalog.int8)",
   "ON CONFLICT (provider_id, anchor_id) DO NOTHING",
   `RETURNING ${HEAD_COLUMNS}`,
 ].join(" ");
 const UPDATE_QUERY = [
   "UPDATE session_authority.filesystem_image_provider_heads",
-  "SET contract_version = $3, sequence = $4,",
-  "last_checksum = $5, ledger_bytes = $6::pg_catalog.int8",
+  "SET contract_version = $3, anchor_revision = $4::pg_catalog.numeric,",
+  "generation = $5::pg_catalog.numeric, state_revision = $6::pg_catalog.numeric,",
+  "base_head_checksum = $7, checkpoint_state_revision = $8::pg_catalog.numeric,",
+  "checkpoint_frame_count = $9::pg_catalog.int8, checkpoint_checksum = $10,",
+  "checkpoint_bytes = $11::pg_catalog.int8, frame_count = $12::pg_catalog.int4,",
+  "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8",
   "WHERE provider_id = $1 AND anchor_id = $2",
-  "AND contract_version = $7 AND sequence = $8",
-  "AND last_checksum IS NOT DISTINCT FROM $9",
-  "AND ledger_bytes = $10::pg_catalog.int8",
+  "AND contract_version = $15",
+  "AND anchor_revision = $16::pg_catalog.numeric",
+  "AND generation = $17::pg_catalog.numeric",
+  "AND state_revision = $18::pg_catalog.numeric",
+  "AND base_head_checksum IS NOT DISTINCT FROM $19",
+  "AND checkpoint_state_revision = $20::pg_catalog.numeric",
+  "AND checkpoint_frame_count = $21::pg_catalog.int8",
+  "AND checkpoint_checksum IS NOT DISTINCT FROM $22",
+  "AND checkpoint_bytes = $23::pg_catalog.int8",
+  "AND frame_count = $24::pg_catalog.int4",
+  "AND last_checksum IS NOT DISTINCT FROM $25",
+  "AND ledger_bytes = $26::pg_catalog.int8",
   `RETURNING ${HEAD_COLUMNS}`,
 ].join(" ");
 
@@ -225,11 +263,31 @@ function canonicalHead(value, code) {
   }
 }
 
+function canonicalHeadChecksum(value, code) {
+  try {
+    return callIntrinsic(
+      filesystemImageProviderStateHeadChecksum,
+      undefined,
+      [value],
+    );
+  } catch {
+    fail(code);
+  }
+}
+
 function genesisHead() {
   return canonicalHead(
     {
       contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-      sequence: 0,
+      anchorRevision: "0",
+      generation: "0",
+      stateRevision: "0",
+      baseHeadChecksum: null,
+      checkpointStateRevision: "0",
+      checkpointFrameCount: 0,
+      checkpointChecksum: null,
+      checkpointBytes: 0,
+      frameCount: 0,
       lastChecksum: null,
       ledgerBytes: 0,
     },
@@ -240,13 +298,21 @@ function genesisHead() {
 function headEqual(left, right) {
   return (
     left.contractVersion === right.contractVersion &&
-    left.sequence === right.sequence &&
+    left.anchorRevision === right.anchorRevision &&
+    left.generation === right.generation &&
+    left.stateRevision === right.stateRevision &&
+    left.baseHeadChecksum === right.baseHeadChecksum &&
+    left.checkpointStateRevision === right.checkpointStateRevision &&
+    left.checkpointFrameCount === right.checkpointFrameCount &&
+    left.checkpointChecksum === right.checkpointChecksum &&
+    left.checkpointBytes === right.checkpointBytes &&
+    left.frameCount === right.frameCount &&
     left.lastChecksum === right.lastChecksum &&
     left.ledgerBytes === right.ledgerBytes
   );
 }
 
-function canonicalLedgerBytes(value, code) {
+function canonicalStoredNumber(value, maximum, code) {
   ensure(typeof value === "string" && regexpTest(DECIMAL_PATTERN, value), code);
   let parsed;
   try {
@@ -254,10 +320,60 @@ function canonicalLedgerBytes(value, code) {
   } catch {
     fail(code);
   }
-  ensure(parsed <= BigIntConstructor(MAX_LEDGER_BYTES), code);
+  ensure(parsed <= BigIntConstructor(maximum), code);
   const number = NumberConstructor(parsed);
   ensure(numberIsSafeInteger(number), code);
   return number;
+}
+
+function decimalSuccessor(previous, next) {
+  return (
+    BigIntConstructor(next) === BigIntConstructor(previous) + 1n
+  );
+}
+
+function isNormalAppend(expectedHead, nextHead) {
+  return (
+    nextHead.contractVersion === expectedHead.contractVersion &&
+    decimalSuccessor(expectedHead.anchorRevision, nextHead.anchorRevision) &&
+    nextHead.generation === expectedHead.generation &&
+    decimalSuccessor(expectedHead.stateRevision, nextHead.stateRevision) &&
+    nextHead.baseHeadChecksum === expectedHead.baseHeadChecksum &&
+    nextHead.checkpointStateRevision ===
+      expectedHead.checkpointStateRevision &&
+    nextHead.checkpointFrameCount === expectedHead.checkpointFrameCount &&
+    nextHead.checkpointChecksum === expectedHead.checkpointChecksum &&
+    nextHead.checkpointBytes === expectedHead.checkpointBytes &&
+    nextHead.frameCount === expectedHead.frameCount + 1 &&
+    nextHead.frameCount <= MAX_FRAME_COUNT &&
+    nextHead.lastChecksum !== null &&
+    nextHead.ledgerBytes > expectedHead.ledgerBytes
+  );
+}
+
+function isPureRotation(expectedHead, nextHead, code) {
+  if (
+    nextHead.contractVersion !== expectedHead.contractVersion ||
+    !decimalSuccessor(expectedHead.anchorRevision, nextHead.anchorRevision) ||
+    !decimalSuccessor(expectedHead.generation, nextHead.generation) ||
+    nextHead.stateRevision !== expectedHead.stateRevision ||
+    expectedHead.frameCount === 0 ||
+    expectedHead.ledgerBytes === 0 ||
+    nextHead.checkpointStateRevision !== expectedHead.stateRevision ||
+    nextHead.checkpointFrameCount < 2 ||
+    nextHead.checkpointFrameCount > MAX_CHECKPOINT_FRAME_COUNT ||
+    nextHead.checkpointChecksum === null ||
+    nextHead.checkpointBytes <= 0 ||
+    nextHead.checkpointBytes > MAX_CHECKPOINT_BYTES ||
+    nextHead.frameCount !== 0 ||
+    nextHead.lastChecksum !== nextHead.checkpointChecksum ||
+    nextHead.ledgerBytes !== 0
+  ) {
+    return false;
+  }
+  return (
+    nextHead.baseHeadChecksum === canonicalHeadChecksum(expectedHead, code)
+  );
 }
 
 function rowsFromResult(result, command, code) {
@@ -295,13 +411,37 @@ function normalizeHeadRow(value, expectedIdentity, code) {
   const head = canonicalHead(
     {
       contractVersion: row.contract_version,
-      sequence: row.sequence,
+      anchorRevision: row.anchor_revision,
+      generation: row.generation,
+      stateRevision: row.state_revision,
+      baseHeadChecksum: row.base_head_checksum,
+      checkpointStateRevision: row.checkpoint_state_revision,
+      checkpointFrameCount: canonicalStoredNumber(
+        row.checkpoint_frame_count,
+        MAX_CHECKPOINT_FRAME_COUNT,
+        code,
+      ),
+      checkpointChecksum: row.checkpoint_checksum,
+      checkpointBytes: canonicalStoredNumber(
+        row.checkpoint_bytes,
+        MAX_CHECKPOINT_BYTES,
+        code,
+      ),
+      frameCount: canonicalStoredNumber(
+        row.frame_count,
+        MAX_FRAME_COUNT,
+        code,
+      ),
       lastChecksum: row.last_checksum,
-      ledgerBytes: canonicalLedgerBytes(row.ledger_bytes, code),
+      ledgerBytes: canonicalStoredNumber(
+        row.ledger_bytes,
+        MAX_LEDGER_BYTES,
+        code,
+      ),
     },
     code,
   );
-  ensure(head.sequence > 0, code);
+  ensure(!headEqual(head, genesisHead()), code);
   return head;
 }
 
@@ -320,7 +460,15 @@ function headValues(identity, head) {
     identity.providerId,
     identity.anchorId,
     head.contractVersion,
-    head.sequence,
+    head.anchorRevision,
+    head.generation,
+    head.stateRevision,
+    head.baseHeadChecksum,
+    head.checkpointStateRevision,
+    callIntrinsic(StringConstructor, undefined, [head.checkpointFrameCount]),
+    head.checkpointChecksum,
+    callIntrinsic(StringConstructor, undefined, [head.checkpointBytes]),
+    callIntrinsic(StringConstructor, undefined, [head.frameCount]),
     head.lastChecksum,
     callIntrinsic(StringConstructor, undefined, [head.ledgerBytes]),
   ];
@@ -347,7 +495,7 @@ async function compareAndAdvanceDurableHead(store, identity, input) {
   return await runSerializable(store, async (transaction) => {
     const code =
       "postgres_filesystem_image_provider_head_anchor_state_invalid";
-    const genesis = input.expectedHead.sequence === 0;
+    const genesis = headEqual(input.expectedHead, genesisHead());
     const text = genesis ? INSERT_QUERY : UPDATE_QUERY;
     const nextValues = headValues(identity, input.nextHead);
     const values = genesis
@@ -359,8 +507,30 @@ async function compareAndAdvanceDurableHead(store, identity, input) {
           nextValues[3],
           nextValues[4],
           nextValues[5],
+          nextValues[6],
+          nextValues[7],
+          nextValues[8],
+          nextValues[9],
+          nextValues[10],
+          nextValues[11],
+          nextValues[12],
+          nextValues[13],
           input.expectedHead.contractVersion,
-          input.expectedHead.sequence,
+          input.expectedHead.anchorRevision,
+          input.expectedHead.generation,
+          input.expectedHead.stateRevision,
+          input.expectedHead.baseHeadChecksum,
+          input.expectedHead.checkpointStateRevision,
+          callIntrinsic(StringConstructor, undefined, [
+            input.expectedHead.checkpointFrameCount,
+          ]),
+          input.expectedHead.checkpointChecksum,
+          callIntrinsic(StringConstructor, undefined, [
+            input.expectedHead.checkpointBytes,
+          ]),
+          callIntrinsic(StringConstructor, undefined, [
+            input.expectedHead.frameCount,
+          ]),
           input.expectedHead.lastChecksum,
           callIntrinsic(StringConstructor, undefined, [
             input.expectedHead.ledgerBytes,
@@ -435,9 +605,8 @@ export function createPostgresFilesystemImageProviderHeadAnchor(...args) {
     const expectedHead = canonicalHead(request.expectedHead, requestCode);
     const nextHead = canonicalHead(request.nextHead, requestCode);
     ensure(
-      nextHead.sequence === expectedHead.sequence + 1 &&
-        nextHead.ledgerBytes > expectedHead.ledgerBytes &&
-        nextHead.lastChecksum !== null,
+      isNormalAppend(expectedHead, nextHead) ||
+        isPureRotation(expectedHead, nextHead, requestCode),
       requestCode,
     );
     return await compareAndAdvanceDurableHead(

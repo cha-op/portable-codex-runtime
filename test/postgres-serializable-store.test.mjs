@@ -2663,10 +2663,58 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     latestMigration.sql,
     /PRIMARY KEY \(provider_id, anchor_id\)/u,
   );
-  assert.match(latestMigration.sql, /sequence BETWEEN 1 AND 65535/u);
+  assert.match(latestMigration.sql, /contract_version = 2/u);
+  for (const column of [
+    "anchor_revision",
+    "generation",
+    "state_revision",
+    "checkpoint_state_revision",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(`${column} numeric\\(20, 0\\) NOT NULL`, "u"),
+    );
+  }
   assert.match(
     latestMigration.sql,
-    /ledger_bytes BETWEEN 1 AND 67108864/u,
+    /anchor_revision BETWEEN 1 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /generation BETWEEN 0 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /state_revision BETWEEN 0 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /checkpoint_state_revision BETWEEN 0 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /anchor_revision = state_revision \+ generation/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /state_revision = checkpoint_state_revision \+ frame_count/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /checkpoint_frame_count BETWEEN 0 AND 4294967295/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /checkpoint_frame_count BETWEEN 2 AND 4294967295/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /checkpoint_bytes BETWEEN 0 AND 9007199254740991/u,
+  );
+  assert.match(latestMigration.sql, /frame_count BETWEEN 0 AND 65535/u);
+  assert.match(
+    latestMigration.sql,
+    /ledger_bytes BETWEEN 0 AND 67108864/u,
   );
   assert.match(
     latestMigration.sql,
@@ -2686,12 +2734,33 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
+    /base_head_checksum !~ '\[\^0-9a-f\]'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /checkpoint_checksum !~ '\[\^0-9a-f\]'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /generation = 0[\s\S]+base_head_checksum IS NULL[\s\S]+checkpoint_checksum IS NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /generation > 0[\s\S]+base_head_checksum IS NOT NULL[\s\S]+checkpoint_checksum IS NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /frame_count = 0[\s\S]+generation > 0[\s\S]+ledger_bytes = 0[\s\S]+last_checksum = checkpoint_checksum/u,
+  );
+  assert.match(
+    latestMigration.sql,
     /provider_id !~ '\[\^A-Za-z0-9\._:-\]'/u,
   );
   assert.match(
     latestMigration.sql,
     /anchor_id !~ '\[\^A-Za-z0-9\._:-\]'/u,
   );
+  assert.doesNotMatch(latestMigration.sql, /\bsequence\b/u);
   assert.doesNotMatch(latestMigration.sql, /jsonb/u);
   client.assertExhausted();
 });

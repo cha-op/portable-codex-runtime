@@ -8,11 +8,13 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rename,
   rm,
   symlink,
   truncate,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,6 +29,9 @@ import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME,
   FilesystemImageProviderState,
   FilesystemImageProviderStateError,
+  filesystemImageProviderStateCheckpointName,
+  filesystemImageProviderStateHeadChecksum,
+  filesystemImageProviderStateLedgerName,
   normalizeFilesystemImageProviderStateHead,
 } from "../src/filesystem-image-provider-state.mjs";
 
@@ -154,7 +159,15 @@ function createSerializedLockProvider(tracker = {}) {
 function copyLedgerHead(head) {
   return {
     contractVersion: head.contractVersion,
-    sequence: head.sequence,
+    anchorRevision: head.anchorRevision,
+    generation: head.generation,
+    stateRevision: head.stateRevision,
+    baseHeadChecksum: head.baseHeadChecksum,
+    checkpointStateRevision: head.checkpointStateRevision,
+    checkpointFrameCount: head.checkpointFrameCount,
+    checkpointChecksum: head.checkpointChecksum,
+    checkpointBytes: head.checkpointBytes,
+    frameCount: head.frameCount,
     lastChecksum: head.lastChecksum,
     ledgerBytes: head.ledgerBytes,
   };
@@ -163,19 +176,39 @@ function copyLedgerHead(head) {
 function sameLedgerHead(left, right) {
   return (
     left.contractVersion === right.contractVersion &&
-    left.sequence === right.sequence &&
+    left.anchorRevision === right.anchorRevision &&
+    left.generation === right.generation &&
+    left.stateRevision === right.stateRevision &&
+    left.baseHeadChecksum === right.baseHeadChecksum &&
+    left.checkpointStateRevision === right.checkpointStateRevision &&
+    left.checkpointFrameCount === right.checkpointFrameCount &&
+    left.checkpointChecksum === right.checkpointChecksum &&
+    left.checkpointBytes === right.checkpointBytes &&
+    left.frameCount === right.frameCount &&
     left.lastChecksum === right.lastChecksum &&
     left.ledgerBytes === right.ledgerBytes
   );
 }
 
-function createTrustedHeadAnchor(tracker = {}) {
-  let head = normalizeFilesystemImageProviderStateHead({
+function genesisHead() {
+  return normalizeFilesystemImageProviderStateHead({
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-    sequence: 0,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    baseHeadChecksum: null,
+    checkpointStateRevision: "0",
+    checkpointFrameCount: 0,
+    checkpointChecksum: null,
+    checkpointBytes: 0,
+    frameCount: 0,
     lastChecksum: null,
     ledgerBytes: 0,
   });
+}
+
+function createTrustedHeadAnchor(tracker = {}) {
+  let head = genesisHead();
   tracker.reads = 0;
   tracker.advances = 0;
   tracker.head = copyLedgerHead(head);
@@ -189,6 +222,7 @@ function createTrustedHeadAnchor(tracker = {}) {
       tracker.advances += 1;
       if (!sameLedgerHead(head, expectedHead)) return false;
       if (tracker.failAdvanceBeforeCommit === true) {
+        if (tracker.failReadAfterFailedAdvance === true) tracker.failRead = true;
         throw new Error("trusted anchor unavailable");
       }
       head = normalizeFilesystemImageProviderStateHead(nextHead);
@@ -232,7 +266,7 @@ function corruptPreviousChecksumWithValidEnvelope(ledger, frameStart) {
   const checksum = createHash("sha256")
     .update(
       Buffer.from(
-        "portable-codex/filesystem-image-provider-state/frame/v1\0",
+        "portable-codex/filesystem-image-provider-state/frame/v2\0",
         "utf8",
       ),
     )
@@ -413,6 +447,890 @@ async function prepareAndCommit(
   });
   return { committed, prepared };
 }
+
+async function createRotatedFixture(t) {
+  const fixture = await createFixture(t);
+  const rotationPolicy = {
+    activeLedgerBytesWatermark: 64 * 1024 * 1024,
+    activeFrameCountWatermark: 1,
+  };
+  const state = fixture.createState({ rotationPolicy });
+  await prepareAndCommit(state);
+  assert.equal(fixture.headAnchorTracker.head.generation, "1");
+  return {
+    checkpointPath: join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    ),
+    fixture,
+    ledgerPath: join(
+      fixture.directory,
+      filesystemImageProviderStateLedgerName("1"),
+    ),
+    rotationPolicy,
+    state,
+  };
+}
+
+test("rotates a prepared operation into a checkpoint before its commit", async (t) => {
+  const fixture = await createFixture(t);
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  const request = operationRequest("provision");
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-prepared-across-rotation-001",
+    request,
+    storageId: "storage-001",
+  });
+  const preparedHead = copyLedgerHead(fixture.headAnchorTracker.head);
+  assert.equal(preparedHead.generation, "0");
+  assert.equal(preparedHead.stateRevision, "1");
+  assert.equal(preparedHead.frameCount, 1);
+
+  const committed = await state.commitOperation({
+    operationId: "operation-prepared-across-rotation-001",
+    request,
+    result: { proofId: "proof-across-rotation", status: "provisioned" },
+    storageState: storageState(),
+  });
+  assert.equal(committed.state, "committed");
+
+  const head = fixture.headAnchorTracker.head;
+  assert.equal(head.anchorRevision, "3");
+  assert.equal(head.generation, "1");
+  assert.equal(head.stateRevision, "2");
+  assert.equal(head.baseHeadChecksum, filesystemImageProviderStateHeadChecksum(preparedHead));
+  assert.equal(head.checkpointStateRevision, "1");
+  assert.equal(head.checkpointFrameCount, 3);
+  assert.equal(head.frameCount, 1);
+  assert.notEqual(head.checkpointChecksum, null);
+  assert.notEqual(head.lastChecksum, head.checkpointChecksum);
+
+  const checkpointPath = join(
+    fixture.directory,
+    filesystemImageProviderStateCheckpointName("1"),
+  );
+  const ledgerPath = join(
+    fixture.directory,
+    filesystemImageProviderStateLedgerName("1"),
+  );
+  assert.equal((await readFile(checkpointPath)).length, head.checkpointBytes);
+  const active = await readFile(ledgerPath);
+  assert.equal(active.length, head.ledgerBytes);
+  assert.equal(active.includes(Buffer.from('"request":', "utf8")), false);
+  await assert.rejects(
+    readFile(fixture.ledgerPath),
+    (error) => error?.code === "ENOENT",
+  );
+
+  const replayed = await fixture.createState().readOperation({
+    operationId: "operation-prepared-across-rotation-001",
+    request,
+  });
+  assert.equal(replayed.state, "committed");
+  assert.deepEqual(replayed.result, committed.result);
+});
+
+test("repeated rotation preserves committed evidence, tombstones, and prepared ambiguity", async (t) => {
+  const fixture = await createFixture(t);
+  const rotationPolicy = {
+    activeLedgerBytesWatermark: 64 * 1024 * 1024,
+    activeFrameCountWatermark: 1,
+  };
+  const state = fixture.createState({ rotationPolicy });
+  await prepareAndCommit(state);
+
+  const destroyRequest = operationRequest("destroy");
+  await state.prepareOperation({
+    kind: "destroy",
+    operationId: "operation-destroy-across-rotation-001",
+    request: destroyRequest,
+    storageId: "storage-001",
+  });
+  const destroyed = storageState({
+    lifecycle: "destroyed",
+    mount: null,
+    revision: "2",
+  });
+  await state.commitOperation({
+    operationId: "operation-destroy-across-rotation-001",
+    request: destroyRequest,
+    result: { proofId: "proof-destroyed", status: "destroyed" },
+    storageState: destroyed,
+  });
+
+  const pendingRequest = operationRequest("provision", "storage-002");
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-pending-across-rotation-002",
+    request: pendingRequest,
+    storageId: "storage-002",
+  });
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-pending-across-rotation-003",
+    request: operationRequest("provision", "storage-003"),
+    storageId: "storage-003",
+  });
+
+  assert.equal(fixture.headAnchorTracker.head.generation, "5");
+  const restarted = fixture.createState({ rotationPolicy });
+  assert.deepEqual(await restarted.readStorage("storage-001"), destroyed);
+  const committedProvision = await restarted.prepareOperation({
+    kind: "provision",
+    operationId: "operation-provision-001",
+    request: operationRequest("provision"),
+    storageId: "storage-001",
+  });
+  assert.equal(committedProvision.state, "committed");
+  assert.equal(committedProvision.replayed, true);
+
+  const replayedPending = await restarted.prepareOperation({
+    kind: "provision",
+    operationId: "operation-pending-across-rotation-002",
+    request: pendingRequest,
+    storageId: "storage-002",
+  });
+  assert.equal(replayedPending.state, "prepared");
+  assert.equal(replayedPending.shouldDispatch, false);
+  await assert.rejects(
+    restarted.prepareOperation({
+      kind: "provision",
+      operationId: "operation-conflicting-pending-storage-002",
+      request: operationRequest("provision", "storage-002"),
+      storageId: "storage-002",
+    }),
+    stateError("operation_already_prepared"),
+  );
+
+  const committedPending = await restarted.commitOperation({
+    operationId: "operation-pending-across-rotation-002",
+    request: pendingRequest,
+    result: { proofId: "proof-storage-002", status: "provisioned" },
+    storageState: storageState({ storageId: "storage-002" }),
+  });
+  assert.equal(committedPending.state, "committed");
+  assert.equal(fixture.headAnchorTracker.head.generation, "6");
+  assert.equal(
+    (await restarted.readOperation({
+      operationId: "operation-pending-across-rotation-003",
+    })).state,
+    "prepared",
+  );
+});
+
+test("capacity inspection reports exact soft and hard boundaries", async (t) => {
+  const fixture = await createFixture(t);
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 2,
+    },
+  });
+  const initialPromise = state.inspectCapacity();
+  assert.equal(Object.getPrototypeOf(initialPromise), Promise.prototype);
+  const initial = await initialPromise;
+  assert.equal(Object.isFrozen(initial), true);
+  assert.deepEqual(initial, {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    checkpointStateRevision: "0",
+    checkpointBytes: 0,
+    checkpointFrameCount: 0,
+    activeLedgerBytes: 0,
+    activeFrameCount: 0,
+    remainingLedgerBytes: 64 * 1024 * 1024,
+    remainingFrameCount: 65_535,
+    activeLedgerBytesWatermark: 64 * 1024 * 1024,
+    activeFrameCountWatermark: 2,
+    rotationRequired: false,
+    retainedOperationCount: 0,
+    preparedOperationCount: 0,
+    storageCount: 0,
+  });
+
+  const request = operationRequest("provision");
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-capacity-boundary-001",
+    request,
+    storageId: "storage-001",
+  });
+  assert.equal((await state.inspectCapacity()).rotationRequired, false);
+  await state.commitOperation({
+    operationId: "operation-capacity-boundary-001",
+    request,
+    result: { proofId: "proof-capacity", status: "provisioned" },
+    storageState: storageState(),
+  });
+  const atFrameBoundary = await state.inspectCapacity();
+  assert.equal(atFrameBoundary.generation, "0");
+  assert.equal(atFrameBoundary.activeFrameCount, 2);
+  assert.equal(atFrameBoundary.rotationRequired, true);
+  assert.equal(atFrameBoundary.retainedOperationCount, 1);
+  assert.equal(atFrameBoundary.preparedOperationCount, 0);
+  assert.equal(atFrameBoundary.storageCount, 1);
+
+  await state.prepareOperation({
+    kind: "checkpoint",
+    operationId: "operation-capacity-boundary-002",
+    request: operationRequest("checkpoint"),
+    storageId: "storage-001",
+  });
+  const afterRotation = await state.inspectCapacity();
+  assert.equal(afterRotation.generation, "1");
+  assert.equal(afterRotation.checkpointStateRevision, "2");
+  assert.equal(afterRotation.activeFrameCount, 1);
+  assert.equal(afterRotation.rotationRequired, false);
+  assert.equal(afterRotation.retainedOperationCount, 2);
+  assert.equal(afterRotation.preparedOperationCount, 1);
+});
+
+test("rotation policy is exact and cannot relax hard active-log limits", async (t) => {
+  const fixture = await createFixture(t);
+  const invalidPolicies = [
+    { activeLedgerBytesWatermark: 1 },
+    { activeFrameCountWatermark: 1 },
+    {
+      activeLedgerBytesWatermark: 1,
+      activeFrameCountWatermark: 1,
+      extra: true,
+    },
+    {
+      activeLedgerBytesWatermark: 0,
+      activeFrameCountWatermark: 1,
+    },
+    {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024 + 1,
+      activeFrameCountWatermark: 1,
+    },
+    {
+      activeLedgerBytesWatermark: 1,
+      activeFrameCountWatermark: 65_536,
+    },
+  ];
+  for (const rotationPolicy of invalidPolicies) {
+    assert.throws(
+      () => fixture.createState({ rotationPolicy }),
+      stateError("invalid_request"),
+    );
+  }
+});
+
+test("an empty active log accepts one legal frame beyond a byte watermark", async (t) => {
+  const fixture = await createFixture(t);
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 1,
+      activeFrameCountWatermark: 65_535,
+    },
+  });
+  const request = operationRequest("provision");
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-byte-watermark-001",
+    request,
+    storageId: "storage-001",
+  });
+  const overWatermark = await state.inspectCapacity();
+  assert.equal(overWatermark.generation, "0");
+  assert(overWatermark.activeLedgerBytes > 1);
+  assert.equal(overWatermark.rotationRequired, true);
+
+  await state.commitOperation({
+    operationId: "operation-byte-watermark-001",
+    request,
+    result: { proofId: "proof-byte-watermark", status: "provisioned" },
+    storageState: storageState(),
+  });
+  assert.equal(fixture.headAnchorTracker.head.generation, "1");
+});
+
+test("the next append rotates at the exact active-byte watermark", async (t) => {
+  const fixture = await createFixture(t);
+  const request = operationRequest("provision");
+  await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-exact-byte-boundary-001",
+    request,
+    storageId: "storage-001",
+  });
+  const activeLedgerBytes = fixture.headAnchorTracker.head.ledgerBytes;
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: activeLedgerBytes,
+      activeFrameCountWatermark: 65_535,
+    },
+  });
+  assert.equal((await state.inspectCapacity()).rotationRequired, true);
+  await state.commitOperation({
+    operationId: "operation-exact-byte-boundary-001",
+    request,
+    result: { proofId: "proof-exact-byte-boundary", status: "provisioned" },
+    storageState: storageState(),
+  });
+  assert.equal(fixture.headAnchorTracker.head.generation, "1");
+  assert.equal(fixture.headAnchorTracker.head.frameCount, 1);
+});
+
+test("cache avoids unchanged-head replay and catches up append and rotation", async (t) => {
+  const fixture = await createFixture(t);
+  const rotationPolicy = {
+    activeLedgerBytesWatermark: 64 * 1024 * 1024,
+    activeFrameCountWatermark: 2,
+  };
+  const first = fixture.createState({ rotationPolicy });
+  const second = fixture.createState({ rotationPolicy });
+  const request = operationRequest("provision");
+  assert.equal((await first.snapshot()).sequence, 0);
+  await second.prepareOperation({
+    kind: "provision",
+    operationId: "operation-cache-001",
+    request,
+    storageId: "storage-001",
+  });
+  assert.equal(
+    (await first.readOperation({ operationId: "operation-cache-001" })).state,
+    "prepared",
+  );
+
+  const probe = await open(fixture.ledgerPath, "r");
+  const fileHandlePrototype = Object.getPrototypeOf(probe);
+  await probe.close();
+  const readDescriptor = Object.getOwnPropertyDescriptor(
+    fileHandlePrototype,
+    "read",
+  );
+  assert.notEqual(readDescriptor, undefined);
+  Object.defineProperty(fileHandlePrototype, "read", {
+    ...readDescriptor,
+    value() {
+      throw new Error("unchanged head must not replay active bytes");
+    },
+  });
+  try {
+    assert.equal((await first.snapshot()).sequence, 1);
+  } finally {
+    Object.defineProperty(fileHandlePrototype, "read", readDescriptor);
+  }
+
+  await second.commitOperation({
+    operationId: "operation-cache-001",
+    request,
+    result: { proofId: "proof-cache", status: "provisioned" },
+    storageState: storageState(),
+  });
+  assert.deepEqual(await first.readStorage("storage-001"), storageState());
+
+  await second.prepareOperation({
+    kind: "checkpoint",
+    operationId: "operation-cache-rotation-002",
+    request: operationRequest("checkpoint"),
+    storageId: "storage-001",
+  });
+  assert.equal(fixture.headAnchorTracker.head.generation, "1");
+  const caughtUp = await first.readOperation({
+    operationId: "operation-cache-rotation-002",
+  });
+  assert.equal(caughtUp.state, "prepared");
+});
+
+test("cache consumes path metadata observed after held-file revalidation", async (t) => {
+  const { checkpointPath, fixture, state } = await createRotatedFixture(t);
+  await state.snapshot();
+  const trustedHead = copyLedgerHead(fixture.headAnchorTracker.head);
+  const targetMetadata = await lstat(checkpointPath, { bigint: true });
+  const corrupted = await readFile(checkpointPath);
+  corrupted[0] ^= 0x01;
+
+  const probe = await open(checkpointPath, "r");
+  const fileHandlePrototype = Object.getPrototypeOf(probe);
+  await probe.close();
+  const statDescriptor = Object.getOwnPropertyDescriptor(
+    fileHandlePrototype,
+    "stat",
+  );
+  assert.notEqual(statDescriptor, undefined);
+  let targetStatCount = 0;
+  let injected = false;
+  Object.defineProperty(fileHandlePrototype, "stat", {
+    ...statDescriptor,
+    async value(...args) {
+      const metadata = await Reflect.apply(statDescriptor.value, this, args);
+      if (metadata.ino === targetMetadata.ino) {
+        targetStatCount += 1;
+        if (!injected && targetStatCount === 2) {
+          injected = true;
+          await writeFile(checkpointPath, corrupted);
+        }
+      }
+      return metadata;
+    },
+  });
+  try {
+    await assert.rejects(state.snapshot(), stateError("corrupt_ledger"));
+  } finally {
+    Object.defineProperty(fileHandlePrototype, "stat", statDescriptor);
+  }
+  assert.equal(injected, true);
+  assert.deepEqual(fixture.headAnchorTracker.head, trustedHead);
+});
+
+test("benign file and directory metadata churn preserves exact content", async (t) => {
+  const fixture = await createFixture(t);
+  await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-metadata-churn-001",
+    request: operationRequest("provision"),
+    storageId: "storage-001",
+  });
+  const before = await readFile(fixture.ledgerPath);
+  const changedTime = new Date(Date.now() - 60_000);
+  await utimes(fixture.ledgerPath, changedTime, changedTime);
+  await writeFile(join(fixture.directory, "unrelated-entry"), "unchanged", {
+    mode: 0o600,
+  });
+
+  const snapshot = await fixture.state.snapshot();
+  assert.equal(snapshot.sequence, 1);
+  assert.deepEqual(await readFile(fixture.ledgerPath), before);
+});
+
+test("maximum canonical request and result fit commit and checkpoint frames", async (t) => {
+  const fixture = await createFixture(t);
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 2,
+    },
+  });
+  const envelopeBytes = Buffer.byteLength('{"payload":""}', "utf8");
+  const payload = "x".repeat(768 * 1024 - envelopeBytes);
+  const request = { payload };
+  const result = { payload };
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-maximum-frame-001",
+    request,
+    storageId: "storage-001",
+  });
+  const committed = await state.commitOperation({
+    operationId: "operation-maximum-frame-001",
+    request,
+    result,
+    storageState: storageState(),
+  });
+  assert.equal(committed.result.payload.length, payload.length);
+
+  await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-after-maximum-frame-002",
+    request: operationRequest("provision", "storage-002"),
+    storageId: "storage-002",
+  });
+  assert.equal(fixture.headAnchorTracker.head.generation, "1");
+  const replayed = await fixture.createState().readOperation({
+    operationId: "operation-maximum-frame-001",
+    request,
+  });
+  assert.equal(replayed.state, "committed");
+  assert.equal(replayed.result.payload.length, payload.length);
+
+  await assert.rejects(
+    state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-over-maximum-frame-003",
+      request: { payload: `${payload}x` },
+      storageId: "storage-003",
+    }),
+    stateError("invalid_request"),
+  );
+});
+
+test("rotation resolves CAS old, new acknowledgement loss, and unknown readback", async (t) => {
+  await t.test("CAS old cleans the candidate and permits retry", async (t) => {
+    const fixture = await createFixture(t);
+    const state = fixture.createState({
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    });
+    const request = operationRequest("provision");
+    await state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-rotation-cas-old-001",
+      request,
+      storageId: "storage-001",
+    });
+    fixture.headAnchorTracker.failAdvanceBeforeCommit = true;
+    await assert.rejects(
+      state.commitOperation({
+        operationId: "operation-rotation-cas-old-001",
+        request,
+        result: { proofId: "proof-cas-old", status: "provisioned" },
+        storageState: storageState(),
+      }),
+      stateError("maintenance_failed"),
+    );
+    fixture.headAnchorTracker.failAdvanceBeforeCommit = false;
+    assert.equal(fixture.headAnchorTracker.head.generation, "0");
+    await assert.rejects(
+      readFile(
+        join(
+          fixture.directory,
+          filesystemImageProviderStateCheckpointName("1"),
+        ),
+      ),
+      (error) => error?.code === "ENOENT",
+    );
+    assert.equal(
+      (await state.commitOperation({
+        operationId: "operation-rotation-cas-old-001",
+        request,
+        result: { proofId: "proof-cas-old", status: "provisioned" },
+        storageState: storageState(),
+      })).state,
+      "committed",
+    );
+  });
+
+  await t.test("CAS new acknowledgement loss is read back and succeeds", async (t) => {
+    const fixture = await createFixture(t);
+    const state = fixture.createState({
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    });
+    const request = operationRequest("provision");
+    await state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-rotation-cas-new-001",
+      request,
+      storageId: "storage-001",
+    });
+    fixture.headAnchorTracker.loseNextAdvanceAcknowledgement = true;
+    const committed = await state.commitOperation({
+      operationId: "operation-rotation-cas-new-001",
+      request,
+      result: { proofId: "proof-cas-new", status: "provisioned" },
+      storageState: storageState(),
+    });
+    assert.equal(committed.state, "committed");
+    assert.equal(fixture.headAnchorTracker.head.generation, "1");
+    assert.equal(fixture.headAnchorTracker.head.stateRevision, "2");
+  });
+
+  await t.test("unknown CAS leaves a candidate selected only by later head read", async (t) => {
+    const fixture = await createFixture(t);
+    const state = fixture.createState({
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    });
+    const request = operationRequest("provision");
+    await state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-rotation-cas-unknown-001",
+      request,
+      storageId: "storage-001",
+    });
+    fixture.headAnchorTracker.failAdvanceBeforeCommit = true;
+    fixture.headAnchorTracker.failReadAfterFailedAdvance = true;
+    await assert.rejects(
+      state.commitOperation({
+        operationId: "operation-rotation-cas-unknown-001",
+        request,
+        result: { proofId: "proof-cas-unknown", status: "provisioned" },
+        storageState: storageState(),
+      }),
+      stateError("maintenance_failed"),
+    );
+    assert(
+      (await readFile(
+        join(
+          fixture.directory,
+          filesystemImageProviderStateCheckpointName("1"),
+        ),
+      )).length > 0,
+    );
+    fixture.headAnchorTracker.failAdvanceBeforeCommit = false;
+    fixture.headAnchorTracker.failReadAfterFailedAdvance = false;
+    fixture.headAnchorTracker.failRead = false;
+    assert.equal(fixture.headAnchorTracker.head.generation, "0");
+    assert.equal(
+      (await state.commitOperation({
+        operationId: "operation-rotation-cas-unknown-001",
+        request,
+        result: { proofId: "proof-cas-unknown", status: "provisioned" },
+        storageState: storageState(),
+      })).state,
+      "committed",
+    );
+  });
+});
+
+test("post-CAS rotation cleanup failure keeps the maintenance head authoritative", async (t) => {
+  const fixture = await createFixture(t);
+  const request = operationRequest("provision");
+  await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-rotation-cleanup-001",
+    request,
+    storageId: "storage-001",
+  });
+  let directorySyncs = 0;
+  const failingCleanup = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+    syncDirectory: async () => {
+      directorySyncs += 1;
+      if (directorySyncs === 2) throw new Error("old generation cleanup failed");
+    },
+  });
+  await assert.rejects(
+    failingCleanup.commitOperation({
+      operationId: "operation-rotation-cleanup-001",
+      request,
+      result: { proofId: "proof-cleanup", status: "provisioned" },
+      storageState: storageState(),
+    }),
+    stateError("maintenance_failed"),
+  );
+  assert.equal(fixture.headAnchorTracker.head.generation, "1");
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "1");
+  assert.equal(fixture.headAnchorTracker.head.frameCount, 0);
+
+  const committed = await fixture.createState().commitOperation({
+    operationId: "operation-rotation-cleanup-001",
+    request,
+    result: { proofId: "proof-cleanup", status: "provisioned" },
+    storageState: storageState(),
+  });
+  assert.equal(committed.state, "committed");
+});
+
+test("a definite user commit survives lock-release cleanup failure", async (t) => {
+  let held = false;
+  const acquireLock = async () => {
+    if (held) {
+      const error = new Error("busy");
+      error.code = "lock_unavailable";
+      throw error;
+    }
+    held = true;
+    return {
+      async assertHeld() {
+        if (!held) throw new Error("lock lost");
+      },
+      async release() {
+        held = false;
+        throw new Error("release acknowledgement lost");
+      },
+    };
+  };
+  const fixture = await createFixture(t, { acquireLock });
+  const prepared = await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-release-cleanup-001",
+    request: operationRequest("provision"),
+    storageId: "storage-001",
+  });
+  assert.equal(prepared.state, "prepared");
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "1");
+});
+
+test("concurrent instances expose one prepared CAS winner", async (t) => {
+  const fixture = await createFixture(t);
+  const first = fixture.createState();
+  const second = fixture.createState();
+  const input = {
+    kind: "provision",
+    operationId: "operation-concurrent-cas-001",
+    request: operationRequest("provision"),
+    storageId: "storage-001",
+  };
+  const results = await Promise.all([
+    first.prepareOperation(input),
+    second.prepareOperation(input),
+  ]);
+  assert.deepEqual(
+    results.map((result) => result.shouldDispatch).sort(),
+    [false, true],
+  );
+  assert.equal(fixture.headAnchorTracker.advances, 1);
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "1");
+});
+
+test("external head selects generations without scanning orphan names", async (t) => {
+  await t.test("generation-zero active state removes only its orphan checkpoint", async (t) => {
+    const fixture = await createFixture(t);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-orphan-checkpoint-zero-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
+    });
+    const checkpointPath = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("0"),
+    );
+    await writeFile(checkpointPath, "orphan", { mode: 0o600 });
+    assert.equal((await fixture.state.snapshot()).sequence, 1);
+    await assert.rejects(
+      readFile(checkpointPath),
+      (error) => error?.code === "ENOENT",
+    );
+    assert((await readFile(fixture.ledgerPath)).length > 0);
+  });
+
+  await t.test("mixed next-generation candidate is removed before rotation", async (t) => {
+    const fixture = await createFixture(t);
+    const state = fixture.createState({
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    });
+    const request = operationRequest("provision");
+    await state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-mixed-next-generation-001",
+      request,
+      storageId: "storage-001",
+    });
+    await writeFile(
+      join(
+        fixture.directory,
+        filesystemImageProviderStateCheckpointName("1"),
+      ),
+      "partial-candidate",
+      { mode: 0o600 },
+    );
+    const committed = await state.commitOperation({
+      operationId: "operation-mixed-next-generation-001",
+      request,
+      result: { proofId: "proof-mixed-next", status: "provisioned" },
+      storageState: storageState(),
+    });
+    assert.equal(committed.state, "committed");
+    assert.equal(fixture.headAnchorTracker.head.generation, "1");
+  });
+
+  await t.test("old generation is cleaned while a distant orphan is ignored", async (t) => {
+    const { checkpointPath, fixture, ledgerPath, state } =
+      await createRotatedFixture(t);
+    const oldCheckpoint = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("0"),
+    );
+    await writeFile(oldCheckpoint, "old-checkpoint", { mode: 0o600 });
+    await writeFile(fixture.ledgerPath, "old-ledger", { mode: 0o600 });
+    const distantCheckpoint = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("9"),
+    );
+    const distantLedger = join(
+      fixture.directory,
+      filesystemImageProviderStateLedgerName("9"),
+    );
+    await writeFile(distantCheckpoint, "distant-checkpoint", { mode: 0o600 });
+    await writeFile(distantLedger, "distant-ledger", { mode: 0o600 });
+
+    assert.equal((await state.snapshot()).sequence, 2);
+    for (const oldPath of [oldCheckpoint, fixture.ledgerPath]) {
+      await assert.rejects(
+        readFile(oldPath),
+        (error) => error?.code === "ENOENT",
+      );
+    }
+    assert.equal(await readFile(distantCheckpoint, "utf8"), "distant-checkpoint");
+    assert.equal(await readFile(distantLedger, "utf8"), "distant-ledger");
+    assert((await readFile(checkpointPath)).length > 0);
+    assert((await readFile(ledgerPath)).length > 0);
+  });
+
+  await t.test("missing selected active log fails closed", async (t) => {
+    const { fixture, ledgerPath } = await createRotatedFixture(t);
+    await rm(ledgerPath);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+});
+
+test("checkpoint access policy and content revalidation fail closed", async (t) => {
+  await t.test("symlink", async (t) => {
+    const { checkpointPath, fixture } = await createRotatedFixture(t);
+    const target = join(fixture.root, "checkpoint-target");
+    await rename(checkpointPath, target);
+    await symlink(target, checkpointPath);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("hard link", async (t) => {
+    const { checkpointPath, fixture } = await createRotatedFixture(t);
+    const target = join(fixture.root, "checkpoint-target");
+    await rename(checkpointPath, target);
+    await link(target, checkpointPath);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("mode change", async (t) => {
+    const { checkpointPath, fixture } = await createRotatedFixture(t);
+    await chmod(checkpointPath, 0o644);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("same-instance object replacement", async (t) => {
+    const { checkpointPath, fixture, state } = await createRotatedFixture(t);
+    const bytes = await readFile(checkpointPath);
+    await rename(checkpointPath, join(fixture.root, "replaced-checkpoint"));
+    await writeFile(checkpointPath, bytes, { mode: 0o600 });
+    await assert.rejects(state.snapshot(), stateError("corrupt_ledger"));
+  });
+
+  await t.test("metadata-only churn with exact bytes", async (t) => {
+    const { checkpointPath, state } = await createRotatedFixture(t);
+    const bytes = await readFile(checkpointPath);
+    const changedTime = new Date(Date.now() - 60_000);
+    await utimes(checkpointPath, changedTime, changedTime);
+    assert.equal((await state.snapshot()).sequence, 2);
+    assert.deepEqual(await readFile(checkpointPath), bytes);
+  });
+
+  await t.test("content mutation", async (t) => {
+    const { checkpointPath, fixture } = await createRotatedFixture(t);
+    const bytes = await readFile(checkpointPath);
+    bytes[48] ^= 0xff;
+    await writeFile(checkpointPath, bytes);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+});
 
 test("replays committed operations and complete mount state after restart", async (t) => {
   const fixture = await createFixture(t);
@@ -835,6 +1753,7 @@ test("trusted external heads reject cold-start deletion, replacement, and rollba
 test("cold restart truncates one complete prepared frame left before head CAS", async (t) => {
   const fixture = await createFixture(t);
   fixture.headAnchorTracker.failAdvanceBeforeCommit = true;
+  fixture.headAnchorTracker.failReadAfterFailedAdvance = true;
   await assert.rejects(
     fixture.state.prepareOperation({
       kind: "provision",
@@ -845,15 +1764,20 @@ test("cold restart truncates one complete prepared frame left before head CAS", 
     stateError("commit_outcome_uncertain"),
   );
   fixture.headAnchorTracker.failAdvanceBeforeCommit = false;
+  fixture.headAnchorTracker.failReadAfterFailedAdvance = false;
+  fixture.headAnchorTracker.failRead = false;
   const unanchored = await readFile(fixture.ledgerPath);
   assert(unanchored.length > 0);
-  assert.equal(fixture.headAnchorTracker.head.sequence, 0);
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "0");
 
   const restarted = fixture.createState();
   const snapshot = await restarted.snapshot();
   assert.equal(snapshot.sequence, 0);
   assert.deepEqual(snapshot.operations, []);
-  assert.deepEqual(await readFile(fixture.ledgerPath), Buffer.alloc(0));
+  await assert.rejects(
+    readFile(fixture.ledgerPath),
+    (error) => error?.code === "ENOENT",
+  );
   assert.equal(
     await restarted.readOperation({
       operationId: "operation-full-prepared-before-cas-001",
@@ -872,9 +1796,10 @@ test("cold restart truncates one complete committed frame left before head CAS",
     storageId: "storage-001",
   });
   const anchoredPrepared = await readFile(fixture.ledgerPath);
-  assert.equal(fixture.headAnchorTracker.head.sequence, 1);
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "1");
 
   fixture.headAnchorTracker.failAdvanceBeforeCommit = true;
+  fixture.headAnchorTracker.failReadAfterFailedAdvance = true;
   await assert.rejects(
     fixture.state.commitOperation({
       operationId: "operation-full-commit-before-cas-001",
@@ -885,9 +1810,11 @@ test("cold restart truncates one complete committed frame left before head CAS",
     stateError("commit_outcome_uncertain"),
   );
   fixture.headAnchorTracker.failAdvanceBeforeCommit = false;
+  fixture.headAnchorTracker.failReadAfterFailedAdvance = false;
+  fixture.headAnchorTracker.failRead = false;
   const unanchored = await readFile(fixture.ledgerPath);
   assert(unanchored.length > anchoredPrepared.length);
-  assert.equal(fixture.headAnchorTracker.head.sequence, 1);
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "1");
 
   const restarted = fixture.createState();
   const snapshot = await restarted.snapshot();
@@ -898,23 +1825,21 @@ test("cold restart truncates one complete committed frame left before head CAS",
   assert.deepEqual(await readFile(fixture.ledgerPath), anchoredPrepared);
 });
 
-test("cold restart rejects multiple or invalid unanchored frames without truncation", async (t) => {
-  await t.test("multiple complete frames", async (t) => {
+test("cold restart follows the external head for orphan and invalid tails", async (t) => {
+  await t.test("genesis head discards an orphan generation-zero log", async (t) => {
     const fixture = await createFixture(t);
     await prepareAndCommit(fixture.state);
-    const before = await readFile(fixture.ledgerPath);
-    const staleAnchor = createFixedTrustedHeadAnchor({
-      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-      sequence: 0,
-      lastChecksum: null,
-      ledgerBytes: 0,
-    });
+    const staleAnchor = createFixedTrustedHeadAnchor(genesisHead());
 
+    const snapshot = await fixture
+      .createState({ headAnchor: staleAnchor })
+      .snapshot();
+    assert.equal(snapshot.sequence, 0);
+    assert.deepEqual(snapshot.operations, []);
     await assert.rejects(
-      fixture.createState({ headAnchor: staleAnchor }).snapshot(),
-      stateError("corrupt_ledger"),
+      readFile(fixture.ledgerPath),
+      (error) => error?.code === "ENOENT",
     );
-    assert.deepEqual(await readFile(fixture.ledgerPath), before);
   });
 
   await t.test("checksum-chain mismatch in one complete frame", async (t) => {
@@ -922,6 +1847,7 @@ test("cold restart rejects multiple or invalid unanchored frames without truncat
     await prepareAndCommit(fixture.state);
     const anchored = await readFile(fixture.ledgerPath);
     fixture.headAnchorTracker.failAdvanceBeforeCommit = true;
+    fixture.headAnchorTracker.failReadAfterFailedAdvance = true;
     await assert.rejects(
       fixture.state.prepareOperation({
         kind: "checkpoint",
@@ -932,6 +1858,8 @@ test("cold restart rejects multiple or invalid unanchored frames without truncat
       stateError("commit_outcome_uncertain"),
     );
     fixture.headAnchorTracker.failAdvanceBeforeCommit = false;
+    fixture.headAnchorTracker.failReadAfterFailedAdvance = false;
+    fixture.headAnchorTracker.failRead = false;
     const corrupted = await readFile(fixture.ledgerPath);
     corruptPreviousChecksumWithValidEnvelope(corrupted, anchored.length);
     await writeFile(fixture.ledgerPath, corrupted);
@@ -950,6 +1878,7 @@ test("recovers a safely truncated final frame under the lock", async (t) => {
   await prepareAndCommit(fixture.state);
   const committedPrefix = await readFile(fixture.ledgerPath);
   fixture.headAnchorTracker.failAdvanceBeforeCommit = true;
+  fixture.headAnchorTracker.failReadAfterFailedAdvance = true;
   await assert.rejects(
     fixture.state.prepareOperation({
       kind: "checkpoint",
@@ -960,6 +1889,8 @@ test("recovers a safely truncated final frame under the lock", async (t) => {
     stateError("commit_outcome_uncertain"),
   );
   fixture.headAnchorTracker.failAdvanceBeforeCommit = false;
+  fixture.headAnchorTracker.failReadAfterFailedAdvance = false;
+  fixture.headAnchorTracker.failRead = false;
   const withThirdFrame = await readFile(fixture.ledgerPath);
   assert(withThirdFrame.length > committedPrefix.length + 16);
   await truncate(fixture.ledgerPath, withThirdFrame.length - 13);
@@ -1043,7 +1974,7 @@ test("checksum corruption and non-frame garbage fail closed without truncation",
     const checksum = createHash("sha256")
       .update(
         Buffer.from(
-          "portable-codex/filesystem-image-provider-state/frame/v1\0",
+          "portable-codex/filesystem-image-provider-state/frame/v2\0",
           "utf8",
         ),
       )
@@ -1060,15 +1991,9 @@ test("checksum corruption and non-frame garbage fail closed without truncation",
   });
 });
 
-test("reports an uncertain outcome when acknowledgement fails after frame fsync", async (t) => {
+test("directory fsync failure before genesis CAS reports failed cleanup without commit", async (t) => {
   const fixture = await createFixture(t);
-  const request = operationRequest("provision");
-  await fixture.state.prepareOperation({
-    kind: "provision",
-    operationId: "operation-uncertain-001",
-    request,
-    storageId: "storage-001",
-  });
+  await fixture.state.snapshot();
   const failingAcknowledger = fixture.createState({
     syncDirectory: async () => {
       throw new Error("directory acknowledgement unavailable");
@@ -1076,27 +2001,24 @@ test("reports an uncertain outcome when acknowledgement fails after frame fsync"
   });
 
   await assert.rejects(
-    failingAcknowledger.commitOperation({
-      operationId: "operation-uncertain-001",
-      request,
-      result: { proofId: "proof-visible", status: "provisioned" },
-      storageState: storageState(),
+    failingAcknowledger.prepareOperation({
+      kind: "provision",
+      operationId: "operation-dir-fsync-before-cas-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
     }),
-    stateError("commit_outcome_uncertain"),
+    stateError("maintenance_failed"),
   );
-
-  const visible = await fixture.createState().readOperation({
-    operationId: "operation-uncertain-001",
-    request,
-  });
-  assert.equal(visible.state, "committed");
-  assert.deepEqual(visible.result, {
-    proofId: "proof-visible",
-    status: "provisioned",
-  });
+  assert.deepEqual(fixture.headAnchorTracker.head, copyLedgerHead(genesisHead()));
+  assert.equal(
+    await fixture.createState().readOperation({
+      operationId: "operation-dir-fsync-before-cas-001",
+    }),
+    null,
+  );
 });
 
-test("lost trusted-anchor acknowledgement is uncertain but exact replay resolves it", async (t) => {
+test("lost trusted-anchor acknowledgement resolves by exact head readback", async (t) => {
   const fixture = await createFixture(t);
   const request = operationRequest("provision");
   await fixture.state.prepareOperation({
@@ -1107,16 +2029,15 @@ test("lost trusted-anchor acknowledgement is uncertain but exact replay resolves
   });
   fixture.headAnchorTracker.loseNextAdvanceAcknowledgement = true;
 
-  await assert.rejects(
-    fixture.state.commitOperation({
-      operationId: "operation-anchor-ack-loss-001",
-      request,
-      result: { proofId: "proof-anchor-ack-loss", status: "provisioned" },
-      storageState: storageState(),
-    }),
-    stateError("commit_outcome_uncertain"),
-  );
-  assert.equal(fixture.headAnchorTracker.head.sequence, 2);
+  const committed = await fixture.state.commitOperation({
+    operationId: "operation-anchor-ack-loss-001",
+    request,
+    result: { proofId: "proof-anchor-ack-loss", status: "provisioned" },
+    storageState: storageState(),
+  });
+  assert.equal(committed.state, "committed");
+  assert.equal(committed.replayed, false);
+  assert.equal(fixture.headAnchorTracker.head.stateRevision, "2");
 
   const beforeReplay = await readFile(fixture.ledgerPath);
   const replayed = await fixture.createState().prepareOperation({
@@ -1162,7 +2083,12 @@ test("rejects unsafe directories, symlinks, hard links, permissions, and replace
 
   await t.test("pinned ledger replacement", async (t) => {
     const fixture = await createFixture(t);
-    await fixture.state.snapshot();
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-replacement-pin-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
+    });
     await rename(fixture.ledgerPath, join(fixture.directory, "replaced.log"));
     await writeFile(fixture.ledgerPath, "", { mode: 0o600 });
     await assert.rejects(fixture.state.snapshot(), stateError("corrupt_ledger"));
@@ -1170,13 +2096,31 @@ test("rejects unsafe directories, symlinks, hard links, permissions, and replace
 });
 
 test("trusted head collaborators and values are exact, receiver-safe, and promise-bound", async (t) => {
-  const canonical = normalizeFilesystemImageProviderStateHead({
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-    sequence: 0,
-    lastChecksum: null,
-    ledgerBytes: 0,
-  });
+  const canonical = genesisHead();
   assert.equal(Object.isFrozen(canonical), true);
+  assert.equal(
+    filesystemImageProviderStateHeadChecksum(canonical),
+    "7bece1a12f8c03f4caf77f9c74e8f839dfeef2e7a1c5beb85ec69a27971d1bb2",
+  );
+  assert.equal(filesystemImageProviderStateLedgerName("0"), "state.g0.log");
+  assert.equal(
+    filesystemImageProviderStateCheckpointName("42"),
+    "state.g42.checkpoint",
+  );
+  assert.throws(
+    () => filesystemImageProviderStateLedgerName("01"),
+    stateError("invalid_request"),
+  );
+  const generationZeroActive = normalizeFilesystemImageProviderStateHead({
+    ...canonical,
+    anchorRevision: "1",
+    stateRevision: "1",
+    frameCount: 1,
+    lastChecksum: "a".repeat(64),
+    ledgerBytes: 1,
+  });
+  assert.equal(generationZeroActive.generation, "0");
+  assert.equal(generationZeroActive.checkpointChecksum, null);
   assert.throws(
     () =>
       normalizeFilesystemImageProviderStateHead({
@@ -1289,7 +2233,7 @@ test("trusted head collaborators and values are exact, receiver-safe, and promis
       request: operationRequest("provision"),
       storageId: "storage-001",
     });
-    assert.deepEqual(receivers, [undefined, undefined, undefined]);
+    assert.deepEqual(receivers, [undefined, undefined, undefined, undefined]);
   });
 
   await t.test("readHead must return a native promise", async (t) => {
@@ -1318,7 +2262,7 @@ test("trusted head collaborators and values are exact, receiver-safe, and promis
         request: operationRequest("provision"),
         storageId: "storage-001",
       }),
-      stateError("commit_outcome_uncertain"),
+      stateError("io_failed"),
     );
   });
 
@@ -1359,7 +2303,7 @@ test("trusted head collaborators and values are exact, receiver-safe, and promis
             request: operationRequest("provision"),
             storageId: "storage-001",
           }),
-          stateError("commit_outcome_uncertain"),
+          stateError("io_failed"),
         );
         settlement.assertUntouched();
       });
@@ -1373,6 +2317,9 @@ test("returns frozen defensive snapshots and rejects hostile objects without inv
   assert.equal(Object.isFrozen(FilesystemImageProviderState.prototype), true);
   assert.equal(Object.isFrozen(FilesystemImageProviderStateError), true);
   assert.equal(Object.isFrozen(FilesystemImageProviderStateError.prototype), true);
+  assert.equal(Object.isFrozen(filesystemImageProviderStateHeadChecksum), true);
+  assert.equal(Object.isFrozen(filesystemImageProviderStateCheckpointName), true);
+  assert.equal(Object.isFrozen(filesystemImageProviderStateLedgerName), true);
   const request = operationRequest("provision");
   const prepared = await state.prepareOperation({
     kind: "provision",
@@ -1498,7 +2445,15 @@ test("validation and replay survive post-import intrinsic poisoning in isolation
       async readHead() {
         return {
           contractVersion: anchoredHead.contractVersion,
-          sequence: anchoredHead.sequence,
+          anchorRevision: anchoredHead.anchorRevision,
+          generation: anchoredHead.generation,
+          stateRevision: anchoredHead.stateRevision,
+          baseHeadChecksum: anchoredHead.baseHeadChecksum,
+          checkpointStateRevision: anchoredHead.checkpointStateRevision,
+          checkpointFrameCount: anchoredHead.checkpointFrameCount,
+          checkpointChecksum: anchoredHead.checkpointChecksum,
+          checkpointBytes: anchoredHead.checkpointBytes,
+          frameCount: anchoredHead.frameCount,
           lastChecksum: anchoredHead.lastChecksum,
           ledgerBytes: anchoredHead.ledgerBytes,
         };
@@ -1506,7 +2461,15 @@ test("validation and replay survive post-import intrinsic poisoning in isolation
       async compareAndAdvance({ expectedHead, nextHead }) {
         if (
           anchoredHead.contractVersion !== expectedHead.contractVersion ||
-          anchoredHead.sequence !== expectedHead.sequence ||
+          anchoredHead.anchorRevision !== expectedHead.anchorRevision ||
+          anchoredHead.generation !== expectedHead.generation ||
+          anchoredHead.stateRevision !== expectedHead.stateRevision ||
+          anchoredHead.baseHeadChecksum !== expectedHead.baseHeadChecksum ||
+          anchoredHead.checkpointStateRevision !== expectedHead.checkpointStateRevision ||
+          anchoredHead.checkpointFrameCount !== expectedHead.checkpointFrameCount ||
+          anchoredHead.checkpointChecksum !== expectedHead.checkpointChecksum ||
+          anchoredHead.checkpointBytes !== expectedHead.checkpointBytes ||
+          anchoredHead.frameCount !== expectedHead.frameCount ||
           anchoredHead.lastChecksum !== expectedHead.lastChecksum ||
           anchoredHead.ledgerBytes !== expectedHead.ledgerBytes
         ) return false;
@@ -1638,12 +2601,7 @@ test("validation and replay survive post-import intrinsic poisoning in isolation
     "Reflect.ownKeys",
     "all",
   ];
-  let trustedHead = normalizeFilesystemImageProviderStateHead({
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
-    sequence: 0,
-    lastChecksum: null,
-    ledgerBytes: 0,
-  });
+  let trustedHead = genesisHead();
   for (let caseIndex = 0; caseIndex < poisonLabels.length; caseIndex += 1) {
     const poisonLabel = poisonLabels[caseIndex];
     const { stderr, stdout } = await execFileAsync(

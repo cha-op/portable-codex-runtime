@@ -36,14 +36,26 @@ superseded_by:
   observation failure.
 - `FilesystemImageProviderState` durably records prepared and committed
   operations, storage and writer state, mount/data-root identity, and
-  publication-control identity. Every mutation checks its append-only ledger
-  against an external monotonic head; the PostgreSQL adapter stores that head
-  in migration 8 using a dedicated serializable store and pool.
-- A ledger frame is not committed merely because its bytes reached disk. Cold
-  recovery first binds the externally anchored prefix, then discards at most
-  one complete unanchored frame or one torn final frame; multiple or malformed
-  suffixes fail closed. External callbacks must return exact native Promises
-  without mutable settlement hooks.
+  publication-control identity. Every mutation and maintenance rotation checks
+  a version 2 generation head stored by the PostgreSQL migration 8 adapter
+  through a dedicated serializable store and pool. The head binds monotonic
+  anchor/state revisions, generation and previous-head digest, checkpoint
+  boundary/digest, and the bounded active delta-log boundary/digest.
+- A delta frame is not committed merely because its bytes reached disk. Cold
+  recovery first binds the externally anchored active prefix and checkpoint,
+  then discards at most one complete unanchored frame or one torn final frame;
+  multiple or malformed suffixes fail closed. A committed delta binds its
+  prepared checksum and does not repeat the request. External callbacks must
+  return exact native Promises without mutable settlement hooks.
+- Provider-state rotation streams all prepared and committed exact-replay
+  records, current storage state, and destroyed tombstones into a new
+  checksum-framed checkpoint. It creates and syncs that checkpoint and an empty
+  active log, syncs the parent directory, and only then attempts the pure-
+  maintenance CAS. Rotation advances the anchor revision and generation while
+  retaining the logical state revision. Default 8 MiB/8,192-frame soft
+  watermarks rotate before the 64 MiB/65,535-frame hard envelope, eliminating
+  manual permanent active-log exhaustion; `inspectCapacity()` exposes both
+  watermarks and current usage.
 - Publication compares each real pre-created control lock against a persistent
   identity authorized outside the replaceable publication image. Session-image
   identity comes from committed provider state. On the archive image, the
@@ -87,6 +99,10 @@ superseded_by:
   identity, content and ledger stability, and access policy. Runtime
   `device`/`inode` values only bind one held-descriptor observation window;
   benign metadata churn is not treated as object replacement.
+- The exact-head provider-state cache is a hot-path optimization, not authority.
+  Stable metadata can reuse cached content only for the exact same head and
+  pinned objects. Metadata change triggers content replay and revalidation; it
+  is not by itself evidence of content mutation.
 - PostgreSQL grants the one physical mutation. The injected backend validates
   and executes that exact invocation but does not mint a grant.
 - The host owns mount-namespace lifetime and exclusive propagation authority.
@@ -113,6 +129,12 @@ superseded_by:
 - Terminal supervisor revisions are retained for exact replay. The current
   state component has no authority-owned bounded retention or compaction path;
   production must use monitored dedicated storage until that callback exists.
+- The provider-state checkpoint is a control-plane exact-replay snapshot, not a
+  physical ext4 image checkpoint, published checkpoint artifact, or content
+  root. Automatic rotation bounds only the active delta log. Permanent exact
+  replay makes checkpoint and aggregate persistent bytes grow with unique
+  operations; this slice provides no provider-state retention floor or garbage
+  collection, so the host must monitor capacity and backing storage.
 - No automatic stale-writer fencing, partition revocation, or successful
   `forceFence()` path; the backend declares `fencing: "manual"`.
 - No differential export/compression, content-addressed distribution,
@@ -126,10 +148,15 @@ superseded_by:
 - Add terminal supervisor-state retention or garbage collection behind an
   authority-owned post-commit/quiescence callback; never put it in the
   stopped-only reconciler.
+- Define an authority-safe provider-state exact-replay retention floor, or move
+  permanent operation history to a PostgreSQL-indexed representation.
 - Any broader crash, automatic-fencing, or backup/distribution capability
   requires a separately scoped authority and conformance design.
 
 ## Evidence
+
+The following completed-run evidence predates the provider-state v2 rotation
+change and does not attest the current head:
 
 - All test files other than `test/app-server-auth-probe.test.mjs` passed in one
   bounded local run with `node --test --test-concurrency=4`. The excluded file's
@@ -151,6 +178,18 @@ superseded_by:
 - Real loop/mount, rootless Podman, cross-host image transfer, and PostgreSQL
   integration remain CI gates because the local host is Darwin and has no
   configured `SESSION_AUTHORITY_DATABASE_URL`.
+- Current-head provider-state v2 focused verification passed 298/298 tests
+  across provider state, ext4 backend, PostgreSQL head-anchor and serializable-
+  store integration, detached-restore runtime control, and deployment fixtures.
+  The provider-state subset covers checkpoint framing and exact replay,
+  automatic soft/hard-boundary rotation, rotation durability and CAS
+  acknowledgement loss, cache revalidation, committed-delta request
+  deduplication, and `inspectCapacity()` reporting.
+- All eight changed `.mjs` files passed `node --check`; project-journal
+  validation and `git diff --check` passed. A full `npm test` run reproduced
+  only the pre-existing watcher-dependent `EMFILE` failure in
+  `test/app-server-auth-probe.test.mjs`; that file passed 43/44 in isolation,
+  and an explicit run of the other 49 test files passed.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

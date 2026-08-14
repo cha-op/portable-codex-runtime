@@ -43,8 +43,9 @@ The physical implementation remains split into small authorities:
   or target authority; ordinary absolute pathnames are never passed to a
   shell.
 - `FilesystemImageProviderState` binds one canonical request to one durable
-  prepared or committed operation and one storage revision. Its append-only
-  ledger is checked against an external monotonic head before every mutation.
+  prepared or committed operation and one storage revision. Its versioned
+  checkpoint and bounded per-generation delta log are checked against an
+  external monotonic v2 head before every mutation or maintenance rotation.
 - `Ext4FilesystemImageBackend` binds the driver and state machine to the raw
   storage lifecycle, restore-attachment, reconciliation, and destination
   resolver contracts. `createInitializedExt4FilesystemImageBackend()` gates
@@ -88,8 +89,8 @@ replacement and fails closed.
 Publication separately binds canonical request/result bytes, journal state,
 artifact manifest digest, modeled content digest, and stopped-tree identity
 digest. Provider state separately binds canonical operation frames and an
-external ledger head. These content signals do not substitute for object
-identity.
+external head covering its generation, checkpoint, and active-log boundaries.
+These content signals do not substitute for object identity.
 
 ### Access policy
 
@@ -173,31 +174,86 @@ namespace manager.
 
 ## Durable Provider State
 
-The provider ledger records exact prepared and committed operations, complete
-storage state, writer authority, mount identity, data-root identity, and the
-publication-control tuple. One unresolved prepared operation blocks a second
-operation for that storage. A fresh operation also supplies its complete
-expected storage state; comparison and append happen under the same provider
-lock.
+Provider-state contract version 2 records exact prepared and committed
+operations, complete current storage state, writer authority, mount identity,
+data-root identity, and the publication-control tuple. One unresolved prepared
+operation blocks a second operation for that storage. A fresh operation also
+supplies its complete expected storage state; comparison and append happen
+under the same provider lock. A committed delta refers to the prepared-frame
+checksum and does not repeat the canonical request; exact replay recovers that
+request from the retained prepared operation.
 
-The ledger file cannot authenticate its own deletion or rollback. A mandatory
-`headAnchor` stores this exact external head:
+The replaceable provider-state directory cannot authenticate its own deletion,
+rollback, or generation substitution. A mandatory `headAnchor` stores the
+complete external version 2 head:
 
 ```js
 {
-  contractVersion: 1,
-  sequence,
+  contractVersion: 2,
+  anchorRevision,
+  generation,
+  stateRevision,
+  baseHeadChecksum,
+  checkpointStateRevision,
+  checkpointFrameCount,
+  checkpointChecksum,
+  checkpointBytes,
+  frameCount,
   lastChecksum,
   ledgerBytes,
 }
 ```
 
-The PostgreSQL adapter stores that head in migration 8 and advances it with a
-serializable compare-and-swap. It requires an otherwise-unused dedicated
-`PostgresSerializableStore` and therefore a fifth PostgreSQL pool in addition
-to the deployment-owned authority, operation, foreground-lifecycle, and
-recovery-lifecycle pools. The state ledger and its anchor must never be
-restored independently.
+The head is the rollback authority for the complete provider-state generation:
+its monotonic anchor and logical state revisions, generation, previous-head
+digest, checkpoint boundary and digest, and bounded active-log boundary and
+digest cannot be reset independently. A logical delta increments
+`anchorRevision` and `stateRevision`. A pure-maintenance rotation increments
+`anchorRevision` and `generation`, retains `stateRevision`, binds the old head
+through `baseHeadChecksum`, installs a checkpoint at that exact state revision,
+and starts an empty active log. The PostgreSQL adapter stores this head in
+migration 8 and advances it with a serializable compare-and-swap. It requires
+an otherwise-unused dedicated `PostgresSerializableStore` and therefore a
+fifth PostgreSQL pool in addition to the deployment-owned authority,
+operation, foreground-lifecycle, and recovery-lifecycle pools. The
+provider-state files and their external head must never be restored
+independently.
+
+Rotation streams a checksum-framed checkpoint containing every prepared and
+committed operation, the exact replay fields for each operation, every current
+storage record, and destroyed-storage tombstones. It creates the next
+generation's checkpoint and log, syncs both files, revalidates them, and syncs
+their parent directory before attempting the pure-maintenance head CAS. Only
+the external CAS makes that generation authoritative; an acknowledgement loss
+is resolved by exact head readback. After a committed rotation, the previous
+generation files can be removed without losing the exact logical history held
+by the new checkpoint.
+
+The default soft rotation watermarks are 8 MiB or 8,192 active frames. The hard
+per-generation log envelope remains 64 MiB and 65,535 frames. An append that
+would cross a soft watermark rotates first, and the hard envelope remains a
+fail-closed validation boundary rather than an operator-visible permanent
+capacity stop. `inspectCapacity()` exposes the current generation and
+revisions, checkpoint bytes and frames, active and remaining log bytes and
+frames, configured watermarks, whether rotation is due, retained/prepared
+operation counts, and storage count.
+
+The exact-head cache is only a hot-path optimization. The external head plus
+the descriptor-bound checkpoint and log content remain authoritative. Stable
+metadata can avoid redundant replay only for the exact same head and pinned
+objects; metadata change is a content-revalidation trigger, not evidence by
+itself of content mutation. Object replacement, changed content, unsafe access
+policy, and failed revalidation remain distinct fail-closed outcomes.
+
+This provider-state checkpoint is a control-plane replay snapshot. It is not a
+physical ext4 image checkpoint, a published checkpoint artifact, or a content
+root. Because exact replay is permanent in this version, every unique
+operation remains in later checkpoints even after it commits. The active log
+is bounded, but checkpoint size and aggregate persistent bytes therefore grow
+with unique operations. This slice has no retention floor or garbage
+collection; a production host must monitor `inspectCapacity()` and the
+provider-state filesystem. Future work may define an authority-safe retention
+floor or move exact replay history to an indexed PostgreSQL representation.
 
 A prepared provision has not exposed a storage result. Its retry may adopt a
 currently valid control object on the same deterministic image and mount; the

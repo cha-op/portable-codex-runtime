@@ -154,10 +154,16 @@
 - [done] Implement production-injectable Linux ext4 physical components:
   sparse raw-image lifecycle below host-owned `rprivate` carriers,
   close-before-unmount clean detach settlement, externally anchored provider
-  state, distinct archive mount-root and artifact-child publication-control
-  identities, rootless digest-pinned Podman launch/stop, and two-host clean
-  detach, transfer, verification-only first remount, identity verification,
-  and a peer-namespace non-propagation gate.
+  state with automatic checkpoint/delta-log generation rotation and capacity
+  inspection, distinct archive mount-root and artifact-child publication-
+  control identities, rootless digest-pinned Podman launch/stop, and two-host
+  clean detach, transfer, verification-only first remount, identity
+  verification, and a peer-namespace non-propagation gate.
+- [pending] Define an authority-safe provider-state exact-replay retention floor
+  or move permanent operation history to a PostgreSQL-indexed representation.
+  Until then, monitor checkpoint bytes, retained operation counts, and aggregate
+  provider-state storage; automatic active-log rotation is not retention or
+  garbage collection.
 - [pending] Bind the provider state's persistent ext4 attachment identity into
   a trusted Podman filesystem authority, exercise that authority with the
   initialized backend in one non-root process, and add authority-owned bounded
