@@ -191,7 +191,9 @@ remains durably blocked, and an unresolved `starting` operation may advance to
 committed verifier has no cooperative cancellation seam, so deployment still
 needs statement and request deadlines.
 
-This production adapter is capture-only. The PostgreSQL authority now exposes
+The private checkpoint-mutation adapter remains capture-only; the final public
+checkpoint facade described below adds restore without widening that adapter.
+The PostgreSQL authority now exposes
 typed restore-generation reservation, single-dispatch claim, finalisation,
 exact replay, read, and bounded recovery transitions. The durable request
 retains the backend's exact `{checkpoint, request}` admission; the claim binds
@@ -399,23 +401,33 @@ duration to equal the deployment policy and meet the derived minimum before
 physical work can begin. Expiry still fails closed and never authorizes a
 second physical dispatch.
 
-Production restore nevertheless remains fail-closed. The production
-checkpoint adapter's `runRestore()` stub is unchanged. The complete assembled
-physical graph now has method-specific settlement and operational lease
-admission. The completed safety-matrix slice classifies all
+Production restore now enters through the immutable public checkpoint backend
+at `deployment.backend.restoreCheckpoint()`. Runtime assembly keeps its first
+capture backend private, then constructs a second stopped-directory backend
+whose capture authority is unchanged and whose restore authority is fixed to
+the version 3 foreground composition. Runtime, controller, and deployment
+expose only the checkpoint facade—metadata plus `captureCheckpoint()` and
+`restoreCheckpoint()`—through their ready/in-flight admission ledgers;
+callers cannot supply the internal publication callback, invoke raw lifecycle
+mutations, or reach operator/provider extensions. The facade advertises the
+settled session lifecycle backend's capability tuple used by registration and
+writer detach, not the private stopped-directory checkpoint overlay's tuple.
+The complete assembled
+physical graph has method-specific settlement and operational lease admission.
+The completed safety-matrix slice classifies all
 nineteen deployment-owned settlement leaves, divides the fourteen leaves on
-the private protocol surface into seven mutators and seven observations, binds the seven
-mutators to existing real-PostgreSQL durable-cut and acknowledgement-loss
-evidence, and combines a same-database/stable-plan retry through fresh physical
-bindings, image binding, runtime, and controller with separate registry
-rehydration plus representative settlement timer and drain cases. The other
-five lifecycle leaves remain contract-only. A test-only callback router proves
-the explicit fresh-publication/committed-verification seam without claiming
-that the final public adapter already exists. This evidence is not one whole-
-saga deployment restart or an operating-system crash test. The final public
-backend is the remaining phase-B implementation. A
-production-neutral runtime factory now constructs the capture-only backend,
-standalone foreground facade, idle scheduler, and a narrow `writerLaunch`
+the private protocol surface into seven mutators and seven observations, binds
+the seven mutators to existing real-PostgreSQL durable-cut and
+acknowledgement-loss evidence, and combines a same-database/stable-plan retry
+through fresh physical bindings, image binding, runtime, and controller with
+separate registry rehydration plus representative settlement timer and drain
+cases. The other
+five lifecycle leaves remain contract-only. The former test-only callback
+router remains matrix evidence; the production backend now applies that same
+closed fresh-publication/committed-verification choice internally. This
+evidence is not one whole-saga deployment restart or an operating-system crash
+test. A production-neutral runtime factory now constructs the private capture
+backend, immutable public backend, idle scheduler, and a narrow `writerLaunch`
 facet plus narrow `stablePlanProvisioning` and `imagePlanReservations` facets
 from one internally consistent graph and four caller-owned pool objects that
 must be pairwise distinct. The launch facet exposes only `runLaunch()` and
@@ -425,12 +437,13 @@ the backend and foreground composition. The provisioning facet exposes only
 receiver-preserving read-only resolver is private to foreground execution.
 This makes the original opaque writer handle reachable by later stop/capture
 without making a committed database row or another launcher authoritative.
-The low-level factory does not migrate, start, stop, or close pools, replace
-the capture-only backend's fixed restore route, or wire foreground restore
-into the production adapter. A deployment controller now invokes its narrow
+The low-level factory does not migrate, start, stop, or close pools. Its public
+backend is an uncontrolled low-level capability and must not be served beside
+the controller or deployment that owns the same runtime. A deployment
+controller invokes the narrow
 same-store migration facet, requires the scheduler's immediate pass to prove a
-complete recovery sweep, and then opens only gated foreground, image-plan-
-reservation, plan-provisioning, and writer-launch facets. Stop closes those
+complete recovery sweep, and then opens only the gated checkpoint backend,
+image-plan-reservation, plan-provisioning, and writer-launch facets. Stop closes those
 facets, stops the scheduler, and drains admitted calls; the caller closes the
 four borrowed pools after that barrier. The exclusive scheduler continues
 bounded no-relaunch recovery.
@@ -445,8 +458,9 @@ only then lets the controller migrate and complete its initial sweep. This is
 a point-in-time topology proof, not continuous primary-affinity monitoring.
 Shutdown first closes controller admission and drains accepted work, then
 attempts and awaits every owned pool close in fixed dependency order. Neither
-the raw pools, low-level runtime, scheduler, controller, nor capture-only
-backend is exposed through the deployment surface.
+the raw pools, low-level runtime, scheduler, controller, private capture
+backend, nor foreground callback seam is exposed through the deployment
+surface.
 
 That deployment now also owns one exact image-plan provider configuration and
 constructs the private image-plan binding used by foreground preparation and
@@ -693,13 +707,13 @@ explicit PostgreSQL connection/bootstrap configuration, restore admission,
 shutdown drain, and final closure of four private pools now have one
 deployment owner. Its lifecycle `stop` facet remains an owner-only capability,
 not a callback available to injected runtime collaborators. Production restore
-remains fail-closed. The settlement foundation, complete deployment-owned
-physical binding graph, and operational lease admission are now assembled;
+is exposed only through the deployment-controlled checkpoint backend. The
+settlement foundation, complete deployment-owned physical binding graph, and
+operational lease admission are assembled;
 the safety matrix now binds the seven real-PostgreSQL durable cuts, separate
 new-object physical/runtime/controller retry and registry rehydration, and
-representative settlement timer/drain evidence. The final public backend is
-next. Filesystem-image
-execution and differential backup remain later work.
+representative settlement timer/drain evidence. Filesystem-image execution is
+the next independent backend slice; differential backup remains later work.
 See
 `docs/architecture/stopped-directory-backend.md`.
 

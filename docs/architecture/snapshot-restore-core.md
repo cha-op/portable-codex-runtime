@@ -5,7 +5,7 @@
 The snapshot and restore core is backend-neutral orchestration for `clean`
 checkpoints taken only after the writer has stopped. It consumes the portable
 session storage contracts, validates the complete operation boundary, delegates
-the physical mutation to a storage backend, and returns a portable checkpoint
+the physical mutation to a checkpoint backend projection, and returns a portable checkpoint
 descriptor only after a definite successful result.
 
 This first slice deliberately supports only:
@@ -71,6 +71,15 @@ production crash-consistent physical backend remains later work. See
 `graceful-abort` and `crash-prefix` before backend dispatch. Successful results
 contain the deeply frozen validated checkpoint descriptor and exact storage
 mutation result; neither result gains new authority fields.
+
+Capture and restore require only the checkpoint projection validated by
+`assertCheckpointBackend()`. An unbranded null-prototype implementation must
+instead expose its operations through an ordinary or class implementation and
+pass that implementation to `createCheckpointBackendFacade()`; this prevents a
+stripped shared prototype from another realm from masquerading as an
+implementation. The separately versioned capture-reconciliation entry point
+still requires the full backend extension because that private operator path
+is not part of the public checkpoint facade.
 
 ## Orchestration Boundary
 
@@ -186,8 +195,8 @@ rejected before dispatch.
 This core does not yet provide or compose:
 
 - a production storage barrier for the graceful `turn/interrupt` boundary;
-- atomic `crash-prefix` capture, production `runRestore()` launcher admission,
-  or invocation of the separate pinned-runtime rollout-tail repair primitive;
+- atomic `crash-prefix` capture or invocation of the separate pinned-runtime
+  rollout-tail repair primitive from a concrete physical backend;
 - repair or automatic continuation of `prepared` or `materialized` capture
   attempts;
 - an ext4 or filesystem-image physical backend;
@@ -216,8 +225,8 @@ pull-request order in the runtime delivery plan:
    (completed separately from this core);
 9. production linearizable authority and the process-local logical-launcher
    foundation (completed separately from this core);
-10. exact generation publication, launcher/recovery, durable stop, and
-    production `runRestore()` composition;
+10. exact generation publication, launcher/recovery, durable stop, assembled
+    matrix, and immutable public restore-backend composition (completed);
 11. ext4 or filesystem-image physical backend; and
 12. differential export.
 

@@ -23,6 +23,9 @@ import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
 import {
+  createCheckpointBackendFacade,
+} from "./session-storage-contracts.mjs";
+import {
   createPhysicalCollaboratorSettlement,
 } from "./physical-collaborator-settlement.mjs";
 
@@ -90,6 +93,7 @@ const createPhysicalBindingsIntrinsic =
   createPostgresDetachedRestorePhysicalBindings;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
+const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 const createPhysicalSettlementIntrinsic =
   createPhysicalCollaboratorSettlement;
 
@@ -241,16 +245,29 @@ const PUBLICATION_METHOD_KEYS = objectFreeze([
 ]);
 const PUBLICATION_SETTLEMENT_KEYS = PUBLICATION_METHOD_KEYS;
 const CONTROLLER_KEYS = objectFreeze([
-  "foreground",
+  "backend",
   "imagePlanReservations",
   "stablePlanProvisioning",
   "start",
   "stop",
   "writerLaunch",
 ]);
-const FOREGROUND_KEYS = objectFreeze([
-  "restoreContextContractVersion",
-  "runRestore",
+const BACKEND_KEYS = objectFreeze([
+  "backendId",
+  "capabilities",
+  "contractVersion",
+  "captureCheckpoint",
+  "restoreCheckpoint",
+]);
+const BACKEND_CAPABILITY_KEYS = objectFreeze([
+  "atomicPointInTimeCheckpoint",
+  "exclusiveWriterAttachment",
+  "fencing",
+  "normalDirectoryAttachment",
+]);
+const BACKEND_METHOD_KEYS = objectFreeze([
+  "captureCheckpoint",
+  "restoreCheckpoint",
 ]);
 const IMAGE_PLAN_RESERVATIONS_KEYS = objectFreeze([
   "prepareImageReservation",
@@ -2112,9 +2129,15 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       CONTROLLER_KEYS,
       OUTCOME_ERROR_CODE,
     );
-    const controllerForeground = exactDataObject(
-      normalizedController.foreground,
-      FOREGROUND_KEYS,
+    const authenticControllerBackend = normalizedController.backend;
+    const controllerBackend = exactDataObject(
+      authenticControllerBackend,
+      BACKEND_KEYS,
+      OUTCOME_ERROR_CODE,
+    );
+    const controllerBackendCapabilities = exactDataObject(
+      controllerBackend.capabilities,
+      BACKEND_CAPABILITY_KEYS,
       OUTCOME_ERROR_CODE,
     );
     const controllerProvisioning = exactDataObject(
@@ -2133,10 +2156,20 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       OUTCOME_ERROR_CODE,
     );
     ensure(
-      controllerForeground.restoreContextContractVersion === 3,
+      objectGetPrototypeOf(normalizedController.backend) === null &&
+        objectIsFrozen(normalizedController.backend) &&
+        (objectGetPrototypeOf(controllerBackend.capabilities) ===
+          objectPrototype ||
+          objectGetPrototypeOf(controllerBackend.capabilities) === null) &&
+        objectIsFrozen(controllerBackend.capabilities) &&
+        typeof controllerBackend.backendId === "string" &&
+        controllerBackend.contractVersion === 1,
       OUTCOME_ERROR_CODE,
     );
-    controllerBindings = exactFrozenRecord({
+    const normalizedControllerBindings = {
+      backendCapabilities: exactFrozenRecord(controllerBackendCapabilities),
+      backendContractVersion: controllerBackend.contractVersion,
+      backendId: controllerBackend.backendId,
       controllerStart: binding(normalizedController, "start"),
       controllerStop: binding(normalizedController, "stop"),
       prepareImageReservation: binding(
@@ -2152,8 +2185,15 @@ export function createPostgresDetachedRestoreDeployment(...args) {
         "reconcileLaunchAttempt",
       ),
       runLaunch: binding(controllerWriterLaunch, "runLaunch"),
-      runRestore: binding(controllerForeground, "runRestore"),
-    });
+    };
+    for (let index = 0; index < BACKEND_METHOD_KEYS.length; index += 1) {
+      const name = BACKEND_METHOD_KEYS[index];
+      normalizedControllerBindings[name] = binding(
+        authenticControllerBackend,
+        name,
+      );
+    }
+    controllerBindings = exactFrozenRecord(normalizedControllerBindings);
   } catch {
     startConstructionCleanup(settlementStopRegistry, poolRecords);
     fail(OUTCOME_ERROR_CODE);
@@ -2305,6 +2345,9 @@ export function createPostgresDetachedRestoreDeployment(...args) {
   }
 
   async function stopInternal(activeStart) {
+    // Admission was closed synchronously by beginStop(). Controller ingress
+    // drain and every fixed physical settlement stop are then started together;
+    // pools remain open until both classes of barrier have settled.
     const startedStops = beginControllerAndSettlementStops();
     const startSettlement =
       activeStart === null
@@ -2435,6 +2478,15 @@ export function createPostgresDetachedRestoreDeployment(...args) {
     return objectFreeze(method);
   }
 
+  let backendFacade = null;
+
+  function backendIngress(bindingValue) {
+    const method = function deploymentBackendIngress(...invocationArgs) {
+      return runIngress(bindingValue, invocationArgs);
+    };
+    return objectFreeze(method);
+  }
+
   function stopFromIngressContext() {
     return (
       callIntrinsic(asyncLocalStorageGetStoreIntrinsic, ingressContexts, []) ===
@@ -2503,11 +2555,23 @@ export function createPostgresDetachedRestoreDeployment(...args) {
 
   objectFreeze(start);
   objectFreeze(stop);
+  backendFacade = callIntrinsic(
+    createCheckpointBackendFacadeIntrinsic,
+    undefined,
+    [
+      objectFreeze({
+        backendId: controllerBindings.backendId,
+        capabilities: controllerBindings.backendCapabilities,
+        contractVersion: controllerBindings.backendContractVersion,
+        captureCheckpoint: backendIngress(controllerBindings.captureCheckpoint),
+        restoreCheckpoint: backendIngress(
+          controllerBindings.restoreCheckpoint,
+        ),
+      }),
+    ],
+  );
   const deployment = exactFrozenRecord({
-    foreground: exactFrozenRecord({
-      restoreContextContractVersion: 3,
-      runRestore: ingress(controllerBindings.runRestore),
-    }),
+    backend: backendFacade,
     imagePlanReservations: exactFrozenRecord({
       prepareImageReservation: ingress(
         controllerBindings.prepareImageReservation,

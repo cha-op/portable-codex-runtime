@@ -1408,7 +1408,7 @@ test("backend checkpoint result envelopes reject proxies, accessors, extra, and 
   }
 });
 
-test("backend identity getter failures on the comparison read stay pre-dispatch and sanitized", async (t) => {
+test("backend identity accessors stay pre-dispatch and sanitized", async (t) => {
   for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
       const { backend, calls } =
@@ -1441,7 +1441,7 @@ test("backend identity getter failures on the comparison read stay pre-dispatch 
           assertContractCode("invalid_storage_backend")(error) &&
           !error.message.includes("secret"),
       );
-      assert.equal(getterReads, 2);
+      assert.equal(getterReads, operation === "reconcile" ? 2 : 0);
       assert.equal(calls[operation].length, 0);
     });
   }
@@ -1555,7 +1555,7 @@ test("backend getters cannot forge public contract errors", async (t) => {
   }
 });
 
-test("backend operation getter failures on the dispatch read stay pre-dispatch and sanitized", async (t) => {
+test("backend operation accessors stay pre-dispatch and sanitized", async (t) => {
   for (const operation of ["capture", "reconcile", "restore"]) {
     await t.test(operation, async () => {
       const { backend, calls } =
@@ -1599,7 +1599,7 @@ test("backend operation getter failures on the dispatch read stay pre-dispatch a
           assertContractCode("invalid_storage_backend")(error) &&
           !error.message.includes("secret"),
       );
-      assert.equal(getterReads, 2);
+      assert.equal(getterReads, operation === "reconcile" ? 2 : 0);
       assert.equal(invocations, 0);
       assert.equal(calls[operation].length, 0);
     });

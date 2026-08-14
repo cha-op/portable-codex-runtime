@@ -68,10 +68,11 @@ pointer. Both paths retain local writer exclusion until exact capture success.
 Detached-destination activation can now materialize an executable prepared
 launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
-bounded recovery scheduler. The invocation-time detached-production gate and
-durable read-only stable-plan lookup now exist, but production `runRestore()`
-integration still requires the remaining deployment bindings and adapter
-wiring.
+bounded recovery scheduler. The invocation-time detached-production gate,
+durable read-only stable-plan lookup, deployment bindings, and final immutable
+public checkpoint backend are now complete. Only the concrete filesystem/ext4
+physical backend and its crash, detach/fence, container-launch, and cross-host
+conformance validation remain.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -634,14 +635,15 @@ an apparently safe state.
 
 ## Production Clean-Capture Mutation Authority
 
-The production checkpoint slice is deliberately capture-only. Its original
-capability-based path reuses the version 1 authority schema and composes the
-existing session-wide operation/reservation kernel with `capture_attempt_claims`,
+The private production checkpoint-mutation slice is deliberately capture-only.
+Its original capability-based path reuses the version 1 authority schema and
+composes the existing session-wide operation/reservation kernel with `capture_attempt_claims`,
 `capture_attempt_tombstones`, and `checkpoint_catalogue`. Restore is not
 admitted through this capture API. The separate typed restore-generation
-authority can name and finalise one canonical detached destination generation,
-but production restore still fails closed until durable logical launcher
-admission consumes that committed generation.
+authority can name and finalise one canonical detached destination generation.
+At that historical slice boundary, production restore still failed closed
+until durable logical launcher admission consumed that committed generation;
+the final public checkpoint facade now closes that later boundary.
 
 Normal capture begins from the exact canonical `ATTACHED` session snapshot.
 Before publication, the authority uses database time to prove that the lease
@@ -1088,17 +1090,17 @@ Bounded recovery enumerates only retained `starting` or `uncertain`
 restore-generation operations whose exact authorised generation and source
 catalogue still validate. The generation relation has no deletion or
 retirement path. These transitions neither invoke publication inside a
-database transaction nor require launch-specific DDL. Production restore
-remains disabled until exact publication finalisation is wired to the
-implemented launcher and recovery facade without weakening the
-no-second-writer boundary.
+database transaction nor require launch-specific DDL. At that typed-authority
+slice boundary, production restore remained disabled until exact publication
+finalisation was wired to the implemented launcher and recovery facade without
+weakening the no-second-writer boundary.
 
-The current capture-oriented stopped-directory backend still constructs its
+The then-current capture-oriented stopped-directory backend constructed its
 legacy restore journal binding from only checkpoint, isolation-proof, and
-reservation context. Production composition must instead pass the exact
+reservation context. Production composition therefore had to pass the exact
 claimed generation binding as the publisher's coordinator binding before it
-can produce a materialisation accepted by generation document v2. Restore
-remains fail-closed until that composition exists.
+could produce a materialisation accepted by generation document v2. The final
+public checkpoint backend now supplies that composition.
 
 ## Implemented Durable Launch-Attempt Lifecycle
 
@@ -1774,7 +1776,7 @@ executes in the interval between a successful probe and a later external side
 effect. Typed authority transitions, exact provider idempotency, and the
 per-operation guard remain the physical-dispatch safety boundary.
 
-## Detached Restore Foreground Composition and Remaining Assembly
+## Detached Restore Foreground Composition and Final Assembly
 
 Foreground phase A introduces a caller-persisted contract version 1 root plan.
 It binds the exact outer restore request, the source checkpoint's
@@ -1814,9 +1816,11 @@ entire sequence:
    capture-bound activation request version 2; and
 6. consume only the activation-materialized prepared launch attempt.
 
-The assembled matrix drives this seam through
-`deployment.foreground.runRestore(admission, publish)`, not through the still
-disabled production checkpoint adapter. `publish` receives one exact frozen
+The assembled matrix originally drove this seam through the private
+two-argument foreground composition. The final public backend now binds that
+composition internally and exposes only
+`deployment.backend.restoreCheckpoint(request)`. Its private `publish`
+callback receives one exact frozen
 null-prototype context with exactly `artifactDirectory`, `artifactOwnedRoot`,
 `artifactProof`, `canonicalLease`, `destinationDirectory`,
 `destinationIsolationProofId`, `destinationOwnedRoot`, `destinationState`,
@@ -1826,7 +1830,7 @@ It must return an exact frozen
 `{materialization, replayed, result}` completion whose result matches that
 predetermined result. `committed-only` requires `replayed: true`. The foreground
 composition does not silently choose a raw publication method behind this
-callback: the safety harness, and later the final public backend, must route
+callback: the safety harness and final public backend route
 fresh publication to `publishRestoreDestination()` and committed replay to
 `verifyCommittedRestoreDestination()` without turning verification into a new
 grant.
@@ -1957,11 +1961,11 @@ no-settlement boundary when the database allowance holds. It does not prove
 physical quiescence, extend a lease, permit retry, or replace a storage or
 writer fence.
 
-The production-neutral phase-B assembly foundation now constructs one
-capture-only backend, standalone foreground facade, idle scheduler, and narrow
-writer-launch, image-plan-reservation, and stable-plan-provisioning facets from
-one internally consistent authority graph and four pairwise-distinct borrowed
-pool objects. The launch facet exposes only `runLaunch()` and
+The production-neutral phase-B assembly now constructs one private capture
+backend, one private foreground composition, one immutable public backend, an
+idle scheduler, and narrow writer-launch, image-plan-reservation, and stable-
+plan-provisioning facets from one internally consistent authority graph and
+four pairwise-distinct borrowed pool objects. The launch facet exposes only `runLaunch()` and
 `reconcileLaunchAttempt()` through receiver-preserving wrappers bound to the
 same internal logical launcher. The frozen null-prototype provisioning facet
 exposes only `provisionStablePlan()` from the registry built on that same
@@ -1974,16 +1978,23 @@ retire, prepared-launch, handle-resolution, read-only plan resolution, and
 internal map capabilities remain private.
 
 The low-level assembly itself does not migrate the store, own scheduler or
-pool lifecycle, resolve deployment configuration, inject foreground restore
-into the backend, or construct the final public restore-capable backend. The
-production checkpoint adapter therefore still rejects restore through its
-fixed fail-closed `runRestore()` implementation.
+pool lifecycle, or resolve deployment configuration. It keeps the original
+capture backend private, constructs the foreground composition over that
+backend, then constructs a second immutable stopped-directory implementation
+whose restore authority is the foreground composition. That implementation
+also remains private. Runtime returns only a branded frozen checkpoint facade
+with metadata, `captureCheckpoint()`, and `restoreCheckpoint()`. Its advertised
+capabilities are copied from the settled session lifecycle backend so
+registration and writer-detach validation use one exact tuple; the private
+stopped-directory checkpoint overlay's manual-fencing tuple is not served.
+Raw lifecycle and operator/provider extension methods cannot bypass the later
+controller.
 
-The deployment controller owns the next lifecycle boundary without changing
-that backend. It invokes the low-level runtime's same-store bootstrap migration,
+The deployment controller owns the next lifecycle boundary. It invokes the
+low-level runtime's same-store bootstrap migration,
 starts the scheduler, and coalesces with the scheduler's immediate pass. It
-opens foreground, image-plan-reservation, stable-plan-provisioning, and writer-
-launch admission only after an exact completed receipt proves a full four-lane
+opens checkpoint-backend, image-plan-reservation, stable-plan-provisioning, and
+writer-launch admission only after an exact completed receipt proves a full four-lane
 sweep. A failed, busy, uncertain, or malformed initial result leaves the
 controller permanently closed. Exactly one controller claims each assembled
 runtime for its lifetime, so one shutdown barrier cannot race a second
@@ -2174,8 +2185,8 @@ same-database/stable-plan retry through fresh physical bindings, image binding,
 runtime, and controller, references separate stable-plan-registry rehydration,
 and layers representative settlement-foundation/deployment timer and drain
 evidence. It does not claim one whole-saga deployment restart or operating-
-system crash. The final public backend remains the next implementation boundary
-before enabling the production entry point.
+system crash. The immutable public backend is now complete; the next
+implementation boundary is the concrete filesystem/ext4 physical backend.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2299,8 +2310,8 @@ binding graph and operational lease admission also exist. The completed safety
 matrix has an exact nineteen-contract/fourteen-protocol-surface scope and binds its
 seven durable-cut aggregation, same-database/stable-plan fresh-object retry,
 separate registry rehydration, and representative settlement timer/drain
-evidence. The final public backend is the next implementation boundary; the
-production checkpoint adapter's `runRestore()` remains closed until that
-backend is wired.
+evidence. The final public backend is wired through controller and deployment
+admission. The concrete filesystem/ext4 physical backend is the next
+implementation boundary.
 Physical-backend pull requests must add crash, detach/fence, container-launch,
 and cross-host conformance evidence.

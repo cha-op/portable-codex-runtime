@@ -104,8 +104,8 @@
   operation, so the facade records a durable `BLOCKED` result instead. A valid
   proof survives database finalization acknowledgement loss through exact
   readback/finalizer replay, and manual fencing records `fence-unavailable`
-  without invoking the provider. The facade remains unscheduled and production
-  restore remains fail-closed.
+  without invoking the provider. This detach-only facade remains unscheduled;
+  production restore was still fail-closed at that historical slice boundary.
 - Production clean-checkpoint capture authority now reuses the version 1
   PostgreSQL schema without DDL. One exact durable operation and reservation
   binds the canonical stopped-writer admission, globally unique capture
@@ -309,10 +309,11 @@
   max-one foreground lifecycle pool from self-deadlocking while its shared
   lease waits for a nested exclusive operation.
 - A production-neutral runtime factory now constructs one internally
-  consistent authority graph, capture-only backend, standalone foreground
-  facade, and idle recovery scheduler from four pairwise-distinct borrowed
-  pools. It performs no migration, start, stop, provider action, or pool close,
-  and it does not inject foreground restore into the checkpoint backend.
+  consistent authority graph, private capture backend, private foreground
+  composition, immutable public backend, and idle recovery scheduler from four
+  pairwise-distinct borrowed pools. It performs no migration, start, stop,
+  provider action, or pool close. Its backend is a low-level capability until
+  claimed by the controller.
 - The same factory now returns a narrow `writerLaunch` facet with only
   `runLaunch()` and `reconcileLaunchAttempt()`. Those receiver-preserving
   wrappers target the exact internal launcher already used by capture and
@@ -338,11 +339,12 @@
   surface.
 - A deployment-owned runtime controller now uses that same store's narrow
   bootstrap facet. It completes migration and one exact full recovery sweep
-  before opening foreground, image-plan-reservation, plan-provisioning, or
-  writer-launch admission. Shutdown closes those facets first, stops the
-  scheduler, and drains every admitted call before the caller may close the
-  four borrowed pools. The raw runtime remains a low-level capability and is
-  not a parallel serving route.
+  before opening checkpoint-backend, image-plan-reservation,
+  plan-provisioning, or writer-launch admission. The raw foreground callback
+  remains private. Shutdown closes those facets first, stops the scheduler,
+  and drains every admitted call before the caller may close the four borrowed
+  pools. The raw runtime remains a low-level capability and is not a parallel
+  serving route.
 - A higher PostgreSQL deployment factory now owns those four pools. It accepts
   only explicit connection, verified-TLS, timeout, role-capacity, and
   application-name configuration; constructs one private pool per authority,
@@ -391,9 +393,9 @@
   binding, runtime, and controller, stable-plan-registry rehydration, and
   representative settlement-foundation/deployment timer and drain cases. A
   test-only router separately locks the explicit fresh/committed publication
-  callback seam while the final public adapter remains absent. It
-  does not claim one whole-saga deployment restart or operating-system crash
-  coverage.
+  callback seam. The immutable public backend now owns that routing in
+  production without accepting a caller callback. The matrix does not claim
+  one whole-saga deployment restart or operating-system crash coverage.
 - Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
   grant entirely inside one coordinator-owned per-operation guard. The storage
   backend exposes a separate version 1 read-only reconciliation contract keyed
@@ -403,12 +405,17 @@
   acknowledgement loss, and copied caller data remain blocked without a second
   physical dispatch. Durable activation request/result version 1 and the
   PostgreSQL schema remain unchanged.
-- The production checkpoint adapter remains capture-only. Restore fails closed
-  because its `runRestore()` stub is unchanged. Production enablement still
-  requires the final public backend and adapter route; the scoped assembled
-  evidence matrix is complete. Operational lease admission is now enforced at
-  stable-plan provision and every resolution from one deployment-owned policy
-  derived from the two database-clock critical windows.
+- The final public checkpoint backend is complete. Runtime keeps the original
+  capture backend private and constructs a second immutable backend whose
+  restore authority is the version 3 foreground composition. Runtime,
+  controller, and deployment expose only its checkpoint facade through
+  ready/in-flight admission. Its metadata carries the same settled lifecycle
+  capability tuple persisted on sessions and enforced by writer detach; raw
+  lifecycle mutations, foreground callbacks, and operator/provider extensions
+  stay private. Operational lease admission
+  is enforced at stable-plan provision and every resolution from one
+  deployment-owned policy derived from the two database-clock critical
+  windows.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Per-workstream implementation state lives under `docs/project_journal/`.
@@ -417,6 +424,8 @@
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Final public restore backend:
+  `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - Assembled restore safety matrix:
   `docs/project_journal/2026/08/2026-08-12-assembled-restore-safety-matrix-6d3a91.md`
 - Physical-collaborator settlement:
@@ -510,9 +519,9 @@
   repair covers only pinned plain-JSONL tail framing on a detached restored
   copy; production recovery still needs external sync/freeze, atomic crash
   capture, trusted OCI resolution, fencing, and launcher admission.
-- Restore remains intentionally unavailable in the production checkpoint
-  adapter. Capture-bound detached activation and bounded no-relaunch recovery
-  now exist, the stop-to-prepared-capture handoff is durable, and the cross-
+- Restore is now available through the deployment-controlled public checkpoint
+  backend. Capture-bound detached activation and bounded no-relaunch recovery
+  exist, the stop-to-prepared-capture handoff is durable, and the cross-
   process lifecycle guard, scheduler, stable root plan, invocation-time fleet
   gate, foreground composition seam, production-neutral runtime assembly, and
   same-launcher writer-start ingress are implemented. The durable stable-plan
@@ -529,6 +538,7 @@
   The deployment now also derives and admits one exact operational lease
   policy across the two database-clock windows, including physical deadline/
   grace bounds, an aggregate database allowance, and a safety margin.
-  The scoped assembled safety matrix is complete. Production still requires the
-  final public backend and adapter assembly before the checkpoint adapter's
-  `runRestore()` stub may be enabled.
+  The scoped assembled safety matrix and immutable public adapter assembly are
+  complete. The next boundary is the concrete filesystem/ext4 physical
+  backend; the public adapter does not make the injected physical collaborators
+  filesystem-durable by itself.

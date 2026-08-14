@@ -16,6 +16,7 @@ import {
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  assertCheckpointBackend,
   createSessionManifest,
 } from "../../../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../../../src/stopped-directory-publication.mjs";
@@ -707,7 +708,7 @@ async function zeroIoAndLifecycle() {
   const { calls, options } = validOptions();
   const deployment = createPostgresDetachedRestoreDeployment(options);
   exactKeys(deployment, [
-    "foreground",
+    "backend",
     "imagePlanReservations",
     "stablePlanProvisioning",
     "start",
@@ -717,6 +718,41 @@ async function zeroIoAndLifecycle() {
   assert.equal(Object.getPrototypeOf(deployment), null);
   assert.equal(Object.isFrozen(deployment), true);
   assert.equal(isPostgresDetachedRestoreDeployment(deployment), true);
+  exactKeys(deployment.backend, [
+    "backendId",
+    "capabilities",
+    "contractVersion",
+    "captureCheckpoint",
+    "restoreCheckpoint",
+  ]);
+  assert.equal(Object.getPrototypeOf(deployment.backend), null);
+  assert.equal(Object.isFrozen(deployment.backend), true);
+  assert.strictEqual(
+    assertCheckpointBackend(deployment.backend),
+    deployment.backend,
+  );
+  assert.equal(deployment.backend.backendId, BACKEND_ID);
+  assert.equal(deployment.backend.contractVersion, 1);
+  exactKeys(deployment.backend.capabilities, [
+    "atomicPointInTimeCheckpoint",
+    "exclusiveWriterAttachment",
+    "fencing",
+    "normalDirectoryAttachment",
+  ]);
+  assert.equal(Object.getPrototypeOf(deployment.backend.capabilities), null);
+  assert.equal(Object.isFrozen(deployment.backend.capabilities), true);
+  assert.deepEqual({ ...deployment.backend.capabilities }, {
+    atomicPointInTimeCheckpoint: true,
+    exclusiveWriterAttachment: true,
+    fencing: "epoch-enforced",
+    normalDirectoryAttachment: true,
+  });
+  for (const method of [
+    "captureCheckpoint",
+    "restoreCheckpoint",
+  ]) {
+    assert.equal(Object.isFrozen(deployment.backend[method]), true);
+  }
   exactKeys(deployment.imagePlanReservations, ["prepareImageReservation"]);
   assert.equal(Object.getPrototypeOf(deployment.imagePlanReservations), null);
   assert.equal(Object.isFrozen(deployment.imagePlanReservations), true);
@@ -727,9 +763,9 @@ async function zeroIoAndLifecycle() {
     true,
   );
   for (const hidden of [
-    "backend",
     "bootstrap",
     "controller",
+    "foreground",
     "pools",
     "postgres",
     "runtime",
@@ -737,6 +773,27 @@ async function zeroIoAndLifecycle() {
   ]) {
     assert.equal(hidden in deployment, false);
   }
+  for (const hidden of [
+    "captureReconciliationContractVersion",
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "prepareRestoreAttachment",
+    "prepareWritableAttachment",
+    "preparedCheckpointCaptureContractVersion",
+    "provisionSession",
+    "reconcileRestoreAttachment",
+    "restoreAttachmentActivationContractVersion",
+    "restoreAttachmentReconciliationContractVersion",
+    "resumePreparedCheckpointCapture",
+    "runRestore",
+  ]) {
+    assert.equal(hidden in deployment.backend, false);
+  }
+  assert.throws(
+    () => deployment.backend.restoreCheckpoint(restoreAdmission()),
+    requestError,
+  );
   const before = poolSummary();
   assert.equal(before.length, 4);
   assert.deepEqual(
@@ -1550,6 +1607,53 @@ async function admittedIngressCannotStopItsDeployment() {
   assertStatusReceipt(await deployment.stop(), "stopped");
 }
 
+async function backendIngressIsExactAndGated() {
+  configureFakePg();
+  const { calls, controls, options } = validOptions();
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  const { backend } = deployment;
+  const input = restoreAdmission("deployment-public-backend-operation-001");
+  const clone = Object.freeze(Object.assign(Object.create(null), backend));
+  const hostileReceiver = new Proxy(backend, {
+    get() {
+      throw new Error("hostile backend receiver must not be inspected");
+    },
+    getPrototypeOf() {
+      throw new Error("hostile backend receiver prototype must not be inspected");
+    },
+  });
+  for (const receiver of [undefined, null, {}, clone, hostileReceiver]) {
+    assert.throws(
+      () => Reflect.apply(backend.restoreCheckpoint, receiver, [input]),
+      TypeError,
+    );
+  }
+  assert.throws(() => backend.restoreCheckpoint(input), requestError);
+  assertStatusReceipt(await deployment.start(), "ready");
+  let rawCallbackCalls = 0;
+  const rawCallback = Object.freeze(() => {
+    rawCallbackCalls += 1;
+  });
+  await assert.rejects(
+    backend.restoreCheckpoint(input, rawCallback),
+    (error) => error?.code === "invalid_stopped_directory_backend_request",
+  );
+  assert.equal(rawCallbackCalls, 0);
+  await assert.rejects(backend.restoreCheckpoint(input));
+  assert.equal(calls.provider, 0);
+  assert.equal(controls.lifecycleContexts.length, 0);
+  const stopped = deployment.stop();
+  assert.throws(() => backend.restoreCheckpoint(input), requestError);
+  assertStatusReceipt(await stopped, "stopped");
+  assert.throws(() => backend.restoreCheckpoint(input), requestError);
+  assert.deepEqual(fakePgState().endOrder, [
+    "recoveryLifecycle",
+    "foregroundLifecycle",
+    "operation",
+    "authority",
+  ]);
+}
+
 async function stopDuringTopologyNeverReopensIngress() {
   configureFakePg();
   const topology = holdFakeTopology("authority");
@@ -2211,6 +2315,7 @@ const scenarios = Object.freeze({
   "all-settlement-stops-start-before-await":
     allSettlementStopsStartBeforeAwait,
   "application-name-budget": applicationNameBudget,
+  "backend-ingress-is-exact-and-gated": backendIngressIsExactAndGated,
   "checked-out-client-error-forces-fatal-shutdown":
     checkedOutClientErrorForcesFatalShutdown,
   "empty-password-blocks-ambient-fallback":

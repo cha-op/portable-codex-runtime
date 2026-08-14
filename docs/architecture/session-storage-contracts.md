@@ -350,6 +350,22 @@ evidence. Passing the capability validator confirms only this object shape and
 declaration; backend behavior remains untrusted until the concrete adapter
 passes its conformance suite.
 
+Checkpoint orchestration may instead accept the narrower projection validated
+by `assertCheckpointBackend()`: the same backend ID, contract version, and
+capabilities plus only `captureCheckpoint()` and `restoreCheckpoint()`. This
+projection is not a complete storage backend and does not authorize or expose
+provision, attachment, fencing, or destroy operations. A full v1 backend also
+satisfies the projection; a checkpoint-only facade intentionally fails
+`assertStorageBackend()`.
+
+Unbranded null-prototype inputs are rejected because a structural validator
+cannot distinguish one from another realm's stripped shared
+`Object.prototype`. `createCheckpointBackendFacade()` consumes an ordinary or
+class implementation, captures both operations, and returns the only supported
+module-branded null-prototype facade with receiver-checked methods. Backends
+may declare fields on the candidate or an explicit non-terminal prototype; the
+validator never consumes fields from a terminal shared prototype.
+
 Checkpoint-capture reconciliation is an optional, separately versioned
 extension rather than a new required v1 storage method. A backend that exposes
 `captureReconciliationContractVersion: 1` plus

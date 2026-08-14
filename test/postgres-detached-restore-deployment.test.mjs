@@ -18,6 +18,7 @@ const SCENARIOS = Object.freeze([
   "after-import-promise-species-getter-fails-closed",
   "after-import-promise-try-poison-is-ignored",
   "application-name-budget",
+  "backend-ingress-is-exact-and-gated",
   "checked-out-client-error-forces-fatal-shutdown",
   "zero-io-and-lifecycle",
   "partial-construction-failure",

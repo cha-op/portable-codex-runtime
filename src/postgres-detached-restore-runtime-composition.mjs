@@ -49,6 +49,7 @@ import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   STORAGE_CONTRACT_VERSION,
+  createCheckpointBackendFacade,
 } from "./session-storage-contracts.mjs";
 import { StoppedDirectoryBackend } from "./stopped-directory-backend.mjs";
 import { StoppedDirectoryPublication } from "./stopped-directory-publication.mjs";
@@ -82,10 +83,15 @@ const PostgresSerializableStoreConstructor = PostgresSerializableStore;
 const PostgresSessionAuthorityConstructor = PostgresSessionAuthority;
 const PostgresOperationGuardConstructor = PostgresOperationGuard;
 const StoppedDirectoryBackendConstructor = StoppedDirectoryBackend;
+const captureCheckpointBackendIntrinsic =
+  StoppedDirectoryBackend.prototype.captureCheckpoint;
+const restoreCheckpointBackendIntrinsic =
+  StoppedDirectoryBackend.prototype.restoreCheckpoint;
 const migrateSerializableStoreIntrinsic =
   PostgresSerializableStore.prototype.migrate;
 const createCheckpointMutationAuthorityIntrinsic =
   createPostgresCheckpointMutationAuthority;
+const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 const createDetachedRestoreForegroundIntrinsic =
   createPostgresDetachedRestoreForegroundComposition;
 const createDetachedRestoreStablePlanRegistryIntrinsic =
@@ -468,6 +474,7 @@ function preflightLifecycleBackend(backend) {
   );
   trustedFunction(prepareRestoreAttachment);
   trustedFunction(reconcileRestoreAttachment);
+  return exactFrozenRecord(normalizedCapabilities);
 }
 
 function preflightPublication(publication) {
@@ -569,6 +576,37 @@ function receiverCallback(method, receiver) {
     return callIntrinsic(method, receiver, args);
   };
   return objectFreeze(callback);
+}
+
+function createPublicBackendMutationAuthority(
+  checkpointMutationAuthority,
+  foreground,
+) {
+  return exactFrozenRecord({
+    restoreContextContractVersion: 3,
+    runCapture: receiverCallback(
+      ownFrozenDataFunction(checkpointMutationAuthority, "runCapture"),
+      checkpointMutationAuthority,
+    ),
+    runCaptureReconciliation: receiverCallback(
+      ownFrozenDataFunction(
+        checkpointMutationAuthority,
+        "runCaptureReconciliation",
+      ),
+      checkpointMutationAuthority,
+    ),
+    runPreparedCapture: receiverCallback(
+      ownFrozenDataFunction(
+        checkpointMutationAuthority,
+        "runPreparedCapture",
+      ),
+      checkpointMutationAuthority,
+    ),
+    runRestore: receiverCallback(
+      ownFrozenDataFunction(foreground, "runRestore"),
+      foreground,
+    ),
+  });
 }
 
 function createRestoreActivationAuthority(authority) {
@@ -701,7 +739,9 @@ function assemble(options) {
     ),
   );
   preflightDistinctPools(options.pools);
-  preflightLifecycleBackend(options.storage.lifecycleBackend);
+  const lifecycleBackendCapabilities = preflightLifecycleBackend(
+    options.storage.lifecycleBackend,
+  );
   ensure(
     isPostgresDetachedRestoreImagePlanBinding(
       options.launch.imagePlanBinding,
@@ -797,7 +837,8 @@ function assemble(options) {
       resolveSourceOwnedRoot: options.storage.resolveSourceOwnedRoot,
     }),
   );
-  const backend = construct(
+  const resolveStoppedWriter = createResolveStoppedWriter(launcher);
+  const captureBackend = construct(
     StoppedDirectoryBackendConstructor,
     exactFrozenRecord({
       backendId: options.storage.backendId,
@@ -805,7 +846,7 @@ function assemble(options) {
       lifecycleBackend: options.storage.lifecycleBackend,
       mutationAuthority: checkpointMutationAuthority,
       publication: options.storage.publication,
-      resolveStoppedWriter: createResolveStoppedWriter(launcher),
+      resolveStoppedWriter,
     }),
   );
   const durableStopCapture = callFactory(
@@ -817,7 +858,9 @@ function assemble(options) {
     exactFrozenRecord({
       authority,
       operationGuard,
-      storageBackend: backend,
+      // Detach authority must match the capabilities persisted on the
+      // session, not the stopped-directory checkpoint overlay.
+      storageBackend: options.storage.lifecycleBackend,
     }),
   );
   const restoreActivationCoordinator = callFactory(
@@ -828,14 +871,14 @@ function assemble(options) {
       operationalLeaseBudget: options.planRegistry.operationalLeaseBudget,
       publication: options.storage.publication,
       resolveRestoreDestination: options.storage.resolveRestoreDestination,
-      storageBackend: backend,
+      storageBackend: captureBackend,
     }),
   );
   const foreground = callFactory(
     createDetachedRestoreForegroundIntrinsic,
     exactFrozenRecord({
       authority,
-      captureBackend: backend,
+      captureBackend,
       durableStopCapture,
       fleetCapabilityGate: options.foreground.fleetCapabilityGate,
       imagePlanBinding: options.launch.imagePlanBinding,
@@ -845,6 +888,36 @@ function assemble(options) {
       resolveStablePlan,
       restoreActivationCoordinator,
       writerDetach,
+    }),
+  );
+  const restoreBackend = construct(
+    StoppedDirectoryBackendConstructor,
+    exactFrozenRecord({
+      backendId: options.storage.backendId,
+      coordinator: options.launch.stoppedWriterCoordinator,
+      lifecycleBackend: options.storage.lifecycleBackend,
+      mutationAuthority: createPublicBackendMutationAuthority(
+        checkpointMutationAuthority,
+        foreground,
+      ),
+      publication: options.storage.publication,
+      resolveStoppedWriter,
+    }),
+  );
+  const backend = callFactory(
+    createCheckpointBackendFacadeIntrinsic,
+    objectFreeze({
+      backendId: options.storage.backendId,
+      capabilities: lifecycleBackendCapabilities,
+      contractVersion: STORAGE_CONTRACT_VERSION,
+      captureCheckpoint: receiverCallback(
+        captureCheckpointBackendIntrinsic,
+        restoreBackend,
+      ),
+      restoreCheckpoint: receiverCallback(
+        restoreCheckpointBackendIntrinsic,
+        restoreBackend,
+      ),
     }),
   );
 
@@ -879,7 +952,6 @@ function assemble(options) {
   const runtime = exactFrozenRecord({
     backend,
     bootstrap,
-    foreground,
     imagePlanReservations: createImagePlanReservationsFacet(
       options.launch.imagePlanBinding,
     ),

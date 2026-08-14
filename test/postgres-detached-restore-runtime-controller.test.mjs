@@ -41,6 +41,7 @@ import {
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
+  assertCheckpointBackend,
   createSessionManifest,
 } from "../src/session-storage-contracts.mjs";
 import { StoppedDirectoryPublication } from "../src/stopped-directory-publication.mjs";
@@ -802,7 +803,7 @@ function assertNoPhysicalEffects(fixture) {
   }
 }
 
-test("controller exposes only exact frozen admission and lifecycle facets", async () => {
+test("controller exposes only the exact frozen backend and lifecycle facets", async () => {
   const fixture = await createFixture();
   const { controller } = fixture;
   assert.equal(
@@ -812,7 +813,7 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
     true,
   );
   assert.deepEqual(Reflect.ownKeys(controller), [
-    "foreground",
+    "backend",
     "imagePlanReservations",
     "stablePlanProvisioning",
     "start",
@@ -823,10 +824,33 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
   assert.equal(Object.isFrozen(controller), true);
   assert.equal(isPostgresDetachedRestoreRuntimeController(controller), true);
   assert.equal(isPostgresDetachedRestoreRuntimeController({ ...controller }), false);
-  assert.deepEqual(Reflect.ownKeys(controller.foreground), [
-    "restoreContextContractVersion",
-    "runRestore",
+  assert.deepEqual(Reflect.ownKeys(controller.backend), [
+    "backendId",
+    "capabilities",
+    "contractVersion",
+    "captureCheckpoint",
+    "restoreCheckpoint",
   ]);
+  assert.equal(Object.getPrototypeOf(controller.backend), null);
+  assert.strictEqual(
+    assertCheckpointBackend(controller.backend),
+    controller.backend,
+  );
+  assert.equal(controller.backend.backendId, BACKEND_ID);
+  assert.equal(controller.backend.contractVersion, 1);
+  assert.deepEqual(Reflect.ownKeys(controller.backend.capabilities), [
+    "atomicPointInTimeCheckpoint",
+    "exclusiveWriterAttachment",
+    "fencing",
+    "normalDirectoryAttachment",
+  ]);
+  assert.equal(Object.getPrototypeOf(controller.backend.capabilities), null);
+  assert.deepEqual({ ...controller.backend.capabilities }, {
+    atomicPointInTimeCheckpoint: true,
+    exclusiveWriterAttachment: true,
+    fencing: "epoch-enforced",
+    normalDirectoryAttachment: true,
+  });
   assert.deepEqual(Reflect.ownKeys(controller.imagePlanReservations), [
     "prepareImageReservation",
   ]);
@@ -837,18 +861,21 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
     "reconcileLaunchAttempt",
     "runLaunch",
   ]);
-  for (const hidden of ["backend", "bootstrap", "runtime", "scheduler"]) {
+  for (const hidden of ["bootstrap", "foreground", "runtime", "scheduler"]) {
     assert.equal(hidden in controller, false);
   }
   for (const value of [
     controller,
-    controller.foreground,
+    controller.backend,
+    controller.backend.capabilities,
     controller.imagePlanReservations,
     controller.stablePlanProvisioning,
     controller.writerLaunch,
     controller.start,
     controller.stop,
-    controller.foreground.runRestore,
+    ...Object.values(controller.backend).filter(
+      (value) => typeof value === "function",
+    ),
     controller.imagePlanReservations.prepareImageReservation,
     controller.stablePlanProvisioning.provisionStablePlan,
     controller.writerLaunch.reconcileLaunchAttempt,
@@ -860,8 +887,26 @@ test("controller exposes only exact frozen admission and lifecycle facets", asyn
     controller.imagePlanReservations.prepareImageReservation({}),
     controllerError(REQUEST_CODE),
   );
+  assert.equal("runRestore" in controller.backend, false);
+  for (const hidden of [
+    "captureReconciliationContractVersion",
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "prepareRestoreAttachment",
+    "prepareWritableAttachment",
+    "preparedCheckpointCaptureContractVersion",
+    "provisionSession",
+    "reconcileCapture",
+    "reconcileRestoreAttachment",
+    "restoreAttachmentActivationContractVersion",
+    "restoreAttachmentReconciliationContractVersion",
+    "resumePreparedCheckpointCapture",
+  ]) {
+    assert.equal(hidden in controller.backend, false);
+  }
   await assert.rejects(
-    controller.foreground.runRestore(restoreAdmission(), async () => null),
+    controller.backend.restoreCheckpoint(restoreAdmission()),
     controllerError(REQUEST_CODE),
   );
   await assert.rejects(
@@ -1014,10 +1059,10 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   fixture.imagePlanBlock = deferred();
   fixture.blockedGuardRoles.add("foreground-lifecycle");
   fixture.blockedGuardRoles.add("operation");
-  const foreground = fixture.controller.foreground.runRestore(
-    restoreAdmission("controller-foreground-drain-001"),
-    async () => null,
+  const backend = fixture.controller.backend.restoreCheckpoint(
+    restoreAdmission("controller-backend-drain-001"),
   );
+  void backend.catch(() => undefined);
   const launch = fixture.controller.writerLaunch.reconcileLaunchAttempt({
     launchAttemptId: "controller-launch-drain-001",
   });
@@ -1056,9 +1101,8 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
     controllerError(REQUEST_CODE),
   );
   await assert.rejects(
-    fixture.controller.foreground.runRestore(
-      restoreAdmission("controller-foreground-after-stop-001"),
-      async () => null,
+    fixture.controller.backend.restoreCheckpoint(
+      restoreAdmission("controller-backend-after-stop-001"),
     ),
     controllerError(REQUEST_CODE),
   );
@@ -1076,7 +1120,7 @@ test("stop closes ingress immediately and drains every admitted ingress facet", 
   fixture.guardConnectReleases.get("foreground-lifecycle")();
   fixture.guardConnectReleases.get("operation")();
   const settlements = await Promise.allSettled([
-    foreground,
+    backend,
     imagePlanReservation,
     provision,
     launch,
@@ -1194,16 +1238,59 @@ test(
   },
 );
 
-test("controller preserves the capture-only backend and caller-owned pools", async () => {
+test("controller serves the public restore-capable backend and preserves caller-owned pools", async () => {
   const fixture = await createFixture();
   await assert.rejects(
-    fixture.runtime.backend.restoreCheckpoint(restoreAdmission()),
-    (error) => error?.code === "stopped_directory_backend_outcome_uncertain",
+    fixture.controller.backend.restoreCheckpoint(restoreAdmission()),
+    controllerError(REQUEST_CODE),
   );
   assertNoPhysicalEffects(fixture);
   await fixture.controller.start();
+  await assert.rejects(
+    fixture.controller.backend.restoreCheckpoint(restoreAdmission()),
+    (error) => error?.code === "stopped_directory_backend_outcome_uncertain",
+  );
   await fixture.controller.stop();
   assertNoPhysicalEffects(fixture);
+});
+
+test("controller backend accepts only its authentic receiver", async () => {
+  const fixture = await createFixture();
+  const { backend } = fixture.controller;
+  const clone = freezeRecord(Object.fromEntries(
+    Reflect.ownKeys(backend).map((key) => [key, backend[key]]),
+  ));
+  const hostileReceiver = new Proxy(backend, {
+    get() {
+      throw new Error("hostile receiver must not be inspected");
+    },
+    getPrototypeOf() {
+      throw new Error("hostile receiver prototype must not be inspected");
+    },
+  });
+  for (const receiver of [undefined, null, {}, clone, hostileReceiver]) {
+    assert.throws(
+      () => Reflect.apply(backend.restoreCheckpoint, receiver, [
+        restoreAdmission("controller-wrong-backend-receiver-001"),
+      ]),
+      TypeError,
+    );
+  }
+  await fixture.controller.start();
+  let rawCallbackCalls = 0;
+  const rawCallback = Object.freeze(() => {
+    rawCallbackCalls += 1;
+  });
+  await assert.rejects(
+    backend.restoreCheckpoint(
+      restoreAdmission("controller-backend-extra-args-001"),
+      rawCallback,
+    ),
+    (error) => error?.code === "invalid_stopped_directory_backend_request",
+  );
+  assert.equal(rawCallbackCalls, 0);
+  assertNoPhysicalEffects(fixture);
+  await fixture.controller.stop();
 });
 
 test("stop ignores after-import Array iterator poison and stays single-flight", async () => {

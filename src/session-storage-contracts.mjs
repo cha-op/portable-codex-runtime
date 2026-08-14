@@ -11,6 +11,7 @@ const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
+const objectIs = Object.is;
 const objectIsFrozen = Object.isFrozen;
 const objectPrototype = Object.prototype;
 const objectValues = Object.values;
@@ -19,6 +20,10 @@ const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
 const structuredCloneIntrinsic = globalThis.structuredClone;
+const TypeErrorConstructor = TypeError;
+const WeakSetConstructor = WeakSet;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
 
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
@@ -94,6 +99,18 @@ const STORAGE_BACKEND_METHODS = Object.freeze([
   "provisionSession",
   "restoreCheckpoint",
 ]);
+const CHECKPOINT_BACKEND_METHODS = Object.freeze([
+  "captureCheckpoint",
+  "restoreCheckpoint",
+]);
+const STORAGE_BACKEND_CAPABILITY_KEYS = Object.freeze([
+  "atomicPointInTimeCheckpoint",
+  "exclusiveWriterAttachment",
+  "fencing",
+  "normalDirectoryAttachment",
+]);
+const MAX_BACKEND_PROTOTYPE_DEPTH = 64;
+const checkpointBackendProjections = new WeakSetConstructor();
 
 export class SessionStorageContractError extends Error {
   constructor(code, message) {
@@ -1046,15 +1063,169 @@ export function assertStorageBackend(value) {
   return value;
 }
 
+function checkpointBackendProjection(value) {
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !arrayIsArray(value) &&
+      !isProxyValue(value),
+    "invalid_storage_backend",
+    "checkpoint backend must be an object",
+  );
+  if (
+    reflectApply(weakSetHasIntrinsic, checkpointBackendProjections, [value])
+  ) {
+    return value;
+  }
+  let candidatePrototype;
+  try {
+    candidatePrototype = objectGetPrototypeOf(value);
+  } catch {
+    fail(
+      "invalid_storage_backend",
+      "checkpoint backend prototype chain is invalid",
+    );
+  }
+  ensure(
+    candidatePrototype !== null,
+    "invalid_storage_backend",
+    "unbranded null-prototype checkpoint backends are unsupported",
+  );
+  const dataValue = (key) => {
+    let cursor = value;
+    for (
+      let depth = 0;
+      cursor !== null && depth < MAX_BACKEND_PROTOTYPE_DEPTH;
+      depth += 1
+    ) {
+      ensure(
+        !isProxyValue(cursor),
+        "invalid_storage_backend",
+        "checkpoint backend prototype chain must not contain a proxy",
+      );
+      let nextPrototype;
+      try {
+        nextPrototype = objectGetPrototypeOf(cursor);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "checkpoint backend prototype chain is invalid",
+        );
+      }
+      ensure(
+        cursor !== objectPrototype && !(depth > 0 && nextPrototype === null),
+        "invalid_storage_backend",
+        "checkpoint backend fields must not come from the shared object prototype",
+      );
+      let descriptor;
+      try {
+        descriptor = objectGetOwnPropertyDescriptor(cursor, key);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "checkpoint backend fields must be data properties",
+        );
+      }
+      if (descriptor !== undefined) {
+        ensure(
+          objectHasOwn(descriptor, "value"),
+          "invalid_storage_backend",
+          "checkpoint backend fields must be data properties",
+        );
+        return descriptor.value;
+      }
+      cursor = nextPrototype;
+    }
+    ensure(
+      cursor === null,
+      "invalid_storage_backend",
+      "checkpoint backend prototype chain is too deep",
+    );
+    fail(
+      "invalid_storage_backend",
+      "checkpoint backend is missing a required field",
+    );
+  };
+  const contractVersion = dataValue("contractVersion");
+  ensure(
+    contractVersion === STORAGE_CONTRACT_VERSION,
+    "invalid_storage_backend",
+    "checkpoint backend contract version is unsupported",
+  );
+  const backendId = dataValue("backendId");
+  assertOpaqueId(
+    backendId,
+    "invalid_storage_backend",
+    "checkpoint backend ID",
+  );
+  const capabilities = assertStorageBackendCapabilities(
+    dataValue("capabilities"),
+  );
+  const projection = objectCreate(null);
+  projection.backendId = backendId;
+  projection.capabilities = capabilities;
+  projection.contractVersion = contractVersion;
+  for (let index = 0; index < CHECKPOINT_BACKEND_METHODS.length; index += 1) {
+    const method = CHECKPOINT_BACKEND_METHODS[index];
+    const operation = dataValue(method);
+    ensure(
+      typeof operation === "function" && !isProxyValue(operation),
+      "invalid_storage_backend",
+      "checkpoint backend is missing a required operation",
+    );
+    const captured = function checkpointBackendOperation(...args) {
+      return reflectApply(operation, value, args);
+    };
+    objectFreeze(captured);
+    projection[method] = captured;
+  }
+  objectFreeze(projection);
+  reflectApply(weakSetAddIntrinsic, checkpointBackendProjections, [projection]);
+  return projection;
+}
+
+export function assertCheckpointBackend(value) {
+  return checkpointBackendProjection(value);
+}
+
+export function createCheckpointBackendFacade(value) {
+  const implementation = checkpointBackendProjection(value);
+  const capabilities = objectCreate(null);
+  for (
+    let index = 0;
+    index < STORAGE_BACKEND_CAPABILITY_KEYS.length;
+    index += 1
+  ) {
+    const key = STORAGE_BACKEND_CAPABILITY_KEYS[index];
+    capabilities[key] = implementation.capabilities[key];
+  }
+  objectFreeze(capabilities);
+  let facade;
+  const checkpointMethod = (method) => {
+    const operation = implementation[method];
+    const callback = function checkpointBackendMethod(...args) {
+      if (!objectIs(this, facade)) {
+        throw new TypeErrorConstructor("Invalid checkpoint backend receiver");
+      }
+      return reflectApply(operation, implementation, args);
+    };
+    return objectFreeze(callback);
+  };
+  facade = objectCreate(null);
+  facade.backendId = implementation.backendId;
+  facade.capabilities = capabilities;
+  facade.contractVersion = implementation.contractVersion;
+  facade.captureCheckpoint = checkpointMethod("captureCheckpoint");
+  facade.restoreCheckpoint = checkpointMethod("restoreCheckpoint");
+  objectFreeze(facade);
+  reflectApply(weakSetAddIntrinsic, checkpointBackendProjections, [facade]);
+  return facade;
+}
+
 export function assertStorageBackendCapabilities(value) {
   assertExactObject(
     value,
-    [
-      "atomicPointInTimeCheckpoint",
-      "exclusiveWriterAttachment",
-      "fencing",
-      "normalDirectoryAttachment",
-    ],
+    STORAGE_BACKEND_CAPABILITY_KEYS,
     "invalid_storage_backend",
     "storage backend capabilities",
   );
