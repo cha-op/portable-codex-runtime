@@ -60,3 +60,268 @@ jobs:
       - run: npm run test:postgres
         env:
           SESSION_AUTHORITY_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/portable_codex_runtime_test
+
+  podman-writer-integration:
+    name: Rootless Podman writer integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install rootless Podman prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes acl build-essential fuse-overlayfs podman slirp4netns uidmap
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          printf 'XDG_RUNTIME_DIR=%s\n' "$runtime_dir" >> "$GITHUB_ENV"
+      - name: Build the digest-pinned scratch writer image
+        id: image
+        run: |
+          cc -O2 -std=c11 -Wall -Wextra -Werror -static \
+            native/podman-writer-probe.c \
+            -o integration/fixtures/podman-writer/podman-writer-probe
+          podman info --format=json > "$RUNNER_TEMP/podman-info.json"
+          test "$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1])).host.security.rootless" "$RUNNER_TEMP/podman-info.json")" = "true"
+          podman build \
+            --file integration/fixtures/podman-writer/Containerfile \
+            --tag localhost/portable-codex-writer:integration \
+            integration/fixtures/podman-writer
+          digest="$(podman image inspect --format '{{.Digest}}' localhost/portable-codex-writer:integration)"
+          test -n "$digest"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Exercise launch, bind write, stop, and cold reconcile
+        run: node --test integration/podman-writer-supervisor.mjs
+        env:
+          PODMAN_EXECUTABLE: /usr/bin/podman
+          PODMAN_WRITER_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          PODMAN_WRITER_IMAGE_REFERENCE: localhost/portable-codex-writer@${{ steps.image.outputs.digest }}
+          PODMAN_WRITER_TEST_ROOT: /var/tmp/portable-codex-runtime-podman-${{ github.run_id }}
+      - name: Remove the integration image
+        if: always()
+        run: podman image rm --force localhost/portable-codex-writer:integration || true
+
+  linux-ext4-producer:
+    name: Linux ext4 physical producer
+    runs-on: ubuntu-24.04
+    outputs:
+      archive-mount-publication-control-identity: ${{ steps.provider-state-head.outputs.archive-mount-control }}
+      archive-publication-control-identity: ${{ steps.provider-state-head.outputs.archive-control }}
+      provider-state-head: ${{ steps.provider-state-head.outputs.value }}
+      service-uid: ${{ steps.provider-state-head.outputs.service-uid }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install the privileged ext4 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes acl build-essential e2fsprogs jq libcap2-bin udev util-linux
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            native/linux-ext4-inspector.c \
+            -o "$RUNNER_TEMP/linux-ext4-inspector"
+          sudo groupadd --system portable-codex-ext4
+          sudo usermod --append --groups portable-codex-ext4 "$(id -un)"
+          sudo install -d -m 0755 /usr/local/libexec
+          sudo install -o root -g portable-codex-ext4 -m 0750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          sudo setcap cap_dac_override,cap_sys_admin=ep \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          test "$(stat -c '%U:%G:%a' /usr/local/libexec/portable-codex-linux-ext4-inspector)" = \
+            'root:portable-codex-ext4:750'
+          getcap /usr/local/libexec/portable-codex-linux-ext4-inspector |
+            grep -Fx '/usr/local/libexec/portable-codex-linux-ext4-inspector cap_dac_override,cap_sys_admin=ep'
+          if sudo -u nobody test -x /usr/local/libexec/portable-codex-linux-ext4-inspector; then
+            exit 1
+          fi
+          set +e
+          sudo /usr/local/libexec/portable-codex-linux-ext4-inspector
+          root_identity_status="$?"
+          set -e
+          test "$root_identity_status" -eq 69
+          sudo install -o root -g portable-codex-ext4 -m 4750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test -u /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          set +e
+          sg portable-codex-ext4 -c \
+            '/usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative'
+          identity_status="$?"
+          set -e
+          sudo rm -f /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test "$identity_status" -eq 69
+      - name: Publish and verify on a real ext4 loop image
+        env:
+          LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
+          LINUX_EXT4_TEST_MODE: producer
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          sg portable-codex-ext4 -c \
+            'node --test integration/linux-ext4-physical-backend.mjs'
+      - name: Capture the provider head and sparse transfer image
+        id: provider-state-head
+        env:
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          value="$(sudo jq -c '.providerStateHead' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          archive_mount_control="$(sudo jq -c '.archiveMountPublicationControlIdentity' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          archive_control="$(sudo jq -c '.archivePublicationControlIdentity' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          service_uid="$(sudo jq -r '.serviceUid' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          test -n "$value"
+          test -n "$archive_mount_control"
+          test -n "$archive_control"
+          test "$service_uid" = "$(id -u)"
+          printf 'archive-mount-control=%s\n' "$archive_mount_control" >> "$GITHUB_OUTPUT"
+          printf 'archive-control=%s\n' "$archive_control" >> "$GITHUB_OUTPUT"
+          printf 'service-uid=%s\n' "$service_uid" >> "$GITHUB_OUTPUT"
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
+          sudo tar \
+            --acls \
+            --numeric-owner \
+            --sparse \
+            --xattrs \
+            -C /var/tmp \
+            -cf "$RUNNER_TEMP/linux-ext4-transfer.tar" \
+            "portable-codex-runtime-linux-ext4-${{ github.run_id }}"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/linux-ext4-transfer.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-ext4-transfer-${{ github.run_id }}
+          path: ${{ runner.temp }}/linux-ext4-transfer.tar
+          if-no-files-found: error
+          retention-days: 1
+      - name: Clean the scoped producer resources
+        if: always()
+        env:
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          case "$LINUX_EXT4_TEST_ROOT" in
+            /var/tmp/portable-codex-runtime-linux-ext4-[1-9]*) ;;
+            *) exit 1 ;;
+          esac
+          findmnt -rn -o TARGET | sort -r | while IFS= read -r target; do
+            case "$target" in
+              "$LINUX_EXT4_TEST_ROOT"/archive-mounts/*) sudo umount -- "$target" ;;
+              "$LINUX_EXT4_TEST_ROOT"/mounts/*) sudo umount -- "$target" ;;
+            esac
+          done
+          if test -d "$LINUX_EXT4_TEST_ROOT/images"; then
+            find "$LINUX_EXT4_TEST_ROOT/images" -maxdepth 1 -type f -name '*.img' -print0 |
+              while IFS= read -r -d '' image; do
+                sudo losetup -j "$image" | cut -d: -f1 |
+                  while IFS= read -r loop; do
+                    test -z "$loop" || sudo losetup -d "$loop"
+                  done
+              done
+          fi
+          sudo udevadm settle
+          sudo rm -rf -- "$LINUX_EXT4_TEST_ROOT"
+
+  linux-ext4-consumer:
+    name: Linux ext4 cross-host consumer
+    needs: linux-ext4-producer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install the privileged ext4 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes acl build-essential e2fsprogs libcap2-bin udev util-linux
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            native/linux-ext4-inspector.c \
+            -o "$RUNNER_TEMP/linux-ext4-inspector"
+          sudo groupadd --system portable-codex-ext4
+          sudo usermod --append --groups portable-codex-ext4 "$(id -un)"
+          sudo install -d -m 0755 /usr/local/libexec
+          sudo install -o root -g portable-codex-ext4 -m 0750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          sudo setcap cap_dac_override,cap_sys_admin=ep \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          test "$(stat -c '%U:%G:%a' /usr/local/libexec/portable-codex-linux-ext4-inspector)" = \
+            'root:portable-codex-ext4:750'
+          getcap /usr/local/libexec/portable-codex-linux-ext4-inspector |
+            grep -Fx '/usr/local/libexec/portable-codex-linux-ext4-inspector cap_dac_override,cap_sys_admin=ep'
+          if sudo -u nobody test -x /usr/local/libexec/portable-codex-linux-ext4-inspector; then
+            exit 1
+          fi
+          set +e
+          sudo /usr/local/libexec/portable-codex-linux-ext4-inspector
+          root_identity_status="$?"
+          set -e
+          test "$root_identity_status" -eq 69
+          sudo install -o root -g portable-codex-ext4 -m 4750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test -u /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          set +e
+          sg portable-codex-ext4 -c \
+            '/usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative'
+          identity_status="$?"
+          set -e
+          sudo rm -f /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test "$identity_status" -eq 69
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-ext4-transfer-${{ github.run_id }}
+          path: ${{ runner.temp }}/linux-ext4-transfer
+      - name: Restore the sparse transfer image
+        run: |
+          sudo tar \
+            --acls \
+            --numeric-owner \
+            --same-owner \
+            --sparse \
+            --xattrs \
+            -C /var/tmp \
+            -xf "$RUNNER_TEMP/linux-ext4-transfer/linux-ext4-transfer.tar"
+      - name: Reconcile, verify, reattach, and destroy on a new host
+        env:
+          LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY: ${{ needs.linux-ext4-producer.outputs.archive-mount-publication-control-identity }}
+          LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY: ${{ needs.linux-ext4-producer.outputs.archive-publication-control-identity }}
+          LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
+          LINUX_EXT4_PRODUCER_UID: ${{ needs.linux-ext4-producer.outputs.service-uid }}
+          LINUX_EXT4_PROVIDER_STATE_HEAD: ${{ needs.linux-ext4-producer.outputs.provider-state-head }}
+          LINUX_EXT4_TEST_MODE: consumer
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          sg portable-codex-ext4 -c \
+            'node --test integration/linux-ext4-physical-backend.mjs'
+      - name: Clean the scoped consumer resources
+        if: always()
+        env:
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          case "$LINUX_EXT4_TEST_ROOT" in
+            /var/tmp/portable-codex-runtime-linux-ext4-[1-9]*) ;;
+            *) exit 1 ;;
+          esac
+          findmnt -rn -o TARGET | sort -r | while IFS= read -r target; do
+            case "$target" in
+              "$LINUX_EXT4_TEST_ROOT"/archive-mounts/*) sudo umount -- "$target" ;;
+              "$LINUX_EXT4_TEST_ROOT"/mounts/*) sudo umount -- "$target" ;;
+            esac
+          done
+          if test -d "$LINUX_EXT4_TEST_ROOT/images"; then
+            find "$LINUX_EXT4_TEST_ROOT/images" -maxdepth 1 -type f -name '*.img' -print0 |
+              while IFS= read -r -d '' image; do
+                sudo losetup -j "$image" | cut -d: -f1 |
+                  while IFS= read -r loop; do
+                    test -z "$loop" || sudo losetup -d "$loop"
+                  done
+              done
+          fi
+          sudo udevadm settle
+          sudo rm -rf -- "$LINUX_EXT4_TEST_ROOT"

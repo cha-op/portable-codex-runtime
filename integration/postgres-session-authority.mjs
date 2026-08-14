@@ -102,6 +102,9 @@ import {
   SESSION_AUTHORITY_MIGRATION_VERSION,
 } from "../src/postgres-serializable-store.mjs";
 import {
+  createPostgresFilesystemImageProviderHeadAnchor,
+} from "../src/postgres-filesystem-image-provider-head-anchor.mjs";
+import {
   PostgresRestoreRecoveryCursorStoreError,
   createPostgresRestoreRecoveryCursorStore,
 } from "../src/postgres-restore-recovery-cursor-store.mjs";
@@ -180,6 +183,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
     ),
     version: 7,
   }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/008-filesystem-image-provider-heads.sql",
+      import.meta.url,
+    ),
+    version: 8,
+  }),
 ]);
 
 if (!databaseConfigured) {
@@ -234,6 +244,175 @@ async function readMigrationLedger(pool) {
     ].join(" "),
   );
   return result.rows;
+}
+
+async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
+  pool,
+  store,
+) {
+  const providerId = "filesystem-image-ext4";
+  const anchorId = `integration-${randomUUID()}`;
+  const createAnchor = (
+    selectedStore = store,
+    selectedAnchorId = anchorId,
+  ) =>
+    createPostgresFilesystemImageProviderHeadAnchor({
+      store: selectedStore,
+      providerId,
+      anchorId: selectedAnchorId,
+    });
+  const genesis = {
+    contractVersion: 1,
+    sequence: 0,
+    lastChecksum: null,
+    ledgerBytes: 0,
+  };
+  const first = {
+    contractVersion: 1,
+    sequence: 1,
+    lastChecksum: "a".repeat(64),
+    ledgerBytes: 512,
+  };
+  const second = {
+    contractVersion: 1,
+    sequence: 2,
+    lastChecksum: "b".repeat(64),
+    ledgerBytes: 1024,
+  };
+  const anchor = createAnchor();
+  assert.deepEqual(await anchor.readHead(), genesis);
+  assert.equal(
+    await anchor.compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: first,
+    }),
+    true,
+  );
+  assert.deepEqual(await createAnchor().readHead(), first);
+  assert.equal(
+    await anchor.compareAndAdvance({
+      expectedHead: {
+        ...first,
+        lastChecksum: "f".repeat(64),
+      },
+      nextHead: second,
+    }),
+    false,
+  );
+  assert.deepEqual(await anchor.readHead(), first);
+  assert.equal(
+    await anchor.compareAndAdvance({
+      expectedHead: first,
+      nextHead: second,
+    }),
+    true,
+  );
+  assert.deepEqual(await createAnchor().readHead(), second);
+  const concurrentHeads = [
+    {
+      contractVersion: 1,
+      sequence: 3,
+      lastChecksum: "c".repeat(64),
+      ledgerBytes: 1536,
+    },
+    {
+      contractVersion: 1,
+      sequence: 3,
+      lastChecksum: "d".repeat(64),
+      ledgerBytes: 2048,
+    },
+  ];
+  const concurrentResults = await Promise.all(
+    concurrentHeads.map((nextHead) =>
+      createAnchor().compareAndAdvance({
+        expectedHead: second,
+        nextHead,
+      }),
+    ),
+  );
+  assert.deepEqual([...concurrentResults].sort(), [false, true]);
+  const concurrentWinner = concurrentHeads[
+    concurrentResults.indexOf(true)
+  ];
+  assert.deepEqual(await createAnchor().readHead(), concurrentWinner);
+
+  const stored = await pool.query(
+    [
+      "SELECT provider_id, anchor_id, contract_version, sequence,",
+      "last_checksum, ledger_bytes::pg_catalog.text AS ledger_bytes",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, anchorId],
+  );
+  assert.deepEqual(stored.rows, [
+    {
+      provider_id: providerId,
+      anchor_id: anchorId,
+      contract_version: 1,
+      sequence: concurrentWinner.sequence,
+      last_checksum: concurrentWinner.lastChecksum,
+      ledger_bytes: String(concurrentWinner.ledgerBytes),
+    },
+  ]);
+
+  const acknowledgementLossAnchorId = `ack-loss-${randomUUID()}`;
+  const acknowledgementLossPool =
+    commitAcknowledgementLossAfterQueryPool(
+      pool,
+      "filesystem image provider head anchor",
+      (text) =>
+        text.startsWith(
+          "INSERT INTO session_authority.filesystem_image_provider_heads",
+        ),
+    );
+  const acknowledgementLossStore = new PostgresSerializableStore({
+    dedicatedPool: acknowledgementLossPool,
+    maxTransactionAttempts: 1,
+  });
+  await assert.rejects(
+    createAnchor(
+      acknowledgementLossStore,
+      acknowledgementLossAnchorId,
+    ).compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: first,
+    }),
+    assertCommitOutcomeUncertain,
+  );
+  assert.equal(acknowledgementLossPool.didLoseAcknowledgement(), true);
+  assert.deepEqual(
+    await createAnchor(store, acknowledgementLossAnchorId).readHead(),
+    first,
+  );
+
+  const resultLossAnchorId = `result-loss-${randomUUID()}`;
+  const resultLossPool = firstMatchingQueryResultFailurePool(
+    pool,
+    "filesystem image provider head anchor read",
+    (text) =>
+      text.startsWith("SELECT ") &&
+      text.includes(
+        "FROM session_authority.filesystem_image_provider_heads",
+      ),
+  );
+  const resultLossStore = new PostgresSerializableStore({
+    dedicatedPool: resultLossPool,
+    maxTransactionAttempts: 1,
+  });
+  await assert.rejects(
+    createAnchor(resultLossStore, resultLossAnchorId).readHead(),
+    assertTransactionBoundaryLost,
+  );
+  assert.equal(resultLossPool.didFail(), true);
+
+  await pool.query(
+    [
+      "DELETE FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id IN ($2, $3)",
+    ].join(" "),
+    [providerId, anchorId, acknowledgementLossAnchorId],
+  );
 }
 
 function frozenNullPrototypeRecord(entries) {
@@ -609,7 +788,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 7,
+    version: 8,
   });
   const registry = await pool.query(
     [
@@ -3710,10 +3889,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 7);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 8);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7],
+      [1, 2, 3, 4, 5, 6, 7, 8],
     );
 
     await pool.query(
@@ -3723,7 +3902,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 7,
+      version: 8,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -3736,7 +3915,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 7,
+      version: 8,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -3751,7 +3930,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 7,
+      version: 8,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -3763,8 +3942,9 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 7,
+      version: 8,
     });
+    await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
     await assertLegacyRestoreV2MigrationGate(
       pool,
       store,
@@ -10320,7 +10500,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6, 7],
+          [1, 2, 3, 4, 5, 6, 7, 8],
         );
 
         const input = writerLaunchAttemptInput(

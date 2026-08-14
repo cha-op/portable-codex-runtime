@@ -490,22 +490,33 @@ agent does not consume a subagent slot. Depth is counted as root `0`, child `1`,
 and grandchild `2`; a depth-2 agent cannot spawn another agent. These are
 runtime policy limits, not per-parent multipliers.
 
-## Deferred Implementation
+## Implementation Boundary
 
-Later pull requests own:
+These contracts remain provider-neutral and do not themselves mount storage,
+launch a container, or grant physical mutation authority. Separate layers now
+provide the production checkpoint authority/catalogue, held-directory
+publication and launch admission, plus production-injectable Linux ext4 and
+rootless Podman components for clean/manual-fencing operation. That
+physical slice binds raw-image lifecycle to held descriptors, anchors provider
+state externally, keeps archive mount-root and artifact-child publication
+control identities distinct, and verifies clean detach, transfer, and remount
+on two hosts. See `linux-ext4-physical-backend.md`.
+The trusted bridge from committed ext4 identity to Podman filesystem authority
+and same-process evidence for the combined components remain pending.
 
-- Podman/Docker launch and UID/SELinux mapping;
-- production local, NFS, LVM, ZFS, cloud-volume, or filesystem-image adapters;
-- physical exact-owner detach and host-fence implementations beyond the
-  PostgreSQL release/force-fence authority and structural proof envelopes;
-- production held-directory launch authority, provider-specific mutation/fence
-  transitions, proofs, and conformance validators beyond the stopped-directory
-  adapter;
-- the production checkpoint mutation-authority and catalogue adapter;
-- production graceful-abort storage barriers and crash-prefix atomic capture;
+Remaining adapter and evidence work includes:
+
+- Docker, UID-remapping, and SELinux-specific launch profiles beyond the
+  current rootless Podman path;
+- NFS, LVM, ZFS, cloud-volume, and other shared or remote storage adapters;
+- automatic exact-owner host fencing beyond the ext4 backend's clean detach and
+  `fencing: "manual"` boundary;
+- production graceful-abort barriers and power-loss/crash-prefix atomic
+  capture;
 - composition of the separate pinned-runtime rollout-tail repair primitive
   with trusted OCI resolution and launcher admission;
-- ext4 or filesystem-image physical snapshot and restore;
-- differential compression, encryption, retention, and atomic publication;
-- cross-host migration and fault injection; and
+- differential export/compression, content-addressed distribution, encryption,
+  retention, registry trust, and remote image transport;
+- full cross-host failover, stale-writer, and fault-injection evidence beyond
+  clean detach/transfer/remount verification; and
 - the read-only Git Summary.

@@ -16,6 +16,10 @@ versioned provider attachment proof, atomic detached activation into a
 prepared launch, four bounded no-relaunch recovery lanes, and a
 production-neutral detached-restore foreground composition seam and runtime
 assembly with a narrow same-launcher writer-start ingress.
+The Linux production-injection surface now has a concrete clean/manual-fencing
+implementation: FD-bound raw ext4 images, externally anchored provider state,
+separate publication-control identities, and a rootless Podman writer
+supervisor.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -71,9 +75,11 @@ The runtime now has executable v1 record validators for a secret-free session
 manifest, trusted OCI-resolution matching, uint64 fencing epochs,
 lease/attachment matching, dedicated exact force-fence request/result
 envelopes, declared storage backend capabilities, structural rootless worker
-directory binds, and recovery checkpoint classes. Physical launch, fencing,
-and snapshot authorization remain the responsibility of later concrete
-adapters and their conformance tests.
+directory binds, and recovery checkpoint classes. These contracts remain
+provider-neutral; the Linux ext4 and Podman components supply independent
+clean, manually fenced seams without turning a lease or database epoch into
+physical authority. Their trusted persistent-identity bridge and same-process
+conformance evidence remain pending.
 An optional version 1 restore-attachment activation extension binds the exact
 committed publication object and materialization digest to the provider's
 attach mutation, canonical attachment, and proof. Path equality remains
@@ -522,9 +528,25 @@ it is not replay of a durable mutation. The generic lifecycle methods
 `provisionSession()`, and `restoreCheckpoint()` remain outside the currently
 assembled restore saga even though deployment settles their contracts.
 
-Crash-consistent ext4 or filesystem-image backend execution, differential
-compression, periodic backup, and cross-host restore verification remain later
-work; neither a database lease nor a higher epoch is a physical writer fence.
+Production-injectable Linux components now own sparse raw ext4-image creation,
+FD-bound format/mount/sync/unmount/loop-detach settlement, an append-only
+provider ledger checked against an external PostgreSQL head, separate
+persistent publication-control identities, and a rootless Podman writer
+supervisor. Its two-host Ubuntu conformance flow cleanly detaches and transfers
+separate session and archive images. On the consumer host, the externally
+anchored archive mount-root tuple makes the first remount verification-only;
+the distinct artifact-child tuple then authorizes publication verification for
+that exact owned root. The default Podman filesystem authority protects the
+object selected for a call; a trusted adapter that binds the provider's
+committed ext4 identity into that authority, and same-process evidence for the
+combined components, remain pending.
+
+That evidence is a clean operator-controlled transfer boundary, not sudden
+power-loss or crash-prefix evidence and not automatic stale-writer fencing.
+The backend remains `fencing: "manual"`; neither a database lease nor a higher
+epoch is a physical fence. Differential export/compression, encryption,
+retention, registry publisher/signature trust, and remote image transport
+remain outside this slice.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -533,7 +555,9 @@ capability. This closes serialized image-identity substitution inside the
 authority boundary. It intentionally rejects artifact manifests and unsupported
 descriptor extensions; it does not implement registry signature policy, mount
 an image, launch Podman/Docker, or turn a database epoch into a physical
-stale-writer fence. The stopped-directory backend remains manual-fencing only.
+stale-writer fence. Those are limits of the image-profile component; the
+separately injected ext4 backend and Podman supervisor implement only the clean,
+manual-fencing component boundaries described above.
 See `docs/architecture/session-runtime-authority.md`.
 
 ## Snapshot and Restore Core
@@ -712,9 +736,13 @@ settlement foundation, complete deployment-owned physical binding graph, and
 operational lease admission are assembled;
 the safety matrix now binds the seven real-PostgreSQL durable cuts, separate
 new-object physical/runtime/controller retry and registry rehydration, and
-representative settlement timer/drain evidence. Filesystem-image execution is
-the next independent backend slice; differential backup remains later work.
-See
+representative settlement timer/drain evidence. The Linux ext4 physical slice
+now supplies the clean/manual-fencing storage and rootless Podman collaborators
+through those injection points, including two-host clean detach, transfer,
+verification-only first remount, and separate mount-root/artifact-child
+identity verification. Crash-prefix recovery, automatic stale-writer fencing,
+and differential/compressed backup remain later independent work. See
+`docs/architecture/linux-ext4-physical-backend.md` and
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

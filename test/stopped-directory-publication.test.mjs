@@ -32,6 +32,7 @@ import {
   stoppedDirectoryPublicationCandidateName,
 } from "../src/stopped-directory-publication.mjs";
 import {
+  bindStoppedTreeObjectIdentity,
   digestStoppedTreeIdentities,
   digestTree,
   inspectStoppedTreeObjectIdentity,
@@ -72,6 +73,41 @@ async function inspectTestPersistentObjectIdentityAs(path, objectId) {
   return {
     ...(await inspectTestPersistentObjectIdentity(path)),
     objectId,
+  };
+}
+
+async function inspectTestFilesystemObject(path) {
+  return {
+    filesystem: {
+      durability: "local-fsync-rename",
+      filesystemId: "test-filesystem-001",
+      objectIdentityScheme: TEST_OBJECT_IDENTITY_SCHEME,
+      type: "test-local",
+    },
+    identity: await inspectTestPersistentObjectIdentity(path),
+  };
+}
+
+async function createTestPublicationControl(ownedRoot) {
+  const lockPath = join(
+    await realpath(ownedRoot),
+    STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME,
+  );
+  await writeFile(lockPath, "publication control\n", { mode: 0o600 });
+  const observation = await inspectTestFilesystemObject(lockPath);
+  return Object.freeze({
+    expected: Object.freeze({
+      filesystem: Object.freeze({ ...observation.filesystem }),
+      objectId: observation.identity.objectId,
+    }),
+    lockPath,
+  });
+}
+
+function mutablePublicationControlExpected(expected) {
+  return {
+    filesystem: { ...expected.filesystem },
+    objectId: expected.objectId,
   };
 }
 
@@ -414,6 +450,81 @@ function assertPublicationError(error, code, commitState) {
   return true;
 }
 
+function promiseSettlementCases(resolvedValue) {
+  const cases = [
+    {
+      name: "ordinary thenable",
+      create() {
+        let executions = 0;
+        return {
+          assertUntouched: () => assert.equal(executions, 0),
+          value: {
+            then() {
+              executions += 1;
+              throw new Error("ordinary thenable must not execute");
+            },
+          },
+        };
+      },
+    },
+    {
+      name: "Promise Proxy",
+      create() {
+        let executions = 0;
+        const trap = () => {
+          executions += 1;
+          throw new Error("Promise Proxy trap must not execute");
+        };
+        return {
+          assertUntouched: () => assert.equal(executions, 0),
+          value: new Proxy(Promise.resolve(resolvedValue), {
+            get: trap,
+            getOwnPropertyDescriptor: trap,
+            getPrototypeOf: trap,
+          }),
+        };
+      },
+    },
+    {
+      name: "Promise subclass",
+      create() {
+        let executions = 0;
+        class SettlementPromise extends Promise {
+          then(...args) {
+            executions += 1;
+            return super.then(...args);
+          }
+        }
+        return {
+          assertUntouched: () => assert.equal(executions, 0),
+          value: SettlementPromise.resolve(resolvedValue),
+        };
+      },
+    },
+  ];
+  for (const key of ["then", "catch", "finally", "constructor"]) {
+    cases.push({
+      name: `own ${key} accessor`,
+      create() {
+        let executions = 0;
+        const value = Promise.resolve(resolvedValue);
+        Object.defineProperty(value, key, {
+          configurable: true,
+          get() {
+            executions += 1;
+            throw new Error(`own ${key} accessor must not execute`);
+          },
+        });
+        return {
+          assertUntouched: () => assert.equal(executions, 0),
+          value,
+        };
+      },
+    });
+  }
+  return cases;
+}
+
 async function readArtifactManifest(artifactDirectory) {
   return JSON.parse(await readFile(join(artifactDirectory, "artifact.json"), "utf8"));
 }
@@ -596,6 +707,697 @@ test("persistent identity rejects accessor-based adapter results", async (t) => 
     /persistent object identity is invalid/u,
   );
   assert.equal(getterCalls, 0);
+});
+
+test("persistent identity binder rejects Proxy and accessor records without execution", async (t) => {
+  const fixture = await createFixture(t);
+  const path = join(fixture.sourceDirectory, "workspace", "README.md");
+  const expectedIdentity = await lstat(path, { bigint: true });
+  let proxyTraps = 0;
+  const hostileProxy = new Proxy({}, {
+    get() {
+      proxyTraps += 1;
+      throw new Error("persistent identity proxy trap must not run");
+    },
+    getOwnPropertyDescriptor() {
+      proxyTraps += 1;
+      throw new Error("persistent identity proxy trap must not run");
+    },
+    ownKeys() {
+      proxyTraps += 1;
+      throw new Error("persistent identity proxy trap must not run");
+    },
+  });
+  assert.throws(
+    () => bindStoppedTreeObjectIdentity(hostileProxy, expectedIdentity),
+    /persistent object identity is invalid/u,
+  );
+  assert.equal(proxyTraps, 0);
+
+  let accessorCalls = 0;
+  const hostileAccessor = {};
+  for (const key of ["device", "inode", "objectId"]) {
+    Object.defineProperty(hostileAccessor, key, {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error("persistent identity accessor must not run");
+      },
+    });
+  }
+  assert.throws(
+    () => bindStoppedTreeObjectIdentity(hostileAccessor, expectedIdentity),
+    /persistent object identity is invalid/u,
+  );
+  assert.equal(accessorCalls, 0);
+});
+
+test("persistent identity binder ignores benign metadata churn", async (t) => {
+  const fixture = await createFixture(t);
+  const path = join(fixture.sourceDirectory, "workspace", "README.md");
+  const metadata = await lstat(path, { bigint: true });
+  const identity = await inspectTestPersistentObjectIdentity(path);
+  assert.equal(
+    bindStoppedTreeObjectIdentity(identity, {
+      dev: metadata.dev,
+      ino: metadata.ino,
+      mtimeNs: metadata.mtimeNs + 1n,
+      size: metadata.size + 1n,
+    }),
+    identity.objectId,
+  );
+});
+
+test("atomic filesystem/object observations never consume split samples", async (t) => {
+  let atomicCalls = 0;
+  let splitFilesystemCalls = 0;
+  let splitIdentityCalls = 0;
+  const fixture = await createFixture(t, {
+    inspectFilesystem: async () => {
+      splitFilesystemCalls += 1;
+      return {
+        durability: "local-fsync-rename",
+        filesystemId: "split-filesystem-stale",
+        objectIdentityScheme: "split-scheme-stale",
+        type: "test-local",
+      };
+    },
+    inspectFilesystemObject: async (path) => {
+      atomicCalls += 1;
+      return inspectTestFilesystemObject(path);
+    },
+    inspectPersistentObjectIdentity: async (path) => {
+      splitIdentityCalls += 1;
+      return inspectTestPersistentObjectIdentityAs(
+        path,
+        "split-object-from-another-sample",
+      );
+    },
+  });
+
+  const outcome = await fixture.publication.publishCheckpointArtifact(
+    captureOptions(fixture),
+  );
+  assert.equal(outcome.result.mutation.status, "checkpoint-created");
+  assert.equal(atomicCalls > 0, true);
+  assert.equal(splitFilesystemCalls, 0);
+  assert.equal(splitIdentityCalls, 0);
+  const publication = (
+    await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })
+  ).record.binding.publication;
+  for (const root of [
+    publication.destination,
+    publication.journal,
+    publication.source,
+  ]) {
+    const filesystem = root.rootFilesystem ?? root.filesystem;
+    assert.equal(root.root.filesystemId, filesystem.filesystemId);
+    assert.equal(
+      root.root.objectIdentityScheme,
+      filesystem.objectIdentityScheme,
+    );
+  }
+});
+
+test("atomic filesystem/object observation binds identity to the pinned root", async (t) => {
+  let fixture;
+  let targetRoot;
+  fixture = await createFixture(t, {
+    inspectFilesystemObject: async (path) => {
+      if (path !== targetRoot) return inspectTestFilesystemObject(path);
+      const observation = await inspectTestFilesystemObject(path);
+      return {
+        filesystem: observation.filesystem,
+        identity: await inspectTestPersistentObjectIdentity(
+          fixture.sourceOwnedRoot,
+        ),
+      };
+    },
+  });
+  targetRoot = await realpath(fixture.artifactOwnedRoot);
+
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+    (error) =>
+      assertPublicationError(
+        error,
+        "unsupported_publication_filesystem",
+        "not-committed",
+      ),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record,
+    null,
+  );
+});
+
+test("atomic root mismatch preserves committed replay classification", async (t) => {
+  let corruptTarget = false;
+  let fixture;
+  let targetRoot;
+  fixture = await createFixture(t, {
+    inspectFilesystemObject: async (path) => {
+      if (!corruptTarget || path !== targetRoot) {
+        return inspectTestFilesystemObject(path);
+      }
+      const observation = await inspectTestFilesystemObject(path);
+      return {
+        filesystem: observation.filesystem,
+        identity: await inspectTestPersistentObjectIdentity(
+          fixture.sourceOwnedRoot,
+        ),
+      };
+    },
+  });
+  targetRoot = await realpath(fixture.artifactOwnedRoot);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+
+  corruptTarget = true;
+  await assert.rejects(
+    fixture.publication.publishCheckpointArtifact(options),
+    (error) =>
+      assertPublicationError(error, "published_state_invalid", "committed"),
+  );
+  assert.equal(
+    (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID })).record
+      .state,
+    "committed",
+  );
+});
+
+test("atomic filesystem/object observation rejects hostile records without execution", async (t) => {
+  await t.test("Proxy", async (t) => {
+    let traps = 0;
+    const hostile = new Proxy({}, {
+      get() {
+        traps += 1;
+        throw new Error("atomic observation Proxy trap must not run");
+      },
+      getOwnPropertyDescriptor() {
+        traps += 1;
+        throw new Error("atomic observation Proxy trap must not run");
+      },
+      ownKeys() {
+        traps += 1;
+        throw new Error("atomic observation Proxy trap must not run");
+      },
+    });
+    const fixture = await createFixture(t, {
+      inspectFilesystemObject: () => hostile,
+    });
+    await assert.rejects(
+      fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+      (error) =>
+        assertPublicationError(
+          error,
+          "unsupported_publication_filesystem",
+          "uncertain",
+        ),
+    );
+    assert.equal(traps, 0);
+  });
+
+  await t.test("accessors", async (t) => {
+    let accessorCalls = 0;
+    const hostile = {};
+    for (const key of ["filesystem", "identity", "then"]) {
+      Object.defineProperty(hostile, key, {
+        enumerable: true,
+        get() {
+          accessorCalls += 1;
+          throw new Error("atomic observation accessor must not run");
+        },
+      });
+    }
+    const fixture = await createFixture(t, {
+      inspectFilesystemObject: () => hostile,
+    });
+    await assert.rejects(
+      fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+      (error) =>
+        assertPublicationError(
+          error,
+          "unsupported_publication_filesystem",
+          "uncertain",
+        ),
+    );
+    assert.equal(accessorCalls, 0);
+  });
+});
+
+test("publication control gates all publish and verify entry points", async (t) => {
+  const expectedByRoot = new Map();
+  const events = [];
+  const inspectedPaths = [];
+  const resolvedRoots = [];
+  let resolverInvocation = 0;
+
+  function resolveExpectedPublicationControl(targetOwnedRoot) {
+    assert.equal(this, undefined);
+    resolvedRoots.push(targetOwnedRoot);
+    events.push("resolve");
+    resolverInvocation += 1;
+    const expected = expectedByRoot.get(targetOwnedRoot);
+    assert.notEqual(expected, undefined);
+    const snapshot = mutablePublicationControlExpected(expected);
+    return resolverInvocation % 2 === 0 ? Promise.resolve(snapshot) : snapshot;
+  }
+
+  function inspectPublicationControl(path) {
+    assert.equal(this, undefined);
+    inspectedPaths.push(path);
+    events.push("inspect");
+    return inspectTestFilesystemObject(path);
+  }
+
+  const fixture = await createFixture(t, {
+    acquireLock: async (...args) => {
+      const lock = await simpleLockProvider()(...args);
+      return {
+        async assertHeld() {
+          events.push("assert");
+          await lock.assertHeld();
+        },
+        async release() {
+          await lock.release();
+        },
+        async renameWhileHeld(...renameArgs) {
+          return lock.renameWhileHeld(...renameArgs);
+        },
+      };
+    },
+    inspectPublicationControl,
+    resolveExpectedPublicationControl,
+  });
+  const artifactControl = await createTestPublicationControl(
+    fixture.artifactOwnedRoot,
+  );
+  const destinationControl = await createTestPublicationControl(
+    fixture.destinationOwnedRoot,
+  );
+  expectedByRoot.set(fixture.artifactOwnedRoot, artifactControl.expected);
+  expectedByRoot.set(
+    fixture.destinationOwnedRoot,
+    destinationControl.expected,
+  );
+
+  const resetObservations = () => {
+    events.length = 0;
+    inspectedPaths.length = 0;
+    resolvedRoots.length = 0;
+  };
+  const assertSingleControlObservation = (ownedRoot, control) => {
+    assert.deepEqual(resolvedRoots, [ownedRoot]);
+    assert.deepEqual(inspectedPaths, [control.lockPath]);
+    const inspection = events.indexOf("inspect");
+    assert.notEqual(inspection, -1);
+    assert.equal(events[inspection - 1], "assert");
+    assert.equal(events[inspection + 1], "assert");
+  };
+
+  const capture = captureOptions(fixture);
+  const captured = await fixture.publication.publishCheckpointArtifact(capture);
+  fixture.artifactProof = Object.freeze({
+    artifactManifestDigest: captured.materialization.artifactManifestDigest,
+    captureOperationId: CAPTURE_OPERATION_ID,
+    modeledDigest: captured.materialization.modeledDigest,
+  });
+  assertSingleControlObservation(fixture.artifactOwnedRoot, artifactControl);
+
+  resetObservations();
+  await fixture.publication.verifyCommittedCheckpointArtifact(
+    committedVerificationOptions(fixture, capture),
+  );
+  assertSingleControlObservation(fixture.artifactOwnedRoot, artifactControl);
+
+  resetObservations();
+  const restore = restoreOptions(fixture);
+  await fixture.publication.publishRestoreDestination(restore);
+  assertSingleControlObservation(
+    fixture.destinationOwnedRoot,
+    destinationControl,
+  );
+
+  resetObservations();
+  await fixture.publication.verifyCommittedRestoreDestination(
+    committedRestoreVerificationOptions(fixture, restore),
+  );
+  assertSingleControlObservation(
+    fixture.destinationOwnedRoot,
+    destinationControl,
+  );
+
+  for (const [operationId, objectId] of [
+    [CAPTURE_OPERATION_ID, artifactControl.expected.objectId],
+    [RESTORE_OPERATION_ID, destinationControl.expected.objectId],
+  ]) {
+    const durableRecord = (
+      await fixture.journal.read({ operationId })
+    ).record;
+    assert.notEqual(durableRecord, null);
+    assert.equal(JSON.stringify(durableRecord).includes(objectId), false);
+    assert.equal(
+      JSON.stringify(durableRecord).includes("expectedPublicationControl"),
+      false,
+    );
+  }
+});
+
+test("publication control resolver snapshots before queued execution", async (t) => {
+  let expected;
+  let firstAcquisitionStartedResolve;
+  const firstAcquisitionStarted = new Promise((resolve) => {
+    firstAcquisitionStartedResolve = resolve;
+  });
+  let releaseFirstAcquisition;
+  const firstAcquisitionGate = new Promise((resolve) => {
+    releaseFirstAcquisition = resolve;
+  });
+  t.after(() => releaseFirstAcquisition());
+  const resolverValues = [];
+  let resolverCalls = 0;
+  let publicationLockAcquisitions = 0;
+
+  function resolveExpectedPublicationControl(targetOwnedRoot) {
+    assert.equal(this, undefined);
+    assert.equal(targetOwnedRoot.endsWith("artifact-root"), true);
+    resolverCalls += 1;
+    const value = mutablePublicationControlExpected(expected);
+    resolverValues.push(value);
+    return resolverCalls === 1 ? value : Promise.resolve(value);
+  }
+
+  function inspectPublicationControl(path) {
+    assert.equal(this, undefined);
+    return inspectTestFilesystemObject(path);
+  }
+
+  const fixture = await createFixture(t, {
+    acquireLock: async (...args) => {
+      publicationLockAcquisitions += 1;
+      if (publicationLockAcquisitions === 1) {
+        firstAcquisitionStartedResolve();
+        await firstAcquisitionGate;
+      }
+      return simpleLockProvider()(...args);
+    },
+    inspectPublicationControl,
+    resolveExpectedPublicationControl,
+  });
+  const control = await createTestPublicationControl(
+    fixture.artifactOwnedRoot,
+  );
+  expected = control.expected;
+  const options = captureOptions(fixture);
+  const first = fixture.publication.publishCheckpointArtifact(options);
+  await firstAcquisitionStarted;
+
+  const replay = fixture.publication.publishCheckpointArtifact(options);
+  await Promise.resolve();
+  assert.equal(resolverCalls, 2);
+  assert.equal(publicationLockAcquisitions, 1);
+  resolverValues[1].filesystem.filesystemId = "mutated-after-resolution";
+  resolverValues[1].objectId = "mutated-after-resolution";
+  releaseFirstAcquisition();
+
+  const [firstOutcome, replayOutcome] = await Promise.all([first, replay]);
+  assert.equal(firstOutcome.replayed, false);
+  assert.equal(replayOutcome.replayed, true);
+  assert.equal(resolverCalls, 2);
+  assert.equal(publicationLockAcquisitions, 2);
+});
+
+test("null publication control preserves legacy archive behavior", async (t) => {
+  let resolverCalls = 0;
+  let inspectorCalls = 0;
+  const fixture = await createFixture(t, {
+    inspectPublicationControl() {
+      assert.equal(this, undefined);
+      inspectorCalls += 1;
+      throw new Error("null control must skip inspection");
+    },
+    resolveExpectedPublicationControl(targetOwnedRoot) {
+      assert.equal(this, undefined);
+      assert.equal(targetOwnedRoot, fixture.artifactOwnedRoot);
+      resolverCalls += 1;
+      return null;
+    },
+  });
+
+  const outcome = await fixture.publication.publishFreshCheckpointArtifact(
+    captureOptions(fixture),
+  );
+  assert.equal(outcome.result.mutation.status, "checkpoint-created");
+  assert.equal(resolverCalls, 1);
+  assert.equal(inspectorCalls, 0);
+});
+
+test("publication control rejects runtime replacement and persistent policy mismatch", async (t) => {
+  for (const scenario of [
+    "runtime replacement",
+    "filesystem incarnation",
+    "persistent object",
+  ]) {
+    await t.test(scenario, async (t) => {
+      let expected;
+      let fixture;
+      fixture = await createFixture(t, {
+        inspectPublicationControl: async (path) => {
+          const observation = await inspectTestFilesystemObject(path);
+          if (scenario !== "runtime replacement") return observation;
+          return {
+            filesystem: observation.filesystem,
+            identity: await inspectTestPersistentObjectIdentity(
+              fixture.sourceOwnedRoot,
+            ),
+          };
+        },
+        resolveExpectedPublicationControl: () => expected,
+      });
+      const control = await createTestPublicationControl(
+        fixture.artifactOwnedRoot,
+      );
+      expected = mutablePublicationControlExpected(control.expected);
+      if (scenario === "filesystem incarnation") {
+        expected.filesystem.filesystemId = "different-filesystem-incarnation";
+      } else if (scenario === "persistent object") {
+        expected.objectId = "different-persistent-object";
+      }
+
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_outcome_uncertain",
+            "uncertain",
+          ),
+      );
+      assert.equal(
+        (await fixture.journal.read({ operationId: CAPTURE_OPERATION_ID }))
+          .record,
+        null,
+      );
+    });
+  }
+});
+
+test("publication control callbacks reject hostile shapes without execution", async (t) => {
+  await t.test("callbacks must be paired", async (t) => {
+    for (const options of [
+      { inspectPublicationControl: () => {} },
+      { resolveExpectedPublicationControl: () => null },
+    ]) {
+      await assert.rejects(createFixture(t, options), (error) =>
+        assertPublicationError(
+          error,
+          "invalid_publication_request",
+          "not-committed",
+        ),
+      );
+    }
+  });
+
+  await t.test("callback Proxy", async (t) => {
+    let traps = 0;
+    const hostile = new Proxy(function hostileCallback() {}, {
+      apply() {
+        traps += 1;
+        throw new Error("callback Proxy must not execute");
+      },
+      get() {
+        traps += 1;
+        throw new Error("callback Proxy must not execute");
+      },
+    });
+    await assert.rejects(
+      createFixture(t, {
+        inspectPublicationControl: () => {},
+        resolveExpectedPublicationControl: hostile,
+      }),
+      (error) =>
+        assertPublicationError(
+          error,
+          "invalid_publication_request",
+          "not-committed",
+        ),
+    );
+    assert.equal(traps, 0);
+  });
+
+  for (const hostileKind of ["Proxy", "accessors", "thenable"]) {
+    await t.test(`resolver ${hostileKind}`, async (t) => {
+      let executions = 0;
+      let hostile;
+      if (hostileKind === "Proxy") {
+        hostile = new Proxy({}, {
+          get() {
+            executions += 1;
+            throw new Error("resolver result Proxy must not execute");
+          },
+          getOwnPropertyDescriptor() {
+            executions += 1;
+            throw new Error("resolver result Proxy must not execute");
+          },
+          ownKeys() {
+            executions += 1;
+            throw new Error("resolver result Proxy must not execute");
+          },
+        });
+      } else if (hostileKind === "accessors") {
+        hostile = {};
+        for (const key of ["filesystem", "objectId", "then"]) {
+          Object.defineProperty(hostile, key, {
+            enumerable: true,
+            get() {
+              executions += 1;
+              throw new Error("resolver result accessor must not execute");
+            },
+          });
+        }
+      } else {
+        hostile = {
+          then() {
+            executions += 1;
+            throw new Error("ordinary thenable must not execute");
+          },
+        };
+      }
+      let lockAcquisitions = 0;
+      const fixture = await createFixture(t, {
+        acquireLock: async (...args) => {
+          lockAcquisitions += 1;
+          return simpleLockProvider()(...args);
+        },
+        inspectPublicationControl: inspectTestFilesystemObject,
+        resolveExpectedPublicationControl: () => hostile,
+      });
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+        (error) =>
+          assertPublicationError(
+            error,
+            "invalid_publication_request",
+            "not-committed",
+          ),
+      );
+      assert.equal(executions, 0);
+      assert.equal(lockAcquisitions, 0);
+    });
+  }
+
+  for (const unsafe of promiseSettlementCases(null)) {
+    await t.test(`resolver ${unsafe.name}`, async (t) => {
+      const settlement = unsafe.create();
+      let lockAcquisitions = 0;
+      const fixture = await createFixture(t, {
+        acquireLock: async (...args) => {
+          lockAcquisitions += 1;
+          return simpleLockProvider()(...args);
+        },
+        inspectPublicationControl: inspectTestFilesystemObject,
+        resolveExpectedPublicationControl: () => settlement.value,
+      });
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+        (error) =>
+          assertPublicationError(
+            error,
+            "invalid_publication_request",
+            "not-committed",
+          ),
+      );
+      assert.equal(lockAcquisitions, 0);
+      settlement.assertUntouched();
+    });
+  }
+
+  await t.test("inspector accessors", async (t) => {
+    let expected;
+    let getterCalls = 0;
+    const hostile = {};
+    for (const key of ["filesystem", "identity", "then"]) {
+      Object.defineProperty(hostile, key, {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          throw new Error("control inspector accessor must not execute");
+        },
+      });
+    }
+    const fixture = await createFixture(t, {
+      inspectPublicationControl: () => hostile,
+      resolveExpectedPublicationControl: () => expected,
+    });
+    const control = await createTestPublicationControl(
+      fixture.artifactOwnedRoot,
+    );
+    expected = control.expected;
+    await assert.rejects(
+      fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+      (error) =>
+        assertPublicationError(
+          error,
+          "publication_outcome_uncertain",
+          "uncertain",
+        ),
+    );
+    assert.equal(getterCalls, 0);
+  });
+
+  for (const unsafeName of promiseSettlementCases(null).map(
+    (unsafe) => unsafe.name,
+  )) {
+    await t.test(`inspector ${unsafeName}`, async (t) => {
+      let expected;
+      let settlement;
+      const fixture = await createFixture(t, {
+        inspectPublicationControl: () => settlement.value,
+        resolveExpectedPublicationControl: () => expected,
+      });
+      const control = await createTestPublicationControl(
+        fixture.artifactOwnedRoot,
+      );
+      expected = control.expected;
+      const observation = await inspectTestFilesystemObject(control.lockPath);
+      const unsafe = promiseSettlementCases(observation).find(
+        (candidate) => candidate.name === unsafeName,
+      );
+      assert.notEqual(unsafe, undefined);
+      settlement = unsafe.create();
+      await assert.rejects(
+        fixture.publication.publishCheckpointArtifact(captureOptions(fixture)),
+        (error) =>
+          assertPublicationError(
+            error,
+            "publication_outcome_uncertain",
+            "uncertain",
+          ),
+      );
+      settlement.assertUntouched();
+    });
+  }
 });
 
 test("reserved publication names fail before lock or journal mutation", async (t) => {

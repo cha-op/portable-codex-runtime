@@ -10,6 +10,7 @@ import {
   statfs,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import { acquireAdvisoryLock } from "./advisory-lock.mjs";
 import {
@@ -24,6 +25,7 @@ import {
   assertStorageMutationResult,
 } from "./session-storage-contracts.mjs";
 import {
+  bindStoppedTreeObjectIdentity,
   copyStoppedTreeBetweenRoots,
   digestStoppedTreeIdentities,
   digestTree,
@@ -39,6 +41,10 @@ import {
 const journalPrepareFreshIntrinsic =
   FilesystemOperationJournal.prototype.prepareFresh;
 const reflectApply = Reflect.apply;
+const { isPromise, isProxy } = utilTypes;
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const promisePrototype = Promise.prototype;
 
 export const STOPPED_DIRECTORY_ARTIFACT_VERSION = 1;
 
@@ -50,6 +56,8 @@ const PUBLICATION_CANDIDATE_PREFIX = ".publication-";
 export const STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME =
   ".stopped-directory-publication.lock";
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const PERSISTENT_OBJECT_ID_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const COMMIT_STATES = new Set(["committed", "not-committed", "uncertain"]);
 const PUBLICATION_STATE_RANK = Object.freeze({
@@ -327,6 +335,32 @@ function parseFileIdentityRecord(value) {
   });
 }
 
+function rememberBoundObjectIdentity(
+  observedObjectIdentities,
+  expectedIdentity,
+  filesystem,
+  objectId,
+  code,
+  commitState,
+) {
+  const key = `${filesystem.filesystemId}\0${filesystem.objectIdentityScheme}\0${objectId}`;
+  const runtimeIdentity = `${expectedIdentity.dev}:${expectedIdentity.ino}`;
+  const persistentKey = `persistent\0${key}`;
+  const runtimeKey = `runtime\0${runtimeIdentity}`;
+  const previousRuntimeIdentity = observedObjectIdentities.get(persistentKey);
+  const previousPersistentIdentity = observedObjectIdentities.get(runtimeKey);
+  ensure(
+    (previousRuntimeIdentity === undefined ||
+      previousRuntimeIdentity === runtimeIdentity) &&
+      (previousPersistentIdentity === undefined ||
+        previousPersistentIdentity === key),
+    code,
+    commitState,
+  );
+  observedObjectIdentities.set(persistentKey, runtimeIdentity);
+  observedObjectIdentities.set(runtimeKey, key);
+}
+
 async function inspectBoundObjectIdentity(
   inspector,
   observedObjectIdentities,
@@ -342,22 +376,14 @@ async function inspectBoundObjectIdentity(
       inspector,
       expectedIdentity,
     );
-    const key = `${filesystem.filesystemId}\0${filesystem.objectIdentityScheme}\0${objectId}`;
-    const runtimeIdentity = `${expectedIdentity.dev}:${expectedIdentity.ino}`;
-    const persistentKey = `persistent\0${key}`;
-    const runtimeKey = `runtime\0${runtimeIdentity}`;
-    const previousRuntimeIdentity = observedObjectIdentities.get(persistentKey);
-    const previousPersistentIdentity = observedObjectIdentities.get(runtimeKey);
-    ensure(
-      (previousRuntimeIdentity === undefined ||
-        previousRuntimeIdentity === runtimeIdentity) &&
-        (previousPersistentIdentity === undefined ||
-          previousPersistentIdentity === key),
+    rememberBoundObjectIdentity(
+      observedObjectIdentities,
+      expectedIdentity,
+      filesystem,
+      objectId,
       code,
       commitState,
     );
-    observedObjectIdentities.set(persistentKey, runtimeIdentity);
-    observedObjectIdentities.set(runtimeKey, key);
     return objectId;
   } catch {
     fail(code, commitState);
@@ -780,6 +806,250 @@ function normalizeFilesystemProfile(raw) {
   });
 }
 
+function sameFilesystemProfile(left, right) {
+  return (
+    left.durability === right.durability &&
+    left.filesystemId === right.filesystemId &&
+    left.objectIdentityScheme === right.objectIdentityScheme &&
+    left.type === right.type
+  );
+}
+
+function normalizeFilesystemObjectObservation(
+  raw,
+  expectedIdentity,
+  code,
+  commitState,
+) {
+  try {
+    ensure(!isProxy(raw), code, commitState);
+    const observation = exactOptions(
+      raw,
+      ["filesystem", "identity"],
+      ["filesystem", "identity"],
+      code,
+    );
+    ensure(
+      !isProxy(observation.filesystem) && !isProxy(observation.identity),
+      code,
+      commitState,
+    );
+    const rawIdentity = exactOptions(
+      observation.identity,
+      ["device", "inode", "objectId"],
+      ["device", "inode", "objectId"],
+      code,
+    );
+    const identity = Object.freeze({
+      device: rawIdentity.device,
+      inode: rawIdentity.inode,
+      objectId: rawIdentity.objectId,
+    });
+    const filesystem = normalizeFilesystemProfile(observation.filesystem);
+    const objectId = bindStoppedTreeObjectIdentity(identity, expectedIdentity);
+    return Object.freeze({ filesystem, identity, objectId });
+  } catch {
+    fail(code, commitState);
+  }
+}
+
+async function inspectAtomicFilesystemObject(
+  inspector,
+  path,
+  expectedIdentity,
+  code = "unsupported_publication_filesystem",
+  commitState = "not-committed",
+) {
+  let raw;
+  try {
+    const inspected = inspector(path);
+    ensure(!isProxy(inspected), code, commitState);
+    if (isPromise(inspected)) {
+      ensure(isExactNativePromise(inspected), code, commitState);
+      raw = await inspected;
+    } else {
+      raw = inspected;
+    }
+  } catch {
+    fail(code, commitState);
+  }
+  return normalizeFilesystemObjectObservation(
+    raw,
+    expectedIdentity,
+    code,
+    commitState,
+  );
+}
+
+function isExactNativePromise(value) {
+  if (isProxy(value) || !isPromise(value)) return false;
+  try {
+    return (
+      objectGetPrototypeOf(value) === promisePrototype &&
+      objectGetOwnPropertyDescriptor(value, "catch") === undefined &&
+      objectGetOwnPropertyDescriptor(value, "constructor") === undefined &&
+      objectGetOwnPropertyDescriptor(value, "finally") === undefined &&
+      objectGetOwnPropertyDescriptor(value, "then") === undefined
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function inspectBoundFilesystemObject({
+  code = "unsupported_publication_filesystem",
+  commitState = "not-committed",
+  expectedIdentity,
+  inspectFilesystem: filesystemInspector,
+  inspectFilesystemObject,
+  inspectPersistentObjectIdentity,
+  observedObjectIdentities,
+  path,
+}) {
+  if (inspectFilesystemObject === undefined) {
+    const filesystem = await inspectFilesystem(
+      filesystemInspector,
+      path,
+      code,
+      commitState,
+    );
+    const objectId = await inspectBoundObjectIdentity(
+      inspectPersistentObjectIdentity,
+      observedObjectIdentities,
+      path,
+      expectedIdentity,
+      filesystem,
+      code,
+      commitState,
+    );
+    return Object.freeze({ filesystem, objectId });
+  }
+
+  const observation = await inspectAtomicFilesystemObject(
+    inspectFilesystemObject,
+    path,
+    expectedIdentity,
+    code,
+    commitState,
+  );
+  try {
+    rememberBoundObjectIdentity(
+      observedObjectIdentities,
+      expectedIdentity,
+      observation.filesystem,
+      observation.objectId,
+      code,
+      commitState,
+    );
+  } catch {
+    fail(code, commitState);
+  }
+  return Object.freeze({
+    filesystem: observation.filesystem,
+    objectId: observation.objectId,
+  });
+}
+
+function normalizeExpectedPublicationControl(
+  raw,
+  code = "invalid_publication_request",
+  commitState = "not-committed",
+) {
+  if (raw === null) return null;
+  try {
+    ensure(!isProxy(raw), code, commitState);
+    const expected = exactOptions(
+      raw,
+      ["filesystem", "objectId"],
+      ["filesystem", "objectId"],
+      code,
+    );
+    ensure(!isProxy(expected.filesystem), code, commitState);
+    const filesystem = normalizeFilesystemProfile(expected.filesystem);
+    ensure(
+      typeof expected.objectId === "string" &&
+        PERSISTENT_OBJECT_ID_PATTERN.test(expected.objectId),
+      code,
+      commitState,
+    );
+    return Object.freeze({ filesystem, objectId: expected.objectId });
+  } catch {
+    fail(code, commitState);
+  }
+}
+
+async function resolveExpectedPublicationControl(
+  resolver,
+  targetOwnedRoot,
+) {
+  if (resolver === undefined) return null;
+  ensure(
+    typeof targetOwnedRoot === "string" &&
+      isAbsolute(targetOwnedRoot) &&
+      resolve(targetOwnedRoot) === targetOwnedRoot,
+    "invalid_publication_request",
+  );
+  let raw;
+  try {
+    const resolved = resolver(targetOwnedRoot);
+    ensure(!isProxy(resolved), "invalid_publication_request");
+    if (isPromise(resolved)) {
+      ensure(isExactNativePromise(resolved), "invalid_publication_request");
+      raw = await resolved;
+    } else {
+      raw = resolved;
+    }
+  } catch {
+    fail("invalid_publication_request");
+  }
+  return normalizeExpectedPublicationControl(raw);
+}
+
+async function assertPublicationControl(
+  lock,
+  lockPath,
+  expected,
+  inspector,
+  code,
+  commitState,
+) {
+  try {
+    await lock.assertHeld();
+  } catch {
+    fail(code, commitState);
+  }
+  if (expected === null) return;
+
+  // dev+ino binds this sample to the currently held pathname object. The
+  // filesystem incarnation plus persistent object ID is the cross-restart
+  // control identity; mutable metadata is intentionally outside this check.
+  let runtimeIdentity;
+  try {
+    runtimeIdentity = await lstat(lockPath, { bigint: true });
+  } catch {
+    fail(code, commitState);
+  }
+  ensure(runtimeIdentity.isFile(), code, commitState);
+  const observed = await inspectAtomicFilesystemObject(
+    inspector,
+    lockPath,
+    runtimeIdentity,
+    code,
+    commitState,
+  );
+  try {
+    await lock.assertHeld();
+  } catch {
+    fail(code, commitState);
+  }
+  ensure(
+    sameFilesystemProfile(observed.filesystem, expected.filesystem) &&
+      observed.objectId === expected.objectId,
+    code,
+    commitState,
+  );
+}
+
 function validateResult(request, value) {
   const result = exactOptions(value, ["checkpoint", "mutation"]);
   let checkpoint;
@@ -1185,6 +1455,8 @@ async function openPinnedDirectory(
   {
     committed = false,
     filesystem,
+    inspectFilesystem,
+    inspectFilesystemObject,
     inspectPersistentObjectIdentity,
     observedObjectIdentities,
     inspectOwnedRootAcl,
@@ -1202,15 +1474,39 @@ async function openPinnedDirectory(
       inspectOwnedRootAncestorAcl,
     });
     const metadata = authority.identity;
-    const objectId = await inspectBoundObjectIdentity(
-      inspectPersistentObjectIdentity,
-      observedObjectIdentities,
-      path,
-      metadata,
-      filesystem,
-      committed ? "published_state_invalid" : "publication_recovery_required",
-      committed ? "committed" : "not-committed",
-    );
+    const code = committed
+      ? "published_state_invalid"
+      : "publication_recovery_required";
+    const commitState = committed ? "committed" : "not-committed";
+    let objectId;
+    if (inspectFilesystemObject === undefined) {
+      objectId = await inspectBoundObjectIdentity(
+        inspectPersistentObjectIdentity,
+        observedObjectIdentities,
+        path,
+        metadata,
+        filesystem,
+        code,
+        commitState,
+      );
+    } else {
+      const observation = await inspectBoundFilesystemObject({
+        code,
+        commitState,
+        expectedIdentity: metadata,
+        inspectFilesystem,
+        inspectFilesystemObject,
+        inspectPersistentObjectIdentity,
+        observedObjectIdentities,
+        path,
+      });
+      ensure(
+        sameFilesystemProfile(filesystem, observation.filesystem),
+        code,
+        commitState,
+      );
+      objectId = observation.objectId;
+    }
     await authority.assertCurrent();
     ensure(
       identityMatchesMaterialization(objectId, materialization, filesystem),
@@ -1328,11 +1624,14 @@ export class StoppedDirectoryPublication {
   #acquireLock;
   #faults;
   #inspectFilesystem;
+  #inspectFilesystemObject;
+  #inspectPublicationControl;
   #inspectPersistentObjectIdentity;
   #inspectOwnedRootAcl;
   #inspectOwnedRootAncestorAcl;
   #journal;
   #listMountPoints;
+  #resolveExpectedPublicationControl;
   #trustRenameOutcome;
 
   constructor(options) {
@@ -1342,11 +1641,14 @@ export class StoppedDirectoryPublication {
         "acquireLock",
         "faults",
         "inspectFilesystem",
+        "inspectFilesystemObject",
+        "inspectPublicationControl",
         "inspectPersistentObjectIdentity",
         "inspectOwnedRootAcl",
         "inspectOwnedRootAncestorAcl",
         "journal",
         "listMountPoints",
+        "resolveExpectedPublicationControl",
       ],
       ["journal"],
     );
@@ -1357,18 +1659,50 @@ export class StoppedDirectoryPublication {
     this.#journal = normalized.journal;
     this.#acquireLock = normalized.acquireLock ?? acquireAdvisoryLock;
     this.#trustRenameOutcome = this.#acquireLock === acquireAdvisoryLock;
-    this.#inspectFilesystem = normalized.inspectFilesystem ?? defaultInspectFilesystem;
-    this.#inspectPersistentObjectIdentity =
-      normalized.inspectPersistentObjectIdentity ??
-      (async () => {
-        throw new Error("persistent object identity is unavailable");
-      });
+    this.#inspectFilesystemObject = normalized.inspectFilesystemObject;
+    if (this.#inspectFilesystemObject === undefined) {
+      this.#inspectFilesystem =
+        normalized.inspectFilesystem ?? defaultInspectFilesystem;
+      this.#inspectPersistentObjectIdentity =
+        normalized.inspectPersistentObjectIdentity ??
+        (async () => {
+          throw new Error("persistent object identity is unavailable");
+        });
+    } else {
+      const atomicInspector = this.#inspectFilesystemObject;
+      this.#inspectFilesystem = async (path) =>
+        (await inspectAtomicFilesystemObject(atomicInspector, path, undefined))
+          .filesystem;
+      this.#inspectPersistentObjectIdentity = async (path) =>
+        (await inspectAtomicFilesystemObject(atomicInspector, path, undefined))
+          .identity;
+    }
     this.#inspectOwnedRootAcl = normalized.inspectOwnedRootAcl;
     this.#inspectOwnedRootAncestorAcl = normalized.inspectOwnedRootAncestorAcl;
+    this.#inspectPublicationControl = normalized.inspectPublicationControl;
     this.#listMountPoints = normalized.listMountPoints;
+    this.#resolveExpectedPublicationControl =
+      normalized.resolveExpectedPublicationControl;
     this.#faults = normalizeFaults(normalized.faults);
+    const publicationControlCallbacksAbsent =
+      this.#inspectPublicationControl === undefined &&
+      this.#resolveExpectedPublicationControl === undefined;
+    const publicationControlCallbacksPresent =
+      typeof this.#inspectPublicationControl === "function" &&
+      !isProxy(this.#inspectPublicationControl) &&
+      typeof this.#resolveExpectedPublicationControl === "function" &&
+      !isProxy(this.#resolveExpectedPublicationControl);
     ensure(
       typeof this.#acquireLock === "function" &&
+        (normalized.inspectFilesystem === undefined ||
+          (typeof normalized.inspectFilesystem === "function" &&
+            !isProxy(normalized.inspectFilesystem))) &&
+        (this.#inspectFilesystemObject === undefined ||
+          (typeof this.#inspectFilesystemObject === "function" &&
+            !isProxy(this.#inspectFilesystemObject))) &&
+        (normalized.inspectPersistentObjectIdentity === undefined ||
+          (typeof normalized.inspectPersistentObjectIdentity === "function" &&
+            !isProxy(normalized.inspectPersistentObjectIdentity))) &&
         typeof this.#inspectFilesystem === "function" &&
         typeof this.#inspectPersistentObjectIdentity === "function" &&
         (this.#inspectOwnedRootAcl === undefined ||
@@ -1376,10 +1710,31 @@ export class StoppedDirectoryPublication {
         (this.#inspectOwnedRootAncestorAcl === undefined ||
           typeof this.#inspectOwnedRootAncestorAcl === "function") &&
         (this.#listMountPoints === undefined ||
-          typeof this.#listMountPoints === "function"),
+          typeof this.#listMountPoints === "function") &&
+        (publicationControlCallbacksAbsent ||
+          publicationControlCallbacksPresent),
       "invalid_publication_request",
     );
     Object.freeze(this);
+  }
+
+  async #inspectBoundFilesystemObject(
+    path,
+    expectedIdentity,
+    observedObjectIdentities,
+    code,
+    commitState,
+  ) {
+    return inspectBoundFilesystemObject({
+      code,
+      commitState,
+      expectedIdentity,
+      inspectFilesystem: this.#inspectFilesystem,
+      inspectFilesystemObject: this.#inspectFilesystemObject,
+      inspectPersistentObjectIdentity: this.#inspectPersistentObjectIdentity,
+      observedObjectIdentities,
+      path,
+    });
   }
 
   async verifyCommittedCheckpointArtifact(options) {
@@ -1405,14 +1760,20 @@ export class StoppedDirectoryPublication {
     } catch {
       fail("invalid_publication_request");
     }
-    const verification = {
+    const expectedPublicationControl =
+      await resolveExpectedPublicationControl(
+        this.#resolveExpectedPublicationControl,
+        normalized.artifactOwnedRoot,
+      );
+    const verification = Object.freeze({
       artifactProof: null,
       expected,
+      expectedPublicationControl,
       finalDirectory: normalized.artifactDirectory,
       kind: "checkpoint-artifact",
       operationId: snapshot.operationId,
       targetOwnedRoot: normalized.artifactOwnedRoot,
-    };
+    });
     const queueKey = await publicationQueueKey(verification.targetOwnedRoot);
     return runPublicationQueued(queueKey, () =>
       this.#verifyCommittedPublication(verification),
@@ -1443,14 +1804,20 @@ export class StoppedDirectoryPublication {
     } catch {
       fail("invalid_publication_request");
     }
-    const verification = {
+    const expectedPublicationControl =
+      await resolveExpectedPublicationControl(
+        this.#resolveExpectedPublicationControl,
+        normalized.destinationOwnedRoot,
+      );
+    const verification = Object.freeze({
       artifactProof: snapshot.artifactProof,
       expected,
+      expectedPublicationControl,
       finalDirectory: normalized.destinationDirectory,
       kind: "restore-destination",
       operationId: snapshot.operationId,
       targetOwnedRoot: normalized.destinationOwnedRoot,
-    };
+    });
     const queueKey = await publicationQueueKey(verification.targetOwnedRoot);
     return runPublicationQueued(queueKey, () =>
       this.#verifyCommittedPublication(verification),
@@ -1538,15 +1905,26 @@ export class StoppedDirectoryPublication {
         listMountPoints: this.#listMountPoints,
         targetAuthority,
       });
+      const lockPath = join(
+        targetAuthority.path,
+        STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME,
+      );
       try {
         lock = await this.#acquireLock(
-          join(targetAuthority.path, STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME),
+          lockPath,
           { requireExisting: true },
         );
-        await lock.assertHeld();
       } catch {
         fail("publication_outcome_uncertain", "uncertain");
       }
+      await assertPublicationControl(
+        lock,
+        lockPath,
+        options.expectedPublicationControl,
+        this.#inspectPublicationControl,
+        "publication_outcome_uncertain",
+        "uncertain",
+      );
       const assertLockHeld = async (code, state) => {
         try {
           await lock.assertHeld();
@@ -1741,36 +2119,24 @@ export class StoppedDirectoryPublication {
         recorded.filesystemId === filesystem.filesystemId &&
         recorded.objectIdentityScheme === filesystem.objectIdentityScheme &&
         recorded.objectId === objectId;
-      const journalFilesystem = await inspectFilesystem(
-        this.#inspectFilesystem,
-        journalAuthority.path,
-        "published_state_invalid",
-        "committed",
-      );
-      const journalRootObjectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
-        observedObjectIdentities,
+      const journalObservation = await this.#inspectBoundFilesystemObject(
         journalAuthority.path,
         journalIdentity,
-        journalFilesystem,
-        "published_state_invalid",
-        "committed",
-      );
-      const targetFilesystem = await inspectFilesystem(
-        this.#inspectFilesystem,
-        targetAuthority.path,
-        "published_state_invalid",
-        "committed",
-      );
-      const targetRootObjectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
         observedObjectIdentities,
+        "published_state_invalid",
+        "committed",
+      );
+      const journalFilesystem = journalObservation.filesystem;
+      const journalRootObjectId = journalObservation.objectId;
+      const targetObservation = await this.#inspectBoundFilesystemObject(
         targetAuthority.path,
         targetAuthority.identity,
-        targetFilesystem,
+        observedObjectIdentities,
         "published_state_invalid",
         "committed",
       );
+      const targetFilesystem = targetObservation.filesystem;
+      const targetRootObjectId = targetObservation.objectId;
       const stableJournalFilesystem = await inspectFilesystem(
         this.#inspectFilesystem,
         journalAuthority.path,
@@ -1847,6 +2213,8 @@ export class StoppedDirectoryPublication {
         {
           committed: true,
           filesystem: targetFilesystem,
+          inspectFilesystem: this.#inspectFilesystem,
+          inspectFilesystemObject: this.#inspectFilesystemObject,
           inspectPersistentObjectIdentity:
             this.#inspectPersistentObjectIdentity,
           observedObjectIdentities,
@@ -1974,8 +2342,14 @@ export class StoppedDirectoryPublication {
       "checkpoint-artifact",
       normalized,
     );
-    const publication = {
+    const expectedPublicationControl =
+      await resolveExpectedPublicationControl(
+        this.#resolveExpectedPublicationControl,
+        normalized.artifactOwnedRoot,
+      );
+    const publication = Object.freeze({
       binding: snapshot.binding,
+      expectedPublicationControl,
       finalDirectory: normalized.artifactDirectory,
       kind: "checkpoint-artifact",
       operationId: snapshot.operationId,
@@ -1985,7 +2359,7 @@ export class StoppedDirectoryPublication {
       sourceDirectory: normalized.sourceDirectory,
       sourceOwnedRoot: normalized.sourceOwnedRoot,
       targetOwnedRoot: normalized.artifactOwnedRoot,
-    };
+    });
     const queueKey = await publicationQueueKey(publication.targetOwnedRoot);
     return runPublicationQueued(queueKey, () => this.#publish(publication));
   }
@@ -2006,9 +2380,15 @@ export class StoppedDirectoryPublication {
       "restore-destination",
       normalized,
     );
-    const publication = {
+    const expectedPublicationControl =
+      await resolveExpectedPublicationControl(
+        this.#resolveExpectedPublicationControl,
+        normalized.destinationOwnedRoot,
+      );
+    const publication = Object.freeze({
       binding: snapshot.binding,
       artifactProof: snapshot.artifactProof,
+      expectedPublicationControl,
       finalDirectory: normalized.destinationDirectory,
       kind: "restore-destination",
       operationId: snapshot.operationId,
@@ -2018,7 +2398,7 @@ export class StoppedDirectoryPublication {
       sourceDirectory: normalized.artifactDirectory,
       sourceOwnedRoot: normalized.artifactOwnedRoot,
       targetOwnedRoot: normalized.destinationOwnedRoot,
-    };
+    });
     const queueKey = await publicationQueueKey(publication.targetOwnedRoot);
     return runPublicationQueued(queueKey, () => this.#publish(publication));
   }
@@ -2129,7 +2509,7 @@ export class StoppedDirectoryPublication {
 
       publicationMayHaveOccurred = true;
       const journalAuthority = await this.#journal.describeAuthority();
-      const journalFilesystem = await inspectFilesystem(
+      const initialJournalFilesystem = await inspectFilesystem(
         this.#inspectFilesystem,
         journalAuthority.path,
         "unsupported_publication_filesystem",
@@ -2235,15 +2615,26 @@ export class StoppedDirectoryPublication {
         if (callbackError !== undefined) throw callbackError;
       };
       await assertPublicationTopology(publicationTopology);
+      const lockPath = join(
+        targetAuthority.path,
+        STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME,
+      );
       try {
         lock = await this.#acquireLock(
-          join(targetAuthority.path, STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME),
+          lockPath,
           { requireExisting: true },
         );
-        await lock.assertHeld();
       } catch {
         fail("publication_outcome_uncertain", "uncertain");
       }
+      await assertPublicationControl(
+        lock,
+        lockPath,
+        options.expectedPublicationControl,
+        this.#inspectPublicationControl,
+        "publication_outcome_uncertain",
+        "uncertain",
+      );
       await assertUntrustedLockHeld(lock);
       const lockedRootOnlyTopology =
         publicationTopologyForSource(unobservedSource);
@@ -2456,21 +2847,15 @@ export class StoppedDirectoryPublication {
         observed.record === null
           ? "unsupported_publication_filesystem"
           : topologyProbeCode;
-      const targetFilesystem = await inspectFilesystem(
-        this.#inspectFilesystem,
-        targetAuthority.path,
-        objectIdentityProbeCode,
-        topologyProbeState,
-      );
-      const targetRootObjectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
-        observedObjectIdentities,
+      const targetObservation = await this.#inspectBoundFilesystemObject(
         targetAuthority.path,
         targetAuthority.identity,
-        targetFilesystem,
+        observedObjectIdentities,
         objectIdentityProbeCode,
         topologyProbeState,
       );
+      const targetFilesystem = targetObservation.filesystem;
+      const targetRootObjectId = targetObservation.objectId;
       const stableTargetFilesystem = await inspectFilesystem(
         this.#inspectFilesystem,
         targetAuthority.path,
@@ -2508,21 +2893,15 @@ export class StoppedDirectoryPublication {
           : uncertain
             ? "uncertain"
             : "not-committed";
-        const currentFilesystem = await inspectFilesystem(
-          this.#inspectFilesystem,
-          targetAuthority.path,
-          code,
-          stateClassification,
-        );
-        const currentObjectId = await inspectBoundObjectIdentity(
-          this.#inspectPersistentObjectIdentity,
-          observedObjectIdentities,
+        const currentObservation = await this.#inspectBoundFilesystemObject(
           targetAuthority.path,
           targetAuthority.identity,
-          currentFilesystem,
+          observedObjectIdentities,
           code,
           stateClassification,
         );
+        const currentFilesystem = currentObservation.filesystem;
+        const currentObjectId = currentObservation.objectId;
         const stableCurrentFilesystem = await inspectFilesystem(
           this.#inspectFilesystem,
           targetAuthority.path,
@@ -2611,30 +2990,24 @@ export class StoppedDirectoryPublication {
           : publicationMayHaveOccurred
             ? "uncertain"
             : "not-committed";
-      const sourceRootFilesystem = await inspectFilesystem(
-        this.#inspectFilesystem,
-        sourceAuthority.path,
-        continuityCode,
-        continuityState,
-      );
-      const journalRootObjectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
-        observedObjectIdentities,
+      const journalObservation = await this.#inspectBoundFilesystemObject(
         journalAuthority.path,
         journalIdentity,
-        journalFilesystem,
+        observedObjectIdentities,
         continuityCode,
         continuityState,
       );
-      const sourceRootObjectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
-        observedObjectIdentities,
+      const journalFilesystem = journalObservation.filesystem;
+      const journalRootObjectId = journalObservation.objectId;
+      const sourceRootObservation = await this.#inspectBoundFilesystemObject(
         sourceAuthority.path,
         sourceAuthority.identity,
-        sourceRootFilesystem,
+        observedObjectIdentities,
         continuityCode,
         continuityState,
       );
+      const sourceRootFilesystem = sourceRootObservation.filesystem;
+      const sourceRootObjectId = sourceRootObservation.objectId;
       const stableJournalFilesystem = await inspectFilesystem(
         this.#inspectFilesystem,
         journalAuthority.path,
@@ -2648,7 +3021,8 @@ export class StoppedDirectoryPublication {
         continuityState,
       );
       ensure(
-        profileMatches(journalFilesystem, stableJournalFilesystem) &&
+        profileMatches(initialJournalFilesystem, journalFilesystem) &&
+          profileMatches(journalFilesystem, stableJournalFilesystem) &&
           profileMatches(sourceRootFilesystem, stableSourceRootFilesystem),
         continuityCode,
         continuityState,
@@ -2688,21 +3062,15 @@ export class StoppedDirectoryPublication {
         sourceFilesystem = recordedSourceFilesystem;
         sourceDirectoryObjectId = recordedSourceDirectoryIdentity.objectId;
       } else if (source.identity !== null) {
-        sourceFilesystem = await inspectFilesystem(
-          this.#inspectFilesystem,
-          source.path,
-          continuityCode,
-          continuityState,
-        );
-        sourceDirectoryObjectId = await inspectBoundObjectIdentity(
-          this.#inspectPersistentObjectIdentity,
-          observedObjectIdentities,
+        const sourceObservation = await this.#inspectBoundFilesystemObject(
           source.path,
           source.identity,
-          sourceFilesystem,
+          observedObjectIdentities,
           continuityCode,
           continuityState,
         );
+        sourceFilesystem = sourceObservation.filesystem;
+        sourceDirectoryObjectId = sourceObservation.objectId;
         const stableSourceFilesystem = await inspectFilesystem(
           this.#inspectFilesystem,
           source.path,
@@ -2841,6 +3209,8 @@ export class StoppedDirectoryPublication {
             {
               committed: true,
               filesystem: targetFilesystem,
+              inspectFilesystem: this.#inspectFilesystem,
+              inspectFilesystemObject: this.#inspectFilesystemObject,
               inspectPersistentObjectIdentity:
                 this.#inspectPersistentObjectIdentity,
               observedObjectIdentities,
@@ -3027,6 +3397,8 @@ export class StoppedDirectoryPublication {
             materialization,
             {
               filesystem: targetFilesystem,
+              inspectFilesystem: this.#inspectFilesystem,
+              inspectFilesystemObject: this.#inspectFilesystemObject,
               inspectPersistentObjectIdentity:
                 this.#inspectPersistentObjectIdentity,
               observedObjectIdentities,
@@ -3123,6 +3495,8 @@ export class StoppedDirectoryPublication {
           );
           pinnedPublication = await openPinnedDirectory(finalPath, materialization, {
             filesystem: targetFilesystem,
+            inspectFilesystem: this.#inspectFilesystem,
+            inspectFilesystemObject: this.#inspectFilesystemObject,
             inspectPersistentObjectIdentity:
               this.#inspectPersistentObjectIdentity,
             observedObjectIdentities,
@@ -3341,14 +3715,16 @@ export class StoppedDirectoryPublication {
       targetAuthority,
     });
     const assertSourcePersistentIdentity = async () => {
-      let currentSourceFilesystem;
-      try {
-        currentSourceFilesystem = normalizeFilesystemProfile(
-          await this.#inspectFilesystem(source.path),
+      const currentSourceObservation =
+        await this.#inspectBoundFilesystemObject(
+          source.path,
+          source.identity,
+          observedObjectIdentities,
+          "publication_integrity_failed",
+          "not-committed",
         );
-      } catch {
-        fail("publication_integrity_failed");
-      }
+      const currentSourceFilesystem = currentSourceObservation.filesystem;
+      const objectId = currentSourceObservation.objectId;
       ensure(
         currentSourceFilesystem.durability === sourceFilesystem.durability &&
           currentSourceFilesystem.filesystemId === sourceFilesystem.filesystemId &&
@@ -3360,15 +3736,6 @@ export class StoppedDirectoryPublication {
       await assertDirectoryIdentity(
         source.path,
         source.identity,
-        "publication_integrity_failed",
-        "not-committed",
-      );
-      const objectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
-        observedObjectIdentities,
-        source.path,
-        source.identity,
-        currentSourceFilesystem,
         "publication_integrity_failed",
         "not-committed",
       );
@@ -3591,15 +3958,21 @@ export class StoppedDirectoryPublication {
     let treeIdentityDigest;
     let objectId;
     try {
-      objectId = await inspectBoundObjectIdentity(
-        this.#inspectPersistentObjectIdentity,
-        observedObjectIdentities,
+      const candidateObservation = await this.#inspectBoundFilesystemObject(
         candidatePath,
         identity,
-        targetFilesystem,
+        observedObjectIdentities,
         "publication_integrity_failed",
         "not-committed",
       );
+      ensure(
+        sameFilesystemProfile(
+          targetFilesystem,
+          candidateObservation.filesystem,
+        ),
+        "publication_integrity_failed",
+      );
+      objectId = candidateObservation.objectId;
       treeIdentityDigest = await digestStoppedTreeIdentities(
         candidatePath,
         targetFilesystem.filesystemId,
@@ -3624,6 +3997,8 @@ export class StoppedDirectoryPublication {
     });
       const pinned = await openPinnedDirectory(candidatePath, materialization, {
         filesystem: targetFilesystem,
+        inspectFilesystem: this.#inspectFilesystem,
+        inspectFilesystemObject: this.#inspectFilesystemObject,
         inspectPersistentObjectIdentity:
           this.#inspectPersistentObjectIdentity,
         observedObjectIdentities,

@@ -418,12 +418,29 @@
   windows.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
+- Production-injectable Linux ext4 physical components now supply sparse raw-
+  image lifecycle through FD-bound native operations, exact clean unmount and
+  loop-detach settlement, an append-only provider ledger checked against an
+  external PostgreSQL head, two distinct persistent archive control identities,
+  and a rootless digest-pinned Podman writer supervisor. Producer outputs bind
+  the archive mount-root and artifact-child tuples separately; on the consumer,
+  the former makes the first remount verification-only and the latter
+  authorizes verification for the exact publication root. Two hosted Ubuntu
+  runners cover clean detach, transfer, remount, provider-head continuity, and
+  source-free committed verification. This remains a clean/manual-fencing
+  boundary: it does not prove power-loss or crash-prefix recovery,
+  automatically fence a stale writer, or implement differential export/
+  compression, encryption, retention, or registry trust. A trusted adapter
+  that binds committed ext4 attachment identity into Podman filesystem
+  authority, plus same-process conformance evidence, remains pending.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Linux ext4 physical backend:
+  `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - Final public restore backend:
   `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - Assembled restore safety matrix:
@@ -539,6 +556,13 @@
   policy across the two database-clock windows, including physical deadline/
   grace bounds, an aggregate database allowance, and a safety margin.
   The scoped assembled safety matrix and immutable public adapter assembly are
-  complete. The next boundary is the concrete filesystem/ext4 physical
-  backend; the public adapter does not make the injected physical collaborators
-  filesystem-durable by itself.
+  complete. Production-injectable Linux ext4 and rootless Podman components
+  now implement the clean/manual-fencing physical boundary and verify clean
+  two-host detach, transfer, and a verification-only first remount against
+  separately anchored archive control tuples. Their conformance jobs remain
+  separate: the default Podman filesystem authority binds only the current
+  held directory object and access policy, while a production composition must
+  supply a trusted authority that maps the durable ext4 attachment identity to
+  that held object. They do not make crash-prefix state durable, revoke a stale
+  remote writer automatically, or supply differential/compressed export,
+  encryption, retention, or registry trust.

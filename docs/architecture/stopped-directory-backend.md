@@ -569,5 +569,13 @@ This backend deliberately does not provide:
   periodic long-goal checkpoints, or cross-host migration verification; or
 - the read-only Git Summary.
 
+The separate Linux ext4 physical components now inject this backend's
+publication surface into clean/manual-fencing raw-image lifecycle and
+rootless Podman seams. Their trusted persistent-identity bridge and
+same-process evidence remain pending. That does not make
+`StoppedDirectoryBackend` itself an ext4 provider or add automatic host
+fencing to it. See
+`linux-ext4-physical-backend.md`.
+
 Git state remains optional user context and is not part of checkpoint
 correctness, catalogue authority, or restore admission.

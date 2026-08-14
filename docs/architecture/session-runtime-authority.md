@@ -70,9 +70,16 @@ launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
 bounded recovery scheduler. The invocation-time detached-production gate,
 durable read-only stable-plan lookup, deployment bindings, and final immutable
-public checkpoint backend are now complete. Only the concrete filesystem/ext4
-physical backend and its crash, detach/fence, container-launch, and cross-host
-conformance validation remain.
+public checkpoint backend are now complete. The production-injectable Linux
+physical components are also complete independently for clean/manual-fencing
+operation: they supply an FD-bound ext4 raw-image lifecycle, an externally
+anchored provider ledger, separate persistent publication-control identities,
+and a rootless Podman supervisor. Their two-host conformance boundary verifies
+clean detach, raw-image transfer, a verification-only first remount, and
+distinct archive mount-root and artifact-child identity readback. A trusted
+bridge from committed ext4 identity to Podman filesystem authority and
+same-process conformance evidence remain pending; the current evidence does not
+claim power-loss/crash-prefix recovery or automatic stale-writer fencing.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -133,8 +140,9 @@ one opaque same-process capability for the exact prepared tuple. V3 crosses
 instead into the exact durably prepared capture intent whose operation ID was
 claimed before stop; its local writer exclusion remains until the fixed
 committed capture result is returned. Ambiguity retains both durable and local
-blockers. Cross-host exclusion still must come from a capable storage backend
-or supervisor.
+blockers. The ext4 cross-host flow begins only after a clean detach; automatic
+exclusion of a partitioned or stale writer remains an operator/provider fencing
+responsibility.
 
 ## Implemented Canonical Session Registry
 
@@ -2185,14 +2193,33 @@ same-database/stable-plan retry through fresh physical bindings, image binding,
 runtime, and controller, references separate stable-plan-registry rehydration,
 and layers representative settlement-foundation/deployment timer and drain
 evidence. It does not claim one whole-saga deployment restart or operating-
-system crash. The immutable public backend is now complete; the next
-implementation boundary is the concrete filesystem/ext4 physical backend.
+system crash. The immutable public backend can now be supplied with the
+production-injectable Linux physical components. The ext4 driver keeps raw-image
+format, mount, sync, unmount, and loop-detach work bound to held descriptors;
+provider mutations require an append-only ledger head anchored outside the
+replaceable image; and publication checks separately authorized persistent
+control identities.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
-A later concrete Podman/Docker adapter must also hold directory identity
-through the bind, enforce rootless execution, and fix the Codex CLI/config
-surface.
+The injected Podman v2 supervisor holds the sole session-directory bind,
+requires rootless execution and a digest-pinned image, publishes immutable
+local revisions, and supports stop/join plus read-only cold reconciliation.
+The generic PostgreSQL deployment still constructs neither collaborator; a
+production host injects them and owns their additional provider-state pool and
+shutdown order.
+Binding the provider's committed ext4 root identity into a trusted Podman
+filesystem authority, together with same-process conformance evidence, remains
+required before describing those components as one production graph.
+
+The resulting scope is deliberately clean and manually fenced. Two hosted
+Ubuntu runners independently anchor the archive mount-root and artifact-child
+control tuples, then verify clean detach, transfer, a verification-only first
+remount, publication identity, and provider-head continuity. They do not prove
+sudden power-loss or crash-prefix recovery, and the backend does not revoke a
+partitioned stale writer automatically. Differential export/compression,
+encryption, retention, registry publisher/signature trust, and remote image
+transport remain separate work.
 
 ## Operational Boundary
 
@@ -2311,7 +2338,13 @@ matrix has an exact nineteen-contract/fourteen-protocol-surface scope and binds 
 seven durable-cut aggregation, same-database/stable-plan fresh-object retry,
 separate registry rehydration, and representative settlement timer/drain
 evidence. The final public backend is wired through controller and deployment
-admission. The concrete filesystem/ext4 physical backend is the next
-implementation boundary.
-Physical-backend pull requests must add crash, detach/fence, container-launch,
-and cross-host conformance evidence.
+admission. Production-injectable Linux components now add FD-bound raw-image
+lifecycle and detach settlement, externally anchored provider-state
+reconciliation, distinct mount-root and artifact-child publication-control
+identity, and rootless Podman launch/stop coverage. Their producer/consumer jobs
+verify a clean two-host image transfer and verification-only first remount; a
+trusted persistent-identity bridge and same-process conformance evidence remain
+pending.
+Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
+export/compression, encryption, retention, and registry trust remain unproved
+or unimplemented by design.

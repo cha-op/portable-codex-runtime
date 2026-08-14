@@ -151,8 +151,21 @@
   directory backend and exposed only through controller/deployment admission.
   Callers cannot inject the internal generation-publication callback, invoke
   raw lifecycle mutations, or reach operator/provider extensions.
-- [pending] Implement an ext4 or filesystem-image physical backend, followed by
-  differential compression, content-addressed storage, encryption, retention,
-  periodic long-goal snapshots, and cross-host restore verification.
+- [done] Implement production-injectable Linux ext4 physical components:
+  FD-bound sparse raw-image lifecycle and clean detach settlement, externally
+  anchored provider state, distinct archive mount-root and artifact-child
+  publication-control identities, rootless digest-pinned Podman launch/stop,
+  and two-host clean detach, transfer, verification-only first remount, and
+  identity verification.
+- [pending] Bind the provider state's persistent ext4 attachment identity into
+  a trusted Podman filesystem authority, exercise that authority with the
+  initialized backend in one non-root process, and add authority-owned bounded
+  retention or garbage collection for terminal local supervisor state. The
+  stopped-only reconciler remains read-only and cannot supply either mutation.
+- [pending] Extend beyond that clean/manual-fencing boundary only in separately
+  scoped work: power-loss/crash-prefix evidence, automatic stale-writer
+  fencing, differential export/compression, content-addressed distribution,
+  encryption, retention and periodic snapshots, registry publisher/signature
+  trust, and remote image transport.
 - [deferred] Add a read-only Git Summary for user context; it is not part of
   snapshot correctness or recovery.

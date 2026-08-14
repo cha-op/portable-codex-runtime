@@ -46,6 +46,7 @@ import {
   assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
   assertStorageMutationResult,
+  assertWriterAttachmentMutationResult,
   checkpointClassPolicy,
   compareFencingEpochs,
   createCheckpointBackendFacade,
@@ -2638,6 +2639,53 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
           rootPath: "/var/lib/portable-codex/session-001",
         },
         { request: attachRequest },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+  const writerAttachmentResult = {
+    ...legacyAttachResult,
+    rootPath: "/var/lib/portable-codex/session-001",
+  };
+  assert.deepEqual(
+    assertWriterAttachmentMutationResult(writerAttachmentResult, {
+      request: attachRequest,
+    }),
+    writerAttachmentResult,
+  );
+  assert(Object.isFrozen(
+    assertWriterAttachmentMutationResult(writerAttachmentResult, {
+      request: attachRequest,
+    }),
+  ));
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, rootPath: "relative/session" },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, rootPath: `/${"é".repeat(2048)}` },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, rootPath: "/tmp/\ud800" },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, operation: "detach", status: "detached" },
+        { request: mutationRequest({ operation: "detach" }) },
       ),
     assertCode("invalid_storage_mutation"),
   );

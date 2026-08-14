@@ -10,3 +10,4 @@ out/
 target/
 __pycache__/
 *.py[cod]
+integration/fixtures/podman-writer/podman-writer-probe
