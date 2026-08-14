@@ -16,6 +16,9 @@ superseded_by:
 
 - Completed production-injectable Linux physical components for the PostgreSQL
   detached-restore storage, publication, and writer-supervisor seams.
+- Bound ext4 serving to a host-owned long-lived private mount namespace with
+  separate `rprivate` archive and session carriers; the helper verifies but
+  does not create or own that propagation boundary.
 - Kept the supported boundary to clean stopped-writer publication and manual
   fencing while making cross-host raw-image identity verifiable after an
   operator-controlled clean detach.
@@ -23,11 +26,14 @@ superseded_by:
 ## Current State
 
 - `LinuxExt4Inspector` and `LinuxExt4ImageDriver` bind object observation and
-  sparse raw-image creation, `mkfs.ext4`, loop attachment, private mount,
-  `syncfs`, unmount, detach settlement, and destruction to held file
-  descriptors and fixed native/helper interfaces. A child-root absence is
-  conclusive only when observations before and after `lstat` bind the same
-  mounted object; mount loss or replacement remains an observation failure.
+  sparse raw-image creation, `mkfs.ext4`, loop attachment, mount under a
+  host-owned private carrier, `syncfs`, unmount, detach settlement, and
+  destruction to pinned descriptor authority and fixed native/helper
+  interfaces. Clean unmount closes the mounted-root descriptor before its
+  non-lazy dispatch while retaining the pinned parent/direct-child authority.
+  A child-root absence is conclusive only when observations before and after
+  `lstat` bind the same mounted object; mount loss or replacement remains an
+  observation failure.
 - `FilesystemImageProviderState` durably records prepared and committed
   operations, storage and writer state, mount/data-root identity, and
   publication-control identity. Every mutation checks its append-only ledger
@@ -67,6 +73,10 @@ superseded_by:
   group, carries only `cap_dac_override,cap_sys_admin=ep`, and rejects root,
   setuid, or any real/effective/saved UID/GID split before parsing a request.
   Producer and consumer receipts bind the same non-root numeric service UID.
+- Both ext4 jobs create one long-lived private mount namespace with separate
+  `rprivate` archive and session self-bind roots before dropping to that
+  service user. A producer barrier gates whether both live ext4 mounts are
+  visible in the child namespace and absent from the parent namespace.
 
 ## Safety Boundary
 
@@ -76,6 +86,9 @@ superseded_by:
   benign metadata churn is not treated as object replacement.
 - PostgreSQL grants the one physical mutation. The injected backend validates
   and executes that exact invocation but does not mint a grant.
+- The host owns mount-namespace lifetime and exclusive propagation authority.
+  The native mount-ID/mountinfo check rejects a non-private carrier but cannot
+  serialize another `CAP_SYS_ADMIN` actor in the same namespace.
 - A database epoch, expired lease, process exit, inaccessible path, or
   successful first detach syscall is not by itself a physical fence or settled
   detach proof.
@@ -122,6 +135,9 @@ superseded_by:
   was the Linux-only ACL path on the Darwin development host.
 - JavaScript syntax checks, native C strict syntax checks, workflow YAML parse,
   project-journal validation, and tracked/untracked whitespace checks passed.
+- The privileged Ubuntu producer is the runtime gate for the live parent/child
+  namespace barrier and close-before-unmount behavior; Darwin cannot execute
+  either Linux mount semantic locally.
 - Real loop/mount, rootless Podman, cross-host image transfer, and PostgreSQL
   integration remain CI gates because the local host is Darwin and has no
   configured `SESSION_AUTHORITY_DATABASE_URL`.

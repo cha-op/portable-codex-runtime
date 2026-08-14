@@ -67,7 +67,8 @@ enum inspector_exit_code {
     defined(RESOLVE_NO_SYMLINKS) && defined(RESOLVE_NO_XDEV) &&              \
     defined(LOOP_CONFIGURE) && defined(LOOP_CTL_GET_FREE) &&                 \
     defined(BLKGETSIZE64) && defined(BLKSSZGET) && defined(BLKGETDISKSEQ) && \
-    defined(CLOSE_RANGE_UNSHARE) &&                                         \
+    defined(CLOSE_RANGE_UNSHARE) && defined(STATX_MNT_ID) &&                \
+    defined(UMOUNT_NOFOLLOW) &&                                             \
     (defined(SYS_close_range) || defined(__NR_close_range)) &&              \
     (defined(SYS_openat2) || defined(__NR_openat2))
 #define PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI 1
@@ -274,6 +275,7 @@ static int call_openat2(int directory_fd, const char *path,
 #define CONTROL_FILE_MODE 0600
 #define DIRECTORY_MODE 0700
 #define IMAGE_MODE 0600
+#define MOUNTINFO_BYTES_LIMIT (1024U * 1024U)
 
 static int valid_direct_name(const char *name) {
   const unsigned char *cursor = (const unsigned char *)name;
@@ -428,6 +430,13 @@ static int require_fd_identity(int fd, const char *device_text,
 static int format_proc_fd_path(int fd, char output[64]) {
   const int length = snprintf(output, 64U, "/proc/self/fd/%d", fd);
   return length > 0 && length < 64;
+}
+
+static int format_proc_fd_child_path(int parent_fd, const char *name,
+                                     char output[320]) {
+  const int length = snprintf(output, 320U, "/proc/self/fd/%d/%s", parent_fd,
+                              name);
+  return valid_direct_name(name) && length > 0 && length < 320;
 }
 
 static int clear_close_on_exec(int fd) {
@@ -1653,6 +1662,145 @@ static int statx_mount_id(int fd, uint64_t *mount_id) {
   return 0;
 }
 
+static int read_mountinfo(char **output, size_t *output_length) {
+  char *buffer = NULL;
+  size_t length = 0U;
+  int fd = -1;
+  int status = -1;
+  fd = open("/proc/self/mountinfo", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) goto cleanup;
+  buffer = (char *)malloc(MOUNTINFO_BYTES_LIMIT + 1U);
+  if (buffer == NULL) goto cleanup;
+  while (length < MOUNTINFO_BYTES_LIMIT) {
+    const ssize_t count =
+        read(fd, buffer + length, MOUNTINFO_BYTES_LIMIT - length);
+    if (count < 0) {
+      if (errno == EINTR) continue;
+      goto cleanup;
+    }
+    if (count == 0) break;
+    length += (size_t)count;
+  }
+  if (length == MOUNTINFO_BYTES_LIMIT) {
+    char extra;
+    ssize_t count;
+    do {
+      count = read(fd, &extra, 1U);
+    } while (count < 0 && errno == EINTR);
+    if (count != 0) goto cleanup;
+  }
+  if (length == 0U || buffer[length - 1U] != '\n' ||
+      memchr(buffer, '\0', length) != NULL) {
+    goto cleanup;
+  }
+  buffer[length] = '\0';
+  *output = buffer;
+  *output_length = length;
+  buffer = NULL;
+  status = 0;
+
+cleanup:
+  free(buffer);
+  if (fd >= 0 && close(fd) != 0) status = -1;
+  return status;
+}
+
+static int mountinfo_token_is(const char *token, size_t length,
+                              const char *expected) {
+  const size_t expected_length = strlen(expected);
+  return length == expected_length &&
+         memcmp(token, expected, expected_length) == 0;
+}
+
+static int mountinfo_token_starts_with(const char *token, size_t length,
+                                       const char *prefix) {
+  const size_t prefix_length = strlen(prefix);
+  return length >= prefix_length &&
+         memcmp(token, prefix, prefix_length) == 0;
+}
+
+static int mount_carrier_is_private(int fd) {
+  char *mountinfo = NULL;
+  size_t mountinfo_length = 0U;
+  uint64_t expected_mount_id;
+  size_t offset = 0U;
+  int found = 0;
+  int isolated = 0;
+  int status = -1;
+  if (statx_mount_id(fd, &expected_mount_id) != 0 ||
+      read_mountinfo(&mountinfo, &mountinfo_length) != 0) {
+    goto cleanup;
+  }
+  while (offset < mountinfo_length) {
+    char *line = mountinfo + offset;
+    char *newline = memchr(line, '\n', mountinfo_length - offset);
+    char *cursor;
+    size_t field_index = 0U;
+    size_t separator_index = SIZE_MAX;
+    uint64_t line_mount_id = 0U;
+    int non_private = 0;
+    if (newline == NULL || newline == line) goto cleanup;
+    *newline = '\0';
+    cursor = line;
+    while (*cursor != '\0') {
+      char *token = cursor;
+      char *end = strchr(cursor, ' ');
+      size_t token_length;
+      if (end == cursor) goto cleanup;
+      if (end == NULL) end = cursor + strlen(cursor);
+      token_length = (size_t)(end - token);
+      if (field_index == 0U) {
+        const char saved = *end;
+        *end = '\0';
+        if (!parse_u64_decimal(token, &line_mount_id)) {
+          *end = saved;
+          goto cleanup;
+        }
+        *end = saved;
+      } else if (line_mount_id == expected_mount_id && field_index >= 6U &&
+                 separator_index == SIZE_MAX) {
+        if (mountinfo_token_is(token, token_length, "-")) {
+          separator_index = field_index;
+        } else if (mountinfo_token_is(token, token_length, "unbindable") ||
+                   mountinfo_token_starts_with(token, token_length,
+                                               "shared:") ||
+                   mountinfo_token_starts_with(token, token_length,
+                                               "master:") ||
+                   mountinfo_token_starts_with(token, token_length,
+                                               "propagate_from:")) {
+          non_private = 1;
+        }
+      }
+      field_index += 1U;
+      if (*end == '\0') break;
+      cursor = end + 1;
+      if (*cursor == '\0') goto cleanup;
+    }
+    if (line_mount_id == expected_mount_id) {
+      if (found || separator_index == SIZE_MAX || separator_index < 6U ||
+          separator_index + 3U >= field_index) {
+        goto cleanup;
+      }
+      found = 1;
+      isolated = !non_private;
+    }
+    offset = (size_t)(newline - mountinfo) + 1U;
+  }
+  if (!found) goto cleanup;
+  status = isolated ? 1 : 0;
+
+cleanup:
+  free(mountinfo);
+  return status;
+}
+
+static int require_private_mount_carrier(int fd, int dispatched) {
+  const int state = mount_carrier_is_private(fd);
+  if (state > 0) return EXIT_SUCCESS;
+  if (state == 0 && !dispatched) return INSPECTOR_EXIT_MISMATCH;
+  return dispatched ? INSPECTOR_EXIT_OUTCOME_UNCERTAIN : INSPECTOR_EXIT_IO;
+}
+
 static int mount_ext4_loop(const char *root_path,
                            const char *relative_parent, const char *name,
                            const char *loop_path,
@@ -1720,12 +1868,14 @@ static int mount_ext4_loop(const char *root_path,
   }
   if (validate_loop_geometry(loop_fd, backing_device, backing_inode,
                              expected_size, expected_major, expected_minor) !=
-      1 ||
+          1 ||
       !format_proc_fd_path(loop_fd, source_proc_path) ||
       !format_proc_fd_path(target_fd, target_proc_path)) {
     status = INSPECTOR_EXIT_MISMATCH;
     goto cleanup;
   }
+  status = require_private_mount_carrier(parent_fd, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
   dispatched = 1;
   if (mount(source_proc_path, target_proc_path, "ext4", mount_flags,
             mount_data) != 0) {
@@ -1742,6 +1892,7 @@ static int mount_ext4_loop(const char *root_path,
       target_metadata.st_dev != current_target_metadata.st_dev ||
       target_metadata.st_ino != current_target_metadata.st_ino ||
       !format_proc_fd_path(visible_fd, target_proc_path) ||
+      require_private_mount_carrier(parent_fd, 1) != EXIT_SUCCESS ||
       mount(NULL, target_proc_path, NULL, MS_PRIVATE, NULL) != 0 ||
       fchmod(visible_fd, DIRECTORY_MODE) != 0 || syncfs(visible_fd) != 0 ||
       require_private_policy(visible_fd, S_IFDIR, DIRECTORY_MODE, 0, 1) !=
@@ -1776,9 +1927,10 @@ static int unmount_ext4_root(const char *root_path,
                              const char *target_filesystem_id,
                              const char *target_object_id) {
   struct statfs filesystem;
+  uint64_t parent_mount_id;
   uint64_t before_mount_id;
   uint64_t after_mount_id;
-  char target_proc_path[64];
+  char target_proc_path[320];
   int root_fd = -1;
   int parent_fd = -1;
   int target_fd = -1;
@@ -1791,6 +1943,14 @@ static int unmount_ext4_root(const char *root_path,
   if (status != EXIT_SUCCESS) goto cleanup;
   status = require_fd_identity(parent_fd, parent_device, parent_inode, 0);
   if (status != EXIT_SUCCESS) goto cleanup;
+  status = require_private_policy(parent_fd, S_IFDIR, DIRECTORY_MODE, 0, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
+  if (statx_mount_id(parent_fd, &parent_mount_id) != 0) {
+    status = INSPECTOR_EXIT_IO;
+    goto cleanup;
+  }
+  status = require_private_mount_carrier(parent_fd, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
   target_fd = open_direct_child(parent_fd, name, O_RDONLY | O_DIRECTORY, 1);
   if (target_fd < 0) {
     status = classify_path_errno(errno);
@@ -1801,29 +1961,62 @@ static int unmount_ext4_root(const char *root_path,
   status = require_persistent_identity(target_fd, target_filesystem_id,
                                        target_object_id, 0);
   if (status != EXIT_SUCCESS) goto cleanup;
-  if (require_private_policy(target_fd, S_IFDIR, DIRECTORY_MODE, 0, 0) !=
-          EXIT_SUCCESS ||
-      fstatfs(target_fd, &filesystem) != 0 ||
-      (unsigned long)filesystem.f_type != (unsigned long)EXT4_SUPER_MAGIC ||
-      statx_mount_id(target_fd, &before_mount_id) != 0 ||
-      !format_proc_fd_path(target_fd, target_proc_path)) {
+  status = require_private_policy(target_fd, S_IFDIR, DIRECTORY_MODE, 0, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
+  if (fstatfs(target_fd, &filesystem) != 0 ||
+      statx_mount_id(target_fd, &before_mount_id) != 0) {
+    status = INSPECTOR_EXIT_IO;
+    goto cleanup;
+  }
+  if ((unsigned long)filesystem.f_type != (unsigned long)EXT4_SUPER_MAGIC ||
+      before_mount_id == parent_mount_id ||
+      !format_proc_fd_child_path(parent_fd, name, target_proc_path)) {
     status = INSPECTOR_EXIT_MISMATCH;
     goto cleanup;
   }
   dispatched = 1;
-  if (syncfs(target_fd) != 0 || umount2(target_proc_path, 0) != 0) {
+  if (syncfs(target_fd) != 0 ||
+      require_fd_identity(target_fd, target_device, target_inode, 1) !=
+          EXIT_SUCCESS ||
+      require_persistent_identity(target_fd, target_filesystem_id,
+                                  target_object_id, 1) != EXIT_SUCCESS ||
+      require_private_policy(target_fd, S_IFDIR, DIRECTORY_MODE, 0, 1) !=
+          EXIT_SUCCESS ||
+      fstatfs(target_fd, &filesystem) != 0 ||
+      (unsigned long)filesystem.f_type != (unsigned long)EXT4_SUPER_MAGIC ||
+      statx_mount_id(target_fd, &after_mount_id) != 0 ||
+      after_mount_id != before_mount_id ||
+      require_fd_identity(parent_fd, parent_device, parent_inode, 1) !=
+          EXIT_SUCCESS ||
+      require_private_policy(parent_fd, S_IFDIR, DIRECTORY_MODE, 0, 1) !=
+          EXIT_SUCCESS ||
+      statx_mount_id(parent_fd, &after_mount_id) != 0 ||
+      after_mount_id != parent_mount_id ||
+      require_private_mount_carrier(parent_fd, 1) != EXIT_SUCCESS) {
     status = INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
     goto cleanup;
   }
+  {
+    const int closing_fd = target_fd;
+    target_fd = -1;
+    if (close(closing_fd) != 0 ||
+        umount2(target_proc_path, UMOUNT_NOFOLLOW) != 0) {
+      status = INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+      goto cleanup;
+    }
+  }
   host_fd = open_direct_child(parent_fd, name, O_RDONLY | O_DIRECTORY, 0);
-  if (require_private_policy(target_fd, S_IFDIR, DIRECTORY_MODE, 0, 1) !=
-          EXIT_SUCCESS ||
-      host_fd < 0 || statx_mount_id(host_fd, &after_mount_id) != 0 ||
-      after_mount_id == before_mount_id ||
+  if (host_fd < 0 || statx_mount_id(host_fd, &after_mount_id) != 0 ||
+      after_mount_id != parent_mount_id ||
       require_private_policy(host_fd, S_IFDIR, DIRECTORY_MODE, 0, 1) !=
           EXIT_SUCCESS ||
+      require_fd_identity(parent_fd, parent_device, parent_inode, 1) !=
+          EXIT_SUCCESS ||
       require_private_policy(parent_fd, S_IFDIR, DIRECTORY_MODE, 0, 1) !=
-          EXIT_SUCCESS) {
+          EXIT_SUCCESS ||
+      statx_mount_id(parent_fd, &after_mount_id) != 0 ||
+      after_mount_id != parent_mount_id ||
+      require_private_mount_carrier(parent_fd, 1) != EXIT_SUCCESS) {
     status = INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
     goto cleanup;
   }

@@ -462,10 +462,13 @@ Restore and launcher authority are now split into eight serial pull requests:
 
 The production-injectable Linux ext4 and rootless Podman components are now
 complete independently for clean, manually fenced operation. They supply an
-FD-bound raw-image lifecycle, externally anchored provider state, distinct
-publication-control identities, and two-host clean detach, transfer, and
-remount verification. Their trusted persistent-identity bridge and
-same-process conformance evidence remain pending. See
+FD-bound raw-image lifecycle below host-owned `rprivate` carriers in one
+long-lived private mount namespace, externally anchored provider state,
+distinct publication-control identities, and two-host clean detach, transfer,
+and remount verification plus a producer peer-namespace non-propagation gate.
+Their trusted
+persistent-identity bridge and same-process conformance evidence remain
+pending. See
 `linux-ext4-physical-backend.md`. Later slices own power-loss/crash-prefix
 evidence, automatic stale-writer fencing, differential export/compression,
 content-addressed distribution, encryption, retention, registry trust, remote

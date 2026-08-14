@@ -152,11 +152,12 @@
   Callers cannot inject the internal generation-publication callback, invoke
   raw lifecycle mutations, or reach operator/provider extensions.
 - [done] Implement production-injectable Linux ext4 physical components:
-  FD-bound sparse raw-image lifecycle and clean detach settlement, externally
-  anchored provider state, distinct archive mount-root and artifact-child
-  publication-control identities, rootless digest-pinned Podman launch/stop,
-  and two-host clean detach, transfer, verification-only first remount, and
-  identity verification.
+  sparse raw-image lifecycle below host-owned `rprivate` carriers,
+  close-before-unmount clean detach settlement, externally anchored provider
+  state, distinct archive mount-root and artifact-child publication-control
+  identities, rootless digest-pinned Podman launch/stop, and two-host clean
+  detach, transfer, verification-only first remount, identity verification,
+  and a peer-namespace non-propagation gate.
 - [pending] Bind the provider state's persistent ext4 attachment identity into
   a trusted Podman filesystem authority, exercise that authority with the
   initialized backend in one non-root process, and add authority-owned bounded

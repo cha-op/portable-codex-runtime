@@ -158,13 +158,115 @@ jobs:
           sudo rm -f /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
           test "$identity_status" -eq 69
       - name: Publish and verify on a real ext4 loop image
+        timeout-minutes: 15
         env:
           LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
+          LINUX_EXT4_PEER_NAMESPACE_BARRIER: "1"
+          LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE: "1"
           LINUX_EXT4_TEST_MODE: producer
           LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
         run: |
-          sg portable-codex-ext4 -c \
-            'node --test integration/linux-ext4-physical-backend.mjs'
+          service_uid="$(id -u)"
+          service_gid="$(id -g)"
+          node_path="$(command -v node)"
+          namespace_pid_path="${LINUX_EXT4_TEST_ROOT}.namespace-pid"
+          namespace_pid_pending_path="${namespace_pid_path}.pending"
+          peer_ready_path="${LINUX_EXT4_TEST_ROOT}.peer-ready"
+          peer_ready_pending_path="${peer_ready_path}.pending"
+          peer_release_path="${LINUX_EXT4_TEST_ROOT}.peer-release"
+          peer_release_pending_path="${peer_release_path}.pending"
+          sudo install -d -o "$service_uid" -g "$service_gid" -m 0700 \
+            "$LINUX_EXT4_TEST_ROOT" \
+            "$LINUX_EXT4_TEST_ROOT/archive-mounts" \
+            "$LINUX_EXT4_TEST_ROOT/images" \
+            "$LINUX_EXT4_TEST_ROOT/mounts" \
+            "$LINUX_EXT4_TEST_ROOT/state"
+          sudo rm -f -- \
+            "$namespace_pid_path" \
+            "$namespace_pid_pending_path" \
+            "$peer_ready_path" \
+            "$peer_ready_pending_path" \
+            "$peer_release_path" \
+            "$peer_release_pending_path"
+          publish_peer_release() {
+            umask 077
+            printf 'release\n' > "$peer_release_pending_path"
+            mv -f -- "$peer_release_pending_path" "$peer_release_path"
+          }
+          peer_namespace_probe() {
+            trap 'publish_peer_release || true' EXIT
+            deadline="$((SECONDS + 180))"
+            while ! test -s "$namespace_pid_path" || ! test -s "$peer_ready_path"; do
+              test "$SECONDS" -lt "$deadline"
+              sleep 0.1
+            done
+            namespace_pid="$(cat "$namespace_pid_path")"
+            archive_mount="$(jq -r '.archiveMount' "$peer_ready_path")"
+            storage_mount="$(jq -r '.storageMount' "$peer_ready_path")"
+            for target in "$archive_mount" "$storage_mount"; do
+              case "$target" in
+                "$LINUX_EXT4_TEST_ROOT"/archive-mounts/* | "$LINUX_EXT4_TEST_ROOT"/mounts/*) ;;
+                *) exit 1 ;;
+              esac
+              test "$(sudo /usr/bin/nsenter -t "$namespace_pid" -m -- \
+                /usr/bin/findmnt -rn -M "$target" -o FSTYPE)" = ext4
+              if /usr/bin/findmnt -rn -M "$target" -o FSTYPE >/dev/null; then
+                echo "ext4 mount propagated into the parent namespace: $target" >&2
+                exit 1
+              fi
+            done
+            publish_peer_release
+            trap - EXIT
+          }
+          peer_namespace_probe &
+          probe_pid="$!"
+          set +e
+          sudo /usr/bin/env \
+            LINUX_EXT4_INSPECTOR_HELPER="$LINUX_EXT4_INSPECTOR_HELPER" \
+            LINUX_EXT4_PEER_NAMESPACE_BARRIER="$LINUX_EXT4_PEER_NAMESPACE_BARRIER" \
+            LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE="$LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE" \
+            LINUX_EXT4_TEST_MODE="$LINUX_EXT4_TEST_MODE" \
+            LINUX_EXT4_TEST_ROOT="$LINUX_EXT4_TEST_ROOT" \
+            PORTABLE_CODEX_NAMESPACE_PID_PATH="$namespace_pid_path" \
+            PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH="$namespace_pid_pending_path" \
+            PORTABLE_CODEX_NODE="$node_path" \
+            PORTABLE_CODEX_SERVICE_GID="$service_gid" \
+            PORTABLE_CODEX_SERVICE_UID="$service_uid" \
+            /usr/bin/unshare --mount --propagation private -- /bin/bash -c '
+              set -euo pipefail
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/archive-mounts" "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/mounts" "$LINUX_EXT4_TEST_ROOT/mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/mounts"
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/archive-mounts" -o PROPAGATION)" = private
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/mounts" -o PROPAGATION)" = private
+              umask 022
+              printf "%s\n" "$$" > "$PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH"
+              chmod 0644 "$PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH"
+              /usr/bin/mv -f -- "$PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH" "$PORTABLE_CODEX_NAMESPACE_PID_PATH"
+              umask 077
+              exec /usr/bin/setpriv \
+                --reuid "$PORTABLE_CODEX_SERVICE_UID" \
+                --regid "$PORTABLE_CODEX_SERVICE_GID" \
+                --init-groups -- \
+                "$PORTABLE_CODEX_NODE" --test integration/linux-ext4-physical-backend.mjs
+            '
+          node_status="$?"
+          if test "$node_status" -ne 0; then
+            kill "$probe_pid" 2>/dev/null || true
+          fi
+          wait "$probe_pid"
+          probe_status="$?"
+          set -e
+          test "$node_status" -eq 0
+          test "$probe_status" -eq 0
+          sudo rm -f -- \
+            "$namespace_pid_path" \
+            "$namespace_pid_pending_path" \
+            "$peer_ready_path" \
+            "$peer_ready_pending_path" \
+            "$peer_release_path" \
+            "$peer_release_pending_path"
       - name: Capture the provider head and sparse transfer image
         id: provider-state-head
         env:
@@ -222,6 +324,13 @@ jobs:
               done
           fi
           sudo udevadm settle
+          sudo rm -f -- \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid" \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release.pending"
           sudo rm -rf -- "$LINUX_EXT4_TEST_ROOT"
 
   linux-ext4-consumer:
@@ -288,17 +397,48 @@ jobs:
             -C /var/tmp \
             -xf "$RUNNER_TEMP/linux-ext4-transfer/linux-ext4-transfer.tar"
       - name: Reconcile, verify, reattach, and destroy on a new host
+        timeout-minutes: 15
         env:
           LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY: ${{ needs.linux-ext4-producer.outputs.archive-mount-publication-control-identity }}
           LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY: ${{ needs.linux-ext4-producer.outputs.archive-publication-control-identity }}
           LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
+          LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE: "1"
           LINUX_EXT4_PRODUCER_UID: ${{ needs.linux-ext4-producer.outputs.service-uid }}
           LINUX_EXT4_PROVIDER_STATE_HEAD: ${{ needs.linux-ext4-producer.outputs.provider-state-head }}
           LINUX_EXT4_TEST_MODE: consumer
           LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
         run: |
-          sg portable-codex-ext4 -c \
-            'node --test integration/linux-ext4-physical-backend.mjs'
+          service_uid="$(id -u)"
+          service_gid="$(id -g)"
+          node_path="$(command -v node)"
+          test -d "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+          test -d "$LINUX_EXT4_TEST_ROOT/mounts"
+          sudo /usr/bin/env \
+            LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY="$LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY" \
+            LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY="$LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY" \
+            LINUX_EXT4_INSPECTOR_HELPER="$LINUX_EXT4_INSPECTOR_HELPER" \
+            LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE="$LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE" \
+            LINUX_EXT4_PRODUCER_UID="$LINUX_EXT4_PRODUCER_UID" \
+            LINUX_EXT4_PROVIDER_STATE_HEAD="$LINUX_EXT4_PROVIDER_STATE_HEAD" \
+            LINUX_EXT4_TEST_MODE="$LINUX_EXT4_TEST_MODE" \
+            LINUX_EXT4_TEST_ROOT="$LINUX_EXT4_TEST_ROOT" \
+            PORTABLE_CODEX_NODE="$node_path" \
+            PORTABLE_CODEX_SERVICE_GID="$service_gid" \
+            PORTABLE_CODEX_SERVICE_UID="$service_uid" \
+            /usr/bin/unshare --mount --propagation private -- /bin/bash -c '
+              set -euo pipefail
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/archive-mounts" "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/mounts" "$LINUX_EXT4_TEST_ROOT/mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/mounts"
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/archive-mounts" -o PROPAGATION)" = private
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/mounts" -o PROPAGATION)" = private
+              exec /usr/bin/setpriv \
+                --reuid "$PORTABLE_CODEX_SERVICE_UID" \
+                --regid "$PORTABLE_CODEX_SERVICE_GID" \
+                --init-groups -- \
+                "$PORTABLE_CODEX_NODE" --test integration/linux-ext4-physical-backend.mjs
+            '
       - name: Clean the scoped consumer resources
         if: always()
         env:
@@ -324,4 +464,11 @@ jobs:
               done
           fi
           sudo udevadm settle
+          sudo rm -f -- \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid" \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release.pending"
           sudo rm -rf -- "$LINUX_EXT4_TEST_ROOT"

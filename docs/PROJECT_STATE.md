@@ -419,15 +419,17 @@
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Production-injectable Linux ext4 physical components now supply sparse raw-
-  image lifecycle through FD-bound native operations, exact clean unmount and
-  loop-detach settlement, an append-only provider ledger checked against an
-  external PostgreSQL head, two distinct persistent archive control identities,
-  and a rootless digest-pinned Podman writer supervisor. Producer outputs bind
+  image lifecycle through native operations below host-owned `rprivate` mount
+  carriers, exact close-before-unmount and loop-detach settlement, an
+  append-only provider ledger checked against an external PostgreSQL head, two
+  distinct persistent archive control identities, and a rootless digest-pinned
+  Podman writer supervisor. Producer outputs bind
   the archive mount-root and artifact-child tuples separately; on the consumer,
   the former makes the first remount verification-only and the latter
   authorizes verification for the exact publication root. Two hosted Ubuntu
   runners cover clean detach, transfer, remount, provider-head continuity, and
-  source-free committed verification. This remains a clean/manual-fencing
+  source-free committed verification; the producer additionally gates private-
+  namespace non-propagation. This remains a clean/manual-fencing
   boundary: it does not prove power-loss or crash-prefix recovery,
   automatically fence a stale writer, or implement differential export/
   compression, encryption, retention, or registry trust. A trusted adapter
@@ -559,8 +561,11 @@
   complete. Production-injectable Linux ext4 and rootless Podman components
   now implement the clean/manual-fencing physical boundary and verify clean
   two-host detach, transfer, and a verification-only first remount against
-  separately anchored archive control tuples. Their conformance jobs remain
-  separate: the default Podman filesystem authority binds only the current
+  separately anchored archive control tuples. Each ext4 job runs below
+  dedicated `rprivate` carriers in one long-lived private mount namespace and
+  the producer gates whether its live mounts propagate to the parent
+  namespace. The ext4 and Podman conformance jobs remain separate: the default
+  Podman filesystem authority binds only the current
   held directory object and access policy, while a production composition must
   supply a trusted authority that maps the durable ext4 attachment identity to
   that held object. They do not make crash-prefix state durable, revoke a stale

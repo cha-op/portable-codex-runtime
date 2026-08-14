@@ -16,10 +16,11 @@ versioned provider attachment proof, atomic detached activation into a
 prepared launch, four bounded no-relaunch recovery lanes, and a
 production-neutral detached-restore foreground composition seam and runtime
 assembly with a narrow same-launcher writer-start ingress.
-The Linux production-injection surface now has a concrete clean/manual-fencing
-implementation: FD-bound raw ext4 images, externally anchored provider state,
-separate publication-control identities, and a rootless Podman writer
-supervisor.
+The Linux production-injection surface now has independent clean/manual-
+fencing components: FD-bound raw ext4 images, externally anchored provider
+state, separate publication-control identities, and a rootless Podman writer
+supervisor. The ext4 component requires a host-owned long-lived private mount
+namespace; the persistent ext4-to-Podman identity bridge remains pending.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -528,18 +529,23 @@ it is not replay of a durable mutation. The generic lifecycle methods
 `provisionSession()`, and `restoreCheckpoint()` remain outside the currently
 assembled restore saga even though deployment settles their contracts.
 
-Production-injectable Linux components now own sparse raw ext4-image creation,
-FD-bound format/mount/sync/unmount/loop-detach settlement, an append-only
-provider ledger checked against an external PostgreSQL head, separate
-persistent publication-control identities, and a rootless Podman writer
-supervisor. Its two-host Ubuntu conformance flow cleanly detaches and transfers
-separate session and archive images. On the consumer host, the externally
-anchored archive mount-root tuple makes the first remount verification-only;
-the distinct artifact-child tuple then authorizes publication verification for
-that exact owned root. The default Podman filesystem authority protects the
-object selected for a call; a trusted adapter that binds the provider's
-committed ext4 identity into that authority, and same-process evidence for the
-combined components, remain pending.
+Production-injectable Linux components now provide sparse raw ext4-image
+creation, FD-bound format/mount/sync/unmount/loop-detach settlement, an
+append-only provider ledger checked against an external PostgreSQL head,
+separate persistent publication-control identities, and a rootless Podman
+writer supervisor. Their two-host Ubuntu conformance flow runs each Node
+process and helper in one long-lived private mount namespace with dedicated
+`rprivate` archive and session roots. A live-mount barrier proves the
+producer's ext4 mounts are visible in that child namespace and absent from its
+parent when the privileged workflow gate runs. The flow then cleanly detaches
+and transfers both images. On the
+consumer host, the externally anchored archive mount-root tuple makes the
+first remount
+verification-only; the distinct artifact-child tuple then authorizes
+publication verification for that exact owned root. The default Podman
+filesystem authority protects the object selected for a call; a trusted
+adapter that binds the provider's committed ext4 identity into that authority,
+and same-process evidence for the combined components, remain pending.
 
 That evidence is a clean operator-controlled transfer boundary, not sudden
 power-loss or crash-prefix evidence and not automatic stale-writer fencing.
@@ -738,10 +744,12 @@ the safety matrix now binds the seven real-PostgreSQL durable cuts, separate
 new-object physical/runtime/controller retry and registry rehydration, and
 representative settlement timer/drain evidence. The Linux ext4 physical slice
 now supplies the clean/manual-fencing storage and rootless Podman collaborators
-through those injection points, including two-host clean detach, transfer,
-verification-only first remount, and separate mount-root/artifact-child
-identity verification. Crash-prefix recovery, automatic stale-writer fencing,
-and differential/compressed backup remain later independent work. See
+through those injection points, including host-owned long-lived private mount
+namespaces with dedicated `rprivate` carriers, a producer peer-namespace non-
+propagation gate, two-host clean detach and transfer, verification-only first remount,
+and separate mount-root/artifact-child identity verification. Crash-prefix
+recovery, automatic stale-writer fencing, and differential/compressed backup
+remain later independent work. See
 `docs/architecture/linux-ext4-physical-backend.md` and
 `docs/architecture/stopped-directory-backend.md`.
 

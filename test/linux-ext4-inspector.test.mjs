@@ -437,8 +437,16 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   assert.match(source, /BLKGETDISKSEQ/u);
   assert.match(source, /\/sys\/dev\/block\/%u:%u\/loop\/backing_file/u);
   assert.match(source, /\/run\/udev\/data\/b%u:%u/u);
+  assert.match(source, /"\/proc\/self\/mountinfo"/u);
+  assert.match(source, /STATX_MNT_ID/u);
+  assert.match(source, /"shared:"/u);
+  assert.match(source, /"master:"/u);
+  assert.match(source, /"propagate_from:"/u);
+  assert.match(source, /separator_index == SIZE_MAX/u);
+  assert.match(source, /defined\(STATX_MNT_ID\)/u);
+  assert.match(source, /defined\(UMOUNT_NOFOLLOW\)/u);
   assert.match(source, /mount\(source_proc_path, target_proc_path, "ext4"/u);
-  assert.match(source, /umount2\(target_proc_path, 0\)/u);
+  assert.match(source, /umount2\(target_proc_path, UMOUNT_NOFOLLOW\)/u);
   assert.match(source, /syncfs\(target_fd\)/u);
   assert.match(source, /mkdirat\(parent_fd, name, DIRECTORY_MODE\)/u);
   assert.match(source, /unlinkat\(parent_fd, name,/u);
@@ -457,6 +465,89 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   );
   assert.match(source, /"\/proc\/self\/fd\/%d"/u);
   assert.doesNotMatch(source, /execlp?\(/u);
+});
+
+test("native unmount releases mounted-root authority before non-lazy unmount", async () => {
+  const source = await readFile(
+    new URL("../native/linux-ext4-inspector.c", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("static int unmount_ext4_root(");
+  const end = source.indexOf("static int remove_pinned_child(", start);
+  assert(start >= 0);
+  assert(end > start);
+  const body = source.slice(start, end);
+  const childPath = body.indexOf(
+    "format_proc_fd_child_path(parent_fd, name, target_proc_path)",
+  );
+  const sync = body.indexOf("syncfs(target_fd)");
+  const persistentRevalidation = body.indexOf(
+    "require_persistent_identity(target_fd, target_filesystem_id,",
+    sync,
+  );
+  const clearAuthority = body.indexOf("target_fd = -1", persistentRevalidation);
+  const closeAuthority = body.indexOf("close(closing_fd)", clearAuthority);
+  const unmount = body.indexOf(
+    "umount2(target_proc_path, UMOUNT_NOFOLLOW)",
+    closeAuthority,
+  );
+  const reopenHost = body.indexOf("host_fd = open_direct_child", unmount);
+  assert(childPath >= 0);
+  assert(sync > childPath);
+  assert(persistentRevalidation > sync);
+  assert(clearAuthority > persistentRevalidation);
+  assert(closeAuthority > clearAuthority);
+  assert(unmount > closeAuthority);
+  assert(reopenHost > unmount);
+  assert.match(body, /before_mount_id == parent_mount_id/u);
+  assert.match(body, /after_mount_id != parent_mount_id/u);
+  assert.doesNotMatch(body, /format_proc_fd_path\(target_fd, target_proc_path\)/u);
+  assert.doesNotMatch(
+    body.slice(unmount),
+    /require_private_policy\(target_fd,/u,
+  );
+});
+
+test("native mount and unmount require a private parent carrier before dispatch", async () => {
+  const source = await readFile(
+    new URL("../native/linux-ext4-inspector.c", import.meta.url),
+    "utf8",
+  );
+  const mountStart = source.indexOf("static int mount_ext4_loop(");
+  const mountEnd = source.indexOf("static int unmount_ext4_root(", mountStart);
+  const unmountEnd = source.indexOf(
+    "static int remove_pinned_child(",
+    mountEnd,
+  );
+  assert(mountStart >= 0);
+  assert(mountEnd > mountStart);
+  assert(unmountEnd > mountEnd);
+  const mountBody = source.slice(mountStart, mountEnd);
+  const mountCarrierCheck = mountBody.indexOf(
+    "require_private_mount_carrier(parent_fd, 0)",
+  );
+  const mountDispatch = mountBody.indexOf(
+    'mount(source_proc_path, target_proc_path, "ext4"',
+  );
+  assert(mountCarrierCheck >= 0);
+  assert(mountDispatch > mountCarrierCheck);
+  assert.match(
+    mountBody.slice(mountDispatch),
+    /require_private_mount_carrier\(parent_fd, 1\)/u,
+  );
+  const unmountBody = source.slice(mountEnd, unmountEnd);
+  const unmountCarrierCheck = unmountBody.indexOf(
+    "require_private_mount_carrier(parent_fd, 0)",
+  );
+  const unmountDispatch = unmountBody.indexOf(
+    "umount2(target_proc_path, UMOUNT_NOFOLLOW)",
+  );
+  assert(unmountCarrierCheck >= 0);
+  assert(unmountDispatch > unmountCarrierCheck);
+  assert.match(
+    unmountBody.slice(unmountDispatch),
+    /require_private_mount_carrier\(parent_fd, 1\)/u,
+  );
 });
 
 test("listMountPoints parses current Linux mountinfo and freezes the result", async () => {

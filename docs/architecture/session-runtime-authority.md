@@ -76,7 +76,10 @@ operation: they supply an FD-bound ext4 raw-image lifecycle, an externally
 anchored provider ledger, separate persistent publication-control identities,
 and a rootless Podman supervisor. Their two-host conformance boundary verifies
 clean detach, raw-image transfer, a verification-only first remount, and
-distinct archive mount-root and artifact-child identity readback. A trusted
+distinct archive mount-root and artifact-child identity readback. The ext4
+component operates only below host-prepared `rprivate` carriers in one
+long-lived private mount namespace; a live producer barrier gates whether
+those ext4 mounts propagate to its parent namespace. A trusted
 bridge from committed ext4 identity to Podman filesystem authority and
 same-process conformance evidence remain pending; the current evidence does not
 claim power-loss/crash-prefix recovery or automatic stale-writer fencing.
@@ -2194,8 +2197,11 @@ runtime, and controller, references separate stable-plan-registry rehydration,
 and layers representative settlement-foundation/deployment timer and drain
 evidence. It does not claim one whole-saga deployment restart or operating-
 system crash. The immutable public backend can now be supplied with the
-production-injectable Linux physical components. The ext4 driver keeps raw-image
-format, mount, sync, unmount, and loop-detach work bound to held descriptors;
+production-injectable Linux physical components. The ext4 driver keeps raw-
+image format, mount, sync, and loop-detach work bound to pinned descriptor
+authority below host-owned `rprivate` carriers; clean unmount closes the
+mounted-root descriptor before its non-lazy dispatch while retaining the
+pinned parent/direct-child authority;
 provider mutations require an append-only ledger head anchored outside the
 replaceable image; and publication checks separately authorized persistent
 control identities.
@@ -2344,7 +2350,9 @@ reconciliation, distinct mount-root and artifact-child publication-control
 identity, and rootless Podman launch/stop coverage. Their producer/consumer jobs
 verify a clean two-host image transfer and verification-only first remount; a
 trusted persistent-identity bridge and same-process conformance evidence remain
-pending.
+pending. The ext4 producer additionally gates whether live child-namespace
+mounts propagate to its parent namespace under the required host-owned
+long-lived namespace contract.
 Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
 export/compression, encryption, retention, and registry trust remain unproved
 or unimplemented by design.

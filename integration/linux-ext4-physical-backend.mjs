@@ -5,11 +5,13 @@ import {
   mkdir,
   open,
   readFile,
+  rename,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   FilesystemOperationJournal,
@@ -60,7 +62,19 @@ const HELPER = resolve(
     "/usr/local/libexec/portable-codex-linux-ext4-inspector",
 );
 const TRANSFER_PATH = join(ROOT, "transfer.json");
+const PRIVATE_MOUNT_NAMESPACE =
+  process.env.LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE === "1";
+const PEER_NAMESPACE_BARRIER =
+  process.env.LINUX_EXT4_PEER_NAMESPACE_BARRIER === "1";
+const PEER_READY_PATH = `${ROOT}.peer-ready`;
+const PEER_READY_PENDING_PATH = `${PEER_READY_PATH}.pending`;
+const PEER_RELEASE_PATH = `${ROOT}.peer-release`;
 const CREATED_AT = "2026-08-14T00:00:00.000Z";
+if (!PRIVATE_MOUNT_NAMESPACE) {
+  throw new TypeError(
+    "Linux ext4 integration requires a host-owned private mount namespace",
+  );
+}
 const EXTERNAL_ARCHIVE_PUBLICATION_CONTROL_IDENTITY =
   process.env.LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY === undefined
     ? null
@@ -454,6 +468,57 @@ async function syncFileAndDirectory(path) {
   }
 }
 
+async function assertMountAbsent(inspector, mountPath) {
+  const mountPoints = await inspector.listMountPoints();
+  assert.equal(
+    mountPoints.includes(mountPath),
+    false,
+    `mount must be absent after clean unmount: ${mountPath}`,
+  );
+}
+
+async function assertDedicatedMountRoots(inspector, directories) {
+  if (!PRIVATE_MOUNT_NAMESPACE) return;
+  const mountPoints = await inspector.listMountPoints();
+  for (const mountRoot of [directories.archiveMounts, directories.mounts]) {
+    assert.equal(
+      mountPoints.includes(mountRoot),
+      true,
+      `dedicated mount root must be a mount point: ${mountRoot}`,
+    );
+  }
+}
+
+async function waitForPeerNamespaceProbe({ archiveMount, storageMount }) {
+  if (!PEER_NAMESPACE_BARRIER) return;
+  await writeFile(
+    PEER_READY_PENDING_PATH,
+    `${JSON.stringify({ archiveMount, storageMount })}\n`,
+    { flag: "wx", mode: 0o600 },
+  );
+  await syncFileAndDirectory(PEER_READY_PENDING_PATH);
+  await rename(PEER_READY_PENDING_PATH, PEER_READY_PATH);
+  await syncFileAndDirectory(PEER_READY_PATH);
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      const release = await readFile(PEER_RELEASE_PATH, "utf8");
+      assert.equal(release, "release\n");
+      return;
+    } catch (error) {
+      if (
+        error === null ||
+        typeof error !== "object" ||
+        error.code !== "ENOENT"
+      ) {
+        throw error;
+      }
+    }
+    await delay(100);
+  }
+  throw new Error("timed out waiting for the parent mount-namespace probe");
+}
+
 async function ensureDirectory(path) {
   await mkdir(path, { mode: 0o700 });
   await assertSafeDirectory(path);
@@ -468,7 +533,8 @@ async function assertSafeDirectory(path) {
 }
 
 async function prepareRoots({ existing }) {
-  if (existing) await assertSafeDirectory(ROOT);
+  const precreated = existing || PRIVATE_MOUNT_NAMESPACE;
+  if (precreated) await assertSafeDirectory(ROOT);
   else await ensureDirectory(ROOT);
   const ownedRoots = exact({
     archiveMounts: join(ROOT, "archive-mounts"),
@@ -477,7 +543,7 @@ async function prepareRoots({ existing }) {
     state: join(ROOT, "state"),
   });
   for (const path of Object.values(ownedRoots)) {
-    if (existing) await assertSafeDirectory(path);
+    if (precreated) await assertSafeDirectory(path);
     else await ensureDirectory(path);
   }
   return exact({
@@ -530,6 +596,7 @@ async function createFixture({
       directories.mounts,
     ],
   });
+  await assertDedicatedMountRoots(inspector, directories);
   const driver = createLinuxExt4ImageDriver({ inspector });
   const archiveMountRequest = exact({
     imagePath: directories.archiveImage,
@@ -680,6 +747,13 @@ async function produce() {
     attach,
     context(),
   );
+  const mountedStorage = await fixed.state.readStorage(provisioned.storageId);
+  assert.equal(mountedStorage.lifecycle, "attached");
+  assert.notEqual(mountedStorage.mount, null);
+  await waitForPeerNamespaceProbe({
+    archiveMount: fixed.directories.archiveMount,
+    storageMount: mountedStorage.mount.mountPath,
+  });
   const payloadPath = join(attached.rootPath, "portable.txt");
   await writeFile(payloadPath, PAYLOAD, { flag: "wx", mode: 0o600 });
   await syncFileAndDirectory(payloadPath);
@@ -709,10 +783,12 @@ async function produce() {
     storageId: storage.storageId,
   });
   await fixed.backend.quiesceStorage(storage.storageId);
+  await assertMountAbsent(fixed.inspector, storage.mount.mountPath);
   await fixed.driver.quiesce(exact({
     imagePath: fixed.directories.archiveImage,
     mountPath: fixed.directories.archiveMount,
   }));
+  await assertMountAbsent(fixed.inspector, fixed.directories.archiveMount);
   await writeFile(TRANSFER_PATH, `${JSON.stringify(receipt)}\n`, {
     flag: "wx",
     mode: 0o600,
@@ -801,6 +877,7 @@ async function consume({ destroy }) {
       destroyRequest(detached, "001"),
       context(),
     );
+    await assertMountAbsent(fixed.inspector, detached.mount.mountPath);
     const destroyed = await fixed.state.readStorage(receipt.storageId);
     assert.equal(destroyed.lifecycle, "destroyed");
     assert.equal(destroyed.mount, null);
@@ -809,12 +886,15 @@ async function consume({ destroy }) {
       imagePath: fixed.directories.archiveImage,
       mountPath: fixed.directories.archiveMount,
     }));
+    await assertMountAbsent(fixed.inspector, fixed.directories.archiveMount);
   } else {
     await fixed.backend.quiesceStorage(receipt.storageId);
+    await assertMountAbsent(fixed.inspector, detached.mount.mountPath);
     await fixed.driver.quiesce(exact({
       imagePath: fixed.directories.archiveImage,
       mountPath: fixed.directories.archiveMount,
     }));
+    await assertMountAbsent(fixed.inspector, fixed.directories.archiveMount);
   }
 }
 

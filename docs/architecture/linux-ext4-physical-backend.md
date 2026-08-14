@@ -37,10 +37,11 @@ The physical implementation remains split into small authorities:
   `device`/`inode` binding from one pinned file descriptor. It also owns the
   closed FD-operation protocol used by the driver.
 - `LinuxExt4ImageDriver` owns sparse-image creation, `mkfs.ext4`, loop-device
-  attachment, private ext4 mount, `syncfs`, unmount, loop detach settlement,
-  control-file provisioning, and image destruction. Every mutating path is
-  reopened through a pinned parent or target authority; ordinary absolute
-  pathnames are never passed to a shell.
+  attachment, ext4 mount inside a host-owned private mount namespace,
+  `syncfs`, unmount, loop detach settlement, control-file provisioning, and
+  image destruction. Every mutating path is reopened through a pinned parent
+  or target authority; ordinary absolute pathnames are never passed to a
+  shell.
 - `FilesystemImageProviderState` binds one canonical request to one durable
   prepared or committed operation and one storage revision. Its append-only
   ledger is checked against an external monotonic head before every mutation.
@@ -101,12 +102,39 @@ missing object and remains uncertain.
 ## FD-Bound Linux Operations
 
 The native helper resolves the selected mount root and target using
-`openat2(2)` constraints, holds the resulting descriptors through the
-operation, and returns bounded canonical JSON. The driver uses direct Linux
-syscalls for mount, unmount, loop configuration, loop inspection, directory
-creation, removal, and `syncfs`. The only external storage command is
-`mkfs.ext4`, which receives a pinned `/proc/self/fd/<n>` image descriptor and a
-fixed argument vector without a shell or ambient `PATH`.
+`openat2(2)` constraints and returns bounded canonical JSON. It holds the
+selected descriptors while validating an operation; for non-lazy unmount it
+must release the mounted-root descriptor before dispatch while retaining the
+pinned parent/direct-child authority. The driver uses direct Linux syscalls
+for mount, unmount, loop configuration, loop inspection, directory creation,
+removal, and `syncfs`. The only external storage command is `mkfs.ext4`, which
+receives a pinned `/proc/self/fd/<n>` image descriptor and a fixed argument
+vector without a shell or ambient `PATH`.
+
+Mount propagation is a lifecycle property of the deployment process, not a
+property that a short-lived helper can create after the fact. The namespace
+owner and Node process must remain inside one host-created private mount
+namespace for the complete serving window; each helper invocation inherits
+that same namespace. Within it, the archive and session mount roots are
+separate self-bind mount points marked `rprivate` before any storage-bearing
+ext4 mount. Immediately before mount or unmount, the helper binds the parent
+carrier by `STATX_MNT_ID` and parses the matching
+bounded `/proc/self/mountinfo` record. A `shared:`, `master:`,
+`propagate_from:`, or `unbindable` marker is rejected before dispatch; an
+unreadable or malformed record is an observation failure. These checks detect
+misconfiguration or replacement. They do not replace the host's exclusive
+authority over propagation changes by another `CAP_SYS_ADMIN` process in the
+same namespace.
+
+For non-lazy unmount, the mounted-root descriptor remains authoritative
+through `syncfs` and a final runtime, persistent-identity, access-policy, and
+mount-ID revalidation. The helper then closes that descriptor before calling
+`umount2` through `/proc/self/fd/<parent-fd>/<direct-child>`. The pinned parent
+remains open throughout. After unmount, the direct child must resolve on the
+same parent mount ID and retain its private access policy. This protects the
+selected mounted object until the dispatch boundary and the parent/name
+location after it; it does not claim continuity for the covered host-directory
+inode, which is not part of the current request contract.
 
 Loop detach is not inferred from one successful `LOOP_CLR_FD`. The helper
 waits for `LOOP_GET_STATUS64` to report absence, the matching sysfs loop state
@@ -134,12 +162,14 @@ installing the helper setuid-root, does not satisfy this boundary.
 The Ubuntu conformance jobs install one root-owned, dedicated-group 0750
 helper at the fixed path, prove an unrelated user cannot execute it, apply and
 read back those exact file capabilities, reject a setuid-root negative copy,
-and then run the Node integration as the ordinary service user in that group.
+and then run the Node integration as the ordinary service user in that group
+inside a long-lived private mount namespace prepared by a root-owned launcher.
 A production host may replace file capabilities with an equivalently
-constrained `runHelper` broker, but it must preserve the caller's ownership
-identity and the exact helper protocol. `CAP_SYS_ADMIN` is a broad host trust
-root; this design narrows its executable surface and inputs but does not
-describe it as a sandbox.
+constrained `runHelper` broker, but the broker must enter the same namespace,
+preserve the caller's ownership identity, and preserve the exact helper
+protocol. `CAP_SYS_ADMIN` is a broad host trust root; this design narrows its
+executable surface and inputs but does not describe it as a sandbox or a
+namespace manager.
 
 ## Durable Provider State
 
@@ -262,14 +292,21 @@ the deployment. It maps them as follows:
 The host must call `migrate()` on the dedicated provider-state store before
 the backend can serve. The archive control identity must come from a trusted
 authority outside the archive image. The deployment's four pools must not be
-reused as the provider-state pool.
+reused as the provider-state pool. Before constructing or initializing the
+driver, the host must enter one long-lived private mount namespace, create
+separate archive and session self-bind roots there, mark both roots `rprivate`,
+and keep the deployment plus every helper or broker invocation in that
+namespace until shutdown. Creating the namespace inside one helper call is
+invalid because its mounts would disappear when that helper exits.
 
 Shutdown order is also host-owned:
 
 1. stop the generic deployment and wait for admission and settlement drain;
 2. enumerate provider state and quiesce every non-destroyed session image;
 3. quiesce the archive image and the Podman supervisor state; and
-4. close the dedicated provider-state PostgreSQL pool.
+4. close the dedicated provider-state PostgreSQL pool; then
+5. drain any namespace-entered helper broker and let the service process exit
+   the private mount namespace.
 
 The generic deployment cannot prove that collaborators owned outside its
 object graph are quiet.
@@ -282,15 +319,20 @@ acknowledgement loss, writer-authority transitions, control replacement,
 publication atomic observation, Podman replay, and driver request sequencing.
 
 The privileged Ubuntu workflow uses two different hosted runners with the
-same explicitly recorded numeric service UID. The producer
-creates separate session and archive ext4 images, publishes a fresh checkpoint
-and restore destination, verifies both, cleanly unmounts and detaches both loop
-devices, and uploads the sparse raw images plus anchored receipts. The consumer
-remounts those same bytes on a new host, verifies the provider head and archive
-mount-root and artifact-child control tuples from independent job outputs,
-rejects a transferred receipt unless its service UID equals the consumer's,
-performs source-free committed checkpoint and restore verification, reattaches
-the writer root at a higher epoch, and destroys both images.
+same explicitly recorded numeric service UID. Each runner starts one
+long-lived private mount namespace, prepares separate `rprivate` archive and
+session self-bind roots, then drops to the ordinary service user before Node
+starts. While both producer images are mounted, a parent/child barrier proves
+that the child namespace sees each exact ext4 mount and the parent namespace
+does not when the privileged workflow gate runs. The producer publishes a
+fresh checkpoint and restore destination,
+verifies both, cleanly unmounts and detaches both loop devices, and uploads the
+sparse raw images plus anchored receipts. The consumer remounts those same
+bytes on a new host, verifies the provider head and archive mount-root and
+artifact-child control tuples from independent job outputs, rejects a
+transferred receipt unless its service UID equals the consumer's, performs
+source-free committed checkpoint and restore verification, reattaches the
+writer root at a higher epoch, and destroys both images.
 
 A separate Ubuntu job builds a digest-pinned scratch image and exercises the
 rootless Podman launch, bind write, ready proof, stop, and cold reconciliation
