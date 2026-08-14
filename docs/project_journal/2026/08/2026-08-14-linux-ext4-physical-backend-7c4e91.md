@@ -62,7 +62,10 @@ superseded_by:
   reconciliation. Its immutable local state publishes each revision through
   one no-replace data-file commit point, so a crash cannot leave a permanent
   data/marker half-commit. Only the grant-bearing stop path retires a container;
-  reconciliation remains a repeatable observation.
+  reconciliation remains a repeatable observation. Timeout, abort, and output-
+  overflow failures request `SIGKILL` but settle only after the child `close`
+  barrier, so the pinned attachment descriptor remains valid through process
+  termination and stdio drain.
 - The privileged Ubuntu producer cleanly unmounts and detaches separate session
   and archive ext4 images before upload. A consumer on a second hosted runner
   remounts the transferred bytes under those two independently supplied archive
@@ -92,6 +95,10 @@ superseded_by:
 - A database epoch, expired lease, process exit, inaccessible path, or
   successful first detach syscall is not by itself a physical fence or settled
   detach proof.
+- A Podman command deadline starts termination; it is not a safe authority-
+  release deadline. If a killed child cannot be reaped, the supervisor keeps
+  the pinned attachment authority rather than returning and permitting its
+  descriptor number to disappear or be reused.
 
 ## Non-Goals
 
@@ -132,7 +139,10 @@ superseded_by:
 - Focused ext4 inspector, image-driver, paths, provider-state, backend,
   PostgreSQL head-anchor, publication, Podman supervisor-state, supervisor,
   physical-binding, and logical-launcher suites passed. The only focused skip
-  was the Linux-only ACL path on the Darwin development host.
+  was Linux-only filesystem-authority coverage on the Darwin development host.
+  The default-runner regression covers delayed close after timeout, abort, and
+  stdout/stderr overflow; Ubuntu additionally checks that a real `/proc` held-
+  directory descriptor remains visible until the child is reaped.
 - JavaScript syntax checks, native C strict syntax checks, workflow YAML parse,
   project-journal validation, and tracked/untracked whitespace checks passed.
 - The privileged Ubuntu producer is the runtime gate for the live parent/child

@@ -1529,19 +1529,30 @@ function defaultCommandRunner(executable, arguments_, options) {
       return;
     }
     let settled = false;
+    let primaryError = null;
+    let terminationRequested = false;
+    let discardOutput = false;
     let stdout = callIntrinsic(bufferAllocIntrinsic, Buffer, [0]);
     let stderr = callIntrinsic(bufferAllocIntrinsic, Buffer, [0]);
     let timer;
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      callback(value);
+    const rememberFailure = (error, terminate) => {
+      if (primaryError === null) primaryError = error;
+      if (!terminate || terminationRequested || settled) return;
+      terminationRequested = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The authority cannot be released safely until `close` proves reap.
+      }
     };
     const append = (current, chunk) => {
+      if (discardOutput) return current;
       if (current.length + chunk.length > options.maxOutputBytes) {
-        child.kill("SIGKILL");
-        finish(rejectPromise, new Error("Podman output exceeded the configured bound"));
+        discardOutput = true;
+        rememberFailure(
+          new Error("Podman output exceeded the configured bound"),
+          true,
+        );
         return current;
       }
       return callIntrinsic(bufferConcatIntrinsic, Buffer, [[current, chunk]]);
@@ -1552,23 +1563,28 @@ function defaultCommandRunner(executable, arguments_, options) {
     child.stderr.on("data", (chunk) => {
       stderr = append(stderr, chunk);
     });
-    child.once("error", (error) => finish(rejectPromise, error));
+    child.stdout.on("error", (error) => rememberFailure(error, true));
+    child.stderr.on("error", (error) => rememberFailure(error, true));
+    child.on("error", (error) => rememberFailure(error, false));
     child.once("close", (code, signal) => {
-      if (code !== 0 || signal !== null) {
-        finish(rejectPromise, new Error("Podman command failed"));
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (primaryError !== null) {
+        rejectPromise(primaryError);
         return;
       }
-      finish(
-        resolvePromise,
-        frozenRecord({
-          stderr: callIntrinsic(bufferToStringIntrinsic, stderr, ["utf8"]),
-          stdout: callIntrinsic(bufferToStringIntrinsic, stdout, ["utf8"]),
-        }),
-      );
+      if (code !== 0 || signal !== null) {
+        rejectPromise(new Error("Podman command failed"));
+        return;
+      }
+      resolvePromise(frozenRecord({
+        stderr: callIntrinsic(bufferToStringIntrinsic, stderr, ["utf8"]),
+        stdout: callIntrinsic(bufferToStringIntrinsic, stdout, ["utf8"]),
+      }));
     });
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(rejectPromise, new Error("Podman command timed out"));
+      rememberFailure(new Error("Podman command timed out"), true);
     }, options.timeoutMilliseconds);
     timer.unref?.();
   });

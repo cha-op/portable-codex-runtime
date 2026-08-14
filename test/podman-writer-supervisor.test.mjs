@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  openSync,
+} from "node:fs";
 import {
   chmod,
   mkdir,
@@ -15,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
@@ -34,6 +40,142 @@ const IMAGE_REFERENCE = `localhost/portable-codex@${DIGEST}`;
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
 const SUPERVISOR_ID = "podman-supervisor-001";
 const HELD_MOUNT_SOURCE = "/proc/4242/fd/9";
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+async function waitForPath(path) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (existsSync(path)) return;
+    await delay(10);
+  }
+  assert.fail(`timed out waiting for ${path}`);
+}
+
+function delayedReapPodmanScript({
+  mode,
+  phase,
+  reapedPath,
+  releasePath,
+  startedPath,
+  terminatedPath,
+}) {
+  const info = JSON.stringify({ host: { security: { rootless: true } } });
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  const failureBody = mode === "stdout-overflow"
+    ? `printf '%2048s' x\nexec /bin/sleep 30`
+    : mode === "stderr-overflow"
+      ? `printf '%2048s' x >&2\nexec /bin/sleep 30`
+      : "exec /bin/sleep 30";
+  const targetBody = `
+    target_pid=$$
+    (
+      while kill -0 "$target_pid" 2>/dev/null; do
+        /bin/sleep 0.01
+      done
+      : > ${shellQuote(terminatedPath)}
+      while ! test -f ${shellQuote(releasePath)}; do
+        /bin/sleep 0.01
+      done
+      printf '%s\\n' reaped > ${shellQuote(reapedPath)}
+    ) &
+    : > ${shellQuote(startedPath)}
+    ${failureBody}`;
+  const createBody = phase === "create"
+    ? targetBody
+    : `printf '%s\\n' ${shellQuote(CONTAINER_ID)}`;
+  const startBody = phase === "start"
+    ? targetBody
+    : `printf '%s\\n' ${shellQuote(CONTAINER_ID)}`;
+  return `#!/bin/sh
+set -eu
+case "$1" in
+  info)
+    printf '%s\\n' ${shellQuote(info)}
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  create)
+    ${createBody}
+    ;;
+  start)
+    ${startBody}
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
+
+function heldFdReapPodmanScript({
+  missingPath,
+  reapedPath,
+  releasePath,
+  startedPath,
+  terminatedPath,
+  visiblePath,
+}) {
+  const info = JSON.stringify({ host: { security: { rootless: true } } });
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  return `#!/bin/sh
+set -eu
+case "$1" in
+  info)
+    printf '%s\\n' ${shellQuote(info)}
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  create)
+    mount_spec=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--mount" ]; then
+        shift
+        mount_spec=$1
+        break
+      fi
+      shift
+    done
+    source_path=\${mount_spec#type=bind,source=}
+    source_path=\${source_path%%,target=/session,*}
+    test -d "$source_path"
+    target_pid=$$
+    (
+      while kill -0 "$target_pid" 2>/dev/null; do
+        /bin/sleep 0.01
+      done
+      if test -d "$source_path"; then
+        printf '%s\\n' visible > ${shellQuote(visiblePath)}
+      else
+        printf '%s\\n' missing > ${shellQuote(missingPath)}
+      fi
+      : > ${shellQuote(terminatedPath)}
+      while ! test -f ${shellQuote(releasePath)}; do
+        /bin/sleep 0.01
+      done
+      printf '%s\\n' reaped > ${shellQuote(reapedPath)}
+    ) &
+    : > ${shellQuote(startedPath)}
+    printf '%2048s' x
+    exec /bin/sleep 30
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
 
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -396,7 +538,9 @@ function successfulFilesystemAuthority(
       openHandles.add(handle);
       return exact({
         handle,
-        mountSource: settings.mountSource ?? HELD_MOUNT_SOURCE,
+        mountSource: typeof settings.mountSource === "function"
+          ? settings.mountSource(input)
+          : settings.mountSource ?? HELD_MOUNT_SOURCE,
       });
     },
     async verifyCurrent(input) {
@@ -443,11 +587,18 @@ async function fixture(t, settings = {}) {
   const events = [];
   const filesystemEvents = [];
   const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
-  const commandRunner =
-    settings.commandRunner ?? successfulRunner(attachmentRoot, events, settings);
+  let podmanExecutable = settings.podmanExecutable ?? "/usr/bin/podman";
+  if (settings.defaultCommandRunnerScript !== undefined) {
+    podmanExecutable = join(parent, "podman-fixture");
+    await writeFile(
+      podmanExecutable,
+      settings.defaultCommandRunnerScript({ attachmentRoot, parent }),
+      { mode: 0o700 },
+    );
+    await chmod(podmanExecutable, 0o700);
+  }
   const optionValues = {
-    commandRunner,
-    commandTimeoutMilliseconds: 10_000,
+    commandTimeoutMilliseconds: settings.commandTimeoutMilliseconds ?? 10_000,
     configuredAttachmentRoot: parent,
     images: exact({
       [DIGEST]: exact({
@@ -457,14 +608,14 @@ async function fixture(t, settings = {}) {
         os: "linux",
       }),
     }),
-    maxOutputBytes: 64 * 1024,
+    maxOutputBytes: settings.maxOutputBytes ?? 64 * 1024,
     podmanEnvironment: exact({
       HOME: "/var/empty/podman",
       XDG_RUNTIME_DIR: "/run/user/1000",
     }),
-    podmanExecutable: "/usr/bin/podman",
+    podmanExecutable,
     state,
-    stopTimeoutSeconds: 7,
+    stopTimeoutSeconds: settings.stopTimeoutSeconds ?? 7,
     supervisorId: SUPERVISOR_ID,
     writerCommand: Object.freeze(["/usr/local/bin/codex", "app-server"]),
     writerEnvironment: exact({
@@ -472,6 +623,10 @@ async function fixture(t, settings = {}) {
       LANG: "C.UTF-8",
     }),
   };
+  if (settings.useDefaultCommandRunner !== true) {
+    optionValues.commandRunner = settings.commandRunner ??
+      successfulRunner(attachmentRoot, events, settings);
+  }
   if (settings.useDefaultFilesystemAuthority !== true) {
     optionValues.filesystemAuthority = settings.filesystemAuthority ??
       successfulFilesystemAuthority(
@@ -1309,6 +1464,172 @@ test("enforces rootless execution, exact local digest, and bounded unambiguous o
     malformed.events.filter((event) => event.arguments_[0] === "create").length,
     createCount,
   );
+});
+
+test("default runner holds filesystem authority until failed Podman children close", async (t) => {
+  const scenarios = [
+    { mode: "timeout", phase: "create" },
+    { mode: "abort", phase: "start" },
+    { mode: "stdout-overflow", phase: "create" },
+    { mode: "stderr-overflow", phase: "start" },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(`${scenario.mode} during ${scenario.phase}`, async (t) => {
+      let closeCount = 0;
+      let reapedPath;
+      let releasePath;
+      let startedPath;
+      let terminatedPath;
+      const controller = new AbortController();
+      const base = await fixture(t, {
+        commandTimeoutMilliseconds: scenario.mode === "timeout" ? 2_000 : 10_000,
+        defaultCommandRunnerScript({ parent }) {
+          reapedPath = join(parent, "podman-child-reaped");
+          releasePath = join(parent, "podman-child-release");
+          startedPath = join(parent, "podman-child-started");
+          terminatedPath = join(parent, "podman-child-terminated");
+          return delayedReapPodmanScript({
+            mode: scenario.mode,
+            phase: scenario.phase,
+            reapedPath,
+            releasePath,
+            startedPath,
+            terminatedPath,
+          });
+        },
+        filesystemSettings: {
+          onClose() {
+            closeCount += 1;
+            assert.equal(existsSync(reapedPath), true);
+          },
+        },
+        maxOutputBytes: 1_024,
+        stopTimeoutSeconds: 1,
+        useDefaultCommandRunner: true,
+      });
+      let settled = false;
+      const pending = base.supervisor.launchWriter(
+        launchInput(base.attachmentRoot, { signal: controller.signal }),
+      ).then(
+        () => {
+          settled = true;
+          assert.fail("failed Podman launch unexpectedly succeeded");
+        },
+        (error) => {
+          settled = true;
+          return error;
+        },
+      );
+
+      await waitForPath(startedPath);
+      if (scenario.mode === "abort") controller.abort();
+      try {
+        await waitForPath(terminatedPath);
+        assert.equal(existsSync(reapedPath), false);
+        assert.equal(settled, false);
+        assert.equal(closeCount, 0);
+      } finally {
+        await writeFile(releasePath, "release\n", { mode: 0o600 });
+      }
+
+      const error = await pending;
+      assert.equal(error instanceof PodmanWriterSupervisorError, true);
+      assert.equal(
+        error.code,
+        scenario.mode === "abort"
+          ? "podman_writer_supervisor_aborted"
+          : "podman_writer_supervisor_outcome_uncertain",
+      );
+      assert.equal(existsSync(reapedPath), true);
+      assert.equal(closeCount, 1);
+    });
+  }
+});
+
+test("Linux default runner keeps the real attachment fd visible through reap", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  let heldFd = null;
+  let missingPath;
+  let reapedPath;
+  let releasePath;
+  let startedPath;
+  let terminatedPath;
+  let visiblePath;
+  const base = await fixture(t, {
+    defaultCommandRunnerScript({ parent }) {
+      missingPath = join(parent, "attachment-fd-missing");
+      reapedPath = join(parent, "podman-child-reaped");
+      releasePath = join(parent, "podman-child-release");
+      startedPath = join(parent, "podman-child-started");
+      terminatedPath = join(parent, "podman-child-terminated");
+      visiblePath = join(parent, "attachment-fd-visible");
+      return heldFdReapPodmanScript({
+        missingPath,
+        reapedPath,
+        releasePath,
+        startedPath,
+        terminatedPath,
+        visiblePath,
+      });
+    },
+    filesystemSettings: {
+      mountSource(input) {
+        assert.equal(input.attachment.rootPath.endsWith("/attachment"), true);
+        return `/proc/${process.pid}/fd/${heldFd}`;
+      },
+      onAcquire(input) {
+        heldFd = openSync(
+          input.attachment.rootPath,
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+        );
+      },
+      onClose() {
+        assert.equal(existsSync(reapedPath), true);
+        assert.equal(existsSync(visiblePath), true);
+        assert.equal(existsSync(missingPath), false);
+        closeSync(heldFd);
+        heldFd = null;
+      },
+    },
+    maxOutputBytes: 1_024,
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+  });
+  t.after(() => {
+    if (heldFd !== null) closeSync(heldFd);
+  });
+
+  let settled = false;
+  const pending = base.supervisor.launchWriter(base.input).then(
+    () => {
+      settled = true;
+      assert.fail("overflowing Podman launch unexpectedly succeeded");
+    },
+    (error) => {
+      settled = true;
+      return error;
+    },
+  );
+  await waitForPath(startedPath);
+  try {
+    await waitForPath(terminatedPath);
+    assert.equal(settled, false);
+    assert.equal(heldFd !== null, true);
+    assert.equal(existsSync(visiblePath), true);
+    assert.equal(existsSync(missingPath), false);
+    assert.equal(existsSync(reapedPath), false);
+  } finally {
+    await writeFile(releasePath, "release\n", { mode: 0o600 });
+  }
+
+  const error = await pending;
+  assert.equal(error instanceof PodmanWriterSupervisorError, true);
+  assert.equal(error.code, "podman_writer_supervisor_outcome_uncertain");
+  assert.equal(existsSync(visiblePath), true);
+  assert.equal(existsSync(missingPath), false);
+  assert.equal(heldFd, null);
 });
 
 test("preserves AbortSignal and rejects bad callback arity or non-native runner promises", async (t) => {

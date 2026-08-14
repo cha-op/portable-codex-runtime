@@ -246,6 +246,16 @@ absence of access or default ACLs, and keeps that same runtime object pinned
 through Podman create, start, and the live `/session` observation. Pathname ABA
 or a bind to another runtime object fails closed.
 
+The default Podman command runner retains that filesystem authority until the
+spawned child emits `close`, which proves both process termination and stdio
+drain. Timeout, abort, or output overflow latches the first failure and requests
+`SIGKILL`, but it does not settle the runner or release the held directory
+descriptor before that close barrier. The command timeout is therefore the
+termination-request deadline, not permission to return while a child may still
+resolve `/proc/<node-pid>/fd/<fd>`. If the operating system cannot reap the
+child, the safe outcome is to keep the authority held rather than return a
+normal error that would release it.
+
 That default does not reconstruct the provider state's persistent ext4
 `rootIdentity` from an opaque attachment proof. Production must inject the
 trusted `filesystemAuthority` seam and bind the complete attachment tuple to
