@@ -37,6 +37,7 @@ const objectPrototype = Object.prototype;
 const reflectOwnKeys = Reflect.ownKeys;
 const reflectApply = Reflect.apply;
 const regexpTestIntrinsic = RegExp.prototype.test;
+const stringEndsWithIntrinsic = String.prototype.endsWith;
 const stringStartsWithIntrinsic = String.prototype.startsWith;
 const { isProxy } = utilTypes;
 
@@ -52,8 +53,8 @@ const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const RESTORED_ATTACHMENT_NAME_PATTERN = /^generation-[0-9a-f]{48}$/u;
-const NUL_PATTERN = /\0/u;
-const MAX_PATH_BYTES = 4096;
+const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
+const MAX_PATH_BYTES = 4095;
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_ext4_filesystem_image_path_options:
@@ -128,33 +129,33 @@ function exactFrozenRecord(value) {
   return objectFreeze(objectAssign(objectCreate(null), value));
 }
 
-function canonicalRoot(value, code) {
+function canonicalPath(value, code) {
   ensure(
-    typeof value === "string" && value.length <= MAX_PATH_BYTES,
+    typeof value === "string" &&
+      value.length > 1 &&
+      value.length <= MAX_PATH_BYTES &&
+      !reflectApply(regexpTestIntrinsic, CONTROL_PATTERN, [value]),
     code,
   );
   const encoded = reflectApply(bufferFromIntrinsic, Buffer, [value, "utf8"]);
   ensure(
     encoded.length <= MAX_PATH_BYTES &&
       reflectApply(bufferToStringIntrinsic, encoded, ["utf8"]) === value &&
-      !reflectApply(regexpTestIntrinsic, NUL_PATTERN, [value]) &&
       isAbsolute(value) &&
       resolve(value) === value &&
-      value !== parse(value).root,
+      value !== parse(value).root &&
+      !reflectApply(stringEndsWithIntrinsic, value, [sep]),
     code,
   );
   return value;
 }
 
+function canonicalRoot(value, code) {
+  return canonicalPath(value, code);
+}
+
 function boundedPath(value, code) {
-  ensure(value.length <= MAX_PATH_BYTES, code);
-  const encoded = reflectApply(bufferFromIntrinsic, Buffer, [value, "utf8"]);
-  ensure(
-    encoded.length <= MAX_PATH_BYTES &&
-      reflectApply(bufferToStringIntrinsic, encoded, ["utf8"]) === value,
-    code,
-  );
-  return value;
+  return canonicalPath(value, code);
 }
 
 function pathContains(parent, child) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import test from "node:test";
 
 import {
@@ -12,6 +13,11 @@ import {
 
 const BACKEND_ID = "ext4-backend-001";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
+
+function pathsError(code) {
+  return (error) =>
+    error instanceof Ext4FilesystemImagePathsError && error.code === code;
+}
 
 function fixture() {
   return createExt4FilesystemImagePaths({
@@ -123,6 +129,80 @@ test("derives deterministic disjoint direct-child image, mount, and artifact pat
   });
   assert.equal(artifact.artifactOwnedRoot, "/var/lib/portable-codex-runtime/archive");
   assert.match(artifact.artifactDirectory, /\/artifact-[0-9a-f]{48}$/u);
+});
+
+test("matches the driver canonical path domain at UTF-8 and control boundaries", () => {
+  const rootAtMaximum = `/${"r".repeat(4094)}`;
+  assert.doesNotThrow(() =>
+    createExt4FilesystemImagePaths({
+      archiveRoot: rootAtMaximum,
+      backendId: BACKEND_ID,
+      imageRoot: "/var/lib/portable-codex-runtime/images",
+      mountRoot: "/run/portable-codex-runtime/mounts",
+    }));
+  assert.throws(
+    () =>
+      createExt4FilesystemImagePaths({
+        archiveRoot: `/${"r".repeat(4095)}`,
+        backendId: BACKEND_ID,
+        imageRoot: "/var/lib/portable-codex-runtime/images",
+        mountRoot: "/run/portable-codex-runtime/mounts",
+      }),
+    pathsError("invalid_ext4_filesystem_image_path_options"),
+  );
+
+  for (const codePoint of [...Array(32).keys(), 0x7f]) {
+    const control = String.fromCodePoint(codePoint);
+    assert.throws(
+      () =>
+        createExt4FilesystemImagePaths({
+          archiveRoot: `/var/lib/portable-codex-runtime/archive${control}`,
+          backendId: BACKEND_ID,
+          imageRoot: "/var/lib/portable-codex-runtime/images",
+          mountRoot: "/run/portable-codex-runtime/mounts",
+        }),
+      pathsError("invalid_ext4_filesystem_image_path_options"),
+    );
+  }
+
+  const unicodeRoots = {
+    archiveRoot: "/var/lib/portable-codex-runtime/archive-雪",
+    backendId: BACKEND_ID,
+    imageRoot: "/var/lib/portable-codex-runtime/images-雪",
+    mountRoot: "/run/portable-codex-runtime/mounts-雪",
+  };
+  const unicodePlan = createExt4FilesystemImagePaths(unicodeRoots).planProvision(
+    provisionRequest(),
+  );
+  assert.equal(
+    unicodePlan.imagePath.startsWith(`${unicodeRoots.imageRoot}/`),
+    true,
+  );
+  assert.equal(
+    unicodePlan.mountPath.startsWith(`${unicodeRoots.mountRoot}/`),
+    true,
+  );
+});
+
+test("accepts a generated 4095-byte path and rejects a 4096-byte path", () => {
+  const createWithImageRootLength = (rootBytes) =>
+    createExt4FilesystemImagePaths({
+      archiveRoot: "/var/lib/portable-codex-runtime/archive",
+      backendId: BACKEND_ID,
+      imageRoot: `/${"i".repeat(rootBytes - 1)}`,
+      mountRoot: "/run/portable-codex-runtime/mounts",
+    });
+
+  const maximumPlan = createWithImageRootLength(4025).planProvision(
+    provisionRequest(),
+  );
+  assert.equal(Buffer.byteLength(maximumPlan.imagePath, "utf8"), 4095);
+
+  const oversizedPaths = createWithImageRootLength(4026);
+  assert.throws(
+    () => oversizedPaths.planProvision(provisionRequest()),
+    pathsError("invalid_ext4_filesystem_image_path_request"),
+  );
 });
 
 test("maps attachment and restore destinations to one storage-owned mount root", () => {

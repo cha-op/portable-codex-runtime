@@ -68,6 +68,7 @@ export const EXT4_FILESYSTEM_IMAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION = 1;
 
 const MAX_CLONE_DEPTH = 32;
 const MAX_CLONE_NODES = 16_384;
+const IMAGE_SIZE_ALIGNMENT_BYTES = 512;
 const MIN_IMAGE_SIZE_BYTES = 1024 * 1024;
 const MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024 * 1024 * 1024;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -772,7 +773,8 @@ export function createExt4FilesystemImageBackend(...args) {
       regexpTest(OPAQUE_ID_PATTERN, options.backendId) &&
       Number.isSafeInteger(options.imageSizeBytes) &&
       options.imageSizeBytes >= MIN_IMAGE_SIZE_BYTES &&
-      options.imageSizeBytes <= MAX_IMAGE_SIZE_BYTES,
+      options.imageSizeBytes <= MAX_IMAGE_SIZE_BYTES &&
+      options.imageSizeBytes % IMAGE_SIZE_ALIGNMENT_BYTES === 0,
     "invalid_options",
   );
 

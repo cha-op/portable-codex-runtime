@@ -555,6 +555,39 @@ function activationRequest(storageId, rootPath, rootIdentity, suffix = "001") {
   };
 }
 
+test("rejects image sizes adjacent to 512-byte alignment before state mutation", async (t) => {
+  const fixed = await fixture(t);
+  const alignedBoundary = 2 * 1024 * 1024;
+  const createWithImageSize = (imageSizeBytes) =>
+    createExt4FilesystemImageBackend({
+      backendId: BACKEND_ID,
+      driver: fixed.fake.driver,
+      imageSizeBytes,
+      paths: fixed.paths,
+      state: fixed.state,
+    });
+
+  await assert.rejects(readFile(fixed.ledgerPath), { code: "ENOENT" });
+  for (const imageSizeBytes of [
+    alignedBoundary + 511,
+    alignedBoundary + 513,
+  ]) {
+    assert.throws(
+      () => createWithImageSize(imageSizeBytes),
+      backendError("invalid_options"),
+    );
+  }
+  await assert.rejects(readFile(fixed.ledgerPath), { code: "ENOENT" });
+  assert.deepEqual(fixed.fake.calls, []);
+
+  const alignedBackend = createWithImageSize(alignedBoundary + 512);
+  await alignedBackend.lifecycleBackend.provisionSession(
+    provisionRequest("aligned-image-size-provision-001"),
+    context(),
+  );
+  assert.deepEqual(fixed.fake.calls, ["provision", "ensurePublicationRoot"]);
+});
+
 test("exposes exact receiver-authentic raw surfaces and rejects hostile inputs", async (t) => {
   const fixed = await fixture(t);
   assert.equal(Object.getPrototypeOf(fixed.backend), null);
