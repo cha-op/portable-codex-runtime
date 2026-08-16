@@ -1465,33 +1465,6 @@ static int read_disk_sequence(unsigned int device_major,
   return parse_u64_decimal(buffer, sequence) ? 0 : -1;
 }
 
-static int udev_database_has_sequence(unsigned int device_major,
-                                      unsigned int device_minor,
-                                      uint64_t sequence) {
-  char path[128];
-  char buffer[4096];
-  char q_entry[64];
-  char property_entry[96];
-  size_t length;
-  int path_length = snprintf(path, sizeof(path), "/run/udev/data/b%u:%u",
-                             device_major, device_minor);
-  int q_length = snprintf(q_entry, sizeof(q_entry), "Q:%" PRIu64 "\n",
-                          sequence);
-  int property_length =
-      snprintf(property_entry, sizeof(property_entry),
-               "E:DISKSEQ=%" PRIu64 "\n", sequence);
-  if (path_length <= 0 || (size_t)path_length >= sizeof(path) ||
-      q_length <= 0 || (size_t)q_length >= sizeof(q_entry) ||
-      property_length <= 0 ||
-      (size_t)property_length >= sizeof(property_entry) ||
-      read_small_text_file(path, buffer, sizeof(buffer), &length) != 0) {
-    return 0;
-  }
-  (void)length;
-  return strstr(buffer, q_entry) != NULL ||
-         strstr(buffer, property_entry) != NULL;
-}
-
 static int loop_sysfs_backing_absent(unsigned int device_major,
                                      unsigned int device_minor) {
   char path[160];
@@ -1528,13 +1501,11 @@ static int detached_loop_settled(const struct loop_receipt *receipt,
                          &current_sequence) != 0 ||
       current_sequence <= prior_disk_sequence ||
       !loop_sysfs_backing_absent(receipt->device_major,
-                                 receipt->device_minor) ||
-      !udev_database_has_sequence(receipt->device_major,
-                                  receipt->device_minor, current_sequence)) {
+                                 receipt->device_minor)) {
     return 0;
   }
-  /* The exact rdev is unused in-kernel, absent from loop sysfs, and observed
-   * by udev at a strictly newer disk sequence before teardown may complete. */
+  /* The exact rdev is unused in-kernel, absent from loop sysfs, and at a
+   * strictly newer disk sequence before teardown may complete. */
   return 1;
 }
 

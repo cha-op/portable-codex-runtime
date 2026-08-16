@@ -3,7 +3,7 @@ id: 20260814-7c4e91
 title: Linux ext4 Physical Backend
 status: completed
 created: 2026-08-14
-updated: 2026-08-14
+updated: 2026-08-16
 branch: wip/filesystem-physical-backend
 pr:
 supersedes: []
@@ -271,6 +271,28 @@ change and does not attest the current head:
   `/usr/bin:/bin` value to the normalized child environment. It still rejects
   caller-controlled `PATH` and does not inherit the ambient process
   environment. The next Ubuntu run remains the authority for this diagnosis.
+- PR #52's fifth GitHub Actions run passed all four Node matrices and the
+  PostgreSQL authority integration. The ext4 producer completed writable
+  attachment, checkpoint and higher-epoch restore publication, clean unmount,
+  and mount-absence verification before `detach-loop-settle` timed out. The
+  helper had incorrectly required `/run/udev/data` to contain a post-detach
+  `diskseq`: systemd's `Q:` record is a current tag, while Linux 6.8 emits the
+  loop change event before incrementing `diskseq`, so that asynchronous cache
+  has no promised matching record. Settlement now relies on the exact loop
+  `rdev`, `LOOP_GET_STATUS64 == ENXIO`, a strictly newer `diskseq`, absent
+  sysfs backing state, the driver's exact-image zero-mapping scan, and retained
+  object/access-policy revalidation. The next privileged producer and
+  dependent consumer runs remain the runtime authority for this change.
+- The same run disproved fixed `PATH` as a sufficient explanation for the
+  Podman timeout: the temporary five-second restricted-environment preflight
+  still timed out before the real supervisor ran. The fatal probes have been
+  removed. One non-blocking, output-redacted 2-by-2 diagnostic now compares
+  shell versus Node `execFile` and inherited versus restricted fixed-`PATH`
+  environments after the image build, all from `/` under eight-second and
+  one-MiB output bounds. It records only a fixed label, elapsed time,
+  exit/signal, and byte counts, then always continues to the real supervisor's
+  existing 30-second production path. No additional ambient environment value
+  is admitted to production without that evidence.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

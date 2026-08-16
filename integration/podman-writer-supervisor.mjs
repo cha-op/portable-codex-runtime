@@ -22,6 +22,9 @@ const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const SUPERVISOR_ID = "podman-linux-integration-v1";
 const TEST_ROOT_PREFIX = "/var/tmp/portable-codex-runtime-podman-";
 const PODMAN_EXECUTION_PATH = "/usr/bin:/bin";
+const PODMAN_DIAGNOSTIC_TIMEOUT_MILLISECONDS = 6_000;
+const PODMAN_DIAGNOSTIC_CLEANUP_TIMEOUT_MILLISECONDS = 2_000;
+const PODMAN_DIAGNOSTIC_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -224,6 +227,125 @@ async function waitForReadyMarker(path) {
   }
 }
 
+function diagnosticOutputBytes(value) {
+  if (Buffer.isBuffer(value)) return value.length;
+  if (typeof value === "string") return Buffer.byteLength(value);
+  return 0;
+}
+
+function recordPodmanExecFileDiagnostic(label, environment) {
+  return new Promise((resolve) => {
+    const started = process.hrtime.bigint();
+    let child;
+    let cleanupTimer;
+    let deadlineOutcome;
+    let finished = false;
+    let stderrBytes = 0;
+    let stdoutBytes = 0;
+    let timeoutTimer;
+
+    const destroyOutputStreams = () => {
+      for (const stream of [child?.stdout, child?.stderr]) {
+        try {
+          stream?.destroy();
+        } catch {
+          // Keep cleanup independent of stream implementation details.
+        }
+      }
+    };
+
+    const finish = (outcome) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(cleanupTimer);
+      destroyOutputStreams();
+      child?.removeListener("exit", settleDeadlineOutcome);
+      child?.removeListener("close", settleDeadlineOutcome);
+      child?.unref();
+      const elapsedMilliseconds = Number(
+        (process.hrtime.bigint() - started) / 1_000_000n,
+      );
+      try {
+        console.error(
+          `podman-diagnostic label=${label} ` +
+            `elapsedMilliseconds=${elapsedMilliseconds} exit=${outcome.exit} ` +
+            `signal=${outcome.signal} stdoutBytes=${stdoutBytes} ` +
+            `stderrBytes=${stderrBytes}`,
+        );
+      } finally {
+        resolve();
+      }
+    };
+
+    const settleDeadlineOutcome = () => {
+      if (deadlineOutcome !== undefined) finish(deadlineOutcome);
+    };
+
+    const beginTimeoutCleanup = () => {
+      if (finished) return;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        deadlineOutcome = {
+          exit: child.exitCode ?? "none",
+          signal: child.signalCode ?? "none",
+        };
+      } else {
+        deadlineOutcome = { exit: "none", signal: "SIGKILL" };
+        if (!child.killed) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // The timeout result remains fixed and content-free.
+          }
+        }
+      }
+      destroyOutputStreams();
+      if (child.exitCode !== null || child.signalCode !== null) {
+        settleDeadlineOutcome();
+        return;
+      }
+      cleanupTimer = setTimeout(() => {
+        finish(deadlineOutcome);
+      }, PODMAN_DIAGNOSTIC_CLEANUP_TIMEOUT_MILLISECONDS);
+    };
+
+    try {
+      child = execFile(PODMAN, ["info", "--format=json"], {
+        cwd: "/",
+        encoding: "buffer",
+        env: environment,
+        killSignal: "SIGKILL",
+        maxBuffer: PODMAN_DIAGNOSTIC_MAX_OUTPUT_BYTES,
+      }, (error) => {
+        if (deadlineOutcome !== undefined) return;
+        finish({
+          exit: error === null
+            ? 0
+            : Number.isInteger(error.code) ? error.code : "none",
+          signal: error !== null && typeof error.signal === "string"
+            ? error.signal
+            : child.signalCode ?? "none",
+        });
+      });
+      child.once("exit", settleDeadlineOutcome);
+      child.once("close", settleDeadlineOutcome);
+      child.stdout?.on("data", (chunk) => {
+        stdoutBytes += diagnosticOutputBytes(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderrBytes += diagnosticOutputBytes(chunk);
+      });
+      timeoutTimer = setTimeout(
+        beginTimeoutCleanup,
+        PODMAN_DIAGNOSTIC_TIMEOUT_MILLISECONDS,
+      );
+    } catch {
+      if (child === undefined) finish({ exit: "none", signal: "none" });
+      else beginTimeoutCleanup();
+    }
+  });
+}
+
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
   assert.match(DIGEST, /^sha256:[0-9a-f]{64}$/u);
   assert.equal(IMAGE_REFERENCE, `localhost/portable-codex-writer@${DIGEST}`);
@@ -238,15 +360,26 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
   let phase = "setup";
   let supervisorState = null;
   try {
-    await mkdir(ROOT, { mode: 0o700 });
-    await mkdir(attachmentRoot, { mode: 0o700 });
-    const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
-    supervisorState = state;
     const podmanEnvironment = exact({
       HOME: process.env.HOME,
       LANG: "C.UTF-8",
       XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
     });
+    await recordPodmanExecFileDiagnostic(
+      "node-execfile-inherited",
+      process.env,
+    ).catch(() => {});
+    await recordPodmanExecFileDiagnostic(
+      "node-execfile-restricted-fixed-path",
+      exact({
+        ...podmanEnvironment,
+        PATH: PODMAN_EXECUTION_PATH,
+      }),
+    ).catch(() => {});
+    await mkdir(ROOT, { mode: 0o700 });
+    await mkdir(attachmentRoot, { mode: 0o700 });
+    const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
+    supervisorState = state;
     const options = exact({
       commandTimeoutMilliseconds: 30_000,
       configuredAttachmentRoot: ROOT,
@@ -267,25 +400,6 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       writerCommand: Object.freeze(["/usr/local/bin/writer"]),
       writerEnvironment: exact({ LANG: "C.UTF-8" }),
     });
-    const preflightOptions = {
-      cwd: "/",
-      encoding: "utf8",
-      env: exact({
-        ...podmanEnvironment,
-        PATH: PODMAN_EXECUTION_PATH,
-      }),
-      killSignal: "SIGKILL",
-      maxBuffer: 1024 * 1024,
-      timeout: 5_000,
-    };
-    phase = "preflight-info";
-    await execFileAsync(PODMAN, ["info", "--format=json"], preflightOptions);
-    phase = "preflight-image-inspect";
-    await execFileAsync(
-      PODMAN,
-      ["image", "inspect", "--format=json", IMAGE_REFERENCE],
-      preflightOptions,
-    );
     const input = launchInput(attachmentRoot);
     const supervisor = createPodmanWriterSupervisor(options);
     phase = "launch";

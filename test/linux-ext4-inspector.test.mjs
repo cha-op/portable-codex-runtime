@@ -436,7 +436,6 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   assert.match(source, /LOOP_CLR_FD/u);
   assert.match(source, /BLKGETDISKSEQ/u);
   assert.match(source, /\/sys\/dev\/block\/%u:%u\/loop\/backing_file/u);
-  assert.match(source, /\/run\/udev\/data\/b%u:%u/u);
   assert.match(source, /"\/proc\/self\/mountinfo"/u);
   assert.match(source, /STATX_MNT_ID/u);
   assert.match(source, /"shared:"/u);
@@ -472,6 +471,54 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   );
   assert.match(source, /"\/proc\/self\/fd\/%d"/u);
   assert.doesNotMatch(source, /execlp?\(/u);
+});
+
+test("native loop detach settles on authoritative kernel state", async () => {
+  const source = await readFile(
+    new URL("../native/linux-ext4-inspector.c", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("static int detached_loop_settled(");
+  const end = source.indexOf("static int detach_loop_device(", start);
+  assert(start >= 0);
+  assert(end > start);
+  const body = source.slice(start, end);
+  const exactRdev = body.indexOf(
+    "major(metadata.st_rdev) != receipt->device_major",
+  );
+  const exactRdevMinor = body.indexOf(
+    "minor(metadata.st_rdev) != receipt->device_minor",
+  );
+  const unbound = body.indexOf(
+    "ioctl(loop_fd, LOOP_GET_STATUS64, &information) == 0 || errno != ENXIO",
+  );
+  const diskSequence = body.indexOf(
+    "read_disk_sequence(receipt->device_major, receipt->device_minor,",
+  );
+  const strictAdvance = body.indexOf(
+    "current_sequence <= prior_disk_sequence",
+  );
+  const backingAbsent = body.indexOf("!loop_sysfs_backing_absent(");
+  assert(exactRdev >= 0);
+  assert(exactRdevMinor > exactRdev);
+  assert(unbound > exactRdevMinor);
+  assert(diskSequence > unbound);
+  assert(strictAdvance > diskSequence);
+  assert(backingAbsent > strictAdvance);
+  assert.match(
+    body,
+    /major\(metadata\.st_rdev\) != receipt->device_major \|\|\s+minor\(metadata\.st_rdev\) != receipt->device_minor/u,
+  );
+  assert.match(
+    body,
+    /if \(ioctl\(loop_fd, LOOP_GET_STATUS64, &information\) == 0 \|\| errno != ENXIO\) \{\s+\(void\)close\(loop_fd\);\s+return 0;/u,
+  );
+  assert.match(
+    body,
+    /close\(loop_fd\) != 0 \|\|\s+read_disk_sequence\(receipt->device_major, receipt->device_minor,\s+&current_sequence\) != 0 \|\|\s+current_sequence <= prior_disk_sequence \|\|\s+!loop_sysfs_backing_absent\(receipt->device_major,\s+receipt->device_minor\)/u,
+  );
+  assert.doesNotMatch(body, /udev/u);
+  assert.doesNotMatch(source, /udev_database_has_sequence|\/run\/udev\/data/u);
 });
 
 test("native unmount releases mounted-root authority before non-lazy unmount", async () => {

@@ -140,9 +140,13 @@ location after it; it does not claim continuity for the covered host-directory
 inode, which is not part of the current request contract.
 
 Loop detach is not inferred from one successful `LOOP_CLR_FD`. The helper
-waits for `LOOP_GET_STATUS64` to report absence, the matching sysfs loop state
-to disappear, `udevadm settle` to complete, and a final observation to remain
-absent. A timeout or unverifiable boundary is an uncertain outcome.
+requires the exact loop `rdev` to report `ENXIO` through
+`LOOP_GET_STATUS64`, the block-device `diskseq` to advance, and the matching
+sysfs backing-file entry to disappear. The driver then scans all loop mappings
+for the exact image object and revalidates the retained image, parent, and
+mount authorities. `/run/udev/data` is an asynchronous derived cache and is
+not an authority signal for detach settlement. A timeout or unverifiable
+kernel boundary is an uncertain outcome.
 
 The trusted native helper path is deployment configuration. Production must
 install reviewed bytes at that fixed path as a root-owned, non-writable 0750
