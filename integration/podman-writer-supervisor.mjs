@@ -241,6 +241,11 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     await mkdir(attachmentRoot, { mode: 0o700 });
     const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
     supervisorState = state;
+    const podmanEnvironment = exact({
+      HOME: process.env.HOME,
+      LANG: "C.UTF-8",
+      XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+    });
     const options = exact({
       commandTimeoutMilliseconds: 30_000,
       configuredAttachmentRoot: ROOT,
@@ -253,11 +258,7 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
         }),
       }),
       maxOutputBytes: 1024 * 1024,
-      podmanEnvironment: exact({
-        HOME: process.env.HOME,
-        LANG: "C.UTF-8",
-        XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-      }),
+      podmanEnvironment,
       podmanExecutable: PODMAN,
       state,
       stopTimeoutSeconds: 10,
@@ -265,6 +266,22 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       writerCommand: Object.freeze(["/usr/local/bin/writer"]),
       writerEnvironment: exact({ LANG: "C.UTF-8" }),
     });
+    const preflightOptions = {
+      cwd: "/",
+      encoding: "utf8",
+      env: podmanEnvironment,
+      killSignal: "SIGKILL",
+      maxBuffer: 1024 * 1024,
+      timeout: 5_000,
+    };
+    phase = "preflight-info";
+    await execFileAsync(PODMAN, ["info", "--format=json"], preflightOptions);
+    phase = "preflight-image-inspect";
+    await execFileAsync(
+      PODMAN,
+      ["image", "inspect", "--format=json", IMAGE_REFERENCE],
+      preflightOptions,
+    );
     const input = launchInput(attachmentRoot);
     const supervisor = createPodmanWriterSupervisor(options);
     phase = "launch";

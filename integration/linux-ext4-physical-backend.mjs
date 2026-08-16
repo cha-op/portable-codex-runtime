@@ -229,7 +229,7 @@ function detachRequest(attachment, suffix) {
     sessionId: attachment.sessionId,
     storageId: attachment.storageId,
     target: exact({
-      attachmentId: attachment.attachmentId,
+      attachmentId: attachment.target.attachmentId,
       kind: "attachment",
     }),
   });

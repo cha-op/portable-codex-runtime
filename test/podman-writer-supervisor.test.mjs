@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
 import {
   closeSync,
   constants as fsConstants,
@@ -17,6 +17,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1499,46 +1500,34 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
     assertSupervisorError("podman_writer_attachment_mismatch"),
   );
 
-  const inheritedError = Object.getOwnPropertyDescriptor(
-    Object.prototype,
-    "error",
-  );
-  Object.defineProperty(Object.prototype, "error", {
-    configurable: true,
-    value: new Error("inherited spawn result poison"),
-    writable: true,
+  const originalSpawnSync = childProcess.spawnSync;
+  const inheritedSpawnResult = Object.assign(Object.create({
+    error: new Error("inherited spawn result poison"),
+  }), {
+    signal: null,
+    status: 0,
+    stderr: Buffer.alloc(0),
+    stdout: Buffer.from("user::rwx\ngroup::---\nother::---\n\n", "utf8"),
   });
-  let claimReached = false;
-  const poisonProbeState = exact({
-    contractVersion: base.state.contractVersion,
-    async claim() {
-      claimReached = true;
-      throw new Error("stop after default authority acquisition");
-    },
-    async read() {
-      return null;
-    },
-    async transition() {
-      throw new Error("unexpected transition");
-    },
-  });
-  const poisonProbe = createPodmanWriterSupervisor(exact({
-    ...base.options,
-    state: poisonProbeState,
-  }));
+  childProcess.spawnSync = () => inheritedSpawnResult;
+  syncBuiltinESMExports();
+  const before = base.events.length;
   try {
     await assert.rejects(
-      poisonProbe.launchWriter(base.input),
-      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+      base.supervisor.launchWriter(base.input),
+      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
     );
   } finally {
-    if (inheritedError === undefined) delete Object.prototype.error;
-    else Object.defineProperty(Object.prototype, "error", inheritedError);
+    childProcess.spawnSync = originalSpawnSync;
+    syncBuiltinESMExports();
   }
-  // Reaching the state boundary proves inherited spawnSync result fields did
-  // not replace the own getfacl status/stdout/stderr snapshot. Stop there so
-  // unrelated filesystem calls do not run while Object.prototype is poisoned.
-  assert.equal(claimReached, true);
+  // The fake container PID has no live /session path, so launch must fail
+  // after create. Reaching create proves inherited spawnSync result fields did
+  // not replace the own getfacl status/stdout/stderr snapshot.
+  assert.equal(
+    base.events.slice(before).some((event) => event.arguments_[0] === "create"),
+    true,
+  );
 });
 
 test("enforces rootless execution, exact local digest, and bounded unambiguous output", async (t) => {

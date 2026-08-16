@@ -195,13 +195,14 @@ change and does not attest the current head:
   producer reached `mount-ext4` after formatting a root-owned filesystem while
   the capability-bearing helper intentionally remained the non-root service
   UID; formatting now supplies the exact real `uid:gid` through mke2fs
-  `root_owner` instead of expanding helper capabilities. Rootless Podman
-  started the container, but the detached container kept the CLI's captured
-  output pipes open and therefore held the close-only command runner until its
-  30-second timeout. The exact `start <container-id>` command now uses no
-  captured output; direct-CLI close/reap remains the settlement barrier, and
-  the existing exact container inspection plus live attachment-object proof
-  remains the authoritative success evidence.
+  `root_owner` instead of expanding helper capabilities. The rootless Podman
+  job reached a 30-second command-runner failure, but that run did not expose
+  the exact command or durable lifecycle phase. The exact
+  `start <64-hex-container-id>` command now uses no captured output because its
+  output is not authority evidence; direct-CLI close/reap remains the
+  settlement barrier, and exact container inspection plus the live
+  attachment-object proof remain the authoritative success evidence. This
+  hardening is not claimed as the root cause of that opaque CI failure.
 - After those fixes, the focused ext4 inspector/image-driver and Podman
   supervisor/state suites passed, both changed JavaScript files passed
   `node --check`, the Darwin unsupported native-helper branch passed strict
@@ -221,9 +222,11 @@ change and does not attest the current head:
 - Both Ubuntu Node matrices exposed one Linux-only hostile test whose global
   `Object.prototype` poisoning continued through unrelated state/filesystem
   work after the default ACL authority had already been exercised. The test
-  now stops at an injected state boundary: reaching it proves that only own
-  `spawnSync` result fields were consumed without asking unrelated Node
-  internals to operate under the poisoned prototype. Podman state/supervisor
+  now injects a `spawnSync` result whose prototype alone supplies an inherited
+  `error` property while status, signal, stdout, and stderr remain own data
+  properties. Reaching container creation proves that the ACL authority
+  consumed only those own result fields without asking unrelated Node internals
+  to operate under a globally poisoned prototype. Podman state/supervisor
   focused tests and JavaScript syntax checks pass locally.
 - The second rootless Podman integration still reached a 30-second runner
   failure, but its sanitized public error and top-level Node test stack do not
@@ -232,6 +235,25 @@ change and does not attest the current head:
   print argv, container IDs, paths, requests, or command output. No behavioral
   Podman change is claimed until the next CI run supplies that bounded phase
   evidence.
+- PR #52's third GitHub Actions run proved that the ext4 producer passed mount,
+  canonical loop observation, writable attach, the peer-namespace isolation
+  probe, payload writing, and filesystem sync. Detach then failed before any
+  physical mutation because the integration helper read the attachment ID from
+  `attachment.attachmentId`; the validated mutation result carries it at
+  `attachment.target.attachmentId`. The helper now preserves the exact
+  attachment authority tuple from that target record. The dependent cross-host
+  consumer remains pending a producer-successful Ubuntu run.
+- The same run narrowed the rootless Podman failure to `phase=launch` with no
+  durable supervisor-state record. This excludes filesystem-authority
+  acquisition, claim publication, create, start, and every later lifecycle
+  phase. The 30-second duration and normalized error map the remaining external
+  command timeout to the pre-claim `podman info` or image-inspection call;
+  local state read/claim failures have no matching timer and the diagnostic
+  state read itself succeeded. The integration now performs those two exact
+  read-only calls with the same executable, environment, cwd, encoding, and
+  kill signal under independent five-second bounds before constructing the
+  supervisor. These probes are diagnostic-only and do not change the
+  production supervisor contract or claim a root cause.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`
