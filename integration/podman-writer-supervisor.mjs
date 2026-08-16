@@ -223,6 +223,44 @@ async function waitForReadyMarker(path) {
   }
 }
 
+async function observeCreatedContainer() {
+  try {
+    const observed = await execFileAsync(
+      PODMAN,
+      [
+        "--remote=false",
+        "ps",
+        "-a",
+        "--filter",
+        `ancestor=${IMAGE_REFERENCE}`,
+        "--format=json",
+      ],
+      {
+        cwd: "/",
+        env: process.env,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * 1024,
+        timeout: 5_000,
+      },
+    );
+    const parsed = JSON.parse(observed.stdout);
+    if (!Array.isArray(parsed)) return "unreadable";
+    if (parsed.length === 0) return "absent";
+    if (parsed.length !== 1) return "ambiguous";
+    const descriptor = Object.getOwnPropertyDescriptor(parsed[0], "State");
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "string"
+    ) {
+      return "unreadable";
+    }
+    return descriptor.value === "configured" ? "configured" : "other-state";
+  } catch {
+    return "unreadable";
+  }
+}
+
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
   assert.match(DIGEST, /^sha256:[0-9a-f]{64}$/u);
   assert.equal(IMAGE_REFERENCE, `localhost/portable-codex-writer@${DIGEST}`);
@@ -301,6 +339,7 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     phase = "complete";
   } catch (error) {
     let durableStatus = "unreadable";
+    const createObservation = await observeCreatedContainer();
     if (supervisorState !== null) {
       try {
         const record = await supervisorState.read(exact({
@@ -313,7 +352,8 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       }
     }
     console.error(
-      `podman-integration-failure phase=${phase} durableStatus=${durableStatus}`,
+      `podman-integration-failure phase=${phase} durableStatus=${durableStatus} ` +
+        `createObservation=${createObservation}`,
     );
     throw error;
   } finally {
