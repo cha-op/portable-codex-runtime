@@ -21,6 +21,7 @@ const PODMAN = process.env.PODMAN_EXECUTABLE ?? "/usr/bin/podman";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const SUPERVISOR_ID = "podman-linux-integration-v1";
 const TEST_ROOT_PREFIX = "/var/tmp/portable-codex-runtime-podman-";
+const PODMAN_EXECUTION_PATH = "/usr/bin:/bin";
 
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -269,7 +270,10 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     const preflightOptions = {
       cwd: "/",
       encoding: "utf8",
-      env: podmanEnvironment,
+      env: exact({
+        ...podmanEnvironment,
+        PATH: PODMAN_EXECUTION_PATH,
+      }),
       killSignal: "SIGKILL",
       maxBuffer: 1024 * 1024,
       timeout: 5_000,

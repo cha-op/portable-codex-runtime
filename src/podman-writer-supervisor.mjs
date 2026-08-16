@@ -122,6 +122,7 @@ const FULL_CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/u;
 const PROC_FD_SOURCE_PATTERN = /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+$/u;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u;
 const CODEX_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/u;
+const PODMAN_EXECUTION_PATH = "/usr/bin:/bin";
 const MAX_DATA_DEPTH = 32;
 const MAX_DATA_NODES = 32_768;
 const MAX_CANONICAL_BYTES = 4 * 1024 * 1024;
@@ -2017,11 +2018,19 @@ export function createPodmanWriterSupervisor(...args) {
     false,
     optionCode,
   );
-  const podmanEnvironment = normalizeEnvironment(
+  const configuredPodmanEnvironment = normalizeEnvironment(
     options.podmanEnvironment,
     true,
     optionCode,
   );
+  // Rootless Podman resolves reviewed host helpers such as newuidmap and
+  // newgidmap through PATH even when the Podman executable itself is absolute.
+  // Keep that search path fixed instead of inheriting or accepting a caller-
+  // controlled ambient value.
+  const podmanEnvironment = frozenRecord({
+    ...configuredPodmanEnvironment,
+    PATH: PODMAN_EXECUTION_PATH,
+  });
   const state = normalizeState(options.state, optionCode);
   const filesystemAuthority = options.filesystemAuthority === undefined
     ? defaultFilesystemAuthority

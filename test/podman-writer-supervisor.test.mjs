@@ -768,6 +768,16 @@ async function preparingFixture(t) {
 test("launches with the fixed rootless digest-pinned argv and joins the container on stop", async (t) => {
   const base = await fixture(t);
   const { supervisor } = base;
+  assert.throws(
+    () => createPodmanWriterSupervisor(exact({
+      ...base.options,
+      podmanEnvironment: exact({
+        ...base.options.podmanEnvironment,
+        PATH: "/tmp/untrusted-podman-tools",
+      }),
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
   assert.equal(Object.getPrototypeOf(supervisor), null);
   assert.equal(Object.isFrozen(supervisor), true);
   assert.deepEqual(Reflect.ownKeys(supervisor), [
@@ -795,6 +805,12 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   const create = base.events.find((event) => event.arguments_[0] === "create");
   assert.equal(create.executable, "/usr/bin/podman");
   assert.equal(create.receiver, undefined);
+  assert.deepEqual(create.options.environment, exact({
+    HOME: "/var/empty/podman",
+    PATH: "/usr/bin:/bin",
+    XDG_RUNTIME_DIR: "/run/user/1000",
+  }));
+  assert.equal(Object.isFrozen(create.options.environment), true);
   assert.deepEqual(create.arguments_, [
     "create",
     "--name",

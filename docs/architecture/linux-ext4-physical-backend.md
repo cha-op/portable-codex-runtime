@@ -57,7 +57,9 @@ The physical implementation remains split into small authorities:
 - `PodmanWriterSupervisor` implements the raw version 2 writer-supervisor
   surface with a digest-pinned image reference, rootless execution, a private
   bind, immutable revision publication, stop/join, and stopped-only read-only
-  launch reconciliation.
+  launch reconciliation. Its Podman child environment adds the fixed
+  `/usr/bin:/bin` search path required by reviewed rootless helpers; it never
+  inherits or accepts an ambient caller-controlled `PATH`.
 
 No one component is a grant authority. PostgreSQL continues to decide whether
 one physical mutator may run; these components only validate and execute the

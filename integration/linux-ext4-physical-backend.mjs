@@ -265,14 +265,15 @@ function publicationMutationRequest(
   operation,
   operationId,
   storage,
+  authority,
 ) {
-  assert.notEqual(storage.writerAuthority, null);
+  assert.notEqual(authority, null);
   return exact({
     backendId: BACKEND_ID,
     contractVersion: 1,
-    fencingEpoch: storage.writerAuthority.fencingEpoch,
-    holderId: storage.writerAuthority.holderId,
-    leaseId: storage.writerAuthority.leaseId,
+    fencingEpoch: authority.fencingEpoch,
+    holderId: authority.holderId,
+    leaseId: authority.leaseId,
     operation,
     operationId,
     sessionId: SESSION_ID,
@@ -320,15 +321,24 @@ function publicationResult(request, storage) {
 function publicationInputs(storage, directories, artifactProof = null) {
   assert.notEqual(storage.mount, null);
   assert.notEqual(storage.dataRoot, null);
+  assert.notEqual(storage.writerAuthority, null);
+  assert.equal(storage.writerAuthority.fencingEpoch, "1");
+  const restoreAuthority = exact({
+    fencingEpoch: "2",
+    holderId: "physical-restore-holder-001",
+    leaseId: "physical-restore-lease-001",
+  });
   const checkpointRequest = publicationMutationRequest(
     "checkpoint",
     CHECKPOINT_OPERATION_ID,
     storage,
+    storage.writerAuthority,
   );
   const restoreRequest = publicationMutationRequest(
     "restore",
     RESTORE_OPERATION_ID,
     storage,
+    restoreAuthority,
   );
   const artifactOwnedRoot = directories.archive;
   const artifactDirectory = join(artifactOwnedRoot, ARTIFACT_ID);
@@ -874,7 +884,7 @@ async function consume({ destroy }) {
   assert.equal(before.filesystemId, receipt.filesystemId);
   assert.deepEqual(JSON.parse(JSON.stringify(before.dataRoot)), receipt.dataRoot);
   await verifyTransferredPublication(fixed, before, receipt);
-  const attach = attachmentRequest(receipt.storageId, "002", "2");
+  const attach = attachmentRequest(receipt.storageId, "002", "3");
   const attached = await fixed.backend.lifecycleBackend.prepareWritableAttachment(
     attach,
     context(),

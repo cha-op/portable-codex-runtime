@@ -254,6 +254,23 @@ change and does not attest the current head:
   kill signal under independent five-second bounds before constructing the
   supervisor. These probes are diagnostic-only and do not change the
   production supervisor contract or claim a root cause.
+- PR #52's fourth GitHub Actions run passed both Ubuntu Node matrices, closing
+  the Linux-only `spawnSync` result-prototype regression. The ext4 producer
+  completed checkpoint publication and then rejected restore publication
+  before journal prepare because both the checkpoint source and restore request
+  used writer epoch `1`. The physical fixture now models the intended authority
+  sequence explicitly: source/checkpoint epoch `1`, restore publication epoch
+  `2` with its own holder and lease, and cross-host writer reattachment epoch
+  `3`. The operation journal's strict newer-than-source restore check remains
+  unchanged.
+- The aligned Podman preflight proved that `/usr/bin/podman info --format=json`
+  itself exceeded five seconds with no output under the supervisor's restricted
+  environment, while the workflow shell invocation had just succeeded. Podman
+  4.9.3's rootless path resolves reviewed helpers such as `newuidmap` and
+  `newgidmap` through `PATH`; the supervisor now adds only the fixed
+  `/usr/bin:/bin` value to the normalized child environment. It still rejects
+  caller-controlled `PATH` and does not inherit the ambient process
+  environment. The next Ubuntu run remains the authority for this diagnosis.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`
