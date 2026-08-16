@@ -234,10 +234,13 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
   const attachmentRoot = `${ROOT}/attachment`;
   const stateRoot = `${ROOT}/state`;
   let containerId = null;
+  let phase = "setup";
+  let supervisorState = null;
   try {
     await mkdir(ROOT, { mode: 0o700 });
     await mkdir(attachmentRoot, { mode: 0o700 });
     const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
+    supervisorState = state;
     const options = exact({
       commandTimeoutMilliseconds: 30_000,
       configuredAttachmentRoot: ROOT,
@@ -264,17 +267,22 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     });
     const input = launchInput(attachmentRoot);
     const supervisor = createPodmanWriterSupervisor(options);
+    phase = "launch";
     const receipt = await supervisor.launchWriter(input);
     containerId = receipt.evidence.processIncarnationId.slice("podman-process:".length);
+    phase = "ready-marker";
     await waitForReadyMarker(`${attachmentRoot}/podman-writer-ready`);
+    phase = "stop";
     assert.deepEqual(await receipt.stopWriter(stopInput(input, receipt)), exact({
       contractVersion: 2,
       status: "stopped",
     }));
     const restarted = createPodmanWriterSupervisor(options);
+    phase = "reconcile";
     const reconciled = await restarted.reconcileWriterLaunch(reconcileInput(input));
     assert.equal(reconciled.evidence.status, "complete-stopped");
     assert.equal(reconciled.stopWriter, null);
+    phase = "external-ps";
     const retired = await execFileAsync(
       PODMAN,
       ["ps", "-a", "--filter", `id=${containerId}`, "--format=json"],
@@ -282,6 +290,24 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     );
     assert.deepEqual(JSON.parse(retired.stdout), []);
     containerId = null;
+    phase = "complete";
+  } catch (error) {
+    let durableStatus = "unreadable";
+    if (supervisorState !== null) {
+      try {
+        const record = await supervisorState.read(exact({
+          launchAttemptId: "podman-launch-attempt-001",
+        }));
+        durableStatus = record === null ? "absent" : record.status;
+      } catch {
+        // Preserve the primary integration failure while keeping diagnostics
+        // restricted to fixed lifecycle labels.
+      }
+    }
+    console.error(
+      `podman-integration-failure phase=${phase} durableStatus=${durableStatus}`,
+    );
+    throw error;
   } finally {
     if (containerId !== null) {
       await execFileAsync(PODMAN, ["rm", "--force", containerId], {

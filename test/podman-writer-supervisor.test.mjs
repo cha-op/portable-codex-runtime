@@ -1508,23 +1508,37 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
     value: new Error("inherited spawn result poison"),
     writable: true,
   });
-  const before = base.events.length;
+  let claimReached = false;
+  const poisonProbeState = exact({
+    contractVersion: base.state.contractVersion,
+    async claim() {
+      claimReached = true;
+      throw new Error("stop after default authority acquisition");
+    },
+    async read() {
+      return null;
+    },
+    async transition() {
+      throw new Error("unexpected transition");
+    },
+  });
+  const poisonProbe = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    state: poisonProbeState,
+  }));
   try {
     await assert.rejects(
-      base.supervisor.launchWriter(base.input),
-      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+      poisonProbe.launchWriter(base.input),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
     );
   } finally {
     if (inheritedError === undefined) delete Object.prototype.error;
     else Object.defineProperty(Object.prototype, "error", inheritedError);
   }
-  // The fake container PID has no live /session path, so launch must fail
-  // after create. Reaching create proves inherited spawnSync result fields did
-  // not replace the own getfacl status/stdout/stderr snapshot.
-  assert.equal(
-    base.events.slice(before).some((event) => event.arguments_[0] === "create"),
-    true,
-  );
+  // Reaching the state boundary proves inherited spawnSync result fields did
+  // not replace the own getfacl status/stdout/stderr snapshot. Stop there so
+  // unrelated filesystem calls do not run while Object.prototype is poisoned.
+  assert.equal(claimReached, true);
 });
 
 test("enforces rootless execution, exact local digest, and bounded unambiguous output", async (t) => {

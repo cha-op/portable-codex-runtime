@@ -266,6 +266,7 @@ function createFixture(paths, overrides = {}) {
   const calls = [];
   const fdCalls = [];
   const loopDevice = overrides.loopDevice ?? LOOP_DEVICE;
+  const mountSource = overrides.mountSource ?? loopDevice;
   const state = {
     associatedLoops:
       overrides.associatedLoops ??
@@ -349,7 +350,7 @@ function createFixture(paths, overrides = {}) {
         ? "rw,errors=remount-ro"
         : "ro,errors=continue";
       return Buffer.from(
-        `${rootLine}36 29 7:7 / ${encodeMountField(paths.mountPath)} ${options}${optional} - ext4 ${loopDevice} ${superOptions}\n`,
+        `${rootLine}36 29 7:7 / ${encodeMountField(paths.mountPath)} ${options}${optional} - ext4 ${mountSource} ${superOptions}\n`,
         "utf8",
       );
     });
@@ -450,10 +451,21 @@ test("driver loop receipts use the canonical native 0..4095 domain", async () =>
   const acceptedPaths = await createPaths();
   const accepted = createFixture(acceptedPaths, {
     loopDevice: "/dev/loop4095",
+    mountSource: "/proc/self/fd/17",
   });
   assert.equal(
     (await accepted.driver.provision(provisionRequest(acceptedPaths))).loopDevice,
     "/dev/loop4095",
+  );
+  const inspectedLoops = accepted.fdCalls.filter(
+    ({ operation }) => operation === "inspect-loop",
+  );
+  assert.equal(inspectedLoops.length > 0, true);
+  assert.equal(
+    inspectedLoops.every(
+      ({ loopDevice }) => loopDevice === "/dev/loop4095",
+    ),
+    true,
   );
 
   for (const loopDevice of ["/dev/loop4096", "/dev/loop04095"]) {
@@ -755,7 +767,7 @@ test("observeMount is read-only and fails closed on backing or mount-policy mism
   );
   assert.deepEqual(
     fixture.fdCalls.map(({ operation }) => operation),
-    ["inspect-loop", "inspect-loop"],
+    ["find-loop", "inspect-loop"],
   );
 
   fixture.state.backingPath = `${paths.imagePath}.replacement`;
@@ -781,13 +793,17 @@ test("observeMount is read-only and fails closed on backing or mount-policy mism
   assert.equal(fixture.state.mounted, true);
 });
 
-test("mountinfo loop sources use the canonical native 0..4095 domain", async () => {
-  async function mountedFixture(loopDevice) {
+test("mountinfo source is display-only while loop authority stays canonical", async () => {
+  async function mountedFixture(loopDevice, mountSource = loopDevice) {
     const paths = await createPaths();
     await writeFile(paths.imagePath, Buffer.alloc(1024), { mode: 0o600 });
     await mkdir(paths.mountPath, { mode: 0o700 });
     return {
-      fixture: createFixture(paths, { initiallyMounted: true, loopDevice }),
+      fixture: createFixture(paths, {
+        initiallyMounted: true,
+        loopDevice,
+        mountSource,
+      }),
       paths,
     };
   }
@@ -799,6 +815,44 @@ test("mountinfo loop sources use the canonical native 0..4095 domain", async () 
     "/dev/loop4095",
   );
 
+  const fdBound = await mountedFixture("/dev/loop4095", "/proc/self/fd/17");
+  assert.equal(
+    (await fdBound.fixture.driver.observeMount(mountRequest(fdBound.paths)))
+      .loopDevice,
+    "/dev/loop4095",
+  );
+  assert.deepEqual(
+    fdBound.fixture.fdCalls.map(({ operation }) => operation),
+    ["find-loop", "inspect-loop"],
+  );
+
+  const changingPaths = await createPaths();
+  await writeFile(changingPaths.imagePath, Buffer.alloc(1024), { mode: 0o600 });
+  await mkdir(changingPaths.mountPath, { mode: 0o700 });
+  let mountInfoRead = 0;
+  const changingDisplay = createFixture(changingPaths, {
+    initiallyMounted: true,
+    loopDevice: "/dev/loop4095",
+    readMountInfo: async () => {
+      mountInfoRead += 1;
+      const source = mountInfoRead === 1
+        ? "/proc/self/fd/17"
+        : "/proc/self/fd/18";
+      return Buffer.from(
+        "29 23 0:25 / / rw,relatime - ext4 /dev/root rw\n" +
+          `36 29 7:7 / ${encodeMountField(changingPaths.mountPath)} ` +
+          `rw,nosuid,nodev,noexec,noatime - ext4 ${source} ` +
+          "rw,errors=remount-ro\n",
+        "utf8",
+      );
+    },
+  });
+  assert.equal(
+    (await changingDisplay.driver.observeMount(mountRequest(changingPaths)))
+      .loopDevice,
+    "/dev/loop4095",
+  );
+
   for (const loopDevice of ["/dev/loop4096", "/dev/loop04095"]) {
     const rejected = await mountedFixture(loopDevice);
     await assert.rejects(
@@ -806,6 +860,26 @@ test("mountinfo loop sources use the canonical native 0..4095 domain", async () 
       driverError("mount_mismatch"),
     );
     assert.equal(rejected.fixture.fdCalls.length, 0);
+  }
+});
+
+test("observeMount rejects absent or ambiguous loop authority", async () => {
+  for (const associatedLoops of [[], [LOOP_DEVICE, "/dev/loop8"]]) {
+    const paths = await createPaths();
+    await writeFile(paths.imagePath, Buffer.alloc(1024), { mode: 0o600 });
+    await mkdir(paths.mountPath, { mode: 0o700 });
+    const fixture = createFixture(paths, {
+      associatedLoops,
+      initiallyMounted: true,
+      loopAttached: associatedLoops.length > 0,
+      mountSource: "/proc/self/fd/17",
+    });
+    await assert.rejects(
+      fixture.driver.observeMount(mountRequest(paths)),
+      driverError(
+        associatedLoops.length === 0 ? "backing_mismatch" : "loop_ambiguous",
+      ),
+    );
   }
 });
 
@@ -1459,7 +1533,10 @@ const options = {
   inspector: Object.freeze({
     inspectFilesystemObject() { return inspectedPending; },
     runFdOperation(request) {
-      if (request.operation !== "inspect-loop") {
+      if (
+        request.operation !== "find-loop" &&
+        request.operation !== "inspect-loop"
+      ) {
         throw new Error("unexpected fd operation");
       }
       return loopPending;

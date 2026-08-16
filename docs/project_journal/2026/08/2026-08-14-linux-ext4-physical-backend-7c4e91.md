@@ -209,6 +209,29 @@ change and does not attest the current head:
   same host-level watcher `EMFILE` failure. The actual Ubuntu ext4 producer,
   dependent cross-host consumer, and rootless Podman integration are pending
   the next pushed-head CI run and are not claimed by this local evidence.
+- PR #52's second GitHub Actions run passed both macOS Node matrices and the
+  PostgreSQL authority integration. The ext4 helper also completed its
+  FD-bound mount and native post-check, then the JavaScript driver rejected the
+  resulting mountinfo because Linux preserved `/proc/self/fd/<n>` as the
+  display source. The driver now treats that field as display-only and binds
+  mount identity through mountinfo `major:minor`, the unique canonical loop
+  receipt and backing image identity, plus the ext4 root identity. Focused
+  inspector/image-driver/backend tests and strict native syntax checking pass;
+  real producer and cross-host consumer evidence remains pending Ubuntu CI.
+- Both Ubuntu Node matrices exposed one Linux-only hostile test whose global
+  `Object.prototype` poisoning continued through unrelated state/filesystem
+  work after the default ACL authority had already been exercised. The test
+  now stops at an injected state boundary: reaching it proves that only own
+  `spawnSync` result fields were consumed without asking unrelated Node
+  internals to operate under the poisoned prototype. Podman state/supervisor
+  focused tests and JavaScript syntax checks pass locally.
+- The second rootless Podman integration still reached a 30-second runner
+  failure, but its sanitized public error and top-level Node test stack do not
+  identify the command or lifecycle phase. The integration now emits only a
+  fixed phase label and normalized durable-state status on failure; it does not
+  print argv, container IDs, paths, requests, or command output. No behavioral
+  Podman change is claimed until the next CI run supplies that bounded phase
+  evidence.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

@@ -193,6 +193,7 @@ const REQUIRED_VFS_OPTIONS = objectFreezeIntrinsic([
 ]);
 const LOOP_DEVICE_PATTERN =
   /^\/dev\/loop(?:0|[1-9][0-9]{0,2}|[1-3][0-9]{3}|40(?:[0-8][0-9]|9[0-5]))$/u;
+const PROC_FD_MOUNT_SOURCE_PATTERN = /^\/proc\/self\/fd\/[1-9][0-9]*$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 const DEVICE_PATTERN = /^(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)$/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -1551,7 +1552,8 @@ function parseMountInfo(bytes, mountPath, requirePolicy, allowMissing = false) {
         regexpTest(DEVICE_PATTERN, fields[2]) &&
         decodeMountField(fields[3]) === "/" &&
         fields[separatorIndex + 1] === "ext4" &&
-        regexpTest(LOOP_DEVICE_PATTERN, source),
+        (regexpTest(LOOP_DEVICE_PATTERN, source) ||
+          regexpTest(PROC_FD_MOUNT_SOURCE_PATTERN, source)),
       "mount_mismatch",
     );
     selected = frozenRecord({
@@ -1560,7 +1562,6 @@ function parseMountInfo(bytes, mountPath, requirePolicy, allowMissing = false) {
       parentMountId: fields[1],
       propagation: privatePropagation ? "private" : "not-private",
       root: "/",
-      source,
     });
   }
   ensure(rootSeen, "observation_failed");
@@ -1599,8 +1600,7 @@ function sameMountEvidence(left, right) {
     left.mountId === right.mountId &&
     left.parentMountId === right.parentMountId &&
     left.propagation === right.propagation &&
-    left.root === right.root &&
-    left.source === right.source
+    left.root === right.root
   );
 }
 
@@ -1755,9 +1755,11 @@ function sameMountedObservation(left, right) {
 async function observeMountInternal(state, requestValue, requirePolicy = true) {
   const request = mountRequest(requestValue);
   const before = await readMountEvidence(state, request.mountPath, requirePolicy);
-  const loop = await readLoopBacking(state, before.source, request.imagePath);
+  const beforeLoops = await loopsForImage(state, request.imagePath);
+  ensure(beforeLoops.length === 1, "backing_mismatch");
+  const loop = beforeLoops[0];
   ensure(
-    loop.loopRdev === before.device && loop.loopDevice === before.source,
+    loop.loopRdev === before.device,
     "backing_mismatch",
   );
   const inspected = await inspectObject(state, request.mountPath);
@@ -1770,11 +1772,12 @@ async function observeMountInternal(state, requestValue, requirePolicy = true) {
   ensure(sameMountEvidence(before, after), "mount_mismatch");
   const stableLoop = await readLoopBacking(
     state,
-    after.source,
+    loop.loopDevice,
     request.imagePath,
   );
   ensure(
     stableLoop.loopRdev === after.device &&
+      stableLoop.loopDevice === loop.loopDevice &&
       stableLoop.backingDevice === loop.backingDevice &&
       stableLoop.backingInode === loop.backingInode &&
       stableLoop.sizeBytes === loop.sizeBytes,
@@ -1784,7 +1787,7 @@ async function observeMountInternal(state, requestValue, requirePolicy = true) {
     filesystem: inspected.filesystem,
     imageIdentity: logicalImageIdentity,
     imagePath: request.imagePath,
-    loopDevice: before.source,
+    loopDevice: loop.loopDevice,
     mountEvidence: mountEvidenceRecord(before, inspected.runtimeIdentity),
     mountPath: request.mountPath,
     rootIdentity: inspected.identity,
@@ -1794,7 +1797,6 @@ async function observeMountInternal(state, requestValue, requirePolicy = true) {
 async function verifyMountedMutation(state, request, loopDevice) {
   try {
     const rawMount = await readMountEvidence(state, request.mountPath, false);
-    ensure(rawMount.source === loopDevice, "operation_outcome_uncertain");
     const loop = await readLoopBacking(state, loopDevice, request.imagePath);
     ensure(loop.loopRdev === rawMount.device, "operation_outcome_uncertain");
   } catch (error) {
