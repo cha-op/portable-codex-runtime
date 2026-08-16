@@ -190,6 +190,25 @@ change and does not attest the current head:
   only the pre-existing watcher-dependent `EMFILE` failure in
   `test/app-server-auth-probe.test.mjs`; that file passed 43/44 in isolation,
   and an explicit run of the other 49 test files passed.
+- PR #52's first current-head GitHub Actions run passed the PostgreSQL authority
+  integration but exposed two Linux-only integration defects. The ext4
+  producer reached `mount-ext4` after formatting a root-owned filesystem while
+  the capability-bearing helper intentionally remained the non-root service
+  UID; formatting now supplies the exact real `uid:gid` through mke2fs
+  `root_owner` instead of expanding helper capabilities. Rootless Podman
+  started the container, but the detached container kept the CLI's captured
+  output pipes open and therefore held the close-only command runner until its
+  30-second timeout. The exact `start <container-id>` command now uses no
+  captured output; direct-CLI close/reap remains the settlement barrier, and
+  the existing exact container inspection plus live attachment-object proof
+  remains the authoritative success evidence.
+- After those fixes, the focused ext4 inspector/image-driver and Podman
+  supervisor/state suites passed, both changed JavaScript files passed
+  `node --check`, the Darwin unsupported native-helper branch passed strict
+  `cc` syntax checking, and full Node test discovery again reproduced only the
+  same host-level watcher `EMFILE` failure. The actual Ubuntu ext4 producer,
+  dependent cross-host consumer, and rootless Podman integration are pending
+  the next pushed-head CI run and are not claimed by this local evidence.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

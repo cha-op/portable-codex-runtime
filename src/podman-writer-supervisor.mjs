@@ -118,6 +118,7 @@ const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IMAGE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const CONTAINER_ID_PATTERN = /^[0-9a-f]{12,64}$/u;
+const FULL_CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/u;
 const PROC_FD_SOURCE_PATTERN = /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+$/u;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u;
 const CODEX_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/u;
@@ -1514,6 +1515,10 @@ async function closeFilesystemAuthority(authority, acquired) {
 
 function defaultCommandRunner(executable, arguments_, options) {
   return new PromiseConstructor((resolvePromise, rejectPromise) => {
+    const discardCommandOutput =
+      arguments_.length === 2 &&
+      arguments_[0] === "start" &&
+      regexpTest(FULL_CONTAINER_ID_PATTERN, arguments_[1]);
     let child;
     try {
       child = spawn(executable, arguments_, {
@@ -1522,7 +1527,14 @@ function defaultCommandRunner(executable, arguments_, options) {
         killSignal: "SIGKILL",
         shell: false,
         signal: options.signal,
-        stdio: ["ignore", "pipe", "pipe"],
+        // A detached Podman container may keep the CLI's stdout/stderr file
+        // descriptions open after the direct CLI has exited. `start` has no
+        // authoritative output: its exit status is followed by an exact
+        // inspect plus live attachment proof. Avoid pipes only for that closed
+        // command shape so `close` still proves the direct CLI was reaped.
+        stdio: discardCommandOutput
+          ? ["ignore", "ignore", "ignore"]
+          : ["ignore", "pipe", "pipe"],
       });
     } catch (error) {
       rejectPromise(error);
@@ -1557,14 +1569,16 @@ function defaultCommandRunner(executable, arguments_, options) {
       }
       return callIntrinsic(bufferConcatIntrinsic, Buffer, [[current, chunk]]);
     };
-    child.stdout.on("data", (chunk) => {
-      stdout = append(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = append(stderr, chunk);
-    });
-    child.stdout.on("error", (error) => rememberFailure(error, true));
-    child.stderr.on("error", (error) => rememberFailure(error, true));
+    if (!discardCommandOutput) {
+      child.stdout.on("data", (chunk) => {
+        stdout = append(stdout, chunk);
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr = append(stderr, chunk);
+      });
+      child.stdout.on("error", (error) => rememberFailure(error, true));
+      child.stderr.on("error", (error) => rememberFailure(error, true));
+    }
     child.on("error", (error) => rememberFailure(error, false));
     child.once("close", (code, signal) => {
       if (settled) return;
@@ -2470,20 +2484,7 @@ export function createPodmanWriterSupervisor(...args) {
         await transition(record, "preparing", created),
         expected,
       );
-      const startedOutput = await runPodman(
-        ["start", containerId],
-        input.signal,
-      );
-      const startedIdentity = callIntrinsic(
-        stringTrimIntrinsic,
-        startedOutput.stdout,
-        [],
-      );
-      ensure(
-        (startedIdentity === containerId || startedIdentity === name) &&
-          startedOutput.stdout === `${startedIdentity}\n`,
-        "podman_writer_output_invalid",
-      );
+      await runPodman(["start", containerId], input.signal);
       const inspected = await runPodman(
         ["container", "inspect", "--format=json", containerId],
         input.signal,

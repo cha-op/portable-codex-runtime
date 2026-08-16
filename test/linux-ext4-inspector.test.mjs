@@ -452,6 +452,13 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   assert.match(source, /unlinkat\(parent_fd, name,/u);
   assert.match(source, /unlinked_private_policy_status\(/u);
   assert.match(source, /O_CREAT \| O_EXCL \| O_NOFOLLOW/u);
+  assert.match(source, /"root_owner=%ju:%ju"/u);
+  assert.match(source, /\(uintmax_t\)getuid\(\)/u);
+  assert.match(source, /\(uintmax_t\)getgid\(\)/u);
+  assert.match(
+    source,
+    /\(char \*\)"-E", root_owner, \(char \*\)"--"/u,
+  );
   assert.match(source, /execve\(executable, arguments, environment\)/u);
   assert.match(source, /dup3\(retained_fd, 3, 0\)/u);
   assert.match(source, /retained_fd <= STDERR_FILENO/u);

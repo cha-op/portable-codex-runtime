@@ -472,18 +472,25 @@ static int run_mkfs_on_fd(const char *executable, int image_fd) {
   static char *const environment[] = {(char *)"LANG=C", (char *)"LC_ALL=C",
                                       NULL};
   char proc_path[64];
+  char root_owner[96];
   pid_t child;
   int wait_status = 0;
+  int root_owner_length;
   pid_t waited;
+  root_owner_length = snprintf(root_owner, sizeof(root_owner),
+                               "root_owner=%ju:%ju", (uintmax_t)getuid(),
+                               (uintmax_t)getgid());
   if (!valid_absolute_executable(executable) ||
-      !format_proc_fd_path(3, proc_path)) {
+      !format_proc_fd_path(3, proc_path) || root_owner_length <= 0 ||
+      (size_t)root_owner_length >= sizeof(root_owner)) {
     return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
   }
   child = fork();
   if (child < 0) return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
   if (child == 0) {
     char *const arguments[] = {(char *)executable, (char *)"-F", (char *)"-q",
-                               (char *)"--", proc_path, NULL};
+                               (char *)"-E", root_owner, (char *)"--",
+                               proc_path, NULL};
     if (close_helper_authorities_for_exec(image_fd) != 0) _exit(126);
     execve(executable, arguments, environment);
     _exit(127);

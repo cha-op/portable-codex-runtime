@@ -177,6 +177,100 @@ esac
 `;
 }
 
+function detachedStartPodmanScript({
+  containerId = CONTAINER_ID,
+  holdingPath,
+  namePath,
+  releasePath,
+  releasedPath,
+}) {
+  const info = JSON.stringify({ host: { security: { rootless: true } } });
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  return `#!/bin/sh
+set -eu
+case "$1" in
+  info)
+    printf '%s\\n' ${shellQuote(info)}
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  create)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--name" ]; then
+        shift
+        printf '%s\\n' "$1" > ${shellQuote(namePath)}
+        break
+      fi
+      shift
+    done
+    printf '%s\\n' ${shellQuote(containerId)}
+    ;;
+  start)
+    (
+      : > ${shellQuote(holdingPath)}
+      while ! test -f ${shellQuote(releasePath)}; do
+        /bin/sleep 0.01
+      done
+      : > ${shellQuote(releasedPath)}
+    ) &
+    while ! test -f ${shellQuote(holdingPath)}; do
+      /bin/sleep 0.01
+    done
+    printf '%2048s' x
+    printf '%2048s' x >&2
+    printf '%s\\n' ${shellQuote(containerId)}
+    exit 0
+    ;;
+  container)
+    name=$(cat ${shellQuote(namePath)})
+    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":42001,"Running":true,"Status":"running"}}]\\n' \\
+      ${shellQuote(containerId)} ${shellQuote(DIGEST)} \\
+      ${shellQuote(HELD_MOUNT_SOURCE)} "$name"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
+
+function blockingStartPodmanScript({ pidPath, startedPath }) {
+  const info = JSON.stringify({ host: { security: { rootless: true } } });
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  return `#!/bin/sh
+set -eu
+case "$1" in
+  info)
+    printf '%s\\n' ${shellQuote(info)}
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  create)
+    printf '%s\\n' ${shellQuote(CONTAINER_ID)}
+    ;;
+  start)
+    printf '%s\\n' "$$" > ${shellQuote(pidPath)}
+    : > ${shellQuote(startedPath)}
+    exec /bin/sleep 30
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
+
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
 }
@@ -1469,9 +1563,9 @@ test("enforces rootless execution, exact local digest, and bounded unambiguous o
 test("default runner holds filesystem authority until failed Podman children close", async (t) => {
   const scenarios = [
     { mode: "timeout", phase: "create" },
-    { mode: "abort", phase: "start" },
+    { mode: "abort", phase: "create" },
     { mode: "stdout-overflow", phase: "create" },
-    { mode: "stderr-overflow", phase: "start" },
+    { mode: "stderr-overflow", phase: "create" },
   ];
 
   for (const scenario of scenarios) {
@@ -1545,6 +1639,124 @@ test("default runner holds filesystem authority until failed Podman children clo
       assert.equal(closeCount, 1);
     });
   }
+});
+
+test("default runner reaps detached Podman start without waiting for container pipes", async (t) => {
+  let holdingPath;
+  let namePath;
+  let releasePath;
+  let releasedPath;
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 2_000,
+    defaultCommandRunnerScript({ parent }) {
+      holdingPath = join(parent, "podman-start-descendant-holding");
+      namePath = join(parent, "podman-start-container-name");
+      releasePath = join(parent, "podman-start-descendant-release");
+      releasedPath = join(parent, "podman-start-descendant-released");
+      return detachedStartPodmanScript({
+        holdingPath,
+        namePath,
+        releasePath,
+        releasedPath,
+      });
+    },
+    maxOutputBytes: 1_024,
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+  });
+
+  const pending = base.supervisor.launchWriter(base.input);
+  await waitForPath(holdingPath);
+  try {
+    const receipt = await pending;
+    assert.equal(receipt.evidence.status, "started");
+    assert.equal(existsSync(releasedPath), false);
+  } finally {
+    await writeFile(releasePath, "release\n", { mode: 0o600 });
+  }
+  await waitForPath(releasedPath);
+});
+
+test("default runner captures output for non-full Podman start identities", async (t) => {
+  const shortContainerId = "e".repeat(63);
+  let holdingPath;
+  let namePath;
+  let releasePath;
+  let releasedPath;
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 2_000,
+    defaultCommandRunnerScript({ parent }) {
+      holdingPath = join(parent, "podman-short-start-descendant-holding");
+      namePath = join(parent, "podman-short-start-container-name");
+      releasePath = join(parent, "podman-short-start-descendant-release");
+      releasedPath = join(parent, "podman-short-start-descendant-released");
+      return detachedStartPodmanScript({
+        containerId: shortContainerId,
+        holdingPath,
+        namePath,
+        releasePath,
+        releasedPath,
+      });
+    },
+    maxOutputBytes: 1_024,
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+  });
+
+  const pending = base.supervisor.launchWriter(base.input);
+  await waitForPath(holdingPath);
+  try {
+    await writeFile(releasePath, "release\n", { mode: 0o600 });
+    await assert.rejects(
+      pending,
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+    );
+  } finally {
+    if (!existsSync(releasePath)) {
+      await writeFile(releasePath, "release\n", { mode: 0o600 });
+    }
+  }
+  await waitForPath(releasedPath);
+});
+
+test("default runner reaps an aborted outputless Podman start before closing authority", async (t) => {
+  const controller = new AbortController();
+  let closeCount = 0;
+  let pidPath;
+  let startedPath;
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 10_000,
+    defaultCommandRunnerScript({ parent }) {
+      pidPath = join(parent, "podman-aborted-start-pid");
+      startedPath = join(parent, "podman-aborted-started");
+      return blockingStartPodmanScript({ pidPath, startedPath });
+    },
+    filesystemSettings: {
+      onClose() {
+        closeCount += 1;
+        const pid = Number(execFileSync("/bin/cat", [pidPath], {
+          encoding: "utf8",
+        }).trim());
+        assert.throws(
+          () => process.kill(pid, 0),
+          (error) => error?.code === "ESRCH",
+        );
+      },
+    },
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+  });
+
+  const pending = base.supervisor.launchWriter(
+    launchInput(base.attachmentRoot, { signal: controller.signal }),
+  );
+  await waitForPath(startedPath);
+  controller.abort();
+  await assert.rejects(
+    pending,
+    assertSupervisorError("podman_writer_supervisor_aborted"),
+  );
+  assert.equal(closeCount, 1);
 });
 
 test("Linux default runner keeps the real attachment fd visible through reap", {
