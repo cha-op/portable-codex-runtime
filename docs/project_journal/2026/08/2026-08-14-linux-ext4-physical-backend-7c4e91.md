@@ -293,6 +293,23 @@ change and does not attest the current head:
   exit/signal, and byte counts, then always continues to the real supervisor's
   existing 30-second production path. No additional ambient environment value
   is admitted to production without that evidence.
+- PR #52's sixth GitHub Actions run passed the real ext4 producer and dependent
+  cross-host consumer, proving clean loop detach without the asynchronous udev
+  database conjunct. All four bounded Podman diagnostics—shell and Node,
+  inherited and restricted environments—timed out in `podman info` with no
+  stdout, while the same job immediately removed the built image in about
+  46 milliseconds. That evidence rejects a global Podman or storage lock and
+  isolates the failure to the broad `info` inventory path, without claiming a
+  particular internal helper or lock.
+- The temporary diagnostics are removed. The supervisor now requires equal
+  non-root real/effective user IDs, prefixes every lifecycle command with
+  `--remote=false`, and proves the local rootless ABI through the exact bounded
+  `unshare /usr/bin/true` command before publishing a new claim. Podman 4.9.3
+  rejects `unshare` for its remote client and rootful engine, so command success
+  directly protects the local-rootless property without parsing the unrelated
+  host/store inventory returned by `info`. The workflow build, inspect, and
+  cleanup calls use the same explicit local mode. The next Ubuntu run remains
+  the runtime authority for this replacement.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

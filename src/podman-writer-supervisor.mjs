@@ -31,7 +31,6 @@ const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArrayIntrinsic = Array.isArray;
 const arrayPushIntrinsic = Array.prototype.push;
-const arraySliceIntrinsic = Array.prototype.slice;
 const arraySortIntrinsic = Array.prototype.sort;
 const bufferAllocIntrinsic = Buffer.alloc;
 const bufferByteLengthIntrinsic = Buffer.byteLength;
@@ -72,9 +71,17 @@ const stringTrimIntrinsic = String.prototype.trim;
 const StringConstructor = String;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
-const currentPlatform = process.platform;
-const currentProcessId = process.pid;
-const currentUserId = typeof process.getuid === "function" ? process.getuid() : null;
+const processObject = process;
+const processGetUserIdIntrinsic = typeof processObject.getuid === "function"
+  ? processObject.getuid
+  : null;
+const processGetEffectiveUserIdIntrinsic =
+  typeof processObject.geteuid === "function" ? processObject.geteuid : null;
+const currentPlatform = processObject.platform;
+const currentProcessId = processObject.pid;
+const currentUserId = processGetUserIdIntrinsic === null
+  ? null
+  : processGetUserIdIntrinsic();
 const currentUserIdBigInt = currentUserId === null ? null : BigInt(currentUserId);
 const realpathNativeIntrinsic = realpathSync.native;
 const openDirectoryFlag = fsConstants.O_DIRECTORY;
@@ -123,6 +130,8 @@ const PROC_FD_SOURCE_PATTERN = /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+$/u;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u;
 const CODEX_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/u;
 const PODMAN_EXECUTION_PATH = "/usr/bin:/bin";
+const PODMAN_LOCAL_MODE_ARGUMENT = "--remote=false";
+const PODMAN_ROOTLESS_PROOF_EXECUTABLE = "/usr/bin/true";
 const MAX_DATA_DEPTH = 32;
 const MAX_DATA_NODES = 32_768;
 const MAX_CANONICAL_BYTES = 4 * 1024 * 1024;
@@ -1517,9 +1526,10 @@ async function closeFilesystemAuthority(authority, acquired) {
 function defaultCommandRunner(executable, arguments_, options) {
   return new PromiseConstructor((resolvePromise, rejectPromise) => {
     const discardCommandOutput =
-      arguments_.length === 2 &&
-      arguments_[0] === "start" &&
-      regexpTest(FULL_CONTAINER_ID_PATTERN, arguments_[1]);
+      arguments_.length === 3 &&
+      arguments_[0] === PODMAN_LOCAL_MODE_ARGUMENT &&
+      arguments_[1] === "start" &&
+      regexpTest(FULL_CONTAINER_ID_PATTERN, arguments_[2]);
     let child;
     try {
       child = spawn(executable, arguments_, {
@@ -1532,7 +1542,8 @@ function defaultCommandRunner(executable, arguments_, options) {
         // descriptions open after the direct CLI has exited. `start` has no
         // authoritative output: its exit status is followed by an exact
         // inspect plus live attachment proof. Avoid pipes only for that closed
-        // command shape so `close` still proves the direct CLI was reaped.
+        // local-only command shape so `close` still proves the direct CLI was
+        // reaped.
         stdio: discardCommandOutput
           ? ["ignore", "ignore", "ignore"]
           : ["ignore", "pipe", "pipe"],
@@ -2055,9 +2066,48 @@ export function createPodmanWriterSupervisor(...args) {
 
   async function runPodman(arguments_, signal) {
     ensureNotAborted(signal);
-    const commandArguments = callIntrinsic(objectFreezeIntrinsic, Object, [
-      callIntrinsic(arraySliceIntrinsic, arguments_, []),
-    ]);
+    // Re-read both identities before every dispatch so a privilege transition
+    // cannot carry an earlier rootless proof into a later Podman command.
+    ensure(
+      processGetUserIdIntrinsic !== null &&
+        processGetEffectiveUserIdIntrinsic !== null,
+      "podman_writer_supervisor_outcome_uncertain",
+    );
+    let realUserId;
+    let effectiveUserId;
+    try {
+      realUserId = callIntrinsic(
+        processGetUserIdIntrinsic,
+        processObject,
+        [],
+      );
+      effectiveUserId = callIntrinsic(
+        processGetEffectiveUserIdIntrinsic,
+        processObject,
+        [],
+      );
+    } catch {
+      fail("podman_writer_supervisor_outcome_uncertain");
+    }
+    ensure(
+      numberIsSafeIntegerIntrinsic(realUserId) &&
+        realUserId >= 0 &&
+        numberIsSafeIntegerIntrinsic(effectiveUserId) &&
+        effectiveUserId >= 0,
+      "podman_writer_supervisor_outcome_uncertain",
+    );
+    if (realUserId === 0 || effectiveUserId === 0) {
+      fail("podman_writer_rootless_required");
+    }
+    ensure(
+      realUserId === effectiveUserId,
+      "podman_writer_supervisor_outcome_uncertain",
+    );
+    const commandArguments = [PODMAN_LOCAL_MODE_ARGUMENT];
+    for (let index = 0; index < arguments_.length; index += 1) {
+      arrayPush(commandArguments, arguments_[index]);
+    }
+    callIntrinsic(objectFreezeIntrinsic, Object, [commandArguments]);
     const runnerOptions = frozenRecord({
       environment: podmanEnvironment,
       maxOutputBytes,
@@ -2359,27 +2409,12 @@ export function createPodmanWriterSupervisor(...args) {
       fail("podman_writer_supervisor_outcome_uncertain");
     }
     ensureNotAborted(input.signal);
-    const info = await runPodman(["info", "--format=json"], input.signal);
-    const infoValue = jsonObject(
-      parsedJson(info.stdout, "podman_writer_output_invalid"),
-      "podman_writer_output_invalid",
+    // This fixed ABI command succeeds only for the explicitly selected local
+    // rootless engine and does not traverse Podman's heavyweight info probes.
+    await runPodman(
+      ["unshare", PODMAN_ROOTLESS_PROOF_EXECUTABLE],
+      input.signal,
     );
-    const host = ownJsonAlias(
-      infoValue,
-      ["host", "Host"],
-      "podman_writer_output_invalid",
-    );
-    const security = ownJsonAlias(
-      host,
-      ["security", "Security"],
-      "podman_writer_output_invalid",
-    );
-    const rootless = ownJsonAlias(
-      security,
-      ["rootless", "Rootless"],
-      "podman_writer_output_invalid",
-    );
-    ensure(rootless === true, "podman_writer_rootless_required");
     const imageInspect = await runPodman(
       ["image", "inspect", "--format=json", policy.imageReference],
       input.signal,

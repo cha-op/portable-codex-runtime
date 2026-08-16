@@ -57,9 +57,13 @@ The physical implementation remains split into small authorities:
 - `PodmanWriterSupervisor` implements the raw version 2 writer-supervisor
   surface with a digest-pinned image reference, rootless execution, a private
   bind, immutable revision publication, stop/join, and stopped-only read-only
-  launch reconciliation. Its Podman child environment adds the fixed
-  `/usr/bin:/bin` search path required by reviewed rootless helpers; it never
-  inherits or accepts an ambient caller-controlled `PATH`.
+  launch reconciliation. Every Podman child invocation is explicitly local
+  through `--remote=false`, and a new launch proves the local rootless ABI with
+  the exact `unshare /usr/bin/true` command before it publishes a claim. The
+  supervisor also requires matching non-root real and effective user IDs. Its
+  Podman child environment adds the fixed `/usr/bin:/bin` search path required
+  by reviewed rootless helpers; it never inherits or accepts an ambient
+  caller-controlled `PATH`.
 
 No one component is a grant authority. PostgreSQL continues to decide whether
 one physical mutator may run; these components only validate and execute the
@@ -317,6 +321,15 @@ termination-request deadline, not permission to return while a child may still
 resolve `/proc/<node-pid>/fd/<fd>`. If the operating system cannot reap the
 child, the safe outcome is to keep the authority held rather than return a
 normal error that would release it.
+
+The runner receives a closed local-only argv shape: every command begins with
+`--remote=false`. This prevents a caller's Podman connection configuration
+from redirecting lifecycle authority to a remote service. A new writer launch
+does not parse the broad `podman info` inventory as an authority signal. It
+instead requires the bounded ABI-only `unshare /usr/bin/true` probe to succeed;
+Podman rejects that command in remote or rootful mode. A failed or timed-out
+probe is an uncertain observation, while directly observed root real or
+effective credentials are a deterministic rootless-policy mismatch.
 
 That default does not reconstruct the provider state's persistent ext4
 `rootIdentity` from an opaque attachment proof. Production must inject the

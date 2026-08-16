@@ -62,7 +62,6 @@ function delayedReapPodmanScript({
   startedPath,
   terminatedPath,
 }) {
-  const info = JSON.stringify({ host: { security: { rootless: true } } });
   const image = JSON.stringify([{
     Architecture: "amd64",
     Digest: DIGEST,
@@ -95,9 +94,11 @@ function delayedReapPodmanScript({
     : `printf '%s\\n' ${shellQuote(CONTAINER_ID)}`;
   return `#!/bin/sh
 set -eu
+test "$1" = "--remote=false"
+shift
 case "$1" in
-  info)
-    printf '%s\\n' ${shellQuote(info)}
+  unshare)
+    test "$2" = "/usr/bin/true"
     ;;
   image)
     printf '%s\\n' ${shellQuote(image)}
@@ -123,7 +124,6 @@ function heldFdReapPodmanScript({
   terminatedPath,
   visiblePath,
 }) {
-  const info = JSON.stringify({ host: { security: { rootless: true } } });
   const image = JSON.stringify([{
     Architecture: "amd64",
     Digest: DIGEST,
@@ -131,9 +131,11 @@ function heldFdReapPodmanScript({
   }]);
   return `#!/bin/sh
 set -eu
+test "$1" = "--remote=false"
+shift
 case "$1" in
-  info)
-    printf '%s\\n' ${shellQuote(info)}
+  unshare)
+    test "$2" = "/usr/bin/true"
     ;;
   image)
     printf '%s\\n' ${shellQuote(image)}
@@ -185,7 +187,6 @@ function detachedStartPodmanScript({
   releasePath,
   releasedPath,
 }) {
-  const info = JSON.stringify({ host: { security: { rootless: true } } });
   const image = JSON.stringify([{
     Architecture: "amd64",
     Digest: DIGEST,
@@ -193,9 +194,11 @@ function detachedStartPodmanScript({
   }]);
   return `#!/bin/sh
 set -eu
+test "$1" = "--remote=false"
+shift
 case "$1" in
-  info)
-    printf '%s\\n' ${shellQuote(info)}
+  unshare)
+    test "$2" = "/usr/bin/true"
     ;;
   image)
     printf '%s\\n' ${shellQuote(image)}
@@ -242,7 +245,6 @@ esac
 }
 
 function blockingStartPodmanScript({ pidPath, startedPath }) {
-  const info = JSON.stringify({ host: { security: { rootless: true } } });
   const image = JSON.stringify([{
     Architecture: "amd64",
     Digest: DIGEST,
@@ -250,9 +252,11 @@ function blockingStartPodmanScript({ pidPath, startedPath }) {
   }]);
   return `#!/bin/sh
 set -eu
+test "$1" = "--remote=false"
+shift
 case "$1" in
-  info)
-    printf '%s\\n' ${shellQuote(info)}
+  unshare)
+    test "$2" = "/usr/bin/true"
     ;;
   image)
     printf '%s\\n' ${shellQuote(image)}
@@ -503,14 +507,24 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
   let name = null;
   let mountSource = settings.inspectionSource ?? attachmentRoot;
   return async function commandRunner(executable, arguments_, options) {
-    events.push({ arguments_, executable, options, receiver: this });
-    if (arguments_[0] === "info") {
-      return {
-        stderr: "",
-        stdout: `${JSON.stringify(settings.infoValue ?? {
-          host: { security: { rootless: settings.rootless ?? true } },
-        })}\n`,
-      };
+    assert.equal(Object.isFrozen(arguments_), true);
+    assert.equal(arguments_[0], "--remote=false");
+    const rawArguments_ = arguments_;
+    arguments_ = rawArguments_.slice(1);
+    events.push({
+      arguments_,
+      executable,
+      options,
+      rawArguments_,
+      receiver: this,
+    });
+    if (arguments_[0] === "unshare") {
+      assert.deepEqual(arguments_, ["unshare", "/usr/bin/true"]);
+      await settings.onUnshare?.();
+      if (settings.unshareReject) {
+        throw new Error("simulated rootless proof failure");
+      }
+      return { stderr: "", stdout: "" };
     }
     if (arguments_[0] === "image") {
       return {
@@ -802,6 +816,17 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   const stopped = await stopPending;
   assert.deepEqual(stopped, exact({ contractVersion: 2, status: "stopped" }));
 
+  assert.deepEqual(base.events[0].arguments_, ["unshare", "/usr/bin/true"]);
+  assert.equal(
+    base.events.some((event) => event.arguments_[0] === "info"),
+    false,
+  );
+  for (const event of base.events) {
+    assert.equal(event.rawArguments_[0], "--remote=false");
+    assert.equal(event.rawArguments_.includes("--connection"), false);
+    assert.equal(event.rawArguments_.includes("--context"), false);
+    assert.equal(event.rawArguments_.includes("--url"), false);
+  }
   const create = base.events.find((event) => event.arguments_[0] === "create");
   assert.equal(create.executable, "/usr/bin/podman");
   assert.equal(create.receiver, undefined);
@@ -1546,13 +1571,69 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
   );
 });
 
-test("enforces rootless execution, exact local digest, and bounded unambiguous output", async (t) => {
-  const rootful = await fixture(t, { rootless: false });
-  await assert.rejects(
-    rootful.supervisor.launchWriter(rootful.input),
-    assertSupervisorError("podman_writer_rootless_required"),
+test("revalidates the non-root process identity before every Podman dispatch", async (t) => {
+  const originalGetUserId = process.getuid;
+  const originalGetEffectiveUserId = process.geteuid;
+  let realUserId = 1000;
+  let effectiveUserId = 1000;
+  let userScopedModule;
+  try {
+    process.getuid = () => realUserId;
+    process.geteuid = () => effectiveUserId;
+    userScopedModule = await import(
+      "../src/podman-writer-supervisor.mjs?uid-revalidation-test",
+    );
+  } finally {
+    process.getuid = originalGetUserId;
+    process.geteuid = originalGetEffectiveUserId;
+  }
+  assert.equal(process.getuid, originalGetUserId);
+  assert.equal(process.geteuid, originalGetEffectiveUserId);
+
+  const transitioned = await fixture(t, {
+    onUnshare() {
+      effectiveUserId = 0;
+    },
+  });
+  const transitionedSupervisor = userScopedModule.createPodmanWriterSupervisor(
+    transitioned.options,
   );
-  assert.equal(rootful.events.some((event) => event.arguments_[0] === "create"), false);
+  await assert.rejects(
+    transitionedSupervisor.launchWriter(transitioned.input),
+    (error) => error?.code === "podman_writer_rootless_required",
+  );
+  assert.deepEqual(
+    transitioned.events.map((event) => event.arguments_),
+    [["unshare", "/usr/bin/true"]],
+  );
+
+  realUserId = 0;
+  effectiveUserId = 0;
+  const root = await fixture(t);
+  const rootSupervisor = userScopedModule.createPodmanWriterSupervisor(
+    root.options,
+  );
+  await assert.rejects(
+    rootSupervisor.launchWriter(root.input),
+    (error) => error?.code === "podman_writer_rootless_required",
+  );
+  assert.equal(root.events.length, 0);
+});
+
+test("enforces local rootless execution, exact digest, and bounded unambiguous output", async (t) => {
+  const unprovedRootless = await fixture(t, { unshareReject: true });
+  await assert.rejects(
+    unprovedRootless.supervisor.launchWriter(unprovedRootless.input),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
+  assert.deepEqual(
+    unprovedRootless.events.map((event) => event.arguments_),
+    [["unshare", "/usr/bin/true"]],
+  );
+  assert.equal(
+    unprovedRootless.events.some((event) => event.arguments_[0] === "create"),
+    false,
+  );
 
   const wrongImage = await fixture(t, {
     inspectedDigest: `sha256:${"f".repeat(64)}`,
@@ -1886,7 +1967,7 @@ test("preserves AbortSignal and rejects bad callback arity or non-native runner 
       midRunController.abort();
       return {
         stderr: "",
-        stdout: `${JSON.stringify({ host: { security: { rootless: true } } })}\n`,
+        stdout: "",
       };
     },
   });
@@ -1992,16 +2073,6 @@ test("Podman JSON requires own data fields despite Object and Array prototype po
   };
 
   try {
-    install(Object.prototype, "rootless", true);
-    const inheritedInfo = await fixture(t, {
-      infoValue: { host: { security: {} } },
-    });
-    await assert.rejects(
-      inheritedInfo.supervisor.launchWriter(inheritedInfo.input),
-      assertSupervisorError("podman_writer_output_invalid"),
-    );
-    restore();
-
     install(Object.prototype, "Digest", DIGEST);
     install(Object.prototype, "Architecture", "amd64");
     install(Object.prototype, "Os", "linux");

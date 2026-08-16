@@ -84,109 +84,16 @@ jobs:
           cc -O2 -std=c11 -Wall -Wextra -Werror -static \
             native/podman-writer-probe.c \
             -o integration/fixtures/podman-writer/podman-writer-probe
-          podman info --format=json > "$RUNNER_TEMP/podman-info.json"
-          test "$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1])).host.security.rootless" "$RUNNER_TEMP/podman-info.json")" = "true"
-          podman build \
+          test "$(id -u)" -ne 0
+          /usr/bin/timeout --signal=KILL 10s \
+            /usr/bin/podman --remote=false unshare /usr/bin/true
+          /usr/bin/podman --remote=false build \
             --file integration/fixtures/podman-writer/Containerfile \
             --tag localhost/portable-codex-writer:integration \
             integration/fixtures/podman-writer
-          digest="$(podman image inspect --format '{{.Digest}}' localhost/portable-codex-writer:integration)"
+          digest="$(/usr/bin/podman --remote=false image inspect --format '{{.Digest}}' localhost/portable-codex-writer:integration)"
           test -n "$digest"
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-      - name: Record bounded Podman shell diagnostics
-        continue-on-error: true
-        shell: bash
-        timeout-minutes: 1
-        run: |
-          set +e
-          umask 077
-
-          probe_podman() {
-            local elapsed_milliseconds
-            local end_milliseconds
-            local environment_mode="$2"
-            local exit_value
-            local label="$1"
-            local probe_dir
-            local signal_name
-            local signal_number
-            local signal_value
-            local start_milliseconds
-            local status
-            local stderr_bytes
-            local stdout_bytes
-
-            probe_dir="$(mktemp -d "$RUNNER_TEMP/podman-diagnostic.XXXXXX" 2>/dev/null)"
-            if test -z "$probe_dir"; then
-              printf 'podman-diagnostic label=%s elapsedMilliseconds=0 exit=125 signal=none stdoutBytes=0 stderrBytes=0\n' "$label"
-              return 0
-            fi
-
-            start_milliseconds="$(date +%s%3N)"
-            if test "$environment_mode" = inherited; then
-              (
-                cd / || exit 125
-                ulimit -f 1024 || exit 125
-                /usr/bin/timeout --signal=KILL 8s \
-                  /usr/bin/podman info --format=json
-                exit "$?"
-              ) > "$probe_dir/stdout" 2> "$probe_dir/stderr"
-            else
-              (
-                cd / || exit 125
-                ulimit -f 1024 || exit 125
-                /usr/bin/timeout --signal=KILL 8s \
-                  /usr/bin/env -i \
-                    HOME="$HOME" \
-                    LANG=C.UTF-8 \
-                    PATH=/usr/bin:/bin \
-                    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-                    /usr/bin/podman info --format=json
-                exit "$?"
-              ) > "$probe_dir/stdout" 2> "$probe_dir/stderr"
-            fi
-            status="$?"
-            end_milliseconds="$(date +%s%3N)"
-            if [[ "$start_milliseconds" =~ ^[0-9]+$ ]] && \
-              [[ "$end_milliseconds" =~ ^[0-9]+$ ]]; then
-              elapsed_milliseconds="$((end_milliseconds - start_milliseconds))"
-            else
-              elapsed_milliseconds=0
-            fi
-            stdout_bytes="$(wc -c < "$probe_dir/stdout")"
-            stderr_bytes="$(wc -c < "$probe_dir/stderr")"
-            stdout_bytes="$((stdout_bytes + 0))"
-            stderr_bytes="$((stderr_bytes + 0))"
-
-            if test "$status" -ge 128; then
-              exit_value=none
-              signal_number="$((status - 128))"
-              signal_name="$(kill -l "$signal_number" 2>/dev/null)"
-              if test -n "$signal_name"; then
-                signal_value="SIG$signal_name"
-              else
-                signal_value=unknown
-              fi
-            else
-              exit_value="$status"
-              signal_value=none
-            fi
-
-            rm -f -- "$probe_dir/stdout" "$probe_dir/stderr" 2>/dev/null
-            rmdir -- "$probe_dir" 2>/dev/null
-            printf 'podman-diagnostic label=%s elapsedMilliseconds=%s exit=%s signal=%s stdoutBytes=%s stderrBytes=%s\n' \
-              "$label" \
-              "$elapsed_milliseconds" \
-              "$exit_value" \
-              "$signal_value" \
-              "$stdout_bytes" \
-              "$stderr_bytes"
-            return 0
-          }
-
-          probe_podman shell-inherited inherited
-          probe_podman shell-restricted-fixed-path restricted
-          exit 0
       - name: Exercise launch, bind write, stop, and cold reconcile
         run: node --test integration/podman-writer-supervisor.mjs
         env:
@@ -196,7 +103,7 @@ jobs:
           PODMAN_WRITER_TEST_ROOT: /var/tmp/portable-codex-runtime-podman-${{ github.run_id }}
       - name: Remove the integration image
         if: always()
-        run: podman image rm --force localhost/portable-codex-writer:integration || true
+        run: /usr/bin/podman --remote=false image rm --force localhost/portable-codex-writer:integration || true
 
   linux-ext4-producer:
     name: Linux ext4 physical producer
