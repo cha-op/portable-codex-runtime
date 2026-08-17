@@ -13,7 +13,8 @@
 #include <unistd.h>
 
 #if defined(__linux__) && defined(__has_include)
-#if __has_include(<fcntl.h>) && __has_include(<linux/fs.h>) &&                 \
+#if __has_include(<dirent.h>) && __has_include(<fcntl.h>) &&                  \
+    __has_include(<linux/fs.h>) &&                                            \
     __has_include(<linux/close_range.h>) && __has_include(<linux/loop.h>) && \
     __has_include(<linux/magic.h>) &&                                       \
     __has_include(<linux/openat2.h>) && __has_include(<sys/ioctl.h>) &&      \
@@ -32,6 +33,7 @@
 #endif
 
 #if defined(PORTABLE_CODEX_HAS_LINUX_HEADERS)
+#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/close_range.h>
@@ -642,6 +644,15 @@ static int open_relative_directory(int root_fd, const char *relative_path) {
   return call_openat2(root_fd, relative_path, &how);
 }
 
+static int open_relative_path_handle(int root_fd, const char *relative_path) {
+  struct open_how how;
+  memset(&how, 0, sizeof(how));
+  how.flags = O_PATH | O_NOFOLLOW | O_CLOEXEC;
+  how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS |
+                RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV;
+  return call_openat2(root_fd, relative_path, &how);
+}
+
 static int open_direct_child(int parent_fd, const char *name, uint64_t flags,
                              int allow_mount_transition) {
   struct open_how how;
@@ -674,16 +685,20 @@ static int extended_acl_state(int fd) {
   return 0;
 }
 
+static int private_metadata_matches(const struct stat *metadata, mode_t type,
+                                    mode_t mode, int single_link) {
+  return (metadata->st_mode & S_IFMT) == type &&
+         metadata->st_uid == getuid() &&
+         (metadata->st_mode & 0777U) == mode && metadata->st_nlink >= 1 &&
+         (!single_link || metadata->st_nlink == 1);
+}
+
 static int private_policy_status(int fd, mode_t type, mode_t mode,
                                  int single_link) {
   struct stat metadata;
   int acl_state;
   if (fstat(fd, &metadata) != 0) return -1;
-  if ((metadata.st_mode & S_IFMT) != type || metadata.st_uid != getuid() ||
-      (metadata.st_mode & 0777U) != mode || metadata.st_nlink < 1 ||
-      (single_link && metadata.st_nlink != 1)) {
-    return 0;
-  }
+  if (!private_metadata_matches(&metadata, type, mode, single_link)) return 0;
   acl_state = extended_acl_state(fd);
   if (acl_state < 0) return -1;
   return acl_state == 0 ? 1 : 0;
@@ -730,9 +745,85 @@ static int require_fd_identity(int fd, const char *device_text,
   return EXIT_SUCCESS;
 }
 
+static int directory_empty_state(int directory_fd) {
+  struct dirent *entry;
+  DIR *directory;
+  int scan_fd;
+  int saved_error;
+  scan_fd = openat(directory_fd, ".",
+                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (scan_fd < 0) return -1;
+  directory = fdopendir(scan_fd);
+  if (directory == NULL) {
+    saved_error = errno;
+    (void)close(scan_fd);
+    errno = saved_error;
+    return -1;
+  }
+  errno = 0;
+  while ((entry = readdir(directory)) != NULL) {
+    if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+      if (closedir(directory) != 0) return -1;
+      return 0;
+    }
+    errno = 0;
+  }
+  saved_error = errno;
+  if (closedir(directory) != 0 && saved_error == 0) saved_error = errno;
+  if (saved_error != 0) {
+    errno = saved_error;
+    return -1;
+  }
+  return 1;
+}
+
 static int format_proc_fd_path(int fd, char output[64]) {
   const int length = snprintf(output, 64U, "/proc/self/fd/%d", fd);
   return length > 0 && length < 64;
+}
+
+static int open_acl_fd_from_path_handle(int path_fd, mode_t expected_type) {
+  struct stat handle_metadata;
+  struct stat opened_metadata;
+  char proc_path[64];
+  int opened_fd;
+  int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+  int saved_error;
+  if (fstat(path_fd, &handle_metadata) != 0) return -1;
+  if ((handle_metadata.st_mode & S_IFMT) != expected_type) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (expected_type == S_IFDIR) flags |= O_DIRECTORY;
+  if (!format_proc_fd_path(path_fd, proc_path)) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  /*
+   * fgetxattr(2) rejects O_PATH descriptors with EBADF. Reopening this
+   * internally formatted procfd path obtains an ACL-capable descriptor for
+   * the already-pinned object, not for the caller-controlled pathname. On the
+   * trusted host filesystem, the kind check above occurs before the open, so
+   * a substituted FIFO, device, socket, or symlink cannot trigger its open
+   * hook. The identity check below fails closed if trusted procfs does not
+   * return that exact pinned object.
+  */
+  opened_fd = open(proc_path, flags);
+  if (opened_fd < 0) return -1;
+  if (fstat(opened_fd, &opened_metadata) != 0) {
+    saved_error = errno;
+    (void)close(opened_fd);
+    errno = saved_error;
+    return -1;
+  }
+  if (opened_metadata.st_dev != handle_metadata.st_dev ||
+      opened_metadata.st_ino != handle_metadata.st_ino ||
+      (opened_metadata.st_mode & S_IFMT) != expected_type) {
+    (void)close(opened_fd);
+    errno = ESTALE;
+    return -1;
+  }
+  return opened_fd;
 }
 
 static int format_proc_fd_child_path(int parent_fd, const char *name,
@@ -896,6 +987,189 @@ static int open_operation_parent(const char *root_path,
   *parent_fd = open_relative_directory(*root_fd, relative_path);
   if (*parent_fd < 0) return classify_path_errno(errno);
   status = require_private_policy(*parent_fd, S_IFDIR, DIRECTORY_MODE, 0, 0);
+  return status;
+}
+
+static int inspect_private_path(const char *root_path,
+                                const char *relative_path,
+                                const char *kind,
+                                const char *uid_text,
+                                const char *mode_text,
+                                const char *link_policy,
+                                const char *require_empty_text,
+                                const char *device,
+                                const char *inode) {
+  struct stat current_metadata;
+  struct stat target_metadata;
+  uint64_t expected_uid;
+  mode_t expected_type;
+  mode_t expected_mode;
+  int single_link;
+  int root_fd = -1;
+  int target_handle_fd = -1;
+  int target_fd = -1;
+  int current_handle_fd = -1;
+  int current_fd = -1;
+  int empty = 1;
+  int empty_state;
+  int private = 1;
+  int policy_state;
+  int require_empty;
+  int status;
+
+  if (!parse_u64_decimal(uid_text, &expected_uid) ||
+      expected_uid != (uint64_t)getuid()) {
+    return INSPECTOR_EXIT_USAGE;
+  }
+  if (strcmp(kind, "directory") == 0 && strcmp(mode_text, "0700") == 0 &&
+      strcmp(link_policy, "positive") == 0) {
+    expected_type = S_IFDIR;
+    expected_mode = DIRECTORY_MODE;
+    single_link = 0;
+  } else if (strcmp(kind, "file") == 0 && strcmp(mode_text, "0600") == 0 &&
+             strcmp(link_policy, "single") == 0) {
+    expected_type = S_IFREG;
+    expected_mode = IMAGE_MODE;
+    single_link = 1;
+  } else {
+    return INSPECTOR_EXIT_USAGE;
+  }
+  if (strcmp(require_empty_text, "yes") == 0 && expected_type == S_IFDIR) {
+    require_empty = 1;
+  } else if (strcmp(require_empty_text, "no") == 0) {
+    require_empty = 0;
+  } else {
+    return INSPECTOR_EXIT_USAGE;
+  }
+
+  root_fd = open_root_directory(root_path);
+  if (root_fd < 0) return classify_path_errno(errno);
+  target_handle_fd = open_relative_path_handle(root_fd, relative_path);
+  if (target_handle_fd < 0) {
+    status = classify_path_errno(errno);
+    goto cleanup;
+  }
+  status = require_fd_identity(target_handle_fd, device, inode, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
+  if (fstat(target_handle_fd, &target_metadata) != 0) {
+    status = classify_path_errno(errno);
+    goto cleanup;
+  }
+  if (!private_metadata_matches(&target_metadata, expected_type,
+                                expected_mode, single_link)) {
+    private = 0;
+    if (require_empty) empty = 0;
+  } else {
+    target_fd = open_acl_fd_from_path_handle(target_handle_fd, expected_type);
+    if (target_fd < 0) {
+      status = classify_path_errno(errno);
+      goto cleanup;
+    }
+    policy_state = private_policy_status(target_fd, expected_type,
+                                         expected_mode, single_link);
+    if (policy_state < 0) {
+      status = classify_path_errno(errno);
+      goto cleanup;
+    }
+    if (policy_state == 0) private = 0;
+    if (require_empty) {
+      empty_state = directory_empty_state(target_fd);
+      if (empty_state < 0) {
+        status = classify_path_errno(errno);
+        goto cleanup;
+      }
+      if (empty_state == 0) empty = 0;
+    }
+  }
+
+  /*
+   * Reopen the current pathname after the first FD-bound policy proof. This
+   * binds the receipt to both the retained target object and the pathname at
+   * the final observation boundary; the second target-FD policy check keeps
+   * the original object safe through that rebind. Directory timestamps,
+   * size, ctime, and exact link count are intentionally not compared.
+   */
+  current_handle_fd = open_relative_path_handle(root_fd, relative_path);
+  if (current_handle_fd < 0) {
+    status = classify_path_errno(errno);
+    goto cleanup;
+  }
+  status = require_fd_identity(current_handle_fd, device, inode, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
+  if (fstat(current_handle_fd, &current_metadata) != 0) {
+    status = classify_path_errno(errno);
+    goto cleanup;
+  }
+  if (!private_metadata_matches(&current_metadata, expected_type,
+                                expected_mode, single_link)) {
+    private = 0;
+    if (require_empty) empty = 0;
+  } else {
+    current_fd = open_acl_fd_from_path_handle(current_handle_fd,
+                                              expected_type);
+    if (current_fd < 0) {
+      status = classify_path_errno(errno);
+      goto cleanup;
+    }
+    policy_state = private_policy_status(current_fd, expected_type,
+                                         expected_mode, single_link);
+    if (policy_state < 0) {
+      status = classify_path_errno(errno);
+      goto cleanup;
+    }
+    if (policy_state == 0) private = 0;
+    if (require_empty) {
+      empty_state = directory_empty_state(current_fd);
+      if (empty_state < 0) {
+        status = classify_path_errno(errno);
+        goto cleanup;
+      }
+      if (empty_state == 0) empty = 0;
+    }
+  }
+
+  if (target_fd >= 0) {
+    policy_state = private_policy_status(target_fd, expected_type,
+                                         expected_mode, single_link);
+    if (policy_state < 0) {
+      status = classify_path_errno(errno);
+      goto cleanup;
+    }
+    if (policy_state == 0) private = 0;
+    if (require_empty) {
+      empty_state = directory_empty_state(target_fd);
+      if (empty_state < 0) {
+        status = classify_path_errno(errno);
+        goto cleanup;
+      }
+      if (empty_state == 0) empty = 0;
+    }
+  }
+  status = require_fd_identity(target_handle_fd, device, inode, 0);
+  if (status != EXIT_SUCCESS) goto cleanup;
+  if (fstat(target_handle_fd, &target_metadata) != 0) {
+    status = classify_path_errno(errno);
+    goto cleanup;
+  }
+  if (printf("{\"device\":\"%" PRIuMAX "\",\"empty\":%s,"
+             "\"inode\":\"%" PRIuMAX
+             "\",\"private\":%s,\"status\":\"ok\"}\n",
+             (uintmax_t)target_metadata.st_dev,
+             require_empty ? (empty ? "true" : "false") : "null",
+             (uintmax_t)target_metadata.st_ino,
+             private ? "true" : "false") < 0 ||
+      fflush(stdout) != 0) {
+    status = INSPECTOR_EXIT_IO;
+    goto cleanup;
+  }
+  status = EXIT_SUCCESS;
+
+cleanup:
+  if (current_fd >= 0) (void)close(current_fd);
+  if (current_handle_fd >= 0) (void)close(current_handle_fd);
+  if (target_fd >= 0) (void)close(target_fd);
+  if (target_handle_fd >= 0) (void)close(target_handle_fd);
+  if (root_fd >= 0) (void)close(root_fd);
   return status;
 }
 
@@ -1241,16 +1515,30 @@ static int create_private_directory(const char *root_path,
   }
   directory_fd = open_direct_child(parent_fd, name,
                                    O_RDONLY | O_DIRECTORY, 0);
-  if (directory_fd < 0 ||
-      (created && fchmod(directory_fd, DIRECTORY_MODE) != 0) ||
-      require_private_policy(directory_fd, S_IFDIR, DIRECTORY_MODE, 0,
-                             created) != EXIT_SUCCESS ||
-      fstat(directory_fd, &metadata) != 0 ||
-      (created && (fsync(directory_fd) != 0 || fsync(parent_fd) != 0)) ||
-      require_private_policy(parent_fd, S_IFDIR, DIRECTORY_MODE, 0,
-                             created) != EXIT_SUCCESS) {
+  if (directory_fd < 0) {
+    status = errno == ENOTDIR ? INSPECTOR_EXIT_MISMATCH
+                              : classify_path_errno(errno);
+    goto cleanup;
+  }
+  if (created && fchmod(directory_fd, DIRECTORY_MODE) != 0) {
+    status = INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+    goto cleanup;
+  }
+  status = require_private_policy(directory_fd, S_IFDIR, DIRECTORY_MODE, 0,
+                                  created);
+  if (status != EXIT_SUCCESS) goto cleanup;
+  if (fstat(directory_fd, &metadata) != 0) {
     status = created ? INSPECTOR_EXIT_OUTCOME_UNCERTAIN
-                     : INSPECTOR_EXIT_MISMATCH;
+                     : classify_path_errno(errno);
+    goto cleanup;
+  }
+  if (created && (fsync(directory_fd) != 0 || fsync(parent_fd) != 0)) {
+    status = INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+    goto cleanup;
+  }
+  status = require_private_policy(parent_fd, S_IFDIR, DIRECTORY_MODE, 0,
+                                  created);
+  if (status != EXIT_SUCCESS) {
     goto cleanup;
   }
   if (printf("{\"created\":%s,\"device\":\"%" PRIuMAX
@@ -2491,6 +2779,18 @@ static int dispatch_operation(int argc, char **argv) {
     return provision_control_root(root_path, relative_path, argv[9], argv[11],
                                   argv[13], argv[15], argv[17], argv[19],
                                   argv[21]);
+  }
+  if (strcmp(verb, "inspect-private-path") == 0 && argc == 22 &&
+      strcmp(argv[8], "--kind") == 0 &&
+      strcmp(argv[10], "--uid") == 0 &&
+      strcmp(argv[12], "--mode") == 0 &&
+      strcmp(argv[14], "--link-policy") == 0 &&
+      strcmp(argv[16], "--require-empty") == 0 &&
+      strcmp(argv[18], "--device") == 0 &&
+      strcmp(argv[20], "--inode") == 0) {
+    return inspect_private_path(root_path, relative_path, argv[9], argv[11],
+                                argv[13], argv[15], argv[17], argv[19],
+                                argv[21]);
   }
   if (argc < 10 || strcmp(argv[8], "--name") != 0) {
     return INSPECTOR_EXIT_USAGE;

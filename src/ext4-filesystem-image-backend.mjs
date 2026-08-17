@@ -1257,16 +1257,42 @@ export function createExt4FilesystemImageBackend(...args) {
       storageId: planned.storageId,
     });
     let observation;
-    if (prepared.replayed || storage.dataRoot !== null) {
+    if (storage.dataRoot !== null) {
       try {
         observation = await observeAttachment(plan);
-      } catch {
+      } catch (error) {
+        const code = safeErrorCode(error);
+        if (code === "attachment_root_absent") {
+          fail("attachment_root_absent");
+        }
+        if (
+          code === "attachment_root_unsafe" ||
+          code === "access_policy_mismatch"
+        ) {
+          fail("physical_state_mismatch");
+        }
         fail("physical_effect_ambiguous");
       }
     } else {
-      observation = await callDriver("ensureAttachmentRoot", attachmentRequest(plan));
+      try {
+        observation = await callDriver(
+          "ensureAttachmentRoot",
+          attachmentRequest(plan),
+        );
+      } catch (error) {
+        if (safeErrorCode(error) === "attachment_root_unsafe") {
+          fail("physical_state_mismatch");
+        }
+        fail("physical_effect_ambiguous");
+      }
     }
     const attached = sameAttachmentObservation(observation, storage, plan);
+    if (storage.dataRoot !== null) {
+      ensure(
+        sameIdentity(attached.rootIdentity, storage.dataRoot.rootIdentity),
+        "physical_state_mismatch",
+      );
+    }
     const proof = proofId(
       backendId,
       "attach",

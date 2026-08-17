@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import crypto from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test from "node:test";
@@ -77,6 +78,46 @@ function mutation(operation, storageId = fixture().storageIdForSession(SESSION_I
     sessionId: SESSION_ID,
     storageId,
     target,
+  };
+}
+
+function persistentPathSnapshot(paths) {
+  const storageId = paths.storageIdForSession(SESSION_ID);
+  const provision = paths.planProvision(provisionRequest());
+  const attachment = paths.planWritableAttachment(
+    mutation("attach", storageId),
+  );
+  const restore = paths.planRestoreDestination(mutation("restore", storageId));
+  const artifact = paths.resolveArtifactPaths({
+    checkpoint: checkpoint(),
+    request: mutation("checkpoint", storageId),
+  });
+  const source = paths.resolveSourceOwnedRoot({
+    canonicalAttachment: {
+      attachmentId: "attachment-001",
+      backendId: BACKEND_ID,
+      contractVersion: 1,
+      fencingEpoch: "1",
+      holderId: "holder-001",
+      kind: "directory",
+      leaseId: "lease-001",
+      mode: "read-write",
+      operationId: "attach-operation-001",
+      proofId: "proof-create-hash-hostile-001",
+      rootPath: attachment.attachmentRootPath,
+      sessionId: SESSION_ID,
+      storageId,
+    },
+    checkpoint: checkpoint(),
+    request: mutation("checkpoint", storageId),
+  });
+  return {
+    artifact,
+    attachment,
+    provision,
+    restore,
+    source,
+    storageId,
   };
 }
 
@@ -389,6 +430,71 @@ test(
       parse: 0,
       resolve: 0,
     });
+  },
+);
+
+test(
+  "captures createHash before deriving persistent storage paths",
+  { concurrency: false },
+  () => {
+    const createHashDescriptor = Object.getOwnPropertyDescriptor(
+      crypto,
+      "createHash",
+    );
+    assert.equal(typeof createHashDescriptor?.value, "function");
+    const originalCreateHash = createHashDescriptor.value;
+    const baselinePaths = fixture();
+    const baseline = persistentPathSnapshot(baselinePaths);
+    assert.equal(
+      baseline.storageId,
+      "ext4-storage:51321236acfd018134f7c07cbe395c5cab5a22d51d8497ec",
+    );
+    assert.equal(
+      baseline.provision.mountPath,
+      "/run/portable-codex-runtime/mounts/5164d37325ed8ac55a7a4aef55b6d67ed56a6e2b8022eecb86522012c505280d",
+    );
+    assert.equal(
+      baseline.attachment.attachmentRootPath,
+      `${baseline.provision.mountPath}/data-429a972a23f7d9abfa30150428692b6f22efbd80d9880bdd`,
+    );
+    assert.equal(
+      baseline.restore.destinationDirectory,
+      `${baseline.provision.mountPath}/generation-f622f9434ad63b7580be924559313a83f3e16af8482280c8`,
+    );
+    assert.equal(
+      baseline.artifact.artifactDirectory,
+      "/var/lib/portable-codex-runtime/archive/artifact-1473a9cc43316f9c682064ff140860c09d0700cc529f87ed",
+    );
+    let poisonCalls = 0;
+    let observedError = null;
+    let replay;
+    let restarted;
+
+    try {
+      Object.defineProperty(crypto, "createHash", {
+        ...createHashDescriptor,
+        value(...args) {
+          poisonCalls += 1;
+          const hash = Reflect.apply(originalCreateHash, undefined, args);
+          hash.update("hostile-ext4-path-prefix\0", "utf8");
+          return hash;
+        },
+      });
+      syncBuiltinESMExports();
+
+      replay = persistentPathSnapshot(baselinePaths);
+      restarted = persistentPathSnapshot(fixture());
+    } catch (error) {
+      observedError = error;
+    } finally {
+      Object.defineProperty(crypto, "createHash", createHashDescriptor);
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(observedError, null);
+    assert.equal(poisonCalls, 0);
+    assert.deepEqual(replay, baseline);
+    assert.deepEqual(restarted, baseline);
   },
 );
 

@@ -628,6 +628,46 @@ change and does not attest the current head:
   provider-state suite passes 90/90 tests. This protects bounded canonical
   precursor allocation and resource admission, not filesystem identity,
   content stability, or access policy.
+- A subsequent review found two persistent-path derivation gaps. The ext4 path
+  planner now captures `node:crypto.createHash` together with the existing hash
+  update/digest intrinsics, so post-import `syncBuiltinESMExports()` changes
+  cannot change storage, mount, attachment, restore, artifact, or source paths.
+  The Podman supervisor state likewise captures hashing and `node:path`
+  operations, admits only canonical lossless UTF-8 state roots of at most 4,015
+  bytes, and reserves the remaining 80 bytes of the Linux 4,095-byte pathname
+  domain for `/<64-hex>.<revision>.json.pending`. Exact 4,095-byte derived paths
+  pass; 4,096-byte ASCII and multibyte roots plus lone surrogates fail during
+  state construction, before any durable claim or filesystem I/O. Hostile
+  post-import crypto/path replacements leave both persistent planners stable.
+  These checks protect lexical nameability and persistent path derivation, not
+  filesystem object identity, content stability, or access policy.
+- Two confirmed filesystem races are now closed at the native authority
+  boundary. Private-path inspection first uses `O_PATH` to pin the expected
+  device/inode and prove regular-file/directory kind before a pinned-procfd
+  read-open can occur, so on the trusted host filesystem a FIFO, device,
+  socket, or symlink substitute cannot trigger an open hook. This depends on
+  trusted procfs/host-filesystem semantics rather than claiming safety for an
+  arbitrary malicious filesystem. It samples owner/type/mode/link policy and
+  the access/default POSIX ACL xattrs on fixed descriptors around a
+  current-path reopen, and reports policy mismatch separately from unreadable
+  proof.
+  `ENODATA`/`ENOATTR` and
+  `ENOTSUP`/`EOPNOTSUPP` are the only absent/unsupported ACL outcomes; all
+  other xattr errors fail closed. This replaces path-based `getfacl` authority
+  while retaining its version-1 options as inert validated placeholders.
+  Fresh and prepared-uncommitted attachment admission additionally requires a
+  fixed-descriptor empty-directory proof before and after stable mount
+  observation, followed by a persistent ext4 identity resample bound to that
+  final runtime identity. This is a point-in-time final observation boundary,
+  not continuous descriptor custody through the backend commit. Stable
+  pre-existing content is a physical-state mismatch;
+  created-then-unproved state remains ambiguous. Committed `dataRoot`
+  reattachment permits normal content churn but requires exact durable root
+  identity, so a replacement is never adopted. Committed observation preserves
+  proved absence and separates stable runtime-identity, filesystem, or policy
+  mismatch from unreadable inspection. Tests cover pathname ABA,
+  access/default ACL findings, temporary policy change versus benign child
+  churn, fresh nonempty rejection, replay, and committed reattachment.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

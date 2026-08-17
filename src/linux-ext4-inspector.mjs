@@ -546,8 +546,11 @@ function assertNativePromise(value, code) {
   return value;
 }
 
-function helperFailureCode(exitCode, mutation) {
+function helperFailureCode(exitCode, mutation, preserveMismatch) {
   if (exitCode === HELPER_EXIT.exists) return "path_exists";
+  if (preserveMismatch && exitCode === HELPER_EXIT.mismatch) {
+    return "path_mismatch";
+  }
   if (mutation || exitCode === HELPER_EXIT.outcomeUncertain) {
     return "operation_outcome_uncertain";
   }
@@ -564,6 +567,7 @@ async function invokeHelper(
   command = "inspect",
   extraArgs = [],
   mutation = command === "operate",
+  preserveMismatch = false,
 ) {
   const selected = await selectInspectionRoot(state, path);
   const args = objectFreeze([
@@ -611,7 +615,7 @@ async function invokeHelper(
     fail(mutation ? "operation_outcome_uncertain" : "helper_failed");
   }
   if (completion.exitCode !== 0) {
-    fail(helperFailureCode(completion.exitCode, mutation));
+    fail(helperFailureCode(completion.exitCode, mutation, preserveMismatch));
   }
   if (bufferBytes(completion.stderr) !== 0) fail("helper_output_invalid");
   return completion.stdout;
@@ -802,6 +806,17 @@ const FD_OPERATION_KEYS = objectFreeze({
     "parentInode",
     "path",
   ]),
+  "inspect-private-path": objectFreeze([
+    "device",
+    "inode",
+    "kind",
+    "linkPolicy",
+    "mode",
+    "operation",
+    "path",
+    "requireEmpty",
+    "uid",
+  ]),
   "mount-ext4": objectFreeze([
     "backingDevice",
     "backingInode",
@@ -946,6 +961,23 @@ function exactFdOperationRequest(value) {
     fail("invalid_path");
   }
   if (
+    operation === "inspect-private-path" &&
+    (typeof result.uid !== "string" ||
+      !uint64Decimal(result.uid, DECIMAL_PATTERN) ||
+      typeof result.requireEmpty !== "boolean" ||
+      !(
+        (result.kind === "directory" &&
+          result.mode === "0700" &&
+          result.linkPolicy === "positive") ||
+        (result.kind === "file" &&
+          result.mode === "0600" &&
+          result.linkPolicy === "single")
+      ) ||
+      (result.requireEmpty && result.kind !== "directory"))
+  ) {
+    fail("invalid_path");
+  }
+  if (
     (operation === "inspect-loop" ||
       operation === "detach-loop-settle" ||
       operation === "mount-ext4") &&
@@ -1067,6 +1099,31 @@ function canonicalJsonRecord(bytes, keys) {
 }
 
 function parseFdOperationOutput(bytes, operation) {
+  if (operation === "inspect-private-path") {
+    const record = canonicalJsonRecord(bytes, [
+      "device",
+      "empty",
+      "inode",
+      "private",
+      "status",
+    ]);
+    if (
+      !uint64Decimal(record.device, DECIMAL_PATTERN) ||
+      !uint64Decimal(record.inode, INODE_PATTERN) ||
+      (record.empty !== null && typeof record.empty !== "boolean") ||
+      typeof record.private !== "boolean" ||
+      record.status !== "ok"
+    ) {
+      fail("helper_output_invalid");
+    }
+    return objectFreeze({
+      device: record.device,
+      empty: record.empty,
+      inode: record.inode,
+      private: record.private,
+      status: "ok",
+    });
+  }
   if (operation === "create-directory") {
     const record = canonicalJsonRecord(bytes, [
       "created",
@@ -1210,11 +1267,16 @@ function parseFdOperationOutput(bytes, operation) {
 async function runFdOperationInternal(state, requestValue) {
   const request = exactFdOperationRequest(requestValue);
   const operation = request.operation;
-  const mutation = operation !== "find-loop" && operation !== "inspect-loop";
+  const mutation =
+    operation !== "find-loop" &&
+    operation !== "inspect-loop" &&
+    operation !== "inspect-private-path";
   const path =
     operation === "provision-control-root" ? request.rootPath : request.path;
   const childOperation =
-    operation !== "syncfs" && operation !== "provision-control-root";
+    operation !== "inspect-private-path" &&
+    operation !== "syncfs" &&
+    operation !== "provision-control-root";
   const authorityPath = childOperation ? dirname(path) : path;
   const extraArgs = ["--verb", operation];
   if (childOperation) {
@@ -1227,6 +1289,17 @@ async function runFdOperationInternal(state, requestValue) {
   } else if (operation === "create-directory") {
     arrayPush(extraArgs, "--exclusive");
     arrayPush(extraArgs, request.exclusive ? "yes" : "no");
+  } else if (operation === "inspect-private-path") {
+    arrayPush(extraArgs, "--kind");
+    arrayPush(extraArgs, request.kind);
+    arrayPush(extraArgs, "--uid");
+    arrayPush(extraArgs, request.uid);
+    arrayPush(extraArgs, "--mode");
+    arrayPush(extraArgs, request.mode);
+    arrayPush(extraArgs, "--link-policy");
+    arrayPush(extraArgs, request.linkPolicy);
+    arrayPush(extraArgs, "--require-empty");
+    arrayPush(extraArgs, request.requireEmpty ? "yes" : "no");
   } else if (operation === "format-ext4") {
     arrayPush(extraArgs, "--executable");
     arrayPush(extraArgs, request.executable);
@@ -1305,8 +1378,17 @@ async function runFdOperationInternal(state, requestValue) {
       "operate",
       objectFreeze(extraArgs),
       mutation,
+      operation === "create-directory",
     );
-    return parseFdOperationOutput(output, operation);
+    const parsed = parseFdOperationOutput(output, operation);
+    if (
+      operation === "inspect-private-path" &&
+      ((request.requireEmpty && typeof parsed.empty !== "boolean") ||
+        (!request.requireEmpty && parsed.empty !== null))
+    ) {
+      fail("helper_output_invalid");
+    }
+    return parsed;
   } catch (error) {
     if (!mutation && weakSetHas(internalErrors, error)) {
       throw error;
@@ -1314,7 +1396,8 @@ async function runFdOperationInternal(state, requestValue) {
     if (
       weakSetHas(internalErrors, error) &&
       (error.code === "operation_outcome_uncertain" ||
-        error.code === "path_exists")
+        error.code === "path_exists" ||
+        (operation === "create-directory" && error.code === "path_mismatch"))
     ) {
       throw error;
     }

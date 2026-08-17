@@ -8,7 +8,9 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
+  rename,
   rm,
   rmdir,
   stat,
@@ -94,7 +96,7 @@ function createInspector(paths, state, fdCalls, overrides = {}) {
   return Object.freeze({
     async inspectFilesystemObject(path) {
       const metadata = await stat(path, { bigint: true });
-      return Object.freeze({
+      const inspected = Object.freeze({
         filesystem: Object.freeze({
           durability: "local-fsync-rename",
           filesystemId: FILESYSTEM_ID,
@@ -107,6 +109,9 @@ function createInspector(paths, state, fdCalls, overrides = {}) {
           objectId: objectId(path),
         }),
       });
+      return overrides.inspectFilesystemObject === undefined
+        ? inspected
+        : overrides.inspectFilesystemObject(path, inspected, state);
     },
     async runFdOperation(request) {
       fdCalls.push(request);
@@ -117,6 +122,47 @@ function createInspector(paths, state, fdCalls, overrides = {}) {
         throw new Error("injected fd operation failure");
       }
       switch (request.operation) {
+        case "inspect-private-path": {
+          if (overrides.inspectPrivatePath !== undefined) {
+            return overrides.inspectPrivatePath(request, state);
+          }
+          const metadata = await stat(request.path, { bigint: true });
+          if (
+            String(metadata.dev) !== request.device ||
+            String(metadata.ino) !== request.inode
+          ) {
+            const error = new Error("private path identity mismatch");
+            error.code = "path_mismatch";
+            throw error;
+          }
+          const mode = Number(metadata.mode & 0o777n);
+          const directory = metadata.isDirectory();
+          const regular = metadata.isFile();
+          const privatePolicy =
+            String(metadata.uid) === request.uid &&
+            ((request.kind === "directory" &&
+              directory &&
+              mode === 0o700 &&
+              metadata.nlink >= 1n &&
+              request.linkPolicy === "positive" &&
+              request.mode === "0700") ||
+              (request.kind === "file" &&
+                regular &&
+                mode === 0o600 &&
+                metadata.nlink === 1n &&
+                request.linkPolicy === "single" &&
+                request.mode === "0600")) &&
+            overrides.privatePolicy?.(request, state, metadata) !== false;
+          return Object.freeze({
+            device: String(metadata.dev),
+            empty: request.requireEmpty
+              ? (await readdir(request.path)).length === 0
+              : null,
+            inode: String(metadata.ino),
+            private: privatePolicy,
+            status: "ok",
+          });
+        }
         case "create-image": {
           let handle;
           try {
@@ -356,6 +402,7 @@ function createFixture(paths, overrides = {}) {
     });
   const driver = createLinuxExt4ImageDriver({
     commandRunner,
+    getfaclExecutable: overrides.getfaclExecutable,
     inspector:
       overrides.inspector ?? createInspector(paths, state, fdCalls, overrides),
     platform: "linux",
@@ -445,6 +492,28 @@ test("provision rejects image sizes that cannot bind exact loop geometry", async
     driverError("invalid_request"),
   );
   assert.equal(fixture.fdCalls.length, 0);
+});
+
+test("legacy ACL command options remain accepted but have no authority", async () => {
+  const paths = await createPaths();
+  let runnerCalls = 0;
+  const fixture = createFixture(paths, {
+    async commandRunner() {
+      runnerCalls += 1;
+      throw new Error("legacy ACL runner must not execute");
+    },
+    getfaclExecutable: "/compat/getfacl",
+  });
+
+  await fixture.driver.provision(provisionRequest(paths));
+
+  assert.equal(runnerCalls, 0);
+  assert.equal(
+    fixture.fdCalls.some(
+      ({ operation }) => operation === "inspect-private-path",
+    ),
+    true,
+  );
 });
 
 test("oversized UTF-16 paths are invalid requests before UTF-8 allocation", async () => {
@@ -548,7 +617,10 @@ test("provision dispatches every mutation through exact fd-bound requests", asyn
   await fixture.driver.provision(provisionRequest(paths));
 
   assert.deepEqual(
-    fixture.fdCalls.slice(0, 5).map(({ operation }) => operation),
+    fixture.fdCalls
+      .map(({ operation }) => operation)
+      .filter((operation) => operation !== "inspect-private-path")
+      .slice(0, 5),
     [
       "create-image",
       "format-ext4",
@@ -581,20 +653,7 @@ test("provision dispatches every mutation through exact fd-bound requests", asyn
     ),
     true,
   );
-  assert.equal(
-    fixture.calls.every(({ executable }) => executable === "/usr/bin/getfacl"),
-    true,
-  );
-  for (const call of fixture.calls) {
-    assert.equal(call.executable.startsWith("/"), true);
-    assert.equal(Object.isFrozen(call.args), true);
-    assert.equal(Object.isFrozen(call.options), true);
-    assert.equal(call.options.shell, false);
-    assert.equal(call.options.cwd, "/");
-    assert.equal(call.options.killSignal, "SIGTERM");
-    assert.equal(Object.hasOwn(call.options.env, "PATH"), false);
-    assert.deepEqual({ ...call.options.env }, { LANG: "C", LC_ALL: "C" });
-  }
+  assert.equal(fixture.calls.length, 0);
 });
 
 test("publication control identity is pinned, persistent, and replay-bound", async () => {
@@ -892,15 +951,12 @@ test("exclusive image creation never formats or attaches an existing path", asyn
     driverError("image_exists"),
   );
   assert.deepEqual(
-    fixture.fdCalls.map(({ operation }) => operation),
+    fixture.fdCalls
+      .map(({ operation }) => operation)
+      .filter((operation) => operation !== "inspect-private-path"),
     ["create-image"],
   );
-  assert.equal(
-    fixture.calls.every(
-      ({ executable }) => executable === "/usr/bin/getfacl",
-    ),
-    true,
-  );
+  assert.equal(fixture.calls.length, 0);
   assert.equal(await readFile(paths.imagePath, "utf8"), "owned by someone else");
 });
 
@@ -916,7 +972,9 @@ test("a mutation dispatch failure is uncertain and retains its exclusively-creat
     driverError("operation_outcome_uncertain"),
   );
   assert.deepEqual(
-    fixture.fdCalls.map(({ operation }) => operation),
+    fixture.fdCalls
+      .map(({ operation }) => operation)
+      .filter((operation) => operation !== "inspect-private-path"),
     ["create-image", "format-ext4"],
   );
   assert.equal((await stat(paths.imagePath)).isFile(), true);
@@ -926,11 +984,8 @@ test("post-dispatch access-policy uncertainty never becomes a conclusive mismatc
   const paths = await createPaths();
   let dispatched = false;
   const fixture = createFixture(paths, {
-    aclOutput(path) {
-      if (dispatched && path === paths.mountPath) {
-        return "user::rwx\nuser:123:rwx\ngroup::---\nmask::rwx\nother::---\n";
-      }
-      return "user::rwx\ngroup::---\nother::---\n";
+    privatePolicy(request) {
+      return !(dispatched && request.path === paths.mountPath);
     },
     beforeFdOperation(request) {
       if (request.operation === "mount-ext4") dispatched = true;
@@ -953,16 +1008,11 @@ test("observeMount is read-only and fails closed on backing or mount-policy mism
   const observed = await fixture.driver.observeMount(mountRequest(paths));
   assert.equal(observed.loopDevice, LOOP_DEVICE);
   assert.equal(fixture.state.mounted, true);
-  assert.equal(
-    fixture.calls.every(
-      ({ executable, args }) =>
-        executable === "/usr/bin/getfacl" ||
-        (executable === "/usr/sbin/losetup" && args[0] === "--noheadings"),
-    ),
-    true,
-  );
+  assert.equal(fixture.calls.length, 0);
   assert.deepEqual(
-    fixture.fdCalls.map(({ operation }) => operation),
+    fixture.fdCalls
+      .map(({ operation }) => operation)
+      .filter((operation) => operation !== "inspect-private-path"),
     ["find-loop", "inspect-loop"],
   );
 
@@ -1018,7 +1068,9 @@ test("mountinfo source is display-only while loop authority stays canonical", as
     "/dev/loop4095",
   );
   assert.deepEqual(
-    fdBound.fixture.fdCalls.map(({ operation }) => operation),
+    fdBound.fixture.fdCalls
+      .map(({ operation }) => operation)
+      .filter((operation) => operation !== "inspect-private-path"),
     ["find-loop", "inspect-loop"],
   );
 
@@ -1132,10 +1184,7 @@ test("cold remount reuses one exact existing loop and performs an ordinary safe 
     controlRequest.expectedControlObjectId,
     expectedPublicationControlIdentity.objectId,
   );
-  assert.equal(
-    fixture.calls.every(({ executable }) => executable === "/usr/bin/getfacl"),
-    true,
-  );
+  assert.equal(fixture.calls.length, 0);
 });
 
 test("cold remount attaches only when no loop exists and rejects ambiguous loops", async () => {
@@ -1219,6 +1268,241 @@ test("ensureAttachmentRoot accepts only an exact direct child and preserves the 
   );
 });
 
+test("ensureAttachmentRoot rejects a stable preexisting nonempty child", async () => {
+  const paths = await createPaths();
+  const fixture = createFixture(paths);
+  await fixture.driver.provision(provisionRequest(paths));
+  await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+  await writeFile(join(paths.attachmentRootPath, "existing-data"), "kept", {
+    mode: 0o600,
+  });
+
+  await assert.rejects(
+    fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("attachment_root_unsafe"),
+  );
+
+  assert.equal(
+    await readFile(join(paths.attachmentRootPath, "existing-data"), "utf8"),
+    "kept",
+  );
+  assert.equal(fixture.state.mounted, true);
+});
+
+test("ensureAttachmentRoot classifies a stable preexisting identity swap as unsafe", async () => {
+  const paths = await createPaths();
+  let replaced = false;
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (
+        request.operation !== "inspect-private-path" ||
+        request.path !== paths.attachmentRootPath ||
+        replaced
+      ) {
+        return;
+      }
+      replaced = true;
+      await rmdir(paths.attachmentRootPath);
+      await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+  await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+
+  await assert.rejects(
+    fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("attachment_root_unsafe"),
+  );
+
+  assert.equal(replaced, true);
+  assert.equal((await stat(paths.attachmentRootPath)).isDirectory(), true);
+});
+
+test("the final proof classifies a preexisting attachment identity swap as unsafe", async () => {
+  const paths = await createPaths();
+  let attachmentProofs = 0;
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (
+        request.operation !== "inspect-private-path" ||
+        request.path !== paths.attachmentRootPath ||
+        !request.requireEmpty
+      ) {
+        return;
+      }
+      attachmentProofs += 1;
+      if (attachmentProofs === 2) {
+        await rmdir(paths.attachmentRootPath);
+        await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+      }
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+  await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+
+  await assert.rejects(
+    fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("attachment_root_unsafe"),
+  );
+
+  assert.equal(attachmentProofs, 2);
+});
+
+test("the final proof rejects an attachment incarnation change with reused runtime identity", async (t) => {
+  for (const candidate of [
+    { created: false, expectedCode: "attachment_root_unsafe" },
+    { created: true, expectedCode: "operation_outcome_uncertain" },
+  ]) {
+    await t.test(candidate.created ? "created" : "preexisting", async () => {
+      const paths = await createPaths();
+      let attachmentInspections = 0;
+      const fixture = createFixture(paths, {
+        inspectFilesystemObject(path, inspected) {
+          if (path !== paths.attachmentRootPath) return inspected;
+          attachmentInspections += 1;
+          if (attachmentInspections !== 2) return inspected;
+          return Object.freeze({
+            filesystem: inspected.filesystem,
+            identity: Object.freeze({
+              ...inspected.identity,
+              objectId: `${inspected.identity.objectId}-new-incarnation`,
+            }),
+          });
+        },
+      });
+      await fixture.driver.provision(provisionRequest(paths));
+      if (!candidate.created) {
+        await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+      }
+
+      await assert.rejects(
+        fixture.driver.ensureAttachmentRoot({
+          ...mountRequest(paths),
+          attachmentRootPath: paths.attachmentRootPath,
+        }),
+        driverError(candidate.expectedCode),
+      );
+
+      assert.equal(attachmentInspections, 2);
+    });
+  }
+});
+
+test("existing attachment inspection maps identity and filesystem mismatch to unsafe", async (t) => {
+  for (const kind of ["runtime-identity", "filesystem"]) {
+    await t.test(kind, async () => {
+      const paths = await createPaths();
+      const fixture = createFixture(paths, {
+        inspectFilesystemObject(path, inspected) {
+          if (path !== paths.attachmentRootPath) return inspected;
+          if (kind === "runtime-identity") {
+            return Object.freeze({
+              filesystem: inspected.filesystem,
+              identity: Object.freeze({
+                ...inspected.identity,
+                inode: String(BigInt(inspected.identity.inode) + 1n),
+              }),
+            });
+          }
+          return Object.freeze({
+            filesystem: Object.freeze({
+              ...inspected.filesystem,
+              filesystemId:
+                "ext4fs:11111111-2222-3333-4444-555555555555",
+            }),
+            identity: inspected.identity,
+          });
+        },
+      });
+      await fixture.driver.provision(provisionRequest(paths));
+      await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+
+      await assert.rejects(
+        fixture.driver.ensureAttachmentRoot({
+          ...mountRequest(paths),
+          attachmentRootPath: paths.attachmentRootPath,
+        }),
+        driverError("attachment_root_unsafe"),
+      );
+    });
+  }
+});
+
+test("a created attachment root with failed post-create proof is uncertain", async () => {
+  const paths = await createPaths();
+  let directoryCreated = false;
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (request.operation === "create-directory") directoryCreated = true;
+    },
+    fdOperationError(request) {
+      return (
+        directoryCreated &&
+        request.operation === "inspect-private-path" &&
+        request.path === paths.attachmentRootPath
+      );
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+
+  await assert.rejects(
+    fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("operation_outcome_uncertain"),
+  );
+
+  assert.equal(directoryCreated, true);
+  assert.equal((await stat(paths.attachmentRootPath)).isDirectory(), true);
+});
+
+test("the final fixed-FD proof catches attachment child publication", async () => {
+  const paths = await createPaths();
+  let attachmentProofs = 0;
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (
+        request.operation !== "inspect-private-path" ||
+        request.path !== paths.attachmentRootPath ||
+        !request.requireEmpty
+      ) {
+        return;
+      }
+      attachmentProofs += 1;
+      if (attachmentProofs === 2) {
+        await writeFile(join(paths.attachmentRootPath, "late-child"), "data", {
+          mode: 0o600,
+        });
+      }
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+
+  await assert.rejects(
+    fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("operation_outcome_uncertain"),
+  );
+
+  assert.equal(attachmentProofs, 2);
+  assert.equal(
+    await readFile(join(paths.attachmentRootPath, "late-child"), "utf8"),
+    "data",
+  );
+});
+
 test("observeAttachmentRoot is read-only and distinguishes an absent child", async () => {
   const paths = await createPaths();
   const fixture = createFixture(paths);
@@ -1232,14 +1516,7 @@ test("observeAttachmentRoot is read-only and distinguishes an absent child", asy
     driverError("attachment_root_absent"),
   );
   await assert.rejects(stat(paths.attachmentRootPath), { code: "ENOENT" });
-  assert.equal(
-    fixture.calls.every(
-      ({ executable, args }) =>
-        executable === "/usr/bin/getfacl" ||
-        (executable === "/usr/sbin/losetup" && args[0] === "--noheadings"),
-    ),
-    true,
-  );
+  assert.equal(fixture.calls.length, 0);
 
   const ensured = await fixture.driver.ensureAttachmentRoot({
     ...mountRequest(paths),
@@ -1263,6 +1540,147 @@ test("observeAttachmentRoot is read-only and distinguishes an absent child", asy
     ),
     false,
   );
+});
+
+test("attachment inspection separates stable mismatch from unreadable proof", async (t) => {
+  const cases = [
+    {
+      driverCode: "attachment_root_unsafe",
+      kind: "runtime-identity",
+    },
+    {
+      driverCode: "attachment_root_unsafe",
+      kind: "filesystem",
+    },
+    {
+      driverCode: "inspection_failed",
+      kind: "unreadable",
+    },
+  ];
+  for (const candidate of cases) {
+    await t.test(candidate.kind, async () => {
+      const paths = await createPaths();
+      let rejectAttachment = false;
+      const fixture = createFixture(paths, {
+        inspectFilesystemObject(path, inspected) {
+          if (!rejectAttachment || path !== paths.attachmentRootPath) {
+            return inspected;
+          }
+          if (candidate.kind === "unreadable") {
+            throw new Error("injected inspection read failure");
+          }
+          if (candidate.kind === "runtime-identity") {
+            return Object.freeze({
+              filesystem: inspected.filesystem,
+              identity: Object.freeze({
+                ...inspected.identity,
+                inode: String(BigInt(inspected.identity.inode) + 1n),
+              }),
+            });
+          }
+          return Object.freeze({
+            filesystem: Object.freeze({
+              ...inspected.filesystem,
+              filesystemId:
+                "ext4fs:11111111-2222-3333-4444-555555555555",
+            }),
+            identity: inspected.identity,
+          });
+        },
+      });
+      await fixture.driver.provision(provisionRequest(paths));
+      await fixture.driver.ensureAttachmentRoot({
+        ...mountRequest(paths),
+        attachmentRootPath: paths.attachmentRootPath,
+      });
+      rejectAttachment = true;
+
+      await assert.rejects(
+        fixture.driver.observeAttachmentRoot({
+          ...mountRequest(paths),
+          attachmentRootPath: paths.attachmentRootPath,
+        }),
+        driverError(candidate.driverCode),
+      );
+    });
+  }
+});
+
+test("attachment observation revalidates current identity at its return boundary", async () => {
+  const paths = await createPaths();
+  let armed = false;
+  let attachmentProofs = 0;
+  let replaced = false;
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (
+        !armed ||
+        request.operation !== "inspect-private-path" ||
+        request.path !== paths.attachmentRootPath
+      ) {
+        return;
+      }
+      attachmentProofs += 1;
+      if (attachmentProofs === 3) {
+        replaced = true;
+        await rmdir(paths.attachmentRootPath);
+        await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+      }
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+  await fixture.driver.ensureAttachmentRoot({
+    ...mountRequest(paths),
+    attachmentRootPath: paths.attachmentRootPath,
+  });
+  armed = true;
+
+  await assert.rejects(
+    fixture.driver.observeAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("attachment_root_unsafe"),
+  );
+
+  assert.equal(attachmentProofs, 3);
+  assert.equal(replaced, true);
+});
+
+test("attachment observation rejects persistent incarnation change with reused runtime identity", async () => {
+  const paths = await createPaths();
+  let armed = false;
+  let attachmentInspections = 0;
+  const fixture = createFixture(paths, {
+    inspectFilesystemObject(path, inspected) {
+      if (!armed || path !== paths.attachmentRootPath) return inspected;
+      attachmentInspections += 1;
+      if (attachmentInspections !== 2) return inspected;
+      return Object.freeze({
+        filesystem: inspected.filesystem,
+        identity: Object.freeze({
+          ...inspected.identity,
+          objectId: `${inspected.identity.objectId}-new-incarnation`,
+        }),
+      });
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+  await fixture.driver.ensureAttachmentRoot({
+    ...mountRequest(paths),
+    attachmentRootPath: paths.attachmentRootPath,
+  });
+  armed = true;
+
+  await assert.rejects(
+    fixture.driver.observeAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("attachment_root_unsafe"),
+  );
+
+  assert.equal(attachmentInspections, 2);
 });
 
 test("observeAttachmentRoot reports absence only across one stable mount", async () => {
@@ -1398,10 +1816,7 @@ test("destroy orders fd-bound sync, unmount, detach, unlink, and rmdir", async (
   await assert.rejects(stat(paths.mountPath), { code: "ENOENT" });
   assert.equal(fixture.state.loopAttached, false);
   assert.equal(fixture.state.mounted, false);
-  assert.equal(
-    fixture.calls.every(({ executable }) => executable === "/usr/bin/getfacl"),
-    true,
-  );
+  assert.equal(fixture.calls.length, 0);
 });
 
 test("non-Linux construction fails closed before any collaborator runs", async () => {
@@ -1426,7 +1841,7 @@ test("non-Linux construction fails closed before any collaborator runs", async (
   assert.equal(calls, 0);
 });
 
-test("private owner/mode/ACL policy fails before provisioning mutations", async () => {
+test("private owner and mode policy fails before provisioning mutations", async () => {
   const modePaths = await createPaths();
   await chmod(join(modePaths.root, "images"), 0o750);
   const modeFixture = createFixture(modePaths);
@@ -1436,26 +1851,142 @@ test("private owner/mode/ACL policy fails before provisioning mutations", async 
   );
   await assert.rejects(stat(modePaths.imagePath), { code: "ENOENT" });
   assert.equal(modeFixture.calls.length, 0);
+});
 
-  const aclPaths = await createPaths();
-  const aclFixture = createFixture(aclPaths, {
-    aclOutput(path) {
-      return path === join(aclPaths.root, "images")
-        ? "user::rwx\nuser:123:rwx\ngroup::---\nmask::rwx\nother::---\n"
-        : "user::rwx\ngroup::---\nother::---\n";
+test("access and default ACL findings fail through the fd-bound policy receipt", async () => {
+  for (const aclName of [
+    "system.posix_acl_access",
+    "system.posix_acl_default",
+  ]) {
+    const paths = await createPaths();
+    let policySamples = 0;
+    const fixture = createFixture(paths, {
+      privatePolicy(request) {
+        if (request.path !== join(paths.root, "images")) return true;
+        policySamples += 1;
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      fixture.driver.provision(provisionRequest(paths)),
+      driverError("access_policy_mismatch"),
+      aclName,
+    );
+    await assert.rejects(stat(paths.imagePath), { code: "ENOENT" });
+    assert.equal(policySamples, 1, aclName);
+    assert.equal(fixture.calls.length, 0, aclName);
+  }
+});
+
+test("an fd-bound policy finding survives a temporary policy restoration", async () => {
+  const paths = await createPaths();
+  const imageRoot = join(paths.root, "images");
+  let sampled = false;
+  const fixture = createFixture(paths, {
+    async inspectPrivatePath(request) {
+      const metadata = await stat(request.path, { bigint: true });
+      if (request.path === imageRoot && !sampled) {
+        sampled = true;
+        await chmod(imageRoot, 0o750);
+        await chmod(imageRoot, 0o700);
+        return Object.freeze({
+          device: String(metadata.dev),
+          empty: null,
+          inode: String(metadata.ino),
+          private: false,
+          status: "ok",
+        });
+      }
+      return Object.freeze({
+        device: String(metadata.dev),
+        empty: request.requireEmpty
+          ? (await readdir(request.path)).length === 0
+          : null,
+        inode: String(metadata.ino),
+        private: true,
+        status: "ok",
+      });
     },
   });
+
   await assert.rejects(
-    aclFixture.driver.provision(provisionRequest(aclPaths)),
+    fixture.driver.provision(provisionRequest(paths)),
     driverError("access_policy_mismatch"),
   );
-  await assert.rejects(stat(aclPaths.imagePath), { code: "ENOENT" });
-  assert.equal(
-    aclFixture.calls.every(
-      ({ executable }) => executable === "/usr/bin/getfacl",
-    ),
-    true,
+  assert.equal(sampled, true);
+  assert.equal((await stat(imageRoot)).mode & 0o777, 0o700);
+  await assert.rejects(stat(paths.imagePath), { code: "ENOENT" });
+});
+
+test("benign child churn is not a generic private-directory mutation", async () => {
+  const paths = await createPaths();
+  const imageRoot = join(paths.root, "images");
+  const transient = join(imageRoot, "benign-child-churn");
+  let churned = false;
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (
+        request.operation !== "inspect-private-path" ||
+        request.path !== imageRoot ||
+        request.requireEmpty ||
+        churned
+      ) {
+        return;
+      }
+      churned = true;
+      await writeFile(transient, Buffer.alloc(0), { mode: 0o600 });
+      await unlink(transient);
+    },
+  });
+
+  const provisioned = await fixture.driver.provision(provisionRequest(paths));
+
+  assert.equal(churned, true);
+  assert.equal(provisioned.imagePath, paths.imagePath);
+});
+
+test("a pathname ABA substitute cannot supply the private-policy receipt", async () => {
+  const paths = await createPaths();
+  const imageRoot = join(paths.root, "images");
+  const retainedRoot = `${imageRoot}.retained`;
+  let substituted = false;
+  const fixture = createFixture(paths, {
+    async inspectPrivatePath(request) {
+      const original = await stat(request.path, { bigint: true });
+      if (request.path !== imageRoot || substituted) {
+        return Object.freeze({
+          device: String(original.dev),
+          empty: request.requireEmpty
+            ? (await readdir(request.path)).length === 0
+            : null,
+          inode: String(original.ino),
+          private: true,
+          status: "ok",
+        });
+      }
+      substituted = true;
+      await rename(imageRoot, retainedRoot);
+      await mkdir(imageRoot, { mode: 0o700 });
+      const substitute = await stat(imageRoot, { bigint: true });
+      await rmdir(imageRoot);
+      await rename(retainedRoot, imageRoot);
+      return Object.freeze({
+        device: String(substitute.dev),
+        empty: null,
+        inode: String(substitute.ino),
+        private: true,
+        status: "ok",
+      });
+    },
+  });
+
+  await assert.rejects(
+    fixture.driver.provision(provisionRequest(paths)),
+    driverError("image_io_failed"),
   );
+  assert.equal(substituted, true);
+  await assert.rejects(stat(paths.imagePath), { code: "ENOENT" });
 });
 
 test("image and mount-directory replacement races are detected before later mutation", async () => {
@@ -1700,10 +2231,6 @@ const identity = Object.freeze({
   objectId: ${JSON.stringify(objectId(paths.mountPath))},
 });
 const inspected = Object.freeze({ filesystem, identity });
-const aclCompletion = Object.freeze({
-  stderr: Buffer.alloc(0),
-  stdout: Buffer.from("user::rwx\\ngroup::---\\nother::---\\n"),
-});
 const loopReceipt = Object.freeze({
   backingDevice: ${JSON.stringify(String(imageMetadata.dev))},
   backingInode: ${JSON.stringify(String(imageMetadata.ino))},
@@ -1718,17 +2245,24 @@ const loopReceipt = Object.freeze({
 });
 const mountBytes = Buffer.from(${JSON.stringify(mountInfo)});
 const inspectedPending = Promise.resolve(inspected);
-const aclPending = Promise.resolve(aclCompletion);
 const loopPending = Promise.resolve(loopReceipt);
 const mountPending = Promise.resolve(mountBytes);
 const options = {
   commandRunner(executable) {
-    if (executable === "/usr/bin/getfacl") return aclPending;
     throw new Error("unexpected executable");
   },
   inspector: Object.freeze({
     inspectFilesystemObject() { return inspectedPending; },
     runFdOperation(request) {
+      if (request.operation === "inspect-private-path") {
+        return Promise.resolve({
+          device: request.device,
+          empty: null,
+          inode: request.inode,
+          private: true,
+          status: "ok",
+        });
+      }
       if (
         request.operation !== "find-loop" &&
         request.operation !== "inspect-loop"

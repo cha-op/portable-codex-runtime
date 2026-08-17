@@ -19,6 +19,7 @@ const arrayEveryIntrinsic = Array.prototype.every;
 const bufferEqualsIntrinsic = Buffer.prototype.equals;
 const bufferFromIntrinsic = Buffer.from;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
+const createHashIntrinsic = createHash;
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
 const JsonObject = JSON;
@@ -39,6 +40,9 @@ const objectHasOwnIntrinsic = Object.hasOwn;
 const objectPrototype = Object.prototype;
 const promiseResolveIntrinsic = Promise.resolve;
 const PromiseConstructor = Promise;
+const pathDirnameIntrinsic = dirname;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathResolveIntrinsic = resolve;
 const promisePrototype = Promise.prototype;
 const reflectApplyIntrinsic = Reflect.apply;
 const reflectOwnKeysIntrinsic = Reflect.ownKeys;
@@ -68,6 +72,10 @@ function regexpTest(pattern, value) {
 export const PODMAN_WRITER_SUPERVISOR_STATE_CONTRACT_VERSION = 1;
 
 const MAX_RECORD_BYTES = 16 * 1024;
+const MAX_NATIVE_PATH_BYTES = 4_095;
+// `/<64-hex>.<revision>.json.pending` is the longest derived suffix. The
+// contract's revisions are single decimal digits, so it consumes 80 bytes.
+const MAX_STATE_ROOT_BYTES = MAX_NATIVE_PATH_BYTES - 80;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,127}$/u;
@@ -440,7 +448,7 @@ function safeFileStat(stat, maximumLinks = 1n) {
 }
 
 function recordKey(launchAttemptId) {
-  const hash = createHash("sha256");
+  const hash = createHashIntrinsic("sha256");
   callIntrinsic(hashUpdateIntrinsic, hash, [
     "portable-codex-runtime:podman-writer-state:v1\0",
     "utf8",
@@ -469,7 +477,7 @@ async function validateParentChain(parentPath) {
   while (current !== "/") {
     ensure(components.length < 256, "podman_writer_state_io_failed");
     components[components.length] = current;
-    const next = dirname(current);
+    const next = pathDirnameIntrinsic(current);
     ensure(next !== current, "podman_writer_state_io_failed");
     current = next;
   }
@@ -488,7 +496,7 @@ async function validateParentChain(parentPath) {
 }
 
 async function openPrivateParent(root) {
-  const parentPath = dirname(root);
+  const parentPath = pathDirnameIntrinsic(root);
   let handle;
   try {
     const before = await validateParentChain(parentPath);
@@ -718,7 +726,7 @@ async function readPlainSafeFile(path, maximumLinks = 1n) {
 // this owner-private directory. Link-count churn alone is not content mutation,
 // but an unrecognized alias is an access-policy expansion and fails closed.
 async function cleanupPublishedAlias(path, published, held) {
-  await assertDirectoryHeld(dirname(path), held);
+  await assertDirectoryHeld(pathDirnameIntrinsic(path), held);
   const currentPublished = await readPlainSafeFile(path, 2n);
   ensure(
     currentPublished !== null &&
@@ -812,7 +820,7 @@ async function readImmutableFile(path, held) {
     return null;
   }
   if (ready !== null) {
-    const readyHash = createHash("sha256");
+    const readyHash = createHashIntrinsic("sha256");
     callIntrinsic(hashUpdateIntrinsic, readyHash, [published.bytes]);
     const expected = `${callIntrinsic(hashDigestIntrinsic, readyHash, ["hex"])}\n`;
     ensure(
@@ -1102,6 +1110,24 @@ export function isPodmanWriterSupervisorState(value) {
   );
 }
 
+function validStateRoot(value) {
+  if (
+    typeof value !== "string" ||
+    value.length <= 1 ||
+    value.length > MAX_STATE_ROOT_BYTES ||
+    callIntrinsic(stringIncludesIntrinsic, value, ["\0"])
+  ) {
+    return false;
+  }
+  const encoded = callIntrinsic(bufferFromIntrinsic, Buffer, [value, "utf8"]);
+  return (
+    encoded.length <= MAX_STATE_ROOT_BYTES &&
+    callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === value &&
+    pathIsAbsoluteIntrinsic(value) &&
+    pathResolveIntrinsic(value) === value
+  );
+}
+
 export function createPodmanWriterSupervisorState(...args) {
   ensure(args.length === 1);
   const options = optionalDataObject(
@@ -1109,13 +1135,7 @@ export function createPodmanWriterSupervisorState(...args) {
     OPTION_KEYS,
     REQUIRED_OPTION_KEYS,
   );
-  ensure(
-    typeof options.root === "string" &&
-      options.root.length > 1 &&
-      !callIntrinsic(stringIncludesIntrinsic, options.root, ["\0"]) &&
-      isAbsolute(options.root) &&
-      resolve(options.root) === options.root,
-  );
+  ensure(validStateRoot(options.root));
   const root = options.root;
   const faultHooks = normalizeFaultHooks(options.faultHooks);
   const operationTails = new MapConstructor();

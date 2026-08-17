@@ -25,6 +25,7 @@ const bufferByteLengthIntrinsic = Buffer.byteLength;
 const bufferFromIntrinsic = Buffer.from;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
 const bufferWriteUInt32BEIntrinsic = Buffer.prototype.writeUInt32BE;
+const createHashIntrinsic = createHash;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
 const objectAssign = Object.assign;
@@ -230,7 +231,7 @@ function runtimeSessionId(value, code) {
 }
 
 function digest(parts) {
-  const hash = reflectApply(createHash, undefined, ["sha256"]);
+  const hash = reflectApply(createHashIntrinsic, undefined, ["sha256"]);
   reflectApply(hashUpdateIntrinsic, hash, [
     "portable-codex-runtime/ext4-path/v1\0",
     "utf8",

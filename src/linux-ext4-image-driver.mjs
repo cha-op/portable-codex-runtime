@@ -1,5 +1,4 @@
 import { Buffer } from "node:buffer";
-import { execFile } from "node:child_process";
 import { Hash, createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
@@ -16,9 +15,8 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { TextDecoder, promisify, types as utilTypes } from "node:util";
+import { TextDecoder, types as utilTypes } from "node:util";
 
-const execFileAsync = promisify(execFile);
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -178,12 +176,10 @@ const DIRECTORY_FILE_TYPE = BigInt(fsConstants.S_IFDIR);
 const REGULAR_FILE_TYPE = BigInt(fsConstants.S_IFREG);
 const IMAGE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
-const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const MAX_MOUNTINFO_BYTES = 1024 * 1024;
 const MAX_PATH_BYTES = 4095;
 const MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024 * 1024 * 1024;
 const MIN_IMAGE_SIZE_BYTES = 1024 * 1024;
-const COMMAND_TIMEOUT_MILLISECONDS = 60_000;
 const REQUIRED_VFS_OPTIONS = objectFreezeIntrinsic([
   "rw",
   "nosuid",
@@ -246,6 +242,13 @@ const INSPECTED_IDENTITY_KEYS = objectFreezeIntrinsic([
 ]);
 const INSPECTED_OBJECT_KEYS = objectFreezeIntrinsic(["filesystem", "identity"]);
 const FD_STATUS_KEYS = objectFreezeIntrinsic(["status"]);
+const FD_PRIVATE_PATH_KEYS = objectFreezeIntrinsic([
+  "device",
+  "empty",
+  "inode",
+  "private",
+  "status",
+]);
 const FD_CREATED_IMAGE_KEYS = objectFreezeIntrinsic(["device", "inode", "status"]);
 const FD_DIRECTORY_KEYS = objectFreezeIntrinsic([
   "created",
@@ -279,23 +282,6 @@ const FD_LOOP_KEYS = objectFreezeIntrinsic([
   "sizeLimit",
   "status",
 ]);
-const COMMAND_RESULT_KEYS = objectFreezeIntrinsic(["stderr", "stdout"]);
-
-const SAFE_COMMAND_ENVIRONMENT = frozenRecord({
-  LANG: "C",
-  LC_ALL: "C",
-});
-const COMMAND_OPTIONS = frozenRecord({
-  cwd: "/",
-  encoding: "buffer",
-  env: SAFE_COMMAND_ENVIRONMENT,
-  killSignal: "SIGTERM",
-  maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
-  shell: false,
-  timeout: COMMAND_TIMEOUT_MILLISECONDS,
-  windowsHide: true,
-});
-
 const ERROR_MESSAGES = objectFreezeIntrinsic({
   access_policy_mismatch: "Linux ext4 path access policy does not match",
   attachment_root_absent: "Linux ext4 attachment root is absent",
@@ -535,16 +521,18 @@ function normalizeOptions(value) {
   ensure(typeof platform === "string", "invalid_options");
   if (platform !== "linux") fail("unsupported_platform");
   ensure(DEFAULT_UID !== null, "unsupported_platform");
+  // Version-1 callers may still provide the former path-based ACL runner and
+  // executable. Validate those compatibility placeholders, but never retain
+  // or invoke them as access-policy authority.
+  if (options.commandRunner !== undefined) {
+    assertFunction(options.commandRunner, "invalid_options");
+  }
+  executablePath(
+    options.getfaclExecutable ?? DEFAULT_EXECUTABLES.getfacl,
+    "invalid_options",
+  );
   return objectFreezeIntrinsic({
-    commandRunner:
-      options.commandRunner === undefined
-        ? defaultCommandRunner
-        : assertFunction(options.commandRunner, "invalid_options"),
     executables: objectFreezeIntrinsic({
-      getfacl: executablePath(
-        options.getfaclExecutable ?? DEFAULT_EXECUTABLES.getfacl,
-        "invalid_options",
-      ),
       losetup: executablePath(
         options.losetupExecutable ?? DEFAULT_EXECUTABLES.losetup,
         "invalid_options",
@@ -704,53 +692,6 @@ function isNativePromise(value) {
   }
 }
 
-function defaultCommandRunner(executable, arguments_, options) {
-  return execFileAsync(executable, arguments_, options);
-}
-
-function boundedCommandResult(value, code) {
-  const result = exactDataObject(value, COMMAND_RESULT_KEYS, code);
-  ensure(
-    !isProxyValue(result.stdout) &&
-      !isProxyValue(result.stderr) &&
-      callIntrinsic(bufferIsBufferIntrinsic, Buffer, [result.stdout]) &&
-      callIntrinsic(bufferIsBufferIntrinsic, Buffer, [result.stderr]) &&
-      bufferBytes(result.stdout) <= MAX_COMMAND_OUTPUT_BYTES &&
-      bufferBytes(result.stderr) <= MAX_COMMAND_OUTPUT_BYTES &&
-      bufferBytes(result.stderr) === 0,
-    code,
-  );
-  return result;
-}
-
-async function runCommand(state, executable, arguments_, mutation) {
-  const args = objectFreezeIntrinsic(arraySlice(arguments_, 0));
-  let pending;
-  try {
-    pending = callIntrinsic(state.commandRunner, undefined, [
-      executable,
-      args,
-      COMMAND_OPTIONS,
-    ]);
-  } catch {
-    fail(mutation ? "operation_outcome_uncertain" : "observation_failed");
-  }
-  ensure(
-    isNativePromise(pending),
-    mutation ? "operation_outcome_uncertain" : "observation_failed",
-  );
-  let raw;
-  try {
-    raw = await pending;
-  } catch {
-    fail(mutation ? "operation_outcome_uncertain" : "observation_failed");
-  }
-  return boundedCommandResult(
-    raw,
-    mutation ? "operation_outcome_uncertain" : "observation_failed",
-  );
-}
-
 async function invokeFdOperation(
   state,
   request,
@@ -786,6 +727,28 @@ function normalizeFdStatus(value) {
   );
   ensure(result.status === "ok", "operation_outcome_uncertain");
   return frozenRecord({ status: "ok" });
+}
+
+function normalizePrivatePathReceipt(value, requireEmpty, code) {
+  const result = exactDataObject(value, FD_PRIVATE_PATH_KEYS, code);
+  ensure(
+    typeof result.device === "string" &&
+      regexpTest(DECIMAL_PATTERN, result.device) &&
+      (result.empty === null || typeof result.empty === "boolean") &&
+      typeof result.inode === "string" &&
+      regexpTest(/^[1-9][0-9]*$/u, result.inode) &&
+      typeof result.private === "boolean" &&
+      result.status === "ok" &&
+      (requireEmpty ? typeof result.empty === "boolean" : result.empty === null),
+    code,
+  );
+  return frozenRecord({
+    device: result.device,
+    empty: result.empty,
+    inode: result.inode,
+    private: result.private,
+    status: "ok",
+  });
 }
 
 function normalizeDirectoryReceipt(value) {
@@ -1090,67 +1053,6 @@ function authorityInode(authority) {
 // policy. We deliberately do not treat ctime, directory size, or child-entry
 // churn as replacement evidence.
 
-const ACL_ENTRY_PATTERN =
-  /^(default:)?(user|group|mask|other):([^:]*):[rwx-]{3}(?:\s+#effective:[rwx-]{3})?$/u;
-
-function parseExtendedAcl(bytes, code) {
-  const output = decodeUtf8(bytes, code);
-  ensure(
-    output.length > 0 &&
-      stringEndsWith(output, "\n") &&
-      !stringIncludes(output, "\0") &&
-      !stringIncludes(output, "\r"),
-    code,
-  );
-  const lines = stringSplit(stringSlice(output, 0, -1), "\n");
-  let hasUser = false;
-  let hasGroup = false;
-  let hasOther = false;
-  let extended = false;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index] === "") continue;
-    const match = callIntrinsic(regexpExecIntrinsic, ACL_ENTRY_PATTERN, [
-      lines[index],
-    ]);
-    ensure(match !== null, code);
-    const defaultEntry = match[1] !== undefined;
-    const kind = match[2];
-    const qualifier = match[3];
-    if (defaultEntry || kind === "mask" || qualifier !== "") {
-      extended = true;
-      continue;
-    }
-    if (kind === "user") {
-      ensure(!hasUser, code);
-      hasUser = true;
-    } else if (kind === "group") {
-      ensure(!hasGroup, code);
-      hasGroup = true;
-    } else if (kind === "other") {
-      ensure(!hasOther, code);
-      hasOther = true;
-    }
-  }
-  ensure(hasUser && hasGroup && hasOther, code);
-  return extended;
-}
-
-async function pathHasExtendedAcl(state, path, code) {
-  let result;
-  try {
-    result = await runCommand(
-      state,
-      state.executables.getfacl,
-      ["--absolute-names", "--omit-header", "--", path],
-      false,
-    );
-  } catch (error) {
-    if (weakSetHas(internalErrors, error)) fail(code);
-    throw error;
-  }
-  return parseExtendedAcl(result.stdout, code);
-}
-
 function statHasPolicy(metadata, type, mode) {
   return (
     metadata.uid === DEFAULT_UID_BIGINT &&
@@ -1162,7 +1064,16 @@ function statHasPolicy(metadata, type, mode) {
   );
 }
 
-async function validateOwnedPath(state, path, type, mode, code) {
+async function validateOwnedPath(
+  state,
+  path,
+  type,
+  mode,
+  code,
+  requireEmpty = false,
+  policyCode = "access_policy_mismatch",
+  identityCode = code,
+) {
   let before;
   let after;
   try {
@@ -1170,17 +1081,41 @@ async function validateOwnedPath(state, path, type, mode, code) {
   } catch {
     fail(code);
   }
-  ensure(statHasPolicy(before, type, mode), "access_policy_mismatch");
-  ensure(!(await pathHasExtendedAcl(state, path, code)), "access_policy_mismatch");
+  ensure(statHasPolicy(before, type, mode), policyCode);
+  const receipt = normalizePrivatePathReceipt(
+    await invokeFdOperation(
+      state,
+      frozenRecord({
+        device: bigIntToString(before.dev),
+        inode: bigIntToString(before.ino),
+        kind: type,
+        linkPolicy: type === "directory" ? "positive" : "single",
+        mode: mode === DIRECTORY_MODE ? "0700" : "0600",
+        operation: "inspect-private-path",
+        path,
+        requireEmpty,
+        uid: bigIntToString(DEFAULT_UID_BIGINT),
+      }),
+      code,
+      identityCode,
+    ),
+    requireEmpty,
+    code,
+  );
+  ensure(
+    receipt.device === bigIntToString(before.dev) &&
+      receipt.inode === bigIntToString(before.ino),
+    identityCode,
+  );
+  ensure(receipt.private, policyCode);
+  if (requireEmpty) ensure(receipt.empty, policyCode);
   try {
     after = await lstat(path, { bigint: true });
   } catch {
     fail(code);
   }
-  ensure(
-    sameRuntimeIdentity(before, after) && statHasPolicy(after, type, mode),
-    code,
-  );
+  ensure(sameRuntimeIdentity(before, after), identityCode);
+  ensure(statHasPolicy(after, type, mode), policyCode);
   return after;
 }
 
@@ -1680,13 +1615,22 @@ function imageIdentity(filesystemId) {
   });
 }
 
-async function inspectObject(state, path, expectedFilesystemId = null) {
+async function inspectObject(
+  state,
+  path,
+  expectedFilesystemId = null,
+  identityCode = "inspection_failed",
+  policyCode = "access_policy_mismatch",
+) {
   const before = await validateOwnedPath(
     state,
     path,
     "directory",
     DIRECTORY_MODE,
     "inspection_failed",
+    false,
+    policyCode,
+    identityCode,
   );
   const combined = exactDataObject(
     await invokeInspector(
@@ -1705,6 +1649,9 @@ async function inspectObject(state, path, expectedFilesystemId = null) {
     "directory",
     DIRECTORY_MODE,
     "inspection_failed",
+    false,
+    policyCode,
+    identityCode,
   );
   ensure(
     sameRuntimeIdentity(before, after) &&
@@ -1712,7 +1659,7 @@ async function inspectObject(state, path, expectedFilesystemId = null) {
       inspected.inode === bigIntToString(before.ino) &&
       (expectedFilesystemId === null ||
         filesystem.filesystemId === expectedFilesystemId),
-    "inspection_failed",
+    identityCode,
   );
   return frozenRecord({
     filesystem,
@@ -2126,35 +2073,110 @@ async function ensureAttachmentRootInternal(state, requestValue) {
         parentInode: before.mountEvidence.rootInode,
         path: request.attachmentRootPath,
       }),
+      "operation_outcome_uncertain",
+      "attachment_root_unsafe",
     ),
   );
   const created = directoryReceipt.created;
-  let metadata;
+  let inspected;
   try {
-    metadata = await lstat(request.attachmentRootPath, { bigint: true });
-  } catch {
-    fail(created ? "operation_outcome_uncertain" : "attachment_root_unsafe");
+    const verificationCode = created
+      ? "operation_outcome_uncertain"
+      : "attachment_root_unsafe";
+    const metadata = await validateOwnedPath(
+      state,
+      request.attachmentRootPath,
+      "directory",
+      DIRECTORY_MODE,
+      created ? "operation_outcome_uncertain" : "observation_failed",
+      true,
+      verificationCode,
+      verificationCode,
+    );
+    ensure(
+      directoryReceipt.device === bigIntToString(metadata.dev) &&
+        directoryReceipt.inode === bigIntToString(metadata.ino),
+      verificationCode,
+    );
+    inspected = await inspectObject(
+      state,
+      request.attachmentRootPath,
+      before.imageIdentity.filesystemId,
+      verificationCode,
+      verificationCode,
+    );
+    ensure(
+      directoryReceipt.device === inspected.runtimeIdentity.device &&
+        directoryReceipt.inode === inspected.runtimeIdentity.inode,
+      verificationCode,
+    );
+    ensure(
+      inspected.identity.objectId !== before.rootIdentity.objectId,
+      verificationCode,
+    );
+  } catch (error) {
+    if (created) fail("operation_outcome_uncertain");
+    if (
+      weakSetHas(internalErrors, error) &&
+      safeErrorCode(error) === "attachment_root_unsafe"
+    ) {
+      throw error;
+    }
+    fail("observation_failed");
   }
-  ensure(
-    isDirectoryStat(metadata) && statMode(metadata) === DIRECTORY_MODE,
-    created ? "operation_outcome_uncertain" : "attachment_root_unsafe",
-  );
-  const inspected = await inspectObject(
-    state,
-    request.attachmentRootPath,
-    before.imageIdentity.filesystemId,
-  );
-  ensure(
-    directoryReceipt.device === inspected.runtimeIdentity.device &&
-      directoryReceipt.inode === inspected.runtimeIdentity.inode,
-    created ? "operation_outcome_uncertain" : "attachment_root_unsafe",
-  );
-  ensure(
-    inspected.identity.objectId !== before.rootIdentity.objectId,
-    "attachment_root_unsafe",
-  );
-  const after = await observeMountInternal(state, mount, true);
-  ensure(sameMountedObservation(after, before), "operation_outcome_uncertain");
+  let after;
+  let finalInspected;
+  try {
+    after = await observeMountInternal(state, mount, true);
+    ensure(sameMountedObservation(after, before), "operation_outcome_uncertain");
+    const verificationCode = created
+      ? "operation_outcome_uncertain"
+      : "attachment_root_unsafe";
+    const finalMetadata = await validateOwnedPath(
+      state,
+      request.attachmentRootPath,
+      "directory",
+      DIRECTORY_MODE,
+      created ? "operation_outcome_uncertain" : "observation_failed",
+      true,
+      verificationCode,
+      verificationCode,
+    );
+    finalInspected = await inspectObject(
+      state,
+      request.attachmentRootPath,
+      before.imageIdentity.filesystemId,
+      verificationCode,
+      verificationCode,
+    );
+    ensure(
+      directoryReceipt.device === bigIntToString(finalMetadata.dev) &&
+        directoryReceipt.inode === bigIntToString(finalMetadata.ino) &&
+        inspected.runtimeIdentity.device ===
+          finalInspected.runtimeIdentity.device &&
+        inspected.runtimeIdentity.inode ===
+          finalInspected.runtimeIdentity.inode &&
+        inspected.identity.filesystemId ===
+          finalInspected.identity.filesystemId &&
+        inspected.identity.objectIdentityScheme ===
+          finalInspected.identity.objectIdentityScheme &&
+        inspected.identity.objectId === finalInspected.identity.objectId &&
+        finalInspected.runtimeIdentity.device ===
+          bigIntToString(finalMetadata.dev) &&
+        finalInspected.runtimeIdentity.inode ===
+          bigIntToString(finalMetadata.ino),
+      verificationCode,
+    );
+  } catch (error) {
+    if (created) fail("operation_outcome_uncertain");
+    if (
+      weakSetHas(internalErrors, error) &&
+      safeErrorCode(error) === "attachment_root_unsafe"
+    ) {
+      throw error;
+    }
+    fail("observation_failed");
+  }
   return frozenRecord({
     attachmentRootPath: request.attachmentRootPath,
     created,
@@ -2165,7 +2187,7 @@ async function ensureAttachmentRootInternal(state, requestValue) {
     mountEvidence: after.mountEvidence,
     mountPath: request.mountPath,
     mountRootIdentity: after.rootIdentity,
-    rootIdentity: inspected.identity,
+    rootIdentity: finalInspected.identity,
   });
 }
 
@@ -2195,6 +2217,7 @@ async function observeAttachmentRootInternal(state, requestValue) {
     state,
     request.attachmentRootPath,
     before.imageIdentity.filesystemId,
+    "attachment_root_unsafe",
   );
   ensure(
     inspected.identity.objectId !== before.rootIdentity.objectId,
@@ -2202,6 +2225,21 @@ async function observeAttachmentRootInternal(state, requestValue) {
   );
   const after = await observeMountInternal(state, mount, true);
   ensure(sameMountedObservation(after, before), "observation_failed");
+  const finalInspected = await inspectObject(
+    state,
+    request.attachmentRootPath,
+    before.imageIdentity.filesystemId,
+    "attachment_root_unsafe",
+  );
+  ensure(
+    inspected.runtimeIdentity.device === finalInspected.runtimeIdentity.device &&
+      inspected.runtimeIdentity.inode === finalInspected.runtimeIdentity.inode &&
+      inspected.identity.filesystemId === finalInspected.identity.filesystemId &&
+      inspected.identity.objectIdentityScheme ===
+        finalInspected.identity.objectIdentityScheme &&
+      inspected.identity.objectId === finalInspected.identity.objectId,
+    "attachment_root_unsafe",
+  );
   return frozenRecord({
     attachmentRootPath: request.attachmentRootPath,
     filesystem: after.filesystem,
@@ -2211,7 +2249,7 @@ async function observeAttachmentRootInternal(state, requestValue) {
     mountEvidence: after.mountEvidence,
     mountPath: request.mountPath,
     mountRootIdentity: after.rootIdentity,
-    rootIdentity: inspected.identity,
+    rootIdentity: finalInspected.identity,
   });
 }
 

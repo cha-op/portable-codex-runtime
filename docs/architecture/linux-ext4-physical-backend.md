@@ -124,6 +124,28 @@ with a changed access policy is rejected even when its object identity is
 unchanged. Failure to read or revalidate policy is distinct from a proved
 missing object and remains uncertain.
 
+The exact `inspect-private-path` operation binds that proof to a retained file
+descriptor and to the expected device/inode pair. The caller-controlled path
+is first pinned with `O_PATH`, then checked for exact identity, type, owner,
+mode, and link policy before any read-open can occur. Only a proved regular
+file or directory is reopened through its internally generated
+`/proc/self/fd/<n>` path; the helper immediately rechecks exact identity and
+type on that ACL-capable descriptor. On the ordinary trusted host filesystem,
+a substituted FIFO, device, socket, or symlink therefore cannot run an open
+hook before rejection. This boundary depends on the deployment's trusted
+procfs and host filesystem; it does not claim that an arbitrary malicious
+filesystem implements side-effect-free metadata operations. It samples both
+`system.posix_acl_access` and
+`system.posix_acl_default` before and after reopening the current pathname.
+`ENODATA`/`ENOATTR` means that the corresponding POSIX ACL xattr is absent;
+`ENOTSUP`/`EOPNOTSUPP` means that this filesystem cannot encode that POSIX ACL
+xattr and is also accepted as absent. Any present xattr rejects the private
+policy, while every other xattr error is an unreadable policy proof. The
+version-1 `commandRunner` and `getfaclExecutable` options remain validated
+compatibility placeholders but are neither retained nor invoked as authority.
+Directory ctime, size, exact link count, and ordinary child-entry churn are not
+access-policy signals.
+
 ## FD-Bound Linux Operations
 
 The native helper resolves the selected mount root and target using
@@ -135,6 +157,29 @@ for mount, unmount, loop configuration, loop inspection, directory creation,
 removal, and `syncfs`. The only external storage command is `mkfs.ext4`, which
 receives a pinned `/proc/self/fd/<n>` image descriptor and a fixed argument
 vector without a shell or ambient `PATH`.
+
+Fresh writable-attachment admission uses the same read-only operation with an
+explicit fixed-descriptor emptiness scan. A storage record with no committed
+`dataRoot` must pass this empty proof, including replay of a prepared but
+uncommitted attach. A stable pre-existing nonempty child is a physical-state
+mismatch; if this call created the child, any later proof failure leaves the
+physical effect ambiguous. Once `dataRoot` is committed, reattachment is
+read-only observation: ordinary committed content growth is allowed, but the
+observed root identity must exactly match the durable `dataRoot` identity.
+Stable runtime-identity, filesystem, or access-policy mismatch is a physical
+state mismatch, and proved absence remains `attachment_root_absent`; an
+unreadable or failed inspection remains a physically ambiguous observation.
+Emptiness is revalidated after the final stable mount observation for fresh
+admission, without using directory size, ctime, or link count as substitutes.
+The driver then resamples the persistent ext4 object identity and requires it
+to match both the initial inspection and the final empty-policy sample's
+runtime identity. This protects the object, policy, and emptiness selected at
+the final observation boundary; it is not continuous descriptor custody from
+directory creation through the later backend commit. A temporary substitute
+that is gone and has restored the original safe object before that boundary is
+therefore not itself a mutation signal. Committed read-only observation uses
+the same final persistent-identity resampling but deliberately omits the empty
+requirement.
 
 Formatting has its own deadline inside the native helper, measured from the
 start of the complete format operation. The trusted formatter runs in a new
@@ -499,10 +544,17 @@ record.
 The supervisor state currently retains immutable per-attempt revisions for
 exact acknowledgement-loss replay and has no authority-owned compactor. A
 production host must place that owner-private root on monitored dedicated
-storage. Bounded retention or garbage collection requires a separate callback
-after PostgreSQL has permanently committed the exact terminal attempt and all
-callbacks for that attempt are quiescent; the read-only reconciler cannot be
-used as that authority.
+storage. The configured root is a canonical, lossless UTF-8 native pathname of
+at most 4,015 bytes, reserving the remaining 80 bytes of Linux's 4,095-byte
+domain for `/<64-hex>.<revision>.json.pending`. Record-key hashing and all path
+operations use module-load-captured `node:crypto` and `node:path` intrinsics, so
+post-import builtin synchronization cannot redirect or rename durable state.
+This is a lexical nameability and persistent-derivation property, independent
+of the held-directory object-identity and access-policy proofs. Bounded
+retention or garbage collection requires a separate callback after PostgreSQL
+has permanently committed the exact terminal attempt and all callbacks for
+that attempt are quiescent; the read-only reconciler cannot be used as that
+authority.
 
 ## Production Injection
 

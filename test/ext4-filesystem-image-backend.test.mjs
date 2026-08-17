@@ -202,7 +202,10 @@ function createHeadAnchor() {
 
 function createFakeDriver() {
   const calls = [];
+  const attachmentObservationErrors = new Map();
   const children = new Map();
+  const nonemptyChildren = new Set();
+  const unsafeChildren = new Set();
   let mounted = false;
   const mountRoot = identity("ext4fh1:mount-root-001");
   let publicationControl = identity("ext4fh1:publication-control-001");
@@ -284,6 +287,12 @@ function createFakeDriver() {
     if (created) {
       root = identity(`ext4fh1:${basename(request.attachmentRootPath)}`);
       children.set(request.attachmentRootPath, root);
+    } else if (
+      // Content and policy admission applies only while adopting a fresh root.
+      nonemptyChildren.has(request.attachmentRootPath) ||
+      unsafeChildren.has(request.attachmentRootPath)
+    ) {
+      throw new LinuxExt4ImageDriverError("attachment_root_unsafe");
     }
     return exact({
       ...attachmentObservation(request, root),
@@ -292,6 +301,12 @@ function createFakeDriver() {
   });
   const observeAttachmentRoot = method("observeAttachmentRoot", (request) => {
     if (!mounted) throw new LinuxExt4ImageDriverError("mount_absent");
+    const observationError = attachmentObservationErrors.get(
+      request.attachmentRootPath,
+    );
+    if (observationError !== undefined) {
+      throw new LinuxExt4ImageDriverError(observationError);
+    }
     const root = children.get(request.attachmentRootPath);
     if (root === undefined) {
       throw new LinuxExt4ImageDriverError("attachment_root_absent");
@@ -361,15 +376,35 @@ function createFakeDriver() {
     children,
     driver: surface,
     image,
+    markAttachmentRootNonempty(path) {
+      assert.equal(children.has(path), true);
+      nonemptyChildren.add(path);
+    },
+    markAttachmentRootUnsafe(path) {
+      assert.equal(children.has(path), true);
+      unsafeChildren.add(path);
+    },
     mountRoot,
-    publish(path, root = identity(`ext4fh1:${basename(path)}`)) {
+    publish(
+      path,
+      root = identity(`ext4fh1:${basename(path)}`),
+      { nonempty = false, unsafe = false } = {},
+    ) {
       children.set(path, root);
+      if (nonempty) nonemptyChildren.add(path);
+      else nonemptyChildren.delete(path);
+      if (unsafe) unsafeChildren.add(path);
+      else unsafeChildren.delete(path);
       return root;
     },
     replacePublicationControl(
       next = identity("ext4fh1:publication-control-replaced"),
     ) {
       publicationControl = next;
+    },
+    rejectAttachmentObservation(path, code) {
+      assert.equal(children.has(path), true);
+      attachmentObservationErrors.set(path, code);
     },
     setMounted(value) {
       mounted = value;
@@ -1004,6 +1039,107 @@ test("replays and cold-opens legacy provision state without new attachment headr
   assert.equal((await fixed.backend.initialize()).status, "initialized");
 });
 
+test("fresh writable attachment rejects pre-existing nonempty or unsafe candidates and stays prepared", async (t) => {
+  for (const candidate of [
+    { name: "nonempty", options: { nonempty: true } },
+    { name: "unsafe", options: { unsafe: true } },
+  ]) {
+    await t.test(candidate.name, async (t) => {
+      const fixed = await fixture(t);
+      const provisioned = await provision(fixed);
+      const request = mutationRequest("attach", provisioned.storageId, {
+        operationId: `fresh-${candidate.name}-attach-operation-001`,
+      });
+      const plan = fixed.paths.planWritableAttachment(request);
+      fixed.fake.publish(plan.attachmentRootPath, undefined, candidate.options);
+      const callsBefore = fixed.fake.calls.length;
+
+      const pending = fixed.backend.lifecycleBackend.prepareWritableAttachment(
+        request,
+        context(),
+      );
+      assert.equal(Object.getPrototypeOf(pending), Promise.prototype);
+      await assert.rejects(pending, backendError("physical_state_mismatch"));
+      assert.deepEqual(fixed.fake.calls.slice(callsBefore), [
+        "ensureAttachmentRoot",
+      ]);
+
+      const operation = await fixed.state.readOperation({
+        operationId: request.operationId,
+      });
+      assert.equal(operation.state, "prepared");
+      assert.equal(operation.currentStorageState.lifecycle, "provisioned");
+      assert.equal(operation.currentStorageState.dataRoot, null);
+    });
+  }
+});
+
+test("prepared writable attachment retry re-runs fresh candidate admission", async (t) => {
+  const fixed = await fixture(t);
+  const provisioned = await provision(fixed);
+  const request = mutationRequest("attach", provisioned.storageId, {
+    operationId: "prepared-nonempty-attach-operation-001",
+  });
+  const plan = fixed.paths.planWritableAttachment(request);
+  await fixed.state.prepareOperation({
+    kind: "attach",
+    operationId: request.operationId,
+    request,
+    storageId: provisioned.storageId,
+  });
+  fixed.fake.publish(plan.attachmentRootPath, undefined, { nonempty: true });
+  const callsBefore = fixed.fake.calls.length;
+
+  await assert.rejects(
+    fixed.backend.lifecycleBackend.prepareWritableAttachment(
+      request,
+      context(),
+    ),
+    backendError("physical_state_mismatch"),
+  );
+  assert.deepEqual(fixed.fake.calls.slice(callsBefore), [
+    "ensureAttachmentRoot",
+  ]);
+  assert.equal(
+    (await fixed.state.readOperation({ operationId: request.operationId })).state,
+    "prepared",
+  );
+});
+
+test("prepared writable attachment retry admits an existing empty candidate", async (t) => {
+  const fixed = await fixture(t);
+  const provisioned = await provision(fixed);
+  const request = mutationRequest("attach", provisioned.storageId, {
+    operationId: "prepared-empty-attach-operation-001",
+  });
+  const plan = fixed.paths.planWritableAttachment(request);
+  await fixed.state.prepareOperation({
+    kind: "attach",
+    operationId: request.operationId,
+    request,
+    storageId: provisioned.storageId,
+  });
+  const candidateIdentity = fixed.fake.publish(plan.attachmentRootPath);
+  const callsBefore = fixed.fake.calls.length;
+
+  const result = await fixed.backend.lifecycleBackend.prepareWritableAttachment(
+    request,
+    context(),
+  );
+  assert.equal(result.rootPath, plan.attachmentRootPath);
+  assert.deepEqual(fixed.fake.calls.slice(callsBefore), [
+    "ensureAttachmentRoot",
+  ]);
+  const operation = await fixed.state.readOperation({
+    operationId: request.operationId,
+  });
+  assert.equal(operation.state, "committed");
+  assert.equal(
+    operation.currentStorageState.dataRoot.rootIdentity.objectId,
+    candidateIdentity.objectId,
+  );
+});
+
 test("detach preserves dataRoot, reattach reuses it, and destroy tombstones storage", async (t) => {
   const fixed = await fixture(t);
   const provisioned = await provision(fixed);
@@ -1027,6 +1163,8 @@ test("detach preserves dataRoot, reattach reuses it, and destroy tombstones stor
     holderId: "holder-001",
     leaseId: "lease-001",
   });
+  // Committed roots may gain content; reattach still binds object identity.
+  fixed.fake.markAttachmentRootNonempty(first.rootPath);
 
   const secondRequest = mutationRequest("attach", provisioned.storageId, {
     attachmentId: "attachment-002",
@@ -1035,11 +1173,15 @@ test("detach preserves dataRoot, reattach reuses it, and destroy tombstones stor
     leaseId: "lease-002",
     operationId: "attach-operation-002",
   });
+  const callsBeforeReattach = fixed.fake.calls.length;
   const second = await fixed.backend.lifecycleBackend.prepareWritableAttachment(
     secondRequest,
     context(),
   );
   assert.equal(second.rootPath, first.rootPath);
+  assert.deepEqual(fixed.fake.calls.slice(callsBeforeReattach), [
+    "observeAttachmentRoot",
+  ]);
   assert.equal(
     fixed.fake.calls.filter((call) => call === "ensureAttachmentRoot").length,
     1,
@@ -1072,6 +1214,120 @@ test("detach preserves dataRoot, reattach reuses it, and destroy tombstones stor
     holderId: "holder-002",
     leaseId: "lease-002",
   });
+});
+
+test("reattach rejects replacement of a committed data-root object", async (t) => {
+  const fixed = await fixture(t);
+  const provisioned = await provision(fixed);
+  const first = await fixed.backend.lifecycleBackend.prepareWritableAttachment(
+    mutationRequest("attach", provisioned.storageId),
+    context(),
+  );
+  await fixed.backend.lifecycleBackend.detachAttachment(
+    mutationRequest("detach", provisioned.storageId),
+    context(),
+  );
+  const detached = await fixed.state.readStorage(provisioned.storageId);
+  const replacement = identity("ext4fh1:replacement-data-root-001");
+  fixed.fake.publish(first.rootPath, replacement);
+  const request = mutationRequest("attach", provisioned.storageId, {
+    attachmentId: "attachment-002",
+    fencingEpoch: "2",
+    holderId: "holder-002",
+    leaseId: "lease-002",
+    operationId: "replacement-root-attach-operation-002",
+  });
+  const callsBefore = fixed.fake.calls.length;
+
+  await assert.rejects(
+    fixed.backend.lifecycleBackend.prepareWritableAttachment(
+      request,
+      context(),
+    ),
+    backendError("physical_state_mismatch"),
+  );
+  assert.deepEqual(fixed.fake.calls.slice(callsBefore), [
+    "observeAttachmentRoot",
+  ]);
+  const operation = await fixed.state.readOperation({
+    operationId: request.operationId,
+  });
+  assert.equal(operation.state, "prepared");
+  assert.deepEqual(operation.currentStorageState, detached);
+  assert.notEqual(
+    operation.currentStorageState.dataRoot.rootIdentity.objectId,
+    replacement.objectId,
+  );
+});
+
+test("committed data-root observation preserves conclusive error classes", async (t) => {
+  const cases = [
+    {
+      backendCode: "attachment_root_absent",
+      driverCode: "attachment_root_absent",
+      name: "absent",
+    },
+    {
+      backendCode: "physical_state_mismatch",
+      driverCode: "attachment_root_unsafe",
+      name: "unsafe",
+    },
+    {
+      backendCode: "physical_state_mismatch",
+      driverCode: "access_policy_mismatch",
+      name: "access-policy-mismatch",
+    },
+    {
+      backendCode: "physical_effect_ambiguous",
+      driverCode: "observation_failed",
+      name: "unreadable-observation",
+    },
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async (t) => {
+      const fixed = await fixture(t);
+      const provisioned = await provision(fixed);
+      const first = await fixed.backend.lifecycleBackend
+        .prepareWritableAttachment(
+          mutationRequest("attach", provisioned.storageId),
+          context(),
+        );
+      await fixed.backend.lifecycleBackend.detachAttachment(
+        mutationRequest("detach", provisioned.storageId),
+        context(),
+      );
+      fixed.fake.rejectAttachmentObservation(
+        first.rootPath,
+        candidate.driverCode,
+      );
+      const request = mutationRequest("attach", provisioned.storageId, {
+        attachmentId: `attachment-${candidate.name}`,
+        fencingEpoch: "2",
+        holderId: `holder-${candidate.name}`,
+        leaseId: `lease-${candidate.name}`,
+        operationId: `committed-${candidate.name}-attach-operation-002`,
+      });
+      const callsBefore = fixed.fake.calls.length;
+
+      await assert.rejects(
+        fixed.backend.lifecycleBackend.prepareWritableAttachment(
+          request,
+          context(),
+        ),
+        backendError(candidate.backendCode),
+      );
+      assert.deepEqual(fixed.fake.calls.slice(callsBefore), [
+        "observeAttachmentRoot",
+      ]);
+      assert.equal(
+        (await fixed.state.readOperation({
+          operationId: request.operationId,
+        })).state,
+        "prepared",
+      );
+    });
+  }
 });
 
 test("stale attach and detach fences do not prepare or dispatch", async (t) => {

@@ -45,6 +45,17 @@ function loopLine(loopDevice, status = "present") {
   })}\n`;
 }
 
+function privatePathLine(overrides = {}) {
+  return `${JSON.stringify({
+    device: "2049",
+    empty: true,
+    inode: "42",
+    private: true,
+    status: "ok",
+    ...overrides,
+  })}\n`;
+}
+
 function completion({
   exitCode,
   signal,
@@ -387,6 +398,556 @@ test("trusted-root paths dispatch as a dot-relative helper lookup", async () => 
   ]);
 });
 
+test("private-path inspection uses the exact read-only ABI for root and nested paths", async () => {
+  const calls = [];
+  const outputs = [
+    Buffer.from(privatePathLine({ empty: false }), "utf8"),
+    Buffer.from(privatePathLine({ empty: null, private: false }), "utf8"),
+  ];
+  const fixture = createFixture({
+    calls,
+    runHelper: async (...args) => {
+      calls.push(args);
+      return completion({ stdout: outputs[calls.length - 1] });
+    },
+  });
+
+  const rootReceipt = await fixture.inspector.runFdOperation({
+    device: "2049",
+    inode: "42",
+    kind: "directory",
+    linkPolicy: "positive",
+    mode: "0700",
+    operation: "inspect-private-path",
+    path: TRUSTED_ROOT,
+    requireEmpty: true,
+    uid: "501",
+  });
+  assert.deepEqual(rootReceipt, {
+    device: "2049",
+    empty: false,
+    inode: "42",
+    private: true,
+    status: "ok",
+  });
+  assert.deepEqual(Reflect.ownKeys(rootReceipt), [
+    "device",
+    "empty",
+    "inode",
+    "private",
+    "status",
+  ]);
+  assert.equal(Object.isFrozen(rootReceipt), true);
+
+  const nestedReceipt = await fixture.inspector.runFdOperation({
+    device: "2049",
+    inode: "42",
+    kind: "file",
+    linkPolicy: "single",
+    mode: "0600",
+    operation: "inspect-private-path",
+    path: `${TRUSTED_ROOT}/sessions/one/image.ext4`,
+    requireEmpty: false,
+    uid: "501",
+  });
+  assert.deepEqual(nestedReceipt, {
+    device: "2049",
+    empty: null,
+    inode: "42",
+    private: false,
+    status: "ok",
+  });
+  assert.equal(Object.isFrozen(nestedReceipt), true);
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0][1], [
+    "operate",
+    "--root",
+    TRUSTED_ROOT,
+    "--relative",
+    ".",
+    "--verb",
+    "inspect-private-path",
+    "--kind",
+    "directory",
+    "--uid",
+    "501",
+    "--mode",
+    "0700",
+    "--link-policy",
+    "positive",
+    "--require-empty",
+    "yes",
+    "--device",
+    "2049",
+    "--inode",
+    "42",
+  ]);
+  assert.deepEqual(calls[1][1], [
+    "operate",
+    "--root",
+    TRUSTED_ROOT,
+    "--relative",
+    "sessions/one/image.ext4",
+    "--verb",
+    "inspect-private-path",
+    "--kind",
+    "file",
+    "--uid",
+    "501",
+    "--mode",
+    "0600",
+    "--link-policy",
+    "single",
+    "--require-empty",
+    "no",
+    "--device",
+    "2049",
+    "--inode",
+    "42",
+  ]);
+  for (const [helperPath, args, options] of calls) {
+    assert.equal(helperPath, HELPER_PATH);
+    assert.equal(Object.isFrozen(args), true);
+    assert.deepEqual(options, {
+      encoding: "buffer",
+      env: { LANG: "C", LC_ALL: "C" },
+      killSignal: "SIGKILL",
+      maxBuffer: 4096,
+      shell: false,
+      timeout: 60_000,
+      windowsHide: true,
+    });
+    assert.equal(Object.isFrozen(options), true);
+    assert.equal(Object.isFrozen(options.env), true);
+  }
+});
+
+test("private-path inspection rejects non-canonical or semantically mismatched receipts", async () => {
+  const request = {
+    device: "2049",
+    inode: "42",
+    kind: "directory",
+    linkPolicy: "positive",
+    mode: "0700",
+    operation: "inspect-private-path",
+    path: `${TRUSTED_ROOT}/candidate`,
+    requireEmpty: true,
+    uid: "501",
+  };
+  const malformed = [
+    Buffer.from("{}\n", "utf8"),
+    Buffer.from(privatePathLine({ extra: true }), "utf8"),
+    Buffer.from(privatePathLine({ device: 2049 }), "utf8"),
+    Buffer.from(privatePathLine({ empty: null }), "utf8"),
+    Buffer.from(privatePathLine({ empty: "true" }), "utf8"),
+    Buffer.from(privatePathLine({ inode: "0" }), "utf8"),
+    Buffer.from(privatePathLine({ private: null }), "utf8"),
+    Buffer.from(privatePathLine({ status: "private" }), "utf8"),
+    Buffer.from(
+      `${JSON.stringify({
+        empty: true,
+        device: "2049",
+        inode: "42",
+        private: true,
+        status: "ok",
+      })}\n`,
+      "utf8",
+    ),
+    Buffer.from(
+      `${JSON.stringify(
+        {
+          device: "2049",
+          empty: true,
+          inode: "42",
+          private: true,
+          status: "ok",
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    ),
+  ];
+  for (const stdout of malformed) {
+    const fixture = createFixture({
+      runHelper: async () => completion({ stdout }),
+    });
+    await assert.rejects(
+      fixture.inspector.runFdOperation(request),
+      inspectorError("helper_output_invalid"),
+    );
+  }
+
+  const unexpectedBoolean = createFixture({
+    runHelper: async () =>
+      completion({ stdout: Buffer.from(privatePathLine(), "utf8") }),
+  });
+  await assert.rejects(
+    unexpectedBoolean.inspector.runFdOperation({
+      ...request,
+      requireEmpty: false,
+    }),
+    inspectorError("helper_output_invalid"),
+  );
+});
+
+test("private-path read failures retain inspection semantics", async () => {
+  const request = {
+    device: "2049",
+    inode: "42",
+    kind: "directory",
+    linkPolicy: "positive",
+    mode: "0700",
+    operation: "inspect-private-path",
+    path: `${TRUSTED_ROOT}/candidate`,
+    requireEmpty: true,
+    uid: "501",
+  };
+  const cases = [
+    {
+      code: "path_mismatch",
+      runHelper: async () =>
+        completion({ exitCode: 65, stdout: Buffer.alloc(0) }),
+    },
+    {
+      code: "helper_failed",
+      runHelper: async () =>
+        completion({ exitCode: 74, stdout: Buffer.alloc(0) }),
+    },
+    {
+      code: "helper_failed",
+      runHelper: async () =>
+        completion({ signal: "SIGKILL", stdout: Buffer.alloc(0) }),
+    },
+    {
+      code: "helper_failed",
+      runHelper: async () => {
+        const error = new Error("helper timed out");
+        error.code = "ETIMEDOUT";
+        error.signal = "SIGKILL";
+        error.stderr = Buffer.alloc(0);
+        error.stdout = Buffer.alloc(0);
+        throw error;
+      },
+    },
+  ];
+  for (const { code, runHelper } of cases) {
+    const fixture = createFixture({ runHelper });
+    await assert.rejects(
+      fixture.inspector.runFdOperation(request),
+      inspectorError(code),
+    );
+  }
+});
+
+test("native private-path inspection binds identity, policy, and emptiness to fixed FDs", async () => {
+  const source = await readFile(
+    new URL("../native/linux-ext4-inspector.c", import.meta.url),
+    "utf8",
+  );
+  const handleOpenStart = source.indexOf(
+    "static int open_relative_path_handle(",
+  );
+  const handleOpenEnd = source.indexOf(
+    "static int open_direct_child(",
+    handleOpenStart,
+  );
+  const aclStart = source.indexOf(
+    "static int extended_acl_state(",
+    handleOpenEnd,
+  );
+  const metadataStart = source.indexOf(
+    "static int private_metadata_matches(",
+    aclStart,
+  );
+  const policyStart = source.indexOf(
+    "static int private_policy_status(",
+    metadataStart,
+  );
+  const policyEnd = source.indexOf(
+    "static int unlinked_private_policy_status(",
+    policyStart,
+  );
+  const emptyStart = source.indexOf("static int directory_empty_state(");
+  const emptyEnd = source.indexOf(
+    "static int format_proc_fd_path(",
+    emptyStart,
+  );
+  const aclOpenStart = source.indexOf(
+    "static int open_acl_fd_from_path_handle(",
+    emptyEnd,
+  );
+  const aclOpenEnd = source.indexOf(
+    "static int format_proc_fd_child_path(",
+    aclOpenStart,
+  );
+  const inspectStart = source.indexOf("static int inspect_private_path(");
+  const inspectEnd = source.indexOf("static void format_uuid(", inspectStart);
+  assert(handleOpenStart >= 0);
+  assert(handleOpenEnd > handleOpenStart);
+  assert(aclStart > handleOpenEnd);
+  assert(metadataStart > aclStart);
+  assert(policyStart > metadataStart);
+  assert(policyEnd > policyStart);
+  assert(emptyStart > policyEnd);
+  assert(emptyEnd > emptyStart);
+  assert(aclOpenStart > emptyEnd);
+  assert(aclOpenEnd > aclOpenStart);
+  assert(inspectStart > aclOpenEnd);
+  assert(inspectEnd > inspectStart);
+
+  const handleOpenBody = source.slice(handleOpenStart, handleOpenEnd);
+  assert.match(
+    handleOpenBody,
+    /how\.flags = O_PATH \| O_NOFOLLOW \| O_CLOEXEC/u,
+  );
+  assert.doesNotMatch(
+    handleOpenBody,
+    /\bO_RDONLY\b|\bO_NONBLOCK\b|\bO_DIRECTORY\b/u,
+  );
+  assert.match(
+    handleOpenBody,
+    /RESOLVE_BENEATH \| RESOLVE_NO_MAGICLINKS \|\s+RESOLVE_NO_SYMLINKS \| RESOLVE_NO_XDEV/u,
+  );
+  assert.match(
+    handleOpenBody,
+    /return call_openat2\(root_fd, relative_path, &how\)/u,
+  );
+
+  const aclBody = source.slice(aclStart, metadataStart);
+  assert.match(aclBody, /"system\.posix_acl_access"/u);
+  assert.match(aclBody, /"system\.posix_acl_default"/u);
+  assert.match(aclBody, /fgetxattr\(fd, names\[index\], NULL, 0U\)/u);
+  assert.doesNotMatch(aclBody, /\bgetxattr\(/u);
+
+  const metadataBody = source.slice(metadataStart, policyStart);
+  assert.match(metadataBody, /\(metadata->st_mode & S_IFMT\) == type/u);
+  assert.match(metadataBody, /metadata->st_uid == getuid\(\)/u);
+  assert.match(metadataBody, /\(metadata->st_mode & 0777U\) == mode/u);
+  assert.match(metadataBody, /metadata->st_nlink >= 1/u);
+  assert.match(metadataBody, /!single_link \|\| metadata->st_nlink == 1/u);
+  assert.doesNotMatch(metadataBody, /metadata->st_(?:ctim|mtim|size)/u);
+
+  const policyBody = source.slice(policyStart, policyEnd);
+  assert.match(policyBody, /fstat\(fd, &metadata\)/u);
+  assert.match(
+    policyBody,
+    /private_metadata_matches\(&metadata, type, mode, single_link\)/u,
+  );
+  assert.match(policyBody, /acl_state = extended_acl_state\(fd\)/u);
+
+  const emptyBody = source.slice(emptyStart, emptyEnd);
+  assert.match(
+    emptyBody,
+    /scan_fd = openat\(directory_fd, "\.",\s+O_RDONLY \| O_DIRECTORY \| O_NOFOLLOW \| O_CLOEXEC\)/u,
+  );
+  assert.match(emptyBody, /directory = fdopendir\(scan_fd\)/u);
+  assert.doesNotMatch(emptyBody, /dup\(/u);
+  assert.match(
+    emptyBody,
+    /strcmp\(entry->d_name, "\."\) != 0 && strcmp\(entry->d_name, "\.\."\) != 0/u,
+  );
+
+  const aclOpenBody = source.slice(aclOpenStart, aclOpenEnd);
+  const handleStat = aclOpenBody.indexOf(
+    "fstat(path_fd, &handle_metadata)",
+  );
+  const handleType = aclOpenBody.indexOf(
+    "(handle_metadata.st_mode & S_IFMT) != expected_type",
+    handleStat,
+  );
+  const procPath = aclOpenBody.indexOf(
+    "format_proc_fd_path(path_fd, proc_path)",
+    handleType,
+  );
+  const pinnedOpen = aclOpenBody.indexOf(
+    "opened_fd = open(proc_path, flags)",
+    procPath,
+  );
+  const openedStat = aclOpenBody.indexOf(
+    "fstat(opened_fd, &opened_metadata)",
+    pinnedOpen,
+  );
+  const reopenedDevice = aclOpenBody.indexOf(
+    "opened_metadata.st_dev != handle_metadata.st_dev",
+    openedStat,
+  );
+  const reopenedInode = aclOpenBody.indexOf(
+    "opened_metadata.st_ino != handle_metadata.st_ino",
+    reopenedDevice,
+  );
+  const reopenedType = aclOpenBody.indexOf(
+    "(opened_metadata.st_mode & S_IFMT) != expected_type",
+    reopenedInode,
+  );
+  assert(handleStat >= 0);
+  assert(handleType > handleStat);
+  assert(procPath > handleType);
+  assert(pinnedOpen > procPath);
+  assert(openedStat > pinnedOpen);
+  assert(reopenedDevice > openedStat);
+  assert(reopenedInode > reopenedDevice);
+  assert(reopenedType > reopenedInode);
+  assert.match(
+    aclOpenBody,
+    /int flags = O_RDONLY \| O_NONBLOCK \| O_CLOEXEC/u,
+  );
+  assert.match(
+    aclOpenBody,
+    /if \(expected_type == S_IFDIR\) flags \|= O_DIRECTORY/u,
+  );
+  assert.doesNotMatch(aclOpenBody, /relative_path|root_fd/u);
+  assert.match(
+    aclOpenBody,
+    /substituted FIFO, device, socket, or symlink cannot trigger its open\s+\* hook/u,
+  );
+
+  const inspectBody = source.slice(inspectStart, inspectEnd);
+  const targetHandleOpen = inspectBody.indexOf(
+    "target_handle_fd = open_relative_path_handle(root_fd, relative_path)",
+  );
+  const firstTargetIdentity = inspectBody.indexOf(
+    "require_fd_identity(target_handle_fd, device, inode, 0)",
+    targetHandleOpen,
+  );
+  const targetMetadata = inspectBody.indexOf(
+    "fstat(target_handle_fd, &target_metadata)",
+    firstTargetIdentity,
+  );
+  const targetTypeAndPolicy = inspectBody.indexOf(
+    "private_metadata_matches(&target_metadata, expected_type,",
+    targetMetadata,
+  );
+  const targetAclOpen = inspectBody.indexOf(
+    "target_fd = open_acl_fd_from_path_handle(target_handle_fd, expected_type)",
+    targetTypeAndPolicy,
+  );
+  const firstTargetPolicy = inspectBody.indexOf(
+    "private_policy_status(target_fd, expected_type,",
+    targetAclOpen,
+  );
+  const firstTargetEmpty = inspectBody.indexOf(
+    "directory_empty_state(target_fd)",
+    firstTargetPolicy,
+  );
+  const currentHandleOpen = inspectBody.indexOf(
+    "current_handle_fd = open_relative_path_handle(root_fd, relative_path)",
+    firstTargetEmpty,
+  );
+  const currentIdentity = inspectBody.indexOf(
+    "require_fd_identity(current_handle_fd, device, inode, 0)",
+    currentHandleOpen,
+  );
+  const currentMetadata = inspectBody.indexOf(
+    "fstat(current_handle_fd, &current_metadata)",
+    currentIdentity,
+  );
+  const currentTypeAndPolicy = inspectBody.indexOf(
+    "private_metadata_matches(&current_metadata, expected_type,",
+    currentMetadata,
+  );
+  const currentAclOpen = inspectBody.indexOf(
+    "current_fd = open_acl_fd_from_path_handle(current_handle_fd,",
+    currentTypeAndPolicy,
+  );
+  const currentPolicy = inspectBody.indexOf(
+    "private_policy_status(current_fd, expected_type,",
+    currentAclOpen,
+  );
+  const currentEmpty = inspectBody.indexOf(
+    "directory_empty_state(current_fd)",
+    currentPolicy,
+  );
+  const finalTargetPolicy = inspectBody.indexOf(
+    "private_policy_status(target_fd, expected_type,",
+    firstTargetPolicy + 1,
+  );
+  const finalTargetEmpty = inspectBody.indexOf(
+    "directory_empty_state(target_fd)",
+    firstTargetEmpty + 1,
+  );
+  const finalTargetIdentity = inspectBody.indexOf(
+    "require_fd_identity(target_handle_fd, device, inode, 0)",
+    firstTargetIdentity + 1,
+  );
+  const receiptStat = inspectBody.indexOf(
+    "fstat(target_handle_fd, &target_metadata)",
+    finalTargetIdentity,
+  );
+  assert(targetHandleOpen >= 0);
+  assert(firstTargetIdentity > targetHandleOpen);
+  assert(targetMetadata > firstTargetIdentity);
+  assert(targetTypeAndPolicy > targetMetadata);
+  assert(targetAclOpen > targetTypeAndPolicy);
+  assert(firstTargetPolicy > targetAclOpen);
+  assert(firstTargetEmpty > firstTargetPolicy);
+  assert(currentHandleOpen > firstTargetEmpty);
+  assert(currentIdentity > currentHandleOpen);
+  assert(currentMetadata > currentIdentity);
+  assert(currentTypeAndPolicy > currentMetadata);
+  assert(currentAclOpen > currentTypeAndPolicy);
+  assert(currentPolicy > currentAclOpen);
+  assert(currentEmpty > currentPolicy);
+  assert(finalTargetPolicy > currentEmpty);
+  assert(finalTargetEmpty > finalTargetPolicy);
+  assert(finalTargetIdentity > finalTargetEmpty);
+  assert(receiptStat > finalTargetIdentity);
+  assert.match(
+    inspectBody,
+    /if \(!private_metadata_matches\(&target_metadata, expected_type,[\s\S]*?\} else \{\s+target_fd = open_acl_fd_from_path_handle/u,
+  );
+  assert.match(
+    inspectBody,
+    /if \(!private_metadata_matches\(&current_metadata, expected_type,[\s\S]*?\} else \{\s+current_fd = open_acl_fd_from_path_handle/u,
+  );
+  assert.doesNotMatch(
+    inspectBody,
+    /open_relative_(?:private_path|directory)\(root_fd, relative_path/u,
+  );
+  assert.equal(
+    (inspectBody.match(/open_relative_path_handle\(/gu) ?? []).length,
+    2,
+  );
+  assert.equal(
+    (inspectBody.match(/open_acl_fd_from_path_handle\(/gu) ?? []).length,
+    2,
+  );
+  assert.equal(
+    (inspectBody.match(/private_policy_status\(/gu) ?? []).length,
+    3,
+  );
+  assert.equal(
+    (inspectBody.match(/directory_empty_state\(/gu) ?? []).length,
+    3,
+  );
+  assert.equal(
+    (inspectBody.match(/if \(empty_state == 0\) empty = 0;/gu) ?? []).length,
+    3,
+  );
+  assert.equal(
+    (inspectBody.match(/if \(policy_state == 0\) private = 0;/gu) ?? [])
+      .length,
+    3,
+  );
+  assert.equal((inspectBody.match(/require_fd_identity\(/gu) ?? []).length, 3);
+  assert.match(
+    inspectBody,
+    /Directory timestamps,\s+\* size, ctime, and exact link count are intentionally not compared/u,
+  );
+  assert.doesNotMatch(
+    inspectBody,
+    /metadata\.st_(?:ctim|mtim|size|nlink)/u,
+  );
+  assert.match(
+    inspectBody.slice(receiptStat),
+    /\(uintmax_t\)target_metadata\.st_dev[\s\S]*\(uintmax_t\)target_metadata\.st_ino/u,
+  );
+
+  // Deterministic source and ABI guards are used here because the production
+  // helper has no synchronization hook for a non-flaky ABA or child-churn race.
+});
+
 test("native helper source binds mutation authority, loop geometry, and settle checks", async () => {
   const source = await readFile(
     new URL("../native/linux-ext4-inspector.c", import.meta.url),
@@ -611,6 +1172,47 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   );
   assert.match(source, /"\/proc\/self\/fd\/%d"/u);
   assert.doesNotMatch(source, /execlp?\(/u);
+});
+
+test("existing create-directory preserves read failures apart from proven mismatches", async () => {
+  const source = await readFile(
+    new URL("../native/linux-ext4-inspector.c", import.meta.url),
+    "utf8",
+  );
+  const createStart = source.indexOf(
+    "static int create_private_directory(",
+  );
+  const createEnd = source.indexOf(
+    "static int format_ext4_image(",
+    createStart,
+  );
+  assert(createStart >= 0);
+  assert(createEnd > createStart);
+  const createBody = source.slice(createStart, createEnd);
+  assert.match(
+    createBody,
+    /if \(directory_fd < 0\) \{\s+status = errno == ENOTDIR \? INSPECTOR_EXIT_MISMATCH\s+: classify_path_errno\(errno\);/u,
+  );
+  assert.match(
+    createBody,
+    /status = require_private_policy\(directory_fd, S_IFDIR, DIRECTORY_MODE, 0,\s+created\);\s+if \(status != EXIT_SUCCESS\) goto cleanup;/u,
+  );
+  assert.match(
+    createBody,
+    /if \(fstat\(directory_fd, &metadata\) != 0\) \{\s+status = created \? INSPECTOR_EXIT_OUTCOME_UNCERTAIN\s+: classify_path_errno\(errno\);/u,
+  );
+  assert.match(
+    createBody,
+    /status = require_private_policy\(parent_fd, S_IFDIR, DIRECTORY_MODE, 0,\s+created\);\s+if \(status != EXIT_SUCCESS\)/u,
+  );
+  assert.doesNotMatch(
+    createBody,
+    /status = created \? INSPECTOR_EXIT_OUTCOME_UNCERTAIN\s+: INSPECTOR_EXIT_MISMATCH;/u,
+  );
+  assert.match(
+    createBody,
+    /if \(created && status != EXIT_SUCCESS\) return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;/u,
+  );
 });
 
 test("native formatter harness owns adopted-descendant evidence", async () => {
@@ -1150,6 +1752,31 @@ test("helper exit statuses preserve missing, unreadable, mismatch, and unsupport
       inspectorError(code),
     );
     assert.equal(calls, 1);
+  }
+});
+
+test("existing create-directory read failures do not become path mismatches", async () => {
+  const request = {
+    exclusive: false,
+    operation: "create-directory",
+    parentDevice: "2049",
+    parentInode: "42",
+    path: `${TRUSTED_ROOT}/existing`,
+  };
+  const cases = [
+    [65, "path_mismatch"],
+    [74, "operation_outcome_uncertain"],
+    [77, "operation_outcome_uncertain"],
+  ];
+  for (const [exitCode, code] of cases) {
+    const fixture = createFixture({
+      runHelper: async () =>
+        completion({ exitCode, stdout: Buffer.alloc(0) }),
+    });
+    await assert.rejects(
+      fixture.inspector.runFdOperation(request),
+      inspectorError(code),
+    );
   }
 });
 

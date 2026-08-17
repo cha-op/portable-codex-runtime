@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import crypto, { createHash } from "node:crypto";
 import {
   chmod,
   link,
@@ -13,8 +13,9 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -537,6 +538,107 @@ test("state bytes contain no raw attachment, image, device, or provider authorit
     assert.equal(bytes.includes(authority), false);
   }
 });
+
+test("reserves the native pathname budget for pending state records", () => {
+  const asciiSegments = [
+    ...new Array(19).fill("a".repeat(199)),
+    "a".repeat(214),
+  ];
+  const maximumAsciiRoot = `/${asciiSegments.join("/")}`;
+  const overlongAsciiRoot = `${maximumAsciiRoot}a`;
+  const utf8Segments = [
+    ...new Array(19).fill("é".repeat(100)),
+    `${"é".repeat(97)}a`,
+  ];
+  const maximumUtf8Root = `/${utf8Segments.join("/")}`;
+  const overlongUtf8Root = `${maximumUtf8Root}a`;
+  const pendingSuffix = `/${"f".repeat(64)}.4.json.pending`;
+
+  assert.equal(Buffer.byteLength(pendingSuffix, "utf8"), 80);
+  for (const root of [maximumAsciiRoot, maximumUtf8Root]) {
+    assert.equal(Buffer.byteLength(root, "utf8"), 4_015);
+    assert.equal(Buffer.byteLength(`${root}${pendingSuffix}`, "utf8"), 4_095);
+    assert.equal(
+      isPodmanWriterSupervisorState(
+        createPodmanWriterSupervisorState(exact({ root })),
+      ),
+      true,
+    );
+  }
+  for (const root of [
+    overlongAsciiRoot,
+    overlongUtf8Root,
+    "/state/\ud800",
+  ]) {
+    assert.throws(
+      () => createPodmanWriterSupervisorState(exact({ root })),
+      (error) =>
+        error instanceof PodmanWriterSupervisorStateError &&
+        error.code === "podman_writer_state_invalid",
+    );
+  }
+});
+
+test(
+  "state paths survive post-import crypto and path intrinsic poisoning",
+  { concurrency: false },
+  async (t) => {
+    const { root } = await fixture(t);
+    const initial = record("preparing");
+    const expectedKey = createHash("sha256")
+      .update("portable-codex-runtime:podman-writer-state:v1\0", "utf8")
+      .update(initial.launchAttemptId, "utf8")
+      .digest("hex");
+    const specifications = [
+      [crypto, "createHash"],
+      [path, "dirname"],
+      [path, "isAbsolute"],
+      [path, "resolve"],
+    ];
+    const originals = specifications.map(([target, key]) =>
+      Object.getOwnPropertyDescriptor(target, key)
+    );
+    const poisonCalls = new Map(specifications.map(([, key]) => [key, 0]));
+    try {
+      for (let index = 0; index < specifications.length; index += 1) {
+        const [target, key] = specifications[index];
+        const descriptor = originals[index];
+        assert.equal(typeof descriptor?.value, "function");
+        Object.defineProperty(target, key, {
+          ...descriptor,
+          value() {
+            poisonCalls.set(key, poisonCalls.get(key) + 1);
+            throw new Error(`poisoned node intrinsic: ${key}`);
+          },
+        });
+      }
+      syncBuiltinESMExports();
+      const state = createPodmanWriterSupervisorState(exact({ root }));
+      const claim = await state.claim(exact({ record: initial }));
+      assert.equal(claim.created, true);
+      assert.deepEqual(await readdir(root), [`${expectedKey}.0.json`]);
+      assert.deepEqual(
+        await state.read(exact({ launchAttemptId: initial.launchAttemptId })),
+        initial,
+      );
+    } finally {
+      for (let index = 0; index < specifications.length; index += 1) {
+        Object.defineProperty(
+          specifications[index][0],
+          specifications[index][1],
+          originals[index],
+        );
+      }
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual([...poisonCalls.values()], [0, 0, 0, 0]);
+    const restarted = createPodmanWriterSupervisorState(exact({ root }));
+    assert.deepEqual(
+      await restarted.read(exact({ launchAttemptId: initial.launchAttemptId })),
+      initial,
+    );
+  },
+);
 
 test("rejects malformed records, paths, and state transitions", async (t) => {
   const { root, state } = await fixture(t);
