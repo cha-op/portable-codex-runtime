@@ -75,6 +75,23 @@ async function createPaths() {
   };
 }
 
+async function replaceDirectoryWithDistinctIdentity(path) {
+  const before = await stat(path, { bigint: true });
+  const replacementPath = `${path}-replacement`;
+  await mkdir(replacementPath, { mode: 0o700 });
+  const replacement = await stat(replacementPath, { bigint: true });
+  assert.equal(
+    before.dev !== replacement.dev || before.ino !== replacement.ino,
+    true,
+  );
+  await rmdir(path);
+  await rename(replacementPath, path);
+  const after = await stat(path, { bigint: true });
+  assert.equal(before.dev !== after.dev || before.ino !== after.ino, true);
+  assert.equal(after.dev, replacement.dev);
+  assert.equal(after.ino, replacement.ino);
+}
+
 function createInspector(paths, state, fdCalls, overrides = {}) {
   const loopDevice = overrides.loopDevice ?? LOOP_DEVICE;
   function loopReceipt(status = "present") {
@@ -1305,8 +1322,7 @@ test("ensureAttachmentRoot classifies a stable preexisting identity swap as unsa
         return;
       }
       replaced = true;
-      await rmdir(paths.attachmentRootPath);
-      await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+      await replaceDirectoryWithDistinctIdentity(paths.attachmentRootPath);
     },
   });
   await fixture.driver.provision(provisionRequest(paths));
@@ -1338,8 +1354,7 @@ test("the final proof classifies a preexisting attachment identity swap as unsaf
       }
       attachmentProofs += 1;
       if (attachmentProofs === 2) {
-        await rmdir(paths.attachmentRootPath);
-        await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+        await replaceDirectoryWithDistinctIdentity(paths.attachmentRootPath);
       }
     },
   });
@@ -1623,8 +1638,7 @@ test("attachment observation revalidates current identity at its return boundary
       attachmentProofs += 1;
       if (attachmentProofs === 3) {
         replaced = true;
-        await rmdir(paths.attachmentRootPath);
-        await mkdir(paths.attachmentRootPath, { mode: 0o700 });
+        await replaceDirectoryWithDistinctIdentity(paths.attachmentRootPath);
       }
     },
   });
