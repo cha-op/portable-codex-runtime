@@ -415,6 +415,26 @@ change and does not attest the current head:
   persisted `State.Error`, `ExitCode`, and `ConmonPid` into fixed labels only;
   it never publishes the raw error, container ID, source path, procfd, or stderr and
   does not weaken the production authority-release boundary.
+- Head `770b92d` again passed every job except the bounded rootless Podman
+  integration in Test run `31983924476`. Its exact diagnostic was durable and
+  inspected `created`, non-running with zero PID, plus a non-empty
+  OCI-context `State.Error`, zero exit-code field, and absent `ConmonPid`.
+  Podman 4.9.3 persists an internal `Container.Start` error in that field
+  before releasing the container lock. This proves the internal start path
+  recorded a failure while the supervisor remained pending; it does not alone
+  prove that the direct CLI had closed or that the runner had entered its
+  post-close fail-stop branch. The coarse `oci-other` label does not identify
+  the failed protected operation. The next bounded pass splits the same
+  in-memory error into fixed
+  runtime, operation, and errno allowlists covering procfd, mount propagation,
+  user-namespace mappings, security, cgroup, network, process, and rootfs
+  paths. It also reports only whether Podman recorded a non-empty OCI config
+  path and fixed labels for the optional `OCIRuntime` inspect field and cgroup
+  manager. An absent runtime field can still mean Podman selected its default.
+  Presence proves only that `saveSpec` recorded the path; it does not validate
+  the file or prove that conmon started. Absence narrows the error to an
+  earlier prepare/spec stage. Raw errors, IDs, and paths remain private, and
+  the production launch behavior is unchanged.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

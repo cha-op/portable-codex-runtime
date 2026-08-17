@@ -295,8 +295,28 @@ function containerObservation(
   stateError = "unreadable",
   exitCode = "unreadable",
   conmonPid = "unreadable",
+  errorRuntime = "unreadable",
+  errorOperation = "unreadable",
+  errorErrno = "unreadable",
+  ociConfig = "unreadable",
+  ociRuntime = "unreadable",
+  cgroupManager = "unreadable",
 ) {
-  return { conmonPid, exitCode, inspect, pid, ps, running, stateError };
+  return {
+    cgroupManager,
+    conmonPid,
+    errorErrno,
+    errorOperation,
+    errorRuntime,
+    exitCode,
+    inspect,
+    ociConfig,
+    ociRuntime,
+    pid,
+    ps,
+    running,
+    stateError,
+  };
 }
 
 function classifyStateError(value) {
@@ -349,6 +369,196 @@ function classifyExitCode(value) {
 function classifyProcessIdentifier(value) {
   if (!Number.isSafeInteger(value) || value < 0) return "unreadable";
   return value === 0 ? "zero" : "positive";
+}
+
+function classifyOciRuntime(value) {
+  if (typeof value !== "string" || value === "") return "unreadable";
+  const normalized = value.toLowerCase();
+  if (/(?:^|[^a-z0-9_])crun(?:$|[^a-z0-9_])/u.test(normalized)) {
+    return "crun";
+  }
+  if (/(?:^|[^a-z0-9_])runc(?:$|[^a-z0-9_])/u.test(normalized)) {
+    return "runc";
+  }
+  return "other";
+}
+
+function classifyCgroupManager(value) {
+  if (typeof value !== "string" || value === "") return "unreadable";
+  if (value === "systemd" || value === "cgroupfs") return value;
+  return "other";
+}
+
+function classifyStateErrorAxes(value) {
+  if (typeof value !== "string") {
+    return {
+      errorErrno: "unreadable",
+      errorOperation: "unreadable",
+      errorRuntime: "unreadable",
+    };
+  }
+  const normalized = value.toLowerCase();
+  const crunToken = /(?:^|[^a-z0-9_])crun(?:$|[^a-z0-9_])/u.test(normalized);
+  const runcToken = /(?:^|[^a-z0-9_])runc(?:$|[^a-z0-9_])/u.test(normalized);
+  let errorRuntime = "unknown";
+  if (crunToken) {
+    errorRuntime = "crun";
+  } else if (runcToken) {
+    errorRuntime = "runc";
+  } else if (normalized.includes("conmon")) {
+    errorRuntime = "conmon";
+  } else if (normalized.includes("oci runtime")) {
+    errorRuntime = "oci";
+  } else if (
+    normalized.includes("container creation timeout") ||
+    normalized.includes("container create failed")
+  ) {
+    errorRuntime = "podman";
+  }
+
+  const mentionsProcFd = /\/proc\/(?:self|[1-9][0-9]*)\/fd\/(?:0|[1-9][0-9]*)/u
+    .test(value);
+  let errorOperation = "unknown";
+  if (mentionsProcFd) {
+    errorOperation = "procfd";
+  } else if (
+    normalized.includes("cgroup") ||
+    normalized.includes("controller") ||
+    normalized.includes("sd-bus") ||
+    normalized.includes("systemd unit")
+  ) {
+    errorOperation = "cgroup";
+  } else if (
+    normalized.includes("user namespace") ||
+    normalized.includes("userns") ||
+    normalized.includes("uid_map") ||
+    normalized.includes("gid_map") ||
+    normalized.includes("newuidmap") ||
+    normalized.includes("newgidmap") ||
+    normalized.includes("clone_newuser") ||
+    normalized.includes("setresuid") ||
+    normalized.includes("setresgid") ||
+    normalized.includes("setgroups") ||
+    normalized.includes("uid mapping") ||
+    normalized.includes("gid mapping") ||
+    normalized.includes("invalid mapping specified") ||
+    normalized.includes("relative mapping") ||
+    normalized.includes("no mappings found")
+  ) {
+    errorOperation = "userns";
+  } else if (
+    /(?:^|[^a-z0-9_])setns(?:$|[^a-z0-9_])/u.test(normalized) ||
+    /(?:^|[^a-z0-9_])unshare(?:$|[^a-z0-9_])/u.test(normalized) ||
+    normalized.includes("invalid namespace type")
+  ) {
+    errorOperation = "namespace";
+  } else if (
+    normalized.includes("seccomp") ||
+    normalized.includes("apparmor") ||
+    normalized.includes("selinux") ||
+    normalized.includes("keyring") ||
+    normalized.includes("no-new-privileges") ||
+    normalized.includes("no new privs") ||
+    normalized.includes("capset") ||
+    normalized.includes("capabilit") ||
+    normalized.includes("/attr/")
+  ) {
+    errorOperation = "security";
+  } else if (
+    normalized.includes("network namespace") ||
+    normalized.includes("netns") ||
+    normalized.includes("slirp") ||
+    normalized.includes("pasta") ||
+    normalized.includes("netavark") ||
+    normalized.includes("cni")
+  ) {
+    errorOperation = "network";
+  } else if (
+    normalized.includes("exec container process") ||
+    normalized.includes("chdir to `/session`") ||
+    normalized.includes("executable") ||
+    normalized.includes("working directory") ||
+    normalized.includes("oom_score_adj")
+  ) {
+    errorOperation = "process";
+  } else if (
+    normalized.includes("rootfs") ||
+    normalized.includes("pivot_root") ||
+    normalized.includes("chroot") ||
+    normalized.includes("fchdir") ||
+    normalized.includes("chdir to ") ||
+    normalized.includes("oldroot")
+  ) {
+    errorOperation = "rootfs";
+  } else if (
+    /(?:^|[^a-z0-9_])mount(?:$|[^a-z0-9_])/u.test(normalized) ||
+    normalized.includes("set propagation for") ||
+    normalized.includes("rootfs propagation") ||
+    normalized.includes("mount_setattr") ||
+    normalized.includes("mounting ") ||
+    normalized.includes("remount") ||
+    /(?:^|[^a-z0-9_])umount(?:$|[^a-z0-9_])/u.test(normalized) ||
+    (normalized.includes("make `") && normalized.includes("` private")) ||
+    normalized.includes("open_tree") ||
+    normalized.includes("fsmount") ||
+    normalized.includes("fsopen") ||
+    normalized.includes("move_mount")
+  ) {
+    errorOperation = "mount";
+  } else if (
+    normalized.includes("openat2") ||
+    normalized.includes("cannot resolve") ||
+    normalized.includes("statfs") ||
+    normalized.includes("open mount target")
+  ) {
+    errorOperation = "path";
+  } else if (
+    normalized.includes("no logs from conmon") ||
+    normalized.includes("conmon bytes") ||
+    normalized.includes("sync pipe") ||
+    normalized.includes("init process")
+  ) {
+    errorOperation = "conmon-sync";
+  } else if (
+    normalized.includes("container create") ||
+    normalized.includes("container creation")
+  ) {
+    errorOperation = "create";
+  }
+
+  let errorErrno = normalized === "" ? "none" : "unknown";
+  if (normalized.includes("permission denied")) {
+    errorErrno = "eacces";
+  } else if (normalized.includes("operation not permitted")) {
+    errorErrno = "eperm";
+  } else if (normalized.includes("no such file or directory")) {
+    errorErrno = "enoent";
+  } else if (normalized.includes("not a directory")) {
+    errorErrno = "enotdir";
+  } else if (normalized.includes("invalid argument")) {
+    errorErrno = "einval";
+  } else if (normalized.includes("bad file descriptor")) {
+    errorErrno = "ebadf";
+  } else if (normalized.includes("device or resource busy")) {
+    errorErrno = "ebusy";
+  } else if (normalized.includes("read-only file system")) {
+    errorErrno = "erofs";
+  } else if (normalized.includes("operation not supported")) {
+    errorErrno = "enotsup";
+  } else if (normalized.includes("no space left on device")) {
+    errorErrno = "enospc";
+  } else if (normalized.includes("function not implemented")) {
+    errorErrno = "enosys";
+  } else if (normalized.includes("invalid cross-device link")) {
+    errorErrno = "exdev";
+  } else if (normalized.includes("too many levels of symbolic links")) {
+    errorErrno = "eloop";
+  } else if (normalized.includes("cannot allocate memory")) {
+    errorErrno = "enomem";
+  } else if (normalized.includes("container creation timeout")) {
+    errorErrno = "timeout";
+  }
+  return { errorErrno, errorOperation, errorRuntime };
 }
 
 async function observeUniqueImageContainer() {
@@ -458,6 +668,18 @@ async function observeUniqueImageContainer() {
   ) {
     return containerObservation("unique", "unreadable");
   }
+  const ociConfigPathDescriptor = Object.getOwnPropertyDescriptor(
+    inspectedContainer,
+    "OCIConfigPath",
+  );
+  const ociRuntimeDescriptor = Object.getOwnPropertyDescriptor(
+    inspectedContainer,
+    "OCIRuntime",
+  );
+  const hostConfigDescriptor = Object.getOwnPropertyDescriptor(
+    inspectedContainer,
+    "HostConfig",
+  );
   const statusDescriptor = Object.getOwnPropertyDescriptor(
     stateDescriptor.value,
     "Status",
@@ -514,10 +736,12 @@ async function observeUniqueImageContainer() {
     default:
       if (statusReadable) inspect = "other-state";
   }
-  const stateError = errorDescriptor !== undefined &&
+  const stateErrorValue = errorDescriptor !== undefined &&
       Object.hasOwn(errorDescriptor, "value")
-    ? classifyStateError(errorDescriptor.value)
-    : "unreadable";
+    ? errorDescriptor.value
+    : undefined;
+  const stateError = classifyStateError(stateErrorValue);
+  const stateErrorAxes = classifyStateErrorAxes(stateErrorValue);
   const exitCode = exitCodeDescriptor !== undefined &&
       Object.hasOwn(exitCodeDescriptor, "value")
     ? classifyExitCode(exitCodeDescriptor.value)
@@ -530,6 +754,36 @@ async function observeUniqueImageContainer() {
     : (Object.hasOwn(conmonPidDescriptor, "value")
       ? classifyProcessIdentifier(conmonPidDescriptor.value)
       : "unreadable");
+  const ociConfig = ociConfigPathDescriptor === undefined
+    ? "absent"
+    : (Object.hasOwn(ociConfigPathDescriptor, "value") &&
+        typeof ociConfigPathDescriptor.value === "string" &&
+        ociConfigPathDescriptor.value !== ""
+      ? "present"
+      : "unreadable");
+  const ociRuntime = ociRuntimeDescriptor === undefined
+    ? "absent"
+    : (Object.hasOwn(ociRuntimeDescriptor, "value")
+      ? classifyOciRuntime(ociRuntimeDescriptor.value)
+      : "unreadable");
+  let cgroupManager = "unreadable";
+  if (
+    hostConfigDescriptor !== undefined &&
+    Object.hasOwn(hostConfigDescriptor, "value") &&
+    hostConfigDescriptor.value !== null &&
+    typeof hostConfigDescriptor.value === "object" &&
+    !Array.isArray(hostConfigDescriptor.value)
+  ) {
+    const managerDescriptor = Object.getOwnPropertyDescriptor(
+      hostConfigDescriptor.value,
+      "CgroupManager",
+    );
+    cgroupManager = managerDescriptor === undefined
+      ? "absent"
+      : (Object.hasOwn(managerDescriptor, "value")
+        ? classifyCgroupManager(managerDescriptor.value)
+        : "unreadable");
+  }
   return containerObservation(
     "unique",
     inspect,
@@ -538,6 +792,12 @@ async function observeUniqueImageContainer() {
     stateError,
     exitCode,
     conmonPid,
+    stateErrorAxes.errorRuntime,
+    stateErrorAxes.errorOperation,
+    stateErrorAxes.errorErrno,
+    ociConfig,
+    ociRuntime,
+    cgroupManager,
   );
 }
 
@@ -592,6 +852,101 @@ test("watchdog state-error classification stays fixed and redacted", () => {
   assert.equal(classifyExitCode(0), "zero");
   assert.equal(classifyExitCode(1), "nonzero");
   assert.equal(classifyExitCode(2_147_483_648), "unreadable");
+  assert.equal(classifyOciRuntime("/usr/bin/crun"), "crun");
+  assert.equal(classifyOciRuntime("runc"), "runc");
+  assert.equal(classifyOciRuntime("output truncated"), "other");
+  assert.equal(classifyCgroupManager("systemd"), "systemd");
+  assert.equal(classifyCgroupManager("cgroupfs"), "cgroupfs");
+  assert.equal(classifyCgroupManager("custom"), "other");
+  const axisCases = [
+    [
+      "crun: mount /proc/123/fd/7 to /session: invalid argument: OCI runtime error",
+      ["crun", "procfd", "einval"],
+    ],
+    [
+      "crun: mount /safe/source to /session: invalid argument",
+      ["crun", "mount", "einval"],
+    ],
+    [
+      "crun: set propagation for /session: invalid argument",
+      ["crun", "mount", "einval"],
+    ],
+    [
+      "crun: cannot setresuid to 1000: invalid argument",
+      ["crun", "userns", "einval"],
+    ],
+    [
+      "crun: invalid mapping specified: invalid argument",
+      ["crun", "userns", "einval"],
+    ],
+    [
+      "crun: unshare (CLONE_NEWUSER): invalid argument",
+      ["crun", "userns", "einval"],
+    ],
+    [
+      "crun: setgroups failed: operation not permitted",
+      ["crun", "userns", "eperm"],
+    ],
+    ["crun: setns failed", ["crun", "namespace", "unknown"]],
+    [
+      "crun: requested cgroup controller cpu is not available",
+      ["crun", "cgroup", "unknown"],
+    ],
+    [
+      "crun: create keyring: operation not permitted",
+      ["crun", "security", "eperm"],
+    ],
+    [
+      "crun: capset failed: operation not permitted",
+      ["crun", "security", "eperm"],
+    ],
+    [
+      "runc: exec container process: permission denied",
+      ["runc", "process", "eacces"],
+    ],
+    [
+      "crun: chdir to `/session`: not a directory",
+      ["crun", "process", "enotdir"],
+    ],
+    [
+      "crun: chdir to newroot: not a directory",
+      ["crun", "rootfs", "enotdir"],
+    ],
+    [
+      "container create failed (no logs from conmon): EOF",
+      ["conmon", "conmon-sync", "unknown"],
+    ],
+    ["container creation timeout: internal error", ["podman", "create", "timeout"]],
+    ["OCI runtime error", ["oci", "unknown", "unknown"]],
+    ["output truncated", ["unknown", "unknown", "unknown"]],
+    ["crun: feature is not supported", ["crun", "unknown", "unknown"]],
+    [
+      "crun: cgroup mount /proc/123/fd/7: invalid argument",
+      ["crun", "procfd", "einval"],
+    ],
+    ["crun: cgroup mount failed", ["crun", "cgroup", "unknown"]],
+    ["crun: move_mount: function not implemented", ["crun", "mount", "enosys"]],
+    ["crun: remount: invalid cross-device link", ["crun", "mount", "exdev"]],
+    [
+      "crun: make `/private/root` private: invalid argument",
+      ["crun", "mount", "einval"],
+    ],
+    [
+      "crun: umount /private/root: device or resource busy",
+      ["crun", "mount", "ebusy"],
+    ],
+    ["", ["unknown", "unknown", "none"]],
+  ];
+  for (const [inputValue, expected] of axisCases) {
+    const axes = classifyStateErrorAxes(inputValue);
+    assert.deepEqual(
+      [axes.errorRuntime, axes.errorOperation, axes.errorErrno],
+      expected,
+    );
+  }
+  const sensitiveError =
+    `crun: mount /proc/123/fd/7 to /session for ${"a".repeat(64)}: invalid argument`;
+  const sensitiveAxes = classifyStateErrorAxes(sensitiveError);
   const redactedObservation = containerObservation(
     "unique",
     "created",
@@ -602,8 +957,18 @@ test("watchdog state-error classification stays fixed and redacted", () => {
     ),
     "nonzero",
     "positive",
+    sensitiveAxes.errorRuntime,
+    sensitiveAxes.errorOperation,
+    sensitiveAxes.errorErrno,
+    "present",
+    "crun",
+    "systemd",
   );
-  assert.equal(JSON.stringify(redactedObservation).includes("/proc/"), false);
+  const serializedObservation = JSON.stringify(redactedObservation);
+  assert.equal(serializedObservation.includes("/proc/"), false);
+  assert.equal(serializedObservation.includes("/session"), false);
+  assert.equal(serializedObservation.includes("a".repeat(64)), false);
+  assert.equal(serializedObservation.includes("invalid argument"), false);
 });
 
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
@@ -646,6 +1011,12 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
               `durableStatus=${durableStatus} imagePs=${observed.ps} ` +
               `imageInspect=${observed.inspect} running=${observed.running} ` +
               `pid=${observed.pid} stateError=${observed.stateError} ` +
+              `errorRuntime=${observed.errorRuntime} ` +
+              `errorOperation=${observed.errorOperation} ` +
+              `errorErrno=${observed.errorErrno} ` +
+              `ociConfig=${observed.ociConfig} ` +
+              `ociRuntime=${observed.ociRuntime} ` +
+              `cgroupManager=${observed.cgroupManager} ` +
               `exitCode=${observed.exitCode} conmonPid=${observed.conmonPid}`,
           );
         } catch {
@@ -654,7 +1025,11 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
             `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
               "durableStatus=probe-error imagePs=probe-error " +
               "imageInspect=probe-error running=unreadable pid=unreadable " +
-              "stateError=unreadable exitCode=unreadable conmonPid=unreadable",
+              "stateError=unreadable errorRuntime=unreadable " +
+              "errorOperation=unreadable errorErrno=unreadable " +
+              "ociConfig=unreadable ociRuntime=unreadable " +
+              "cgroupManager=unreadable " +
+              "exitCode=unreadable conmonPid=unreadable",
           );
         }
       })();
@@ -665,7 +1040,11 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
         `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
           "durableStatus=probe-timeout imagePs=probe-timeout " +
           "imageInspect=probe-timeout running=unreadable pid=unreadable " +
-          "stateError=unreadable exitCode=unreadable conmonPid=unreadable",
+          "stateError=unreadable errorRuntime=unreadable " +
+          "errorOperation=unreadable errorErrno=unreadable " +
+          "ociConfig=unreadable ociRuntime=unreadable " +
+          "cgroupManager=unreadable " +
+          "exitCode=unreadable conmonPid=unreadable",
       );
     }, WATCHDOG_HARD_BACKSTOP_MILLISECONDS);
   };
