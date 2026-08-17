@@ -600,6 +600,22 @@ change and does not attest the current head:
   drains adopted group children to `ECHILD` plus PGID `ESRCH` under one bounded
   test deadline. A forced pre-publication failure proves this cleanup without
   sending a deliverable signal after the leader has been reaped.
+- The following current-head GitHub review found three remaining pre-admission
+  bounds. Ext4 path derivation now uses module-load-captured `node:path`
+  helpers and proves every generated path is a direct child of its canonical
+  parent. New-provision admission reserves enough of the 4095-byte native
+  pathname domain for both mandatory `data-<48hex>` and
+  `generation-<48hex>` children, so an unusable storage record cannot be
+  prepared merely because its mount path alone fits. Legacy prepared and
+  committed provision operations, plus cold-open state, retain plan
+  reconstruction without retroactive invalidation. Provider-state
+  canonicalization also rejects a string whose
+  UTF-16 length exceeds the remaining 768 KiB canonical budget before either
+  UTF-8 encoding or JSON serialization. Exact 4095/4096 attachment-child
+  boundaries, post-import path-helper replacement, and 1 MiB request/result
+  strings now fail or succeed before the relevant durable mutation boundary;
+  these checks protect lexical containment and bounded allocation without
+  treating filesystem metadata drift as mutation.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

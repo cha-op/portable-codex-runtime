@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -953,6 +954,112 @@ test("maximum canonical request and result fit commit and checkpoint frames", as
     stateError("invalid_request"),
   );
 });
+
+test(
+  "rejects oversized canonical strings before UTF-8 encoding or durable state",
+  { concurrency: false },
+  async (t) => {
+    const fixture = await createFixture(t);
+    const fromDescriptor = Object.getOwnPropertyDescriptor(Buffer, "from");
+    assert.equal(typeof fromDescriptor?.value, "function");
+    const firstAggregatePayload = "a".repeat(400 * 1024);
+    const remainingBudgetPayload = "b".repeat(400 * 1024);
+    let oversizedStringEncodings = 0;
+    let remainingBudgetStringEncodings = 0;
+    Object.defineProperty(Buffer, "from", {
+      ...fromDescriptor,
+      value(value, ...args) {
+        if (typeof value === "string" && value.length > 768 * 1024) {
+          oversizedStringEncodings += 1;
+        }
+        if (value === remainingBudgetPayload) {
+          remainingBudgetStringEncodings += 1;
+        }
+        return Reflect.apply(fromDescriptor.value, this, [value, ...args]);
+      },
+    });
+    try {
+      const providerModule = await import(
+        "../src/filesystem-image-provider-state.mjs?oversized-string-bound-test"
+      );
+      const state = new providerModule.FilesystemImageProviderState({
+        acquireLock: fixture.acquireLock,
+        directory: fixture.directory,
+        headAnchor: fixture.headAnchor,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+      const oversizedPayload = "x".repeat(1024 * 1024);
+      await assert.rejects(
+        state.prepareOperation({
+          kind: "provision",
+          operationId: "operation-oversized-string-001",
+          request: { payload: oversizedPayload },
+          storageId: "storage-001",
+        }),
+        (error) =>
+          error instanceof providerModule.FilesystemImageProviderStateError &&
+          error.code === "invalid_request" &&
+          error.commitState === "not-committed" &&
+          error.retryable === false,
+      );
+      assert.equal(oversizedStringEncodings, 0);
+      assert.equal(fixture.headAnchorTracker.advances, 0);
+      await assert.rejects(readFile(fixture.ledgerPath), { code: "ENOENT" });
+
+      await assert.rejects(
+        state.prepareOperation({
+          kind: "provision",
+          operationId: "operation-aggregate-string-budget-002",
+          request: {
+            first: firstAggregatePayload,
+            second: remainingBudgetPayload,
+          },
+          storageId: "storage-001",
+        }),
+        (error) =>
+          error instanceof providerModule.FilesystemImageProviderStateError &&
+          error.code === "invalid_request" &&
+          error.commitState === "not-committed" &&
+          error.retryable === false,
+      );
+      assert.equal(remainingBudgetStringEncodings, 0);
+      assert.equal(fixture.headAnchorTracker.advances, 0);
+      await assert.rejects(readFile(fixture.ledgerPath), { code: "ENOENT" });
+
+      const request = operationRequest("provision", "storage-002");
+      await state.prepareOperation({
+        kind: "provision",
+        operationId: "operation-oversized-result-002",
+        request,
+        storageId: "storage-002",
+      });
+      const ledgerBefore = await readFile(fixture.ledgerPath);
+      const advancesBefore = fixture.headAnchorTracker.advances;
+      await assert.rejects(
+        state.commitOperation({
+          operationId: "operation-oversized-result-002",
+          request,
+          result: { payload: oversizedPayload },
+          storageState: storageState({
+            mount: mount("storage-002"),
+            storageId: "storage-002",
+          }),
+        }),
+        (error) =>
+          error instanceof providerModule.FilesystemImageProviderStateError &&
+          error.code === "invalid_request" &&
+          error.commitState === "not-committed" &&
+          error.retryable === false,
+      );
+      assert.deepEqual(await readFile(fixture.ledgerPath), ledgerBefore);
+      assert.equal(fixture.headAnchorTracker.advances, advancesBefore);
+    } finally {
+      Object.defineProperty(Buffer, "from", fromDescriptor);
+    }
+    assert.equal(oversizedStringEncodings, 0);
+    assert.equal(remainingBudgetStringEncodings, 0);
+  },
+);
 
 test("rotation resolves CAS old, new acknowledgement loss, and unknown readback", async (t) => {
   await t.test("CAS old cleans the candidate and permits retry", async (t) => {

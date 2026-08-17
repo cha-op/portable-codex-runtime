@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import test from "node:test";
 
 import {
   EXT4_FILESYSTEM_IMAGE_PATHS_CONTRACT_VERSION,
   Ext4FilesystemImagePathsError,
+  assertExt4FilesystemImageMountPathCapacity,
   createExt4FilesystemImagePaths,
 } from "../src/ext4-filesystem-image-paths.mjs";
 import {
@@ -204,6 +207,190 @@ test("accepts a generated 4095-byte path and rejects a 4096-byte path", () => {
     pathsError("invalid_ext4_filesystem_image_path_request"),
   );
 });
+
+test("provisioning reserves the native path budget for attachment children", () => {
+  const createWithMountRootLength = (rootBytes) =>
+    createExt4FilesystemImagePaths({
+      archiveRoot: "/var/lib/portable-codex-runtime/archive",
+      backendId: BACKEND_ID,
+      imageRoot: "/var/lib/portable-codex-runtime/images",
+      mountRoot: `/${"m".repeat(rootBytes - 1)}`,
+    });
+
+  const maximumPaths = createWithMountRootLength(3970);
+  const maximumPlan = maximumPaths.planProvision(provisionRequest());
+  assert.equal(
+    assertExt4FilesystemImageMountPathCapacity(maximumPlan.mountPath),
+    maximumPlan.mountPath,
+  );
+  const maximumRestore = maximumPaths.planRestoreDestination(
+    mutation("restore", maximumPlan.storageId),
+  );
+  const maximumAttachment = maximumPaths.planWritableAttachment(
+    mutation("attach", maximumPlan.storageId),
+  );
+  assert.equal(Buffer.byteLength(maximumPlan.mountPath, "utf8"), 4035);
+  assert.equal(
+    Buffer.byteLength(maximumRestore.destinationDirectory, "utf8"),
+    4095,
+  );
+  assert.equal(
+    Buffer.byteLength(maximumAttachment.attachmentRootPath, "utf8"),
+    4089,
+  );
+
+  const oversizedPaths = createWithMountRootLength(3971);
+  const oversizedPlan = oversizedPaths.planProvision(provisionRequest());
+  assert.equal(Buffer.byteLength(oversizedPlan.mountPath, "utf8"), 4036);
+  assert.throws(
+    () =>
+      assertExt4FilesystemImageMountPathCapacity(oversizedPlan.mountPath),
+    pathsError("invalid_ext4_filesystem_image_path_request"),
+  );
+});
+
+test(
+  "captures path helpers before deriving storage-owned paths",
+  { concurrency: false },
+  () => {
+    const functionNames = [
+      "basename",
+      "dirname",
+      "isAbsolute",
+      "join",
+      "parse",
+      "resolve",
+    ];
+    const descriptors = Object.fromEntries(
+      [...functionNames, "sep"].map((name) => [
+        name,
+        Object.getOwnPropertyDescriptor(path, name),
+      ]),
+    );
+    const poisonCalls = Object.fromEntries(
+      functionNames.map((name) => [name, 0]),
+    );
+    const targetsPathDerivation = (value) =>
+      typeof value === "string" &&
+      (value.startsWith("/var/lib/portable-codex-runtime/") ||
+        value.startsWith("/run/portable-codex-runtime/"));
+    for (const name of functionNames) {
+      assert.equal(typeof descriptors[name]?.value, "function");
+    }
+    assert.equal(typeof descriptors.sep?.value, "string");
+    try {
+      for (const name of functionNames) {
+        const descriptor = descriptors[name];
+        Object.defineProperty(path, name, {
+          ...descriptor,
+          value(...args) {
+            if (args.some(targetsPathDerivation)) poisonCalls[name] += 1;
+            return Reflect.apply(descriptor.value, this, args);
+          },
+        });
+      }
+      Object.defineProperty(path, "sep", {
+        ...descriptors.sep,
+        value: "!",
+      });
+      syncBuiltinESMExports();
+
+      assert.throws(
+        () =>
+          createExt4FilesystemImagePaths({
+            archiveRoot: "/var/lib/portable-codex-runtime/nested-root",
+            backendId: BACKEND_ID,
+            imageRoot:
+              "/var/lib/portable-codex-runtime/nested-root/images",
+            mountRoot: "/run/portable-codex-runtime/mounts",
+          }),
+        pathsError("invalid_ext4_filesystem_image_path_options"),
+      );
+      const paths = fixture();
+      const provision = paths.planProvision(provisionRequest());
+      const attachment = paths.planWritableAttachment(
+        mutation("attach", provision.storageId),
+      );
+      const restore = paths.planRestoreDestination(
+        mutation("restore", provision.storageId),
+      );
+      const artifact = paths.resolveArtifactPaths({
+        checkpoint: checkpoint(),
+        request: mutation("checkpoint", provision.storageId),
+      });
+      assert.equal(
+        assertExt4FilesystemImageMountPathCapacity(provision.mountPath),
+        provision.mountPath,
+      );
+      const attachRequest = mutation("attach", provision.storageId);
+      const restoredRoot = `${provision.mountPath}/generation-${"a".repeat(48)}`;
+      const source = paths.resolveSourceOwnedRoot({
+        canonicalAttachment: {
+          attachmentId: attachRequest.target.attachmentId,
+          backendId: attachRequest.backendId,
+          contractVersion: attachRequest.contractVersion,
+          fencingEpoch: attachRequest.fencingEpoch,
+          holderId: attachRequest.holderId,
+          kind: "directory",
+          leaseId: attachRequest.leaseId,
+          mode: "read-write",
+          operationId: attachRequest.operationId,
+          proofId: "proof-hostile-path-001",
+          rootPath: restoredRoot,
+          sessionId: attachRequest.sessionId,
+          storageId: attachRequest.storageId,
+        },
+        checkpoint: checkpoint(),
+        request: mutation("checkpoint", provision.storageId),
+      });
+      assert.equal(
+        provision.imagePath.startsWith(
+          "/var/lib/portable-codex-runtime/images/",
+        ),
+        true,
+      );
+      assert.equal(
+        provision.mountPath.startsWith(
+          "/run/portable-codex-runtime/mounts/",
+        ),
+        true,
+      );
+      assert.equal(
+        attachment.attachmentRootPath.startsWith(
+          `${provision.mountPath}/data-`,
+        ),
+        true,
+      );
+      assert.equal(
+        restore.destinationDirectory.startsWith(
+          `${provision.mountPath}/generation-`,
+        ),
+        true,
+      );
+      assert.equal(
+        artifact.artifactDirectory.startsWith(
+          "/var/lib/portable-codex-runtime/archive/artifact-",
+        ),
+        true,
+      );
+      assert.equal(source.sourceOwnedRoot, provision.mountPath);
+      assert.equal(source.sourceDirectory, restoredRoot);
+    } finally {
+      for (const name of [...functionNames, "sep"]) {
+        Object.defineProperty(path, name, descriptors[name]);
+      }
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(poisonCalls, {
+      basename: 0,
+      dirname: 0,
+      isAbsolute: 0,
+      join: 0,
+      parse: 0,
+      resolve: 0,
+    });
+  },
+);
 
 test("maps attachment and restore destinations to one storage-owned mount root", () => {
   const paths = fixture();

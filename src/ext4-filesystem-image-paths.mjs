@@ -34,6 +34,13 @@ const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectPrototype = Object.prototype;
+const pathBasenameIntrinsic = basename;
+const pathDirnameIntrinsic = dirname;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathJoinIntrinsic = join;
+const pathParseIntrinsic = parse;
+const pathResolveIntrinsic = resolve;
+const pathSeparator = sep;
 const reflectOwnKeys = Reflect.ownKeys;
 const reflectApply = Reflect.apply;
 const regexpTestIntrinsic = RegExp.prototype.test;
@@ -55,6 +62,8 @@ const UUID_PATTERN =
 const RESTORED_ATTACHMENT_NAME_PATTERN = /^generation-[0-9a-f]{48}$/u;
 const CONTROL_PATTERN = /[\u0000-\u001f\u007f]/u;
 const MAX_PATH_BYTES = 4095;
+const DATA_CHILD_CAPACITY_NAME = `data-${"0".repeat(48)}`;
+const RESTORE_CHILD_CAPACITY_NAME = `generation-${"0".repeat(48)}`;
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_ext4_filesystem_image_path_options:
@@ -141,10 +150,10 @@ function canonicalPath(value, code) {
   ensure(
     encoded.length <= MAX_PATH_BYTES &&
       reflectApply(bufferToStringIntrinsic, encoded, ["utf8"]) === value &&
-      isAbsolute(value) &&
-      resolve(value) === value &&
-      value !== parse(value).root &&
-      !reflectApply(stringEndsWithIntrinsic, value, [sep]),
+      reflectApply(pathIsAbsoluteIntrinsic, undefined, [value]) &&
+      reflectApply(pathResolveIntrinsic, undefined, [value]) === value &&
+      value !== reflectApply(pathParseIntrinsic, undefined, [value]).root &&
+      !reflectApply(stringEndsWithIntrinsic, value, [pathSeparator]),
     code,
   );
   return value;
@@ -158,10 +167,35 @@ function boundedPath(value, code) {
   return canonicalPath(value, code);
 }
 
+function directChildPath(parent, childName, code) {
+  const child = boundedPath(
+    reflectApply(pathJoinIntrinsic, undefined, [parent, childName]),
+    code,
+  );
+  ensure(
+    reflectApply(pathDirnameIntrinsic, undefined, [child]) === parent,
+    code,
+  );
+  return child;
+}
+
+function assertMountPathAttachmentCapacity(mountPath, code) {
+  directChildPath(mountPath, DATA_CHILD_CAPACITY_NAME, code);
+  directChildPath(mountPath, RESTORE_CHILD_CAPACITY_NAME, code);
+  return mountPath;
+}
+
+export function assertExt4FilesystemImageMountPathCapacity(value) {
+  const code = "invalid_ext4_filesystem_image_path_request";
+  return assertMountPathAttachmentCapacity(canonicalPath(value, code), code);
+}
+
 function pathContains(parent, child) {
   return (
     child === parent ||
-    reflectApply(stringStartsWithIntrinsic, child, [`${parent}${sep}`])
+    reflectApply(stringStartsWithIntrinsic, child, [
+      `${parent}${pathSeparator}`,
+    ])
   );
 }
 
@@ -270,9 +304,10 @@ export function createExt4FilesystemImagePaths(...args) {
     ensure(request.backendId === backendId, requestCode);
     const storageId = storageIdForSession(request.sessionId);
     const token = storageToken(backendId, storageId);
+    const mountPath = directChildPath(mountRoot, token, requestCode);
     return exactFrozenRecord({
-      imagePath: boundedPath(join(imageRoot, `${token}.ext4`), requestCode),
-      mountPath: boundedPath(join(mountRoot, token), requestCode),
+      imagePath: directChildPath(imageRoot, `${token}.ext4`, requestCode),
+      mountPath,
       storageId,
     });
   });
@@ -292,17 +327,15 @@ export function createExt4FilesystemImagePaths(...args) {
         requestCode,
       );
       const token = storageToken(backendId, request.storageId);
+      const mountPath = directChildPath(mountRoot, token, requestCode);
       return exactFrozenRecord({
-        attachmentRootPath: boundedPath(
-          join(
-            mountRoot,
-            token,
-            `data-${digest(["data-root", backendId, request.storageId]).slice(0, 48)}`,
-          ),
+        attachmentRootPath: directChildPath(
+          mountPath,
+          `data-${digest(["data-root", backendId, request.storageId]).slice(0, 48)}`,
           requestCode,
         ),
-        imagePath: boundedPath(join(imageRoot, `${token}.ext4`), requestCode),
-        mountPath: boundedPath(join(mountRoot, token), requestCode),
+        imagePath: directChildPath(imageRoot, `${token}.ext4`, requestCode),
+        mountPath,
         storageId: request.storageId,
       });
     },
@@ -324,19 +357,18 @@ export function createExt4FilesystemImagePaths(...args) {
       );
       const storageId = request.storageId;
       const token = storageToken(backendId, storageId);
-      const destinationOwnedRoot = boundedPath(
-        join(mountRoot, token),
+      const destinationOwnedRoot = directChildPath(
+        mountRoot,
+        token,
         requestCode,
       );
       return exactFrozenRecord({
-        destinationDirectory: boundedPath(
-          join(
-            destinationOwnedRoot,
-            `generation-${digest([
-              "restore-operation",
-              request.operationId,
-            ]).slice(0, 48)}`,
-          ),
+        destinationDirectory: directChildPath(
+          destinationOwnedRoot,
+          `generation-${digest([
+            "restore-operation",
+            request.operationId,
+          ]).slice(0, 48)}`,
           requestCode,
         ),
         destinationOwnedRoot,
@@ -361,8 +393,9 @@ export function createExt4FilesystemImagePaths(...args) {
       checkpoint.checkpointId,
     ]);
     return exactFrozenRecord({
-      artifactDirectory: boundedPath(
-        join(archiveRoot, `artifact-${token.slice(0, 48)}`),
+      artifactDirectory: directChildPath(
+        archiveRoot,
+        `artifact-${token.slice(0, 48)}`,
         requestCode,
       ),
       artifactOwnedRoot: archiveRoot,
@@ -393,19 +426,24 @@ export function createExt4FilesystemImagePaths(...args) {
           attachment.storageId === request.storageId,
         requestCode,
       );
-      const expectedOwnedRoot = join(
+      const expectedOwnedRoot = directChildPath(
         mountRoot,
         storageToken(backendId, attachment.storageId),
+        requestCode,
       );
-      const expectedSourceDirectory = join(
+      const expectedSourceDirectory = directChildPath(
         expectedOwnedRoot,
         `data-${digest(["data-root", backendId, attachment.storageId]).slice(0, 48)}`,
+        requestCode,
       );
       ensure(
-        dirname(attachment.rootPath) === expectedOwnedRoot &&
+        reflectApply(pathDirnameIntrinsic, undefined, [attachment.rootPath]) ===
+          expectedOwnedRoot &&
           (attachment.rootPath === expectedSourceDirectory ||
             reflectApply(regexpTestIntrinsic, RESTORED_ATTACHMENT_NAME_PATTERN, [
-              basename(attachment.rootPath),
+              reflectApply(pathBasenameIntrinsic, undefined, [
+                attachment.rootPath,
+              ]),
             ])),
         requestCode,
       );

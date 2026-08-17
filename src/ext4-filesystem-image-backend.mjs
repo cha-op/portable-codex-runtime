@@ -5,6 +5,7 @@ import { types as utilTypes } from "node:util";
 
 import {
   EXT4_FILESYSTEM_IMAGE_PATHS_CONTRACT_VERSION,
+  assertExt4FilesystemImageMountPathCapacity,
 } from "./ext4-filesystem-image-paths.mjs";
 import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
@@ -62,6 +63,8 @@ const stateReadStorageIntrinsic =
 const stateReadStorageByMountPathIntrinsic =
   FilesystemImageProviderState.prototype.readStorageByMountPath;
 const stateSnapshotIntrinsic = FilesystemImageProviderState.prototype.snapshot;
+const assertMountPathCapacityIntrinsic =
+  assertExt4FilesystemImageMountPathCapacity;
 const abortSignalAbortedGetter = objectGetOwnPropertyDescriptorIntrinsic(
   AbortSignal.prototype,
   "aborted",
@@ -1133,6 +1136,22 @@ export function createExt4FilesystemImageBackend(...args) {
     );
     ensure(request.backendId === backendId, "invalid_request");
     const plan = callPath("planProvision", request);
+    const existing = await callState(
+      stateReadOperationIntrinsic,
+      exactFrozenRecord({
+        operationId: request.operationId,
+        request,
+      }),
+    );
+    if (existing === null) {
+      try {
+        callIntrinsic(assertMountPathCapacityIntrinsic, undefined, [
+          plan.mountPath,
+        ]);
+      } catch {
+        fail("invalid_request");
+      }
+    }
     const prepared = await committedOrPrepared(
       "provision",
       request.operationId,

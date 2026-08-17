@@ -46,6 +46,10 @@ The physical implementation remains split into small authorities:
   prepared or committed operation and one storage revision. Its versioned
   checkpoint and bounded per-generation delta log are checked against an
   external monotonic v2 head before every mutation or maintenance rotation.
+  Canonical strings are rejected by a conservative UTF-16 code-unit bound
+  against the remaining 768 KiB canonical budget before UTF-8 encoding or JSON
+  serialization, so an oversized request or result cannot force an unbounded
+  precursor allocation before durable-state admission rejects it.
 - `Ext4FilesystemImageBackend` binds the driver and state machine to the raw
   storage lifecycle, restore-attachment, reconciliation, and destination
   resolver contracts. `createInitializedExt4FilesystemImageBackend()` gates
@@ -89,6 +93,17 @@ The persistent tuple survives clean unmount, host transfer, and remount.
 or File Provider-style materialization are therefore not object replacement.
 A different filesystem UUID, file-handle identity, or held/path descriptor is
 replacement and fails closed.
+
+The ext4 path planner captures every `node:path` helper at module load and
+requires each derived image, mount, attachment, restore, and artifact path to
+be an exact direct child of its already-canonical parent. Before a new
+provision operation is prepared, backend admission also proves that the
+storage mount path can host both fixed-shape
+`data-<48hex>` and `generation-<48hex>` children within the 4095-byte native
+pathname domain. Existing prepared or committed operations and cold-open state
+reconstruct their original image and mount plan without retroactively applying
+that new admission rule. These are lexical nameability and containment
+prerequisites, not object-identity or content-change signals.
 
 ### Content stability
 

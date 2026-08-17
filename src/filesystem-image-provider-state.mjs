@@ -425,7 +425,13 @@ function consumeBudget(state, bytes, code) {
 }
 
 function assertLosslessString(value, code, maxBytes = MAX_CANONICAL_BYTES) {
-  ensure(typeof value === "string", code);
+  ensure(
+    typeof value === "string" &&
+      numberIsSafeIntegerIntrinsic(maxBytes) &&
+      maxBytes >= 0 &&
+      value.length <= maxBytes,
+    code,
+  );
   const encoded = bufferFrom(value, "utf8");
   ensure(
     encoded.length <= maxBytes && bufferToString(encoded, "utf8") === value,
@@ -468,7 +474,11 @@ function canonicalize(
     return normalized;
   }
   if (typeof value === "string") {
-    assertLosslessString(value, code);
+    assertLosslessString(
+      value,
+      code,
+      MAX_CANONICAL_BYTES - state.budget.bytes,
+    );
     consumeBudget(
       state,
       bufferByteLength(jsonStringifyIntrinsic(value), "utf8"),
@@ -527,7 +537,11 @@ function canonicalize(
   const sortedKeys = callIntrinsic(arraySliceIntrinsic, keys, []);
   arraySort(sortedKeys);
   for (const key of sortedKeys) {
-    assertLosslessString(key, code);
+    assertLosslessString(
+      key,
+      code,
+      MAX_CANONICAL_BYTES - state.budget.bytes,
+    );
     consumeBudget(
       state,
       bufferByteLength(jsonStringifyIntrinsic(key), "utf8") + 1,
