@@ -2579,6 +2579,85 @@ test("checkpoint publication restores private metadata modes under umask 777", a
   assert.equal(manifestMode, 0o600);
 });
 
+test("private publication checks include every special mode bit", async () => {
+  const source = await readFile(
+    new URL("../src/stopped-directory-publication.mjs", import.meta.url),
+    "utf8",
+  );
+  const writeStart = source.indexOf("async function writeArtifactManifest(");
+  const directoryStart = source.indexOf(
+    "async function createPrivateDirectory(",
+    writeStart,
+  );
+  const readStart = source.indexOf(
+    "async function readArtifactManifest(",
+    directoryStart,
+  );
+  const readEnd = source.indexOf("function validateMaterialization(", readStart);
+  assert(writeStart >= 0);
+  assert(directoryStart > writeStart);
+  assert(readStart > directoryStart);
+  assert(readEnd > readStart);
+
+  const writeBody = source.slice(writeStart, directoryStart);
+  const directoryBody = source.slice(directoryStart, readStart);
+  const readBody = source.slice(readStart, readEnd);
+  assert.match(writeBody, /identity\.mode & 0o7777n/u);
+  assert.doesNotMatch(writeBody, /identity\.mode & 0o777n/u);
+  assert.match(directoryBody, /held\.mode & 0o7777n/u);
+  assert.doesNotMatch(directoryBody, /held\.mode & 0o777n/u);
+  assert.match(readBody, /metadata\.mode & 0o7777n/u);
+  assert.doesNotMatch(readBody, /metadata\.mode & 0o777n/u);
+});
+
+test("committed artifacts reject special bits on private roots and manifests", async (t) => {
+  const fixture = await createFixture(t);
+  const options = captureOptions(fixture);
+  await fixture.publication.publishCheckpointArtifact(options);
+  const manifestPath = join(fixture.artifactDirectory, "artifact.json");
+
+  for (const [kind, path, baseMode] of [
+    ["root", fixture.artifactDirectory, 0o700],
+    ["manifest", manifestPath, 0o600],
+  ]) {
+    for (const [name, specialBit] of [
+      ["sticky", 0o1000],
+      ["setgid", 0o2000],
+      ["setuid", 0o4000],
+    ]) {
+      await t.test(`${kind}-${name}`, async (subtest) => {
+        const unsafeMode = baseMode | specialBit;
+        await chmod(path, unsafeMode);
+        const observedMode = Number(
+          (await lstat(path, { bigint: true })).mode & 0o7777n,
+        );
+        if (observedMode !== unsafeMode) {
+          await chmod(path, baseMode);
+          subtest.skip(
+            `${kind}-${name}: host filesystem does not retain this mode bit`,
+          );
+          return;
+        }
+        try {
+          await assert.rejects(
+            fixture.publication.verifyCommittedCheckpointArtifact(
+              committedVerificationOptions(fixture, options),
+            ),
+            (error) =>
+              assertPublicationError(
+                error,
+                "published_state_invalid",
+                "committed",
+              ),
+          );
+        } finally {
+          await chmod(path, baseMode);
+        }
+      });
+    }
+  }
+});
+
 test("restore publication publishes a raw isolated payload and preserves its artifact", async (t) => {
   const fixture = await createFixture(t);
   await publishFixtureArtifact(fixture);

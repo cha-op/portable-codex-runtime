@@ -152,7 +152,7 @@ function createInspector(paths, state, fdCalls, overrides = {}) {
             error.code = "path_mismatch";
             throw error;
           }
-          const mode = Number(metadata.mode & 0o777n);
+          const mode = Number(metadata.mode & 0o7777n);
           const directory = metadata.isDirectory();
           const regular = metadata.isFile();
           const privatePolicy =
@@ -1865,6 +1865,96 @@ test("private owner and mode policy fails before provisioning mutations", async 
   );
   await assert.rejects(stat(modePaths.imagePath), { code: "ENOENT" });
   assert.equal(modeFixture.calls.length, 0);
+});
+
+test("special directory mode bits fail the exact private policy", async (t) => {
+  for (const [name, specialBit] of [
+    ["sticky", 0o1000],
+    ["setgid", 0o2000],
+    ["setuid", 0o4000],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const paths = await createPaths();
+      const imageRoot = join(paths.root, "images");
+      const unsafeMode = 0o700 | specialBit;
+      await chmod(imageRoot, unsafeMode);
+      const observedMode = Number(
+        (await stat(imageRoot, { bigint: true })).mode & 0o7777n,
+      );
+      if (observedMode !== unsafeMode) {
+        subtest.skip("host filesystem does not retain this directory mode bit");
+        return;
+      }
+      const fixture = createFixture(paths);
+
+      await assert.rejects(
+        fixture.driver.provision(provisionRequest(paths)),
+        driverError("access_policy_mismatch"),
+      );
+      await assert.rejects(stat(paths.imagePath), { code: "ENOENT" });
+      assert.equal(fixture.fdCalls.length, 0);
+      assert.equal(fixture.calls.length, 0);
+    });
+  }
+});
+
+test("fd-bound policy proof rejects special bits introduced after the initial sample", async (t) => {
+  for (const [kind, baseMode, specialBit] of [
+    ["directory-sticky", 0o700, 0o1000],
+    ["directory-setgid", 0o700, 0o2000],
+    ["directory-setuid", 0o700, 0o4000],
+    ["file-sticky", 0o600, 0o1000],
+    ["file-setgid", 0o600, 0o2000],
+    ["file-setuid", 0o600, 0o4000],
+  ]) {
+    await t.test(kind, async (subtest) => {
+      const paths = await createPaths();
+      const target = kind.startsWith("directory-")
+        ? join(paths.root, "images")
+        : paths.imagePath;
+      const unsafeMode = baseMode | specialBit;
+      let mutated = false;
+      let modeSupported = true;
+      const fixture = createFixture(paths, {
+        async beforeFdOperation(request) {
+          if (
+            mutated ||
+            request.operation !== "inspect-private-path" ||
+            request.path !== target
+          ) {
+            return;
+          }
+          mutated = true;
+          await chmod(target, unsafeMode);
+          modeSupported =
+            Number((await stat(target, { bigint: true })).mode & 0o7777n) ===
+            unsafeMode;
+        },
+      });
+
+      let captured;
+      try {
+        await fixture.driver.provision(provisionRequest(paths));
+      } catch (error) {
+        captured = error;
+      }
+      assert.equal(mutated, true);
+      if (!modeSupported) {
+        subtest.skip("host filesystem does not retain this object mode bit");
+        return;
+      }
+      assert.notEqual(captured, undefined);
+      driverError("access_policy_mismatch")(captured);
+      assert.equal(
+        fixture.fdCalls.some(
+          (request) =>
+            request.operation === "inspect-private-path" &&
+            request.path === target,
+        ),
+        true,
+      );
+    });
+  }
 });
 
 test("access and default ACL findings fail through the fd-bound policy receipt", async () => {

@@ -1158,7 +1158,7 @@ async function writeArtifactManifest(path, manifest) {
     await handle.sync();
     const identity = await handle.stat({ bigint: true });
     ensure(
-      identity.isFile() && identity.nlink === 1n && Number(identity.mode & 0o777n) === 0o600,
+      identity.isFile() && identity.nlink === 1n && Number(identity.mode & 0o7777n) === 0o600,
       "publication_integrity_failed",
     );
     return sha256(bytes.toString("utf8"));
@@ -1205,7 +1205,7 @@ async function createPrivateDirectory(path) {
     ensure(
       sameFileIdentity(identity, held) &&
         sameFileIdentity(identity, current) &&
-        Number(held.mode & 0o777n) === 0o700,
+        Number(held.mode & 0o7777n) === 0o700,
       "publication_io_failed",
     );
   } catch (error) {
@@ -1232,7 +1232,7 @@ async function readArtifactManifest(path, expectedCheckpoint, expectedProof) {
       metadata.isFile() &&
         !metadata.isSymbolicLink() &&
         metadata.nlink === 1n &&
-        Number(metadata.mode & 0o777n) === 0o600 &&
+        Number(metadata.mode & 0o7777n) === 0o600 &&
         metadata.size <= 512n * 1024n,
       "publication_integrity_failed",
     );

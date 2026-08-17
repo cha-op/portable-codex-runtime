@@ -1031,7 +1031,7 @@ function isRegularFileStat(metadata) {
 }
 
 function statMode(metadata) {
-  return callIntrinsic(NumberConstructor, undefined, [metadata.mode & 0o777n]);
+  return callIntrinsic(NumberConstructor, undefined, [metadata.mode & 0o7777n]);
 }
 
 function sameRuntimeIdentity(left, right) {

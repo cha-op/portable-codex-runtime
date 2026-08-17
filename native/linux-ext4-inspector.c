@@ -689,7 +689,7 @@ static int private_metadata_matches(const struct stat *metadata, mode_t type,
                                     mode_t mode, int single_link) {
   return (metadata->st_mode & S_IFMT) == type &&
          metadata->st_uid == getuid() &&
-         (metadata->st_mode & 0777U) == mode && metadata->st_nlink >= 1 &&
+         (metadata->st_mode & 07777U) == mode && metadata->st_nlink >= 1 &&
          (!single_link || metadata->st_nlink == 1);
 }
 
@@ -709,7 +709,7 @@ static int unlinked_private_policy_status(int fd, mode_t type, mode_t mode) {
   int acl_state;
   if (fstat(fd, &metadata) != 0) return -1;
   if ((metadata.st_mode & S_IFMT) != type || metadata.st_uid != getuid() ||
-      (metadata.st_mode & 0777U) != mode || metadata.st_nlink != 0) {
+      (metadata.st_mode & 07777U) != mode || metadata.st_nlink != 0) {
     return 0;
   }
   acl_state = extended_acl_state(fd);

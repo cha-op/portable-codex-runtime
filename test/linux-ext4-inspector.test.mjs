@@ -669,6 +669,10 @@ test("native private-path inspection binds identity, policy, and emptiness to fi
     "static int unlinked_private_policy_status(",
     policyStart,
   );
+  const unlinkedPolicyEnd = source.indexOf(
+    "static int require_private_policy(",
+    policyEnd,
+  );
   const emptyStart = source.indexOf("static int directory_empty_state(");
   const emptyEnd = source.indexOf(
     "static int format_proc_fd_path(",
@@ -690,7 +694,8 @@ test("native private-path inspection binds identity, policy, and emptiness to fi
   assert(metadataStart > aclStart);
   assert(policyStart > metadataStart);
   assert(policyEnd > policyStart);
-  assert(emptyStart > policyEnd);
+  assert(unlinkedPolicyEnd > policyEnd);
+  assert(emptyStart > unlinkedPolicyEnd);
   assert(emptyEnd > emptyStart);
   assert(aclOpenStart > emptyEnd);
   assert(aclOpenEnd > aclOpenStart);
@@ -724,7 +729,8 @@ test("native private-path inspection binds identity, policy, and emptiness to fi
   const metadataBody = source.slice(metadataStart, policyStart);
   assert.match(metadataBody, /\(metadata->st_mode & S_IFMT\) == type/u);
   assert.match(metadataBody, /metadata->st_uid == getuid\(\)/u);
-  assert.match(metadataBody, /\(metadata->st_mode & 0777U\) == mode/u);
+  assert.match(metadataBody, /\(metadata->st_mode & 07777U\) == mode/u);
+  assert.doesNotMatch(metadataBody, /\(metadata->st_mode & 0777U\)/u);
   assert.match(metadataBody, /metadata->st_nlink >= 1/u);
   assert.match(metadataBody, /!single_link \|\| metadata->st_nlink == 1/u);
   assert.doesNotMatch(metadataBody, /metadata->st_(?:ctim|mtim|size)/u);
@@ -736,6 +742,16 @@ test("native private-path inspection binds identity, policy, and emptiness to fi
     /private_metadata_matches\(&metadata, type, mode, single_link\)/u,
   );
   assert.match(policyBody, /acl_state = extended_acl_state\(fd\)/u);
+
+  const unlinkedPolicyBody = source.slice(policyEnd, unlinkedPolicyEnd);
+  assert.match(
+    unlinkedPolicyBody,
+    /\(metadata\.st_mode & 07777U\) != mode/u,
+  );
+  assert.doesNotMatch(
+    unlinkedPolicyBody,
+    /\(metadata\.st_mode & 0777U\)/u,
+  );
 
   const emptyBody = source.slice(emptyStart, emptyEnd);
   assert.match(

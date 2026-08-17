@@ -416,7 +416,7 @@ function safeDirectoryStat(stat) {
     !stat.isSymbolicLink() &&
     uid !== null &&
     stat.uid === uid &&
-    Number(stat.mode & 0o777n) === 0o700
+    Number(stat.mode & 0o7777n) === 0o700
   );
 }
 
@@ -441,7 +441,7 @@ function safeFileStat(stat, maximumLinks = 1n) {
     stat.nlink <= maximumLinks &&
     uid !== null &&
     stat.uid === uid &&
-    Number(stat.mode & 0o777n) === 0o600 &&
+    Number(stat.mode & 0o7777n) === 0o600 &&
     stat.size > 0n &&
     stat.size <= BigInt(MAX_RECORD_BYTES)
   );

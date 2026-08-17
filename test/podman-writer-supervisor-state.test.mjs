@@ -245,6 +245,126 @@ test("requires an owner-private parent and never traverses symlink ancestors", a
   );
 });
 
+test("held state roots reject every special mode bit", async (t) => {
+  for (const [name, specialBit] of [
+    ["sticky", 0o1000],
+    ["setgid", 0o2000],
+    ["setuid", 0o4000],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const { root } = await fixture(subtest);
+      const unsafeMode = 0o700 | specialBit;
+      let mutated = false;
+      let modeSupported = true;
+      const state = stateWithFaultHooks(
+        root,
+        exact({
+          async afterRootDirectorySync() {
+            mutated = true;
+            await chmod(root, unsafeMode);
+            modeSupported =
+              Number((await lstat(root, { bigint: true })).mode & 0o7777n) ===
+              unsafeMode;
+          },
+        }),
+      );
+
+      let captured;
+      try {
+        await state.claim(exact({ record: record("preparing") }));
+      } catch (error) {
+        captured = error;
+      }
+      assert.equal(mutated, true);
+      if (!modeSupported) {
+        subtest.skip("host filesystem does not retain this state-root mode bit");
+        return;
+      }
+      assert.notEqual(captured, undefined);
+      assert.equal(stateIoError(captured), true);
+      assert.deepEqual(await readdir(root), []);
+    });
+  }
+});
+
+test("pending state files reject every special mode bit before publication", async (t) => {
+  for (const [name, specialBit] of [
+    ["sticky", 0o1000],
+    ["setgid", 0o2000],
+    ["setuid", 0o4000],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const { root } = await fixture(subtest);
+      const unsafeMode = 0o600 | specialBit;
+      let pendingPath;
+      let modeSupported = true;
+      const state = stateWithFaultHooks(
+        root,
+        exact({
+          async afterTemporarySync() {
+            const entries = await readdir(root);
+            assert.equal(entries.length, 1);
+            assert.match(entries[0], /\.json\.pending$/u);
+            pendingPath = join(root, entries[0]);
+            await chmod(pendingPath, unsafeMode);
+            modeSupported =
+              Number(
+                (await lstat(pendingPath, { bigint: true })).mode & 0o7777n,
+              ) === unsafeMode;
+          },
+        }),
+      );
+
+      let captured;
+      try {
+        await state.claim(exact({ record: record("preparing") }));
+      } catch (error) {
+        captured = error;
+      }
+      assert.notEqual(pendingPath, undefined);
+      if (!modeSupported) {
+        subtest.skip("host filesystem does not retain this pending-file mode bit");
+        return;
+      }
+      assert.notEqual(captured, undefined);
+      assert.equal(stateIoError(captured), true);
+      assert.deepEqual(await readdir(root), [pendingPath.slice(root.length + 1)]);
+    });
+  }
+});
+
+test("published state files with special mode bits are neither read nor cleaned", async (t) => {
+  for (const [name, specialBit] of [
+    ["sticky", 0o1000],
+    ["setgid", 0o2000],
+    ["setuid", 0o4000],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const { root, state } = await fixture(subtest);
+      const initial = record("preparing");
+      await state.claim(exact({ record: initial }));
+      const entries = await readdir(root);
+      assert.equal(entries.length, 1);
+      const path = join(root, entries[0]);
+      const unsafeMode = 0o600 | specialBit;
+      await chmod(path, unsafeMode);
+      const observedMode = Number(
+        (await lstat(path, { bigint: true })).mode & 0o7777n,
+      );
+      if (observedMode !== unsafeMode) {
+        subtest.skip("host filesystem does not retain this published-file mode bit");
+        return;
+      }
+
+      await assert.rejects(
+        state.read(exact({ launchAttemptId: initial.launchAttemptId })),
+        stateIoError,
+      );
+      assert.deepEqual(await readdir(root), entries);
+    });
+  }
+});
+
 test("claims one launcher, replays the winner, and rejects conflicting transitions", async (t) => {
   const { state } = await fixture(t);
   const initial = record("preparing");
