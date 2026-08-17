@@ -153,13 +153,19 @@ superseded_by:
 
 ## Next Steps
 
-- Bind the committed ext4 attachment identity into a trusted Podman filesystem
-  authority and cover both components in one non-root process.
-- Add terminal supervisor-state retention or garbage collection behind an
-  authority-owned post-commit/quiescence callback; never put it in the
-  stopped-only reconciler.
-- Define an authority-safe provider-state exact-replay retention floor, or move
-  permanent operation history to a PostgreSQL-indexed representation.
+The remaining clean/manual-fencing slices are independently reviewable. Land
+them in the following priority order so the production identity gap closes
+before storage-growth work; this order does not transfer mutation authority
+between the tracks:
+
+1. Bind the committed ext4 attachment identity into a trusted Podman filesystem
+   authority and cover both components in one non-root process.
+2. Add terminal supervisor-state retention or garbage collection behind an
+   authority-owned post-commit/quiescence callback; never put it in the
+   stopped-only reconciler.
+3. Define an authority-safe provider-state exact-replay retention floor, or move
+   permanent operation history to a PostgreSQL-indexed representation.
+
 - Any broader crash, automatic-fencing, or backup/distribution capability
   requires a separately scoped authority and conformance design.
 

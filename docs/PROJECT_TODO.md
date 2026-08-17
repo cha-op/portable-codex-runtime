@@ -159,16 +159,22 @@
   control identities, rootless digest-pinned Podman launch/stop, and two-host
   clean detach, transfer, verification-only first remount, identity
   verification, and a peer-namespace non-propagation gate.
-- [pending] Define an authority-safe provider-state exact-replay retention floor
-  or move permanent operation history to a PostgreSQL-indexed representation.
-  Until then, monitor checkpoint bytes, retained operation counts, and aggregate
-  provider-state storage; automatic active-log rotation is not retention or
-  garbage collection.
-- [pending] Bind the provider state's persistent ext4 attachment identity into
-  a trusted Podman filesystem authority, exercise that authority with the
-  initialized backend in one non-root process, and add authority-owned bounded
-  retention or garbage collection for terminal local supervisor state. The
-  stopped-only reconciler remains read-only and cannot supply either mutation.
+- [pending] First, bind the provider state's committed ext4 attachment identity
+  into a trusted Podman filesystem authority and exercise that bridge with the
+  initialized backend in one non-root process. This closes the current
+  production identity gap without depending on either retention track below.
+- [pending] Second, add authority-owned bounded retention or garbage collection
+  for terminal local supervisor state, but only after PostgreSQL has permanently
+  committed the exact terminal attempt and every callback for that attempt is
+  quiescent. The stopped-only reconciler remains read-only and cannot authorize
+  this mutation.
+- [pending] Third, define an authority-safe provider-state exact-replay
+  retention floor or move permanent operation history to a PostgreSQL-indexed
+  representation. This track has its own replay authority and does not inherit
+  authority from the bridge or supervisor retention. Until then, monitor
+  checkpoint bytes, retained operation counts, and aggregate provider-state
+  storage; automatic active-log rotation is not retention or garbage
+  collection.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer
   fencing, differential export/compression, content-addressed distribution,
