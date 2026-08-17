@@ -6728,7 +6728,7 @@ test("writer dispatch reserves revisions for uncertain recovery and finalize", a
 test("exact-bound attachment proof finalizes atomically after lease expiry", async () => {
   const options = writerAcquireOptions();
   const lease = writerLease(options);
-  const rootPath = `/${"a".repeat(4_095)}`;
+  const rootPath = `/${"a".repeat(4_094)}`;
   const result = writerAttachmentResult(options, lease, {
     attachment: writerAttachment(options, lease, { rootPath }),
     mutationResult: writerMutationResult(options, lease, { rootPath }),
@@ -6774,7 +6774,7 @@ test("exact-bound attachment proof finalizes atomically after lease expiry", asy
   assert.equal(receipt.operation.revision, "2");
   assert.equal(receipt.reservation.state, "released");
   assert.equal(receipt.session.document.lifecycle, "ATTACHED");
-  assert.equal(Buffer.byteLength(rootPath, "utf8"), 4_096);
+  assert.equal(Buffer.byteLength(rootPath, "utf8"), 4_095);
   assert.deepEqual(receipt.session.document.attachment, result.attachment);
   assert.equal(
     authorityQueries(clients[0]).some(
@@ -7737,8 +7737,8 @@ test("writer attachment finalization bounds provider paths before PostgreSQL", a
   const options = writerAcquireOptions();
   const lease = writerLease(options);
   const result = writerAttachmentResult(options, lease);
-  const asciiOversizedPath = `/${"a".repeat(4_096)}`;
-  const utf8OversizedPath = `/${"\u00e9".repeat(2_048)}`;
+  const asciiOversizedPath = `/${"a".repeat(4_095)}`;
+  const utf8OversizedPath = `/${"\u00e9".repeat(2_047)}a`;
   const byteLengthDescriptor = Object.getOwnPropertyDescriptor(
     Buffer,
     "byteLength",
@@ -7871,12 +7871,12 @@ test("writer attachment finalization bounds provider paths before PostgreSQL", a
     syncBuiltinESMExports();
   }
 
-  assert.equal(asciiOversizedPath.length, 4_097);
-  assert.equal(Buffer.byteLength(utf8OversizedPath, "utf8"), 4_097);
+  assert.equal(asciiOversizedPath.length, 4_096);
+  assert.equal(Buffer.byteLength(utf8OversizedPath, "utf8"), 4_096);
   assert.equal(poisonedByteLengthCalls, 0);
   assert.equal(poisonedCharCodeAtCalls, 0);
   assert.equal(poisonedCloneCalls, 0);
-  assert(poisonedPathResolveCalls > 0);
+  assert.equal(poisonedPathResolveCalls, 0);
   assert.equal(errors.length, cases.length);
   for (const error of errors) {
     assert.ok(error instanceof PostgresSessionAuthorityError);
@@ -9717,6 +9717,48 @@ test("writer launch request builder rejects hostile or mismatched bindings witho
     { code: "invalid_operation_request" },
   );
   assert.equal(pool.connectCalls, 0);
+});
+
+test("writer launch runtime path accepts 4095 UTF-8 bytes and rejects 4096", () => {
+  const fixture = writerLaunchFixture();
+  const maximumPath = `/${"é".repeat(2_047)}`;
+  const oversizedPath = `${maximumPath}a`;
+  assert.equal(Buffer.byteLength(maximumPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedPath, "utf8"), 4_096);
+
+  const measuredImage = {
+    ...fixture.measuredImage,
+    runtimeIdentity: {
+      ...fixture.measuredImage.runtimeIdentity,
+      codexBinaryPath: maximumPath,
+    },
+  };
+  assert.equal(
+    createWriterLaunchAttemptOperationRequest({
+      expectedSession: fixture.options.expectedSession,
+      generation: fixture.generation,
+      measuredImage,
+      supervisor: fixture.supervisor,
+    }).measuredImage.runtimeIdentity.codexBinaryPath,
+    maximumPath,
+  );
+  assert.throws(
+    () => createWriterLaunchAttemptOperationRequest({
+      expectedSession: fixture.options.expectedSession,
+      generation: fixture.generation,
+      measuredImage: {
+        ...measuredImage,
+        runtimeIdentity: {
+          ...measuredImage.runtimeIdentity,
+          codexBinaryPath: oversizedPath,
+        },
+      },
+      supervisor: fixture.supervisor,
+    }),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "invalid_operation_request",
+  );
 });
 
 test("checkpoint capture admission requires the current launch process and writer incarnations", () => {

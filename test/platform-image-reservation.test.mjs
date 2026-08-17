@@ -293,6 +293,33 @@ test("accepts standard OCI optional manifest and descriptor metadata", async () 
   assert.equal(inspected.requests.length, 1);
 });
 
+test("runtime path accepts 4095 UTF-8 bytes and rejects 4096", async () => {
+  const fixture = imageFixture();
+  const maximumPath = `/${"é".repeat(2_047)}`;
+  const oversizedPath = `${maximumPath}a`;
+  assert.equal(Buffer.byteLength(maximumPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedPath, "utf8"), 4_096);
+
+  const accepted = inspector({
+    result: measurement({ codexBinaryPath: maximumPath }),
+  });
+  const reserved = await new PlatformImageReservationCoordinator()
+    .reservePlatformImage(reserveOptions(fixture, accepted.inspectCodex));
+  assert.equal(reserved.runtimeIdentity.codexBinaryPath, maximumPath);
+
+  for (const codexBinaryPath of [oversizedPath, "/opt/codex-\ud800"]) {
+    const rejected = inspector({
+      result: measurement({ codexBinaryPath }),
+    });
+    await assert.rejects(
+      new PlatformImageReservationCoordinator().reservePlatformImage(
+        reserveOptions(fixture, rejected.inspectCodex),
+      ),
+      assertCode("platform_image_inspection_uncertain"),
+    );
+  }
+});
+
 test("rejects descriptor metadata outside the bounded profile", async (t) => {
   for (const [name, mutate] of [
     [

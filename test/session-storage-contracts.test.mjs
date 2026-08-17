@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import { types as utilTypes } from "node:util";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
@@ -762,6 +764,63 @@ test("storage references and attachments contain no host path in portable state"
     assert.throws(() => assertSessionAttachment(invalid), assertCode("invalid_storage_attachment"));
   }
 });
+
+test("attachment roots use the 4095-byte native pathname domain", () => {
+  const maximumRootPath = `/${"é".repeat(2_047)}`;
+  const oversizedRootPath = `${maximumRootPath}a`;
+  assert.equal(Buffer.byteLength(maximumRootPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedRootPath, "utf8"), 4_096);
+  assert.equal(
+    assertSessionAttachment(
+      attachment({ rootPath: maximumRootPath }),
+    ).rootPath,
+    maximumRootPath,
+  );
+  assert.throws(
+    () => assertSessionAttachment(attachment({ rootPath: oversizedRootPath })),
+    assertCode("invalid_storage_attachment"),
+  );
+});
+
+test(
+  "attachment root canonicality uses captured node:path intrinsics",
+  { concurrency: false },
+  () => {
+    const descriptors = {
+      isAbsolute: Object.getOwnPropertyDescriptor(path, "isAbsolute"),
+      parse: Object.getOwnPropertyDescriptor(path, "parse"),
+      resolve: Object.getOwnPropertyDescriptor(path, "resolve"),
+    };
+    let poisonCalls = 0;
+    path.isAbsolute = () => {
+      poisonCalls += 1;
+      return true;
+    };
+    path.parse = () => {
+      poisonCalls += 1;
+      return { root: "/poisoned-root" };
+    };
+    path.resolve = (value) => {
+      poisonCalls += 1;
+      return value;
+    };
+    syncBuiltinESMExports();
+    try {
+      for (const rootPath of ["relative/session", "/var/lib/../etc", "/"]) {
+        assert.throws(
+          () => assertSessionAttachment(attachment({ rootPath })),
+          assertCode("invalid_storage_attachment"),
+        );
+      }
+      assert.equal(poisonCalls, 0);
+    } finally {
+      Object.defineProperty(path, "isAbsolute", descriptors.isAbsolute);
+      Object.defineProperty(path, "parse", descriptors.parse);
+      Object.defineProperty(path, "resolve", descriptors.resolve);
+      syncBuiltinESMExports();
+    }
+  },
+);
 
 test("rootless worker template is structural and fixed-layout", () => {
   const currentLease = lease();

@@ -523,6 +523,34 @@ change and does not attest the current head:
   `EventTarget` intrinsics. The exact-start abort regression also attaches its
   rejection observer before release, preserving the production fail-stop
   timing without a test-runner unhandled-rejection race.
+- A fresh whole-range Codex review of the resulting green head found that
+  publication-control resolution still called the provider's full `snapshot()`
+  projection and that the public attachment contract admitted one byte beyond
+  the ext4/Linux pathname domain. Publication lookup now uses one locked
+  backend-and-mount query that scans only storage records. A deterministic
+  129-operation regression verifies that the lookup never iterates the
+  permanent operation map, while duplicate live mount mappings remain an
+  explicit fail-closed physical mismatch.
+- Every native Linux pathname ingress in this slice now shares a lossless
+  UTF-8, NUL-free maximum of 4095 bytes. This includes session attachments,
+  PostgreSQL attachment and restore admission, measured runtime executable
+  paths, recovery candidates, platform-image reservation, Podman roots and
+  executable/source validation, and the holder acquisition frame. Exact
+  4095-byte success and 4096-byte rejection tests replace the former PostgreSQL
+  4096-byte success case. The bound protects lexical nameability before durable
+  mutation or external dispatch; object identity and access-policy evidence
+  remain separate.
+- Path canonicality now uses module-load-captured `node:path` intrinsics at the
+  session contract, recovery-service, and Podman request boundaries. Hostile
+  `syncBuiltinESMExports()` regressions prove that callback-time or ambient
+  replacement cannot admit relative or non-canonical roots, and measured
+  runtime executable paths are rejected before filesystem or Podman dispatch.
+  The seven focused provider/backend/contract/PostgreSQL/recovery/Podman/
+  reservation suites passed together. All 16 changed JavaScript modules passed
+  `node --check`, project-journal validation and `git diff --check` passed, and
+  the complete Node test suite passed outside the desktop sandbox. The same
+  auth-monitor case returned `EMFILE` only inside that sandbox and passed when
+  rerun alone under the same unsandboxed gate.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

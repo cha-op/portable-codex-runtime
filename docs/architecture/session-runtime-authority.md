@@ -347,8 +347,11 @@ operation, storage identity, attachment ID, proof ID, and canonical host-local
 `rootPath`. The provider mutation result must carry the same `rootPath`; a
 caller cannot splice a different structurally valid directory into the
 attachment evidence. This writer-specific evidence validates its root-path-free
-projection against the unchanged generic storage contract v1 result shape. It
-can finalize an operation from `starting` revision 1 or `uncertain` revision 2.
+projection against the unchanged generic storage contract v1 result shape.
+The attachment and restore-destination pathname domain is canonical absolute,
+non-root, NUL-free, round-trip UTF-8 of at most 4095 bytes; PostgreSQL admission
+uses the same boundary before any query. With that bound, finalization can
+accept an operation from `starting` revision 1 or `uncertain` revision 2.
 In one
 transaction it commits the exact `writer-attached` result, retires the
 operation, releases the reservation, clears `activeOperation`, persists the
@@ -1408,6 +1411,8 @@ The portable identity is the existing manifest's exact platform-manifest
 digest, media type, Linux platform, and normalized Codex version. A trusted
 resolver may add measured descriptor and executable evidence, but cannot
 replace those four fields or accept an OCI index/tag as the portable identity.
+The measured Linux `codexBinaryPath` must be canonical absolute, NUL-free,
+round-trip UTF-8, and at most 4095 bytes before reservation or recovery.
 The current resolver accepts a bounded runnable-image profile rather than every
 OCI artifact extension: it validates the exact manifest and config bytes,
 required config/rootfs structure, one or more recognized layer descriptors,

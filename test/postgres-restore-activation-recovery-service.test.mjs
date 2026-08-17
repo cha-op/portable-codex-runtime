@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import test from "node:test";
 
 import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
@@ -1465,6 +1467,135 @@ test("activation batches admit exact v1 and capture-bound v2 predecessors", asyn
   assertDeepFrozen(observed[1]);
   assertDeepFrozen(result);
 });
+
+test("recovery pathnames accept 4095 UTF-8 bytes and reject 4096", async () => {
+  const maximumPath = `/${"é".repeat(2_047)}`;
+  const oversizedPath = `${maximumPath}a`;
+  assert.equal(Buffer.byteLength(maximumPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedPath, "utf8"), 4_096);
+
+  const acceptedActivation = activationCandidate();
+  acceptedActivation.request.destinationRootPath = maximumPath;
+  let observedActivation;
+  const activationFixture = callbacks({
+    async listRestoreAttachmentActivationCandidates() {
+      return page([acceptedActivation]);
+    },
+    async reconcileRestoreAttachmentActivation(candidate) {
+      observedActivation = candidate;
+    },
+  });
+  const activationService = createPostgresRestoreActivationRecoveryService(
+    activationFixture.options,
+  );
+  const activationResult = await activationService.runActivationBatch(request());
+  assert.equal(activationResult.results[0].status, "reconciled");
+  assert.equal(observedActivation.request.destinationRootPath, maximumPath);
+
+  const rejectedActivation = activationCandidate();
+  rejectedActivation.request.destinationRootPath = oversizedPath;
+  const rejectedActivationFixture = callbacks({
+    async listRestoreAttachmentActivationCandidates() {
+      return page([rejectedActivation]);
+    },
+  });
+  await assert.rejects(
+    createPostgresRestoreActivationRecoveryService(
+      rejectedActivationFixture.options,
+    ).runActivationBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
+
+  const acceptedLaunch = launchCandidate();
+  acceptedLaunch.request.measuredImage.runtimeIdentity.codexBinaryPath =
+    maximumPath;
+  let observedLaunch;
+  const launchFixture = callbacks({
+    async listWriterLaunchAttemptCandidates() {
+      return page([acceptedLaunch]);
+    },
+    async reconcileWriterLaunchAttempt(candidate) {
+      observedLaunch = candidate;
+    },
+  });
+  const launchService = createPostgresRestoreActivationRecoveryService(
+    launchFixture.options,
+  );
+  const launchResult = await launchService.runLaunchAttemptBatch(request());
+  assert.equal(launchResult.results[0].status, "reconciled");
+  assert.equal(
+    observedLaunch.request.measuredImage.runtimeIdentity.codexBinaryPath,
+    maximumPath,
+  );
+
+  const rejectedLaunch = launchCandidate();
+  rejectedLaunch.request.measuredImage.runtimeIdentity.codexBinaryPath =
+    oversizedPath;
+  const rejectedLaunchFixture = callbacks({
+    async listWriterLaunchAttemptCandidates() {
+      return page([rejectedLaunch]);
+    },
+  });
+  await assert.rejects(
+    createPostgresRestoreActivationRecoveryService(
+      rejectedLaunchFixture.options,
+    ).runLaunchAttemptBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
+});
+
+test(
+  "recovery validates candidate paths with captured node:path intrinsics",
+  { concurrency: false },
+  async () => {
+    const isAbsoluteDescriptor = Object.getOwnPropertyDescriptor(
+      path,
+      "isAbsolute",
+    );
+    const resolveDescriptor = Object.getOwnPropertyDescriptor(path, "resolve");
+    const candidate = activationCandidate();
+    candidate.request.destinationRootPath = "relative/session";
+    let poisonCalls = 0;
+    let reconcileCalls = 0;
+    const fixture = callbacks({
+      async listRestoreAttachmentActivationCandidates() {
+        path.isAbsolute = () => {
+          poisonCalls += 1;
+          return true;
+        };
+        path.resolve = (value) => {
+          poisonCalls += 1;
+          return value;
+        };
+        syncBuiltinESMExports();
+        return page([candidate]);
+      },
+      async reconcileRestoreAttachmentActivation() {
+        reconcileCalls += 1;
+      },
+    });
+    try {
+      await assert.rejects(
+        createPostgresRestoreActivationRecoveryService(
+          fixture.options,
+        ).runActivationBatch(request()),
+        assertCode(
+          "postgres_restore_activation_recovery_service_outcome_uncertain",
+        ),
+      );
+      assert.equal(poisonCalls, 0);
+      assert.equal(reconcileCalls, 0);
+    } finally {
+      Object.defineProperty(path, "isAbsolute", isAbsoluteDescriptor);
+      Object.defineProperty(path, "resolve", resolveDescriptor);
+      syncBuiltinESMExports();
+    }
+  },
+);
 
 test("runSweep preserves independent cursors and fixed lane order", async () => {
   const order = [];

@@ -898,6 +898,44 @@ test("binds publication control callbacks to anchored provider state", async (t)
   }));
 });
 
+test("publication control rejects an ambiguous current mount-path lookup", async (t) => {
+  const fixed = await fixture(t);
+  const provisioned = await provision(fixed);
+  const first = await fixed.state.readStorage(provisioned.storageId);
+  const duplicateStorageId = "duplicate-storage-002";
+  const request = {
+    contractVersion: 1,
+    kind: "provision",
+    storageId: duplicateStorageId,
+  };
+  await fixed.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-duplicate-publication-mount-002",
+    request,
+    storageId: duplicateStorageId,
+  });
+  await fixed.state.commitOperation({
+    operationId: "operation-duplicate-publication-mount-002",
+    request,
+    result: { status: "provisioned" },
+    storageState: {
+      ...first,
+      imagePath: `${first.imagePath}.duplicate`,
+      sessionId: "019f2100-0000-7000-8000-000000000099",
+      storageId: duplicateStorageId,
+    },
+  });
+
+  await assert.rejects(
+    Reflect.apply(
+      fixed.backend.resolveExpectedPublicationControl,
+      undefined,
+      [first.mount.mountPath],
+    ),
+    backendError("physical_state_mismatch"),
+  );
+});
+
 test("a prepared provision retry observes the exact effect before commit", async (t) => {
   const fixed = await fixture(t);
   const request = provisionRequest("prepared-provision-001");
@@ -1295,7 +1333,7 @@ test("rejects a 4096-byte restore root before durable activation preparation", a
       request,
       context(),
     ),
-    backendError("physical_state_mismatch"),
+    (error) => error?.code === "invalid_restore_attachment_activation",
   );
   assert.deepEqual(await readFile(fixed.ledgerPath), ledgerBefore);
   assert.equal(

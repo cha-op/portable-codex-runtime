@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import { isAbsolute, resolve } from "node:path";
 
@@ -17,6 +18,8 @@ const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayPrototype = Array.prototype;
 const bufferByteLength = Buffer.byteLength;
+const bufferFrom = Buffer.from;
+const bufferToStringIntrinsic = Buffer.prototype.toString;
 const DateConstructor = Date;
 const dateParse = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
@@ -27,6 +30,8 @@ const isPromiseValue = utilTypes.isPromise;
 const isProxyValue = utilTypes.isProxy;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathResolveIntrinsic = resolve;
 const objectCreate = Object.create;
 const objectDefineProperties = Object.defineProperties;
 const objectDefineProperty = Object.defineProperty;
@@ -81,6 +86,7 @@ const MAX_JSON_NODES = 8_192;
 const MAX_JSON_BYTES = 262_144;
 const MAX_ARRAY_ENTRIES = 1_024;
 const MAX_OBJECT_KEYS = 256;
+const MAX_HOST_PATH_BYTES = 4_095;
 
 const OPTION_KEYS = objectFreeze([
   "listCurrentWriterLaunchCandidates",
@@ -423,6 +429,25 @@ function canonicalSha256(value, code) {
   return value;
 }
 
+function canonicalHostPathname(value, code) {
+  ensure(
+    typeof value === "string" &&
+      value.length > 1 &&
+      value.length <= MAX_HOST_PATH_BYTES,
+    code,
+  );
+  const encoded = callIntrinsic(bufferFrom, Buffer, [value, "utf8"]);
+  ensure(
+    encoded.length <= MAX_HOST_PATH_BYTES &&
+      callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === value &&
+      !regexpTest(/\0/u, value) &&
+      pathIsAbsoluteIntrinsic(value) &&
+      pathResolveIntrinsic(value) === value,
+    code,
+  );
+  return value;
+}
+
 function canonicalTimestamp(value, code) {
   ensure(typeof value === "string", code);
   let milliseconds;
@@ -493,11 +518,7 @@ function validateMeasuredImage(value, code) {
       regexpTest(OCI_SHA256_PATTERN, platformImage.digest) &&
       typeof config.digest === "string" &&
       regexpTest(OCI_SHA256_PATTERN, config.digest) &&
-      typeof runtimeIdentity.codexBinaryPath === "string" &&
-      runtimeIdentity.codexBinaryPath.length > 1 &&
-      runtimeIdentity.codexBinaryPath.length <= 4_096 &&
-      isAbsolute(runtimeIdentity.codexBinaryPath) &&
-      resolve(runtimeIdentity.codexBinaryPath) ===
+      canonicalHostPathname(runtimeIdentity.codexBinaryPath, code) ===
         runtimeIdentity.codexBinaryPath &&
       canonicalSha256(runtimeIdentity.codexBinarySha256, code) ===
         runtimeIdentity.codexBinarySha256 &&
@@ -1019,11 +1040,8 @@ function activationCandidate(value, code) {
   );
   ensure(
     (request.contractVersion === 1 || captureBound) &&
-      typeof request.destinationRootPath === "string" &&
-      request.destinationRootPath.length > 1 &&
-      request.destinationRootPath.length <= 4_096 &&
-      isAbsolute(request.destinationRootPath) &&
-      resolve(request.destinationRootPath) === request.destinationRootPath &&
+      canonicalHostPathname(request.destinationRootPath, code) ===
+        request.destinationRootPath &&
       numberIsSafeInteger(request.leaseDurationMilliseconds) &&
       request.leaseDurationMilliseconds > 0 &&
       request.leaseDurationMilliseconds <= 86_400_000,

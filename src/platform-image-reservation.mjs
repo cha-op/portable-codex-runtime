@@ -16,6 +16,7 @@ const bufferAllocUnsafe = Buffer.allocUnsafe;
 const bufferCompare = Buffer.compare;
 const bufferFrom = Buffer.from;
 const bufferIsBuffer = Buffer.isBuffer;
+const bufferToStringIntrinsic = Buffer.prototype.toString;
 const createHashIntrinsic = createHash;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
@@ -290,6 +291,7 @@ const JSON_STRING_AT_PATTERN =
 const JSON_PRIMITIVE_AT_PATTERN =
   /(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)/y;
 const MAX_JSON_NESTING_DEPTH = 32;
+const MAX_NATIVE_PATH_BYTES = 4_095;
 
 const ERROR_MESSAGES = Object.freeze({
   invalid_platform_image_request: "Platform image request is invalid",
@@ -1056,6 +1058,16 @@ function normalizeInspector(inspectCodex) {
   return inspectCodex;
 }
 
+function validNativePathnameBytes(value) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_NATIVE_PATH_BYTES
+  ) return false;
+  const encoded = callIntrinsic(bufferFrom, Buffer, [value, "utf8"]);
+  return encoded.length <= MAX_NATIVE_PATH_BYTES &&
+    callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === value;
+}
+
 function normalizeMeasurement(value) {
   const measurement = assertExactPlainObject(
     value,
@@ -1070,7 +1082,7 @@ function normalizeMeasurement(value) {
       regexpTest(CODEX_VERSION_PATTERN, measurement.codexVersion) &&
       typeof measurement.codexBinaryPath === "string" &&
       measurement.codexBinaryPath.length > 1 &&
-      measurement.codexBinaryPath.length <= 4096 &&
+      validNativePathnameBytes(measurement.codexBinaryPath) &&
       !stringIncludes(measurement.codexBinaryPath, "\0") &&
       callIntrinsic(posixIsAbsolute, posixPath, [
         measurement.codexBinaryPath,

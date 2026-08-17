@@ -9,6 +9,9 @@ const bufferFromIntrinsic = Buffer.from;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
 const isProxyValue = utilTypes.isProxy;
 const numberIsSafeInteger = Number.isSafeInteger;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathParseIntrinsic = parse;
+const pathResolveIntrinsic = resolve;
 const objectCreate = Object.create;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
@@ -113,7 +116,7 @@ const STORAGE_BACKEND_CAPABILITY_KEYS = Object.freeze([
   "normalDirectoryAttachment",
 ]);
 const MAX_BACKEND_PROTOTYPE_DEPTH = 64;
-const MAX_ATTACHMENT_ROOT_PATH_BYTES = 4096;
+const MAX_ATTACHMENT_ROOT_PATH_BYTES = 4095;
 const checkpointBackendProjections = new WeakSetConstructor();
 
 export class SessionStorageContractError extends Error {
@@ -254,9 +257,9 @@ function assertAttachmentRootPath(value, code, label) {
     encoded.length <= MAX_ATTACHMENT_ROOT_PATH_BYTES &&
       reflectApply(bufferToStringIntrinsic, encoded, ["utf8"]) === value &&
       !containsNullCharacter(value) &&
-      isAbsolute(value) &&
-      resolve(value) === value &&
-      value !== parse(value).root,
+      pathIsAbsoluteIntrinsic(value) &&
+      pathResolveIntrinsic(value) === value &&
+      value !== pathParseIntrinsic(value).root,
     code,
     `${label} must be an absolute host-local directory path`,
   );

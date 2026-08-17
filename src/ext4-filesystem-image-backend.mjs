@@ -59,6 +59,8 @@ const stateReadOperationIntrinsic =
   FilesystemImageProviderState.prototype.readOperation;
 const stateReadStorageIntrinsic =
   FilesystemImageProviderState.prototype.readStorage;
+const stateReadStorageByMountPathIntrinsic =
+  FilesystemImageProviderState.prototype.readStorageByMountPath;
 const stateSnapshotIntrinsic = FilesystemImageProviderState.prototype.snapshot;
 const abortSignalAbortedGetter = objectGetOwnPropertyDescriptorIntrinsic(
   AbortSignal.prototype,
@@ -932,22 +934,17 @@ export function createExt4FilesystemImageBackend(...args) {
 
   async function storageForPublicationRoot(rootValue) {
     const root = canonicalOwnedRoot(rootValue);
-    const snapshot = await callState(stateSnapshotIntrinsic, undefined);
-    let matched = null;
-    for (let index = 0; index < snapshot.storages.length; index += 1) {
-      const storage = snapshot.storages[index];
-      if (
-        storage.backendId !== backendId ||
-        storage.lifecycle === "destroyed" ||
-        storage.mount === null ||
-        storage.mount.mountPath !== root
-      ) {
-        continue;
+    try {
+      return await callState(
+        stateReadStorageByMountPathIntrinsic,
+        exactFrozenRecord({ backendId, mountPath: root }),
+      );
+    } catch (error) {
+      if (safeErrorCode(error) === "storage_lookup_ambiguous") {
+        fail("physical_state_mismatch");
       }
-      ensure(matched === null, "physical_state_mismatch");
-      matched = storage;
+      throw error;
     }
-    return matched;
   }
 
   function expectedPublicationControl(storage) {

@@ -21,7 +21,7 @@ import {
 } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -556,6 +556,7 @@ function measuredImage() {
 function launchInput(attachmentRoot, options = {}) {
   const launchAttemptId = options.launchAttemptId ?? "launch-attempt-001";
   const signal = options.signal ?? new AbortController().signal;
+  const launchMeasuredImage = options.measuredImage ?? measuredImage();
   const attachment = exact({
     attachmentId: `attachment-${launchAttemptId}`,
     backendId: "filesystem-backend",
@@ -596,7 +597,7 @@ function launchInput(attachmentRoot, options = {}) {
     fencingEpoch: "7",
     generation: generationReference,
     lease,
-    measuredImage: measuredImage(),
+    measuredImage: launchMeasuredImage,
     supervisor: exact({ contractVersion: 1, supervisorId: SUPERVISOR_ID }),
   });
   const sessionDocument = exact({
@@ -1704,25 +1705,199 @@ test("attachment replacement, access-policy change, and unreadable revalidation 
   assert.equal(unreadable.filesystemEvents.at(-1).operation, "acquire");
 });
 
-test("oversized configured and requested roots fail before filesystem or Podman dispatch", async (t) => {
+test("native pathname ingress accepts 4095 UTF-8 bytes and rejects 4096", async (t) => {
   const base = await fixture(t);
-  const oversizedRoot = `/${"x".repeat(1_000_000)}`;
+  const maximumPath = `/${"é".repeat(2_047)}`;
+  const oversizedPath = `${maximumPath}a`;
+  assert.equal(Buffer.byteLength(maximumPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedPath, "utf8"), 4_096);
+
+  assert.doesNotThrow(() => createPodmanWriterSupervisor(exact({
+    ...base.options,
+    configuredAttachmentRoot: maximumPath,
+  })));
+  assert.doesNotThrow(() => createPodmanWriterSupervisor(exact({
+    ...base.options,
+    podmanExecutable: maximumPath,
+  })));
   assert.throws(
     () => createPodmanWriterSupervisor(exact({
       ...base.options,
-      configuredAttachmentRoot: oversizedRoot,
+      configuredAttachmentRoot: oversizedPath,
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+  assert.throws(
+    () => createPodmanWriterSupervisor(exact({
+      ...base.options,
+      podmanExecutable: oversizedPath,
     })),
     assertSupervisorError("invalid_podman_writer_supervisor_options"),
   );
   assert.equal(base.events.length, 0);
   assert.equal(base.filesystemEvents.length, 0);
 
+  const prefix = `${base.parent}/`;
+  const maximumRequestedRoot =
+    `${prefix}${"x".repeat(4_095 - Buffer.byteLength(prefix, "utf8"))}`;
+  const oversizedRequestedRoot = `${maximumRequestedRoot}x`;
+  assert.equal(Buffer.byteLength(maximumRequestedRoot, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedRequestedRoot, "utf8"), 4_096);
+  const acceptedFilesystemEvents = [];
+  const acceptedRequestSupervisor = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    filesystemAuthority: successfulFilesystemAuthority(
+      base.parent,
+      maximumRequestedRoot,
+      acceptedFilesystemEvents,
+      { acquireError: new Error("stop after pathname validation") },
+    ),
+  }));
   await assert.rejects(
-    base.supervisor.launchWriter(launchInput(oversizedRoot)),
+    acceptedRequestSupervisor.launchWriter(launchInput(maximumRequestedRoot)),
+    assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+  );
+  assert.deepEqual(
+    acceptedFilesystemEvents.map((event) => event.operation),
+    ["acquire"],
+  );
+  const runnerCallsBeforeRejection = base.events.length;
+  const filesystemCallsBeforeRejection = base.filesystemEvents.length;
+  await assert.rejects(
+    base.supervisor.launchWriter(launchInput(oversizedRequestedRoot)),
     assertSupervisorError("invalid_podman_writer_supervisor_request"),
   );
-  assert.equal(base.events.length, 0);
-  assert.equal(base.filesystemEvents.length, 0);
+  assert.equal(base.events.length, runnerCallsBeforeRejection);
+  assert.equal(
+    base.filesystemEvents.length,
+    filesystemCallsBeforeRejection,
+  );
+});
+
+test("measured runtime paths use the native pathname domain before dispatch", async (t) => {
+  const base = await fixture(t);
+  const maximumPath = `/${"é".repeat(2_047)}`;
+  const oversizedPath = `${maximumPath}a`;
+  assert.equal(Buffer.byteLength(maximumPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedPath, "utf8"), 4_096);
+
+  const acceptedMeasuredImage = exact({
+    ...measuredImage(),
+    runtimeIdentity: exact({
+      ...measuredImage().runtimeIdentity,
+      codexBinaryPath: maximumPath,
+    }),
+  });
+  const acceptedInput = launchInput(base.attachmentRoot, {
+    measuredImage: acceptedMeasuredImage,
+  });
+  const receipt = await base.supervisor.launchWriter(acceptedInput);
+  await receipt.stopWriter(stopInput(acceptedInput, receipt));
+  const runnerCallsBeforeRejection = base.events.length;
+  const filesystemCallsBeforeRejection = base.filesystemEvents.length;
+
+  for (const codexBinaryPath of [
+    oversizedPath,
+    "/provider/runtime/\ud800",
+    "relative/codex",
+    "/provider/runtime/../codex",
+  ]) {
+    const invalidMeasuredImage = exact({
+      ...measuredImage(),
+      runtimeIdentity: exact({
+        ...measuredImage().runtimeIdentity,
+        codexBinaryPath,
+      }),
+    });
+    await assert.rejects(
+      base.supervisor.launchWriter(
+        launchInput(base.attachmentRoot, {
+          measuredImage: invalidMeasuredImage,
+        }),
+      ),
+      assertSupervisorError("invalid_podman_writer_supervisor_request"),
+    );
+  }
+  assert.equal(base.events.length, runnerCallsBeforeRejection);
+  assert.equal(base.filesystemEvents.length, filesystemCallsBeforeRejection);
+});
+
+test(
+  "measured runtime canonicality uses captured node:path intrinsics",
+  { concurrency: false },
+  async (t) => {
+    const base = await fixture(t);
+    const invalidMeasuredImage = exact({
+      ...measuredImage(),
+      runtimeIdentity: exact({
+        ...measuredImage().runtimeIdentity,
+        codexBinaryPath: "relative/codex",
+      }),
+    });
+    const invalidInput = launchInput(base.attachmentRoot, {
+      measuredImage: invalidMeasuredImage,
+    });
+    const isAbsoluteDescriptor = Object.getOwnPropertyDescriptor(
+      path,
+      "isAbsolute",
+    );
+    const resolveDescriptor = Object.getOwnPropertyDescriptor(path, "resolve");
+    let poisonCalls = 0;
+    path.isAbsolute = () => {
+      poisonCalls += 1;
+      return true;
+    };
+    path.resolve = (value) => {
+      poisonCalls += 1;
+      return value;
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        base.supervisor.launchWriter(invalidInput),
+        assertSupervisorError("invalid_podman_writer_supervisor_request"),
+      );
+      assert.equal(poisonCalls, 0);
+      assert.equal(base.events.length, 0);
+      assert.equal(base.filesystemEvents.length, 0);
+    } finally {
+      Object.defineProperty(path, "isAbsolute", isAbsoluteDescriptor);
+      Object.defineProperty(path, "resolve", resolveDescriptor);
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test("held mount sources use the 4095-byte native pathname domain", async (t) => {
+  const sourcePrefix = "/proc/";
+  const sourceSuffix = "/fd/7";
+  const maximumSource = `${sourcePrefix}${"1".repeat(
+    4_095 - sourcePrefix.length - sourceSuffix.length,
+  )}${sourceSuffix}`;
+  const oversizedSource = `${sourcePrefix}${"1".repeat(
+    4_096 - sourcePrefix.length - sourceSuffix.length,
+  )}${sourceSuffix}`;
+  assert.equal(Buffer.byteLength(maximumSource, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedSource, "utf8"), 4_096);
+
+  const accepted = await fixture(t, {
+    filesystemSettings: { mountSource: maximumSource },
+  });
+  const receipt = await accepted.supervisor.launchWriter(accepted.input);
+  assert.equal(receipt.evidence.status, "started");
+  await receipt.stopWriter(stopInput(accepted.input, receipt));
+
+  const rejected = await fixture(t, {
+    filesystemSettings: { mountSource: oversizedSource },
+  });
+  await assert.rejects(
+    rejected.supervisor.launchWriter(rejected.input),
+    assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+  );
+  assert.equal(
+    rejected.events.some((event) => event.arguments_[0] === "create"),
+    false,
+  );
 });
 
 test("configured attachment root containment and held-source shape are enforced outside the collaborator", async (t) => {

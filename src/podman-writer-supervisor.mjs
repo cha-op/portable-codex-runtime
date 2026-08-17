@@ -54,6 +54,8 @@ const hashUpdateIntrinsic = Hash.prototype.update;
 const numberIsFiniteIntrinsic = Number.isFinite;
 const numberIsSafeIntegerIntrinsic = Number.isSafeInteger;
 const NumberConstructor = Number;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathResolveIntrinsic = resolve;
 const objectAssignIntrinsic = Object.assign;
 const objectCreateIntrinsic = Object.create;
 const objectDefinePropertiesIntrinsic = Object.defineProperties;
@@ -173,6 +175,7 @@ const COMMAND_PROCESS_GROUP_POLL_MILLISECONDS = 20;
 const MAX_DATA_DEPTH = 32;
 const MAX_DATA_NODES = 32_768;
 const MAX_CANONICAL_BYTES = 4 * 1024 * 1024;
+const MAX_HOST_PATH_BYTES = 4_095;
 
 const EMPTY_KEYS = Object.freeze([]);
 const OPTION_KEYS = Object.freeze([
@@ -688,7 +691,11 @@ function normalizeMeasuredImage(value, code) {
       config.size >= 0 &&
       regexpTest(OCI_DIGEST_PATTERN, platformImage.digest) &&
       regexpTest(OCI_DIGEST_PATTERN, config.digest) &&
-      typeof runtime.codexBinaryPath === "string" &&
+      validHostPathnameBytes(runtime.codexBinaryPath) &&
+      runtime.codexBinaryPath.length > 1 &&
+      pathIsAbsoluteIntrinsic(runtime.codexBinaryPath) &&
+      pathResolveIntrinsic(runtime.codexBinaryPath) ===
+        runtime.codexBinaryPath &&
       assertSha256(runtime.codexBinarySha256, code) === runtime.codexBinarySha256 &&
       runtime.codexVersion === projection.codexVersion &&
       runtime.platformImageDigest === platformImage.digest,
@@ -1091,6 +1098,19 @@ function sameDirectoryAuthority(left, right) {
     left.uid === right.uid && left.mode === right.mode;
 }
 
+function validHostPathnameBytes(value) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_HOST_PATH_BYTES ||
+    stringIncludes(value, "\0")
+  ) return false;
+  // Bound UTF-16 code units before UTF-8 encoding so an untrusted request
+  // cannot force an attacker-sized temporary allocation.
+  const encoded = callIntrinsic(bufferFromIntrinsic, Buffer, [value, "utf8"]);
+  return encoded.length <= MAX_HOST_PATH_BYTES &&
+    callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === value;
+}
+
 function assertCanonicalAttachmentRoot(
   rootPath,
   code = "invalid_podman_writer_supervisor_request",
@@ -1098,18 +1118,9 @@ function assertCanonicalAttachmentRoot(
   ensure(
     typeof rootPath === "string" &&
       rootPath.length > 1 &&
-      rootPath.length <= 4096,
-    code,
-  );
-  // Bound UTF-16 code units before either UTF-8 sizing or encoding so an
-  // untrusted request cannot force an attacker-sized temporary allocation.
-  const encoded = callIntrinsic(bufferFromIntrinsic, Buffer, [rootPath, "utf8"]);
-  ensure(
-    callIntrinsic(bufferByteLengthIntrinsic, Buffer, [rootPath, "utf8"]) <=
-      4096 &&
-      callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === rootPath &&
-      isAbsolute(rootPath) &&
-      resolve(rootPath) === rootPath &&
+      validHostPathnameBytes(rootPath) &&
+      pathIsAbsoluteIntrinsic(rootPath) &&
+      pathResolveIntrinsic(rootPath) === rootPath &&
       !regexpTest(/[\0,\r\n]/u, rootPath),
     code,
   );
@@ -1413,8 +1424,8 @@ async function startFilesystemHolder(input, configured, attachment) {
     typeof input.holder === "object" &&
       input.holder !== null &&
       input.holder.podmanExecutable !== undefined &&
-      isAbsolute(processExecutable) &&
-      isAbsolute(filesystemAuthorityHelper),
+      pathIsAbsoluteIntrinsic(processExecutable) &&
+      pathIsAbsoluteIntrinsic(filesystemAuthorityHelper),
     "podman_writer_attachment_revalidation_failed",
   );
   const acquisitionFrame = callIntrinsic(jsonStringifyIntrinsic, JsonObject, [
@@ -1962,9 +1973,9 @@ async function acquireFilesystemAuthority(
   const normalized = frozenRecord(acquired);
   const validMountSource = typeof acquired.mountSource === "string" &&
     acquired.mountSource.length > 1 &&
-    acquired.mountSource.length <= 4096 &&
-    isAbsolute(acquired.mountSource) &&
-    resolve(acquired.mountSource) === acquired.mountSource &&
+    validHostPathnameBytes(acquired.mountSource) &&
+    pathIsAbsoluteIntrinsic(acquired.mountSource) &&
+    pathResolveIntrinsic(acquired.mountSource) === acquired.mountSource &&
     acquired.mountSource !== rootPath &&
     !regexpTest(/[\0,\r\n]/u, acquired.mountSource) &&
     regexpTest(PROC_FD_SOURCE_PATTERN, acquired.mountSource);
@@ -2509,9 +2520,9 @@ function validAttachmentMountSource(source, expected) {
   if (
     typeof source !== "string" ||
     source.length <= 1 ||
-    source.length > 4096 ||
-    !isAbsolute(source) ||
-    resolve(source) !== source ||
+    !validHostPathnameBytes(source) ||
+    !pathIsAbsoluteIntrinsic(source) ||
+    pathResolveIntrinsic(source) !== source ||
     regexpTest(/[\0,\r\n]/u, source)
   ) {
     return false;
@@ -2619,11 +2630,10 @@ export function createPodmanWriterSupervisor(...args) {
   );
   const supervisorId = assertOpaqueId(options.supervisorId, optionCode);
   ensure(
-    typeof options.podmanExecutable === "string" &&
+    validHostPathnameBytes(options.podmanExecutable) &&
       options.podmanExecutable.length > 1 &&
-      !stringIncludes(options.podmanExecutable, "\0") &&
-      isAbsolute(options.podmanExecutable) &&
-      resolve(options.podmanExecutable) === options.podmanExecutable,
+      pathIsAbsoluteIntrinsic(options.podmanExecutable) &&
+      pathResolveIntrinsic(options.podmanExecutable) === options.podmanExecutable,
     optionCode,
   );
   const podmanExecutable = options.podmanExecutable;

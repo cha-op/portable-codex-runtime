@@ -10,6 +10,7 @@ import { isAbsolute, resolve } from "node:path";
 const MAX_CONTROL_BYTES = 16;
 const MAX_ACQUISITION_BYTES = 64 * 1024;
 const MAX_RECEIPT_BYTES = 1024;
+const MAX_HOST_PATH_BYTES = 4095;
 const CLOSE_MESSAGE = "close\n";
 const VERIFY_MESSAGE = "verify\n";
 
@@ -36,6 +37,20 @@ function heldDirectory(fd) {
   };
 }
 
+function validHostPathname(path) {
+  if (
+    typeof path !== "string" ||
+    path.length <= 1 ||
+    path.length > MAX_HOST_PATH_BYTES
+  ) return false;
+  const encoded = Buffer.from(path, "utf8");
+  return encoded.length <= MAX_HOST_PATH_BYTES &&
+    encoded.toString("utf8") === path &&
+    isAbsolute(path) &&
+    resolve(path) === path &&
+    !/[\0\r\n]/u.test(path);
+}
+
 let configuredFd = null;
 let attachmentFd = null;
 let initialAttachment = null;
@@ -60,13 +75,7 @@ function acquisitionFrame(message) {
     typeof value.attachmentRoot !== "string"
   ) throw new Error("invalid acquisition");
   for (const path of [value.configuredRoot, value.attachmentRoot]) {
-    if (
-      path.length <= 1 ||
-      path.length > 4096 ||
-      !isAbsolute(path) ||
-      resolve(path) !== path ||
-      /[\0\r\n]/u.test(path)
-    ) throw new Error("invalid path");
+    if (!validHostPathname(path)) throw new Error("invalid path");
   }
   configuredFd = openDirectory(value.configuredRoot);
   attachmentFd = openDirectory(value.attachmentRoot);

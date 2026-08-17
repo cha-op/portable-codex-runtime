@@ -65,7 +65,7 @@ const MAX_OPERATION_JSON_BYTES = 65_536;
 const MAX_OPERATION_ENVELOPE_JSON_BYTES = 131_072;
 const MAX_OPERATION_JSON_DEPTH = 32;
 const MAX_OPERATION_JSON_NODES = 4_096;
-const MAX_ATTACHMENT_ROOT_PATH_BYTES = 4_096;
+const MAX_NATIVE_PATH_BYTES = 4_095;
 const OPERATION_REQUEST_VERSION = 1;
 const RESERVATION_PAYLOAD_VERSION = 1;
 const OPERATION_RESULT_VERSION = 1;
@@ -1690,6 +1690,28 @@ function assertLosslessString(value, code) {
   return value;
 }
 
+function canonicalPosixPathname(value, code) {
+  assertLosslessString(value, code);
+  ensure(
+    value.length > 1 &&
+      value.length <= MAX_NATIVE_PATH_BYTES &&
+      reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
+        value,
+        "utf8",
+      ]) <= MAX_NATIVE_PATH_BYTES &&
+      posixPathIsAbsoluteIntrinsic(value) &&
+      posixPathNormalizeIntrinsic(value) === value,
+    code,
+  );
+  for (let index = 0; index < value.length; index += 1) {
+    ensure(
+      reflectApply(stringCharCodeAtIntrinsic, value, [index]) !== 0,
+      code,
+    );
+  }
+  return value;
+}
+
 function consumeOperationJsonBytes(state, additionalBytes, code) {
   ensure(
     numberIsSafeInteger(additionalBytes) &&
@@ -2060,16 +2082,16 @@ function canonicalLeaseGrant(value, code) {
 }
 
 function canonicalAttachmentRootPath(value, code) {
+  assertLosslessString(value, code);
   ensure(
-    typeof value === "string" &&
-      value.length <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
+    value.length <= MAX_NATIVE_PATH_BYTES,
     code,
   );
   ensure(
     reflectApply(bufferByteLengthIntrinsic, BufferConstructor, [
       value,
       "utf8",
-    ]) <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
+    ]) <= MAX_NATIVE_PATH_BYTES,
     code,
   );
   for (let index = 0; index < value.length; index += 1) {
@@ -3693,7 +3715,7 @@ function canonicalWriterLaunchMeasuredImage(value, manifest, code) {
   assertLosslessString(platformImage.mediaType, code);
   assertLosslessString(platformImage.os, code);
   assertLosslessString(config.mediaType, code);
-  assertLosslessString(runtimeIdentity.codexBinaryPath, code);
+  canonicalPosixPathname(runtimeIdentity.codexBinaryPath, code);
   ensure(
     platformImage.architecture.length >= 1 &&
       platformImage.architecture.length <= 64 &&
@@ -3715,11 +3737,6 @@ function canonicalWriterLaunchMeasuredImage(value, manifest, code) {
       regexpTest(OCI_SHA256_DIGEST_PATTERN, config.digest) &&
       typeof runtimeIdentity.codexBinarySha256 === "string" &&
       regexpTest(SHA256_PATTERN, runtimeIdentity.codexBinarySha256) &&
-      runtimeIdentity.codexBinaryPath.length > 1 &&
-      runtimeIdentity.codexBinaryPath.length <= 4_096 &&
-      posixPathIsAbsoluteIntrinsic(runtimeIdentity.codexBinaryPath) &&
-      posixPathNormalizeIntrinsic(runtimeIdentity.codexBinaryPath) ===
-        runtimeIdentity.codexBinaryPath &&
       projection.codexSandbox === manifest.runtime.codexSandbox &&
       projection.codexVersion === manifest.runtime.codexVersion &&
       `${platformImage.os}/${platformImage.architecture}` ===

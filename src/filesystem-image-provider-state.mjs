@@ -247,7 +247,7 @@ const MAX_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
 const MAX_FRAME_COUNT = 65_535;
 const MAX_UINT32 = 4_294_967_295;
-const MAX_PATH_BYTES = 4_096;
+const MAX_PATH_BYTES = 4_095;
 const MAX_PHYSICAL_OBJECT_ID_BYTES = 512;
 const MAX_UINT64 = 18_446_744_073_709_551_615n;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -303,6 +303,8 @@ const ERROR_MESSAGES = objectFreeze({
   operation_conflict: "Filesystem image provider operation conflicts with durable state",
   operation_already_prepared:
     "Filesystem image provider operation is already durably prepared",
+  storage_lookup_ambiguous:
+    "Filesystem image provider storage lookup is ambiguous",
   state_capacity_exhausted:
     "Filesystem image provider state active ledger capacity is exhausted",
   maintenance_failed: "Filesystem image provider state maintenance failed",
@@ -3949,6 +3951,33 @@ export class FilesystemImageProviderState {
     return await this.#run(
       async ({ state }) => mapGet(state.storages, normalizedId) ?? null,
     );
+  }
+
+  async readStorageByMountPath(options) {
+    const input = exactDataObject(
+      options,
+      ["backendId", "mountPath"],
+      ["backendId", "mountPath"],
+      "invalid_request",
+    );
+    const backendId = canonicalOpaqueId(input.backendId, "invalid_request");
+    const mountPath = canonicalAbsolutePath(input.mountPath, "invalid_request");
+    return await this.#run(async ({ state }) => {
+      let matched = null;
+      mapForEach(state.storages, (storage) => {
+        if (
+          storage.backendId !== backendId ||
+          storage.lifecycle === "destroyed" ||
+          storage.mount === null ||
+          storage.mount.mountPath !== mountPath
+        ) {
+          return;
+        }
+        ensure(matched === null, "storage_lookup_ambiguous");
+        matched = storage;
+      });
+      return matched;
+    });
   }
 
   async inspectCapacity() {

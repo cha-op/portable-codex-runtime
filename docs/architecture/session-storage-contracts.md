@@ -346,8 +346,11 @@ provider proof. The portable storage reference contains only backend, storage,
 and runtime session IDs. The attachment adds the host-local absolute directory
 path, holder, operation, proof, and exact lease/epoch; it is ephemeral and must
 not be written to the session manifest, checkpoint descriptor, or portable
-evidence. Passing the capability validator confirms only this object shape and
-declaration; backend behavior remains untrusted until the concrete adapter
+evidence. Every attachment root is a canonical non-root absolute pathname that
+round-trips through UTF-8, contains no NUL, and occupies at most 4095 UTF-8
+bytes. This native pathname domain is independent of the generic JSON and argv
+size budgets. Passing the capability validator confirms only this object shape
+and declaration; backend behavior remains untrusted until the concrete adapter
 passes its conformance suite.
 
 Checkpoint orchestration may instead accept the narrower projection validated

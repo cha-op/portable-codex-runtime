@@ -1473,6 +1473,128 @@ test("anchors the publication control identity at provision and preserves it", a
   );
 });
 
+test("reads storage by mount path without traversing permanent operation history", async (t) => {
+  const forEachDescriptor = Object.getOwnPropertyDescriptor(
+    Map.prototype,
+    "forEach",
+  );
+  let countOperationIterations = false;
+  let operationIterations = 0;
+  Object.defineProperty(Map.prototype, "forEach", {
+    ...forEachDescriptor,
+    value(callback, thisArg) {
+      if (countOperationIterations) {
+        let operationShaped = false;
+        Reflect.apply(forEachDescriptor.value, this, [
+          (value) => {
+            if (
+              value !== null &&
+              typeof value === "object" &&
+              Object.hasOwn(value, "operationId")
+            ) {
+              operationShaped = true;
+            }
+          },
+        ]);
+        if (operationShaped) operationIterations += 1;
+      }
+      return Reflect.apply(forEachDescriptor.value, this, [callback, thisArg]);
+    },
+  });
+  let LookupState;
+  try {
+    ({ FilesystemImageProviderState: LookupState } = await import(
+      "../src/filesystem-image-provider-state.mjs?storage-lookup-tripwire"
+    ));
+  } finally {
+    Object.defineProperty(Map.prototype, "forEach", forEachDescriptor);
+  }
+
+  const fixture = await createFixture(t);
+  const state = new LookupState({
+    acquireLock: fixture.acquireLock,
+    directory: fixture.directory,
+    headAnchor: fixture.headAnchor,
+    ...TRUSTED_ACL_INSPECTORS,
+  });
+  await prepareAndCommit(state);
+  for (let index = 0; index < 128; index += 1) {
+    const operationId = `operation-history-${String(index).padStart(4, "0")}`;
+    const request = operationRequest("checkpoint", "storage-001", { index });
+    await state.prepareOperation({
+      kind: "checkpoint",
+      operationId,
+      request,
+      storageId: "storage-001",
+    });
+    await state.commitOperation({
+      operationId,
+      request,
+      result: { status: "checkpointed" },
+      storageState: storageState({ revision: String(index + 2) }),
+    });
+  }
+  assert.equal((await state.inspectCapacity()).retainedOperationCount, 129);
+
+  countOperationIterations = true;
+  const storage = await state.readStorageByMountPath({
+    backendId: "filesystem-image-ext4",
+    mountPath: mount().mountPath,
+  });
+  countOperationIterations = false;
+  assert.equal(storage.storageId, "storage-001");
+  assert.equal(operationIterations, 0);
+});
+
+test("mount-path lookup rejects ambiguity and uses the 4095-byte path domain", async (t) => {
+  const fixture = await createFixture(t);
+  const validMount = {
+    ...mount(),
+    mountPath: `/${"m".repeat(4_094)}`,
+  };
+  assert.equal(Buffer.byteLength(validMount.mountPath, "utf8"), 4_095);
+  await prepareAndCommit(fixture.state, {
+    storage: storageState({ mount: validMount }),
+  });
+  assert.equal(
+    (await fixture.state.readStorageByMountPath({
+      backendId: "filesystem-image-ext4",
+      mountPath: validMount.mountPath,
+    })).storageId,
+    "storage-001",
+  );
+  assert.equal(
+    await fixture.state.readStorageByMountPath({
+      backendId: "another-backend",
+      mountPath: validMount.mountPath,
+    }),
+    null,
+  );
+  await assert.rejects(
+    fixture.state.readStorageByMountPath({
+      backendId: "filesystem-image-ext4",
+      mountPath: `/${"m".repeat(4_095)}`,
+    }),
+    stateError("invalid_request"),
+  );
+
+  await prepareAndCommit(fixture.state, {
+    operationId: "operation-provision-duplicate-mount-002",
+    request: operationRequest("provision", "storage-002"),
+    storage: storageState({
+      mount: validMount,
+      storageId: "storage-002",
+    }),
+  });
+  await assert.rejects(
+    fixture.state.readStorageByMountPath({
+      backendId: "filesystem-image-ext4",
+      mountPath: validMount.mountPath,
+    }),
+    stateError("storage_lookup_ambiguous"),
+  );
+});
+
 test("exact committed replay returns the original result without appending", async (t) => {
   const fixture = await createFixture(t);
   const request = operationRequest("provision");

@@ -255,6 +255,15 @@ objects; metadata change is a content-revalidation trigger, not evidence by
 itself of content mutation. Object replacement, changed content, unsafe access
 policy, and failed revalidation remain distinct fail-closed outcomes.
 
+Publication-control resolution uses one locked
+`readStorageByMountPath({ backendId, mountPath })` query. It scans only storage
+records and never projects, clones, or sorts the permanently retained operation
+history. No match remains an ordinary absent result; multiple live records for
+the same backend and mount path are ambiguous and fail closed. A cold cache may
+still replay the authoritative checkpoint and active log before this query, so
+the guarantee is independence from operation-history projection on the warm
+lookup path, not an end-to-end constant-time open.
+
 This provider-state checkpoint is a control-plane replay snapshot. It is not a
 physical ext4 image checkpoint, a published checkpoint artifact, or a content
 root. Because exact replay is permanent in this version, every unique
@@ -312,6 +321,10 @@ absence of access or default ACLs. Directory child-entry churn is not an object
 or policy change: identity uses the held `dev`/`ino`; current UID, mode, and the
 ACL check are access-policy signals. A positive link count independently proves
 that the directory remains linked, while its exact value is not compared.
+Configured roots, attachment roots, the host Podman executable, holder-frame
+paths, and observed mount sources share the native pathname domain: canonical
+absolute NUL-free round-trip UTF-8 of at most 4095 bytes. Generic environment,
+argv, JSON, and protocol-frame budgets remain separate limits.
 
 Before create, the built-in authority starts a temporary FD holder through
 `podman --remote=false unshare` so the holder and later Podman lifecycle
