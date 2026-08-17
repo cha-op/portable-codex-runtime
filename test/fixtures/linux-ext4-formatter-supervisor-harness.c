@@ -10,7 +10,8 @@ static void formatter_test_ignore_term(int signal_number) {
   const char trace = 'T';
   (void)signal_number;
   if (formatter_test_trace_fd >= 0) {
-    (void)write(formatter_test_trace_fd, &trace, 1U);
+    ssize_t written = write(formatter_test_trace_fd, &trace, 1U);
+    (void)written;
   }
 }
 
