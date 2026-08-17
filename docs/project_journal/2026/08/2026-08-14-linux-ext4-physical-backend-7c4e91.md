@@ -462,6 +462,52 @@ change and does not attest the current head:
   `absent` or `unreadable`; those labels do not prove that no fatal occurred.
   The diagnostic backstop is now 65 seconds inside the existing two-minute
   workflow bound.
+- The next fixed CI result was `wait-exit-one` with no attributable conmon
+  journal record. Only for that exact pair, the watchdog now creates a separate
+  authority-free ordinary bind and runs an explicit same-image `create` then
+  full-ID `start` control after observing the protected failure tuple while the
+  launch promise remains pending and its filesystem authority remains held. It
+  never retries, aborts, or captures output from the protected exact-start
+  promise. This control is diagnostic evidence only; it does not prove the
+  protected procfd production path safe or authorize releasing its authority.
+  The control uses the same rootless environment, image, security,
+  user-namespace, workdir, writer, and bind-propagation settings, with only the
+  ordinary source and container identity differing. Its exact create argv also
+  ignores image-declared volumes, sets `/usr/local/bin/writer` as the explicit
+  entrypoint, and leaves no command argument after the image, matching the
+  production single-element writer command. Its stderr pipe is drained
+  continuously, retains at most 64 KiB, and discards any excess. A direct
+  Podman leader `exit` clears the command timeout and permits a fixed 250 ms
+  post-exit drain grace: stream `end` or `close` can finish it early, while the
+  timer destroys descendant-held pipes instead of waiting indefinitely for
+  EOF. A command timeout sends `SIGKILL` to that control-only process group.
+  This avoids both unbounded diagnostic-file growth and a descendant-held pipe
+  blocking the watchdog. Captured raw stderr is retained only in bounded
+  memory; neither it nor the exact control ID is formatted. Cleanup addresses
+  only that exact ID.
+- The resulting line adds finite `controlCreate`, `controlStart`,
+  `controlStderrStage`, `controlStderrErrno`, `controlCliOption`, and
+  `controlCleanup` labels. The stderr classifier admits only anchored conmon
+  2.1.10 fatal prefixes and Podman's exact exit-one wrapper, retains pidfile
+  priority, and maps GLib unknown-option or missing-argument text only to the
+  fixed Podman 4.9.3 conmon-option allowlist. Paths, IDs, PIDs, raw option
+  tokens, error text, and numeric exit statuses cannot enter the formatted
+  output. The hard watchdog is 90 seconds from protected launch, leaving 30
+  seconds inside the unchanged two-minute workflow step. The focused
+  classifier, exact-argv, delayed post-exit capture, output-cap, and
+  process-group timeout regressions passed locally. The integration module's
+  `node --check` validation also passed; the real Ubuntu Podman control remains
+  the next runtime gate.
+- The current review-fix delta moves writable-attachment planning and restore
+  root validation ahead of durable provider-state preparation. It binds the
+  selected storage/image/mount and direct `data-*` or `generation-*` child,
+  rejects a 4096-byte restore child before mutation, and keeps failed-operation
+  ledger bytes, operation state, and driver dispatch unchanged. The inspector
+  and driver also reject overlong UTF-16 path inputs before UTF-8 allocation.
+  Writer containers now ignore image-declared volumes and explicitly override
+  the image entrypoint with the configured writer executable. Holder abort
+  listener setup uses captured `EventTarget` intrinsics without an inherited
+  options dictionary and keeps force-stop/reap in the failure path.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

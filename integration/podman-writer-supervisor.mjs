@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { writeSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
@@ -25,9 +25,13 @@ const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const SUPERVISOR_ID = "podman-linux-integration-v1";
 const TEST_ROOT_PREFIX = "/var/tmp/portable-codex-runtime-podman-";
 const WATCHDOG_DIAGNOSTIC_MILLISECONDS = 45_000;
-const WATCHDOG_HARD_BACKSTOP_MILLISECONDS = 65_000;
+const WATCHDOG_HARD_BACKSTOP_MILLISECONDS = 90_000;
 const WATCHDOG_JOURNAL_BYTES = 64 * 1024;
 const WATCHDOG_PROBE_MILLISECONDS = 5_000;
+const WATCHDOG_CONTROL_START_MILLISECONDS = 7_000;
+const WATCHDOG_CONTROL_DRAIN_MILLISECONDS = 250;
+const WATCHDOG_CONTROL_STDERR_BYTES = 64 * 1024;
+const WATCHDOG_CONTROL_STDOUT_BYTES = 128;
 
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -445,17 +449,8 @@ function classifyConmonFatalErrno(value) {
   return "unknown";
 }
 
-function classifyConmonFatalMessage(value, containerId) {
-  if (
-    typeof value !== "string" ||
-    typeof containerId !== "string" ||
-    !/^[0-9a-f]{64}$/u.test(containerId)
-  ) {
-    return null;
-  }
-  const prefix = `conmon ${containerId.slice(0, 20)} <error>:`;
-  if (!value.startsWith(prefix)) return null;
-  const normalized = value.slice(prefix.length).trim().toLowerCase();
+function classifyConmonFatalBody(value) {
+  const normalized = value.trim().toLowerCase();
   let conmonStage = "unknown";
   let noErrno = false;
   if (
@@ -512,6 +507,140 @@ function classifyConmonFatalMessage(value, containerId) {
     conmonErrno: noErrno ? "none" : classifyConmonFatalErrno(normalized),
     conmonStage,
   });
+}
+
+function classifyConmonFatalMessage(value, containerId) {
+  if (
+    typeof value !== "string" ||
+    typeof containerId !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(containerId)
+  ) {
+    return null;
+  }
+  const prefix = `conmon ${containerId.slice(0, 20)} <error>:`;
+  if (!value.startsWith(prefix)) return null;
+  return classifyConmonFatalBody(value.slice(prefix.length));
+}
+
+const CONTROL_CLI_OPTION_LABELS = exact({
+  "--api-version": "api-version",
+  "--bundle": "bundle",
+  "--cid": "cid",
+  "--conmon-pidfile": "conmon-pidfile",
+  "--container-pidfile": "container-pidfile",
+  "--cuuid": "cuuid",
+  "--exit-command": "exit-command",
+  "--exit-command-arg": "exit-command-arg",
+  "--exit-dir": "exit-dir",
+  "--full-attach": "full-attach",
+  "--log-level": "log-level",
+  "--log-path": "log-path",
+  "--log-size-max": "log-size-max",
+  "--name": "name",
+  "--no-new-keyring": "no-new-keyring",
+  "--runtime": "runtime",
+  "--runtime-arg": "runtime-arg",
+  "--syslog": "syslog",
+  "-b": "bundle",
+  "-c": "cid",
+  "-l": "log-path",
+  "-n": "name",
+  "-p": "container-pidfile",
+  "-r": "runtime",
+  "-u": "cuuid",
+});
+
+function classifyControlCliOption(value) {
+  const match = /^conmon: option parsing failed: (?:Unknown option|Missing argument for) ((?:--[a-z0-9][a-z0-9-]*|-[a-z0-9]))(?:=.*)?$/u
+    .exec(value);
+  if (match === null) return "unknown";
+  return Object.hasOwn(CONTROL_CLI_OPTION_LABELS, match[1])
+    ? CONTROL_CLI_OPTION_LABELS[match[1]]
+    : "other";
+}
+
+function controlStderrObservation(
+  controlStderrStage,
+  controlStderrErrno,
+  controlCliOption = "not-applicable",
+) {
+  return exact({ controlCliOption, controlStderrErrno, controlStderrStage });
+}
+
+function classifyControlStderr(value, overflow = false, readable = true) {
+  if (!readable || typeof value !== "string") {
+    return controlStderrObservation("unreadable", "unreadable", "unknown");
+  }
+  if (overflow) {
+    return controlStderrObservation("overflow", "unreadable", "unknown");
+  }
+  if (value === "") {
+    return controlStderrObservation("absent", "absent");
+  }
+  const records = [];
+  let wrapperObserved = false;
+  for (const rawLine of value.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line === "") continue;
+    if (line.startsWith("conmon: option parsing failed:")) {
+      records.push(exact({
+        conmonErrno: "none",
+        conmonStage: "cli-option",
+        controlCliOption: classifyControlCliOption(line),
+      }));
+      continue;
+    }
+    if (line === "conmon: Container ID not provided. Use --cid") {
+      records.push(exact({
+        conmonErrno: "none",
+        conmonStage: "cli-cid",
+        controlCliOption: "not-applicable",
+      }));
+      continue;
+    }
+    let body = null;
+    if (line.startsWith("[conmon:e]: ")) {
+      body = line.slice("[conmon:e]: ".length);
+    } else if (line.startsWith("[conmon:e] ")) {
+      body = line.slice("[conmon:e] ".length);
+    }
+    if (body !== null) {
+      records.push(exact({
+        ...classifyConmonFatalBody(body),
+        controlCliOption: "not-applicable",
+      }));
+      continue;
+    }
+    if (/^Error: .*conmon failed: exit status 1$/u.test(line)) {
+      wrapperObserved = true;
+    }
+  }
+  if (records.length === 0) {
+    return wrapperObserved
+      ? controlStderrObservation("wrapper-only", "unknown")
+      : controlStderrObservation("unknown", "unknown");
+  }
+  const pidfileRecords = records.filter(
+    (record) => record.conmonStage === "pidfile",
+  );
+  const selectedRecords = pidfileRecords.length > 0 ? pidfileRecords : records;
+  const stages = new Set(selectedRecords.map((record) => record.conmonStage));
+  const errnos = new Set(selectedRecords.map((record) => record.conmonErrno));
+  const cliOptions = new Set(
+    selectedRecords
+      .filter((record) => record.conmonStage === "cli-option")
+      .map((record) => record.controlCliOption),
+  );
+  const controlStderrStage = stages.size === 1 ? [...stages][0] : "ambiguous";
+  return controlStderrObservation(
+    controlStderrStage,
+    errnos.size === 1 ? [...errnos][0] : "ambiguous",
+    cliOptions.size === 0
+      ? "not-applicable"
+      : (controlStderrStage === "cli-option" && cliOptions.size === 1
+        ? [...cliOptions][0]
+        : "unknown"),
+  );
 }
 
 function classifyConmonJournalOutput(value, containerId, expectedUid) {
@@ -1091,6 +1220,361 @@ async function observeUniqueImageContainer(journalBoundary) {
   );
 }
 
+function retainControlOutput(capture, chunk) {
+  const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  const remaining = Math.max(0, capture.limit - capture.bytes);
+  if (bytes.length > remaining) capture.overflow = true;
+  if (remaining > 0) {
+    const retained = Math.min(bytes.length, remaining);
+    bytes.copy(capture.buffer, capture.bytes, 0, retained);
+    capture.bytes += retained;
+  }
+}
+
+function destroyControlStream(stream) {
+  if (stream === null) return;
+  try {
+    stream.destroy();
+  } catch {
+    // The direct leader status remains independently bounded and classified.
+  }
+}
+
+function runBoundedControlLeader(
+  executable,
+  arguments_,
+  {
+    captureStderrBytes = 0,
+    captureStdoutBytes = 0,
+    environment,
+    timeoutMilliseconds,
+  },
+) {
+  return new Promise((resolve) => {
+    const stdoutCapture = {
+      buffer: Buffer.alloc(captureStdoutBytes),
+      bytes: 0,
+      complete: captureStdoutBytes === 0,
+      limit: captureStdoutBytes,
+      overflow: false,
+      readable: true,
+    };
+    const stderrCapture = {
+      buffer: Buffer.alloc(captureStderrBytes),
+      bytes: 0,
+      complete: captureStderrBytes === 0,
+      limit: captureStderrBytes,
+      overflow: false,
+      readable: true,
+    };
+    let child;
+    try {
+      child = spawn(executable, arguments_, {
+        cwd: "/",
+        detached: true,
+        env: environment,
+        killSignal: "SIGKILL",
+        shell: false,
+        stdio: [
+          "ignore",
+          captureStdoutBytes > 0 ? "pipe" : "ignore",
+          captureStderrBytes > 0 ? "pipe" : "ignore",
+        ],
+      });
+    } catch {
+      resolve(exact({
+        status: "spawn-failed",
+        stderr: Buffer.alloc(0),
+        stderrOverflow: false,
+        stderrReadable: false,
+        stdout: Buffer.alloc(0),
+        stdoutOverflow: false,
+        stdoutReadable: false,
+      }));
+      return;
+    }
+    let commandError = false;
+    let commandTimer = null;
+    let drainTimer = null;
+    let leaderStatus = null;
+    let settled = false;
+    let spawned = false;
+    let timedOut = false;
+    const result = (status) => exact({
+      status,
+      stderr: stderrCapture.buffer.subarray(0, stderrCapture.bytes),
+      stderrOverflow: stderrCapture.overflow,
+      stderrReadable: stderrCapture.readable,
+      stdout: stdoutCapture.buffer.subarray(0, stdoutCapture.bytes),
+      stdoutOverflow: stdoutCapture.overflow,
+      stdoutReadable: stdoutCapture.readable,
+    });
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      if (commandTimer !== null) {
+        clearTimeout(commandTimer);
+        commandTimer = null;
+      }
+      if (drainTimer !== null) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
+      destroyControlStream(child.stdout);
+      destroyControlStream(child.stderr);
+      resolve(result(status));
+    };
+    const finishIfDrained = () => {
+      if (
+        leaderStatus !== null &&
+        stdoutCapture.complete &&
+        stderrCapture.complete
+      ) {
+        finish(leaderStatus);
+      }
+    };
+    const completeCapture = (capture) => {
+      capture.complete = true;
+      finishIfDrained();
+    };
+    const attachCapture = (stream, capture) => {
+      if (stream === null) return;
+      stream.on("data", (chunk) => {
+        if (!settled) retainControlOutput(capture, chunk);
+      });
+      stream.once("end", () => completeCapture(capture));
+      stream.once("close", () => completeCapture(capture));
+      stream.on("error", () => {
+        if (!settled) capture.readable = false;
+        completeCapture(capture);
+      });
+    };
+    attachCapture(child.stdout, stdoutCapture);
+    attachCapture(child.stderr, stderrCapture);
+    child.once("spawn", () => {
+      spawned = true;
+    });
+    child.once("error", () => {
+      commandError = true;
+      if (!spawned) finish("spawn-failed");
+    });
+    child.once("exit", (code, signal) => {
+      if (commandTimer !== null) {
+        clearTimeout(commandTimer);
+        commandTimer = null;
+      }
+      if (timedOut) {
+        leaderStatus = "timeout";
+      } else if (commandError) {
+        leaderStatus = "unreadable";
+      } else if (signal !== null) {
+        leaderStatus = "signal";
+      } else if (code === 0) {
+        leaderStatus = "zero";
+      } else if (Number.isSafeInteger(code)) {
+        leaderStatus = "nonzero";
+      } else {
+        leaderStatus = "unreadable";
+      }
+      finishIfDrained();
+      if (!settled) {
+        drainTimer = setTimeout(
+          () => finish(leaderStatus),
+          WATCHDOG_CONTROL_DRAIN_MILLISECONDS,
+        );
+      }
+    });
+    commandTimer = setTimeout(() => {
+      if (settled) return;
+      commandTimer = null;
+      timedOut = true;
+      if (
+        Number.isSafeInteger(child.pid) &&
+        child.pid > 0 &&
+        child.exitCode === null &&
+        child.signalCode === null
+      ) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch (error) {
+          if (error?.code !== "ESRCH") commandError = true;
+        }
+      }
+    }, timeoutMilliseconds);
+  });
+}
+
+function decodeControlOutput(value) {
+  if (!Buffer.isBuffer(value)) return null;
+  const decoded = value.toString("utf8");
+  return Buffer.from(decoded, "utf8").equals(value) ? decoded : null;
+}
+
+function ordinaryControlObservation({
+  controlCleanup = "not-needed",
+  controlCliOption = "not-applicable",
+  controlCreate = "not-run",
+  controlStart = "not-run",
+  controlStderrErrno = "not-applicable",
+  controlStderrStage = "not-applicable",
+} = {}) {
+  return exact({
+    controlCleanup,
+    controlCliOption,
+    controlCreate,
+    controlStart,
+    controlStderrErrno,
+    controlStderrStage,
+  });
+}
+
+function formatOrdinaryControlObservation(observed) {
+  return `controlCreate=${observed.controlCreate} ` +
+    `controlStart=${observed.controlStart} ` +
+    `controlStderrStage=${observed.controlStderrStage} ` +
+    `controlStderrErrno=${observed.controlStderrErrno} ` +
+    `controlCliOption=${observed.controlCliOption} ` +
+    `controlCleanup=${observed.controlCleanup}`;
+}
+
+function ordinaryControlCreateArguments(
+  controlRoot,
+  containerName,
+  imageReference,
+) {
+  return [
+    "--remote=false",
+    "create",
+    "--name",
+    containerName,
+    "--pull=never",
+    "--image-volume=ignore",
+    "--read-only",
+    "--security-opt=no-new-privileges",
+    "--cap-drop=all",
+    "--userns=keep-id:uid=1000,gid=1000",
+    "--restart=no",
+    "--mount",
+    `type=bind,source=${controlRoot},target=/session,rw,bind-propagation=rprivate`,
+    "--workdir",
+    "/session",
+    "--entrypoint",
+    "/usr/local/bin/writer",
+    "--env",
+    "LANG=C.UTF-8",
+    imageReference,
+  ];
+}
+
+async function observeOrdinaryBindControl() {
+  const controlRoot = `${ROOT}-ordinary-control`;
+  const environment = exact({
+    HOME: process.env.HOME,
+    LANG: "C.UTF-8",
+    PATH: "/usr/bin:/bin",
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+  });
+  let containerId = null;
+  let controlCleanup = "not-needed";
+  let controlCreate = "unreadable";
+  let controlStart = "not-run";
+  let stderrObservation = controlStderrObservation(
+    "not-applicable",
+    "not-applicable",
+  );
+  try {
+    await mkdir(controlRoot, { mode: 0o700 });
+  } catch {
+    return ordinaryControlObservation({ controlCreate });
+  }
+  try {
+    const created = await runBoundedControlLeader(
+      PODMAN,
+      ordinaryControlCreateArguments(
+        controlRoot,
+        `portable-codex-diagnostic-control-${process.pid}`,
+        IMAGE_REFERENCE,
+      ),
+      {
+        captureStdoutBytes: WATCHDOG_CONTROL_STDOUT_BYTES,
+        environment,
+        timeoutMilliseconds: WATCHDOG_PROBE_MILLISECONDS,
+      },
+    );
+    controlCreate = created.status === "zero" ? "unreadable" : created.status;
+    const createOutput = created.stdoutReadable && !created.stdoutOverflow
+      ? decodeControlOutput(created.stdout)
+      : null;
+    const idMatch = createOutput === null
+      ? null
+      : /^([0-9a-f]{64})\n$/u.exec(createOutput);
+    if (idMatch !== null) containerId = idMatch[1];
+    if (
+      containerId === null &&
+      created.status !== "spawn-failed" &&
+      created.status !== "nonzero"
+    ) {
+      controlCleanup = "failed";
+    }
+    if (created.status === "zero" && containerId !== null) {
+      controlCreate = "ok";
+      const started = await runBoundedControlLeader(
+        PODMAN,
+        ["--remote=false", "start", containerId],
+        {
+          captureStderrBytes: WATCHDOG_CONTROL_STDERR_BYTES,
+          environment,
+          timeoutMilliseconds: WATCHDOG_CONTROL_START_MILLISECONDS,
+        },
+      );
+      controlStart = started.status;
+      const stderr = started.stderrReadable
+        ? decodeControlOutput(started.stderr)
+        : null;
+      stderrObservation = classifyControlStderr(
+        stderr,
+        started.stderrOverflow,
+        started.stderrReadable && stderr !== null,
+      );
+    }
+  } catch {
+    if (controlCreate !== "ok") controlCreate = "unreadable";
+    controlStart = "unreadable";
+    stderrObservation = controlStderrObservation(
+      "unreadable",
+      "unreadable",
+      "unknown",
+    );
+  } finally {
+    if (containerId !== null) {
+      const removed = await runBoundedControlLeader(
+        PODMAN,
+        ["--remote=false", "rm", "--force", containerId],
+        {
+          environment,
+          timeoutMilliseconds: WATCHDOG_PROBE_MILLISECONDS,
+        },
+      ).catch(() => exact({ status: "unreadable" }));
+      controlCleanup = removed.status === "zero"
+        ? "complete"
+        : (removed.status === "timeout" ? "timeout" : "failed");
+    }
+    try {
+      await rm(controlRoot, { recursive: true });
+    } catch {
+      if (controlCleanup !== "timeout") controlCleanup = "failed";
+    }
+  }
+  return ordinaryControlObservation({
+    controlCleanup,
+    controlCliOption: stderrObservation.controlCliOption,
+    controlCreate,
+    controlStart,
+    controlStderrErrno: stderrObservation.controlStderrErrno,
+    controlStderrStage: stderrObservation.controlStderrStage,
+  });
+}
+
 function fixedPhaseLabel(phase) {
   switch (phase) {
     case "setup":
@@ -1377,6 +1861,319 @@ test("watchdog state-error classification stays fixed and redacted", () => {
     false,
   );
   assert.equal(serializedObservation.includes(fakeContainerId), false);
+
+  const controlOptionCases = [
+    ["--api-version", "api-version"],
+    ["-c", "cid"],
+    ["--cuuid", "cuuid"],
+    ["-r", "runtime"],
+    ["--bundle", "bundle"],
+    ["-p", "container-pidfile"],
+    ["--name", "name"],
+    ["--exit-dir", "exit-dir"],
+    ["--full-attach", "full-attach"],
+    ["-l", "log-path"],
+    ["--log-level", "log-level"],
+    ["--syslog", "syslog"],
+    ["--log-size-max", "log-size-max"],
+    ["--no-new-keyring", "no-new-keyring"],
+    ["--conmon-pidfile", "conmon-pidfile"],
+    ["--exit-command", "exit-command"],
+    ["--exit-command-arg", "exit-command-arg"],
+    ["--runtime-arg=/secret/runtime-log", "runtime-arg"],
+    ["--sdnotify-socket=/secret/socket", "other"],
+  ];
+  for (const [token, expectedOption] of controlOptionCases) {
+    assert.deepEqual(
+      classifyControlStderr(
+        `conmon: option parsing failed: Unknown option ${token}\n`,
+      ),
+      controlStderrObservation("cli-option", "none", expectedOption),
+    );
+  }
+  assert.deepEqual(
+    classifyControlStderr(
+      "conmon: option parsing failed: Missing argument for --runtime\n",
+    ),
+    controlStderrObservation("cli-option", "none", "runtime"),
+  );
+  assert.deepEqual(
+    classifyControlStderr(
+      "conmon: option parsing failed: parser detail omitted\n",
+    ),
+    controlStderrObservation("cli-option", "none", "unknown"),
+  );
+  const controlStderrCases = [
+    [
+      "conmon: Container ID not provided. Use --cid\n",
+      controlStderrObservation("cli-cid", "none"),
+    ],
+    [
+      "[conmon:e] Container UUID not provided. Use --cuuid\n",
+      controlStderrObservation("cli", "none"),
+    ],
+    [
+      "[conmon:e] Runtime path not provided. Use --runtime\n",
+      controlStderrObservation("runtime-path", "none"),
+    ],
+    [
+      "[conmon:e]: Runtime path /secret/crun is not valid Permission denied\n",
+      controlStderrObservation("runtime-path", "eacces"),
+    ],
+    [
+      "[conmon:e] Failed to get working directory\n",
+      controlStderrObservation("cwd", "none"),
+    ],
+    [
+      "[conmon:e] Log driver not provided. Use --log-path\n",
+      controlStderrObservation("log-config", "none"),
+    ],
+    [
+      "[conmon:e]: Failed to open log file /secret/ctr.log Read-only file system\n",
+      controlStderrObservation("log-open", "erofs"),
+    ],
+    [
+      "[conmon:e]: unable to parse _OCI_STARTPIPE Bad file descriptor\n",
+      controlStderrObservation("start-pipe", "ebadf"),
+    ],
+    [
+      "[conmon:e]: Failed to open /dev/null Too many open files\n",
+      controlStderrObservation("devnull", "emfile"),
+    ],
+    [
+      "[conmon:e]: Failed to fork the create command Resource temporarily unavailable\n",
+      controlStderrObservation("fork", "eagain"),
+    ],
+    [
+      "Error: container secret: conmon failed: exit status 1\n",
+      controlStderrObservation("wrapper-only", "unknown"),
+    ],
+    [
+      "prefix [conmon:e]: Failed to open /dev/null Permission denied\n",
+      controlStderrObservation("unknown", "unknown"),
+    ],
+    ["", controlStderrObservation("absent", "absent")],
+  ];
+  for (const [controlStderr, expected] of controlStderrCases) {
+    assert.deepEqual(classifyControlStderr(controlStderr), expected);
+  }
+  assert.deepEqual(
+    classifyControlStderr(
+      "[conmon:e]: Failed to fork the create command Resource temporarily unavailable\n" +
+        "[conmon:e]: Failed to write conmon pidfile: /secret/pid Permission denied\n",
+    ),
+    controlStderrObservation("pidfile", "eacces"),
+  );
+  assert.deepEqual(
+    classifyControlStderr(
+      "[conmon:e]: Failed to open log file /secret/log Read-only file system\n" +
+        "[conmon:e]: Failed to fork the create command Resource temporarily unavailable\n",
+    ),
+    controlStderrObservation("ambiguous", "ambiguous"),
+  );
+  assert.deepEqual(
+    classifyControlStderr("[conmon:e] ignored\n", true),
+    controlStderrObservation("overflow", "unreadable", "unknown"),
+  );
+  assert.deepEqual(
+    classifyControlStderr(null, false, false),
+    controlStderrObservation("unreadable", "unreadable", "unknown"),
+  );
+  const sensitiveControlStderr = classifyControlStderr(
+    `[conmon:e]: Failed to write conmon pidfile: /proc/123/fd/7/secret/${fakeContainerId} Permission denied\n` +
+      `Error: container ${fakeContainerId}: conmon failed: exit status 1\n`,
+  );
+  const controlLine = formatOrdinaryControlObservation(
+    ordinaryControlObservation({
+      controlCleanup: "complete",
+      controlCliOption: sensitiveControlStderr.controlCliOption,
+      controlCreate: "ok",
+      controlStart: "nonzero",
+      controlStderrErrno: sensitiveControlStderr.controlStderrErrno,
+      controlStderrStage: sensitiveControlStderr.controlStderrStage,
+    }),
+  );
+  assert.equal(controlLine.includes("/secret"), false);
+  assert.equal(controlLine.includes("/proc/"), false);
+  assert.equal(controlLine.includes(fakeContainerId), false);
+  assert.equal(controlLine.includes("exit status 1"), false);
+});
+
+test("ordinary control create matches the production single writer command", () => {
+  const imageReference =
+    `localhost/portable-codex-writer@sha256:${"a".repeat(64)}`;
+  assert.deepEqual(
+    ordinaryControlCreateArguments(
+      "/var/tmp/portable-codex-control",
+      "portable-codex-diagnostic-control-123",
+      imageReference,
+    ),
+    [
+      "--remote=false",
+      "create",
+      "--name",
+      "portable-codex-diagnostic-control-123",
+      "--pull=never",
+      "--image-volume=ignore",
+      "--read-only",
+      "--security-opt=no-new-privileges",
+      "--cap-drop=all",
+      "--userns=keep-id:uid=1000,gid=1000",
+      "--restart=no",
+      "--mount",
+      "type=bind,source=/var/tmp/portable-codex-control," +
+        "target=/session,rw,bind-propagation=rprivate",
+      "--workdir",
+      "/session",
+      "--entrypoint",
+      "/usr/local/bin/writer",
+      "--env",
+      "LANG=C.UTF-8",
+      imageReference,
+    ],
+  );
+});
+
+test("bounded control capture drains briefly after direct exit without waiting for EOF", async () => {
+  const delayedWriter = `
+    const { writeSync } = require("node:fs");
+    const leaderPid = Number(process.argv[1]);
+    const waitForLeaderExit = setInterval(() => {
+      try {
+        process.kill(leaderPid, 0);
+        return;
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+      clearInterval(waitForLeaderExit);
+      setTimeout(() => {
+        writeSync(1, String(process.pid) + "\\n");
+        writeSync(
+          2,
+          "[conmon:e]: Failed to open /dev/null Too many open files\\n",
+        );
+      }, 25);
+    }, 1);
+    setTimeout(() => {}, 1_000);
+  `;
+  const leader = await runBoundedControlLeader(
+    process.execPath,
+    [
+      "-e",
+      `
+        const { spawn } = require("node:child_process");
+        const child = spawn(
+          process.execPath,
+          ["-e", ${JSON.stringify(delayedWriter)}, String(process.pid)],
+          { stdio: ["ignore", 1, 2] },
+        );
+        child.unref();
+        process.exit(1);
+      `,
+    ],
+    {
+      captureStderrBytes: WATCHDOG_CONTROL_STDERR_BYTES,
+      captureStdoutBytes: 32,
+      environment: process.env,
+      timeoutMilliseconds: 2_000,
+    },
+  );
+  assert.equal(leader.status, "nonzero");
+  assert.equal(leader.stderrOverflow, false);
+  assert.deepEqual(
+    classifyControlStderr(
+      decodeControlOutput(leader.stderr),
+      leader.stderrOverflow,
+      leader.stderrReadable,
+    ),
+    controlStderrObservation("devnull", "emfile"),
+  );
+  const descendantPidText = decodeControlOutput(leader.stdout);
+  assert.match(descendantPidText, /^[1-9][0-9]*\n$/u);
+  const descendantPid = Number(descendantPidText.trim());
+  let descendantAlive = false;
+  try {
+    process.kill(descendantPid, 0);
+    descendantAlive = true;
+  } catch {
+    // A runner that incorrectly waited for EOF observes the descendant gone.
+  }
+  try {
+    process.kill(descendantPid, "SIGKILL");
+  } catch {
+    // The liveness assertion below remains the test's decisive evidence.
+  }
+  assert.equal(descendantAlive, true);
+});
+
+test("bounded control capture caps output and classifies spawn failure", async () => {
+  const overflowed = await runBoundedControlLeader(
+    process.execPath,
+    [
+      "-e",
+      "require('node:fs').writeSync(2,Buffer.alloc(2048,120));process.exit(1)",
+    ],
+    {
+      captureStderrBytes: 1024,
+      environment: process.env,
+      timeoutMilliseconds: 2_000,
+    },
+  );
+  assert.equal(overflowed.status, "nonzero");
+  assert.equal(overflowed.stderr.length, 1024);
+  assert.equal(overflowed.stderrOverflow, true);
+  const spawnFailed = await runBoundedControlLeader(
+    "/portable-codex-runtime-missing-control-executable",
+    [],
+    {
+      environment: process.env,
+      timeoutMilliseconds: 100,
+    },
+  );
+  assert.equal(spawnFailed.status, "spawn-failed");
+});
+
+test("bounded control timeout kills its owned process group", async () => {
+  const descendant = "setTimeout(() => {}, 3_000);";
+  const startedAt = Date.now();
+  const timedOut = await runBoundedControlLeader(
+    process.execPath,
+    [
+      "-e",
+      `
+        const { spawn } = require("node:child_process");
+        const { writeSync } = require("node:fs");
+        const child = spawn(
+          process.execPath,
+          ["-e", ${JSON.stringify(descendant)}],
+          { stdio: ["ignore", "ignore", "ignore"] },
+        );
+        writeSync(1, String(child.pid) + "\\n");
+        setTimeout(() => {}, 3_000);
+      `,
+    ],
+    {
+      captureStdoutBytes: 32,
+      environment: process.env,
+      timeoutMilliseconds: 100,
+    },
+  );
+  assert.equal(timedOut.status, "timeout");
+  assert.equal(Date.now() - startedAt < 2_000, true);
+  const descendantPidText = decodeControlOutput(timedOut.stdout);
+  assert.match(descendantPidText, /^[1-9][0-9]*\n$/u);
+  const descendantPid = Number(descendantPidText.trim());
+  let descendantAlive = true;
+  for (let attempt = 0; attempt < 200 && descendantAlive; attempt += 1) {
+    try {
+      process.kill(descendantPid, 0);
+      await delay(10);
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+      descendantAlive = false;
+    }
+  }
+  assert.equal(descendantAlive, false);
 });
 
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
@@ -1413,6 +2210,12 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
         try {
           const durableStatus = await observeDurableStatus(supervisorState);
           const observed = await observeUniqueImageContainer(journalBoundary);
+          const control =
+              observed.conmonOutcome === "wait-exit-one" &&
+              observed.conmonStage === "absent" &&
+              observed.conmonErrno === "absent"
+            ? await observeOrdinaryBindControl()
+            : ordinaryControlObservation();
           if (!watchdogActive) return;
           writeWatchdogAndExit(
             `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
@@ -1428,7 +2231,8 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
               `conmonOutcome=${observed.conmonOutcome} ` +
               `conmonStage=${observed.conmonStage} ` +
               `conmonErrno=${observed.conmonErrno} ` +
-              `exitCode=${observed.exitCode} conmonPid=${observed.conmonPid}`,
+              `exitCode=${observed.exitCode} conmonPid=${observed.conmonPid} ` +
+              formatOrdinaryControlObservation(control),
           );
         } catch {
           if (!watchdogActive) return;
@@ -1442,7 +2246,15 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
               "cgroupManager=unreadable " +
               "conmonOutcome=unreadable conmonStage=unreadable " +
               "conmonErrno=unreadable " +
-              "exitCode=unreadable conmonPid=unreadable",
+              "exitCode=unreadable conmonPid=unreadable " +
+              formatOrdinaryControlObservation(ordinaryControlObservation({
+                controlCleanup: "failed",
+                controlCliOption: "unknown",
+                controlCreate: "unreadable",
+                controlStart: "unreadable",
+                controlStderrErrno: "unreadable",
+                controlStderrStage: "unreadable",
+              })),
           );
         }
       })();
@@ -1459,7 +2271,15 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
           "cgroupManager=unreadable " +
           "conmonOutcome=unreadable conmonStage=unreadable " +
           "conmonErrno=unreadable " +
-          "exitCode=unreadable conmonPid=unreadable",
+          "exitCode=unreadable conmonPid=unreadable " +
+          formatOrdinaryControlObservation(ordinaryControlObservation({
+            controlCleanup: "timeout",
+            controlCliOption: "unknown",
+            controlCreate: "unreadable",
+            controlStart: "unreadable",
+            controlStderrErrno: "unreadable",
+            controlStderrStage: "unreadable",
+          })),
       );
     }, WATCHDOG_HARD_BACKSTOP_MILLISECONDS);
   };
