@@ -435,6 +435,33 @@ change and does not attest the current head:
   the file or prove that conmon started. Absence narrows the error to an
   earlier prepare/spec stage. Raw errors, IDs, and paths remain private, and
   the production launch behavior is unchanged.
+- Head `799b776` again passed both Node versions on macOS and Linux, the
+  PostgreSQL integration, the physical ext4 producer, and the cross-host
+  consumer in Test run `31984917265`. The bounded Podman result was still
+  durable and inspected `created`, non-running with zero PID, but refined the
+  error to runtime `conmon`, unknown operation and errno, present OCI config,
+  configured runtime `crun`, cgroup manager `cgroupfs`, zero exit-code field,
+  and absent `ConmonPid`. This tuple most closely matches Podman 4.9.3's
+  `conmon failed: %w` wait wrapper, but does not yet distinguish `cmd.Start`
+  failure, initial conmon exit, or signal, and still cannot authorize release
+  of the held filesystem authority.
+- The next diagnostic therefore adds a fixed `conmonOutcome` before consulting
+  any log. Only an exact conmon wait-exit outcome consumes the CI system
+  journal. The integration records a private launch boundary, then reads at
+  most 64 KiB for five seconds from the current boot, error priority, exact
+  conmon syslog identifier, current host UID, and syslog transport. A `_COMM`
+  value is checked when journald captured one but is not required for a
+  short-lived fatal process. In memory the diagnostic further
+  requires the exact first 20 characters of the uniquely inspected full
+  container ID and emits only fixed `conmonStage` and `conmonErrno` labels.
+  The cursor, ID, numeric exit status, raw message, path, PID, stdout, and
+  stderr are never serialized. The CI-only read uses passwordless `sudo` on
+  GitHub's disposable runner and does not change the production command or
+  recovery contract. Conmon failures before `set_conmon_logs`, missing or
+  delayed journal records, permissions, overflow, and malformed JSON remain
+  `absent` or `unreadable`; those labels do not prove that no fatal occurred.
+  The diagnostic backstop is now 65 seconds inside the existing two-minute
+  workflow bound.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

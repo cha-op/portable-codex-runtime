@@ -19,11 +19,14 @@ const DIGEST = process.env.PODMAN_WRITER_IMAGE_DIGEST;
 const IMAGE_REFERENCE = process.env.PODMAN_WRITER_IMAGE_REFERENCE;
 const ROOT = process.env.PODMAN_WRITER_TEST_ROOT;
 const PODMAN = process.env.PODMAN_EXECUTABLE ?? "/usr/bin/podman";
+const JOURNALCTL = "/usr/bin/journalctl";
+const SUDO = "/usr/bin/sudo";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const SUPERVISOR_ID = "podman-linux-integration-v1";
 const TEST_ROOT_PREFIX = "/var/tmp/portable-codex-runtime-podman-";
 const WATCHDOG_DIAGNOSTIC_MILLISECONDS = 45_000;
-const WATCHDOG_HARD_BACKSTOP_MILLISECONDS = 60_000;
+const WATCHDOG_HARD_BACKSTOP_MILLISECONDS = 65_000;
+const WATCHDOG_JOURNAL_BYTES = 64 * 1024;
 const WATCHDOG_PROBE_MILLISECONDS = 5_000;
 
 function exact(value) {
@@ -301,10 +304,16 @@ function containerObservation(
   ociConfig = "unreadable",
   ociRuntime = "unreadable",
   cgroupManager = "unreadable",
+  conmonOutcome = "unreadable",
+  conmonStage = "unreadable",
+  conmonErrno = "unreadable",
 ) {
   return {
     cgroupManager,
+    conmonErrno,
+    conmonOutcome,
     conmonPid,
+    conmonStage,
     errorErrno,
     errorOperation,
     errorRuntime,
@@ -387,6 +396,194 @@ function classifyCgroupManager(value) {
   if (typeof value !== "string" || value === "") return "unreadable";
   if (value === "systemd" || value === "cgroupfs") return value;
   return "other";
+}
+
+function classifyConmonOutcome(value) {
+  if (typeof value !== "string") return "unreadable";
+  const normalized = value.toLowerCase();
+  if (normalized.includes("configuring conmon env:")) return "env";
+  if (normalized.includes("fork/exec") && normalized.includes("conmon")) {
+    return "spawn-failed";
+  }
+  if (normalized.endsWith("conmon failed: exit status 1")) {
+    return "wait-exit-one";
+  }
+  if (/conmon failed: exit status [1-9][0-9]*$/u.test(normalized)) {
+    return "wait-exit-other";
+  }
+  if (normalized.endsWith("conmon failed: signal: killed")) {
+    return "wait-sigkill";
+  }
+  if (
+    normalized.endsWith("conmon failed: signal: segmentation fault") ||
+    normalized.endsWith(
+      "conmon failed: signal: segmentation fault (core dumped)",
+    )
+  ) {
+    return "wait-sigsegv";
+  }
+  if (normalized.includes("conmon failed: signal:")) {
+    return "wait-signal-other";
+  }
+  return normalized.includes("conmon failed:") ? "wait-other" : "other";
+}
+
+function classifyConmonFatalErrno(value) {
+  const normalized = value.toLowerCase();
+  if (normalized.endsWith(" permission denied")) return "eacces";
+  if (normalized.endsWith(" operation not permitted")) return "eperm";
+  if (normalized.endsWith(" no such file or directory")) return "enoent";
+  if (normalized.endsWith(" not a directory")) return "enotdir";
+  if (normalized.endsWith(" invalid argument")) return "einval";
+  if (normalized.endsWith(" bad file descriptor")) return "ebadf";
+  if (normalized.endsWith(" too many open files in system")) return "enfile";
+  if (normalized.endsWith(" too many open files")) return "emfile";
+  if (normalized.endsWith(" resource temporarily unavailable")) return "eagain";
+  if (normalized.endsWith(" cannot allocate memory")) return "enomem";
+  if (normalized.endsWith(" no space left on device")) return "enospc";
+  if (normalized.endsWith(" read-only file system")) return "erofs";
+  return "unknown";
+}
+
+function classifyConmonFatalMessage(value, containerId) {
+  if (
+    typeof value !== "string" ||
+    typeof containerId !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(containerId)
+  ) {
+    return null;
+  }
+  const prefix = `conmon ${containerId.slice(0, 20)} <error>:`;
+  if (!value.startsWith(prefix)) return null;
+  const normalized = value.slice(prefix.length).trim().toLowerCase();
+  let conmonStage = "unknown";
+  let noErrno = false;
+  if (
+    normalized === "container uuid not provided. use --cuuid" ||
+    normalized === "cannot use 'exec' and 'restore' at the same time" ||
+    normalized === "attach can only be specified with exec" ||
+    normalized === "attach can only be specified for a non-legacy exec session" ||
+    normalized === "exec process spec path not provided. use --exec-process-spec" ||
+    normalized === "delay before invoking exit command must be greater than or equal to 0"
+  ) {
+    conmonStage = "cli";
+    noErrno = true;
+  } else if (
+    normalized === "runtime path not provided. use --runtime"
+  ) {
+    conmonStage = "runtime-path";
+    noErrno = true;
+  } else if (
+    normalized.startsWith("runtime path ") && normalized.includes(" is not valid")
+  ) {
+    conmonStage = "runtime-path";
+  } else if (normalized === "failed to get working directory") {
+    conmonStage = "cwd";
+    noErrno = true;
+  } else if (
+    normalized === "log driver not provided. use --log-path" ||
+    normalized === "k8s-file doesn't support --log-tag" ||
+    normalized === "include journald in compilation path to log to systemd journal" ||
+    normalized === "container id must be provided and of the correct length" ||
+    normalized === "container id must be longer than 12 characters" ||
+    normalized === "log-path must not be empty" ||
+    normalized === "k8s-file requires a filename" ||
+    normalized.startsWith("no such log level ") ||
+    normalized.startsWith("no such log driver ")
+  ) {
+    conmonStage = "log-config";
+    noErrno = true;
+  } else if (normalized.startsWith("failed to open log file ")) {
+    conmonStage = "log-open";
+  } else if (
+    normalized.startsWith("unable to parse _oci_startpipe") ||
+    normalized.startsWith("unable to make _oci_startpipe cloexec") ||
+    normalized.startsWith("start-pipe read failed")
+  ) {
+    conmonStage = "start-pipe";
+  } else if (normalized.startsWith("failed to open /dev/null ")) {
+    conmonStage = "devnull";
+  } else if (normalized.startsWith("failed to fork the create command ")) {
+    conmonStage = "fork";
+  } else if (normalized.startsWith("failed to write conmon pidfile:")) {
+    conmonStage = "pidfile";
+  }
+  return exact({
+    conmonErrno: noErrno ? "none" : classifyConmonFatalErrno(normalized),
+    conmonStage,
+  });
+}
+
+function classifyConmonJournalOutput(value, containerId, expectedUid) {
+  if (
+    typeof value !== "string" ||
+    !Number.isSafeInteger(expectedUid) ||
+    expectedUid < 1
+  ) {
+    return exact({ conmonErrno: "unreadable", conmonStage: "unreadable" });
+  }
+  const classifiedRecords = [];
+  const lines = value.split("\n");
+  for (const line of lines) {
+    if (line === "") continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      return exact({ conmonErrno: "unreadable", conmonStage: "unreadable" });
+    }
+    if (record === null || typeof record !== "object" || Array.isArray(record)) {
+      return exact({ conmonErrno: "unreadable", conmonStage: "unreadable" });
+    }
+    const comm = Object.getOwnPropertyDescriptor(record, "_COMM");
+    const transport = Object.getOwnPropertyDescriptor(record, "_TRANSPORT");
+    const uid = Object.getOwnPropertyDescriptor(record, "_UID");
+    const message = Object.getOwnPropertyDescriptor(record, "MESSAGE");
+    const syslogIdentifier = Object.getOwnPropertyDescriptor(
+      record,
+      "SYSLOG_IDENTIFIER",
+    );
+    if (
+      transport === undefined ||
+      !Object.hasOwn(transport, "value") ||
+      transport.value !== "syslog" ||
+      uid === undefined ||
+      !Object.hasOwn(uid, "value") ||
+      uid.value !== String(expectedUid) ||
+      message === undefined ||
+      !Object.hasOwn(message, "value") ||
+      typeof message.value !== "string" ||
+      syslogIdentifier === undefined ||
+      !Object.hasOwn(syslogIdentifier, "value") ||
+      syslogIdentifier.value !== "conmon"
+    ) {
+      return exact({ conmonErrno: "unreadable", conmonStage: "unreadable" });
+    }
+    if (
+      comm !== undefined &&
+      (!Object.hasOwn(comm, "value") || comm.value !== "conmon")
+    ) {
+      return exact({ conmonErrno: "unreadable", conmonStage: "unreadable" });
+    }
+    const classified = classifyConmonFatalMessage(message.value, containerId);
+    if (classified === null) continue;
+    classifiedRecords.push(classified);
+  }
+  if (classifiedRecords.length === 0) {
+    return exact({ conmonErrno: "absent", conmonStage: "absent" });
+  }
+  const pidfileRecords = classifiedRecords.filter(
+    (record) => record.conmonStage === "pidfile",
+  );
+  const selectedRecords = pidfileRecords.length > 0
+    ? pidfileRecords
+    : classifiedRecords;
+  const stages = new Set(selectedRecords.map((record) => record.conmonStage));
+  const errnos = new Set(selectedRecords.map((record) => record.conmonErrno));
+  return exact({
+    conmonErrno: errnos.size === 1 ? [...errnos][0] : "ambiguous",
+    conmonStage: stages.size === 1 ? [...stages][0] : "ambiguous",
+  });
 }
 
 function classifyStateErrorAxes(value) {
@@ -555,13 +752,95 @@ function classifyStateErrorAxes(value) {
     errorErrno = "eloop";
   } else if (normalized.includes("cannot allocate memory")) {
     errorErrno = "enomem";
+  } else if (normalized.includes("too many open files in system")) {
+    errorErrno = "enfile";
+  } else if (normalized.includes("too many open files")) {
+    errorErrno = "emfile";
+  } else if (normalized.includes("resource temporarily unavailable")) {
+    errorErrno = "eagain";
+  } else if (normalized.includes("text file busy")) {
+    errorErrno = "etxtbsy";
+  } else if (normalized.includes("exec format error")) {
+    errorErrno = "enoexec";
   } else if (normalized.includes("container creation timeout")) {
     errorErrno = "timeout";
   }
   return { errorErrno, errorOperation, errorRuntime };
 }
 
-async function observeUniqueImageContainer() {
+async function captureConmonJournalBoundary() {
+  const sinceEpochSeconds = Math.max(0, Math.floor(Date.now() / 1000) - 1);
+  try {
+    const captured = await execFileAsync(
+      SUDO,
+      [
+        "--non-interactive",
+        JOURNALCTL,
+        "--boot",
+        "--no-pager",
+        "--quiet",
+        "--show-cursor",
+        "--lines=0",
+      ],
+      {
+        cwd: "/",
+        env: process.env,
+        killSignal: "SIGKILL",
+        maxBuffer: 4 * 1024,
+        timeout: WATCHDOG_PROBE_MILLISECONDS,
+      },
+    );
+    const match = /^-- cursor: ([!-~]{1,2048})\r?\n?$/u.exec(captured.stdout);
+    return exact({
+      cursor: match === null ? null : match[1],
+      sinceEpochSeconds,
+    });
+  } catch {
+    return exact({ cursor: null, sinceEpochSeconds });
+  }
+}
+
+async function observeConmonJournal(boundary, containerId) {
+  const journalArguments = [
+    "--non-interactive",
+    JOURNALCTL,
+    "--boot",
+    "--no-pager",
+    "--quiet",
+    "--output=json",
+    "--output-fields=MESSAGE,_COMM,_TRANSPORT,_UID,SYSLOG_IDENTIFIER",
+    "--priority=err",
+    "--lines=128",
+  ];
+  if (boundary.cursor === null) {
+    journalArguments.push(`--since=@${boundary.sinceEpochSeconds}`);
+    journalArguments.push(`--until=@${Math.floor(Date.now() / 1000) + 1}`);
+  } else {
+    journalArguments.push(`--after-cursor=${boundary.cursor}`);
+  }
+  const expectedUid = process.getuid();
+  journalArguments.push(`_UID=${expectedUid}`);
+  journalArguments.push("_TRANSPORT=syslog");
+  journalArguments.push("SYSLOG_IDENTIFIER=conmon");
+  try {
+    const observed = await execFileAsync(SUDO, journalArguments, {
+      cwd: "/",
+      env: process.env,
+      killSignal: "SIGKILL",
+      maxBuffer: WATCHDOG_JOURNAL_BYTES,
+      timeout: WATCHDOG_PROBE_MILLISECONDS,
+    });
+    return classifyConmonJournalOutput(
+      observed.stdout,
+      containerId,
+      expectedUid,
+    );
+  } catch {
+    return exact({ conmonErrno: "unreadable", conmonStage: "unreadable" });
+  }
+}
+
+async function observeUniqueImageContainer(journalBoundary) {
   let listed;
   try {
     listed = await execFileAsync(
@@ -742,6 +1021,9 @@ async function observeUniqueImageContainer() {
     : undefined;
   const stateError = classifyStateError(stateErrorValue);
   const stateErrorAxes = classifyStateErrorAxes(stateErrorValue);
+  const conmonOutcome = errorDescriptor === undefined
+    ? "absent"
+    : classifyConmonOutcome(stateErrorValue);
   const exitCode = exitCodeDescriptor !== undefined &&
       Object.hasOwn(exitCodeDescriptor, "value")
     ? classifyExitCode(exitCodeDescriptor.value)
@@ -784,6 +1066,11 @@ async function observeUniqueImageContainer() {
         ? classifyCgroupManager(managerDescriptor.value)
         : "unreadable");
   }
+  const conmonJournal =
+    conmonOutcome === "wait-exit-one" ||
+    conmonOutcome === "wait-exit-other"
+      ? await observeConmonJournal(journalBoundary, idDescriptor.value)
+      : exact({ conmonErrno: "not-applicable", conmonStage: "not-applicable" });
   return containerObservation(
     "unique",
     inspect,
@@ -798,6 +1085,9 @@ async function observeUniqueImageContainer() {
     ociConfig,
     ociRuntime,
     cgroupManager,
+    conmonOutcome,
+    conmonJournal.conmonStage,
+    conmonJournal.conmonErrno,
   );
 }
 
@@ -858,6 +1148,26 @@ test("watchdog state-error classification stays fixed and redacted", () => {
   assert.equal(classifyCgroupManager("systemd"), "systemd");
   assert.equal(classifyCgroupManager("cgroupfs"), "cgroupfs");
   assert.equal(classifyCgroupManager("custom"), "other");
+  const conmonOutcomeCases = [
+    ["conmon failed: exit status 1", "wait-exit-one"],
+    ["conmon failed: exit status 70", "wait-exit-other"],
+    ["conmon failed: signal: killed", "wait-sigkill"],
+    ["conmon failed: signal: segmentation fault", "wait-sigsegv"],
+    [
+      "conmon failed: signal: segmentation fault (core dumped)",
+      "wait-sigsegv",
+    ],
+    ["conmon failed: signal: aborted", "wait-signal-other"],
+    ["configuring conmon env: invalid runtime directory", "env"],
+    ["fork/exec /secret/conmon: permission denied", "spawn-failed"],
+    ["container create failed (no logs from conmon): EOF", "other"],
+    ["conmon failed: unexpected wait status", "wait-other"],
+    ["unrelated error", "other"],
+    [null, "unreadable"],
+  ];
+  for (const [inputValue, expected] of conmonOutcomeCases) {
+    assert.equal(classifyConmonOutcome(inputValue), expected);
+  }
   const axisCases = [
     [
       "crun: mount /proc/123/fd/7 to /session: invalid argument: OCI runtime error",
@@ -927,6 +1237,9 @@ test("watchdog state-error classification stays fixed and redacted", () => {
     ["crun: cgroup mount failed", ["crun", "cgroup", "unknown"]],
     ["crun: move_mount: function not implemented", ["crun", "mount", "enosys"]],
     ["crun: remount: invalid cross-device link", ["crun", "mount", "exdev"]],
+    ["fork/exec /usr/bin/conmon: resource temporarily unavailable", ["conmon", "unknown", "eagain"]],
+    ["fork/exec /usr/bin/conmon: too many open files", ["conmon", "unknown", "emfile"]],
+    ["fork/exec /usr/bin/conmon: exec format error", ["conmon", "unknown", "enoexec"]],
     [
       "crun: make `/private/root` private: invalid argument",
       ["crun", "mount", "einval"],
@@ -944,6 +1257,87 @@ test("watchdog state-error classification stays fixed and redacted", () => {
       expected,
     );
   }
+  const fakeContainerId = "d".repeat(64);
+  const journalRecord = (message, overrides = {}) => JSON.stringify({
+    _COMM: "conmon",
+    _TRANSPORT: "syslog",
+    _UID: "1001",
+    MESSAGE: message,
+    SYSLOG_IDENTIFIER: "conmon",
+    ...overrides,
+  });
+  const pidfileMessage =
+    `conmon ${fakeContainerId.slice(0, 20)} <error>: ` +
+    "Failed to write conmon pidfile: /secret/conmon.pid Permission denied";
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord(pidfileMessage)}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "eacces", conmonStage: "pidfile" }),
+  );
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord(pidfileMessage, { _COMM: undefined })}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "eacces", conmonStage: "pidfile" }),
+  );
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord(pidfileMessage, { _COMM: "not-conmon" })}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "unreadable", conmonStage: "unreadable" }),
+  );
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord("conmon abcdef <error>: unrelated")}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "absent", conmonStage: "absent" }),
+  );
+  const forkMessage =
+    `conmon ${fakeContainerId.slice(0, 20)} <error>: ` +
+    "Failed to fork the create command Resource temporarily unavailable";
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord(pidfileMessage)}\n${journalRecord(forkMessage)}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "eacces", conmonStage: "pidfile" }),
+  );
+  const logOpenMessage =
+    `conmon ${fakeContainerId.slice(0, 20)} <error>: ` +
+    "Failed to open log file Read-only file system";
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord(forkMessage)}\n${journalRecord(logOpenMessage)}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "ambiguous", conmonStage: "ambiguous" }),
+  );
+  const runtimeMissingMessage =
+    `conmon ${fakeContainerId.slice(0, 20)} <error>: ` +
+    "Runtime path not provided. Use --runtime";
+  assert.deepEqual(
+    classifyConmonJournalOutput(
+      `${journalRecord(runtimeMissingMessage)}\n`,
+      fakeContainerId,
+      1001,
+    ),
+    exact({ conmonErrno: "none", conmonStage: "runtime-path" }),
+  );
+  assert.deepEqual(
+    classifyConmonJournalOutput("{not-json}\n", fakeContainerId, 1001),
+    exact({ conmonErrno: "unreadable", conmonStage: "unreadable" }),
+  );
   const sensitiveError =
     `crun: mount /proc/123/fd/7 to /session for ${"a".repeat(64)}: invalid argument`;
   const sensitiveAxes = classifyStateErrorAxes(sensitiveError);
@@ -963,12 +1357,26 @@ test("watchdog state-error classification stays fixed and redacted", () => {
     "present",
     "crun",
     "systemd",
+    "wait-exit-one",
+    "pidfile",
+    "eacces",
   );
   const serializedObservation = JSON.stringify(redactedObservation);
   assert.equal(serializedObservation.includes("/proc/"), false);
   assert.equal(serializedObservation.includes("/session"), false);
   assert.equal(serializedObservation.includes("a".repeat(64)), false);
   assert.equal(serializedObservation.includes("invalid argument"), false);
+  assert.equal(
+    JSON.stringify(
+      classifyConmonJournalOutput(
+        `${journalRecord(pidfileMessage)}\n`,
+        fakeContainerId,
+        1001,
+      ),
+    ).includes("/secret/"),
+    false,
+  );
+  assert.equal(serializedObservation.includes(fakeContainerId), false);
 });
 
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
@@ -998,13 +1406,13 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       watchdogHardBackstopTimer = null;
     }
   };
-  const startLaunchWatchdog = () => {
+  const startLaunchWatchdog = (journalBoundary) => {
     watchdogActive = true;
     watchdogDiagnosticTimer = setTimeout(() => {
       void (async () => {
         try {
           const durableStatus = await observeDurableStatus(supervisorState);
-          const observed = await observeUniqueImageContainer();
+          const observed = await observeUniqueImageContainer(journalBoundary);
           if (!watchdogActive) return;
           writeWatchdogAndExit(
             `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
@@ -1017,6 +1425,9 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
               `ociConfig=${observed.ociConfig} ` +
               `ociRuntime=${observed.ociRuntime} ` +
               `cgroupManager=${observed.cgroupManager} ` +
+              `conmonOutcome=${observed.conmonOutcome} ` +
+              `conmonStage=${observed.conmonStage} ` +
+              `conmonErrno=${observed.conmonErrno} ` +
               `exitCode=${observed.exitCode} conmonPid=${observed.conmonPid}`,
           );
         } catch {
@@ -1029,6 +1440,8 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
               "errorOperation=unreadable errorErrno=unreadable " +
               "ociConfig=unreadable ociRuntime=unreadable " +
               "cgroupManager=unreadable " +
+              "conmonOutcome=unreadable conmonStage=unreadable " +
+              "conmonErrno=unreadable " +
               "exitCode=unreadable conmonPid=unreadable",
           );
         }
@@ -1044,6 +1457,8 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
           "errorOperation=unreadable errorErrno=unreadable " +
           "ociConfig=unreadable ociRuntime=unreadable " +
           "cgroupManager=unreadable " +
+          "conmonOutcome=unreadable conmonStage=unreadable " +
+          "conmonErrno=unreadable " +
           "exitCode=unreadable conmonPid=unreadable",
       );
     }, WATCHDOG_HARD_BACKSTOP_MILLISECONDS);
@@ -1080,8 +1495,9 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     });
     const input = launchInput(attachmentRoot);
     const supervisor = createPodmanWriterSupervisor(options);
+    const journalBoundary = await captureConmonJournalBoundary();
     phase = "launch";
-    startLaunchWatchdog();
+    startLaunchWatchdog(journalBoundary);
     const receipt = await supervisor.launchWriter(input);
     containerId = receipt.evidence.processIncarnationId.slice("podman-process:".length);
     phase = "ready-marker";
