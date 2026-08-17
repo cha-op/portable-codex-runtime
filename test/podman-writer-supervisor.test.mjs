@@ -1213,6 +1213,58 @@ test("writer arguments preserve lossless UTF-8 at the code-unit boundary", async
   }
 });
 
+test("environment values preserve lossless UTF-8 at the code-unit boundary", async (t) => {
+  const base = await fixture(t);
+  const boundaryValue = `${"x".repeat(4_094)}\u{1f680}`;
+  assert.equal(boundaryValue.length, 4_096);
+  assert.equal(Buffer.byteLength(boundaryValue, "utf8"), 4_098);
+
+  for (const environmentName of [
+    "writerEnvironment",
+    "podmanEnvironment",
+  ]) {
+    for (const invalidValue of [
+      `${"x".repeat(4_095)}\ud800`,
+      `${"x".repeat(4_095)}\udc00`,
+      "x".repeat(4_097),
+    ]) {
+      assert.throws(
+        () => createPodmanWriterSupervisor(exact({
+          ...base.options,
+          [environmentName]: exact({
+            ...base.options[environmentName],
+            LANG: invalidValue,
+          }),
+        })),
+        assertSupervisorError("invalid_podman_writer_supervisor_options"),
+      );
+    }
+  }
+  assert.equal(base.events.length, 0);
+  assert.equal(base.filesystemEvents.length, 0);
+  assert.equal(existsSync(base.stateRoot), false);
+
+  const supervisor = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    podmanEnvironment: exact({
+      ...base.options.podmanEnvironment,
+      LANG: boundaryValue,
+    }),
+    writerEnvironment: exact({
+      ...base.options.writerEnvironment,
+      LANG: boundaryValue,
+    }),
+  }));
+  const receipt = await supervisor.launchWriter(base.input);
+  const create = base.events.find((event) => event.arguments_[0] === "create");
+  assert.equal(create.options.environment.LANG, boundaryValue);
+  assert.equal(
+    create.arguments_[create.arguments_.indexOf(`LANG=${boundaryValue}`)],
+    `LANG=${boundaryValue}`,
+  );
+  await receipt.stopWriter(stopInput(base.input, receipt));
+});
+
 test("exact replay and supervisor reconstruction never launch a second container", async (t) => {
   const base = await fixture(t);
   const first = await base.supervisor.launchWriter(base.input);

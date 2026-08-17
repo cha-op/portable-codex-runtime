@@ -473,9 +473,12 @@ start. The fixed create shape ignores image-declared volumes, disables
 Podman's implicit writable read-only tmpfs mounts, validates the configured
 writer executable in the same lossless 4095-byte native pathname domain,
 requires every remaining writer argument to be a non-empty, NUL-free,
-lossless UTF-8 string of at most 4096 UTF-16 code units, replaces both image
-entrypoint and command with that writer command, and selects Podman's `none`
-log driver. Container output is not authority evidence;
+lossless UTF-8 string of at most 4096 UTF-16 code units. Admitted writer and
+Podman environment values use the same NUL-free, lossless UTF-8 code-unit
+domain; environment names remain constrained by the fixed ASCII name pattern
+and Podman allowlist. Create replaces both image entrypoint and command with
+that writer command and selects Podman's `none` log driver. Container output is
+not authority evidence;
 exact configured/running inspection and the live attachment bracket remain
 the success proof, independent of host log-tag or default log-driver policy.
 The immutable image's own `Config.User` must be a canonical non-root

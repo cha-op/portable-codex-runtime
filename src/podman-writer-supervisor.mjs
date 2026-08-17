@@ -869,9 +869,11 @@ function normalizeStringRecord(value, allowedKeys, code) {
     const key = keys[index];
     ensure(
       regexpTest(ENVIRONMENT_NAME_PATTERN, key) &&
+        hasLosslessUtf8Encoding(key) &&
         typeof record[key] === "string" &&
         record[key].length <= 4096 &&
-        !stringIncludes(record[key], "\0"),
+        !stringIncludes(record[key], "\0") &&
+        hasLosslessUtf8Encoding(record[key]),
       code,
     );
     normalized[key] = record[key];

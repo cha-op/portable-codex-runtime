@@ -677,6 +677,11 @@ change and does not attest the current head:
   `syncBuiltinESMExports()` changes and later reconstruction. These checks
   protect canonical argument bytes and durable identity derivation, without
   changing attachment object identity or access-policy authority.
+  A follow-up current-head finding applied the same captured lossless UTF-8
+  round trip to every admitted writer and Podman environment name/value. Lone
+  high and low surrogates now fail during supervisor construction, before
+  state, filesystem, or Podman dispatch; a valid surrogate pair at the existing
+  4096-code-unit value boundary is preserved exactly.
 - The same review closed provider-state and inspection namespace gaps.
   Provider-state now reserves 39 pathname bytes for the longest generation
   checkpoint name, validates every derived lock/checkpoint/log path as an exact
