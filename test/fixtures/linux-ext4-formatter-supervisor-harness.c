@@ -52,23 +52,35 @@ static int formatter_test_read_exact(int fd, void *buffer, size_t length,
   return 0;
 }
 
-static int formatter_test_wait_reap(pid_t child, uint64_t timeout_ms,
-                                    int *wait_status) {
-  uint64_t deadline;
-  if (deadline_after(timeout_ms, &deadline) != 0) return -1;
+static int formatter_test_wait_reap_until(pid_t child, uint64_t deadline,
+                                          int *wait_status) {
   for (;;) {
     struct timespec delay = {0, 5000000L};
     uint64_t now;
     pid_t waited = waitpid(child, wait_status, WNOHANG);
     if (waited == child) return 0;
     if (waited < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR) {
+        if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+        continue;
+      }
       return -1;
     }
     if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
-    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    while (nanosleep(&delay, &delay) != 0) {
+      if (errno != EINTR || monotonic_milliseconds(&now) != 0 ||
+          now >= deadline) {
+        return -1;
+      }
     }
   }
+}
+
+static int formatter_test_wait_reap(pid_t child, uint64_t timeout_ms,
+                                    int *wait_status) {
+  uint64_t deadline;
+  if (deadline_after(timeout_ms, &deadline) != 0) return -1;
+  return formatter_test_wait_reap_until(child, deadline, wait_status);
 }
 
 static int formatter_test_cleanup_child(pid_t *child, int process_group) {
@@ -138,10 +150,49 @@ cleanup:
   return result;
 }
 
+static int formatter_test_expired_terminal(void) {
+  int group_established = 0;
+  int result = -1;
+  int wait_status = 0;
+  uint64_t expired_deadline;
+  uint64_t cleanup_deadline;
+  pid_t expected_parent = getpid();
+  pid_t child = fork();
+  (void)expected_parent;
+  if (child < 0) return -1;
+  if (child == 0) {
+#if defined(__linux__)
+    if (configure_formatter_parent_death(expected_parent) != 0) _exit(31);
+#endif
+    if (setpgid(0, 0) != 0) _exit(32);
+    _exit(0);
+  }
+  if (establish_formatter_process_group(child) != 0) goto cleanup;
+  group_established = 1;
+  if (deadline_after(UINT64_C(1000), &cleanup_deadline) != 0 ||
+      formatter_child_terminal_until(child, cleanup_deadline) != 1 ||
+      monotonic_milliseconds(&expired_deadline) != 0 ||
+      formatter_child_terminal_until(child, expired_deadline) != 0 ||
+      finish_formatter_group(child, cleanup_deadline, &wait_status) != 0 ||
+      !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+    goto cleanup;
+  }
+  errno = 0;
+  if (waitpid(child, &wait_status, WNOHANG) == -1 && errno == ECHILD) {
+    child = -1;
+    result = 0;
+  }
+
+cleanup:
+  if (formatter_test_cleanup_child(&child, group_established) != 0) result = -1;
+  return result;
+}
+
 #if defined(__linux__)
 struct formatter_test_tree {
   int fence_fd;
   int trace_fd;
+  pid_t group;
   pid_t leader;
   pid_t writer;
 };
@@ -152,8 +203,11 @@ struct formatter_test_ready {
 };
 
 static int formatter_test_spawn_tree(int image_fd,
-                                     struct formatter_test_tree *tree) {
+                                     struct formatter_test_tree *tree,
+                                     int natural_leader_exit,
+                                     int fail_before_writer_publish) {
   int fence_pipe[2] = {-1, -1};
+  int leader_release_pipe[2] = {-1, -1};
   int trace_pipe[2] = {-1, -1};
   struct pollfd ready_poll;
   struct formatter_test_ready ready;
@@ -162,9 +216,14 @@ static int formatter_test_spawn_tree(int image_fd,
   memset(tree, 0, sizeof(*tree));
   tree->fence_fd = -1;
   tree->trace_fd = -1;
-  if (pipe(trace_pipe) != 0 || pipe(fence_pipe) != 0) {
+  if (pipe(trace_pipe) != 0 || pipe(fence_pipe) != 0 ||
+      pipe(leader_release_pipe) != 0) {
     if (trace_pipe[0] >= 0) (void)close(trace_pipe[0]);
     if (trace_pipe[1] >= 0) (void)close(trace_pipe[1]);
+    if (fence_pipe[0] >= 0) (void)close(fence_pipe[0]);
+    if (fence_pipe[1] >= 0) (void)close(fence_pipe[1]);
+    if (leader_release_pipe[0] >= 0) (void)close(leader_release_pipe[0]);
+    if (leader_release_pipe[1] >= 0) (void)close(leader_release_pipe[1]);
     return -1;
   }
   leader = fork();
@@ -173,6 +232,8 @@ static int formatter_test_spawn_tree(int image_fd,
     (void)close(trace_pipe[1]);
     (void)close(fence_pipe[0]);
     (void)close(fence_pipe[1]);
+    (void)close(leader_release_pipe[0]);
+    (void)close(leader_release_pipe[1]);
     return -1;
   }
   if (leader == 0) {
@@ -188,6 +249,7 @@ static int formatter_test_spawn_tree(int image_fd,
     }
     (void)close(trace_pipe[0]);
     (void)close(fence_pipe[1]);
+    (void)close(leader_release_pipe[1]);
     writer = fork();
     if (writer < 0) _exit(42);
     if (writer == 0) {
@@ -198,6 +260,7 @@ static int formatter_test_spawn_tree(int image_fd,
       memset(&ignore_term_override, 0, sizeof(ignore_term_override));
       ignore_term_override.sa_handler = formatter_test_ignore_term;
       formatter_test_trace_fd = trace_pipe[1];
+      (void)close(leader_release_pipe[0]);
       fence_flags = fcntl(fence_pipe[0], F_GETFL);
       if (sigemptyset(&ignore_term_override.sa_mask) != 0 ||
           sigaction(SIGTERM, &ignore_term_override, NULL) != 0 ||
@@ -231,26 +294,52 @@ static int formatter_test_spawn_tree(int image_fd,
     (void)close(fence_pipe[0]);
     (void)close(trace_pipe[1]);
     (void)close(image_fd);
+    if (natural_leader_exit) {
+      char release;
+      ssize_t bytes;
+      do {
+        bytes = read(leader_release_pipe[0], &release, 1U);
+      } while (bytes < 0 && errno == EINTR);
+      (void)close(leader_release_pipe[0]);
+      _exit(bytes == 1 && release == 'X' ? 0 : 47);
+    }
+    (void)close(leader_release_pipe[0]);
     for (;;) pause();
   }
 
   (void)close(trace_pipe[1]);
   (void)close(fence_pipe[0]);
+  (void)close(leader_release_pipe[0]);
+  tree->group = leader;
   tree->leader = leader;
   tree->fence_fd = fence_pipe[1];
   tree->trace_fd = trace_pipe[0];
   ready_poll.fd = trace_pipe[0];
   ready_poll.events = POLLIN | POLLHUP;
   ready_poll.revents = 0;
-  if (poll(&ready_poll, 1, 1000) <= 0) return -1;
+  if (poll(&ready_poll, 1, 1000) <= 0) {
+    (void)close(leader_release_pipe[1]);
+    return -1;
+  }
   if (establish_formatter_process_group(leader) != 0 ||
       formatter_test_read_exact(trace_pipe[0], &ready, sizeof(ready),
                                 UINT64_C(1000)) != 0 ||
       ready.marker != 'R' || ready.writer <= 0 ||
       getpgid(ready.writer) != leader) {
+    (void)close(leader_release_pipe[1]);
     return -1;
   }
+  if (fail_before_writer_publish) {
+    (void)close(leader_release_pipe[1]);
+    return -2;
+  }
   tree->writer = ready.writer;
+  if (natural_leader_exit &&
+      write(leader_release_pipe[1], "X", 1U) != 1) {
+    (void)close(leader_release_pipe[1]);
+    return -1;
+  }
+  if (close(leader_release_pipe[1]) != 0) return -1;
   return 0;
 }
 
@@ -289,100 +378,204 @@ static int formatter_test_trace_eof(int fd, int expect_term) {
   }
 }
 
+static int formatter_test_drain_group_children_until(pid_t group,
+                                                      uint64_t deadline) {
+  int discarded_status;
+  for (;;) {
+    struct timespec delay = {0, 5000000L};
+    uint64_t now;
+    int no_group_children = 0;
+    int group_probe;
+    pid_t waited = waitpid(-group, &discarded_status, WNOHANG);
+    if (waited > 0) {
+      if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+      continue;
+    }
+    if (waited < 0) {
+      if (errno == EINTR) {
+        if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+        continue;
+      }
+      if (errno != ECHILD) return -1;
+      no_group_children = 1;
+    }
+    group_probe = kill(-group, 0);
+    if (group_probe < 0) {
+      if (errno != ESRCH || !no_group_children ||
+          monotonic_milliseconds(&now) != 0 || now >= deadline) {
+        return -1;
+      }
+      return 0;
+    }
+    if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+    while (nanosleep(&delay, &delay) != 0) {
+      if (errno != EINTR || monotonic_milliseconds(&now) != 0 ||
+          now >= deadline) {
+        return -1;
+      }
+    }
+  }
+}
+
 static int formatter_test_cleanup_tree(struct formatter_test_tree *tree) {
   char buffer[32];
-  int leader_reaped = tree->leader <= 0;
+  int cleanup_valid = 1;
+  int group_children_reaped = tree->group <= 0;
+  int leader_reaped = tree->group <= 0 || tree->leader < 0;
   int pipe_closed = tree->trace_fd < 0;
+  int process_cleanup_allowed = 1;
   int wait_status;
   uint64_t deadline;
 
-  if (tree->fence_fd >= 0) (void)close(tree->fence_fd);
+  if (deadline_after(UINT64_C(1000), &deadline) != 0) {
+    cleanup_valid = 0;
+    process_cleanup_allowed = 0;
+  }
+  if (tree->fence_fd >= 0 && close(tree->fence_fd) != 0) cleanup_valid = 0;
   tree->fence_fd = -1;
 
   if (tree->trace_fd >= 0) {
     int flags = fcntl(tree->trace_fd, F_GETFL);
-    if (flags >= 0) {
-      (void)fcntl(tree->trace_fd, F_SETFL, flags | O_NONBLOCK);
-    }
-    errno = 0;
-    if (read(tree->trace_fd, buffer, sizeof(buffer)) == 0) pipe_closed = 1;
-  }
-  if (!leader_reaped) {
-    pid_t waited = waitpid(tree->leader, &wait_status, WNOHANG);
-    if (waited == tree->leader || (waited < 0 && errno == ECHILD)) {
-      leader_reaped = 1;
-    } else if (waited == 0) {
-      (void)kill(-tree->leader, SIGKILL);
+    if (flags < 0 ||
+        fcntl(tree->trace_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+      cleanup_valid = 0;
+    } else {
+      errno = 0;
+      if (read(tree->trace_fd, buffer, sizeof(buffer)) == 0) pipe_closed = 1;
     }
   }
-  if (deadline_after(UINT64_C(1000), &deadline) == 0) {
-    while (!leader_reaped) {
-      uint64_t now;
-      pid_t waited = waitpid(tree->leader, &wait_status, WNOHANG);
-      if (waited == tree->leader || (waited < 0 && errno == ECHILD)) {
+
+  if (process_cleanup_allowed && !leader_reaped) {
+    siginfo_t information;
+    int wait_result;
+    uint64_t now;
+    memset(&information, 0, sizeof(information));
+    for (;;) {
+      wait_result = waitid(P_PID, (id_t)tree->leader, &information,
+                           WEXITED | WNOHANG | WNOWAIT);
+      if (wait_result == 0) break;
+      if (errno == ECHILD) {
         leader_reaped = 1;
         break;
       }
-      if (waited < 0 || monotonic_milliseconds(&now) != 0 ||
+      if (errno != EINTR || monotonic_milliseconds(&now) != 0 ||
           now >= deadline) {
+        cleanup_valid = 0;
+        process_cleanup_allowed = 0;
         break;
-      }
-      {
-        struct timespec delay = {0, 5000000L};
-        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
-        }
       }
     }
-    while (!pipe_closed && tree->trace_fd >= 0) {
-      struct pollfd descriptor = {tree->trace_fd, POLLIN | POLLHUP, 0};
-      uint64_t now;
-      ssize_t bytes = read(tree->trace_fd, buffer, sizeof(buffer));
-      if (bytes == 0) {
-        pipe_closed = 1;
-        break;
-      }
-      if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-          errno != EINTR) {
-        break;
-      }
-      if (monotonic_milliseconds(&now) != 0 || now >= deadline ||
-          poll(&descriptor, 1, 20) < 0) {
-        break;
+    if (process_cleanup_allowed && !leader_reaped) {
+      if ((information.si_pid != 0 && information.si_pid != tree->leader) ||
+          tree->group != tree->leader ||
+          monotonic_milliseconds(&now) != 0 || now >= deadline ||
+          (kill(-tree->group, SIGKILL) != 0 && errno != ESRCH) ||
+          formatter_test_wait_reap_until(tree->leader, deadline,
+                                         &wait_status) != 0) {
+        cleanup_valid = 0;
+        process_cleanup_allowed = 0;
+      } else {
+        leader_reaped = 1;
       }
     }
   }
-  if (tree->trace_fd >= 0) (void)close(tree->trace_fd);
+
+  if (process_cleanup_allowed && leader_reaped && tree->group > 0) {
+    if (formatter_test_drain_group_children_until(tree->group, deadline) !=
+        0) {
+      cleanup_valid = 0;
+    } else {
+      group_children_reaped = 1;
+    }
+  }
+
+  while (cleanup_valid && !pipe_closed && tree->trace_fd >= 0) {
+    struct pollfd descriptor = {tree->trace_fd, POLLIN | POLLHUP, 0};
+    uint64_t now;
+    ssize_t bytes = read(tree->trace_fd, buffer, sizeof(buffer));
+    if (bytes == 0) {
+      pipe_closed = 1;
+      break;
+    }
+    if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+        errno != EINTR) {
+      cleanup_valid = 0;
+      break;
+    }
+    if (monotonic_milliseconds(&now) != 0 || now >= deadline ||
+        poll(&descriptor, 1, 20) < 0) {
+      cleanup_valid = 0;
+      break;
+    }
+  }
+  if (tree->trace_fd >= 0 && close(tree->trace_fd) != 0) cleanup_valid = 0;
   tree->trace_fd = -1;
-  tree->leader = -1;
-  tree->writer = -1;
-  return leader_reaped && pipe_closed ? 0 : -1;
+  if (leader_reaped) tree->leader = -1;
+  if (group_children_reaped) {
+    tree->group = -1;
+    tree->writer = -1;
+  }
+  return cleanup_valid && leader_reaped && group_children_reaped && pipe_closed
+             ? 0
+             : -1;
+}
+
+static int formatter_test_unknown_writer_cleanup(int image_fd) {
+  struct formatter_test_tree tree;
+  int wait_status;
+  int seam_reached;
+  pid_t group;
+  memset(&tree, 0, sizeof(tree));
+  tree.fence_fd = -1;
+  tree.trace_fd = -1;
+  seam_reached =
+      ftruncate(image_fd, 0) == 0 &&
+      formatter_test_spawn_tree(image_fd, &tree, 0, 1) == -2 &&
+      tree.group > 0 && tree.leader == tree.group && tree.writer == 0;
+  group = tree.group;
+  if (formatter_test_cleanup_tree(&tree) != 0 || !seam_reached ||
+      tree.group != -1 || tree.leader != -1 || tree.writer != -1) {
+    return -1;
+  }
+  errno = 0;
+  if (waitpid(-group, &wait_status, WNOHANG) != -1 || errno != ECHILD) {
+    return -1;
+  }
+  errno = 0;
+  return kill(-group, 0) == -1 && errno == ESRCH ? 0 : -1;
 }
 
 static int formatter_test_descendant_group(int image_fd) {
+  struct formatter_test_tree natural;
   struct formatter_test_tree positive;
   struct formatter_test_tree negative;
   struct timespec settle = {0, 50000000L};
   uint64_t before;
   uint64_t after;
   uint64_t hard_deadline;
-  uint64_t group_deadline;
   int wait_status = 0;
   int result = -1;
   int supervision;
+  pid_t natural_group = -1;
   pid_t negative_group = -1;
+  pid_t positive_group = -1;
 
+  memset(&natural, 0, sizeof(natural));
   memset(&positive, 0, sizeof(positive));
   memset(&negative, 0, sizeof(negative));
+  natural.fence_fd = -1;
+  natural.trace_fd = -1;
   positive.fence_fd = -1;
   positive.trace_fd = -1;
   negative.fence_fd = -1;
   negative.trace_fd = -1;
 
   if (ftruncate(image_fd, 0) != 0 ||
-      formatter_test_spawn_tree(image_fd, &positive) != 0 ||
+      formatter_test_spawn_tree(image_fd, &positive, 0, 0) != 0 ||
       deadline_after(UINT64_C(1060), &hard_deadline) != 0) {
     goto cleanup;
   }
+  positive_group = positive.leader;
   supervision = supervise_formatter(
       positive.leader, hard_deadline, UINT64_C(20), UINT64_C(40),
       UINT64_C(1000), &wait_status);
@@ -391,7 +584,15 @@ static int formatter_test_descendant_group(int image_fd) {
     goto cleanup;
   }
   positive.leader = -1;
-  if (formatter_test_trace_eof(positive.trace_fd, 1) != 0 ||
+  errno = 0;
+  if (waitpid(positive.writer, &wait_status, WNOHANG) != -1 ||
+      errno != ECHILD) {
+    goto cleanup;
+  }
+  positive.writer = -1;
+  errno = 0;
+  if (kill(-positive_group, 0) != -1 || errno != ESRCH ||
+      formatter_test_trace_eof(positive.trace_fd, 1) != 0 ||
       pread(image_fd, &before, sizeof(before), 0) != (ssize_t)sizeof(before)) {
     goto cleanup;
   }
@@ -406,7 +607,46 @@ static int formatter_test_descendant_group(int image_fd) {
   positive.fence_fd = -1;
 
   if (ftruncate(image_fd, 0) != 0 ||
-      formatter_test_spawn_tree(image_fd, &negative) != 0) {
+      formatter_test_spawn_tree(image_fd, &natural, 1, 0) != 0 ||
+      deadline_after(UINT64_C(1060), &hard_deadline) != 0) {
+    goto cleanup;
+  }
+  natural_group = natural.leader;
+  supervision = supervise_formatter(
+      natural.leader, hard_deadline, UINT64_C(1000), UINT64_C(40),
+      UINT64_C(20), &wait_status);
+  if (supervision != FORMATTER_SUPERVISION_REAPED ||
+      !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+    goto cleanup;
+  }
+  natural.leader = -1;
+  errno = 0;
+  if (waitpid(natural.writer, &wait_status, WNOHANG) != -1 ||
+      errno != ECHILD) {
+    goto cleanup;
+  }
+  natural.writer = -1;
+  errno = 0;
+  if (kill(-natural_group, 0) != -1 || errno != ESRCH ||
+      formatter_test_trace_eof(natural.trace_fd, 0) != 0 ||
+      pread(image_fd, &before, sizeof(before), 0) !=
+          (ssize_t)sizeof(before)) {
+    goto cleanup;
+  }
+  settle.tv_sec = 0;
+  settle.tv_nsec = 50000000L;
+  while (nanosleep(&settle, &settle) != 0 && errno == EINTR) {
+  }
+  if (pread(image_fd, &after, sizeof(after), 0) != (ssize_t)sizeof(after) ||
+      before != after || close(natural.trace_fd) != 0) {
+    goto cleanup;
+  }
+  natural.trace_fd = -1;
+  if (close(natural.fence_fd) != 0) goto cleanup;
+  natural.fence_fd = -1;
+
+  if (ftruncate(image_fd, 0) != 0 ||
+      formatter_test_spawn_tree(image_fd, &negative, 0, 0) != 0) {
     goto cleanup;
   }
   negative_group = negative.leader;
@@ -431,17 +671,33 @@ static int formatter_test_descendant_group(int image_fd) {
   if (read(negative.trace_fd, &after, 1U) != -1 ||
       (errno != EAGAIN && errno != EWOULDBLOCK) ||
       getpgid(negative.writer) != negative_group ||
-      kill(-negative_group, SIGKILL) != 0 ||
+      close(negative.fence_fd) != 0) {
+    goto cleanup;
+  }
+  negative.fence_fd = -1;
+  if (formatter_test_wait_reap(negative.writer, UINT64_C(1000),
+                               &wait_status) != 0 ||
+      !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+    goto cleanup;
+  }
+  errno = 0;
+  if (waitpid(negative.writer, &wait_status, WNOHANG) != -1 ||
+      errno != ECHILD) {
+    goto cleanup;
+  }
+  negative.writer = -1;
+  errno = 0;
+  if (kill(-negative_group, 0) != -1 || errno != ESRCH ||
       formatter_test_trace_eof(negative.trace_fd, 0) != 0 ||
-      deadline_after(UINT64_C(1000), &group_deadline) != 0 ||
-      formatter_group_quiescent_until(negative_group, group_deadline) <= 0 ||
       close(negative.trace_fd) != 0) {
     goto cleanup;
   }
   negative.trace_fd = -1;
+  if (formatter_test_unknown_writer_cleanup(image_fd) != 0) goto cleanup;
   result = 0;
 
 cleanup:
+  if (formatter_test_cleanup_tree(&natural) != 0) result = -1;
   if (formatter_test_cleanup_tree(&positive) != 0) result = -1;
   if (formatter_test_cleanup_tree(&negative) != 0) result = -1;
   return result;
@@ -535,10 +791,16 @@ int main(void) {
   int trace_pipe[2] = {-1, -1};
   int child_group_established = 0;
   int descendant_group_verified = 0;
+  int expired_terminal_verified = 0;
   int result = 1;
   int wait_status = 0;
   int supervision;
   int parent_death_verified = 0;
+#if defined(__linux__) && defined(PR_GET_CHILD_SUBREAPER) &&                \
+    defined(PR_SET_CHILD_SUBREAPER)
+  int prior_subreaper = 0;
+  int subreaper_changed = 0;
+#endif
   uint64_t hard_deadline;
   pid_t child = -1;
   pid_t expected_parent = getpid();
@@ -554,6 +816,18 @@ int main(void) {
     goto cleanup;
   }
   image_unlinked = 1;
+#if defined(__linux__) && defined(PR_GET_CHILD_SUBREAPER) &&                \
+    defined(PR_SET_CHILD_SUBREAPER)
+  if (prctl(PR_GET_CHILD_SUBREAPER, &prior_subreaper) != 0 ||
+      configure_formatter_subreaper() != 0) {
+    result = 18;
+    goto cleanup;
+  }
+  subreaper_changed = 1;
+#elif defined(__linux__)
+  result = 18;
+  goto cleanup;
+#endif
   child = fork();
   if (child < 0) {
     result = 2;
@@ -655,10 +929,12 @@ int main(void) {
   }
   image_fd = -1;
   if (formatter_test_exit_case(0, 23) != 0 ||
-      formatter_test_exit_case(1, 0) != 0) {
+      formatter_test_exit_case(1, 0) != 0 ||
+      formatter_test_expired_terminal() != 0) {
     result = 14;
     goto cleanup;
   }
+  expired_terminal_verified = 1;
 #if defined(__linux__) && defined(PR_SET_CHILD_SUBREAPER)
   if (formatter_test_parent_death() != 0) {
     result = 15;
@@ -666,15 +942,24 @@ int main(void) {
   }
   parent_death_verified = 1;
 #endif
-  if (printf("{\"descendantGroupStopped\":%s,"
-             "\"execFailureReaped\":true,\"imageStable\":true,"
+  if (printf("{\"adoptedDescendantReaped\":%s,"
+             "\"descendantGroupStopped\":%s,"
+             "\"execFailureReaped\":true,"
+             "\"expiredTerminalRejected\":%s,\"imageStable\":true,"
              "\"leaderOnlyMutationDetected\":%s,"
+             "\"naturalLeaderStatusPreserved\":%s,"
              "\"nonzeroReaped\":true,\"pipeClosed\":true,"
+             "\"pgidAbsentAfterReap\":%s,"
              "\"reaped\":true,\"parentDeathKill\":%s,"
-             "\"termThenKill\":true}\n",
+             "\"termThenKill\":true,\"unknownWriterCleanup\":%s}\n",
              descendant_group_verified ? "true" : "false",
              descendant_group_verified ? "true" : "false",
-             parent_death_verified ? "true" : "false") < 0) {
+             expired_terminal_verified ? "true" : "false",
+             descendant_group_verified ? "true" : "false",
+             descendant_group_verified ? "true" : "false",
+             descendant_group_verified ? "true" : "false",
+             parent_death_verified ? "true" : "false",
+             descendant_group_verified ? "true" : "false") < 0) {
     result = 16;
     goto cleanup;
   }
@@ -689,5 +974,12 @@ cleanup:
   if (trace_pipe[1] >= 0) (void)close(trace_pipe[1]);
   if (image_fd >= 0) (void)close(image_fd);
   if (!image_unlinked && image_fd >= 0) (void)unlink(image_path);
+#if defined(__linux__) && defined(PR_GET_CHILD_SUBREAPER) &&                \
+    defined(PR_SET_CHILD_SUBREAPER)
+  if (subreaper_changed &&
+      prctl(PR_SET_CHILD_SUBREAPER, prior_subreaper) != 0 && result == 0) {
+    result = 19;
+  }
+#endif
   return result;
 }

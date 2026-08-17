@@ -121,27 +121,39 @@ vector without a shell or ambient `PATH`.
 Formatting has its own deadline inside the native helper, measured from the
 start of the complete format operation. The trusted formatter runs in a new
 process group with stdin, stdout, and stderr redirected to a verified
-`/dev/null`; only the pinned image descriptor remains available at fd 3. The
+`/dev/null`; only the pinned image descriptor remains available at fd 3.
+Before forking it, the helper must successfully make itself a Linux child
+subreaper; a missing capability at build time disables this backend, and a
+runtime `prctl` failure rejects the operation before formatter dispatch. The
 helper allows 40 seconds for ordinary execution, then two seconds after
 `SIGTERM`, and finally uses the remaining five seconds to send `SIGKILL`, reap
-the retained group leader, and require the process group to become quiescent.
-`waitid(..., WNOWAIT)` keeps the leader PID/PGID reserved until the final group
-signal has been sent. A parent-death signal plus a parent-PID race check covers
-the direct formatter leader when the outer helper is killed before its own
-deadline. The fixed, reviewed formatter invocation must not leave a long-lived
-descendant in that outer-kill fallback; parent-death signaling is not a
-process-group broadcast. The JavaScript 60-second timeout is an independent
-backstop, not the formatter-settlement proof.
+the retained group leader, reap every adopted child that remains in that PGID,
+and require an `ESRCH` process-group absence result. The leader's wait status is
+kept separately from discarded descendant statuses. `waitid(..., WNOWAIT)`
+keeps the leader PID/PGID reserved until the final deliverable group signal has
+been sent; after the leader is reaped, only signal-zero absence probes occur.
+A terminal state first observed at or after its applicable phase deadline is
+not backdated into an on-time completion.
+A parent-death signal plus a parent-PID race check covers the direct formatter
+leader when the outer helper is killed before its own deadline. The fixed,
+reviewed formatter invocation must not leave a long-lived descendant in that
+outer-kill fallback; parent-death signaling is not a process-group broadcast.
+The JavaScript 60-second timeout is an independent backstop, not the
+formatter-settlement proof.
 
 This boundary protects image-content stability after the helper returns
-success: every formatter process that can retain the image descriptor must be
-reaped or gone from the formatter PGID. It assumes the reviewed `mkfs.ext4`
-and any formatter descendants do not call `setsid(2)` or move to another
-process group during ordinary inner supervision, and do not outlive the leader
-when the outer timeout wins. An unreadable clock/wait/group state or a task
-that cannot be proved quiescent remains `operation_outcome_uncertain`;
-timestamp or other ordinary `stat` changes are not used as content-mutation
-evidence.
+success: no live formatter process in the supervised PGID can continue
+writing the image. It separately protects descriptor-lifetime stability: no
+such process can retain fd 3 or a helper pipe after group absence is proved.
+Zombie reaping is lifecycle evidence, not either protected property—a zombie
+cannot write or retain an open descriptor—but adopting and reaping same-PGID
+descendants makes the final group-absence proof independent of PID 1's reap
+timing. It assumes the reviewed `mkfs.ext4` and any formatter descendants do
+not call `setsid(2)` or move to another process group during ordinary inner
+supervision, and do not outlive the leader when the outer timeout wins. An
+unreadable clock/wait/group state, `EPERM`, exhausted hard deadline, or a task
+that cannot be proved absent remains `operation_outcome_uncertain`; timestamp
+or other ordinary `stat` changes are not used as content-mutation evidence.
 
 Mount propagation is a lifecycle property of the deployment process, not a
 property that a short-lived helper can create after the fact. The namespace

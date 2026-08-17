@@ -581,6 +581,25 @@ change and does not attest the current head:
   rejects the second image without another mount dispatch. Cross-process
   exclusion remains the deployment's single-mutator responsibility for the
   private mount namespace.
+- Current-head Linux review found that a killed same-PGID formatter descendant
+  could remain an orphan zombie until PID 1 reaped it, keeping the final PGID
+  probe present and turning an otherwise-settled timeout into an uncertain
+  result. The native helper now becomes a child subreaper before formatter
+  dispatch, retains the leader through the last deliverable group signal,
+  preserves only that leader's status, then reaps adopted same-PGID children
+  under the original hard deadline and requires both `ECHILD` and final PGID
+  `ESRCH`. The Linux harness makes itself a subreaper before its descendant
+  cases, covers timeout and natural leader-exit paths, and keeps a leader-only
+  negative control whose adopted writer is explicitly released and reaped. This
+  protects image-content and descriptor-lifetime stability; zombie reaping is
+  separate lifecycle evidence and does not treat ordinary `stat` metadata as
+  mutation. A deterministic expired-deadline case also proves that an already
+  terminal leader cannot be reported as on-time after its observation window.
+  The harness cleanup separately retains the original PGID before ready-record
+  validation, distinguishes an unpublished writer PID from a proved reap, and
+  drains adopted group children to `ECHILD` plus PGID `ESRCH` under one bounded
+  test deadline. A forced pre-publication failure proves this cleanup without
+  sending a deliverable signal after the leader has been reaped.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

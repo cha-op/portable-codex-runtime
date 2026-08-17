@@ -473,6 +473,19 @@ test("native helper source binds mutation authority, loop geometry, and settle c
     source,
     /FORMATTER_OPERATION_TIMEOUT_MS \+ FORMATTER_OUTER_RESERVE_MS <\s+UINT64_C\(60000\)/u,
   );
+  const inspectionAbiDefine = source.indexOf(
+    "#define PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI 1",
+  );
+  const inspectionAbiGate = source.lastIndexOf(
+    "#if defined(PORTABLE_CODEX_HAS_LINUX_HEADERS)",
+    inspectionAbiDefine,
+  );
+  assert(inspectionAbiGate >= 0);
+  assert(inspectionAbiDefine > inspectionAbiGate);
+  assert.match(
+    source.slice(inspectionAbiGate, inspectionAbiDefine),
+    /defined\(PR_SET_CHILD_SUBREAPER\)/u,
+  );
   assert.match(
     source,
     /deadline_after\(FORMATTER_OPERATION_TIMEOUT_MS, &hard_deadline\)/u,
@@ -481,19 +494,61 @@ test("native helper source binds mutation authority, loop geometry, and settle c
     source,
     /force_formatter_group_cleanup\(leader, hard_deadline, wait_status\)/u,
   );
+  const groupReapStart = source.indexOf(
+    "static int reap_formatter_group_until(",
+  );
+  const finishGroupStart = source.indexOf(
+    "static int finish_formatter_group(",
+    groupReapStart,
+  );
   const forceCleanupStart = source.indexOf(
     "static void force_formatter_group_cleanup(",
+    finishGroupStart,
   );
   const supervisorStart = source.indexOf(
     "static int supervise_formatter(",
     forceCleanupStart,
   );
   const supervisionEnd = source.indexOf("\n}\n\n#endif", supervisorStart);
-  assert(forceCleanupStart >= 0);
+  assert(groupReapStart >= 0);
+  assert(finishGroupStart > groupReapStart);
+  assert(forceCleanupStart > finishGroupStart);
   assert(supervisorStart > forceCleanupStart);
   assert(supervisionEnd > supervisorStart);
   const forceCleanupBody = source.slice(forceCleanupStart, supervisorStart);
-  const supervisionBody = source.slice(forceCleanupStart, supervisionEnd);
+  const groupReapBody = source.slice(groupReapStart, finishGroupStart);
+  const finishGroupBody = source.slice(finishGroupStart, forceCleanupStart);
+  const supervisionBody = source.slice(groupReapStart, supervisionEnd);
+  assert.match(
+    groupReapBody,
+    /caller must first observe this exact leader with waitid\(WNOWAIT\)/u,
+  );
+  assert.match(
+    groupReapBody,
+    /waitpid\(leader, &reaped_leader_status, WNOHANG\)/u,
+  );
+  assert.match(
+    groupReapBody,
+    /waitpid\(-leader, &discarded_descendant_status, WNOHANG\)/u,
+  );
+  assert.match(groupReapBody, /\*leader_wait_status = reaped_leader_status/u);
+  assert.match(groupReapBody, /errno != ECHILD/u);
+  assert.match(
+    groupReapBody,
+    /!no_group_children \|\| monotonic_milliseconds\(&now\) != 0 \|\|\s+now >= deadline/u,
+  );
+  const finalGroupSignal = finishGroupBody.indexOf(
+    "signal_unreaped_formatter_group(leader, SIGKILL)",
+  );
+  const groupReap = finishGroupBody.indexOf(
+    "reap_formatter_group_until(leader, deadline, wait_status)",
+  );
+  assert(finalGroupSignal >= 0);
+  assert(groupReap > finalGroupSignal);
+  assert.doesNotMatch(
+    finishGroupBody.slice(groupReap),
+    /signal_unreaped_formatter_group/u,
+  );
   assert.match(
     forceCleanupBody,
     /formatter_child_terminal_until\(leader, hard_deadline\)/u,
@@ -501,6 +556,14 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   assert.match(
     forceCleanupBody,
     /finish_formatter_group\(leader, hard_deadline, wait_status\)/u,
+  );
+  assert(
+    forceCleanupBody.indexOf(
+      "formatter_child_terminal_until(leader, hard_deadline)",
+    ) <
+      forceCleanupBody.indexOf(
+        "finish_formatter_group(leader, hard_deadline, wait_status)",
+      ),
   );
   assert.match(supervisionBody, /phase_deadline\(hard_deadline,/u);
   assert.doesNotMatch(supervisionBody, /deadline_after\(/u);
@@ -510,11 +573,30 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   );
   assert.match(source, /waitid\(P_PID, \(id_t\)child/u);
   assert.match(source, /WEXITED \| WNOHANG \| WNOWAIT/u);
+  assert.match(
+    source,
+    /if \(information\.si_pid == child\) \{\s+if \(monotonic_milliseconds\(&now\) != 0\) return -1;\s+return now < deadline \? 1 : 0;/u,
+  );
   assert.match(source, /kill\(-leader, signal_number\)/u);
   assert.match(source, /setpgid\(0, 0\)/u);
   assert.match(source, /setpgid\(child, child\)/u);
   assert.match(source, /prctl\(PR_SET_PDEATHSIG, SIGKILL\)/u);
+  assert.match(source, /prctl\(PR_SET_CHILD_SUBREAPER, 1\)/u);
   assert.match(source, /getppid\(\) != expected_parent/u);
+  const runFormatterStart = source.indexOf("static int run_mkfs_on_fd(");
+  const runFormatterEnd = source.indexOf(
+    "static int print_ok(",
+    runFormatterStart,
+  );
+  assert(runFormatterStart >= 0);
+  assert(runFormatterEnd > runFormatterStart);
+  const runFormatterBody = source.slice(runFormatterStart, runFormatterEnd);
+  const configureSubreaper = runFormatterBody.indexOf(
+    "configure_formatter_subreaper()",
+  );
+  const formatterFork = runFormatterBody.indexOf("child = fork()");
+  assert(configureSubreaper >= 0);
+  assert(formatterFork > configureSubreaper);
   assert.match(source, /open\("\/dev\/null", O_RDWR \| O_NOFOLLOW \| O_CLOEXEC\)/u);
   assert.match(source, /redirect_formatter_standard_descriptors\(null_fd\)/u);
   assert.match(source, /dup3\(retained_fd, 3, 0\)/u);
@@ -529,6 +611,110 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   );
   assert.match(source, /"\/proc\/self\/fd\/%d"/u);
   assert.doesNotMatch(source, /execlp?\(/u);
+});
+
+test("native formatter harness owns adopted-descendant evidence", async () => {
+  const harness = await readFile(
+    new URL(
+      "./fixtures/linux-ext4-formatter-supervisor-harness.c",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const mainStart = harness.indexOf("int main(void)");
+  const configureSubreaper = harness.indexOf(
+    "configure_formatter_subreaper()",
+    mainStart,
+  );
+  const firstFormatterFork = harness.indexOf("child = fork()", mainStart);
+  const descendantCase = harness.indexOf(
+    "formatter_test_descendant_group(image_fd)",
+    mainStart,
+  );
+  assert(mainStart >= 0);
+  assert(configureSubreaper > mainStart);
+  assert(firstFormatterFork > configureSubreaper);
+  assert(descendantCase > firstFormatterFork);
+  assert.match(
+    harness,
+    /formatter_test_spawn_tree\(image_fd, &natural, 1, 0\)/u,
+  );
+  assert.match(
+    harness,
+    /supervision != FORMATTER_SUPERVISION_REAPED \|\|\s+!WIFEXITED\(wait_status\) \|\| WEXITSTATUS\(wait_status\) != 0/u,
+  );
+  assert.match(
+    harness,
+    /waitpid\(positive\.writer, &wait_status, WNOHANG\) != -1 \|\|\s+errno != ECHILD/u,
+  );
+  assert.match(harness, /kill\(-positive_group, 0\) != -1 \|\| errno != ESRCH/u);
+  assert.match(
+    harness,
+    /formatter_test_wait_reap\(negative\.writer, UINT64_C\(1000\),\s+&wait_status\)/u,
+  );
+  assert.match(harness, /kill\(-negative_group, 0\) != -1 \|\| errno != ESRCH/u);
+  assert.match(
+    harness,
+    /formatter_child_terminal_until\(child, expired_deadline\) != 0/u,
+  );
+  const treeGroup = harness.indexOf("tree->group = leader;");
+  const treeValidation = harness.indexOf(
+    "establish_formatter_process_group(leader)",
+    treeGroup,
+  );
+  assert(treeGroup >= 0);
+  assert(treeValidation > treeGroup);
+  assert.match(
+    harness,
+    /formatter_test_spawn_tree\(image_fd, &tree, 0, 1\) == -2/u,
+  );
+  assert.match(
+    harness,
+    /waitpid\(-group, &discarded_status, WNOHANG\)/u,
+  );
+  assert.match(
+    harness,
+    /errno != ESRCH \|\| !no_group_children/u,
+  );
+  const cleanupStart = harness.indexOf(
+    "static int formatter_test_cleanup_tree(",
+  );
+  const cleanupEnd = harness.indexOf(
+    "static int formatter_test_unknown_writer_cleanup(",
+    cleanupStart,
+  );
+  assert(cleanupStart >= 0);
+  assert(cleanupEnd > cleanupStart);
+  const cleanupBody = harness.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanupBody, /int process_cleanup_allowed = 1;/u);
+  assert.match(
+    cleanupBody,
+    /if \(process_cleanup_allowed && !leader_reaped\)/u,
+  );
+  assert.match(
+    cleanupBody,
+    /if \(process_cleanup_allowed && leader_reaped && tree->group > 0\)/u,
+  );
+  const cleanupGroupSignal = cleanupBody.indexOf(
+    "kill(-tree->group, SIGKILL)",
+  );
+  const cleanupLeaderReap = cleanupBody.indexOf(
+    "formatter_test_wait_reap_until(tree->leader",
+  );
+  const cleanupGroupDrain = cleanupBody.indexOf(
+    "formatter_test_drain_group_children_until(tree->group",
+  );
+  assert(cleanupGroupSignal >= 0);
+  assert(cleanupLeaderReap > cleanupGroupSignal);
+  assert(cleanupGroupDrain > cleanupLeaderReap);
+  assert.doesNotMatch(
+    cleanupBody.slice(cleanupLeaderReap),
+    /kill\(-tree->group, SIG/u,
+  );
+  assert.doesNotMatch(
+    cleanupBody,
+    /if \(cleanup_valid && (?:!leader_reaped|leader_reaped)/u,
+  );
 });
 
 test(
@@ -576,15 +762,20 @@ test(
       });
       assert.equal(stderr.length, 0);
       assert.deepEqual(JSON.parse(stdout.toString("utf8")), {
+        adoptedDescendantReaped: true,
         descendantGroupStopped: true,
         execFailureReaped: true,
+        expiredTerminalRejected: true,
         imageStable: true,
         leaderOnlyMutationDetected: true,
+        naturalLeaderStatusPreserved: true,
         nonzeroReaped: true,
         pipeClosed: true,
+        pgidAbsentAfterReap: true,
         reaped: true,
         parentDeathKill: true,
         termThenKill: true,
+        unknownWriterCleanup: true,
       });
     } finally {
       await rm(directory, { force: true, recursive: true });

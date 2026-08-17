@@ -73,6 +73,7 @@ enum inspector_exit_code {
     defined(BLKGETSIZE64) && defined(BLKSSZGET) && defined(BLKGETDISKSEQ) && \
     defined(CLOSE_RANGE_UNSHARE) && defined(STATX_MNT_ID) &&                \
     defined(UMOUNT_NOFOLLOW) && defined(PR_SET_PDEATHSIG) &&                 \
+    defined(PR_SET_CHILD_SUBREAPER) &&                                       \
     (defined(SYS_close_range) || defined(__NR_close_range)) &&              \
     (defined(SYS_openat2) || defined(__NR_openat2))
 #define PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI 1
@@ -152,12 +153,17 @@ static int formatter_child_terminal_until(pid_t child, uint64_t deadline) {
     int wait_result;
 
     memset(&information, 0, sizeof(information));
-    do {
-      wait_result = waitid(P_PID, (id_t)child, &information,
-                           WEXITED | WNOHANG | WNOWAIT);
-    } while (wait_result != 0 && errno == EINTR);
-    if (wait_result != 0) return -1;
-    if (information.si_pid == child) return 1;
+    wait_result = waitid(P_PID, (id_t)child, &information,
+                         WEXITED | WNOHANG | WNOWAIT);
+    if (wait_result != 0) {
+      if (errno != EINTR || monotonic_milliseconds(&now) != 0) return -1;
+      if (now >= deadline) return 0;
+      continue;
+    }
+    if (information.si_pid == child) {
+      if (monotonic_milliseconds(&now) != 0) return -1;
+      return now < deadline ? 1 : 0;
+    }
     if (monotonic_milliseconds(&now) != 0) return -1;
     if (now >= deadline) return 0;
     remaining = deadline - now;
@@ -165,7 +171,9 @@ static int formatter_child_terminal_until(pid_t child, uint64_t deadline) {
                                                   : FORMATTER_WAIT_POLL_MS;
     delay.tv_sec = (time_t)(sleep_ms / UINT64_C(1000));
     delay.tv_nsec = (long)((sleep_ms % UINT64_C(1000)) * UINT64_C(1000000));
-    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    while (nanosleep(&delay, &delay) != 0) {
+      if (errno != EINTR || monotonic_milliseconds(&now) != 0) return -1;
+      if (now >= deadline) return 0;
     }
   }
 }
@@ -177,6 +185,12 @@ static int establish_formatter_process_group(pid_t child) {
   group = getpgid(child);
   return group == child ? 0 : -1;
 }
+
+#if defined(__linux__) && defined(PR_SET_CHILD_SUBREAPER)
+static int configure_formatter_subreaper(void) {
+  return prctl(PR_SET_CHILD_SUBREAPER, 1);
+}
+#endif
 
 #if defined(__linux__)
 static int configure_formatter_parent_death(pid_t expected_parent) {
@@ -197,28 +211,16 @@ static int signal_unreaped_formatter_group(pid_t leader, int signal_number) {
 
 static int formatter_group_quiescent(pid_t leader) {
 #if defined(__linux__)
-  if (kill(-leader, 0) == 0 || errno == EPERM) return 0;
+  if (kill(-leader, 0) == 0) return 0;
   return errno == ESRCH ? 1 : -1;
 #else
-  return getpgid(leader) < 0 && errno == ESRCH ? 1 : 0;
+  if (getpgid(leader) >= 0) return 0;
+  return errno == ESRCH ? 1 : -1;
 #endif
 }
 
-static int formatter_group_quiescent_until(pid_t leader, uint64_t deadline) {
-  for (;;) {
-    uint64_t now;
-    struct timespec delay;
-    int state = formatter_group_quiescent(leader);
-    if (state != 0) return state;
-    if (monotonic_milliseconds(&now) != 0) return -1;
-    if (now >= deadline) return 0;
-    delay.tv_sec = 0;
-    delay.tv_nsec = (long)(FORMATTER_WAIT_POLL_MS * UINT64_C(1000000));
-    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
-    }
-  }
-}
-
+#if defined(PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI) &&                     \
+    !defined(PORTABLE_CODEX_FORMATTER_SUPERVISOR_TEST)
 static int reap_formatter_leader(pid_t leader, int *wait_status) {
   pid_t waited;
   do {
@@ -226,18 +228,81 @@ static int reap_formatter_leader(pid_t leader, int *wait_status) {
   } while (waited < 0 && errno == EINTR);
   return waited == leader ? 0 : -1;
 }
+#endif
+
+static int reap_formatter_group_until(pid_t leader, uint64_t deadline,
+                                      int *leader_wait_status) {
+  int discarded_descendant_status;
+  int reaped_leader_status;
+  pid_t waited;
+
+  /* The caller must first observe this exact leader with waitid(WNOWAIT).
+   * That retained zombie is the PID/PGID identity fence for the last signal. */
+  for (;;) {
+    waited = waitpid(leader, &reaped_leader_status, WNOHANG);
+    if (waited == leader) break;
+    if (waited < 0 && errno == EINTR) {
+      uint64_t now;
+      if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+      continue;
+    }
+    return -1;
+  }
+  *leader_wait_status = reaped_leader_status;
+
+  for (;;) {
+    struct timespec delay;
+    uint64_t now;
+    uint64_t remaining;
+    uint64_t sleep_ms;
+    int no_group_children = 0;
+    int quiescent;
+
+    waited = waitpid(-leader, &discarded_descendant_status, WNOHANG);
+    if (waited > 0) {
+      if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+      continue;
+    }
+    if (waited < 0) {
+      if (errno == EINTR) {
+        if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+        continue;
+      }
+      if (errno != ECHILD) return -1;
+      no_group_children = 1;
+    }
+
+    /* Signal zero only probes existence; no deliverable group signal follows
+     * the leader reap, so a reused numeric PGID cannot be killed here. */
+    quiescent = formatter_group_quiescent(leader);
+    if (quiescent < 0) return -1;
+    if (quiescent > 0) {
+      if (!no_group_children || monotonic_milliseconds(&now) != 0 ||
+          now >= deadline) {
+        return -1;
+      }
+      return 0;
+    }
+    if (monotonic_milliseconds(&now) != 0 || now >= deadline) return -1;
+    remaining = deadline - now;
+    sleep_ms = remaining < FORMATTER_WAIT_POLL_MS ? remaining
+                                                  : FORMATTER_WAIT_POLL_MS;
+    delay.tv_sec = (time_t)(sleep_ms / UINT64_C(1000));
+    delay.tv_nsec =
+        (long)((sleep_ms % UINT64_C(1000)) * UINT64_C(1000000));
+    while (nanosleep(&delay, &delay) != 0) {
+      if (errno != EINTR || monotonic_milliseconds(&now) != 0 ||
+          now >= deadline) {
+        return -1;
+      }
+    }
+  }
+}
 
 static int finish_formatter_group(pid_t leader, uint64_t deadline,
                                   int *wait_status) {
-  int quiescent;
-
-  if (signal_unreaped_formatter_group(leader, SIGKILL) != 0 ||
-      reap_formatter_leader(leader, wait_status) != 0) {
-    return -1;
-  }
-  /* No further signal is sent after reap, so a reused PGID is never harmed. */
-  quiescent = formatter_group_quiescent_until(leader, deadline);
-  return quiescent > 0 ? 0 : -1;
+  if (signal_unreaped_formatter_group(leader, SIGKILL) != 0) return -1;
+  return reap_formatter_group_until(leader, deadline, wait_status);
 }
 
 static void force_formatter_group_cleanup(pid_t leader,
@@ -768,6 +833,10 @@ static int run_mkfs_on_fd(const char *executable, int image_fd,
     return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
   }
   (void)launch_deadline;
+  if (configure_formatter_subreaper() != 0) {
+    (void)close(null_fd);
+    return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  }
   expected_parent = getpid();
   child = fork();
   if (child < 0) {
