@@ -400,6 +400,21 @@ change and does not attest the current head:
   Darwin did not execute the new Linux procfd/process-group tests or the real
   rootless Podman holder path; the next Ubuntu job remains their runtime gate
   and will classify any retained start fail-stop before its hard bound.
+- Head `0be49ca` passed every Node matrix, the PostgreSQL authority
+  integration, the real ext4 producer, and the dependent cross-host consumer
+  in Test run `31983148280`. The Linux holder/process-group fixtures therefore
+  passed on both supported Node versions. The sole failure was the bounded
+  Podman watchdog: durable state and exact inspection were both `created`,
+  with `Running == false` and `Pid == 0`. This proves create, the durable
+  `preparing -> created` transition, the exact configured-source inspection,
+  and the pre-start holder revalidation completed before the exact full-ID
+  `start` dispatch remained unsettled. The snapshot is compatible with either
+  a still-running Podman CLI or its non-success path entering the deliberate
+  fail-stop wait; it does not yet distinguish a procfd, user-namespace,
+  conmon, or OCI runtime failure. The next diagnostic classifies Podman's
+  persisted `State.Error`, `ExitCode`, and `ConmonPid` into fixed labels only;
+  it never publishes the raw error, container ID, source path, procfd, or stderr and
+  does not weaken the production authority-release boundary.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

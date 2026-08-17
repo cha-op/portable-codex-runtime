@@ -292,8 +292,63 @@ function containerObservation(
   inspect = "not-run",
   running = "unreadable",
   pid = "unreadable",
+  stateError = "unreadable",
+  exitCode = "unreadable",
+  conmonPid = "unreadable",
 ) {
-  return { inspect, pid, ps, running };
+  return { conmonPid, exitCode, inspect, pid, ps, running, stateError };
+}
+
+function classifyStateError(value) {
+  if (typeof value !== "string") return "unreadable";
+  if (value === "") return "empty";
+  const normalized = value.toLowerCase();
+  const mentionsProcFd = /\/proc\/(?:self|[1-9][0-9]*)\/fd\/(?:0|[1-9][0-9]*)/u
+    .test(value);
+  const accessDenied = normalized.includes("permission denied") ||
+    normalized.includes("operation not permitted") ||
+    normalized.includes("access denied");
+  const missing = normalized.includes("no such file or directory") ||
+    normalized.includes("not a directory") ||
+    normalized.includes("does not exist");
+  const ociRuntimeToken = /(?:^|[^a-z0-9_])(?:crun|runc)(?:$|[^a-z0-9_])/u
+    .test(normalized);
+  const ociContext = ociRuntimeToken ||
+    normalized.includes("oci runtime") ||
+    normalized.includes("conmon") ||
+    normalized.includes("container create") ||
+    normalized.includes("mount") ||
+    normalized.includes("/session");
+  if (mentionsProcFd && accessDenied) return "procfd-access-denied";
+  if (mentionsProcFd && missing) return "procfd-missing";
+  if (mentionsProcFd) return "procfd-other";
+  if (normalized.includes("container creation timeout")) return "oci-timeout";
+  if (
+    normalized.includes("conmon") &&
+    (normalized.includes("no log") || normalized.includes("did not provide"))
+  ) {
+    return "conmon-no-logs";
+  }
+  if (accessDenied && ociContext) return "oci-access-denied";
+  if (missing && ociContext) return "oci-missing";
+  if (ociContext) return "oci-other";
+  return "non-oci";
+}
+
+function classifyExitCode(value) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < -2_147_483_648 ||
+    value > 2_147_483_647
+  ) {
+    return "unreadable";
+  }
+  return value === 0 ? "zero" : "nonzero";
+}
+
+function classifyProcessIdentifier(value) {
+  if (!Number.isSafeInteger(value) || value < 0) return "unreadable";
+  return value === 0 ? "zero" : "positive";
 }
 
 async function observeUniqueImageContainer() {
@@ -415,6 +470,18 @@ async function observeUniqueImageContainer() {
     stateDescriptor.value,
     "Pid",
   );
+  const errorDescriptor = Object.getOwnPropertyDescriptor(
+    stateDescriptor.value,
+    "Error",
+  );
+  const exitCodeDescriptor = Object.getOwnPropertyDescriptor(
+    stateDescriptor.value,
+    "ExitCode",
+  );
+  const conmonPidDescriptor = Object.getOwnPropertyDescriptor(
+    stateDescriptor.value,
+    "ConmonPid",
+  );
   const running = runningDescriptor !== undefined &&
       Object.hasOwn(runningDescriptor, "value") &&
       typeof runningDescriptor.value === "boolean"
@@ -447,7 +514,31 @@ async function observeUniqueImageContainer() {
     default:
       if (statusReadable) inspect = "other-state";
   }
-  return containerObservation("unique", inspect, running, pid);
+  const stateError = errorDescriptor !== undefined &&
+      Object.hasOwn(errorDescriptor, "value")
+    ? classifyStateError(errorDescriptor.value)
+    : "unreadable";
+  const exitCode = exitCodeDescriptor !== undefined &&
+      Object.hasOwn(exitCodeDescriptor, "value")
+    ? classifyExitCode(exitCodeDescriptor.value)
+    : "unreadable";
+  // Podman 4.9.3 declares ConmonPid with `omitempty`. Preserve absence as a
+  // diagnostic category instead of treating a reusable numeric PID as process
+  // authority or silently conflating a malformed present value with zero.
+  const conmonPid = conmonPidDescriptor === undefined
+    ? "absent"
+    : (Object.hasOwn(conmonPidDescriptor, "value")
+      ? classifyProcessIdentifier(conmonPidDescriptor.value)
+      : "unreadable");
+  return containerObservation(
+    "unique",
+    inspect,
+    running,
+    pid,
+    stateError,
+    exitCode,
+    conmonPid,
+  );
 }
 
 function fixedPhaseLabel(phase) {
@@ -472,6 +563,48 @@ function writeWatchdogAndExit(line) {
     process.exit(124);
   }
 }
+
+test("watchdog state-error classification stays fixed and redacted", () => {
+  const stateErrorCases = [
+    ["", "empty"],
+    [
+      "crun: mount /proc/123/fd/7 to /session: permission denied",
+      "procfd-access-denied",
+    ],
+    [
+      "crun: mount /proc/123/fd/7 to /session: no such file or directory",
+      "procfd-missing",
+    ],
+    ["crun: mount /proc/123/fd/7: invalid argument", "procfd-other"],
+    ["container creation timeout: internal error", "oci-timeout"],
+    ["container creation timeout for /proc/123/fd/7", "procfd-other"],
+    ["container create failed (no logs from conmon)", "conmon-no-logs"],
+    ["crun: mount /session: permission denied", "oci-access-denied"],
+    ["output truncated", "non-oci"],
+    ["unrelated permission denied", "non-oci"],
+    ["unrelated failure", "non-oci"],
+    [null, "unreadable"],
+  ];
+  for (const [inputValue, expectedCategory] of stateErrorCases) {
+    assert.equal(classifyStateError(inputValue), expectedCategory);
+  }
+  assert.equal(classifyExitCode(-1), "nonzero");
+  assert.equal(classifyExitCode(0), "zero");
+  assert.equal(classifyExitCode(1), "nonzero");
+  assert.equal(classifyExitCode(2_147_483_648), "unreadable");
+  const redactedObservation = containerObservation(
+    "unique",
+    "created",
+    "false",
+    "zero",
+    classifyStateError(
+      "crun: mount /proc/123/fd/7 to /session: permission denied",
+    ),
+    "nonzero",
+    "positive",
+  );
+  assert.equal(JSON.stringify(redactedObservation).includes("/proc/"), false);
+});
 
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
   assert.match(DIGEST, /^sha256:[0-9a-f]{64}$/u);
@@ -512,14 +645,16 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
             `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
               `durableStatus=${durableStatus} imagePs=${observed.ps} ` +
               `imageInspect=${observed.inspect} running=${observed.running} ` +
-              `pid=${observed.pid}`,
+              `pid=${observed.pid} stateError=${observed.stateError} ` +
+              `exitCode=${observed.exitCode} conmonPid=${observed.conmonPid}`,
           );
         } catch {
           if (!watchdogActive) return;
           writeWatchdogAndExit(
             `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
               "durableStatus=probe-error imagePs=probe-error " +
-              "imageInspect=probe-error running=unreadable pid=unreadable",
+              "imageInspect=probe-error running=unreadable pid=unreadable " +
+              "stateError=unreadable exitCode=unreadable conmonPid=unreadable",
           );
         }
       })();
@@ -529,7 +664,8 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       writeWatchdogAndExit(
         `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
           "durableStatus=probe-timeout imagePs=probe-timeout " +
-          "imageInspect=probe-timeout running=unreadable pid=unreadable",
+          "imageInspect=probe-timeout running=unreadable pid=unreadable " +
+          "stateError=unreadable exitCode=unreadable conmonPid=unreadable",
       );
     }, WATCHDOG_HARD_BACKSTOP_MILLISECONDS);
   };
