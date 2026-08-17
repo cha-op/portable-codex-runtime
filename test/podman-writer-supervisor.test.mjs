@@ -965,7 +965,8 @@ async function fixture(t, settings = {}) {
     state,
     stopTimeoutSeconds: settings.stopTimeoutSeconds ?? 7,
     supervisorId: SUPERVISOR_ID,
-    writerCommand: Object.freeze(["/usr/local/bin/codex", "app-server"]),
+    writerCommand: settings.writerCommand ??
+      Object.freeze(["/usr/local/bin/codex", "app-server"]),
     writerEnvironment: exact({
       CODEX_HOME: "/session/.codex",
       LANG: "C.UTF-8",
@@ -1087,6 +1088,7 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     "--name",
     create.arguments_[2],
     "--pull=never",
+    "--image-volume=ignore",
     "--read-only",
     "--security-opt=no-new-privileges",
     "--cap-drop=all",
@@ -1096,12 +1098,13 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     `type=bind,source=${HELD_MOUNT_SOURCE},target=/session,rw,bind-propagation=rprivate`,
     "--workdir",
     "/session",
+    "--entrypoint",
+    "/usr/local/bin/codex",
     "--env",
     "CODEX_HOME=/session/.codex",
     "--env",
     "LANG=C.UTF-8",
     IMAGE_REFERENCE,
-    "/usr/local/bin/codex",
     "app-server",
   ]);
   assert.deepEqual(
@@ -1140,6 +1143,21 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     assert.equal(Object.getPrototypeOf(event.options), null);
     assert.equal(Object.isFrozen(event.options), true);
   }
+});
+
+test("a single writer executable fully overrides the image command", async (t) => {
+  const writerCommand = Object.freeze(["/usr/local/bin/writer"]);
+  const base = await fixture(t, { writerCommand });
+  const receipt = await base.supervisor.launchWriter(base.input);
+  const create = base.events.find((event) => event.arguments_[0] === "create");
+  const entrypointIndex = create.arguments_.indexOf("--entrypoint");
+  const imageIndex = create.arguments_.indexOf(IMAGE_REFERENCE);
+  assert.deepEqual(
+    create.arguments_.slice(entrypointIndex, entrypointIndex + 2),
+    ["--entrypoint", writerCommand[0]],
+  );
+  assert.deepEqual(create.arguments_.slice(imageIndex), [IMAGE_REFERENCE]);
+  await receipt.stopWriter(stopInput(base.input, receipt));
 });
 
 test("exact replay and supervisor reconstruction never launch a second container", async (t) => {
@@ -2021,6 +2039,91 @@ test("Linux default authority rejects malformed, mismatched, and timed-out holde
     const pid = (await readFile(pidPath, "utf8")).trim();
     assert.equal(existsSync(`/proc/${pid}`), false);
   }
+});
+
+test("Linux holder uses captured AbortSignal listener methods and reaps on abort", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  const controller = new AbortController();
+  let addCalls = 0;
+  let captureReads = 0;
+  let pidPath;
+  let removeCalls = 0;
+  Object.defineProperties(controller.signal, {
+    addEventListener: {
+      configurable: true,
+      value() {
+        addCalls += 1;
+        throw new Error("poisoned addEventListener");
+      },
+    },
+    removeEventListener: {
+      configurable: true,
+      value() {
+        removeCalls += 1;
+        throw new Error("poisoned removeEventListener");
+      },
+    },
+  });
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 2_000,
+    defaultCommandRunnerScript({ parent }) {
+      pidPath = join(parent, "holder-poisoned-listener-pid");
+      return failingHolderPodmanScript({ mode: "timeout", pidPath });
+    },
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+    useDefaultFilesystemAuthority: true,
+  });
+  const captureDescriptor = Object.getOwnPropertyDescriptor(
+    Object.prototype,
+    "capture",
+  );
+  let observedError = null;
+  let pending = null;
+  let pid = null;
+  Object.defineProperty(Object.prototype, "capture", {
+    configurable: true,
+    get() {
+      captureReads += 1;
+      throw new Error("poisoned inherited capture option");
+    },
+  });
+  try {
+    pending = base.supervisor.launchWriter(
+      launchInput(base.attachmentRoot, { signal: controller.signal }),
+    );
+    void pending.catch(() => {});
+    await waitForPath(pidPath);
+    controller.abort();
+    try {
+      await pending;
+    } catch (error) {
+      observedError = error;
+    }
+    pid = Number((await readFile(pidPath, "utf8")).trim());
+    for (let attempt = 0; attempt < 100 && processExists(pid); attempt += 1) {
+      await delay(10);
+    }
+  } finally {
+    try {
+      controller.abort();
+      if (pending !== null) await pending.catch(() => {});
+    } finally {
+      if (captureDescriptor === undefined) delete Object.prototype.capture;
+      else {
+        Object.defineProperty(Object.prototype, "capture", captureDescriptor);
+      }
+    }
+  }
+  assert.equal(
+    assertSupervisorError("podman_writer_supervisor_aborted")(observedError),
+    true,
+  );
+  assert.equal(addCalls, 0);
+  assert.equal(captureReads, 0);
+  assert.equal(removeCalls, 0);
+  assert.equal(processExists(pid), false);
 });
 
 test("Linux default authority blocks start after holder exit or configured-source drift", {

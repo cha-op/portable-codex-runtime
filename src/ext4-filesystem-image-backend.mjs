@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
@@ -29,6 +30,7 @@ import {
 
 const arrayIsArrayIntrinsic = Array.isArray;
 const arrayIncludesIntrinsic = Array.prototype.includes;
+const bufferByteLengthIntrinsic = Buffer.byteLength;
 const objectCreateIntrinsic = Object.create;
 const objectFreezeIntrinsic = Object.freeze;
 const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
@@ -68,12 +70,14 @@ export const EXT4_FILESYSTEM_IMAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION = 1;
 
 const MAX_CLONE_DEPTH = 32;
 const MAX_CLONE_NODES = 16_384;
+const MAX_PATH_BYTES = 4095;
 const IMAGE_SIZE_ALIGNMENT_BYTES = 512;
 const MIN_IMAGE_SIZE_BYTES = 1024 * 1024;
 const MAX_IMAGE_SIZE_BYTES = 8 * 1024 * 1024 * 1024 * 1024;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 const POSITIVE_DECIMAL_PATTERN = /^[1-9][0-9]*$/u;
+const DATA_CHILD_PATTERN = /^data-[0-9a-f]{48}$/u;
 const RESTORE_CHILD_PATTERN = /^generation-[0-9a-f]{48}$/u;
 const rawBackendSurfaces = new WeakSetConstructor();
 
@@ -1058,8 +1062,7 @@ export function createExt4FilesystemImageBackend(...args) {
     return storage;
   }
 
-  async function preflightMutation(
-    kind,
+  async function inspectMutationBeforePrepare(
     mutationRequest,
     validateStorage,
     operationRequest = mutationRequest,
@@ -1071,20 +1074,40 @@ export function createExt4FilesystemImageBackend(...args) {
         request: operationRequest,
       }),
     );
-    if (existing?.state === "committed") return existing;
+    if (existing?.state === "committed") {
+      return { existing, expectedStorageState: null, storage: null };
+    }
 
     const expectedStorageState =
       existing === null
         ? await callState(stateReadStorageIntrinsic, mutationRequest.storageId)
         : existing.storageStateBefore;
-    validateStorage(expectedStorageState, mutationRequest);
+    const storage = validateStorage(expectedStorageState, mutationRequest);
+    return { existing, expectedStorageState, storage };
+  }
+
+  async function preflightMutation(
+    kind,
+    mutationRequest,
+    validateStorage,
+    operationRequest = mutationRequest,
+    inspectedValue = null,
+  ) {
+    const inspected =
+      inspectedValue ??
+      await inspectMutationBeforePrepare(
+        mutationRequest,
+        validateStorage,
+        operationRequest,
+      );
+    if (inspected.existing?.state === "committed") return inspected.existing;
 
     const prepared = await committedOrPrepared(
       kind,
       mutationRequest.operationId,
       operationRequest,
       mutationRequest.storageId,
-      expectedStorageState,
+      inspected.expectedStorageState,
     );
     if (prepared.state !== "committed") {
       validateStorage(prepared.storageStateBefore, mutationRequest);
@@ -1175,10 +1198,31 @@ export function createExt4FilesystemImageBackend(...args) {
       request.backendId === backendId && request.operation === "attach",
       "invalid_request",
     );
+    const planned = callPath("planWritableAttachment", request);
+    const inspected = await inspectMutationBeforePrepare(
+      request,
+      validateAttachPrecondition,
+    );
+    if (inspected.storage !== null) {
+      ensure(
+        planned.storageId === inspected.storage.storageId &&
+          planned.imagePath === inspected.storage.imagePath &&
+          planned.mountPath === inspected.storage.mount.mountPath &&
+          typeof planned.attachmentRootPath === "string" &&
+          dirname(planned.attachmentRootPath) === planned.mountPath &&
+          regexpTest(
+            DATA_CHILD_PATTERN,
+            basename(planned.attachmentRootPath),
+          ),
+        "physical_state_mismatch",
+      );
+    }
     const prepared = await preflightMutation(
       "attach",
       request,
       validateAttachPrecondition,
+      request,
+      inspected,
     );
     const replay = replayIfCommitted(prepared);
     if (replay !== null) return replay;
@@ -1186,13 +1230,6 @@ export function createExt4FilesystemImageBackend(...args) {
       prepared.storageStateBefore,
       request.storageId,
       request.sessionId,
-    );
-    const planned = callPath("planWritableAttachment", request);
-    ensure(
-      planned.storageId === storage.storageId &&
-        planned.imagePath === storage.imagePath &&
-        planned.mountPath === storage.mount.mountPath,
-      "physical_state_mismatch",
     );
     const plan = exactFrozenRecord({
       attachmentRootPath:
@@ -1357,11 +1394,30 @@ export function createExt4FilesystemImageBackend(...args) {
       "invalid_request",
     );
     const mutation = request.mutationRequest;
+    const rootPath = request.publication.root.rootPath;
+    const inspected = await inspectMutationBeforePrepare(
+      mutation,
+      validateAttachPrecondition,
+      request,
+    );
+    let plan = null;
+    if (inspected.storage !== null) {
+      plan = planProvisionForStorage(paths, backendId, inspected.storage);
+      ensure(
+        rootPath.length <= MAX_PATH_BYTES &&
+          callIntrinsic(bufferByteLengthIntrinsic, Buffer, [rootPath, "utf8"]) <=
+            MAX_PATH_BYTES &&
+          dirname(rootPath) === plan.mountPath &&
+          regexpTest(RESTORE_CHILD_PATTERN, basename(rootPath)),
+        "physical_state_mismatch",
+      );
+    }
     const prepared = await preflightMutation(
       "restore-attach",
       mutation,
       validateAttachPrecondition,
       request,
+      inspected,
     );
     const replay = replayIfCommitted(prepared);
     if (replay !== null) return replay;
@@ -1370,13 +1426,7 @@ export function createExt4FilesystemImageBackend(...args) {
       mutation.storageId,
       mutation.sessionId,
     );
-    const plan = planProvisionForStorage(paths, backendId, storage);
-    const rootPath = request.publication.root.rootPath;
-    ensure(
-      dirname(rootPath) === plan.mountPath &&
-        regexpTest(RESTORE_CHILD_PATTERN, basename(rootPath)),
-      "physical_state_mismatch",
-    );
+    ensure(plan !== null, "physical_state_mismatch");
     const restorePlan = exactFrozenRecord({
       attachmentRootPath: rootPath,
       imagePath: plan.imagePath,

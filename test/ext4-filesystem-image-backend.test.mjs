@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -376,7 +377,7 @@ function createFakeDriver() {
   };
 }
 
-async function fixture(t, { driverMethodOverrides } = {}) {
+async function fixture(t, { driverMethodOverrides, mountRoot } = {}) {
   const root = await mkdtemp(join(tmpdir(), "ext4-backend-test-"));
   t.after(() => rm(root, { force: true, recursive: true }));
   const directories = {
@@ -392,7 +393,7 @@ async function fixture(t, { driverMethodOverrides } = {}) {
     archiveRoot: directories.archive,
     backendId: BACKEND_ID,
     imageRoot: directories.images,
-    mountRoot: directories.mounts,
+    mountRoot: mountRoot ?? directories.mounts,
   });
   const state = new FilesystemImageProviderState({
     acquireLock: createLockProvider(),
@@ -917,6 +918,28 @@ test("a prepared provision retry observes the exact effect before commit", async
   assert.equal(fixed.fake.calls.includes("provision"), false);
 });
 
+test("rejects an oversized generated data child before durable attach preparation", async (t) => {
+  const mountRoot = `/mnt/${"a".repeat(3975)}`;
+  assert.equal(Buffer.byteLength(mountRoot, "utf8"), 3980);
+  const fixed = await fixture(t, { mountRoot });
+  const provisioned = await provision(fixed);
+  const request = mutationRequest("attach", provisioned.storageId);
+  const mountPlan = fixed.paths.planProvision(provisionRequest());
+  assert.equal(Buffer.byteLength(mountPlan.mountPath, "utf8") <= 4095, true);
+
+  const ledgerBefore = await readFile(fixed.ledgerPath);
+  const driverCallsBefore = fixed.fake.calls.length;
+  await assert.rejects(
+    fixed.backend.lifecycleBackend.prepareWritableAttachment(
+      request,
+      context(),
+    ),
+    backendError("invalid_request"),
+  );
+  assert.deepEqual(await readFile(fixed.ledgerPath), ledgerBefore);
+  assert.equal(fixed.fake.calls.length, driverCallsBefore);
+});
+
 test("detach preserves dataRoot, reattach reuses it, and destroy tombstones storage", async (t) => {
   const fixed = await fixture(t);
   const provisioned = await provision(fixed);
@@ -1204,6 +1227,84 @@ test("restore activation adopts only the already-published deterministic child",
   );
   assert.equal(reconciled.outcome, "applied");
   assert.deepEqual(reconciled.result, result);
+});
+
+test("rejects a misplaced restore root before durable activation preparation", async (t) => {
+  const fixed = await fixture(t);
+  const provisioned = await provision(fixed);
+  const restore = restoreMutation(provisioned.storageId);
+  const destination = fixed.paths.planRestoreDestination(restore);
+  const wrongRoot = join(destination.destinationOwnedRoot, "unexpected-root");
+  assert.notEqual(wrongRoot, destination.destinationDirectory);
+  const wrongIdentity = fixed.fake.publish(wrongRoot);
+  const wrongRequest = activationRequest(
+    provisioned.storageId,
+    wrongRoot,
+    wrongIdentity,
+    "early-root-validation",
+  );
+  const ledgerBefore = await readFile(fixed.ledgerPath);
+  const driverCallsBefore = fixed.fake.calls.length;
+
+  await assert.rejects(
+    fixed.backend.lifecycleBackend.prepareRestoreAttachment(
+      wrongRequest,
+      context(),
+    ),
+    backendError("physical_state_mismatch"),
+  );
+  assert.deepEqual(await readFile(fixed.ledgerPath), ledgerBefore);
+  assert.equal(fixed.fake.calls.length, driverCallsBefore);
+
+  const expectedIdentity = fixed.fake.publish(destination.destinationDirectory);
+  const result = await fixed.backend.lifecycleBackend.prepareRestoreAttachment(
+    activationRequest(
+      provisioned.storageId,
+      destination.destinationDirectory,
+      expectedIdentity,
+      "early-root-validation",
+    ),
+    context(),
+  );
+  assert.equal(result.attachment.rootPath, destination.destinationDirectory);
+});
+
+test("rejects a 4096-byte restore root before durable activation preparation", async (t) => {
+  const mountRoot = `/mnt/${"a".repeat(3966)}`;
+  const fixed = await fixture(t, { mountRoot });
+  const provisioned = await provision(fixed);
+  const mountPlan = fixed.paths.planProvision(provisionRequest());
+  assert.equal(Buffer.byteLength(mountPlan.mountPath, "utf8"), 4036);
+
+  const rootPath = join(
+    mountPlan.mountPath,
+    `generation-${"a".repeat(48)}`,
+  );
+  assert.equal(Buffer.byteLength(rootPath, "utf8"), 4096);
+  const request = activationRequest(
+    provisioned.storageId,
+    rootPath,
+    fixed.fake.publish(rootPath),
+    "oversized-restore-root",
+  );
+  const ledgerBefore = await readFile(fixed.ledgerPath);
+  const driverCallsBefore = fixed.fake.calls.length;
+
+  await assert.rejects(
+    fixed.backend.lifecycleBackend.prepareRestoreAttachment(
+      request,
+      context(),
+    ),
+    backendError("physical_state_mismatch"),
+  );
+  assert.deepEqual(await readFile(fixed.ledgerPath), ledgerBefore);
+  assert.equal(
+    await fixed.state.readOperation({
+      operationId: request.mutationRequest.operationId,
+    }),
+    null,
+  );
+  assert.equal(fixed.fake.calls.length, driverCallsBefore);
 });
 
 test("restore reconciliation is observational for absent and prepared activation", async (t) => {

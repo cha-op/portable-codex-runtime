@@ -454,6 +454,7 @@ function validPath(value) {
   if (
     typeof value !== "string" ||
     value.length <= 1 ||
+    value.length > MAX_PATH_BYTES ||
     regexpTest(CONTROL_PATTERN, value)
   ) {
     return false;

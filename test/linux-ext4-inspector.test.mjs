@@ -768,6 +768,55 @@ test("invalid, escaped, outside, and ambiguous paths never dispatch the helper",
   assert.equal(fixture.calls.length, 0);
 });
 
+test("oversized UTF-16 paths reject before allocating a UTF-8 buffer", async () => {
+  const originalBufferFrom = Buffer.from;
+  let oversizedEncodes = 0;
+  Buffer.from = function guardedBufferFrom(value, ...args) {
+    if (typeof value === "string" && value.length > 4095) {
+      oversizedEncodes += 1;
+      throw new Error("oversized path reached Buffer.from");
+    }
+    return Reflect.apply(originalBufferFrom, Buffer, [value, ...args]);
+  };
+  let fresh;
+  try {
+    fresh = await import(
+      new URL(
+        "../src/linux-ext4-inspector.mjs?oversized-path-test",
+        import.meta.url,
+      ).href
+    );
+  } finally {
+    Buffer.from = originalBufferFrom;
+  }
+
+  const calls = [];
+  const inspector = fresh.createLinuxExt4Inspector({
+    helperPath: HELPER_PATH,
+    platform: "linux",
+    readMountInfo: async () => {
+      calls.push("mountinfo");
+      return Buffer.alloc(0);
+    },
+    runHelper: async () => {
+      calls.push("helper");
+      return completion();
+    },
+    trustedRoots: [TRUSTED_ROOT],
+  });
+  const oversizedPath = `${TRUSTED_ROOT}/${"a".repeat(1024 * 1024)}`;
+  await assert.rejects(
+    inspector.inspectFilesystem(oversizedPath),
+    (error) => {
+      assert(error instanceof fresh.LinuxExt4InspectorError);
+      assert.equal(error.code, "invalid_path");
+      return true;
+    },
+  );
+  assert.equal(oversizedEncodes, 0);
+  assert.deepEqual(calls, []);
+});
+
 test("helper exit statuses preserve missing, unreadable, mismatch, and unsupported", async () => {
   const cases = [
     [66, "path_missing"],

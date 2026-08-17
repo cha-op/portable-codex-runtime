@@ -303,6 +303,7 @@ function validAbsolutePath(value) {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
+    value.length > MAX_PATH_BYTES ||
     stringIncludes(value, "\0")
   ) {
     return false;

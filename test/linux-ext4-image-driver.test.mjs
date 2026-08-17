@@ -447,6 +447,66 @@ test("provision rejects image sizes that cannot bind exact loop geometry", async
   assert.equal(fixture.fdCalls.length, 0);
 });
 
+test("oversized UTF-16 paths are invalid requests before UTF-8 allocation", async () => {
+  const originalBufferFrom = Buffer.from;
+  let oversizedEncodes = 0;
+  Buffer.from = function guardedBufferFrom(value, ...args) {
+    if (typeof value === "string" && value.length > 4095) {
+      oversizedEncodes += 1;
+      throw new Error("oversized path reached Buffer.from");
+    }
+    return Reflect.apply(originalBufferFrom, Buffer, [value, ...args]);
+  };
+  let fresh;
+  try {
+    fresh = await import(
+      new URL(
+        "../src/linux-ext4-image-driver.mjs?oversized-path-test",
+        import.meta.url,
+      ).href
+    );
+  } finally {
+    Buffer.from = originalBufferFrom;
+  }
+
+  let dispatches = 0;
+  const driver = fresh.createLinuxExt4ImageDriver({
+    commandRunner: async () => {
+      dispatches += 1;
+      return completion();
+    },
+    inspector: Object.freeze({
+      async inspectFilesystemObject() {
+        dispatches += 1;
+        throw new Error("unexpected inspector dispatch");
+      },
+      async runFdOperation() {
+        dispatches += 1;
+        throw new Error("unexpected fd operation dispatch");
+      },
+    }),
+    platform: "linux",
+    readMountInfo: async () => {
+      dispatches += 1;
+      return Buffer.alloc(0);
+    },
+  });
+  const oversizedPath = `/${"a".repeat(1024 * 1024)}`;
+  await assert.rejects(
+    driver.observeMount({
+      imagePath: "/srv/images/session.ext4",
+      mountPath: oversizedPath,
+    }),
+    (error) => {
+      assert(error instanceof fresh.LinuxExt4ImageDriverError);
+      assert.equal(error.code, "invalid_request");
+      return true;
+    },
+  );
+  assert.equal(oversizedEncodes, 0);
+  assert.equal(dispatches, 0);
+});
+
 test("driver loop receipts use the canonical native 0..4095 domain", async () => {
   const acceptedPaths = await createPaths();
   const accepted = createFixture(acceptedPaths, {

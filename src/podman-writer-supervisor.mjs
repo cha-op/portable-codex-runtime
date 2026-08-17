@@ -42,6 +42,10 @@ const bufferToStringIntrinsic = Buffer.prototype.toString;
 const dateParseIntrinsic = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const DateConstructor = Date;
+const eventTargetAddEventListenerIntrinsic =
+  EventTarget.prototype.addEventListener;
+const eventTargetRemoveEventListenerIntrinsic =
+  EventTarget.prototype.removeEventListener;
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
 const JsonObject = JSON;
@@ -1556,24 +1560,55 @@ async function startFilesystemHolder(input, configured, attachment) {
     failProtocol();
   }
 
-  let timeoutId;
+  let timeoutId = null;
   let abortListener = null;
-  const timeoutPromise = new PromiseConstructor((resolvePromise) => {
-    timeoutId = setTimeout(() => resolvePromise(null), input.holder.timeoutMilliseconds);
-  });
-  const abortPromise = new PromiseConstructor((resolvePromise) => {
-    abortListener = () => resolvePromise(null);
-    input.holder.signal.addEventListener("abort", abortListener, { once: true });
-    if (signalAborted(input.holder.signal)) abortListener();
-  });
-  const receiptText = await firstPromiseOfThree(
-    readyPromise,
-    timeoutPromise,
-    abortPromise,
-  );
-  clearTimeout(timeoutId);
-  input.holder.signal.removeEventListener("abort", abortListener);
-  if (receiptText === null || holder.protocolFailed || holder.stderrBytes !== 0) {
+  let abortListenerInstalled = false;
+  let receiptText = null;
+  let waitFailed = false;
+  try {
+    const timeoutPromise = new PromiseConstructor((resolvePromise) => {
+      timeoutId = setTimeout(
+        () => resolvePromise(null),
+        input.holder.timeoutMilliseconds,
+      );
+    });
+    const abortPromise = new PromiseConstructor((resolvePromise) => {
+      abortListener = () => resolvePromise(null);
+      callIntrinsic(
+        eventTargetAddEventListenerIntrinsic,
+        input.holder.signal,
+        ["abort", abortListener],
+      );
+      abortListenerInstalled = true;
+      if (signalAborted(input.holder.signal)) abortListener();
+    });
+    receiptText = await firstPromiseOfThree(
+      readyPromise,
+      timeoutPromise,
+      abortPromise,
+    );
+  } catch {
+    waitFailed = true;
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    if (abortListenerInstalled) {
+      try {
+        callIntrinsic(
+          eventTargetRemoveEventListenerIntrinsic,
+          input.holder.signal,
+          ["abort", abortListener],
+        );
+      } catch {
+        waitFailed = true;
+      }
+    }
+  }
+  if (
+    waitFailed ||
+    receiptText === null ||
+    holder.protocolFailed ||
+    holder.stderrBytes !== 0
+  ) {
     await stopFilesystemHolder(holder, true);
     ensureNotAborted(input.holder.signal);
     fail("podman_writer_supervisor_outcome_uncertain");
@@ -3061,6 +3096,7 @@ export function createPodmanWriterSupervisor(...args) {
         "--name",
         name,
         "--pull=never",
+        "--image-volume=ignore",
         "--read-only",
         "--security-opt=no-new-privileges",
         "--cap-drop=all",
@@ -3072,6 +3108,8 @@ export function createPodmanWriterSupervisor(...args) {
           ",target=/session,rw,bind-propagation=rprivate",
         "--workdir",
         "/session",
+        "--entrypoint",
+        writerCommand[0],
       ];
       const environmentKeys = reflectOwnKeysIntrinsic(writerEnvironment);
       for (let index = 0; index < environmentKeys.length; index += 1) {
@@ -3079,7 +3117,7 @@ export function createPodmanWriterSupervisor(...args) {
         arrayPushTwo(createArguments, "--env", `${key}=${writerEnvironment[key]}`);
       }
       arrayPush(createArguments, policy.imageReference);
-      for (let index = 0; index < writerCommand.length; index += 1) {
+      for (let index = 1; index < writerCommand.length; index += 1) {
         arrayPush(createArguments, writerCommand[index]);
       }
       const createdOutput = await runPodman(createArguments, input.signal);
