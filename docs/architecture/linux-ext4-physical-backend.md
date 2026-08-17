@@ -308,19 +308,76 @@ The supervisor's default filesystem authority protects the call-time object
 selected by the canonical attachment path. It requires a configured attachment
 root, proves strict containment, holds both directories by file descriptor,
 checks current-user ownership, exact mode `0700`, link/type policy, and the
-absence of access or default ACLs, and keeps that same runtime object pinned
-through Podman create, start, and the live `/session` observation. Pathname ABA
-or a bind to another runtime object fails closed.
+absence of access or default ACLs. Directory child-entry churn is not an object
+or policy change: identity uses the held `dev`/`ino`; current UID, mode, and the
+ACL check are access-policy signals. A positive link count independently proves
+that the directory remains linked, while its exact value is not compared.
 
-The default Podman command runner retains that filesystem authority until the
-spawned child emits `close`, which proves both process termination and stdio
-drain. Timeout, abort, or output overflow latches the first failure and requests
-`SIGKILL`, but it does not settle the runner or release the held directory
-descriptor before that close barrier. The command timeout is therefore the
-termination-request deadline, not permission to return while a child may still
-resolve `/proc/<node-pid>/fd/<fd>`. If the operating system cannot reap the
-child, the safe outcome is to keep the authority held rather than return a
-normal error that would release it.
+Before create, the built-in authority starts a temporary FD holder through
+`podman --remote=false unshare` so the holder and later Podman lifecycle
+commands join the same rootless user and mount namespaces. The canonical paths
+are delivered only in one bounded private-stdin acquisition frame, not in child
+argv. The helper opens both directories without following the final component
+and returns a bounded fixed-version/status receipt whose identity payload is
+limited to PID, descriptor numbers, and decimal `dev`/`ino` fields for the
+configured and attachment records. The parent compares that receipt with its
+own pinned observations and independently stats the exact
+`/proc/<holder-pid>/fd/<attachment-fd>` source.
+Each heartbeat repeats the helper-side FD observation and is followed by that
+parent-side object and policy proof.
+
+The configured container must inspect as non-running `configured`, with one
+read-write `rprivate` `/session` bind whose source is exactly that holder FD,
+before `start` is dispatched. A new create receipt must contain the complete
+64-lowercase-hex container ID; a short compatibility identity cannot reach
+start. The immutable image's own `Config.User` must be a canonical non-root
+numeric `uid:gid`; create maps that pair through
+`keep-id:uid=...,gid=...`, so the process can write the current-service-UID
+`0700` attachment without broadening its host policy. After start, exact
+container ID and PID inspections bracket the live `/session` object and ACL
+proof. The holder is released only after that proof or after every process that
+may still resolve its FD has crossed the failure barriers below.
+Pathname ABA, source substitution, or a bind to another runtime object therefore
+cannot produce a started receipt.
+
+The default Podman command runner starts each ordinary CLI in an independent
+process group. Timeout, abort, output overflow, or another failure observed
+before the direct child's exit latches the first failure and requests whole-
+group termination. A natural nonzero result learned after exit does not signal
+the frozen numeric PGID because it may already have been reused. Every failure
+still remains unsettled until the direct child has closed and a kernel group
+probe returns `ESRCH`. It does not treat a partial
+`/proc` view or a visible-zombie subset as proof that no hidden live member
+exists. The command timeout is therefore a termination-request deadline, not
+permission to return while a same-group descendant may still resolve the
+holder FD.
+
+The exact local `start <full-container-id>` shape has a stricter mutation
+barrier. Podman may already have launched conmon in another process group, so
+the runner neither attaches the caller's abort signal nor applies its command
+timer after dispatch. A zero exit can continue to exact inspect and live
+attachment proof. Any post-spawn error, signal, or nonzero exit remains pending
+even after same-group cleanup: Podman's internal runtime-create timeout can
+return while a
+separate conmon/crun process is still resolving the holder source, and this
+surface has no authenticated conmon PID or cgroup fence. A Podman or kernel
+hang therefore keeps the filesystem authority held instead of returning an
+error that would release the holder while escaped runtime work might still use
+its FD. This is intentionally an availability non-guarantee. Pre-spawn failure
+can still return normally because no Podman process accepted the mutation. The
+claim is scoped to the reviewed Podman 4.9.3/conmon/crun execution contract and
+to a live supervisor/holder; process crash, host loss, or runtime/configuration
+drift still requires the documented external physical fence.
+
+Holder shutdown likewise requires both direct Podman-wrapper close and kernel
+`ESRCH` for its detached process group. Forced cleanup signals that group only
+before the direct leader's `exit` event proves that its process identity has
+ended. After exit, the numeric PGID might have been reused, so cleanup does not
+signal it and conservatively waits through direct close for absence instead.
+If the operating system cannot prove either group absent, the safe outcome is
+to keep the authority held. These barriers protect the selected directory
+object's identity and FD lifetime; child-entry or timestamp churn remains
+outside the protected property.
 
 The runner receives a closed local-only argv shape: every command begins with
 `--remote=false`. This prevents a caller's Podman connection configuration
@@ -339,7 +396,9 @@ the held object. The current Podman conformance job deliberately exercises the
 narrower default authority with a synthetic attachment; the ext4 conformance
 jobs exercise the persistent identity independently. They are
 production-injectable components, not evidence of that final same-process
-identity bridge.
+identity bridge. The built-in namespace holder is coupled to the built-in
+command runner; a deployment that injects a different runner must also inject
+its matching trusted filesystem authority instead of mixing execution domains.
 
 `reconcileWriterLaunch()` is a repeatable stopped-only observation. It may
 enumerate and inspect the exact container and prove the live bind identity, but

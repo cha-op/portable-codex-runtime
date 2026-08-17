@@ -3,7 +3,7 @@ id: 20260814-7c4e91
 title: Linux ext4 Physical Backend
 status: completed
 created: 2026-08-14
-updated: 2026-08-16
+updated: 2026-08-17
 branch: wip/filesystem-physical-backend
 pr:
 supersedes: []
@@ -74,10 +74,17 @@ superseded_by:
   reconciliation. Its immutable local state publishes each revision through
   one no-replace data-file commit point, so a crash cannot leave a permanent
   data/marker half-commit. Only the grant-bearing stop path retires a container;
-  reconciliation remains a repeatable observation. Timeout, abort, and output-
-  overflow failures request `SIGKILL` but settle only after the child `close`
-  barrier, so the pinned attachment descriptor remains valid through process
-  termination and stdio drain.
+  reconciliation remains a repeatable observation. The default authority pins
+  the parent directories and mirrors them through a temporary holder in
+  Podman's rootless namespace; configured and running inspections bind that
+  exact procfd to stable container ID/PID evidence. New create receipts admit
+  only complete 64-hex container identities. Ordinary failures observed before
+  direct-child exit terminate the isolated process group; every failure settles
+  only after direct close plus a kernel `ESRCH` group-absence proof and never
+  signals the frozen PGID after exit. A dispatched exact start advances only
+  on zero; every post-spawn non-success stays pending so an escaped conmon/crun
+  cannot outlive the holder authority. Holder shutdown independently requires
+  its wrapper close and group absence before parent descriptors are released.
 - The privileged Ubuntu producer cleanly unmounts and detaches separate session
   and archive ext4 images before upload. A consumer on a second hosted runner
   remounts the transferred bytes under those two independently supplied archive
@@ -112,9 +119,12 @@ superseded_by:
   successful first detach syscall is not by itself a physical fence or settled
   detach proof.
 - A Podman command deadline starts termination; it is not a safe authority-
-  release deadline. If a killed child cannot be reaped, the supervisor keeps
-  the pinned attachment authority rather than returning and permitting its
-  descriptor number to disappear or be reused.
+  release deadline. If an ordinary killed command group cannot be proved
+  quiescent, the supervisor keeps the pinned attachment authority. The exact
+  start mutation has no post-dispatch caller timeout: even a naturally nonzero
+  CLI can leave a separately grouped conmon behind, so non-success remains
+  pending until an external process/cgroup fence exists. This protects object
+  identity and FD lifetime, not directory content or ordinary metadata churn.
 
 ## Non-Goals
 
@@ -310,6 +320,62 @@ change and does not attest the current head:
   host/store inventory returned by `info`. The workflow build, inspect, and
   cleanup calls use the same explicit local mode. The next Ubuntu run remains
   the runtime authority for this replacement.
+- The next bounded diagnostic proved the remaining launch failure occurred in
+  `podman create` after the durable `preparing` claim and before any container
+  existed. Podman 4.9.3 dereferences bind sources with `statfs` after entering
+  its rootless user namespace, so it cannot use a procfd owned by the parent
+  Node process in the ancestor namespace. The built-in authority now starts a
+  lifecycle-scoped FD holder through the same local `podman unshare` execution
+  domain. Paths cross one bounded private-stdin frame rather than argv; the
+  helper's bounded PID/FD/`dev`/`ino` receipt and heartbeats are independently
+  checked from the parent before create and start.
+- Create is followed by a non-running configured-container inspection that
+  requires the exact holder procfd as the sole read-write `rprivate` session
+  bind. Image `Config.User` must be a canonical non-root numeric `uid:gid` and
+  drives the exact `keep-id:uid=...,gid=...` mapping. Stable exact-container
+  ID/PID inspections bracket the live session-object and ACL proof before the
+  helper is reaped. The Linux integration additionally checks that the writer's
+  `0600` marker is owned by the current service UID/GID. Local focused tests
+  cover malformed and mismatched receipts, timeout cleanup, benign child churn,
+  replacement and policy changes, holder death, and configured-source drift;
+  the actual rootless namespace path remains gated by the next Ubuntu run.
+- A final process-lifetime audit found that direct-child `close` was not enough
+  on command failure: a child that closed stdio could remain alive and use the
+  holder source after the parent released its directory FDs. Ordinary Podman
+  CLIs now run in isolated process groups; abort, timeout, output overflow, and
+  other failures observed before exit kill the group. A natural nonzero result
+  observed after exit only waits. All failures require direct close plus a
+  proved kernel `ESRCH` group-absence result before settlement, and no path
+  signals a frozen numeric PGID after exit. A partial `/proc` view
+  or visible-zombie subset is not accepted because it could hide a live member.
+  Exact full-ID `start` is not force-cancelled after dispatch because Podman
+  4.9.3 launches conmon in a separate process group. A zero exit resumes exact
+  container and live-bind
+  proofs; every post-spawn error, signal, or nonzero exit stays pending because
+  Podman's internal runtime-create timeout can fire while conmon/crun still
+  resolves the source and this supervisor has no authenticated conmon fence.
+  Tests use a
+  closed-stdio descendant to distinguish group quiescence from stdio drain,
+  hold an aborted start past its command deadline until a test-owned zero exit,
+  and require a nonzero dispatched start to retain authority indefinitely. The
+  resulting unbounded wait is an explicit availability tradeoff, not a content-
+  stability or metadata-change detector.
+- The same final audit applied the group fence to the namespace holder itself.
+  Direct wrapper `close` no longer authorizes parent-FD release while a same-
+  group helper may survive with closed stdio. Forced cleanup signals the group
+  only before the wrapper's `exit` event proves its process identity has ended;
+  after exit it waits through direct close for kernel `ESRCH` without
+  signalling a potentially reused PGID. A wrapper-plus-helper fixture must
+  prove group absence before authority close.
+- On the final local bytes, supervisor/state focused tests passed 57/64 with
+  seven Linux-only skips. The supervisor/state, logical-launcher, and physical-
+  binding set passed 224/231 with the same seven skips. Full Node discovery with
+  only the independently reproduced `chatgptAuthTokens` watcher-`EMFILE` case
+  skipped passed 2,910/2,920 with ten skips and no failures. The supervisor,
+  holder helper, integration, and test files passed `node --check`; the bundled
+  project-journal validator and tracked/untracked whitespace checks passed.
+  Darwin did not execute the new Linux procfd/process-group tests or the real
+  rootless Podman holder path; the next Ubuntu job remains their runtime gate.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

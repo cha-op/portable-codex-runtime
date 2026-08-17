@@ -5,6 +5,8 @@ import {
   constants as fsConstants,
   existsSync,
   openSync,
+  readFileSync,
+  writeFileSync,
 } from "node:fs";
 import {
   chmod,
@@ -54,81 +56,62 @@ async function waitForPath(path) {
   assert.fail(`timed out waiting for ${path}`);
 }
 
-function delayedReapPodmanScript({
-  mode,
-  phase,
-  reapedPath,
-  releasePath,
-  startedPath,
-  terminatedPath,
-}) {
-  const image = JSON.stringify([{
-    Architecture: "amd64",
-    Digest: DIGEST,
-    Os: "linux",
-  }]);
-  const failureBody = mode === "stdout-overflow"
-    ? `printf '%2048s' x\nexec /bin/sleep 30`
-    : mode === "stderr-overflow"
-      ? `printf '%2048s' x >&2\nexec /bin/sleep 30`
-      : "exec /bin/sleep 30";
-  const targetBody = `
-    target_pid=$$
-    (
-      while kill -0 "$target_pid" 2>/dev/null; do
-        /bin/sleep 0.01
-      done
-      : > ${shellQuote(terminatedPath)}
-      while ! test -f ${shellQuote(releasePath)}; do
-        /bin/sleep 0.01
-      done
-      printf '%s\\n' reaped > ${shellQuote(reapedPath)}
-    ) &
-    : > ${shellQuote(startedPath)}
-    ${failureBody}`;
-  const createBody = phase === "create"
-    ? targetBody
-    : `printf '%s\\n' ${shellQuote(CONTAINER_ID)}`;
-  const startBody = phase === "start"
-    ? targetBody
-    : `printf '%s\\n' ${shellQuote(CONTAINER_ID)}`;
-  return `#!/bin/sh
-set -eu
-test "$1" = "--remote=false"
-shift
-case "$1" in
-  unshare)
-    test "$2" = "/usr/bin/true"
-    ;;
-  image)
-    printf '%s\\n' ${shellQuote(image)}
-    ;;
-  create)
-    ${createBody}
-    ;;
-  start)
-    ${startBody}
-    ;;
-  *)
-    exit 64
-    ;;
-esac
-`;
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
 }
 
-function heldFdReapPodmanScript({
-  missingPath,
-  reapedPath,
-  releasePath,
-  startedPath,
-  terminatedPath,
-  visiblePath,
+function closedStdioDescendantPodmanScript({
+  descendantExitPath,
+  descendantPidPath,
+  descendantReadyPath,
+  failureMode,
+  sourceAttemptedPath,
+  sourceMissingPath,
+  sourceReleasedPath,
+  sourceVisiblePath,
 }) {
   const image = JSON.stringify([{
     Architecture: "amd64",
+    Config: { User: "1000:1000" },
     Digest: DIGEST,
     Os: "linux",
   }]);
+  const failureBody = failureMode === "nonzero"
+    ? "exit 42"
+    : failureMode === "stdout-overflow"
+      ? `printf '%2048s' x\nexec /bin/sleep 30`
+      : failureMode === "stderr-overflow"
+        ? `printf '%2048s' x >&2\nexec /bin/sleep 30`
+        : "exec /bin/sleep 30";
+  const descendantAfterDirect = failureMode === "nonzero"
+    ? `/bin/sleep 0.1
+      if test -d "$source_path"; then
+        : > ${shellQuote(sourceVisiblePath)}
+      else
+        : > ${shellQuote(sourceMissingPath)}
+      fi
+      : > ${shellQuote(sourceAttemptedPath)}
+      while ! test -f ${shellQuote(descendantExitPath)}; do
+        /bin/sleep 0.01
+      done
+      exit 0`
+    : `while ! test -f ${shellQuote(sourceReleasedPath)}; do
+        /bin/sleep 0.01
+      done
+      if test -d "$source_path"; then
+        : > ${shellQuote(sourceVisiblePath)}
+      else
+        : > ${shellQuote(sourceMissingPath)}
+      fi
+      : > ${shellQuote(sourceAttemptedPath)}
+      exec /bin/sleep 30`;
   return `#!/bin/sh
 set -eu
 test "$1" = "--remote=false"
@@ -153,25 +136,20 @@ case "$1" in
     source_path=\${mount_spec#type=bind,source=}
     source_path=\${source_path%%,target=/session,*}
     test -d "$source_path"
-    target_pid=$$
+    direct_pid=$$
     (
-      while kill -0 "$target_pid" 2>/dev/null; do
+      : > ${shellQuote(descendantReadyPath)}
+      while kill -0 "$direct_pid" 2>/dev/null; do
         /bin/sleep 0.01
       done
-      if test -d "$source_path"; then
-        printf '%s\\n' visible > ${shellQuote(visiblePath)}
-      else
-        printf '%s\\n' missing > ${shellQuote(missingPath)}
-      fi
-      : > ${shellQuote(terminatedPath)}
-      while ! test -f ${shellQuote(releasePath)}; do
-        /bin/sleep 0.01
-      done
-      printf '%s\\n' reaped > ${shellQuote(reapedPath)}
-    ) &
-    : > ${shellQuote(startedPath)}
-    printf '%2048s' x
-    exec /bin/sleep 30
+      ${descendantAfterDirect}
+    ) </dev/null >/dev/null 2>/dev/null &
+    descendant_pid=$!
+    printf '%s\\n' "$descendant_pid" > ${shellQuote(descendantPidPath)}
+    while ! test -f ${shellQuote(descendantReadyPath)}; do
+      /bin/sleep 0.01
+    done
+    ${failureBody}
     ;;
   *)
     exit 64
@@ -189,6 +167,7 @@ function detachedStartPodmanScript({
 }) {
   const image = JSON.stringify([{
     Architecture: "amd64",
+    Config: { User: "1000:1000" },
     Digest: DIGEST,
     Os: "linux",
   }]);
@@ -233,9 +212,18 @@ case "$1" in
     ;;
   container)
     name=$(cat ${shellQuote(namePath)})
-    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":42001,"Running":true,"Status":"running"}}]\\n' \\
+    if test -f ${shellQuote(holdingPath)}; then
+      pid=42001
+      running=true
+      status=running
+    else
+      pid=0
+      running=false
+      status=configured
+    fi
+    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":%s,"Running":%s,"Status":"%s"}}]\\n' \\
       ${shellQuote(containerId)} ${shellQuote(DIGEST)} \\
-      ${shellQuote(HELD_MOUNT_SOURCE)} "$name"
+      ${shellQuote(HELD_MOUNT_SOURCE)} "$name" "$pid" "$running" "$status"
     ;;
   *)
     exit 64
@@ -244,9 +232,16 @@ esac
 `;
 }
 
-function blockingStartPodmanScript({ pidPath, startedPath }) {
+function blockingStartPodmanScript({
+  namePath,
+  pidPath,
+  releasePath,
+  startExitCode = 0,
+  startedPath,
+}) {
   const image = JSON.stringify([{
     Architecture: "amd64",
+    Config: { User: "1000:1000" },
     Digest: DIGEST,
     Os: "linux",
   }]);
@@ -262,12 +257,246 @@ case "$1" in
     printf '%s\\n' ${shellQuote(image)}
     ;;
   create)
+    shift
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--name" ]; then
+        shift
+        printf '%s\\n' "$1" > ${shellQuote(namePath)}
+        break
+      fi
+      shift
+    done
     printf '%s\\n' ${shellQuote(CONTAINER_ID)}
+    ;;
+  container)
+    name=$(cat ${shellQuote(namePath)})
+    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":0,"Running":false,"Status":"configured"}}]\\n' \\
+      ${shellQuote(CONTAINER_ID)} ${shellQuote(DIGEST)} \\
+      ${shellQuote(HELD_MOUNT_SOURCE)} "$name"
     ;;
   start)
     printf '%s\\n' "$$" > ${shellQuote(pidPath)}
     : > ${shellQuote(startedPath)}
-    exec /bin/sleep 30
+    while ! test -f ${shellQuote(releasePath)}; do
+      /bin/sleep 0.01
+    done
+    exit ${startExitCode}
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
+
+function defaultAuthorityPodmanScript({
+  createMarker,
+  createMutation = "",
+  holderArgvPath = "/dev/null",
+  mountPath,
+  namePath,
+  startedPath,
+}) {
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Config: { User: "1000:1000" },
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  return `#!/bin/sh
+set -eu
+test "$1" = "--remote=false"
+shift
+case "$1" in
+  unshare)
+    if test "$2" = "/usr/bin/true"; then
+      exit 0
+    fi
+    printf '%s\\n' "$@" > ${shellQuote(holderArgvPath)}
+    shift
+    exec "$@"
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  create)
+    shift
+    while test "$#" -gt 0; do
+      case "$1" in
+        --name)
+          shift
+          printf '%s\\n' "$1" > ${shellQuote(namePath)}
+          ;;
+        --mount)
+          shift
+          source_path=\${1#type=bind,source=}
+          source_path=\${source_path%%,target=/session,*}
+          test -d "$source_path"
+          printf '%s\\n' "$source_path" > ${shellQuote(mountPath)}
+          ${createMutation}
+          ;;
+      esac
+      shift
+    done
+    : > ${shellQuote(createMarker)}
+    printf '%s\\n' ${shellQuote(CONTAINER_ID)}
+    ;;
+  start)
+    : > ${shellQuote(startedPath)}
+    ;;
+  container)
+    name=$(cat ${shellQuote(namePath)})
+    source_path=$(cat ${shellQuote(mountPath)})
+    if test -f ${shellQuote(startedPath)}; then
+      pid=$$
+      running=true
+      status=running
+    else
+      pid=0
+      running=false
+      status=configured
+    fi
+    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":%s,"Running":%s,"Status":"%s"}}]\\n' \\
+      ${shellQuote(CONTAINER_ID)} ${shellQuote(DIGEST)} "$source_path" \\
+      "$name" "$pid" "$running" "$status"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
+
+function failingHolderPodmanScript({ mode, pidPath }) {
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Config: { User: "1000:1000" },
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  const dev = mode === "malformed" ? "00" : "0";
+  const holder = mode === "timeout"
+    ? `printf '%s\\n' "$$" > ${shellQuote(pidPath)}\nexec /bin/sleep 30`
+    : mode === "invalid-json"
+      ? `printf '%s\\n' "$$" > ${shellQuote(pidPath)}
+printf '{invalid-json\\n'
+exec /bin/sleep 30`
+    : `printf '%s\\n' "$$" > ${shellQuote(pidPath)}
+printf '{"attachment":{"dev":"${dev}","fd":0,"ino":"0"},"configured":{"dev":"${dev}","fd":0,"ino":"0"},"contractVersion":1,"pid":%s,"status":"ready"}\\n' "$$"
+exec /bin/sleep 30`;
+  return `#!/bin/sh
+set -eu
+test "$1" = "--remote=false"
+shift
+case "$1" in
+  unshare)
+    if test "$2" = "/usr/bin/true"; then
+      exit 0
+    fi
+    ${holder}
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`;
+}
+
+function descendantHolderPodmanScript({
+  attachmentRoot,
+  authorityReleasedPath,
+  configuredRoot,
+  descendantExitPath,
+  descendantPidPath,
+  descendantReadyPath,
+  leaderGonePath,
+  mode,
+  sourceAfterReleasePath,
+  sourceRetainedPath,
+}) {
+  const image = JSON.stringify([{
+    Architecture: "amd64",
+    Config: { User: "1000:1000" },
+    Digest: DIGEST,
+    Os: "linux",
+  }]);
+  const afterReady = mode === "leader-error" || mode === "exit-before-close"
+    ? "exit 42"
+    : `while IFS= read -r command; do
+  case "$command" in
+    verify)
+      printf '%s\\n' verified
+      ;;
+    close)
+      exit 0
+      ;;
+    *)
+      exit 65
+      ;;
+  esac
+done
+exit 66`;
+  const ready = mode === "timeout"
+    ? "exec /bin/sleep 30"
+    : `printf '{"attachment":{"dev":"%s","fd":7,"ino":"%s"},"configured":{"dev":"%s","fd":8,"ino":"%s"},"contractVersion":1,"pid":%s,"status":"ready"}\\n' \\
+  "$attachment_dev" "$attachment_ino" "$configured_dev" "$configured_ino" "$$"
+${afterReady}`;
+  const descendantRedirection = mode === "exit-before-close"
+    ? "</dev/null 2>/dev/null"
+    : "</dev/null >/dev/null 2>/dev/null";
+  return `#!/bin/sh
+set -eu
+test "$1" = "--remote=false"
+shift
+case "$1" in
+  unshare)
+    if test "$2" = "/usr/bin/true"; then
+      exit 0
+    fi
+    IFS= read -r acquisition
+    exec 7<${shellQuote(attachmentRoot)}
+    exec 8<${shellQuote(configuredRoot)}
+    attachment_dev=$(/usr/bin/stat -Lc %d /proc/self/fd/7)
+    attachment_ino=$(/usr/bin/stat -Lc %i /proc/self/fd/7)
+    configured_dev=$(/usr/bin/stat -Lc %d /proc/self/fd/8)
+    configured_ino=$(/usr/bin/stat -Lc %i /proc/self/fd/8)
+    leader_pid=$$
+    (
+      : > ${shellQuote(descendantReadyPath)}
+      while kill -0 "$leader_pid" 2>/dev/null; do
+        /bin/sleep 0.01
+      done
+      : > ${shellQuote(leaderGonePath)}
+      if test -d /proc/self/fd/7; then
+        : > ${shellQuote(sourceRetainedPath)}
+      fi
+      while :; do
+        if test -f ${shellQuote(authorityReleasedPath)}; then
+          if test -d /proc/self/fd/7; then
+            : > ${shellQuote(sourceAfterReleasePath)}
+          fi
+          exit 0
+        fi
+        if test -f ${shellQuote(descendantExitPath)}; then
+          exit 0
+        fi
+        /bin/sleep 0.01
+      done
+    ) ${descendantRedirection} &
+    printf '%s\\n' "$!" > ${shellQuote(descendantPidPath)}
+    while ! test -f ${shellQuote(descendantReadyPath)}; do
+      /bin/sleep 0.01
+    done
+    ${ready}
+    ;;
+  image)
+    printf '%s\\n' ${shellQuote(image)}
+    ;;
+  create)
+    printf '%s\\n' short
     ;;
   *)
     exit 64
@@ -503,6 +732,7 @@ function inspection(mountSource, running, status) {
 
 function successfulRunner(attachmentRoot, events, settings = {}) {
   let exists = false;
+  let hasStarted = false;
   let running = false;
   let name = null;
   let mountSource = settings.inspectionSource ?? attachmentRoot;
@@ -532,6 +762,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
         stdout: `${JSON.stringify(settings.imageInspection ?? [
           {
             Architecture: "amd64",
+            Config: { User: settings.imageUser ?? "1000:1000" },
             Digest: settings.inspectedDigest ?? DIGEST,
             Os: "linux",
           },
@@ -552,6 +783,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
         throw new Error("simulated ambiguous create");
       }
       exists = true;
+      hasStarted = false;
       if (settings.createOutput !== undefined) {
         return { stderr: "", stdout: settings.createOutput };
       }
@@ -559,6 +791,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
     }
     if (arguments_[0] === "start") {
       if (settings.startReject) throw new Error("simulated ambiguous start");
+      hasStarted = true;
       running = true;
       return { stderr: "", stdout: `${CONTAINER_ID}\n` };
     }
@@ -572,6 +805,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
     if (arguments_[0] === "rm") {
       await settings.onRm?.();
       exists = false;
+      hasStarted = false;
       running = false;
       if (settings.rmRejectAfterRemove) {
         settings.rmRejectAfterRemove = false;
@@ -610,7 +844,8 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
           : settings.forceStopped
             ? false
             : running,
-        settings.inspectionStatus,
+        settings.inspectionStatus ??
+          (exists && !running && !hasStarted ? "configured" : undefined),
       );
       value.Name = name ?? settings.containerName;
       settings.mutateInspection?.(value);
@@ -785,6 +1020,13 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   assert.throws(
     () => createPodmanWriterSupervisor(exact({
       ...base.options,
+      filesystemAuthority: undefined,
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+  assert.throws(
+    () => createPodmanWriterSupervisor(exact({
+      ...base.options,
       podmanEnvironment: exact({
         ...base.options.podmanEnvironment,
         PATH: "/tmp/untrusted-podman-tools",
@@ -844,7 +1086,7 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     "--read-only",
     "--security-opt=no-new-privileges",
     "--cap-drop=all",
-    "--userns=keep-id",
+    "--userns=keep-id:uid=1000,gid=1000",
     "--restart=no",
     "--mount",
     `type=bind,source=${HELD_MOUNT_SOURCE},target=/session,rw,bind-propagation=rprivate`,
@@ -1079,7 +1321,10 @@ test("missing-state reconciliation probes the exact name and fails closed on liv
     live.supervisor.reconcileWriterLaunch(reconcileInput(live.input)),
     assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
   );
-  assert.deepEqual(live.events.map((event) => event.arguments_[0]), ["ps", "container"]);
+  assert.deepEqual(
+    live.events.map((event) => event.arguments_[0]),
+    ["ps", "container", "container"],
+  );
   assert.equal(
     live.events.some((event) => ["create", "rm"].includes(event.arguments_[0])),
     false,
@@ -1265,7 +1510,7 @@ test("preparing reconciliation rejects running, duplicate, or mismatched candida
   );
   assert.deepEqual(
     runningEvents.map((event) => event.arguments_[0]),
-    ["ps", "container"],
+    ["ps", "container", "container"],
   );
 
   const raced = await preparingFixture(t);
@@ -1284,7 +1529,7 @@ test("preparing reconciliation rejects running, duplicate, or mismatched candida
   );
   assert.deepEqual(
     racedEvents.map((event) => event.arguments_[0]),
-    ["ps", "container"],
+    ["ps", "container", "container"],
   );
 
   const duplicate = await preparingFixture(t);
@@ -1342,7 +1587,13 @@ test("held attachment authority survives pathname ABA and benign child churn unt
   assert.equal(receipt.evidence.status, "started");
   assert.deepEqual(
     base.filesystemEvents.map((event) => event.operation),
-    ["acquire", "verify-current", "verify-running-mount", "close"],
+    [
+      "acquire",
+      "verify-current",
+      "verify-current",
+      "verify-running-mount",
+      "close",
+    ],
   );
   for (const event of base.filesystemEvents) {
     assert.equal(event.receiver, undefined);
@@ -1396,7 +1647,13 @@ test("attachment replacement, access-policy change, and unreadable revalidation 
   );
   assert.deepEqual(
     policyChanged.filesystemEvents.map((event) => event.operation),
-    ["acquire", "verify-current", "verify-running-mount", "close"],
+    [
+      "acquire",
+      "verify-current",
+      "verify-current",
+      "verify-running-mount",
+      "close",
+    ],
   );
 
   const unreadableError = new Error("simulated EACCES");
@@ -1489,12 +1746,321 @@ test("running reconciliation requires the live session bind to match the current
   );
 });
 
+test("running mount proof is bracketed by stable exact-container PID inspections", async (t) => {
+  let runningInspections = 0;
+  const base = await fixture(t, {
+    mutateInspection(value) {
+      if (value.State.Running) {
+        runningInspections += 1;
+        if (runningInspections === 2) value.State.Pid += 1;
+      }
+    },
+  });
+  await assert.rejects(
+    base.supervisor.launchWriter(base.input),
+    assertSupervisorError("podman_writer_output_invalid"),
+  );
+  assert.equal(runningInspections, 2);
+  assert.equal(
+    (await base.state.read(
+      exact({ launchAttemptId: "launch-attempt-001" }),
+    )).status,
+    "created",
+  );
+});
+
+test("pre-start inspection requires the exact configured state", async (t) => {
+  const base = await fixture(t, { inspectionStatus: "exited" });
+  await assert.rejects(
+    base.supervisor.launchWriter(base.input),
+    assertSupervisorError("podman_writer_output_invalid"),
+  );
+  assert.equal(
+    base.events.some((event) => event.arguments_[0] === "start"),
+    false,
+  );
+  assert.equal(
+    (await base.state.read(
+      exact({ launchAttemptId: "launch-attempt-001" }),
+    )).status,
+    "created",
+  );
+});
+
+test("Linux default authority holds a rootless helper procfd and reaps it on close", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  let createMarker;
+  let holderArgvPath;
+  let mountPath;
+  const base = await fixture(t, {
+    defaultCommandRunnerScript({ parent }) {
+      createMarker = join(parent, "holder-create");
+      holderArgvPath = join(parent, "holder-argv");
+      mountPath = join(parent, "holder-mount");
+      return defaultAuthorityPodmanScript({
+        createMarker,
+        createMutation: ': > "$source_path/child-entry"',
+        holderArgvPath,
+        mountPath,
+        namePath: join(parent, "holder-name"),
+        startedPath: join(parent, "holder-started"),
+      });
+    },
+    useDefaultCommandRunner: true,
+    useDefaultFilesystemAuthority: true,
+  });
+  const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+    Array.prototype,
+    Symbol.iterator,
+  );
+  const toJsonDescriptor = Object.getOwnPropertyDescriptor(
+    Object.prototype,
+    "toJSON",
+  );
+  const originalIterator = iteratorDescriptor.value;
+  const reflectApply = Reflect.apply;
+  Object.defineProperty(Array.prototype, Symbol.iterator, {
+    ...iteratorDescriptor,
+    value: function guardedIterator() {
+      let promiseOnly = this.length === 2 || this.length === 3;
+      for (let index = 0; promiseOnly && index < this.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(this, String(index));
+        promiseOnly = descriptor !== undefined &&
+          Object.hasOwn(descriptor, "value") &&
+          Object.getPrototypeOf(descriptor.value) === Promise.prototype;
+      }
+      if (promiseOnly) throw new Error("poisoned promise iterable");
+      return reflectApply(originalIterator, this, []);
+    },
+  });
+  Object.defineProperty(Object.prototype, "toJSON", {
+    configurable: true,
+    value: function guardedToJSON() {
+      if (
+        Object.hasOwn(this, "attachmentRoot") &&
+        Object.hasOwn(this, "configuredRoot") &&
+        Object.hasOwn(this, "contractVersion")
+      ) {
+        throw new Error("poisoned acquisition toJSON");
+      }
+      return this;
+    },
+  });
+  try {
+    await assert.rejects(
+      base.supervisor.launchWriter(base.input),
+      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+    );
+  } finally {
+    Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
+    if (toJsonDescriptor === undefined) delete Object.prototype.toJSON;
+    else Object.defineProperty(Object.prototype, "toJSON", toJsonDescriptor);
+  }
+  assert.equal(existsSync(createMarker), true);
+  assert.equal(existsSync(join(base.attachmentRoot, "child-entry")), true);
+  const source = (await readFile(mountPath, "utf8")).trim();
+  const holderArgv = await readFile(holderArgvPath, "utf8");
+  assert.equal(holderArgv.includes(base.parent), false);
+  assert.equal(holderArgv.includes(base.attachmentRoot), false);
+  const match = /^\/proc\/([1-9][0-9]*)\/fd\/[0-9]+$/u.exec(source);
+  assert.notEqual(match, null);
+  assert.equal(existsSync(`/proc/${match[1]}`), false);
+});
+
+test("Linux holder waits for its closed-stdio process group before authority release", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  for (const mode of ["normal", "leader-error", "exit-before-close", "timeout"]) {
+    await t.test(mode, async (t) => {
+      let authorityReleasedPath;
+      let descendantExitPath;
+      let descendantPidPath;
+      let descendantReadyPath;
+      let leaderGonePath;
+      let sourceAfterReleasePath;
+      let sourceRetainedPath;
+      const base = await fixture(t, {
+        commandTimeoutMilliseconds: 2_000,
+        defaultCommandRunnerScript({ attachmentRoot, parent }) {
+          authorityReleasedPath = join(parent, "holder-authority-released");
+          descendantExitPath = join(parent, "holder-descendant-exit");
+          descendantPidPath = join(parent, "holder-descendant-pid");
+          descendantReadyPath = join(parent, "holder-descendant-ready");
+          leaderGonePath = join(parent, "holder-leader-gone");
+          sourceAfterReleasePath = join(parent, "holder-source-after-release");
+          sourceRetainedPath = join(parent, "holder-source-retained");
+          return descendantHolderPodmanScript({
+            attachmentRoot,
+            authorityReleasedPath,
+            configuredRoot: parent,
+            descendantExitPath,
+            descendantPidPath,
+            descendantReadyPath,
+            leaderGonePath,
+            mode,
+            sourceAfterReleasePath,
+            sourceRetainedPath,
+          });
+        },
+        stopTimeoutSeconds: 1,
+        useDefaultCommandRunner: true,
+        useDefaultFilesystemAuthority: true,
+      });
+
+      let settled = false;
+      const pending = base.supervisor.launchWriter(base.input).then(
+        () => {
+          settled = true;
+          assert.fail("holder failure unexpectedly launched a writer");
+        },
+        (error) => {
+          settled = true;
+          return error;
+        },
+      );
+      await waitForPath(descendantReadyPath);
+      const descendantPid = Number(readFileSync(descendantPidPath, "utf8").trim());
+      let error;
+      try {
+        if (mode === "timeout") {
+          error = await pending;
+        } else {
+          await waitForPath(leaderGonePath);
+          await waitForPath(sourceRetainedPath);
+          await delay(100);
+          assert.equal(settled, false);
+          assert.equal(processExists(descendantPid), true);
+          await writeFile(descendantExitPath, "exit\n", { mode: 0o600 });
+          error = await pending;
+        }
+      } finally {
+        if (mode !== "timeout") {
+          await writeFile(descendantExitPath, "exit\n", { mode: 0o600 })
+            .catch(() => {});
+        }
+      }
+      assert.equal(error instanceof PodmanWriterSupervisorError, true);
+      assert.equal(processExists(descendantPid), false);
+      await writeFile(authorityReleasedPath, "released\n", { mode: 0o600 });
+      await delay(100);
+      assert.equal(existsSync(sourceAfterReleasePath), false);
+    });
+  }
+});
+
+test("Linux default authority rejects malformed, mismatched, and timed-out holders", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  for (const mode of ["invalid-json", "malformed", "mismatch", "timeout"]) {
+    let pidPath;
+    const base = await fixture(t, {
+      commandTimeoutMilliseconds: 2_000,
+      defaultCommandRunnerScript({ parent }) {
+        pidPath = join(parent, `holder-${mode}-pid`);
+        return failingHolderPodmanScript({ mode, pidPath });
+      },
+      stopTimeoutSeconds: 1,
+      useDefaultCommandRunner: true,
+      useDefaultFilesystemAuthority: true,
+    });
+    await assert.rejects(
+      base.supervisor.launchWriter(base.input),
+      assertSupervisorError(
+        mode === "mismatch"
+          ? "podman_writer_attachment_mismatch"
+          : "podman_writer_supervisor_outcome_uncertain",
+      ),
+    );
+    const pid = (await readFile(pidPath, "utf8")).trim();
+    assert.equal(existsSync(`/proc/${pid}`), false);
+  }
+});
+
+test("Linux default authority blocks start after holder exit or configured-source drift", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  for (const mode of ["holder-exit", "source-drift"]) {
+    let startMarker;
+    const base = await fixture(t, {
+      defaultCommandRunnerScript({ parent }) {
+        const mountPath = join(parent, `${mode}-mount`);
+        startMarker = join(parent, `${mode}-started`);
+        const createMutation = mode === "holder-exit"
+          ? 'holder_pid=${source_path#/proc/}; holder_pid=${holder_pid%%/*}; kill -KILL "$holder_pid"'
+          : `printf '%s\\n' /proc/1/fd/0 > ${shellQuote(mountPath)}`;
+        return defaultAuthorityPodmanScript({
+          createMarker: join(parent, `${mode}-create`),
+          createMutation,
+          mountPath,
+          namePath: join(parent, `${mode}-name`),
+          startedPath: startMarker,
+        });
+      },
+      useDefaultCommandRunner: true,
+      useDefaultFilesystemAuthority: true,
+    });
+    await assert.rejects(
+      base.supervisor.launchWriter(base.input),
+      assertSupervisorError(
+        mode === "holder-exit"
+          ? "podman_writer_supervisor_outcome_uncertain"
+          : "podman_writer_output_invalid",
+      ),
+    );
+    assert.equal(existsSync(startMarker), false);
+  }
+});
+
+test("Linux default authority distinguishes child churn from replacement and policy change", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  for (const mode of ["replacement", "policy-change"]) {
+    let startMarker;
+    const base = await fixture(t, {
+      defaultCommandRunnerScript({ attachmentRoot, parent }) {
+        startMarker = join(parent, `${mode}-started`);
+        const createMutation = mode === "replacement"
+          ? `mv ${shellQuote(attachmentRoot)} ${shellQuote(`${attachmentRoot}-old`)}; mkdir -m 700 ${shellQuote(attachmentRoot)}`
+          : 'chmod 0777 "$source_path"';
+        return defaultAuthorityPodmanScript({
+          createMarker: join(parent, `${mode}-create`),
+          createMutation,
+          mountPath: join(parent, `${mode}-mount`),
+          namePath: join(parent, `${mode}-name`),
+          startedPath: startMarker,
+        });
+      },
+      useDefaultCommandRunner: true,
+      useDefaultFilesystemAuthority: true,
+    });
+    await assert.rejects(
+      base.supervisor.launchWriter(base.input),
+      assertSupervisorError("podman_writer_attachment_mismatch"),
+    );
+    assert.equal(existsSync(startMarker), false);
+  }
+});
+
 test("secure Linux authority rejects missing roots and final or ancestor symlink aliases", {
   skip: process.platform !== "linux" ||
     !existsSync("/usr/bin/getfacl") ||
     !existsSync("/usr/bin/setfacl"),
 }, async (t) => {
-  const base = await fixture(t, { useDefaultFilesystemAuthority: true });
+  let createMarker;
+  const base = await fixture(t, {
+    defaultCommandRunnerScript({ parent }) {
+      createMarker = join(parent, "default-authority-create");
+      return defaultAuthorityPodmanScript({
+        createMarker,
+        mountPath: join(parent, "default-authority-mount"),
+        namePath: join(parent, "default-authority-name"),
+        startedPath: join(parent, "default-authority-started"),
+      });
+    },
+    useDefaultCommandRunner: true,
+    useDefaultFilesystemAuthority: true,
+  });
 
   const missingRoot = join(base.parent, "missing-attachment");
   await assert.rejects(
@@ -1552,7 +2118,6 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
   });
   childProcess.spawnSync = () => inheritedSpawnResult;
   syncBuiltinESMExports();
-  const before = base.events.length;
   try {
     await assert.rejects(
       base.supervisor.launchWriter(base.input),
@@ -1562,13 +2127,9 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
     childProcess.spawnSync = originalSpawnSync;
     syncBuiltinESMExports();
   }
-  // The fake container PID has no live /session path, so launch must fail
-  // after create. Reaching create proves inherited spawnSync result fields did
-  // not replace the own getfacl status/stdout/stderr snapshot.
-  assert.equal(
-    base.events.slice(before).some((event) => event.arguments_[0] === "create"),
-    true,
-  );
+  // The fake running PID has no live /session path. Reaching create proves
+  // inherited spawnSync fields did not replace own getfacl result fields.
+  assert.equal(existsSync(createMarker), true);
 });
 
 test("revalidates the non-root process identity before every Podman dispatch", async (t) => {
@@ -1644,6 +2205,30 @@ test("enforces local rootless execution, exact digest, and bounded unambiguous o
   );
   assert.equal(wrongImage.events.some((event) => event.arguments_[0] === "create"), false);
 
+  for (const imageUser of ["1000", "0:1000", "1000:0", "01000:1000", "x:y"]) {
+    const wrongUser = await fixture(t, { imageUser });
+    await assert.rejects(
+      wrongUser.supervisor.launchWriter(wrongUser.input),
+      assertSupervisorError("podman_writer_image_mismatch"),
+    );
+    assert.equal(
+      wrongUser.events.some((event) => event.arguments_[0] === "create"),
+      false,
+    );
+  }
+  const arrayConfig = await fixture(t, {
+    imageInspection: [{
+      Architecture: "amd64",
+      Config: Object.assign([], { User: "1000:1000" }),
+      Digest: DIGEST,
+      Os: "linux",
+    }],
+  });
+  await assert.rejects(
+    arrayConfig.supervisor.launchWriter(arrayConfig.input),
+    assertSupervisorError("podman_writer_image_mismatch"),
+  );
+
   const malformed = await fixture(t, { createOutput: `${CONTAINER_ID}\nextra\n` });
   await assert.rejects(
     malformed.supervisor.launchWriter(malformed.input),
@@ -1660,83 +2245,130 @@ test("enforces local rootless execution, exact digest, and bounded unambiguous o
   );
 });
 
-test("default runner holds filesystem authority until failed Podman children close", async (t) => {
-  const scenarios = [
-    { mode: "timeout", phase: "create" },
-    { mode: "abort", phase: "create" },
-    { mode: "stdout-overflow", phase: "create" },
-    { mode: "stderr-overflow", phase: "create" },
-  ];
-
-  for (const scenario of scenarios) {
-    await t.test(`${scenario.mode} during ${scenario.phase}`, async (t) => {
-      let closeCount = 0;
-      let reapedPath;
-      let releasePath;
-      let startedPath;
-      let terminatedPath;
+test("Linux default runner kills closed-stdio descendants before releasing authority", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  for (const failureMode of [
+    "nonzero",
+    "timeout",
+    "abort",
+    "stdout-overflow",
+    "stderr-overflow",
+  ]) {
+    await t.test(failureMode, async (t) => {
       const controller = new AbortController();
+      let authorityClosedPath;
+      let closeCount = 0;
+      let descendantLiveAtClose = null;
+      let descendantExitPath;
+      let descendantPidPath;
+      let descendantReadyPath;
+      let heldFd = null;
+      let settlementCount = 0;
+      let sourceAttemptedPath;
+      let sourceMissingPath;
+      let sourceVisiblePath;
       const base = await fixture(t, {
-        commandTimeoutMilliseconds: scenario.mode === "timeout" ? 2_000 : 10_000,
+        commandTimeoutMilliseconds: failureMode === "timeout" ? 2_000 : 10_000,
         defaultCommandRunnerScript({ parent }) {
-          reapedPath = join(parent, "podman-child-reaped");
-          releasePath = join(parent, "podman-child-release");
-          startedPath = join(parent, "podman-child-started");
-          terminatedPath = join(parent, "podman-child-terminated");
-          return delayedReapPodmanScript({
-            mode: scenario.mode,
-            phase: scenario.phase,
-            reapedPath,
-            releasePath,
-            startedPath,
-            terminatedPath,
+          authorityClosedPath = join(parent, "filesystem-authority-closed");
+          descendantExitPath = join(parent, "podman-descendant-exit");
+          descendantPidPath = join(parent, "podman-descendant-pid");
+          descendantReadyPath = join(parent, "podman-descendant-ready");
+          sourceAttemptedPath = join(parent, "podman-descendant-source-attempted");
+          sourceMissingPath = join(parent, "podman-descendant-source-missing");
+          sourceVisiblePath = join(parent, "podman-descendant-source-visible");
+          return closedStdioDescendantPodmanScript({
+            descendantExitPath,
+            descendantPidPath,
+            descendantReadyPath,
+            failureMode,
+            sourceAttemptedPath,
+            sourceMissingPath,
+            sourceReleasedPath: authorityClosedPath,
+            sourceVisiblePath,
           });
         },
         filesystemSettings: {
+          mountSource() {
+            return `/proc/${process.pid}/fd/${heldFd}`;
+          },
+          onAcquire(input) {
+            heldFd = openSync(
+              input.attachment.rootPath,
+              fsConstants.O_RDONLY |
+                fsConstants.O_DIRECTORY |
+                fsConstants.O_NOFOLLOW,
+            );
+          },
           onClose() {
             closeCount += 1;
-            assert.equal(existsSync(reapedPath), true);
+            const descendantPid = Number(readFileSync(descendantPidPath, "utf8").trim());
+            descendantLiveAtClose = processExists(descendantPid);
+            closeSync(heldFd);
+            heldFd = null;
+            writeFileSync(authorityClosedPath, "closed\n", { mode: 0o600 });
           },
         },
         maxOutputBytes: 1_024,
         stopTimeoutSeconds: 1,
         useDefaultCommandRunner: true,
       });
-      let settled = false;
+      t.after(() => {
+        if (heldFd !== null) closeSync(heldFd);
+      });
+
       const pending = base.supervisor.launchWriter(
         launchInput(base.attachmentRoot, { signal: controller.signal }),
       ).then(
         () => {
-          settled = true;
+          settlementCount += 1;
           assert.fail("failed Podman launch unexpectedly succeeded");
         },
         (error) => {
-          settled = true;
+          settlementCount += 1;
           return error;
         },
       );
+      await waitForPath(descendantReadyPath);
+      if (failureMode === "abort") controller.abort();
 
-      await waitForPath(startedPath);
-      if (scenario.mode === "abort") controller.abort();
+      let error;
       try {
-        await waitForPath(terminatedPath);
-        assert.equal(existsSync(reapedPath), false);
-        assert.equal(settled, false);
-        assert.equal(closeCount, 0);
+        if (failureMode === "nonzero") {
+          await waitForPath(sourceAttemptedPath);
+          assert.equal(existsSync(sourceVisiblePath), true);
+          assert.equal(existsSync(sourceMissingPath), false);
+          assert.equal(settlementCount, 0);
+          assert.equal(closeCount, 0);
+          assert.equal(heldFd !== null, true);
+          await writeFile(descendantExitPath, "exit\n", { mode: 0o600 });
+        }
+        error = await pending;
       } finally {
-        await writeFile(releasePath, "release\n", { mode: 0o600 });
+        if (failureMode === "nonzero") {
+          await writeFile(descendantExitPath, "exit\n", { mode: 0o600 })
+            .catch(() => {});
+        }
       }
-
-      const error = await pending;
       assert.equal(error instanceof PodmanWriterSupervisorError, true);
       assert.equal(
         error.code,
-        scenario.mode === "abort"
+        failureMode === "abort"
           ? "podman_writer_supervisor_aborted"
           : "podman_writer_supervisor_outcome_uncertain",
       );
-      assert.equal(existsSync(reapedPath), true);
+      const descendantPid = Number(readFileSync(descendantPidPath, "utf8").trim());
+      await delay(100);
+      assert.equal(processExists(descendantPid), false);
+      assert.equal(descendantLiveAtClose, false);
       assert.equal(closeCount, 1);
+      assert.equal(settlementCount, 1);
+      assert.equal(heldFd, null);
+      assert.equal(existsSync(authorityClosedPath), true);
+      assert.equal(existsSync(sourceAttemptedPath), failureMode === "nonzero");
+      assert.equal(existsSync(sourceMissingPath), false);
+      assert.equal(existsSync(sourceVisiblePath), failureMode === "nonzero");
     });
   }
 });
@@ -1777,7 +2409,7 @@ test("default runner reaps detached Podman start without waiting for container p
   await waitForPath(releasedPath);
 });
 
-test("default runner captures output for non-full Podman start identities", async (t) => {
+test("rejects short new create identities before Podman start dispatch", async (t) => {
   const shortContainerId = "e".repeat(63);
   let holdingPath;
   let namePath;
@@ -1803,145 +2435,109 @@ test("default runner captures output for non-full Podman start identities", asyn
     useDefaultCommandRunner: true,
   });
 
-  const pending = base.supervisor.launchWriter(base.input);
-  await waitForPath(holdingPath);
-  try {
-    await writeFile(releasePath, "release\n", { mode: 0o600 });
-    await assert.rejects(
-      pending,
-      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
-    );
-  } finally {
-    if (!existsSync(releasePath)) {
-      await writeFile(releasePath, "release\n", { mode: 0o600 });
-    }
-  }
-  await waitForPath(releasedPath);
+  await assert.rejects(
+    base.supervisor.launchWriter(base.input),
+    assertSupervisorError("podman_writer_output_invalid"),
+  );
+  assert.equal(existsSync(holdingPath), false);
+  assert.equal(existsSync(releasePath), false);
+  assert.equal(existsSync(releasedPath), false);
 });
 
-test("default runner reaps an aborted outputless Podman start before closing authority", async (t) => {
+test("exact Podman start abort and timeout hold authority until natural CLI close", async (t) => {
   const controller = new AbortController();
   let closeCount = 0;
+  let namePath;
   let pidPath;
+  let releasePath;
   let startedPath;
   const base = await fixture(t, {
-    commandTimeoutMilliseconds: 10_000,
+    commandTimeoutMilliseconds: 2_000,
     defaultCommandRunnerScript({ parent }) {
+      namePath = join(parent, "podman-aborted-container-name");
       pidPath = join(parent, "podman-aborted-start-pid");
+      releasePath = join(parent, "podman-aborted-start-release");
       startedPath = join(parent, "podman-aborted-started");
-      return blockingStartPodmanScript({ pidPath, startedPath });
+      return blockingStartPodmanScript({ namePath, pidPath, releasePath, startedPath });
     },
     filesystemSettings: {
       onClose() {
         closeCount += 1;
-        const pid = Number(execFileSync("/bin/cat", [pidPath], {
-          encoding: "utf8",
-        }).trim());
-        assert.throws(
-          () => process.kill(pid, 0),
-          (error) => error?.code === "ESRCH",
-        );
       },
     },
     stopTimeoutSeconds: 1,
     useDefaultCommandRunner: true,
-  });
-
-  const pending = base.supervisor.launchWriter(
-    launchInput(base.attachmentRoot, { signal: controller.signal }),
-  );
-  await waitForPath(startedPath);
-  controller.abort();
-  await assert.rejects(
-    pending,
-    assertSupervisorError("podman_writer_supervisor_aborted"),
-  );
-  assert.equal(closeCount, 1);
-});
-
-test("Linux default runner keeps the real attachment fd visible through reap", {
-  skip: process.platform !== "linux",
-}, async (t) => {
-  let heldFd = null;
-  let missingPath;
-  let reapedPath;
-  let releasePath;
-  let startedPath;
-  let terminatedPath;
-  let visiblePath;
-  const base = await fixture(t, {
-    defaultCommandRunnerScript({ parent }) {
-      missingPath = join(parent, "attachment-fd-missing");
-      reapedPath = join(parent, "podman-child-reaped");
-      releasePath = join(parent, "podman-child-release");
-      startedPath = join(parent, "podman-child-started");
-      terminatedPath = join(parent, "podman-child-terminated");
-      visiblePath = join(parent, "attachment-fd-visible");
-      return heldFdReapPodmanScript({
-        missingPath,
-        reapedPath,
-        releasePath,
-        startedPath,
-        terminatedPath,
-        visiblePath,
-      });
-    },
-    filesystemSettings: {
-      mountSource(input) {
-        assert.equal(input.attachment.rootPath.endsWith("/attachment"), true);
-        return `/proc/${process.pid}/fd/${heldFd}`;
-      },
-      onAcquire(input) {
-        heldFd = openSync(
-          input.attachment.rootPath,
-          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
-        );
-      },
-      onClose() {
-        assert.equal(existsSync(reapedPath), true);
-        assert.equal(existsSync(visiblePath), true);
-        assert.equal(existsSync(missingPath), false);
-        closeSync(heldFd);
-        heldFd = null;
-      },
-    },
-    maxOutputBytes: 1_024,
-    stopTimeoutSeconds: 1,
-    useDefaultCommandRunner: true,
-  });
-  t.after(() => {
-    if (heldFd !== null) closeSync(heldFd);
   });
 
   let settled = false;
-  const pending = base.supervisor.launchWriter(base.input).then(
+  const pending = base.supervisor.launchWriter(
+    launchInput(base.attachmentRoot, { signal: controller.signal }),
+  ).finally(() => {
+    settled = true;
+  });
+  await waitForPath(startedPath);
+  controller.abort();
+  await delay(2_100);
+  const pid = Number(readFileSync(pidPath, "utf8").trim());
+  assert.equal(processExists(pid), true);
+  assert.equal(settled, false);
+  assert.equal(closeCount, 0);
+
+  await writeFile(releasePath, "release\n", { mode: 0o600 });
+  await assert.rejects(pending, assertSupervisorError("podman_writer_supervisor_aborted"));
+  assert.equal(settled, true);
+  assert.equal(closeCount, 1);
+});
+
+test("failed spawned exact Podman start fail-stops with authority held", async (t) => {
+  let closeCount = 0;
+  let namePath;
+  let pidPath;
+  let releasePath;
+  let startedPath;
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 2_000,
+    defaultCommandRunnerScript({ parent }) {
+      namePath = join(parent, "podman-failed-start-container-name");
+      pidPath = join(parent, "podman-failed-start-pid");
+      releasePath = join(parent, "podman-failed-start-release");
+      startedPath = join(parent, "podman-failed-started");
+      return blockingStartPodmanScript({
+        namePath,
+        pidPath,
+        releasePath,
+        startExitCode: 42,
+        startedPath,
+      });
+    },
+    filesystemSettings: {
+      onClose() {
+        closeCount += 1;
+      },
+    },
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+  });
+
+  let settled = false;
+  void base.supervisor.launchWriter(base.input).then(
     () => {
       settled = true;
-      assert.fail("overflowing Podman launch unexpectedly succeeded");
     },
-    (error) => {
+    () => {
       settled = true;
-      return error;
     },
   );
   await waitForPath(startedPath);
-  try {
-    await waitForPath(terminatedPath);
-    assert.equal(settled, false);
-    assert.equal(heldFd !== null, true);
-    assert.equal(existsSync(visiblePath), true);
-    assert.equal(existsSync(missingPath), false);
-    assert.equal(existsSync(reapedPath), false);
-  } finally {
-    await writeFile(releasePath, "release\n", { mode: 0o600 });
+  await writeFile(releasePath, "release\n", { mode: 0o600 });
+  const pid = Number(readFileSync(pidPath, "utf8").trim());
+  for (let attempt = 0; attempt < 100 && processExists(pid); attempt += 1) {
+    await delay(10);
   }
-
-  const error = await pending;
-  assert.equal(error instanceof PodmanWriterSupervisorError, true);
-  assert.equal(error.code, "podman_writer_supervisor_outcome_uncertain");
-  assert.equal(existsSync(visiblePath), true);
-  assert.equal(existsSync(missingPath), false);
-  assert.equal(heldFd, null);
+  assert.equal(processExists(pid), false);
+  await delay(100);
+  assert.equal(settled, false);
+  assert.equal(closeCount, 0);
 });
 
 test("preserves AbortSignal and rejects bad callback arity or non-native runner promises", async (t) => {

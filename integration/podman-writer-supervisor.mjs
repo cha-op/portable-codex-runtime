@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -310,7 +310,13 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     const receipt = await supervisor.launchWriter(input);
     containerId = receipt.evidence.processIncarnationId.slice("podman-process:".length);
     phase = "ready-marker";
-    await waitForReadyMarker(`${attachmentRoot}/podman-writer-ready`);
+    const markerPath = `${attachmentRoot}/podman-writer-ready`;
+    await waitForReadyMarker(markerPath);
+    const markerStat = await lstat(markerPath);
+    assert.equal(markerStat.isFile(), true);
+    assert.equal(markerStat.uid, process.getuid());
+    assert.equal(markerStat.gid, process.getgid());
+    assert.equal(markerStat.mode & 0o7777, 0o600);
     phase = "stop";
     assert.deepEqual(await receipt.stopWriter(stopInput(input, receipt)), exact({
       contractVersion: 2,

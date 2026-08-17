@@ -558,7 +558,24 @@ the first remount verification-only; the distinct artifact-child tuple then
 authorizes publication verification for that exact owned root. The default
 Podman filesystem authority protects the object selected for a call; a trusted
 adapter that binds the provider's committed ext4 identity into that authority,
-and same-process evidence for the combined components, remain pending.
+and same-process evidence for the combined components, remain pending. For its
+narrower local boundary, the default authority keeps parent-held directory FDs
+and a temporary FD holder inside Podman's rootless namespace, compares both
+sides' object identity and access policy, proves the exact configured bind
+before start, and brackets the live bind proof with stable container ID/PID
+observations. A new create receipt must contain the complete 64-hex container
+ID before start is admitted. Image `Config.User` supplies the exact non-root
+numeric UID/GID mapped by `keep-id`; the Linux conformance writer must create a
+current-service-owned `0600` marker through that bind. Custom command runners
+must provide their own matching trusted filesystem authority. An ordinary
+Podman failure observed before direct-child exit requests whole-group
+termination; every failed command waits for direct close and kernel-proved
+group absence, and never signals the frozen numeric PGID after exit. Holder
+shutdown likewise requires its wrapper to close and its group to disappear;
+the exact `start` mutation is not force-cancelled after dispatch because conmon
+may have moved outside the CLI group, so an unresponsive or failed dispatched
+start deliberately remains pending and holds authority instead of returning an
+unsafe error.
 
 That evidence is a clean operator-controlled transfer boundary, not sudden
 power-loss or crash-prefix evidence and not automatic stale-writer fencing.

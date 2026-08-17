@@ -444,7 +444,18 @@
   automatically fence a stale writer, or implement differential export/
   compression, encryption, retention, or registry trust. A trusted adapter
   that binds committed ext4 attachment identity into Podman filesystem
-  authority, plus same-process conformance evidence, remains pending.
+  authority, plus same-process conformance evidence, remains pending. Within
+  the narrower default boundary, parent-held directory FDs are matched to a
+  temporary holder in Podman's rootless namespace, create must preserve that
+  exact procfd source before start, a new create must return its complete
+  64-hex container identity, and image `Config.User` drives the explicit non-
+  root `keep-id` UID/GID mapping used by the conformance writer. Ordinary
+  failures observed before child exit request whole-group termination; every
+  failure waits for direct close and kernel-proved group absence without ever
+  signalling the frozen PGID after exit. Holder shutdown separately requires
+  wrapper close plus group absence; a dispatched exact start only advances on
+  a zero exit and otherwise remains pending because conmon may leave the CLI
+  group.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers

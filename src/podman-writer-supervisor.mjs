@@ -11,6 +11,7 @@ import {
   statSync,
 } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -48,6 +49,7 @@ const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
 const numberIsFiniteIntrinsic = Number.isFinite;
 const numberIsSafeIntegerIntrinsic = Number.isSafeInteger;
+const NumberConstructor = Number;
 const objectAssignIntrinsic = Object.assign;
 const objectCreateIntrinsic = Object.create;
 const objectDefinePropertiesIntrinsic = Object.defineProperties;
@@ -60,11 +62,13 @@ const objectIsIntrinsic = Object.is;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
+const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApplyIntrinsic = Reflect.apply;
 const reflectOwnKeysIntrinsic = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const stringEndsWithIntrinsic = String.prototype.endsWith;
 const stringIncludesIntrinsic = String.prototype.includes;
+const stringIndexOfIntrinsic = String.prototype.indexOf;
 const stringSliceIntrinsic = String.prototype.slice;
 const stringStartsWithIntrinsic = String.prototype.startsWith;
 const stringTrimIntrinsic = String.prototype.trim;
@@ -79,11 +83,16 @@ const processGetEffectiveUserIdIntrinsic =
   typeof processObject.geteuid === "function" ? processObject.geteuid : null;
 const currentPlatform = processObject.platform;
 const currentProcessId = processObject.pid;
+const processExecutable = processObject.execPath;
+const processKillIntrinsic = processObject.kill;
 const currentUserId = processGetUserIdIntrinsic === null
   ? null
   : processGetUserIdIntrinsic();
 const currentUserIdBigInt = currentUserId === null ? null : BigInt(currentUserId);
 const realpathNativeIntrinsic = realpathSync.native;
+const filesystemAuthorityHelper = realpathNativeIntrinsic(
+  fileURLToPath(new URL("./podman-filesystem-authority-helper.mjs", import.meta.url)),
+);
 const openDirectoryFlag = fsConstants.O_DIRECTORY;
 const readOnlyFlag = fsConstants.O_RDONLY;
 const noFollowFlag = fsConstants.O_NOFOLLOW;
@@ -118,6 +127,25 @@ function stringIncludes(value, candidate) {
   return callIntrinsic(stringIncludesIntrinsic, value, [candidate]);
 }
 
+function stringIndexOf(value, candidate) {
+  return callIntrinsic(stringIndexOfIntrinsic, value, [candidate]);
+}
+
+function firstPromiseOfTwo(first, second) {
+  return new PromiseConstructor((resolvePromise, rejectPromise) => {
+    callIntrinsic(promiseThenIntrinsic, first, [resolvePromise, rejectPromise]);
+    callIntrinsic(promiseThenIntrinsic, second, [resolvePromise, rejectPromise]);
+  });
+}
+
+function firstPromiseOfThree(first, second, third) {
+  return new PromiseConstructor((resolvePromise, rejectPromise) => {
+    callIntrinsic(promiseThenIntrinsic, first, [resolvePromise, rejectPromise]);
+    callIntrinsic(promiseThenIntrinsic, second, [resolvePromise, rejectPromise]);
+    callIntrinsic(promiseThenIntrinsic, third, [resolvePromise, rejectPromise]);
+  });
+}
+
 export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 2;
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -125,6 +153,7 @@ const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IMAGE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const CONTAINER_ID_PATTERN = /^[0-9a-f]{12,64}$/u;
+const IMAGE_USER_PATTERN = /^([1-9][0-9]{0,9}):([1-9][0-9]{0,9})$/u;
 const FULL_CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/u;
 const PROC_FD_SOURCE_PATTERN = /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+$/u;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u;
@@ -132,6 +161,11 @@ const CODEX_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/u;
 const PODMAN_EXECUTION_PATH = "/usr/bin:/bin";
 const PODMAN_LOCAL_MODE_ARGUMENT = "--remote=false";
 const PODMAN_ROOTLESS_PROOF_EXECUTABLE = "/usr/bin/true";
+const FILESYSTEM_HOLDER_MAX_OUTPUT_BYTES = 1024;
+const FILESYSTEM_HOLDER_MAX_ACQUISITION_BYTES = 64 * 1024;
+const FILESYSTEM_HOLDER_CLOSE_MESSAGE = "close\n";
+const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
+const COMMAND_PROCESS_GROUP_POLL_MILLISECONDS = 20;
 const MAX_DATA_DEPTH = 32;
 const MAX_DATA_NODES = 32_768;
 const MAX_CANONICAL_BYTES = 4 * 1024 * 1024;
@@ -177,6 +211,14 @@ const FILESYSTEM_AUTHORITY_KEYS = Object.freeze([
   "verifyRunningMount",
 ]);
 const FILESYSTEM_ACQUISITION_KEYS = Object.freeze(["handle", "mountSource"]);
+const HOLDER_DIRECTORY_RECEIPT_KEYS = Object.freeze(["dev", "fd", "ino"]);
+const HOLDER_READY_RECEIPT_KEYS = Object.freeze([
+  "attachment",
+  "configured",
+  "contractVersion",
+  "pid",
+  "status",
+]);
 const RUNNER_RESULT_KEYS = Object.freeze(["stderr", "stdout"]);
 const LAUNCH_KEYS = Object.freeze([
   "attempt",
@@ -1220,6 +1262,396 @@ function validatePinnedDirectory(pin) {
   currentDirectorySnapshot(pin.path, pin.snapshot);
 }
 
+function assertCurrentRootlessProcessIdentity() {
+  ensure(
+    processGetUserIdIntrinsic !== null &&
+      processGetEffectiveUserIdIntrinsic !== null,
+    "podman_writer_supervisor_outcome_uncertain",
+  );
+  let realUserId;
+  let effectiveUserId;
+  try {
+    realUserId = callIntrinsic(processGetUserIdIntrinsic, processObject, []);
+    effectiveUserId = callIntrinsic(
+      processGetEffectiveUserIdIntrinsic,
+      processObject,
+      [],
+    );
+  } catch {
+    fail("podman_writer_supervisor_outcome_uncertain");
+  }
+  ensure(
+    numberIsSafeIntegerIntrinsic(realUserId) &&
+      realUserId >= 0 &&
+      numberIsSafeIntegerIntrinsic(effectiveUserId) &&
+      effectiveUserId >= 0,
+    "podman_writer_supervisor_outcome_uncertain",
+  );
+  if (realUserId === 0 || effectiveUserId === 0) {
+    fail("podman_writer_rootless_required");
+  }
+  ensure(
+    realUserId === effectiveUserId,
+    "podman_writer_supervisor_outcome_uncertain",
+  );
+}
+
+function holderSnapshot(receipt, pin) {
+  const value = exactDataObject(
+    receipt,
+    HOLDER_DIRECTORY_RECEIPT_KEYS,
+    "podman_writer_supervisor_outcome_uncertain",
+  );
+  ensure(
+    numberIsSafeIntegerIntrinsic(value.fd) &&
+      value.fd >= 0 &&
+      typeof value.dev === "string" &&
+      regexpTest(DECIMAL_PATTERN, value.dev) &&
+      typeof value.ino === "string" &&
+      regexpTest(DECIMAL_PATTERN, value.ino),
+    "podman_writer_supervisor_outcome_uncertain",
+  );
+  ensure(
+    value.dev === StringConstructor(pin.snapshot.dev) &&
+      value.ino === StringConstructor(pin.snapshot.ino),
+    "podman_writer_attachment_mismatch",
+  );
+  return frozenRecord({ dev: value.dev, fd: value.fd, ino: value.ino });
+}
+
+function validateHolderMountSource(holder, attachment) {
+  const held = directorySnapshot(
+    filesystemOperation(
+      () => statSync(holder.mountSource, { bigint: true }),
+      "podman_writer_attachment_revalidation_failed",
+    ),
+    "podman_writer_attachment_mismatch",
+  );
+  ensure(
+    sameDirectoryAuthority(held, attachment.snapshot),
+    "podman_writer_attachment_mismatch",
+  );
+}
+
+function killHolderProcessGroup(holder) {
+  if (
+    holder.childExited ||
+    holder.childClosed ||
+    !numberIsSafeIntegerIntrinsic(holder.processGroupId) ||
+    holder.processGroupId <= 0
+  ) return null;
+  try {
+    callIntrinsic(processKillIntrinsic, processObject, [
+      -holder.processGroupId,
+      "SIGKILL",
+    ]);
+    return null;
+  } catch (error) {
+    return filesystemErrorCode(error) === "ESRCH" ? null : error;
+  }
+}
+
+async function waitForHolderClose(holder, timeoutMilliseconds, force) {
+  let killError = force && !holder.childExited && !holder.childClosed
+    ? killHolderProcessGroup(holder)
+    : null;
+  if (!holder.childClosed) {
+    let timeoutId;
+    const timedOut = new PromiseConstructor((resolvePromise) => {
+      timeoutId = setTimeout(() => resolvePromise(false), timeoutMilliseconds);
+    });
+    const closed = await firstPromiseOfTwo(
+      callIntrinsic(promiseThenIntrinsic, holder.closePromise, [() => true]),
+      timedOut,
+    );
+    clearTimeout(timeoutId);
+    if (!closed && !holder.childExited && !holder.childClosed) {
+      const timeoutKillError = killHolderProcessGroup(holder);
+      if (killError === null) killError = timeoutKillError;
+    }
+  }
+  // Direct close proves only that the leader was reaped. Its closed-stdio
+  // descendants may still retain the authority descriptors. Once close has
+  // occurred, never signal the frozen PGID again because it may be reused;
+  // conservatively wait until killpg(0) proves ESRCH.
+  await holder.closePromise;
+  await waitForCommandProcessGroupQuiescence(holder.processGroupId);
+  if (killError !== null) fail("podman_writer_supervisor_outcome_uncertain");
+}
+
+async function stopFilesystemHolder(holder, force = false) {
+  if (holder.stopStarted) {
+    await holder.stopPromise;
+    return;
+  }
+  holder.stopStarted = true;
+  holder.stopPromise = (async () => {
+    if (!force && !holder.childClosed) {
+      try {
+        holder.child.stdin.end(FILESYSTEM_HOLDER_CLOSE_MESSAGE);
+      } catch {
+        force = true;
+      }
+    } else if (!holder.childClosed) {
+      try {
+        holder.child.stdin.end();
+      } catch {
+        // The process-group termination below remains authoritative.
+      }
+    }
+    await waitForHolderClose(holder, holder.timeoutMilliseconds, force);
+  })();
+  await holder.stopPromise;
+}
+
+async function startFilesystemHolder(input, configured, attachment) {
+  ensure(
+    typeof input.holder === "object" &&
+      input.holder !== null &&
+      input.holder.podmanExecutable !== undefined &&
+      isAbsolute(processExecutable) &&
+      isAbsolute(filesystemAuthorityHelper),
+    "podman_writer_attachment_revalidation_failed",
+  );
+  const acquisitionFrame = callIntrinsic(jsonStringifyIntrinsic, JsonObject, [
+    frozenRecord({
+      attachmentRoot: attachment.path,
+      configuredRoot: configured.path,
+      contractVersion: 1,
+    }),
+  ]);
+  ensure(
+    typeof acquisitionFrame === "string" &&
+      callIntrinsic(bufferByteLengthIntrinsic, Buffer, [
+        `${acquisitionFrame}\n`,
+        "utf8",
+      ]) <= FILESYSTEM_HOLDER_MAX_ACQUISITION_BYTES,
+    "podman_writer_attachment_revalidation_failed",
+  );
+  assertCurrentRootlessProcessIdentity();
+  let child;
+  try {
+    child = spawn(
+      input.holder.podmanExecutable,
+      [
+        PODMAN_LOCAL_MODE_ARGUMENT,
+        "unshare",
+        processExecutable,
+        filesystemAuthorityHelper,
+      ],
+      {
+        cwd: "/",
+        detached: true,
+        env: input.holder.environment,
+        killSignal: "SIGKILL",
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+  } catch (error) {
+    fail("podman_writer_supervisor_outcome_uncertain");
+  }
+  const holder = {
+    child,
+    childClosed: false,
+    childExited: false,
+    closePromise: null,
+    liveProofCompleted: false,
+    pendingVerification: null,
+    processGroupId: child.pid,
+    protocolFailed: false,
+    ready: false,
+    stderrBytes: 0,
+    stdoutBuffer: "",
+    stdoutBytes: 0,
+    stopPromise: null,
+    stopStarted: false,
+    timeoutMilliseconds: input.holder.timeoutMilliseconds,
+  };
+  holder.closePromise = new PromiseConstructor((resolvePromise) => {
+    child.once("exit", () => {
+      holder.childExited = true;
+    });
+    child.once("close", (code, signal) => {
+      holder.childClosed = true;
+      holder.closeCode = code;
+      holder.closeSignal = signal;
+      if (
+        holder.pendingVerification !== null ||
+        (holder.ready && (code !== 0 || signal !== null))
+      ) {
+        holder.protocolFailed = true;
+      }
+      if (holder.pendingVerification !== null) {
+        holder.pendingVerification(false);
+        holder.pendingVerification = null;
+      }
+      resolvePromise();
+    });
+    child.once("error", () => {
+      holder.protocolFailed = true;
+    });
+  });
+
+  let settleReady;
+  const readyPromise = new PromiseConstructor((resolvePromise) => {
+    settleReady = resolvePromise;
+  });
+  const failProtocol = () => {
+    holder.protocolFailed = true;
+    settleReady(null);
+    if (holder.pendingVerification !== null) {
+      holder.pendingVerification(false);
+      holder.pendingVerification = null;
+    }
+  };
+  child.stdin.on("error", failProtocol);
+  child.stdout.on("error", failProtocol);
+  child.stderr.on("error", failProtocol);
+  child.stderr.on("data", (chunk) => {
+    holder.stderrBytes += chunk.length;
+    failProtocol();
+  });
+  child.stdout.on("data", (chunk) => {
+    if (holder.protocolFailed) return;
+    holder.stdoutBytes += chunk.length;
+    holder.stdoutBuffer += callIntrinsic(bufferToStringIntrinsic, chunk, ["utf8"]);
+    if (
+      holder.stdoutBytes > FILESYSTEM_HOLDER_MAX_OUTPUT_BYTES ||
+      callIntrinsic(bufferByteLengthIntrinsic, Buffer, [
+        holder.stdoutBuffer,
+        "utf8",
+      ]) > FILESYSTEM_HOLDER_MAX_OUTPUT_BYTES
+    ) {
+      failProtocol();
+      return;
+    }
+    const newline = stringIndexOf(holder.stdoutBuffer, "\n");
+    if (newline === -1) return;
+    if (newline !== holder.stdoutBuffer.length - 1) {
+      failProtocol();
+      return;
+    }
+    const line = callIntrinsic(stringSliceIntrinsic, holder.stdoutBuffer, [0, -1]);
+    holder.stdoutBuffer = "";
+    if (!holder.ready) {
+      holder.ready = true;
+      settleReady(line);
+      return;
+    }
+    if (line !== "verified" || holder.pendingVerification === null) {
+      failProtocol();
+      return;
+    }
+    const resolveVerification = holder.pendingVerification;
+    holder.pendingVerification = null;
+    resolveVerification(true);
+  });
+  callIntrinsic(promiseThenIntrinsic, holder.closePromise, [() => {
+    if (!holder.ready) failProtocol();
+  }]);
+  try {
+    child.stdin.write(`${acquisitionFrame}\n`);
+  } catch {
+    failProtocol();
+  }
+
+  let timeoutId;
+  let abortListener = null;
+  const timeoutPromise = new PromiseConstructor((resolvePromise) => {
+    timeoutId = setTimeout(() => resolvePromise(null), input.holder.timeoutMilliseconds);
+  });
+  const abortPromise = new PromiseConstructor((resolvePromise) => {
+    abortListener = () => resolvePromise(null);
+    input.holder.signal.addEventListener("abort", abortListener, { once: true });
+    if (signalAborted(input.holder.signal)) abortListener();
+  });
+  const receiptText = await firstPromiseOfThree(
+    readyPromise,
+    timeoutPromise,
+    abortPromise,
+  );
+  clearTimeout(timeoutId);
+  input.holder.signal.removeEventListener("abort", abortListener);
+  if (receiptText === null || holder.protocolFailed || holder.stderrBytes !== 0) {
+    await stopFilesystemHolder(holder, true);
+    ensureNotAborted(input.holder.signal);
+    fail("podman_writer_supervisor_outcome_uncertain");
+  }
+  try {
+    let parsed;
+    try {
+      parsed = callIntrinsic(jsonParseIntrinsic, JsonObject, [receiptText]);
+    } catch {
+      fail("podman_writer_supervisor_outcome_uncertain");
+    }
+    const receipt = exactDataObject(
+      parsed,
+      HOLDER_READY_RECEIPT_KEYS,
+      "podman_writer_supervisor_outcome_uncertain",
+    );
+    ensure(
+      receipt.contractVersion === 1 &&
+        receipt.status === "ready" &&
+        numberIsSafeIntegerIntrinsic(receipt.pid) &&
+        receipt.pid > 0,
+      "podman_writer_supervisor_outcome_uncertain",
+    );
+    const configuredReceipt = holderSnapshot(receipt.configured, configured);
+    const attachmentReceipt = holderSnapshot(receipt.attachment, attachment);
+    holder.helperPid = receipt.pid;
+    holder.configuredReceipt = configuredReceipt;
+    holder.attachmentReceipt = attachmentReceipt;
+    holder.mountSource = `/proc/${receipt.pid}/fd/${attachmentReceipt.fd}`;
+    validateHolderMountSource(holder, attachment);
+    return holder;
+  } catch (error) {
+    await stopFilesystemHolder(holder, true);
+    throw error;
+  }
+}
+
+async function validateFilesystemHolder(holder, attachment) {
+  ensure(
+    holder.ready &&
+      !holder.childClosed &&
+      !holder.protocolFailed &&
+      !holder.stopStarted &&
+      holder.pendingVerification === null,
+    "podman_writer_supervisor_outcome_uncertain",
+  );
+  const verified = new PromiseConstructor((resolvePromise) => {
+    holder.pendingVerification = resolvePromise;
+  });
+  try {
+    holder.child.stdin.write("verify\n");
+  } catch {
+    holder.pendingVerification = null;
+    await stopFilesystemHolder(holder, true);
+    fail("podman_writer_supervisor_outcome_uncertain");
+  }
+  let timeoutId;
+  const timeout = new PromiseConstructor((resolvePromise) => {
+    timeoutId = setTimeout(() => resolvePromise(false), holder.timeoutMilliseconds);
+  });
+  const result = await firstPromiseOfTwo(
+    verified,
+    timeout,
+  );
+  clearTimeout(timeoutId);
+  if (
+    result !== true ||
+    holder.pendingVerification !== null ||
+    holder.childClosed ||
+    holder.protocolFailed
+  ) {
+    holder.pendingVerification = null;
+    await stopFilesystemHolder(holder, true);
+    fail("podman_writer_supervisor_outcome_uncertain");
+  }
+  validateHolderMountSource(holder, attachment);
+}
+
 const defaultFilesystemAuthority = frozenRecord({
   contractVersion: 1,
   acquire: frozenFunction(async function acquire(input) {
@@ -1247,20 +1679,30 @@ const defaultFilesystemAuthority = frozenRecord({
     );
     let configured = null;
     let attachment = null;
+    let holder = null;
     try {
       configured = openPinnedDirectory(input.configuredAttachmentRoot);
       attachment = openPinnedDirectory(input.attachment.rootPath);
       validatePinnedDirectory(configured);
+      holder = await startFilesystemHolder(input, configured, attachment);
       const handle = frozenRecord({
         attachment,
         attachmentAuthorization: input.attachment,
         configured,
         configuredAttachmentRoot: input.configuredAttachmentRoot,
+        holder,
         rootPath: input.attachment.rootPath,
       });
       callIntrinsic(weakSetAddIntrinsic, defaultAuthorityHandles, [handle]);
-      return frozenRecord({ handle, mountSource: attachment.mountSource });
+      return frozenRecord({ handle, mountSource: holder.mountSource });
     } catch (error) {
+      if (holder !== null) {
+        try {
+          await stopFilesystemHolder(holder, true);
+        } catch {
+          // Preserve the authoritative acquisition failure.
+        }
+      }
       if (attachment !== null) {
         try {
           closeSync(attachment.fileDescriptor);
@@ -1292,6 +1734,7 @@ const defaultFilesystemAuthority = frozenRecord({
     );
     validatePinnedDirectory(input.handle.configured);
     validatePinnedDirectory(input.handle.attachment);
+    await validateFilesystemHolder(input.handle.holder, input.handle.attachment);
     return true;
   }),
   verifyRunningMount: frozenFunction(async function verifyRunningMount(input) {
@@ -1330,13 +1773,12 @@ const defaultFilesystemAuthority = frozenRecord({
       sameDirectoryAuthority(liveAfter, input.handle.attachment.snapshot),
       "podman_writer_attachment_mismatch",
     );
-    await callIntrinsic(defaultFilesystemAuthority.verifyCurrent, undefined, [
-      frozenRecord({
-        configuredAttachmentRoot: input.configuredAttachmentRoot,
-        handle: input.handle,
-        attachment: input.attachment,
-      }),
-    ]);
+    // The live mount is now the final object proof. Revalidate the parent-held
+    // pins and pathname policy, but do not make the completed proof depend on
+    // the temporary namespace holder continuing to run.
+    validatePinnedDirectory(input.handle.configured);
+    validatePinnedDirectory(input.handle.attachment);
+    input.handle.holder.liveProofCompleted = true;
     return true;
   }),
   close: frozenFunction(async function close(input) {
@@ -1349,10 +1791,26 @@ const defaultFilesystemAuthority = frozenRecord({
     );
     callIntrinsic(weakSetAddIntrinsic, closedDefaultAuthorityHandles, [input.handle]);
     let closeError = null;
+    let invalidHolderSettlement = false;
+    try {
+      await stopFilesystemHolder(input.handle.holder);
+      invalidHolderSettlement =
+        !input.handle.holder.liveProofCompleted &&
+        (
+          !input.handle.holder.childClosed ||
+          input.handle.holder.closeCode !== 0 ||
+          input.handle.holder.closeSignal !== null ||
+          input.handle.holder.protocolFailed ||
+          input.handle.holder.stdoutBuffer !== "" ||
+          input.handle.holder.pendingVerification !== null
+        );
+    } catch (error) {
+      closeError = error;
+    }
     try {
       closeSync(input.handle.attachment.fileDescriptor);
     } catch (error) {
-      closeError = error;
+      if (closeError === null) closeError = error;
     }
     try {
       closeSync(input.handle.configured.fileDescriptor);
@@ -1362,6 +1820,10 @@ const defaultFilesystemAuthority = frozenRecord({
     if (closeError !== null) {
       failFilesystem(closeError, "podman_writer_attachment_revalidation_failed");
     }
+    ensure(
+      !invalidHolderSettlement,
+      "podman_writer_supervisor_outcome_uncertain",
+    );
     return true;
   }),
 });
@@ -1432,6 +1894,7 @@ async function acquireFilesystemAuthority(
   configuredAttachmentRoot,
   attachment,
   signal,
+  defaultHolderOptions,
 ) {
   const rootPath = attachment.rootPath;
   assertCanonicalAttachmentRoot(configuredAttachmentRoot);
@@ -1441,10 +1904,14 @@ async function acquireFilesystemAuthority(
     "podman_writer_attachment_mismatch",
   );
   ensureNotAborted(signal);
-  const raw = await invokeFilesystemAuthority(
-    authority.acquire,
-    frozenRecord({ attachment, configuredAttachmentRoot }),
-  );
+  const acquireInput = authority === defaultFilesystemAuthority
+    ? frozenRecord({
+      attachment,
+      configuredAttachmentRoot,
+      holder: frozenRecord({ ...defaultHolderOptions, signal }),
+    })
+    : frozenRecord({ attachment, configuredAttachmentRoot });
+  const raw = await invokeFilesystemAuthority(authority.acquire, acquireInput);
   const acquired = exactDataObject(
     raw,
     FILESYSTEM_ACQUISITION_KEYS,
@@ -1523,8 +1990,43 @@ async function closeFilesystemAuthority(authority, acquired) {
   ensure(closed === true, "podman_writer_attachment_revalidation_failed");
 }
 
+function commandProcessGroupExists(processGroupId) {
+  try {
+    callIntrinsic(processKillIntrinsic, processObject, [-processGroupId, 0]);
+    return true;
+  } catch (error) {
+    return filesystemErrorCode(error) !== "ESRCH";
+  }
+}
+
+function killCommandProcessGroup(processGroupId) {
+  if (!numberIsSafeIntegerIntrinsic(processGroupId) || processGroupId <= 0) return;
+  try {
+    callIntrinsic(processKillIntrinsic, processObject, [-processGroupId, "SIGKILL"]);
+  } catch (error) {
+    if (filesystemErrorCode(error) !== "ESRCH") throw error;
+  }
+}
+
+async function waitForCommandProcessGroupQuiescence(processGroupId) {
+  if (!numberIsSafeIntegerIntrinsic(processGroupId) || processGroupId <= 0) return;
+  while (commandProcessGroupExists(processGroupId)) {
+    // Only ESRCH proves that the kernel no longer has a process-group member.
+    // /proc visibility can be incomplete (for example under hidepid), so even
+    // an apparently zombie-only group is an availability-preserving fail-stop
+    // until its external reaper makes killpg(0) return ESRCH.
+    await new PromiseConstructor((resolvePromise) => {
+      setTimeout(resolvePromise, COMMAND_PROCESS_GROUP_POLL_MILLISECONDS);
+    });
+  }
+}
+
 function defaultCommandRunner(executable, arguments_, options) {
   return new PromiseConstructor((resolvePromise, rejectPromise) => {
+    if (signalAborted(options.signal)) {
+      rejectPromise(new Error("Podman command aborted before dispatch"));
+      return;
+    }
     const discardCommandOutput =
       arguments_.length === 3 &&
       arguments_[0] === PODMAN_LOCAL_MODE_ARGUMENT &&
@@ -1534,10 +2036,15 @@ function defaultCommandRunner(executable, arguments_, options) {
     try {
       child = spawn(executable, arguments_, {
         cwd: "/",
+        detached: true,
         env: options.environment,
         killSignal: "SIGKILL",
         shell: false,
-        signal: options.signal,
+        // Once an exact local start is dispatched, Podman may already have
+        // launched conmon in a different process group. Abort and command
+        // timeout therefore cannot safely release the filesystem authority;
+        // this closed shape waits for the direct CLI to close naturally.
+        signal: discardCommandOutput ? undefined : options.signal,
         // A detached Podman container may keep the CLI's stdout/stderr file
         // descriptions open after the direct CLI has exited. `start` has no
         // authoritative output: its exit status is followed by an exact
@@ -1552,6 +2059,9 @@ function defaultCommandRunner(executable, arguments_, options) {
       rejectPromise(error);
       return;
     }
+    const processGroupId = child.pid;
+    let childExited = false;
+    let childSpawned = false;
     let settled = false;
     let primaryError = null;
     let terminationRequested = false;
@@ -1563,10 +2073,15 @@ function defaultCommandRunner(executable, arguments_, options) {
       if (primaryError === null) primaryError = error;
       if (!terminate || terminationRequested || settled) return;
       terminationRequested = true;
+      // `exit` means Node has waitpid-reaped the leader. From that point the
+      // numeric PGID may be reused, so close-time failure may only wait for
+      // ESRCH and must never signal the old identifier.
+      if (childExited) return;
       try {
-        child.kill("SIGKILL");
+        killCommandProcessGroup(processGroupId);
       } catch {
-        // The authority cannot be released safely until `close` proves reap.
+        // The authority cannot be released safely until the direct close and
+        // process-group quiescence checks below both succeed.
       }
     };
     const append = (current, chunk) => {
@@ -1591,28 +2106,60 @@ function defaultCommandRunner(executable, arguments_, options) {
       child.stdout.on("error", (error) => rememberFailure(error, true));
       child.stderr.on("error", (error) => rememberFailure(error, true));
     }
-    child.on("error", (error) => rememberFailure(error, false));
+    child.once("spawn", () => {
+      childSpawned = true;
+    });
+    child.once("exit", () => {
+      childExited = true;
+    });
+    // Node's built-in AbortSignal handling signals only the direct child. Its
+    // AbortError therefore also has to enter the process-group termination
+    // path. All other spawn/runtime errors are equally outcome-uncertain.
+    child.on("error", (error) => rememberFailure(error, true));
     child.once("close", (code, signal) => {
       if (settled) return;
-      settled = true;
       clearTimeout(timer);
-      if (primaryError !== null) {
-        rejectPromise(primaryError);
+      if (primaryError === null && code === 0 && signal === null) {
+        settled = true;
+        resolvePromise(frozenRecord({
+          stderr: callIntrinsic(bufferToStringIntrinsic, stderr, ["utf8"]),
+          stdout: callIntrinsic(bufferToStringIntrinsic, stdout, ["utf8"]),
+        }));
         return;
       }
-      if (code !== 0 || signal !== null) {
-        rejectPromise(new Error("Podman command failed"));
+      rememberFailure(new Error("Podman command failed"), true);
+      // The protected property here is the filesystem authority's object
+      // identity and descriptor lifetime: no failed lifecycle CLI or same-group
+      // descendant may retain the procfd after the authority is released.
+      // Content and benign metadata churn are not mutation signals. This PGID
+      // barrier covers ordinary failed commands and their same-group children;
+      // after exact start has spawned, even natural failed direct close cannot
+      // prove cleanup of a conmon that called Setpgid. The runner deliberately
+      // remains pending after same-group hygiene. This is an availability
+      // boundary until escaped helpers have a separate pidfd/cgroup fence.
+      const quiescence = waitForCommandProcessGroupQuiescence(
+        processGroupId,
+      );
+      if (discardCommandOutput && childSpawned) {
+        callIntrinsic(promiseThenIntrinsic, quiescence, [() => {}, () => {}]);
         return;
       }
-      resolvePromise(frozenRecord({
-        stderr: callIntrinsic(bufferToStringIntrinsic, stderr, ["utf8"]),
-        stdout: callIntrinsic(bufferToStringIntrinsic, stdout, ["utf8"]),
-      }));
+      callIntrinsic(promiseThenIntrinsic, quiescence, [() => {
+          if (settled) return;
+          settled = true;
+          rejectPromise(primaryError);
+        }, (error) => {
+          // An unreadable or failed group proof cannot authorize normal
+          // settlement and authority release. Keep the command pending.
+          if (primaryError === null) primaryError = error;
+        }]);
     });
-    timer = setTimeout(() => {
-      rememberFailure(new Error("Podman command timed out"), true);
-    }, options.timeoutMilliseconds);
-    timer.unref?.();
+    if (!discardCommandOutput) {
+      timer = setTimeout(() => {
+        rememberFailure(new Error("Podman command timed out"), true);
+      }, options.timeoutMilliseconds);
+      timer.unref?.();
+    }
   });
 }
 
@@ -1848,12 +2395,32 @@ function validateImageInspection(value, policy, digest) {
     ["Os", "OS", "os"],
     "podman_writer_image_mismatch",
   );
+  const config = ownJsonValue(value, "Config", "podman_writer_image_mismatch");
+  jsonObject(config, "podman_writer_image_mismatch");
+  const imageUser = ownJsonValue(config, "User", "podman_writer_image_mismatch");
+  const imageUserMatch = typeof imageUser === "string"
+    ? callIntrinsic(regexpExecIntrinsic, IMAGE_USER_PATTERN, [imageUser])
+    : null;
   ensure(
     imageDigest === digest &&
       architecture === policy.architecture &&
-      os === policy.os,
+      os === policy.os &&
+      imageUserMatch !== null,
     "podman_writer_image_mismatch",
   );
+  const userId = NumberConstructor(imageUserMatch[1]);
+  const groupId = NumberConstructor(imageUserMatch[2]);
+  ensure(
+    numberIsSafeIntegerIntrinsic(userId) &&
+      userId > 0 &&
+      userId <= 2_147_483_647 &&
+      numberIsSafeIntegerIntrinsic(groupId) &&
+      groupId > 0 &&
+      groupId <= 2_147_483_647 &&
+      imageUser === `${userId}:${groupId}`,
+    "podman_writer_image_mismatch",
+  );
+  return frozenRecord({ groupId, userId });
 }
 
 function normalizedPodmanName(value) {
@@ -1913,6 +2480,9 @@ function validAttachmentMountSource(source, expected) {
     regexpTest(/[\0,\r\n]/u, source)
   ) {
     return false;
+  }
+  if (expected.exactSourceProof === true) {
+    return source === expected.attachmentSource;
   }
   if (expected.liveObjectProof === true) return true;
   return source === expected.attachmentRoot ||
@@ -2008,6 +2578,10 @@ export function createPodmanWriterSupervisor(...args) {
   const optionCode = "invalid_podman_writer_supervisor_options";
   ensure(args.length === 1, optionCode);
   const options = dataObject(args[0], OPTION_KEYS, REQUIRED_OPTION_KEYS, optionCode);
+  ensure(
+    options.commandRunner === undefined || options.filesystemAuthority !== undefined,
+    optionCode,
+  );
   const supervisorId = assertOpaqueId(options.supervisorId, optionCode);
   ensure(
     typeof options.podmanExecutable === "string" &&
@@ -2063,46 +2637,17 @@ export function createPodmanWriterSupervisor(...args) {
       timeout >= stopTimeoutSeconds * 1000 + 1000,
     optionCode,
   );
+  const defaultHolderOptions = frozenRecord({
+    environment: podmanEnvironment,
+    podmanExecutable,
+    timeoutMilliseconds: timeout,
+  });
 
   async function runPodman(arguments_, signal) {
     ensureNotAborted(signal);
     // Re-read both identities before every dispatch so a privilege transition
     // cannot carry an earlier rootless proof into a later Podman command.
-    ensure(
-      processGetUserIdIntrinsic !== null &&
-        processGetEffectiveUserIdIntrinsic !== null,
-      "podman_writer_supervisor_outcome_uncertain",
-    );
-    let realUserId;
-    let effectiveUserId;
-    try {
-      realUserId = callIntrinsic(
-        processGetUserIdIntrinsic,
-        processObject,
-        [],
-      );
-      effectiveUserId = callIntrinsic(
-        processGetEffectiveUserIdIntrinsic,
-        processObject,
-        [],
-      );
-    } catch {
-      fail("podman_writer_supervisor_outcome_uncertain");
-    }
-    ensure(
-      numberIsSafeIntegerIntrinsic(realUserId) &&
-        realUserId >= 0 &&
-        numberIsSafeIntegerIntrinsic(effectiveUserId) &&
-        effectiveUserId >= 0,
-      "podman_writer_supervisor_outcome_uncertain",
-    );
-    if (realUserId === 0 || effectiveUserId === 0) {
-      fail("podman_writer_rootless_required");
-    }
-    ensure(
-      realUserId === effectiveUserId,
-      "podman_writer_supervisor_outcome_uncertain",
-    );
+    assertCurrentRootlessProcessIdentity();
     const commandArguments = [PODMAN_LOCAL_MODE_ARGUMENT];
     for (let index = 0; index < arguments_.length; index += 1) {
       arrayPush(commandArguments, arguments_[index]);
@@ -2171,21 +2716,60 @@ export function createPodmanWriterSupervisor(...args) {
     return raw;
   }
 
-  async function proveRunningAttachment(attachment, inspection, signal, code) {
+  async function verifyRunningAttachmentBracket(
+    authority,
+    acquired,
+    attachment,
+    inspection,
+    inspectSelector,
+    inspectionExpected,
+    signal,
+    code,
+  ) {
+    const beforePid = runningContainerPid(inspection, code);
+    await verifyRunningFilesystemAuthority(
+      authority,
+      acquired,
+      configuredAttachmentRoot,
+      attachment,
+      beforePid,
+      signal,
+    );
+    const reinspected = await runPodman(
+      ["container", "inspect", "--format=json", inspectSelector],
+      signal,
+    );
+    ensure(reinspected.stderr === "", code);
+    const reinspection = inspectObject(reinspected.stdout, code);
+    validateContainerInspection(reinspection, inspectionExpected, true, code);
+    ensure(runningContainerPid(reinspection, code) === beforePid, code);
+  }
+
+  async function proveRunningAttachment(
+    attachment,
+    inspection,
+    inspectSelector,
+    inspectionExpected,
+    signal,
+    code,
+  ) {
     const acquired = await acquireFilesystemAuthority(
       filesystemAuthority,
       configuredAttachmentRoot,
       attachment,
       signal,
+      defaultHolderOptions,
     );
     try {
-      await verifyRunningFilesystemAuthority(
+      await verifyRunningAttachmentBracket(
         filesystemAuthority,
         acquired,
-        configuredAttachmentRoot,
         attachment,
-        runningContainerPid(inspection, code),
+        inspection,
+        inspectSelector,
+        inspectionExpected,
         signal,
+        code,
       );
     } finally {
       await closeFilesystemAuthority(filesystemAuthority, acquired);
@@ -2419,7 +3003,7 @@ export function createPodmanWriterSupervisor(...args) {
       ["image", "inspect", "--format=json", policy.imageReference],
       input.signal,
     );
-    validateImageInspection(
+    const imageRuntimeIdentity = validateImageInspection(
       inspectObject(imageInspect.stdout, "podman_writer_output_invalid"),
       policy,
       digest,
@@ -2429,6 +3013,7 @@ export function createPodmanWriterSupervisor(...args) {
       configuredAttachmentRoot,
       attachment,
       input.signal,
+      defaultHolderOptions,
     );
     try {
       const preparing = newStateRecord({
@@ -2479,7 +3064,8 @@ export function createPodmanWriterSupervisor(...args) {
         "--read-only",
         "--security-opt=no-new-privileges",
         "--cap-drop=all",
-        "--userns=keep-id",
+        `--userns=keep-id:uid=${imageRuntimeIdentity.userId},` +
+          `gid=${imageRuntimeIdentity.groupId}`,
         "--restart=no",
         "--mount",
         `type=bind,source=${acquired.mountSource}` +
@@ -2503,7 +3089,7 @@ export function createPodmanWriterSupervisor(...args) {
         [],
       );
       ensure(
-        regexpTest(CONTAINER_ID_PATTERN, containerId) &&
+        regexpTest(FULL_CONTAINER_ID_PATTERN, containerId) &&
           createdOutput.stdout === `${containerId}\n`,
         "podman_writer_output_invalid",
       );
@@ -2528,6 +3114,50 @@ export function createPodmanWriterSupervisor(...args) {
         await transition(record, "preparing", created),
         expected,
       );
+      const configuredInspectionOutput = await runPodman(
+        ["container", "inspect", "--format=json", containerId],
+        input.signal,
+      );
+      ensure(
+        configuredInspectionOutput.stderr === "",
+        "podman_writer_output_invalid",
+      );
+      const configuredInspection = inspectObject(
+        configuredInspectionOutput.stdout,
+        "podman_writer_output_invalid",
+      );
+      validateContainerInspection(
+        configuredInspection,
+        frozenRecord({
+          attachmentRoot,
+          attachmentSource: acquired.mountSource,
+          containerId,
+          containerName: name,
+          exactSourceProof: true,
+          imageDigest: digest,
+          liveObjectProof: false,
+        }),
+        false,
+      );
+      ensure(
+        ownJsonValue(
+          ownJsonValue(
+            configuredInspection,
+            "State",
+            "podman_writer_output_invalid",
+          ),
+          "Status",
+          "podman_writer_output_invalid",
+        ) === "configured",
+        "podman_writer_output_invalid",
+      );
+      await verifyCurrentFilesystemAuthority(
+        filesystemAuthority,
+        acquired,
+        configuredAttachmentRoot,
+        attachment,
+        input.signal,
+      );
       await runPodman(["start", containerId], input.signal);
       const inspected = await runPodman(
         ["container", "inspect", "--format=json", containerId],
@@ -2537,25 +3167,29 @@ export function createPodmanWriterSupervisor(...args) {
         inspected.stdout,
         "podman_writer_output_invalid",
       );
+      const runningInspectionExpected = frozenRecord({
+        attachmentRoot,
+        attachmentSource: acquired.mountSource,
+        containerId,
+        containerName: name,
+        exactSourceProof: true,
+        imageDigest: digest,
+        liveObjectProof: true,
+      });
       validateContainerInspection(
         inspection,
-        {
-          attachmentRoot,
-          attachmentSource: acquired.mountSource,
-          containerId,
-          containerName: name,
-          imageDigest: digest,
-          liveObjectProof: true,
-        },
+        runningInspectionExpected,
         true,
       );
-      await verifyRunningFilesystemAuthority(
+      await verifyRunningAttachmentBracket(
         filesystemAuthority,
         acquired,
-        configuredAttachmentRoot,
         attachment,
-        runningContainerPid(inspection, "podman_writer_output_invalid"),
+        inspection,
+        containerId,
+        runningInspectionExpected,
         input.signal,
+        "podman_writer_output_invalid",
       );
       const started = newStateRecord({
         containerName: name,
@@ -2693,15 +3327,16 @@ export function createPodmanWriterSupervisor(...args) {
           typeof isRunning === "boolean",
           "podman_writer_supervisor_outcome_uncertain",
         );
+        const inspectionExpected = frozenRecord({
+          attachmentRoot,
+          containerId: candidate.id,
+          containerName: name,
+          imageDigest: input.typed.image.platformImage.digest,
+          liveObjectProof: isRunning,
+        });
         const observedContainerId = validateContainerInspection(
           inspection,
-          {
-            attachmentRoot,
-            containerId: candidate.id,
-            containerName: name,
-            imageDigest: input.typed.image.platformImage.digest,
-            liveObjectProof: isRunning,
-          },
+          inspectionExpected,
           isRunning,
           "podman_writer_supervisor_outcome_uncertain",
         );
@@ -2709,6 +3344,8 @@ export function createPodmanWriterSupervisor(...args) {
           await proveRunningAttachment(
             attachment,
             inspection,
+            name,
+            inspectionExpected,
             input.signal,
             "podman_writer_supervisor_outcome_uncertain",
           );
@@ -2783,15 +3420,16 @@ export function createPodmanWriterSupervisor(...args) {
         typeof isRunning === "boolean",
         "podman_writer_supervisor_outcome_uncertain",
       );
+      const inspectionExpected = frozenRecord({
+        attachmentRoot,
+        containerId: record.containerId,
+        containerName: name,
+        imageDigest: input.typed.image.platformImage.digest,
+        liveObjectProof: isRunning,
+      });
       validateContainerInspection(
         inspection,
-        {
-          attachmentRoot,
-          containerId: record.containerId,
-          containerName: name,
-          imageDigest: input.typed.image.platformImage.digest,
-          liveObjectProof: isRunning,
-        },
+        inspectionExpected,
         isRunning,
         "podman_writer_supervisor_outcome_uncertain",
       );
@@ -2799,6 +3437,8 @@ export function createPodmanWriterSupervisor(...args) {
         await proveRunningAttachment(
           attachment,
           inspection,
+          record.containerId,
+          inspectionExpected,
           input.signal,
           "podman_writer_supervisor_outcome_uncertain",
         );
