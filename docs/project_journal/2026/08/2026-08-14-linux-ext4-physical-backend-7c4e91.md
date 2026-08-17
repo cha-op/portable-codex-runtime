@@ -368,6 +368,28 @@ change and does not attest the current head:
   after exit it waits through direct close for kernel `ESRCH` without
   signalling a potentially reused PGID. A wrapper-plus-helper fixture must
   prove group absence before authority close.
+- Head `100d580` passed the PostgreSQL integration and both real ext4 producer
+  and cross-host consumer jobs in Test run `31981977882`. Its two Ubuntu Node
+  jobs exposed a Linux-only fixture race: the fake holder could publish its
+  receipt and fail before Node observed `exit`, so forced cleanup legitimately
+  killed the descendant before the fixture's leader marker appeared. The
+  fixture now consumes the first heartbeat before requesting leader exit,
+  labels that marker only as an exit request, and registers its marker-based
+  bounded cleanup before the fixture-root cleanup. It never signals an
+  unbound numeric PID.
+- The same run's Podman lifecycle stayed pending from `00:25:49Z` until the
+  already-failed run was cancelled at `00:35:01Z`, without reaching the
+  integration catch/finally diagnostics. This matches the explicit exact-
+  `start` fail-stop boundary above. The conformance integration now has a
+  lifecycle-wide 45-second watchdog that emits only fixed durable/Podman state,
+  running, and PID categories, followed by a 60-second hard exit. Its workflow
+  step has a two-minute outer bound and its always-run image cleanup has a
+  separate one-minute/30-second command bound. The watchdog does not inject an
+  `AbortSignal` into the production `start` or settle that promise through its
+  normal cleanup path; it terminates only the ephemeral conformance process.
+  That exit closes the holder control pipe and may release the synthetic test
+  authority, so GitHub's disposable runner teardown is the outer diagnostic
+  fence, not evidence of a production recovery path.
 - On the final local bytes, supervisor/state focused tests passed 59/66 with
   seven Linux-only skips. The supervisor/state, logical-launcher, and physical-
   binding set passed 226/233 with the same seven skips. Full Node discovery with
@@ -376,7 +398,8 @@ change and does not attest the current head:
   holder helper, integration, and test files passed `node --check`; the bundled
   project-journal validator and tracked/untracked whitespace checks passed.
   Darwin did not execute the new Linux procfd/process-group tests or the real
-  rootless Podman holder path; the next Ubuntu job remains their runtime gate.
+  rootless Podman holder path; the next Ubuntu job remains their runtime gate
+  and will classify any retained start fail-stop before its hard bound.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

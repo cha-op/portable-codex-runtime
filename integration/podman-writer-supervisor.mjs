@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { writeSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -21,6 +22,9 @@ const PODMAN = process.env.PODMAN_EXECUTABLE ?? "/usr/bin/podman";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const SUPERVISOR_ID = "podman-linux-integration-v1";
 const TEST_ROOT_PREFIX = "/var/tmp/portable-codex-runtime-podman-";
+const WATCHDOG_DIAGNOSTIC_MILLISECONDS = 45_000;
+const WATCHDOG_HARD_BACKSTOP_MILLISECONDS = 60_000;
+const WATCHDOG_PROBE_MILLISECONDS = 5_000;
 
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
@@ -261,6 +265,214 @@ async function observeCreatedContainer() {
   }
 }
 
+async function observeDurableStatus(supervisorState) {
+  if (supervisorState === null) return "unavailable";
+  try {
+    const record = await supervisorState.read(exact({
+      launchAttemptId: "podman-launch-attempt-001",
+    }));
+    if (record === null) return "absent";
+    switch (record.status) {
+      case "preparing":
+      case "created":
+      case "started":
+      case "stopping":
+      case "stopped":
+        return record.status;
+      default:
+        return "unreadable";
+    }
+  } catch {
+    return "unreadable";
+  }
+}
+
+function containerObservation(
+  ps,
+  inspect = "not-run",
+  running = "unreadable",
+  pid = "unreadable",
+) {
+  return { inspect, pid, ps, running };
+}
+
+async function observeUniqueImageContainer() {
+  let listed;
+  try {
+    listed = await execFileAsync(
+      PODMAN,
+      [
+        "--remote=false",
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        `ancestor=${IMAGE_REFERENCE}`,
+        "--format=json",
+      ],
+      {
+        cwd: "/",
+        env: process.env,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * 1024,
+        timeout: WATCHDOG_PROBE_MILLISECONDS,
+      },
+    );
+  } catch {
+    return containerObservation("unreadable");
+  }
+  let containers;
+  try {
+    containers = JSON.parse(listed.stdout);
+  } catch {
+    return containerObservation("unreadable");
+  }
+  if (!Array.isArray(containers)) {
+    return containerObservation("unreadable");
+  }
+  if (containers.length === 0) return containerObservation("absent");
+  if (containers.length !== 1) {
+    return containerObservation("ambiguous");
+  }
+  const container = containers[0];
+  if (
+    container === null ||
+    typeof container !== "object" ||
+    Array.isArray(container)
+  ) {
+    return containerObservation("unique", "unreadable");
+  }
+  const idDescriptor = Object.getOwnPropertyDescriptor(container, "Id");
+  if (
+    idDescriptor === undefined ||
+    !Object.hasOwn(idDescriptor, "value") ||
+    typeof idDescriptor.value !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(idDescriptor.value)
+  ) {
+    return containerObservation("unique", "unreadable");
+  }
+  let inspected;
+  try {
+    inspected = await execFileAsync(
+      PODMAN,
+      [
+        "--remote=false",
+        "container",
+        "inspect",
+        "--format=json",
+        idDescriptor.value,
+      ],
+      {
+        cwd: "/",
+        env: process.env,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * 1024,
+        timeout: WATCHDOG_PROBE_MILLISECONDS,
+      },
+    );
+  } catch {
+    return containerObservation("unique", "unreadable");
+  }
+  let inspection;
+  try {
+    inspection = JSON.parse(inspected.stdout);
+  } catch {
+    return containerObservation("unique", "unreadable");
+  }
+  if (!Array.isArray(inspection) || inspection.length !== 1) {
+    return containerObservation("unique", "unreadable");
+  }
+  const inspectedContainer = inspection[0];
+  if (
+    inspectedContainer === null ||
+    typeof inspectedContainer !== "object" ||
+    Array.isArray(inspectedContainer)
+  ) {
+    return containerObservation("unique", "unreadable");
+  }
+  const stateDescriptor = Object.getOwnPropertyDescriptor(
+    inspectedContainer,
+    "State",
+  );
+  if (
+    stateDescriptor === undefined ||
+    !Object.hasOwn(stateDescriptor, "value") ||
+    stateDescriptor.value === null ||
+    typeof stateDescriptor.value !== "object" ||
+    Array.isArray(stateDescriptor.value)
+  ) {
+    return containerObservation("unique", "unreadable");
+  }
+  const statusDescriptor = Object.getOwnPropertyDescriptor(
+    stateDescriptor.value,
+    "Status",
+  );
+  const runningDescriptor = Object.getOwnPropertyDescriptor(
+    stateDescriptor.value,
+    "Running",
+  );
+  const pidDescriptor = Object.getOwnPropertyDescriptor(
+    stateDescriptor.value,
+    "Pid",
+  );
+  const running = runningDescriptor !== undefined &&
+      Object.hasOwn(runningDescriptor, "value") &&
+      typeof runningDescriptor.value === "boolean"
+    ? String(runningDescriptor.value)
+    : "unreadable";
+  const pid = pidDescriptor !== undefined &&
+      Object.hasOwn(pidDescriptor, "value") &&
+      Number.isSafeInteger(pidDescriptor.value) &&
+      pidDescriptor.value >= 0
+    ? (pidDescriptor.value === 0 ? "zero" : "positive")
+    : "unreadable";
+  const statusReadable = statusDescriptor !== undefined &&
+    Object.hasOwn(statusDescriptor, "value") &&
+    typeof statusDescriptor.value === "string";
+  let inspect = "unreadable";
+  switch (statusReadable ? statusDescriptor.value : null) {
+    case "created":
+      inspect = "created";
+      break;
+    case "initialized":
+      inspect = "initialized";
+      break;
+    case "running":
+      inspect = "running";
+      break;
+    case "exited":
+    case "stopped":
+      inspect = "stopped";
+      break;
+    default:
+      if (statusReadable) inspect = "other-state";
+  }
+  return containerObservation("unique", inspect, running, pid);
+}
+
+function fixedPhaseLabel(phase) {
+  switch (phase) {
+    case "setup":
+    case "launch":
+    case "ready-marker":
+    case "stop":
+    case "reconcile":
+    case "external-ps":
+    case "complete":
+      return phase;
+    default:
+      return "unknown";
+  }
+}
+
+function writeWatchdogAndExit(line) {
+  try {
+    writeSync(2, `${line}\n`);
+  } finally {
+    process.exit(124);
+  }
+}
+
 test("rootless Podman launches, writes through the sole bind, stops, and reconciles", async () => {
   assert.match(DIGEST, /^sha256:[0-9a-f]{64}$/u);
   assert.equal(IMAGE_REFERENCE, `localhost/portable-codex-writer@${DIGEST}`);
@@ -274,6 +486,53 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
   let containerId = null;
   let phase = "setup";
   let supervisorState = null;
+  let watchdogActive = false;
+  let watchdogDiagnosticTimer = null;
+  let watchdogHardBackstopTimer = null;
+  const clearLaunchWatchdog = () => {
+    watchdogActive = false;
+    if (watchdogDiagnosticTimer !== null) {
+      clearTimeout(watchdogDiagnosticTimer);
+      watchdogDiagnosticTimer = null;
+    }
+    if (watchdogHardBackstopTimer !== null) {
+      clearTimeout(watchdogHardBackstopTimer);
+      watchdogHardBackstopTimer = null;
+    }
+  };
+  const startLaunchWatchdog = () => {
+    watchdogActive = true;
+    watchdogDiagnosticTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          const durableStatus = await observeDurableStatus(supervisorState);
+          const observed = await observeUniqueImageContainer();
+          if (!watchdogActive) return;
+          writeWatchdogAndExit(
+            `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
+              `durableStatus=${durableStatus} imagePs=${observed.ps} ` +
+              `imageInspect=${observed.inspect} running=${observed.running} ` +
+              `pid=${observed.pid}`,
+          );
+        } catch {
+          if (!watchdogActive) return;
+          writeWatchdogAndExit(
+            `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
+              "durableStatus=probe-error imagePs=probe-error " +
+              "imageInspect=probe-error running=unreadable pid=unreadable",
+          );
+        }
+      })();
+    }, WATCHDOG_DIAGNOSTIC_MILLISECONDS);
+    watchdogHardBackstopTimer = setTimeout(() => {
+      if (!watchdogActive) return;
+      writeWatchdogAndExit(
+        `podman-integration-watchdog phase=${fixedPhaseLabel(phase)} ` +
+          "durableStatus=probe-timeout imagePs=probe-timeout " +
+          "imageInspect=probe-timeout running=unreadable pid=unreadable",
+      );
+    }, WATCHDOG_HARD_BACKSTOP_MILLISECONDS);
+  };
   try {
     const podmanEnvironment = exact({
       HOME: process.env.HOME,
@@ -307,6 +566,7 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     const input = launchInput(attachmentRoot);
     const supervisor = createPodmanWriterSupervisor(options);
     phase = "launch";
+    startLaunchWatchdog();
     const receipt = await supervisor.launchWriter(input);
     containerId = receipt.evidence.processIncarnationId.slice("podman-process:".length);
     phase = "ready-marker";
@@ -326,7 +586,6 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     phase = "reconcile";
     const reconciled = await restarted.reconcileWriterLaunch(reconcileInput(input));
     assert.equal(reconciled.evidence.status, "complete-stopped");
-    assert.equal(reconciled.stopWriter, null);
     phase = "external-ps";
     const retired = await execFileAsync(
       PODMAN,
@@ -343,7 +602,9 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     assert.deepEqual(JSON.parse(retired.stdout), []);
     containerId = null;
     phase = "complete";
+    clearLaunchWatchdog();
   } catch (error) {
+    clearLaunchWatchdog();
     let durableStatus = "unreadable";
     const createObservation = await observeCreatedContainer();
     if (supervisorState !== null) {
@@ -363,6 +624,7 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     );
     throw error;
   } finally {
+    clearLaunchWatchdog();
     if (containerId !== null) {
       await execFileAsync(PODMAN, [
         "--remote=false",

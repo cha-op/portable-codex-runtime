@@ -412,7 +412,7 @@ function descendantHolderPodmanScript({
   descendantExitPath,
   descendantPidPath,
   descendantReadyPath,
-  leaderGonePath,
+  leaderExitRequestedPath,
   mode,
   sourceAfterReleasePath,
   sourceRetainedPath,
@@ -423,14 +423,19 @@ function descendantHolderPodmanScript({
     Digest: DIGEST,
     Os: "linux",
   }]);
+  const markLeaderExitRequest = `: > ${shellQuote(leaderExitRequestedPath)}`;
   const afterReady = mode === "leader-error" || mode === "exit-before-close"
-    ? "exit 42"
+    ? `IFS= read -r command
+test "$command" = verify
+${markLeaderExitRequest}
+exit 42`
     : `while IFS= read -r command; do
   case "$command" in
     verify)
       printf '%s\\n' verified
       ;;
     close)
+      ${markLeaderExitRequest}
       exit 0
       ;;
     *)
@@ -438,6 +443,7 @@ function descendantHolderPodmanScript({
       ;;
   esac
 done
+${markLeaderExitRequest}
 exit 66`;
   const ready = mode === "timeout"
     ? "exec /bin/sleep 30"
@@ -463,13 +469,11 @@ case "$1" in
     attachment_ino=$(/usr/bin/stat -Lc %i /proc/self/fd/7)
     configured_dev=$(/usr/bin/stat -Lc %d /proc/self/fd/8)
     configured_ino=$(/usr/bin/stat -Lc %i /proc/self/fd/8)
-    leader_pid=$$
     (
       : > ${shellQuote(descendantReadyPath)}
-      while kill -0 "$leader_pid" 2>/dev/null; do
+      while ! test -f ${shellQuote(leaderExitRequestedPath)}; do
         /bin/sleep 0.01
       done
-      : > ${shellQuote(leaderGonePath)}
       if test -d /proc/self/fd/7; then
         : > ${shellQuote(sourceRetainedPath)}
       fi
@@ -1881,9 +1885,41 @@ test("Linux holder waits for its closed-stdio process group before authority rel
       let descendantExitPath;
       let descendantPidPath;
       let descendantReadyPath;
-      let leaderGonePath;
+      let leaderExitRequestedPath;
       let sourceAfterReleasePath;
       let sourceRetainedPath;
+      t.after(async () => {
+        if (
+          typeof descendantExitPath !== "string" ||
+          typeof descendantPidPath !== "string"
+        ) return;
+        try {
+          await writeFile(descendantExitPath, "cleanup\n", { mode: 0o600 });
+        } catch {
+          // A setup failure may leave no writable fixture root. The bounded
+          // absence check below still reports any recorded survivor.
+        }
+        let descendantPid = null;
+        try {
+          descendantPid = Number(
+            (await readFile(descendantPidPath, "utf8")).trim(),
+          );
+        } catch {
+          return;
+        }
+        for (
+          let attempt = 0;
+          attempt < 100 && processExists(descendantPid);
+          attempt += 1
+        ) {
+          await delay(10);
+        }
+        assert.equal(
+          processExists(descendantPid),
+          false,
+          "holder descendant ignored its test-owned cleanup marker",
+        );
+      });
       const base = await fixture(t, {
         commandTimeoutMilliseconds: 2_000,
         defaultCommandRunnerScript({ attachmentRoot, parent }) {
@@ -1891,7 +1927,10 @@ test("Linux holder waits for its closed-stdio process group before authority rel
           descendantExitPath = join(parent, "holder-descendant-exit");
           descendantPidPath = join(parent, "holder-descendant-pid");
           descendantReadyPath = join(parent, "holder-descendant-ready");
-          leaderGonePath = join(parent, "holder-leader-gone");
+          leaderExitRequestedPath = join(
+            parent,
+            "holder-leader-exit-requested",
+          );
           sourceAfterReleasePath = join(parent, "holder-source-after-release");
           sourceRetainedPath = join(parent, "holder-source-retained");
           return descendantHolderPodmanScript({
@@ -1901,7 +1940,7 @@ test("Linux holder waits for its closed-stdio process group before authority rel
             descendantExitPath,
             descendantPidPath,
             descendantReadyPath,
-            leaderGonePath,
+            leaderExitRequestedPath,
             mode,
             sourceAfterReleasePath,
             sourceRetainedPath,
@@ -1930,7 +1969,10 @@ test("Linux holder waits for its closed-stdio process group before authority rel
         if (mode === "timeout") {
           error = await pending;
         } else {
-          await waitForPath(leaderGonePath);
+          // This marker says only that the wrapper is about to exit. The
+          // production childExited/PGID barriers, not the fixture marker,
+          // establish waitpid and process-group quiescence.
+          await waitForPath(leaderExitRequestedPath);
           await waitForPath(sourceRetainedPath);
           await delay(100);
           assert.equal(settled, false);

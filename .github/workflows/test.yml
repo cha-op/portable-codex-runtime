@@ -95,6 +95,7 @@ jobs:
           test -n "$digest"
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
       - name: Exercise launch, bind write, stop, and cold reconcile
+        timeout-minutes: 2
         run: node --test integration/podman-writer-supervisor.mjs
         env:
           PODMAN_EXECUTABLE: /usr/bin/podman
@@ -103,7 +104,8 @@ jobs:
           PODMAN_WRITER_TEST_ROOT: /var/tmp/portable-codex-runtime-podman-${{ github.run_id }}
       - name: Remove the integration image
         if: always()
-        run: /usr/bin/podman --remote=false image rm --force localhost/portable-codex-writer:integration || true
+        timeout-minutes: 1
+        run: /usr/bin/timeout --signal=KILL 30s /usr/bin/podman --remote=false image rm --force localhost/portable-codex-writer:integration || true
 
   linux-ext4-producer:
     name: Linux ext4 physical producer
