@@ -17,6 +17,7 @@ import {
 
 const BACKEND_ID = "ext4-backend-001";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
+const SECOND_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 
 function pathsError(code) {
   return (error) =>
@@ -119,6 +120,88 @@ function persistentPathSnapshot(paths) {
     source,
     storageId,
   };
+}
+
+function isolationPathSnapshot(paths, sessionId, suffix) {
+  const storageId = paths.storageIdForSession(sessionId);
+  const provision = paths.planProvision({
+    backendId: BACKEND_ID,
+    contractVersion: 1,
+    operationId: `provision-operation-${suffix}`,
+    sessionId,
+  });
+  const attachRequest = {
+    ...mutation("attach", storageId),
+    operationId: `attach-operation-${suffix}`,
+    sessionId,
+  };
+  const attachment = paths.planWritableAttachment(attachRequest);
+  const restore = paths.planRestoreDestination({
+    ...mutation("restore", storageId),
+    operationId: `restore-operation-${suffix}`,
+    sessionId,
+  });
+  const descriptor = {
+    artifactId: "artifact-001",
+    backendId: BACKEND_ID,
+    checkpointClass: "clean",
+    checkpointId: "checkpoint-001",
+    codexSessionId: sessionId,
+    codexThreadId: sessionId,
+    contractVersion: 1,
+    createdAt: "2026-08-14T12:00:00.000Z",
+    imageDigest: `sha256:${"a".repeat(64)}`,
+    sessionId,
+    sourceFencingEpoch: "1",
+    storageId,
+  };
+  const checkpointRequest = {
+    ...mutation("checkpoint", storageId),
+    operationId: `checkpoint-operation-${suffix}`,
+    sessionId,
+  };
+  const artifact = paths.resolveArtifactPaths({
+    checkpoint: descriptor,
+    request: checkpointRequest,
+  });
+  const source = paths.resolveSourceOwnedRoot({
+    canonicalAttachment: {
+      attachmentId: attachRequest.target.attachmentId,
+      backendId: BACKEND_ID,
+      contractVersion: 1,
+      fencingEpoch: "1",
+      holderId: "holder-001",
+      kind: "directory",
+      leaseId: "lease-001",
+      mode: "read-write",
+      operationId: attachRequest.operationId,
+      proofId: `proof-iterator-isolation-${suffix}`,
+      rootPath: attachment.attachmentRootPath,
+      sessionId,
+      storageId,
+    },
+    checkpoint: descriptor,
+    request: checkpointRequest,
+  });
+  return {
+    artifact,
+    attachment,
+    provision,
+    restore,
+    source,
+    storageId,
+  };
+}
+
+function arrayTargetsDigestDomain(value) {
+  return (
+    Array.isArray(value) &&
+    (value[0] === "session" ||
+      value[0] === "storage" ||
+      value[0] === "data-root" ||
+      value[0] === "restore-operation" ||
+      value[0] === "artifact")
+  );
 }
 
 test("derives deterministic disjoint direct-child image, mount, and artifact paths", () => {
@@ -495,6 +578,104 @@ test(
     assert.equal(poisonCalls, 0);
     assert.deepEqual(replay, baseline);
     assert.deepEqual(restarted, baseline);
+  },
+);
+
+test(
+  "keeps session and storage paths isolated after Array iterator pollution",
+  { concurrency: false },
+  () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    assert.equal(typeof iteratorDescriptor?.value, "function");
+    const originalIterator = iteratorDescriptor.value;
+    const paths = fixture();
+    const firstBaseline = isolationPathSnapshot(paths, SESSION_ID, "first");
+    const secondBaseline = isolationPathSnapshot(
+      paths,
+      SECOND_SESSION_ID,
+      "second",
+    );
+    assert.notEqual(firstBaseline.storageId, secondBaseline.storageId);
+    assert.notEqual(
+      firstBaseline.provision.imagePath,
+      secondBaseline.provision.imagePath,
+    );
+    assert.notEqual(
+      firstBaseline.provision.mountPath,
+      secondBaseline.provision.mountPath,
+    );
+    assert.notEqual(
+      firstBaseline.attachment.attachmentRootPath,
+      secondBaseline.attachment.attachmentRootPath,
+    );
+    assert.notEqual(
+      firstBaseline.restore.destinationDirectory,
+      secondBaseline.restore.destinationDirectory,
+    );
+    assert.notEqual(
+      firstBaseline.artifact.artifactDirectory,
+      secondBaseline.artifact.artifactDirectory,
+    );
+
+    let firstReplay;
+    let secondReplay;
+    let observedError = null;
+    let poisonCalls = 0;
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        ...iteratorDescriptor,
+        value: function hostileDigestPartsIterator() {
+          if (arrayTargetsDigestDomain(this)) {
+            poisonCalls += 1;
+            return {
+              next() {
+                return { done: true, value: undefined };
+              },
+            };
+          }
+          return Reflect.apply(originalIterator, this, []);
+        },
+      });
+      firstReplay = isolationPathSnapshot(paths, SESSION_ID, "first");
+      secondReplay = isolationPathSnapshot(
+        paths,
+        SECOND_SESSION_ID,
+        "second",
+      );
+    } catch (error) {
+      observedError = error;
+    } finally {
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.equal(observedError, null);
+    assert.equal(poisonCalls, 0);
+    assert.deepEqual(firstReplay, firstBaseline);
+    assert.deepEqual(secondReplay, secondBaseline);
+    assert.notEqual(firstReplay.storageId, secondReplay.storageId);
+    assert.notEqual(
+      firstReplay.provision.mountPath,
+      secondReplay.provision.mountPath,
+    );
+    assert.notEqual(
+      firstReplay.attachment.attachmentRootPath,
+      secondReplay.attachment.attachmentRootPath,
+    );
+    assert.notEqual(
+      firstReplay.restore.destinationDirectory,
+      secondReplay.restore.destinationDirectory,
+    );
+    assert.notEqual(
+      firstReplay.artifact.artifactDirectory,
+      secondReplay.artifact.artifactDirectory,
+    );
   },
 );
 

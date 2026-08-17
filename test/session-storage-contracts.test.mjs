@@ -2567,6 +2567,108 @@ test("storage force-fence validation uses captured intrinsics", () => {
   assert(Object.isFrozen(checkedResult.target));
 });
 
+test(
+  "storage mutation target ID validation ignores post-import Array iterator poisoning",
+  { concurrency: false },
+  () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const targetIds = [
+      { field: "attachmentId", operation: "attach" },
+      { field: "artifactId", operation: "checkpoint" },
+      { field: "checkpointId", operation: "checkpoint" },
+      { field: "attachmentId", operation: "detach" },
+      { field: "artifactId", operation: "restore" },
+      { field: "checkpointId", operation: "restore" },
+    ];
+    const invalidIds = [
+      { label: "undefined", value: undefined },
+      { label: "NUL", value: "target\0id" },
+      { label: "slash", value: "target/id" },
+      { label: "noncanonical leading separator", value: "-target-id" },
+    ];
+    const invalidErrors = new Array(targetIds.length * invalidIds.length);
+    const validErrors = new Array(targetIds.length);
+    const validatedRequests = new Array(targetIds.length);
+    let poisonedCalls = 0;
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        ...iteratorDescriptor,
+        value() {
+          poisonedCalls += 1;
+          return {
+            next() {
+              return { done: true };
+            },
+          };
+        },
+      });
+      let invalidIndex = 0;
+      for (let targetIndex = 0; targetIndex < targetIds.length; targetIndex += 1) {
+        const targetId = targetIds[targetIndex];
+        const validRequest = mutationRequest({ operation: targetId.operation });
+        try {
+          validatedRequests[targetIndex] =
+            assertStorageMutationRequest(validRequest);
+        } catch (error) {
+          validErrors[targetIndex] = error;
+        }
+        for (
+          let invalidIdIndex = 0;
+          invalidIdIndex < invalidIds.length;
+          invalidIdIndex += 1
+        ) {
+          const invalidId = invalidIds[invalidIdIndex];
+          const invalidRequest = mutationRequest({
+            operation: targetId.operation,
+          });
+          invalidRequest.target = {
+            ...invalidRequest.target,
+            [targetId.field]: invalidId.value,
+          };
+          try {
+            assertStorageMutationRequest(invalidRequest);
+          } catch (error) {
+            invalidErrors[invalidIndex] = error;
+          }
+          invalidIndex += 1;
+        }
+      }
+    } finally {
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.equal(poisonedCalls, 0);
+    let invalidIndex = 0;
+    for (let targetIndex = 0; targetIndex < targetIds.length; targetIndex += 1) {
+      const targetId = targetIds[targetIndex];
+      assert.equal(validErrors[targetIndex], undefined);
+      assert.deepEqual(
+        validatedRequests[targetIndex],
+        mutationRequest({ operation: targetId.operation }),
+      );
+      for (
+        let invalidIdIndex = 0;
+        invalidIdIndex < invalidIds.length;
+        invalidIdIndex += 1
+      ) {
+        const invalidId = invalidIds[invalidIdIndex];
+        assert.ok(
+          assertCode("invalid_storage_mutation")(invalidErrors[invalidIndex]),
+          `${targetId.operation}.${targetId.field} accepted ${invalidId.label}`,
+        );
+        invalidIndex += 1;
+      }
+    }
+  },
+);
+
 test("storage mutation envelopes bind operation IDs to the complete writer fence", () => {
   const request = mutationRequest();
   assert.deepEqual(assertStorageMutationRequest(request), request);

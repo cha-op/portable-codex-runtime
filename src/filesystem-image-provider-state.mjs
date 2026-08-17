@@ -450,7 +450,10 @@ function exactDataObject(value, allowedKeys, requiredKeys, code) {
     code,
   );
   const normalized = objectCreate(null);
-  for (const key of keys) normalized[key] = ownDataValue(value, key, code);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    normalized[key] = ownDataValue(value, key, code);
+  }
   return normalized;
 }
 
@@ -557,7 +560,9 @@ function canonicalize(
       fail(code);
     }
     const keySet = new SetConstructor();
-    for (const key of keys) callIntrinsic(setAddIntrinsic, keySet, [key]);
+    for (let index = 0; index < keys.length; index += 1) {
+      callIntrinsic(setAddIntrinsic, keySet, [keys[index]]);
+    }
     ensure(
       keys.length === length + 1 &&
         callIntrinsic(setHasIntrinsic, keySet, ["length"]),
@@ -590,7 +595,8 @@ function canonicalize(
   const result = {};
   const sortedKeys = callIntrinsic(arraySliceIntrinsic, keys, []);
   arraySort(sortedKeys);
-  for (const key of sortedKeys) {
+  for (let index = 0; index < sortedKeys.length; index += 1) {
+    const key = sortedKeys[index];
     assertLosslessString(
       key,
       code,
@@ -630,7 +636,8 @@ function canonicalString(value) {
   const fields = [];
   const sortedKeys = reflectOwnKeys(value);
   arraySort(sortedKeys);
-  for (const key of sortedKeys) {
+  for (let index = 0; index < sortedKeys.length; index += 1) {
+    const key = sortedKeys[index];
     const descriptor = objectGetOwnPropertyDescriptor(value, key);
     arrayPush(
       fields,
@@ -1535,13 +1542,11 @@ function normalizeCheckpointOperationRecord(value, code) {
     "storageId",
     "storageStateBefore",
   ];
-  const committedKeys = [
-    ...commonKeys,
-    "committedStateRevision",
-    "expectedStorage",
-    "result",
-    "storageState",
-  ];
+  const committedKeys = callIntrinsic(arraySliceIntrinsic, commonKeys, []);
+  arrayPush(committedKeys, "committedStateRevision");
+  arrayPush(committedKeys, "expectedStorage");
+  arrayPush(committedKeys, "result");
+  arrayPush(committedKeys, "storageState");
   const record = exactDataObject(
     value,
     state === "prepared" ? commonKeys : committedKeys,
@@ -1929,11 +1934,11 @@ function finishCheckpointStateHash(hash) {
 
 function checkpointStateChecksum(stateRevision, operations, storages) {
   const hash = createCheckpointStateHash(stateRevision);
-  for (const operation of operations) {
-    updateCheckpointStateHash(hash, "operation", operation);
+  for (let index = 0; index < operations.length; index += 1) {
+    updateCheckpointStateHash(hash, "operation", operations[index]);
   }
-  for (const storage of storages) {
-    updateCheckpointStateHash(hash, "storage", storage);
+  for (let index = 0; index < storages.length; index += 1) {
+    updateCheckpointStateHash(hash, "storage", storages[index]);
   }
   return finishCheckpointStateHash(hash);
 }
@@ -2186,7 +2191,12 @@ async function openDirectoryAuthority(
           "unsafe_directory",
         );
         let currentChildUid = pathMetadata.uid;
-        for (const ancestor of authority.ancestors) {
+        for (
+          let index = 0;
+          index < authority.ancestors.length;
+          index += 1
+        ) {
+          const ancestor = authority.ancestors[index];
           const currentAncestor = await lstat(ancestor.path, { bigint: true });
           ensure(
             sameFileIdentity(currentAncestor, ancestor.identity) &&
@@ -3180,15 +3190,15 @@ async function writeCheckpointFrames(handle, state, generation, baseHeadChecksum
     storageCount: snapshot.storages.length,
     type: "checkpoint-start",
   });
-  for (const operation of snapshot.operations) {
+  for (let index = 0; index < snapshot.operations.length; index += 1) {
     await appendCheckpointFrame({
-      operation,
+      operation: snapshot.operations[index],
       type: "checkpoint-operation",
     });
   }
-  for (const storage of snapshot.storages) {
+  for (let index = 0; index < snapshot.storages.length; index += 1) {
     await appendCheckpointFrame({
-      storage,
+      storage: snapshot.storages[index],
       type: "checkpoint-storage",
     });
   }

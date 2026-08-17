@@ -1590,7 +1590,10 @@ function assertStorageMutationTarget(value, { operation, storageId }) {
       ["checkpointId", "target checkpoint ID"],
     ],
   }[operation];
-  for (const [field, label] of requiredIds) {
+  for (let index = 0; index < requiredIds.length; index += 1) {
+    const requiredId = requiredIds[index];
+    const field = requiredId[0];
+    const label = requiredId[1];
     assertOpaqueId(value[field], "invalid_storage_mutation", label);
   }
   if (operation === "destroy") {

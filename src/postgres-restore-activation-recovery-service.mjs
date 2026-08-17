@@ -1228,7 +1228,9 @@ async function callListInternal(callback, request, kind, code) {
 }
 
 function callList(...args) {
-  return protectPromise(callListInternal(...args));
+  return protectPromise(
+    callListInternal(args[0], args[1], args[2], args[3]),
+  );
 }
 
 async function reconcileCandidateInternal(callback, candidate, code) {
@@ -1260,7 +1262,9 @@ async function reconcileCandidateInternal(callback, candidate, code) {
 }
 
 function reconcileCandidate(...args) {
-  return protectPromise(reconcileCandidateInternal(...args));
+  return protectPromise(
+    reconcileCandidateInternal(args[0], args[1], args[2]),
+  );
 }
 
 async function assertRecoveryLeaseHeldInternal(lifecycleLease, code) {
@@ -1291,7 +1295,9 @@ async function assertRecoveryLeaseHeldInternal(lifecycleLease, code) {
 }
 
 function assertRecoveryLeaseHeld(...args) {
-  return protectPromise(assertRecoveryLeaseHeldInternal(...args));
+  return protectPromise(
+    assertRecoveryLeaseHeldInternal(args[0], args[1]),
+  );
 }
 
 function batchResult(afterSessionId, nextAfterSessionId, results, status) {
@@ -1489,7 +1495,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   }
 
   function runLane(...laneArgs) {
-    return protectPromise(runLaneInternal(...laneArgs));
+    return protectPromise(runLaneInternal(laneArgs[0], laneArgs[1]));
   }
 
   async function withFlightInternal(callback) {

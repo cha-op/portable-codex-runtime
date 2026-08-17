@@ -234,7 +234,10 @@ ID to that target and compare the writer tuple atomically with its canonical
 state as part of the mutation. Calling `assertCanonicalFenceMatch()` and then
 performing an unrelated write is only structural validation and remains a
 TOCTOU bug. Executable request and result validators bind the operation, target,
-operation ID, full writer tuple, status, and backend proof. The snapshot
+operation ID, full writer tuple, status, and backend proof. Every operation-
+specific target ID is validated through dense indexed schema entries rather
+than the mutable Array iterator, so post-import prototype pollution cannot omit
+an attachment, artifact, checkpoint, or storage ID check. The snapshot
 comparison helper also checks the portable storage reference, but remains
 non-atomic and non-authorizing. A concrete adapter must repeat the
 storage-reference and writer-tuple comparison atomically with its mutation. Its

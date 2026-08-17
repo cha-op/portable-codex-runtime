@@ -701,6 +701,33 @@ change and does not attest the current head:
   orders, and disjoint-root admission. These are lexical containment,
   nameability, and durable checksum properties; they do not treat ordinary
   filesystem metadata churn as object replacement.
+- A final whole-range review found that several safety-sensitive internal
+  arrays still used the mutable Array iterator after module import. The ext4
+  path planner now hashes every module-owned digest component by dense index,
+  while provider-state request canonicalization, checkpoint hashing and
+  publication, and ancestor-policy revalidation use the same indexed rule.
+  Hostile post-import iterator replacement can no longer collapse distinct
+  session paths, turn a conflicting request into replay, or skip an ancestor
+  policy check. Regression coverage poisons only the targeted arrays and proves
+  the original path, replay, and access-policy results remain intact; this
+  hardens lexical and durable identity plus access-policy observation without
+  treating unrelated metadata churn as mutation.
+- The same-family range audit found four remaining dynamic iterator reads at
+  authority boundaries. Inspector helper argv and filesystem-identity schemas
+  now use indexed copies, so an observation verb cannot become a mutation and
+  canonical decimal runtime `device`/`inode` checks cannot disappear; durable
+  filesystem and object identity remain separate inspector proofs. Restore-
+  recovery wrappers forward their dense rest slots explicitly, preserving the
+  exact list/reconcile callback and lifecycle lease during admitted candidate
+  work. Their receipt remains process-local provenance bound to service, lane,
+  cursor, limit, and lease; the cursor store remains the durable CAS authority.
+  Storage mutation target schemas likewise index both the required-ID list and
+  each field/label pair. Targeted post-import iterator tests prove that helper
+  mutation paths, lease probes, callbacks, receipt provenance, and every
+  attachment/artifact/checkpoint ID validation remain unchanged. These fixes
+  protect dispatch classification, in-process recovery provenance, and
+  canonical target identity; they do not turn serialized inputs into physical
+  authority.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

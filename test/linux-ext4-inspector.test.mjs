@@ -1674,6 +1674,138 @@ process.stdout.write("ok\\n");
   assert.equal(stderr.length, 0);
 });
 
+test(
+  "post-import iterator poisoning cannot retarget create-directory",
+  { concurrency: false },
+  async () => {
+    const requestedName = "requested-child";
+    const injectedName = "injected-sibling";
+    const request = Object.freeze({
+      exclusive: true,
+      operation: "create-directory",
+      parentDevice: "2049",
+      parentInode: "42",
+      path: `${TRUSTED_ROOT}/sessions/${requestedName}`,
+    });
+    const operationCompletion = completion({
+      stdout: Buffer.from(
+        `${JSON.stringify({
+          created: true,
+          device: "2049",
+          inode: "43",
+          status: "ok",
+        })}\n`,
+        "utf8",
+      ),
+    });
+    let observedArgs;
+    let observedHelperPath;
+    let observedMutationPath;
+    let sensitiveIteratorReads = 0;
+    const fixture = createFixture({
+      runHelper: async (helperPath, args) => {
+        observedHelperPath = helperPath;
+        observedArgs = args;
+        let nameIndex = -1;
+        for (let index = 0; index < args.length; index += 1) {
+          if (args[index] === "--name") nameIndex = index;
+        }
+        if (nameIndex >= 0 && nameIndex + 1 < args.length) {
+          observedMutationPath = `${TRUSTED_ROOT}/sessions/${args[nameIndex + 1]}`;
+        }
+        return operationCompletion;
+      },
+    });
+
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const originalIterator = iteratorDescriptor.value;
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      configurable: iteratorDescriptor.configurable,
+      enumerable: iteratorDescriptor.enumerable,
+      value: function targetedIteratorPoison() {
+        if (
+          this.length === 6 &&
+          this[0] === "device" &&
+          this[1] === "inode" &&
+          this[2] === "parentDevice" &&
+          this[3] === "parentInode" &&
+          this[4] === "targetDevice" &&
+          this[5] === "targetInode"
+        ) {
+          sensitiveIteratorReads += 1;
+        }
+        if (
+          this.length === 10 &&
+          this[0] === "--verb" &&
+          this[1] === "create-directory" &&
+          this[2] === "--name" &&
+          this[3] === requestedName
+        ) {
+          sensitiveIteratorReads += 1;
+          const source = this;
+          let index = 0;
+          return {
+            next() {
+              if (index >= source.length) {
+                return { done: true, value: undefined };
+              }
+              const value = index === 3 ? injectedName : source[index];
+              index += 1;
+              return { done: false, value };
+            },
+          };
+        }
+        return Reflect.apply(originalIterator, this, []);
+      },
+      writable: iteratorDescriptor.writable,
+    });
+
+    let receipt;
+    try {
+      receipt = await fixture.inspector.runFdOperation(request);
+    } finally {
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.equal(sensitiveIteratorReads, 0);
+    assert.equal(observedHelperPath, HELPER_PATH);
+    assert.deepEqual(observedArgs, [
+      "operate",
+      "--root",
+      TRUSTED_ROOT,
+      "--relative",
+      "sessions",
+      "--verb",
+      "create-directory",
+      "--name",
+      requestedName,
+      "--exclusive",
+      "yes",
+      "--parent-device",
+      "2049",
+      "--parent-inode",
+      "42",
+    ]);
+    assert.equal(Object.isFrozen(observedArgs), true);
+    assert.equal(request.path, `${TRUSTED_ROOT}/sessions/${requestedName}`);
+    assert.equal(Object.isFrozen(request), true);
+    assert.equal(observedMutationPath, request.path);
+    assert.deepEqual(receipt, {
+      created: true,
+      device: "2049",
+      inode: "43",
+      status: "ok",
+    });
+  },
+);
+
 test("invalid, escaped, and outside paths never dispatch the helper", async () => {
   const fixture = createFixture();
   const cases = [

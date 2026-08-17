@@ -580,14 +580,17 @@ async function invokeHelper(
   preserveMismatch = false,
 ) {
   const selected = await selectInspectionRoot(state, path);
-  const args = objectFreeze([
+  const args = [
     command,
     "--root",
     selected.root,
     "--relative",
     selected.relativePath,
-    ...extraArgs,
-  ]);
+  ];
+  for (let index = 0; index < extraArgs.length; index += 1) {
+    arrayPush(args, extraArgs[index]);
+  }
+  objectFreeze(args);
   let completion;
   try {
     const pending = callIntrinsic(state.runHelper, undefined, [
@@ -887,6 +890,15 @@ const FD_OPERATION_KEYS = objectFreeze({
   ]),
 });
 
+const FD_IDENTITY_KEYS = objectFreeze([
+  "device",
+  "inode",
+  "parentDevice",
+  "parentInode",
+  "targetDevice",
+  "targetInode",
+]);
+
 function exactFdOperationRequest(value) {
   if (
     value === null ||
@@ -936,14 +948,8 @@ function exactFdOperationRequest(value) {
   const path =
     operation === "provision-control-root" ? result.rootPath : result.path;
   if (!validAbsolutePath(path) || path === "/") fail("invalid_path");
-  for (const key of [
-    "device",
-    "inode",
-    "parentDevice",
-    "parentInode",
-    "targetDevice",
-    "targetInode",
-  ]) {
+  for (let index = 0; index < FD_IDENTITY_KEYS.length; index += 1) {
+    const key = FD_IDENTITY_KEYS[index];
     if (
       objectHasOwn(result, key) &&
       !uint64Decimal(

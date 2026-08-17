@@ -236,7 +236,12 @@ function digest(parts) {
     "portable-codex-runtime/ext4-path/v1\0",
     "utf8",
   ]);
-  for (const part of parts) {
+  // `parts` is always a dense, module-owned array. Persistent identity and
+  // lexical path derivation require every component, in order, to be hashed;
+  // indexed access prevents post-import Array iterator pollution from
+  // omitting or selectively clipping those components.
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
     const byteLength = reflectApply(bufferByteLengthIntrinsic, Buffer, [
       part,
       "utf8",

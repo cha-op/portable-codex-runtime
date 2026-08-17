@@ -35,7 +35,13 @@ The physical implementation remains split into small authorities:
 - `LinuxExt4Inspector` invokes one fixed absolute native helper. It obtains an
   ext4 filesystem UUID, persistent file-handle identity, and runtime
   `device`/`inode` binding from one pinned file descriptor. It also owns the
-  closed FD-operation protocol used by the driver.
+  closed FD-operation protocol used by the driver. Helper argv is assembled
+  from the frozen request by dense index, and all six runtime `device`/`inode`
+  request fields are validated through an indexed frozen key list. Post-import
+  Array iterator replacement therefore cannot turn a read-only verb into a
+  mutation, retarget a child, or skip canonical decimal runtime-binding
+  validation. Persistent filesystem and object identity remain separate
+  inspector proofs.
 - `LinuxExt4ImageDriver` owns sparse-image creation, `mkfs.ext4`, loop-device
   attachment, ext4 mount inside a host-owned private mount namespace,
   `syncfs`, unmount, loop detach settlement, control-file provisioning, and
@@ -105,8 +111,11 @@ storage mount path can host both fixed-shape
 `data-<48hex>` and `generation-<48hex>` children within the 4095-byte native
 pathname domain. Existing prepared or committed operations and cold-open state
 reconstruct their original image and mount plan without retroactively applying
-that new admission rule. These are lexical nameability and containment
-prerequisites, not object-identity or content-change signals.
+that new admission rule. Module-owned digest components are traversed by dense
+index rather than the mutable Array iterator, so post-import prototype
+pollution cannot omit components or collapse distinct session and storage
+paths. These are lexical nameability and containment prerequisites, not
+object-identity or content-change signals.
 
 The inspector rejects duplicate or pairwise-overlapping trusted roots during
 construction. A path therefore selects exactly one configured root before any
@@ -351,7 +360,11 @@ checkpoint, and log pathname is built through module-load-captured `node:path`
 helpers and must still equal one exact direct child of that directory. The
 module likewise captures `node:crypto.createHash`, so post-import builtin
 replacement can neither redirect durable files nor change SHA-256 frame, head,
-or checkpoint identities across restart.
+or checkpoint identities across restart. Canonical request keys, checkpoint
+records, and the retained ancestor-policy chain are also traversed by dense
+index rather than the mutable Array iterator. Post-import iterator replacement
+therefore cannot change replay identity, checkpoint content, or skip an
+access-policy revalidation.
 
 Rotation streams a checksum-framed checkpoint containing every prepared and
 committed operation, the exact replay fields for each operation, every current

@@ -3106,6 +3106,115 @@ test("provider-state paths and SHA-256 survive post-import builtin replacement",
   });
 });
 
+test(
+  "post-import Array iterator pollution cannot change requests or skip ancestor policy revalidation",
+  { concurrency: false },
+  async (t) => {
+    const replayFixture = await createFixture(t);
+    const ancestorFixture = await createFixture(t);
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    assert.equal(typeof iteratorDescriptor?.value, "function");
+
+    function* hostileArrayIterator() {
+      const length = this.length;
+      const requestKeyArray =
+        length === 2 &&
+        ((this[0] === "fence" && this[1] === "target") ||
+          (this[0] === "target" && this[1] === "fence"));
+      if (requestKeyArray) return;
+
+      let ancestorArray = length > 0;
+      for (let index = 0; index < length; index += 1) {
+        const entry = this[index];
+        if (
+          entry === null ||
+          typeof entry !== "object" ||
+          !Object.hasOwn(entry, "identity") ||
+          !Object.hasOwn(entry, "path")
+        ) {
+          ancestorArray = false;
+          break;
+        }
+      }
+      if (ancestorArray) return;
+
+      for (let index = 0; index < length; index += 1) {
+        yield this[index];
+      }
+    }
+
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      ...iteratorDescriptor,
+      value: hostileArrayIterator,
+    });
+    try {
+      const replayState = replayFixture.createState();
+      const firstRequest = {
+        target: "storage-target-a",
+        fence: { epoch: "1", holderId: "holder-a" },
+      };
+      await replayState.prepareOperation({
+        kind: "provision",
+        operationId: "operation-hostile-array-iterator-replay",
+        request: firstRequest,
+        storageId: "storage-hostile-array-iterator",
+      });
+      await assert.rejects(
+        replayState.prepareOperation({
+          kind: "provision",
+          operationId: "operation-hostile-array-iterator-replay",
+          request: {
+            target: "storage-target-b",
+            fence: { epoch: "2", holderId: "holder-b" },
+          },
+          storageId: "storage-hostile-array-iterator",
+        }),
+        stateError("operation_conflict"),
+      );
+      assert.equal(replayFixture.headAnchorTracker.advances, 1);
+
+      let ancestorPolicyUnsafe = false;
+      let unsafeAncestorChecks = 0;
+      const ancestorState = ancestorFixture.createState({
+        acquireLock: async () => {
+          ancestorPolicyUnsafe = true;
+          let released = false;
+          return {
+            async assertHeld() {
+              if (released) throw new Error("lock lost");
+            },
+            async release() {
+              released = true;
+            },
+          };
+        },
+        inspectAncestorAcl: async () => {
+          if (ancestorPolicyUnsafe) unsafeAncestorChecks += 1;
+          return ancestorPolicyUnsafe;
+        },
+      });
+      await assert.rejects(
+        ancestorState.snapshot(),
+        stateError("unsafe_directory"),
+      );
+      assert.equal(unsafeAncestorChecks, 1);
+    } finally {
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator),
+      iteratorDescriptor,
+    );
+  },
+);
+
 test("validation and replay survive post-import intrinsic poisoning in isolation", async (t) => {
   const fixture = await createFixture(t);
   await fixture.state.snapshot();

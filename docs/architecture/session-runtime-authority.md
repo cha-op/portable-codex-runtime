@@ -1732,7 +1732,13 @@ advancing its settled cursor. Generation, activation, and launch-attempt
 failures remain `pending`; current launches are reported only as
 `requires-stop-or-fence`. The service accepts no image resolver, launch
 callback, writer handle, publication callback, or opaque capability and can
-neither relaunch nor adopt a running process.
+neither relaunch nor adopt a running process. Its internal rest arrays are
+forwarded through explicit dense slots rather than call spread, so post-import
+Array iterator replacement cannot substitute a list or reconciliation
+callback, null out the lifecycle lease, or mint a receipt for different
+candidate work. The receipt remains process-local provenance bound to the
+service, lane, input cursor, limit, and lifecycle lease; the cursor store below
+remains the durable compare-and-swap authority.
 
 `PostgresRestoreRecoveryCursorStore` persists each lane outside session
 storage under a startup-selected recovery scope. Revision, cycle, and prior
