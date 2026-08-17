@@ -508,6 +508,21 @@ change and does not attest the current head:
   the image entrypoint with the configured writer executable. Holder abort
   listener setup uses captured `EventTarget` intrinsics without an inherited
   options dictionary and keeps force-stop/reap in the failure path.
+- The authority-free ordinary-bind control reproduced the protected launch's
+  conmon initial-parent failure and classified its bounded stderr as
+  `log-config` with no errno. This excludes procfd traversal, crun mount setup,
+  and keep-id mapping as the direct failure. Writer stdout and stderr are not
+  authority evidence, so production and control create commands now select
+  Podman's `none` log driver explicitly. Success remains gated by exact
+  configured and running inspections plus the live attachment bracket; host
+  `log_tag` and default log-driver policy can no longer make conmon reject the
+  otherwise fixed writer shape. The inherited `capture` regression now installs
+  its poison after the preliminary rootless proof has spawned. Its signal
+  wrapper delegates and counts Node's null-prototype listener options for both
+  pre-holder children, while the holder remains required to use the captured
+  `EventTarget` intrinsics. The exact-start abort regression also attaches its
+  rejection observer before release, preserving the production fail-stop
+  timing without a test-runner unhandled-rejection race.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

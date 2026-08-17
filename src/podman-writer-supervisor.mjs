@@ -3097,6 +3097,7 @@ export function createPodmanWriterSupervisor(...args) {
         name,
         "--pull=never",
         "--image-volume=ignore",
+        "--log-driver=none",
         "--read-only",
         "--security-opt=no-new-privileges",
         "--cap-drop=all",

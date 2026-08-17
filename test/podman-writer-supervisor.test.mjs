@@ -367,7 +367,12 @@ esac
 `;
 }
 
-function failingHolderPodmanScript({ mode, pidPath }) {
+function failingHolderPodmanScript({
+  mode,
+  pidPath,
+  rootlessProofReadyPath = null,
+  rootlessProofReleasePath = null,
+}) {
   const image = JSON.stringify([{
     Architecture: "amd64",
     Config: { User: "1000:1000" },
@@ -384,6 +389,13 @@ exec /bin/sleep 30`
     : `printf '%s\\n' "$$" > ${shellQuote(pidPath)}
 printf '{"attachment":{"dev":"${dev}","fd":0,"ino":"0"},"configured":{"dev":"${dev}","fd":0,"ino":"0"},"contractVersion":1,"pid":%s,"status":"ready"}\\n' "$$"
 exec /bin/sleep 30`;
+  const rootlessProofBarrier =
+    rootlessProofReadyPath === null || rootlessProofReleasePath === null
+      ? ""
+      : `: > ${shellQuote(rootlessProofReadyPath)}
+while ! test -f ${shellQuote(rootlessProofReleasePath)}; do
+  /bin/sleep 0.01
+done`;
   return `#!/bin/sh
 set -eu
 test "$1" = "--remote=false"
@@ -391,6 +403,7 @@ shift
 case "$1" in
   unshare)
     if test "$2" = "/usr/bin/true"; then
+      ${rootlessProofBarrier}
       exit 0
     fi
     ${holder}
@@ -1089,6 +1102,7 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     create.arguments_[2],
     "--pull=never",
     "--image-volume=ignore",
+    "--log-driver=none",
     "--read-only",
     "--security-opt=no-new-privileges",
     "--cap-drop=all",
@@ -2049,19 +2063,38 @@ test("Linux holder uses captured AbortSignal listener methods and reaps on abort
   let captureReads = 0;
   let pidPath;
   let removeCalls = 0;
+  let rootlessProofReadyPath;
+  let rootlessProofReleasePath;
+  const signalAddEventListener = EventTarget.prototype.addEventListener;
+  const signalRemoveEventListener = EventTarget.prototype.removeEventListener;
+  // Node's default runner legitimately reaches the signal's own methods for
+  // the two pre-holder child processes, but it supplies a null-prototype
+  // listener-options record. A holder regression would instead reach this
+  // method with its ordinary inherited-options dictionary and fail here.
   Object.defineProperties(controller.signal, {
     addEventListener: {
       configurable: true,
-      value() {
+      value(type, listener, options) {
         addCalls += 1;
-        throw new Error("poisoned addEventListener");
+        if (
+          options === null ||
+          typeof options !== "object" ||
+          Object.getPrototypeOf(options) !== null
+        ) {
+          throw new Error("poisoned addEventListener");
+        }
+        return Reflect.apply(signalAddEventListener, this, [
+          type,
+          listener,
+          options,
+        ]);
       },
     },
     removeEventListener: {
       configurable: true,
       value() {
         removeCalls += 1;
-        throw new Error("poisoned removeEventListener");
+        return Reflect.apply(signalRemoveEventListener, this, arguments);
       },
     },
   });
@@ -2069,7 +2102,14 @@ test("Linux holder uses captured AbortSignal listener methods and reaps on abort
     commandTimeoutMilliseconds: 2_000,
     defaultCommandRunnerScript({ parent }) {
       pidPath = join(parent, "holder-poisoned-listener-pid");
-      return failingHolderPodmanScript({ mode: "timeout", pidPath });
+      rootlessProofReadyPath = join(parent, "rootless-proof-ready");
+      rootlessProofReleasePath = join(parent, "rootless-proof-release");
+      return failingHolderPodmanScript({
+        mode: "timeout",
+        pidPath,
+        rootlessProofReadyPath,
+        rootlessProofReleasePath,
+      });
     },
     stopTimeoutSeconds: 1,
     useDefaultCommandRunner: true,
@@ -2080,20 +2120,25 @@ test("Linux holder uses captured AbortSignal listener methods and reaps on abort
     "capture",
   );
   let observedError = null;
-  let pending = null;
+  const pending = base.supervisor.launchWriter(
+    launchInput(base.attachmentRoot, { signal: controller.signal }),
+  );
+  void pending.catch(() => {});
   let pid = null;
-  Object.defineProperty(Object.prototype, "capture", {
-    configurable: true,
-    get() {
-      captureReads += 1;
-      throw new Error("poisoned inherited capture option");
-    },
-  });
+  let poisonInstalled = false;
   try {
-    pending = base.supervisor.launchWriter(
-      launchInput(base.attachmentRoot, { signal: controller.signal }),
-    );
-    void pending.catch(() => {});
+    await waitForPath(rootlessProofReadyPath);
+    assert.equal(addCalls, 1);
+    assert.equal(removeCalls, 0);
+    Object.defineProperty(Object.prototype, "capture", {
+      configurable: true,
+      get() {
+        captureReads += 1;
+        throw new Error("poisoned inherited capture option");
+      },
+    });
+    poisonInstalled = true;
+    await writeFile(rootlessProofReleasePath, "release\n", { mode: 0o600 });
     await waitForPath(pidPath);
     controller.abort();
     try {
@@ -2107,11 +2152,14 @@ test("Linux holder uses captured AbortSignal listener methods and reaps on abort
     }
   } finally {
     try {
+      await writeFile(rootlessProofReleasePath, "release\n", { mode: 0o600 })
+        .catch(() => {});
       controller.abort();
-      if (pending !== null) await pending.catch(() => {});
+      await pending.catch(() => {});
     } finally {
-      if (captureDescriptor === undefined) delete Object.prototype.capture;
-      else {
+      if (poisonInstalled && captureDescriptor === undefined) {
+        delete Object.prototype.capture;
+      } else if (poisonInstalled) {
         Object.defineProperty(Object.prototype, "capture", captureDescriptor);
       }
     }
@@ -2120,9 +2168,9 @@ test("Linux holder uses captured AbortSignal listener methods and reaps on abort
     assertSupervisorError("podman_writer_supervisor_aborted")(observedError),
     true,
   );
-  assert.equal(addCalls, 0);
+  assert.equal(addCalls, 2);
   assert.equal(captureReads, 0);
-  assert.equal(removeCalls, 0);
+  assert.equal(removeCalls, 2);
   assert.equal(processExists(pid), false);
 });
 
@@ -2624,6 +2672,7 @@ test("exact Podman start abort and timeout hold authority until natural CLI clos
   ).finally(() => {
     settled = true;
   });
+  void pending.catch(() => {});
   await waitForPath(startedPath);
   controller.abort();
   await delay(2_100);
