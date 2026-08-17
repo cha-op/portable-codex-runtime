@@ -379,6 +379,16 @@ function normalizeTrustedRoots(value) {
     }
     const root = descriptor.value;
     if (!validAbsolutePath(root) || setHas(seen, root)) fail("invalid_options");
+    for (
+      let existingIndex = 0;
+      existingIndex < roots.length;
+      existingIndex += 1
+    ) {
+      const existing = roots[existingIndex];
+      if (pathAtOrInside(existing, root) || pathAtOrInside(root, existing)) {
+        fail("invalid_options");
+      }
+    }
     setAdd(seen, root);
     arrayPush(roots, root);
   }

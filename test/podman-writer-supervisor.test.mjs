@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import childProcess, { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import {
   closeSync,
   constants as fsConstants,
@@ -1176,6 +1177,42 @@ test("a single writer executable fully overrides the image command", async (t) =
   await receipt.stopWriter(stopInput(base.input, receipt));
 });
 
+test("writer arguments preserve lossless UTF-8 at the code-unit boundary", async (t) => {
+  const base = await fixture(t);
+  const boundaryArgument = `${"x".repeat(4_094)}\u{1f680}`;
+  assert.equal(boundaryArgument.length, 4_096);
+  assert.equal(Buffer.byteLength(boundaryArgument, "utf8"), 4_098);
+
+  const supervisor = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    writerCommand: Object.freeze([
+      "/usr/local/bin/codex",
+      boundaryArgument,
+    ]),
+  }));
+  const receipt = await supervisor.launchWriter(base.input);
+  const create = base.events.find((event) => event.arguments_[0] === "create");
+  assert.equal(create.arguments_.at(-1), boundaryArgument);
+  await receipt.stopWriter(stopInput(base.input, receipt));
+
+  for (const invalidArgument of [
+    `${"x".repeat(4_095)}\ud800`,
+    `${"x".repeat(4_095)}\udc00`,
+    "x".repeat(4_097),
+  ]) {
+    assert.throws(
+      () => createPodmanWriterSupervisor(exact({
+        ...base.options,
+        writerCommand: Object.freeze([
+          "/usr/local/bin/codex",
+          invalidArgument,
+        ]),
+      })),
+      assertSupervisorError("invalid_podman_writer_supervisor_options"),
+    );
+  }
+});
+
 test("exact replay and supervisor reconstruction never launch a second container", async (t) => {
   const base = await fixture(t);
   const first = await base.supervisor.launchWriter(base.input);
@@ -1885,6 +1922,47 @@ test(
       Object.defineProperty(path, "resolve", resolveDescriptor);
       syncBuiltinESMExports();
     }
+  },
+);
+
+test(
+  "durable writer identities use the captured createHash after builtin export sync",
+  { concurrency: false },
+  async (t) => {
+    const base = await fixture(t);
+    const createHashDescriptor = Object.getOwnPropertyDescriptor(
+      crypto,
+      "createHash",
+    );
+    assert.equal(typeof createHashDescriptor?.value, "function");
+    const originalCreateHash = createHashDescriptor.value;
+    let poisonCalls = 0;
+    let launch;
+
+    try {
+      Object.defineProperty(crypto, "createHash", {
+        ...createHashDescriptor,
+        value(...arguments_) {
+          poisonCalls += 1;
+          const hash = Reflect.apply(originalCreateHash, undefined, arguments_);
+          hash.update("hostile-supervisor-identity-prefix\0", "utf8");
+          return hash;
+        },
+      });
+      syncBuiltinESMExports();
+      launch = await base.supervisor.launchWriter(base.input);
+    } finally {
+      Object.defineProperty(crypto, "createHash", createHashDescriptor);
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(poisonCalls, 0);
+    const eventCount = base.events.length;
+    const reconstructed = createPodmanWriterSupervisor(base.options);
+    const replay = await reconstructed.launchWriter(base.input);
+    assert.deepEqual(replay.evidence, launch.evidence);
+    assert.equal(base.events.length, eventCount);
+    await replay.stopWriter(stopInput(base.input, replay));
   },
 );
 

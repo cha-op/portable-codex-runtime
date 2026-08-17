@@ -473,6 +473,43 @@ async function createRotatedFixture(t) {
   };
 }
 
+test("state directory admission reserves the longest generated pathname", () => {
+  const headAnchor = createTrustedHeadAnchor();
+  const options = {
+    directory: `/${"d".repeat(4_055)}`,
+    headAnchor,
+    ...TRUSTED_ACL_INSPECTORS,
+  };
+  const longestName = filesystemImageProviderStateCheckpointName(
+    "18446744073709551615",
+  );
+  assert.equal(Buffer.byteLength(options.directory, "utf8"), 4_056);
+  assert.equal(Buffer.byteLength(longestName, "utf8"), 38);
+  assert.equal(Buffer.byteLength(join(options.directory, longestName), "utf8"), 4_095);
+  assert.doesNotThrow(() => new FilesystemImageProviderState(options));
+
+  const maximumMultibyteDirectory = `/${"é".repeat(2_027)}a`;
+  assert.equal(Buffer.byteLength(maximumMultibyteDirectory, "utf8"), 4_056);
+  assert.doesNotThrow(
+    () =>
+      new FilesystemImageProviderState({
+        ...options,
+        directory: maximumMultibyteDirectory,
+      }),
+  );
+
+  for (const directory of [
+    `/${"d".repeat(4_056)}`,
+    `/${"é".repeat(2_028)}`,
+    `/${"d".repeat(1_000_000)}`,
+  ]) {
+    assert.throws(
+      () => new FilesystemImageProviderState({ ...options, directory }),
+      stateError("invalid_request"),
+    );
+  }
+});
+
 test("rotates a prepared operation into a checkpoint before its commit", async (t) => {
   const fixture = await createFixture(t);
   const state = fixture.createState({
@@ -2778,6 +2815,295 @@ test("returns frozen defensive snapshots and rejects hostile objects without inv
     }),
     stateError("invalid_request"),
   );
+});
+
+test("derived state paths reject a captured join outside the direct-child namespace", async (t) => {
+  const fixture = await createFixture(t);
+  const escapedPath = join(fixture.root, "escaped-provider-state-file");
+  const moduleUrl = new URL(
+    "../src/filesystem-image-provider-state.mjs",
+    import.meta.url,
+  ).href;
+  const script = `
+    import { lstat } from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    import path from "node:path";
+
+    const directory = process.argv[1];
+    const escapedPath = process.argv[2];
+    const joinDescriptor = Object.getOwnPropertyDescriptor(path, "join");
+    Object.defineProperty(path, "join", {
+      ...joinDescriptor,
+      value() {
+        return escapedPath;
+      },
+    });
+    syncBuiltinESMExports();
+    let ProviderState;
+    try {
+      ({ FilesystemImageProviderState: ProviderState } = await import(
+        ${JSON.stringify(moduleUrl + "?captured-hostile-provider-state-join")}
+      ));
+    } finally {
+      Object.defineProperty(path, "join", joinDescriptor);
+      syncBuiltinESMExports();
+    }
+
+    const state = new ProviderState({
+      acquireLock: async () => ({
+        assertHeld: async () => {},
+        release: async () => {},
+      }),
+      directory,
+      headAnchor: {
+        readHead: async () => ({
+          contractVersion: 2,
+          anchorRevision: "0",
+          generation: "0",
+          stateRevision: "0",
+          baseHeadChecksum: null,
+          checkpointStateRevision: "0",
+          checkpointFrameCount: 0,
+          checkpointChecksum: null,
+          checkpointBytes: 0,
+          frameCount: 0,
+          lastChecksum: null,
+          ledgerBytes: 0,
+        }),
+        compareAndAdvance: async () => false,
+      },
+      inspectAncestorAcl: async () => false,
+      inspectDirectoryAcl: async () => false,
+    });
+    let code = null;
+    try {
+      await state.snapshot();
+    } catch (error) {
+      code = error?.code ?? null;
+    }
+    let escapedExists = true;
+    try {
+      await lstat(escapedPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") escapedExists = false;
+      else throw error;
+    }
+    process.stdout.write(JSON.stringify({ code, escapedExists }) + "\\n");
+  `;
+
+  const { stderr, stdout } = await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "--eval", script, fixture.directory, escapedPath],
+    {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+      timeout: 10_000,
+    },
+  );
+  assert.equal(stderr, "");
+  assert.deepEqual(JSON.parse(stdout), {
+    code: "corrupt_ledger",
+    escapedExists: false,
+  });
+});
+
+test("provider-state paths and SHA-256 survive post-import builtin replacement", async (t) => {
+  const fixture = await createFixture(t);
+  const escapedPath = join(fixture.root, "escaped-provider-state-file");
+  const moduleUrl = new URL(
+    "../src/filesystem-image-provider-state.mjs",
+    import.meta.url,
+  ).href;
+  const script = `
+    import crypto from "node:crypto";
+    import { lstat } from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    import path from "node:path";
+
+    const directory = process.argv[1];
+    const escapedPath = process.argv[2];
+    const captured = await import(
+      ${JSON.stringify(moduleUrl + "?captured-provider-state-builtins")}
+    );
+    const cryptoDescriptor = Object.getOwnPropertyDescriptor(crypto, "createHash");
+    const pathKeys = ["basename", "dirname", "isAbsolute", "join", "parse", "resolve"];
+    const pathDescriptors = new Map(
+      pathKeys.map((key) => [key, Object.getOwnPropertyDescriptor(path, key)]),
+    );
+    let anchoredHead = captured.normalizeFilesystemImageProviderStateHead({
+      contractVersion: 2,
+      anchorRevision: "0",
+      generation: "0",
+      stateRevision: "0",
+      baseHeadChecksum: null,
+      checkpointStateRevision: "0",
+      checkpointFrameCount: 0,
+      checkpointChecksum: null,
+      checkpointBytes: 0,
+      frameCount: 0,
+      lastChecksum: null,
+      ledgerBytes: 0,
+    });
+    const copyHead = (head) => ({
+      contractVersion: head.contractVersion,
+      anchorRevision: head.anchorRevision,
+      generation: head.generation,
+      stateRevision: head.stateRevision,
+      baseHeadChecksum: head.baseHeadChecksum,
+      checkpointStateRevision: head.checkpointStateRevision,
+      checkpointFrameCount: head.checkpointFrameCount,
+      checkpointChecksum: head.checkpointChecksum,
+      checkpointBytes: head.checkpointBytes,
+      frameCount: head.frameCount,
+      lastChecksum: head.lastChecksum,
+      ledgerBytes: head.ledgerBytes,
+    });
+    const sameHead = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+    const acquireLock = async () => {
+      let released = false;
+      return {
+        async assertHeld() {
+          if (released) throw new Error("lock lost");
+        },
+        async release() {
+          released = true;
+        },
+      };
+    };
+    const headAnchor = {
+      async readHead() {
+        return copyHead(anchoredHead);
+      },
+      async compareAndAdvance({ expectedHead, nextHead }) {
+        if (!sameHead(copyHead(anchoredHead), expectedHead)) return false;
+        anchoredHead = nextHead;
+        return true;
+      },
+    };
+    const options = {
+      acquireLock,
+      directory,
+      headAnchor,
+      inspectAncestorAcl: async () => false,
+      inspectDirectoryAcl: async () => false,
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    };
+    const request = {
+      contractVersion: 1,
+      kind: "provision",
+      marker: { lane: "provider" },
+      storageId: "storage-builtin-proof",
+    };
+    const imageIdentity = {
+      filesystemId: "hostfs:builtin-proof",
+      objectIdentityScheme: "linux-ext4-file-handle-sha256-v1",
+      objectId: "ext4fh1:image-builtin-proof",
+    };
+    const rootIdentity = {
+      filesystemId: "ext4fs:builtin-proof",
+      objectIdentityScheme: "linux-ext4-file-handle-sha256-v1",
+      objectId: "ext4fh1:root-builtin-proof",
+    };
+    const storageState = {
+      storageId: "storage-builtin-proof",
+      sessionId: "session-builtin-proof",
+      backendId: "filesystem-image-ext4",
+      filesystemId: "ext4fs:builtin-proof",
+      imagePath: "/var/lib/portable-codex/images/storage-builtin-proof.img",
+      lifecycle: "provisioned",
+      revision: "1",
+      writerEpoch: "0",
+      writerAuthority: null,
+      mount: {
+        mountPath: "/var/lib/portable-codex/mounts/storage-builtin-proof",
+        imageIdentity,
+        rootIdentity,
+      },
+      publicationControlIdentity: {
+        filesystemId: rootIdentity.filesystemId,
+        objectIdentityScheme: rootIdentity.objectIdentityScheme,
+        objectId: "ext4fh1:publication-control-builtin-proof",
+      },
+      dataRoot: null,
+      attachment: null,
+    };
+
+    Object.defineProperty(crypto, "createHash", {
+      ...cryptoDescriptor,
+      value() {
+        return Reflect.apply(cryptoDescriptor.value, crypto, ["sha512-256"]);
+      },
+    });
+    for (const key of pathKeys) {
+      const descriptor = pathDescriptors.get(key);
+      Object.defineProperty(path, key, {
+        ...descriptor,
+        value: key === "join"
+          ? () => escapedPath
+          : () => { throw new Error("ambient path helper used: " + key); },
+      });
+    }
+    syncBuiltinESMExports();
+    try {
+      const state = new captured.FilesystemImageProviderState(options);
+      await state.prepareOperation({
+        kind: "provision",
+        operationId: "operation-builtin-proof",
+        request,
+        storageId: "storage-builtin-proof",
+      });
+      await state.commitOperation({
+        operationId: "operation-builtin-proof",
+        request,
+        result: { proofId: "proof-builtin", status: "provisioned" },
+        storageState,
+      });
+    } finally {
+      Object.defineProperty(crypto, "createHash", cryptoDescriptor);
+      for (const key of pathKeys) {
+        Object.defineProperty(path, key, pathDescriptors.get(key));
+      }
+      syncBuiltinESMExports();
+    }
+
+    const restarted = await import(
+      ${JSON.stringify(moduleUrl + "?restarted-provider-state-builtins")}
+    );
+    const snapshot = await new restarted.FilesystemImageProviderState(options).snapshot();
+    let escapedExists = true;
+    try {
+      await lstat(escapedPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") escapedExists = false;
+      else throw error;
+    }
+    process.stdout.write(JSON.stringify({
+      escapedExists,
+      generation: anchoredHead.generation,
+      sequence: snapshot.sequence,
+      storageId: snapshot.storages[0]?.storageId ?? null,
+    }) + "\\n");
+  `;
+
+  const { stderr, stdout } = await execFileAsync(
+    process.execPath,
+    ["--input-type=module", "--eval", script, fixture.directory, escapedPath],
+    {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+      timeout: 15_000,
+    },
+  );
+  assert.equal(stderr, "");
+  assert.deepEqual(JSON.parse(stdout), {
+    escapedExists: false,
+    generation: "1",
+    sequence: 2,
+    storageId: "storage-builtin-proof",
+  });
 });
 
 test("validation and replay survive post-import intrinsic poisoning in isolation", async (t) => {

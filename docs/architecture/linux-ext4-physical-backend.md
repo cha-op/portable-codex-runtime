@@ -108,6 +108,11 @@ reconstruct their original image and mount plan without retroactively applying
 that new admission rule. These are lexical nameability and containment
 prerequisites, not object-identity or content-change signals.
 
+The inspector rejects duplicate or pairwise-overlapping trusted roots during
+construction. A path therefore selects exactly one configured root before any
+helper dispatch; a parent plus descendant root cannot turn a durably prepared
+operation into a permanently ambiguous retry.
+
 ### Content stability
 
 Publication separately binds canonical request/result bytes, journal state,
@@ -339,6 +344,15 @@ operation, foreground-lifecycle, and recovery-lifecycle pools. The
 provider-state files and their external head must never be restored
 independently.
 
+The provider-state directory is a lossless canonical UTF-8 pathname of at most
+4,056 bytes, reserving the remaining 39 bytes of Linux's 4,095-byte pathname
+domain for `/` plus the longest generation checkpoint name. Every lock,
+checkpoint, and log pathname is built through module-load-captured `node:path`
+helpers and must still equal one exact direct child of that directory. The
+module likewise captures `node:crypto.createHash`, so post-import builtin
+replacement can neither redirect durable files nor change SHA-256 frame, head,
+or checkpoint identities across restart.
+
 Rotation streams a checksum-framed checkpoint containing every prepared and
 committed operation, the exact replay fields for each operation, every current
 storage record, and destroyed-storage tombstones. It creates the next
@@ -458,8 +472,10 @@ receipt must contain the complete
 start. The fixed create shape ignores image-declared volumes, disables
 Podman's implicit writable read-only tmpfs mounts, validates the configured
 writer executable in the same lossless 4095-byte native pathname domain,
-replaces both image entrypoint and command with that writer command, and
-selects Podman's `none` log driver. Container output is not authority evidence;
+requires every remaining writer argument to be a non-empty, NUL-free,
+lossless UTF-8 string of at most 4096 UTF-16 code units, replaces both image
+entrypoint and command with that writer command, and selects Podman's `none`
+log driver. Container output is not authority evidence;
 exact configured/running inspection and the live attachment bracket remain
 the success proof, independent of host log-tag or default log-driver policy.
 The immutable image's own `Config.User` must be a canonical non-root

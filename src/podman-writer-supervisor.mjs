@@ -49,6 +49,7 @@ const eventTargetRemoveEventListenerIntrinsic =
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
 const JsonObject = JSON;
+const createHashIntrinsic = createHash;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
 const numberIsFiniteIntrinsic = Number.isFinite;
@@ -646,7 +647,7 @@ function canonicalJson(value) {
 }
 
 function sha256Parts(...parts) {
-  const hash = createHash("sha256");
+  const hash = createHashIntrinsic("sha256");
   for (let index = 0; index < parts.length; index += 1) {
     callIntrinsic(hashUpdateIntrinsic, hash, [parts[index], "utf8"]);
   }
@@ -975,7 +976,8 @@ function normalizeCommand(value, code) {
       typeof argument === "string" &&
         argument.length >= 1 &&
         argument.length <= 4096 &&
-        !stringIncludes(argument, "\0"),
+        !stringIncludes(argument, "\0") &&
+        hasLosslessUtf8Encoding(argument),
       code,
     );
     arrayPush(command, argument);
@@ -1115,6 +1117,11 @@ function validHostPathnameBytes(value) {
   const encoded = callIntrinsic(bufferFromIntrinsic, Buffer, [value, "utf8"]);
   return encoded.length <= MAX_HOST_PATH_BYTES &&
     callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === value;
+}
+
+function hasLosslessUtf8Encoding(value) {
+  const encoded = callIntrinsic(bufferFromIntrinsic, Buffer, [value, "utf8"]);
+  return callIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]) === value;
 }
 
 function assertCanonicalAttachmentRoot(

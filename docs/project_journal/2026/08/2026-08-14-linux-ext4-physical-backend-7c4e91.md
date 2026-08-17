@@ -668,6 +668,28 @@ change and does not attest the current head:
   mismatch from unreadable inspection. Tests cover pathname ABA,
   access/default ACL findings, temporary policy change versus benign child
   churn, fresh nonempty rejection, replay, and committed reattachment.
+- Current-head GitHub review closed two remaining writer-supervisor boundary
+  gaps. Every writer argument now requires a lossless UTF-8 round trip, so a
+  lone surrogate cannot be replaced with U+FFFD at Podman dispatch; the full
+  4096-code-unit boundary still passes when it contains a valid surrogate
+  pair. The supervisor also captures `node:crypto.createHash` at module load,
+  keeping request, start, and stop identities stable across hostile post-import
+  `syncBuiltinESMExports()` changes and later reconstruction. These checks
+  protect canonical argument bytes and durable identity derivation, without
+  changing attachment object identity or access-policy authority.
+- The same review closed provider-state and inspection namespace gaps.
+  Provider-state now reserves 39 pathname bytes for the longest generation
+  checkpoint name, validates every derived lock/checkpoint/log path as an exact
+  direct child through captured `node:path` helpers, and captures
+  `node:crypto.createHash` so hostile post-import builtin replacement cannot
+  redirect durable files or change SHA-256 identities across restart. The
+  inspector rejects pairwise-overlapping trusted roots at construction, before
+  a durable operation can be prepared against an ambiguous root selection.
+  Tests cover ASCII and multibyte 4,056/4,057-byte boundaries, 1 MiB early
+  rejection, hostile path/hash replacement with fresh-import replay, both root
+  orders, and disjoint-root admission. These are lexical containment,
+  nameability, and durable checksum properties; they do not treat ordinary
+  filesystem metadata churn as object replacement.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

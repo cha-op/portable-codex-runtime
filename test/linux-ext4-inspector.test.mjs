@@ -1674,10 +1674,8 @@ process.stdout.write("ok\\n");
   assert.equal(stderr.length, 0);
 });
 
-test("invalid, escaped, outside, and ambiguous paths never dispatch the helper", async () => {
-  const fixture = createFixture({
-    trustedRoots: [TRUSTED_ROOT, `${TRUSTED_ROOT}/nested`],
-  });
+test("invalid, escaped, and outside paths never dispatch the helper", async () => {
+  const fixture = createFixture();
   const cases = [
     ["relative/path", "invalid_path"],
     [`${TRUSTED_ROOT}/../escape`, "invalid_path"],
@@ -1686,7 +1684,6 @@ test("invalid, escaped, outside, and ambiguous paths never dispatch the helper",
     [`${TRUSTED_ROOT}/\ud800`, "invalid_path"],
     ["/srv/portable-codex-other/session", "path_mismatch"],
     ["/outside/session", "path_mismatch"],
-    [`${TRUSTED_ROOT}/nested/session`, "path_mismatch"],
   ];
   for (const [path, code] of cases) {
     const pending = fixture.inspector.inspectFilesystem(path);
@@ -1694,6 +1691,35 @@ test("invalid, escaped, outside, and ambiguous paths never dispatch the helper",
     await assert.rejects(pending, inspectorError(code));
   }
   assert.equal(fixture.calls.length, 0);
+});
+
+test("constructor rejects pairwise-overlapping trusted roots before dispatch", () => {
+  let calls = 0;
+  const base = {
+    helperPath: HELPER_PATH,
+    platform: "linux",
+    runHelper: async () => {
+      calls += 1;
+      return completion();
+    },
+  };
+  for (const trustedRoots of [
+    [TRUSTED_ROOT, `${TRUSTED_ROOT}/nested`],
+    [`${TRUSTED_ROOT}/nested`, TRUSTED_ROOT],
+    ["/", TRUSTED_ROOT],
+  ]) {
+    assert.throws(
+      () => createLinuxExt4Inspector({ ...base, trustedRoots }),
+      inspectorError("invalid_options"),
+    );
+  }
+  assert.doesNotThrow(() =>
+    createLinuxExt4Inspector({
+      ...base,
+      trustedRoots: [TRUSTED_ROOT, "/srv/portable-codex-other"],
+    }),
+  );
+  assert.equal(calls, 0);
 });
 
 test("oversized UTF-16 paths reject before allocating a UTF-8 buffer", async () => {

@@ -39,9 +39,10 @@ const bufferSubarrayIntrinsic = Buffer.prototype.subarray;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
 const bufferWriteUInt32BEIntrinsic = Buffer.prototype.writeUInt32BE;
 const BufferConstructor = Buffer;
+const createHashIntrinsic = createHash;
 const dateNowIntrinsic = Date.now;
 const ErrorConstructor = Error;
-const hashPrototype = Object.getPrototypeOf(createHash("sha256"));
+const hashPrototype = Object.getPrototypeOf(createHashIntrinsic("sha256"));
 const hashDigestIntrinsic = hashPrototype.digest;
 const hashUpdateIntrinsic = hashPrototype.update;
 const isPromiseValue = utilTypes.isPromise;
@@ -74,6 +75,12 @@ const promiseResolveIntrinsic = Promise.resolve;
 const promiseThenIntrinsic = Promise.prototype.then;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
+const pathBasenameIntrinsic = basename;
+const pathDirnameIntrinsic = dirname;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathJoinIntrinsic = join;
+const pathParseIntrinsic = parse;
+const pathResolveIntrinsic = resolve;
 const regexpTestIntrinsic = RegExp.prototype.test;
 const setTimeoutIntrinsic = setTimeout;
 const setAddIntrinsic = Set.prototype.add;
@@ -210,6 +217,30 @@ function objectHasOwn(value, key) {
   return callIntrinsic(objectHasOwnIntrinsic, Object, [value, key]);
 }
 
+function pathBasename(value) {
+  return callIntrinsic(pathBasenameIntrinsic, undefined, [value]);
+}
+
+function pathDirname(value) {
+  return callIntrinsic(pathDirnameIntrinsic, undefined, [value]);
+}
+
+function pathIsAbsolute(value) {
+  return callIntrinsic(pathIsAbsoluteIntrinsic, undefined, [value]);
+}
+
+function pathJoin(...values) {
+  return callIntrinsic(pathJoinIntrinsic, undefined, values);
+}
+
+function pathParse(value) {
+  return callIntrinsic(pathParseIntrinsic, undefined, [value]);
+}
+
+function pathResolve(value) {
+  return callIntrinsic(pathResolveIntrinsic, undefined, [value]);
+}
+
 function reflectOwnKeys(value) {
   return callIntrinsic(reflectOwnKeysIntrinsic, undefined, [value]);
 }
@@ -250,6 +281,15 @@ const MAX_UINT32 = 4_294_967_295;
 const MAX_PATH_BYTES = 4_095;
 const MAX_PHYSICAL_OBJECT_ID_BYTES = 512;
 const MAX_UINT64 = 18_446_744_073_709_551_615n;
+// Reserve the separator plus the longest generated generation filename. This
+// protects Linux lexical nameability; file identity and access policy are
+// proved separately after descriptor acquisition.
+const MAX_STATE_DERIVED_NAME_BYTES = bufferByteLength(
+  `state.g${StringConstructor(MAX_UINT64)}.checkpoint`,
+  "utf8",
+);
+const MAX_STATE_DIRECTORY_BYTES =
+  MAX_PATH_BYTES - 1 - MAX_STATE_DERIVED_NAME_BYTES;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -647,9 +687,9 @@ function canonicalAbsolutePath(value, code) {
   assertLosslessString(value, code, MAX_PATH_BYTES);
   ensure(
     !stringIncludes(value, "\0") &&
-      isAbsolute(value) &&
-      resolve(value) === value &&
-      value !== parse(value).root,
+      pathIsAbsolute(value) &&
+      pathResolve(value) === value &&
+      value !== pathParse(value).root,
     code,
   );
   return value;
@@ -835,8 +875,8 @@ function canonicalStorageState(value, code) {
   if (dataRoot !== null) {
     ensure(
       mount !== null &&
-        dirname(dataRoot.rootPath) === mount.mountPath &&
-        !arrayIncludes(["", ".", ".."], basename(dataRoot.rootPath)) &&
+        pathDirname(dataRoot.rootPath) === mount.mountPath &&
+        !arrayIncludes(["", ".", ".."], pathBasename(dataRoot.rootPath)) &&
         canonicalEqual(dataRoot.imageIdentity, mount.imageIdentity) &&
         dataRoot.rootIdentity.filesystemId === state.filesystemId &&
         !canonicalEqual(dataRoot.rootIdentity, mount.rootIdentity),
@@ -1097,7 +1137,7 @@ function uint64Difference(left, right, code) {
 
 function headChecksum(head, code) {
   const normalized = canonicalLedgerHead(head, code);
-  const hash = createHash("sha256");
+  const hash = createHashIntrinsic("sha256");
   callIntrinsic(hashUpdateIntrinsic, hash, [HEAD_DOMAIN]);
   callIntrinsic(hashUpdateIntrinsic, hash, [bufferFrom(canonicalString(normalized), "utf8")]);
   return bufferToString(callIntrinsic(hashDigestIntrinsic, hash, []), "hex");
@@ -1280,7 +1320,7 @@ function frameChecksum(payload, payloadLength, sequence) {
   const metadata = bufferAllocUnsafe(8);
   bufferWriteUInt32BE(metadata, payloadLength, 0);
   bufferWriteUInt32BE(metadata, sequence, 4);
-  const hash = createHash("sha256");
+  const hash = createHashIntrinsic("sha256");
   callIntrinsic(hashUpdateIntrinsic, hash, [FRAME_DOMAIN]);
   callIntrinsic(hashUpdateIntrinsic, hash, [metadata]);
   callIntrinsic(hashUpdateIntrinsic, hash, [payload]);
@@ -1868,7 +1908,7 @@ function checkpointArrays(state) {
 }
 
 function createCheckpointStateHash(stateRevision) {
-  const hash = createHash("sha256");
+  const hash = createHashIntrinsic("sha256");
   callIntrinsic(hashUpdateIntrinsic, hash, [CHECKPOINT_STATE_DOMAIN]);
   callIntrinsic(hashUpdateIntrinsic, hash, [
     bufferFrom(canonicalString({ stateRevision }), "utf8"),
@@ -2061,9 +2101,9 @@ async function openDirectoryAuthority(
 ) {
   ensure(
     typeof directory === "string" &&
-      isAbsolute(directory) &&
-      resolve(directory) === directory &&
-      directory !== parse(directory).root,
+      pathIsAbsolute(directory) &&
+      pathResolve(directory) === directory &&
+      directory !== pathParse(directory).root,
     "unsafe_directory",
   );
   const currentUid = process.geteuid?.() ?? process.getuid?.();
@@ -2105,7 +2145,7 @@ async function openDirectoryAuthority(
     await inspectAcl(inspectDirectoryAcl, canonical, "unsafe_directory");
     const ancestors = [];
     let childUid = metadata.uid;
-    let current = dirname(canonical);
+    let current = pathDirname(canonical);
     while (true) {
       const ancestor = await lstat(current, { bigint: true });
       ensure(
@@ -2114,7 +2154,7 @@ async function openDirectoryAuthority(
       );
       await inspectAcl(inspectAncestorAcl, current, "unsafe_directory");
       arrayPush(ancestors, objectFreeze({ identity: ancestor, path: current }));
-      const parent = dirname(current);
+      const parent = pathDirname(current);
       if (parent === current) break;
       childUid = ancestor.uid;
       current = parent;
@@ -2188,6 +2228,29 @@ function safeFileMetadata(metadata, currentUid, { empty = false } = {}) {
   );
 }
 
+function stateDirectChildPath(directory, name, code) {
+  // A NUL-free basename proves `name` is one namespace component. Exact
+  // concatenation plus dirname/basename and canonical-resolution agreement
+  // prevents a path helper from redirecting or normalizing that component.
+  assertLosslessString(name, code, MAX_STATE_DERIVED_NAME_BYTES);
+  ensure(
+    !arrayIncludes(["", ".", ".."], name) &&
+      !stringIncludes(name, "\0") &&
+      pathBasename(name) === name,
+    code,
+  );
+  const path = pathJoin(directory, name);
+  ensure(
+    path === `${directory}/${name}` &&
+      pathDirname(path) === directory &&
+      pathBasename(path) === name &&
+      pathResolve(path) === path &&
+      bufferByteLength(path, "utf8") <= MAX_PATH_BYTES,
+    code,
+  );
+  return path;
+}
+
 async function assertPathFileCurrent(path, handle, identity, currentUid, options = {}) {
   let held;
   let pathMetadata;
@@ -2211,7 +2274,11 @@ async function assertPathFileCurrent(path, handle, identity, currentUid, options
 }
 
 async function provisionLockFile(authority, syncDirectory) {
-  const path = join(authority.path, FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME);
+  const path = stateDirectChildPath(
+    authority.path,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME,
+    "corrupt_ledger",
+  );
   let handle;
   let created = false;
   try {
@@ -2383,7 +2450,7 @@ async function openNamedStateFile(
   name,
   { expectedPin, writable = false } = {},
 ) {
-  const path = join(authority.path, name);
+  const path = stateDirectChildPath(authority.path, name, "corrupt_ledger");
   let handle;
   try {
     handle = await open(
@@ -2422,7 +2489,7 @@ async function openNamedStateFile(
 }
 
 async function createNamedStateFile(authority, name) {
-  const path = join(authority.path, name);
+  const path = stateDirectChildPath(authority.path, name, "maintenance_failed");
   let handle;
   try {
     handle = await open(
@@ -2459,7 +2526,7 @@ async function createNamedStateFile(authority, name) {
 }
 
 async function unlinkSafeStateFile(authority, name) {
-  const path = join(authority.path, name);
+  const path = stateDirectChildPath(authority.path, name, "maintenance_failed");
   let metadata;
   try {
     metadata = await lstat(path, { bigint: true });
@@ -3557,13 +3624,16 @@ export class FilesystemImageProviderState {
       ["directory", "headAnchor"],
       "invalid_request",
     );
+    const directory = assertLosslessString(
+      normalized.directory,
+      "invalid_request",
+      MAX_STATE_DIRECTORY_BYTES,
+    );
     ensure(
-      typeof normalized.directory === "string" &&
-        isAbsolute(normalized.directory) &&
-        resolve(normalized.directory) === normalized.directory,
+      pathIsAbsolute(directory) && pathResolve(directory) === directory,
       "invalid_request",
     );
-    this.#directory = normalized.directory;
+    this.#directory = directory;
     this.#headAnchor = canonicalHeadAnchor(
       normalized.headAnchor,
       "invalid_request",
