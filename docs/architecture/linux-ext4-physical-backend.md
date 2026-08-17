@@ -48,8 +48,11 @@ The physical implementation remains split into small authorities:
   external monotonic v2 head before every mutation or maintenance rotation.
   Canonical strings are rejected by a conservative UTF-16 code-unit bound
   against the remaining 768 KiB canonical budget before UTF-8 encoding or JSON
-  serialization, so an oversized request or result cannot force an unbounded
-  precursor allocation before durable-state admission rejects it.
+  serialization. Before enumerating array own keys, canonicalization also
+  requires the array length to fit both the remaining 16,384-node budget and
+  the minimum possible bytes left in that 768 KiB envelope. These checks bound
+  canonical precursor allocation and resource admission before durable state;
+  they are separate from filesystem object identity and access policy.
 - `Ext4FilesystemImageBackend` binds the driver and state machine to the raw
   storage lifecycle, restore-attachment, reconciliation, and destination
   resolver contracts. `createInitializedExt4FilesystemImageBackend()` gates

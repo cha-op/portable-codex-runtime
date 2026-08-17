@@ -616,6 +616,18 @@ change and does not attest the current head:
   strings now fail or succeed before the relevant durable mutation boundary;
   these checks protect lexical containment and bounded allocation without
   treating filesystem metadata drift as mutation.
+- A later provider-state review found that a large dense request array could
+  allocate its complete own-key list and a duplicate `Set` before the existing
+  16,384-node or 768 KiB canonical limit rejected it. Array canonicalization
+  now admits the array length against both remaining budgets before own-key
+  enumeration, using one node and at least one canonical JSON byte per element
+  plus punctuation as the conservative lower bound. The original full key-set,
+  dense-index, own-data-property, Symbol, and extra-key checks remain in force.
+  Exact node and byte boundaries pass, one-element-over inputs and a dense
+  one-million-element input fail before target-array enumeration, and the focused
+  provider-state suite passes 90/90 tests. This protects bounded canonical
+  precursor allocation and resource admission, not filesystem identity,
+  content stability, or access policy.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

@@ -1061,6 +1061,175 @@ test(
   },
 );
 
+test(
+  "bounds dense array precursors before own-key enumeration",
+  { concurrency: false },
+  async (t) => {
+    const fixture = await createFixture(t);
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(Reflect, "ownKeys");
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    const maximumNodeArray = new Array(16_382).fill(0);
+    const overNodeArray = new Array(16_383).fill(0);
+    const hugeDenseArray = new Array(1_000_000).fill(null);
+    const maximumCanonicalBytes = 768 * 1024;
+    const byteBoundaryArray = [0, 0];
+    const overByteArray = [0, 0, 0];
+    const fixedByteEnvelope = Buffer.byteLength(
+      JSON.stringify({ first: "", payload: byteBoundaryArray }),
+      "utf8",
+    );
+    const byteBoundaryPrefix = "x".repeat(
+      maximumCanonicalBytes - fixedByteEnvelope,
+    );
+    const enumerationCounts = new Map([
+      [maximumNodeArray, 0],
+      [overNodeArray, 0],
+      [hugeDenseArray, 0],
+      [byteBoundaryArray, 0],
+      [overByteArray, 0],
+    ]);
+    const rejectBeforeEnumeration = new Set([
+      overNodeArray,
+      hugeDenseArray,
+      overByteArray,
+    ]);
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(value) {
+        if (enumerationCounts.has(value)) {
+          enumerationCounts.set(value, enumerationCounts.get(value) + 1);
+          if (rejectBeforeEnumeration.has(value)) {
+            throw new Error("array own-key enumeration must not start");
+          }
+        }
+        return Reflect.apply(ownKeysDescriptor.value, this, [value]);
+      },
+    });
+    try {
+      const providerModule = await import(
+        "../src/filesystem-image-provider-state.mjs?dense-array-precursor-bound-test"
+      );
+      const state = new providerModule.FilesystemImageProviderState({
+        acquireLock: fixture.acquireLock,
+        directory: fixture.directory,
+        headAnchor: fixture.headAnchor,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+      const rejectsInvalidRequest = (error) =>
+        error instanceof providerModule.FilesystemImageProviderStateError &&
+        error.code === "invalid_request" &&
+        error.commitState === "not-committed" &&
+        error.retryable === false;
+
+      await assert.rejects(
+        state.prepareOperation({
+          kind: "provision",
+          operationId: "operation-huge-dense-array-001",
+          request: { payload: hugeDenseArray },
+          storageId: "storage-001",
+        }),
+        rejectsInvalidRequest,
+      );
+      assert.equal(enumerationCounts.get(hugeDenseArray), 0);
+      assert.equal(fixture.headAnchorTracker.advances, 0);
+      await assert.rejects(readFile(fixture.ledgerPath), { code: "ENOENT" });
+
+      const maximumNodePrepared = await state.prepareOperation({
+        kind: "provision",
+        operationId: "operation-maximum-array-nodes-002",
+        request: { payload: maximumNodeArray },
+        storageId: "storage-002",
+      });
+      assert.equal(maximumNodePrepared.request.payload.length, 16_382);
+      assert.equal(enumerationCounts.get(maximumNodeArray), 1);
+      const ledgerAfterNodeBoundary = await readFile(fixture.ledgerPath);
+      const advancesAfterNodeBoundary = fixture.headAnchorTracker.advances;
+
+      await assert.rejects(
+        state.prepareOperation({
+          kind: "provision",
+          operationId: "operation-over-array-nodes-003",
+          request: { payload: overNodeArray },
+          storageId: "storage-003",
+        }),
+        rejectsInvalidRequest,
+      );
+      assert.equal(enumerationCounts.get(overNodeArray), 0);
+      assert.deepEqual(await readFile(fixture.ledgerPath), ledgerAfterNodeBoundary);
+      assert.equal(fixture.headAnchorTracker.advances, advancesAfterNodeBoundary);
+
+      const maximumBytePrepared = await state.prepareOperation({
+        kind: "provision",
+        operationId: "operation-maximum-array-bytes-004",
+        request: { first: byteBoundaryPrefix, payload: byteBoundaryArray },
+        storageId: "storage-004",
+      });
+      assert.equal(maximumBytePrepared.request.payload.length, 2);
+      assert.equal(enumerationCounts.get(byteBoundaryArray), 1);
+      const ledgerAfterByteBoundary = await readFile(fixture.ledgerPath);
+      const advancesAfterByteBoundary = fixture.headAnchorTracker.advances;
+
+      await assert.rejects(
+        state.prepareOperation({
+          kind: "provision",
+          operationId: "operation-over-array-bytes-005",
+          request: { first: byteBoundaryPrefix, payload: overByteArray },
+          storageId: "storage-005",
+        }),
+        rejectsInvalidRequest,
+      );
+      assert.equal(enumerationCounts.get(overByteArray), 0);
+      assert.deepEqual(await readFile(fixture.ledgerPath), ledgerAfterByteBoundary);
+      assert.equal(fixture.headAnchorTracker.advances, advancesAfterByteBoundary);
+    } finally {
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+  },
+);
+
+test("retains dense-array validation after precursor admission", async (t) => {
+  const fixture = await createFixture(t);
+  const ordinary = ["one", { lane: "provider" }];
+  const prepared = await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-ordinary-dense-array-001",
+    request: { payload: ordinary },
+    storageId: "storage-001",
+  });
+  ordinary[1].lane = "mutated";
+  assert.deepEqual(prepared.request.payload, ["one", { lane: "provider" }]);
+  assert.equal(Object.isFrozen(prepared.request.payload), true);
+
+  const sparse = new Array(2);
+  sparse[0] = "one";
+  let getterCalls = 0;
+  const accessor = ["placeholder"];
+  Object.defineProperty(accessor, "0", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "must-not-run";
+    },
+  });
+  const extraKey = ["one"];
+  extraKey.extra = "unexpected";
+  const symbolKey = ["one"];
+  symbolKey[Symbol("unexpected")] = "unexpected";
+  const invalidArrays = [sparse, accessor, extraKey, symbolKey];
+  for (let index = 0; index < invalidArrays.length; index += 1) {
+    await assert.rejects(
+      fixture.state.prepareOperation({
+        kind: "provision",
+        operationId: `operation-invalid-dense-array-${index + 2}`,
+        request: { payload: invalidArrays[index] },
+        storageId: `storage-${index + 2}`,
+      }),
+      stateError("invalid_request"),
+    );
+  }
+  assert.equal(getterCalls, 0);
+});
+
 test("rotation resolves CAS old, new acknowledgement loss, and unknown readback", async (t) => {
   await t.test("CAS old cleans the candidate and permits retry", async (t) => {
     const fixture = await createFixture(t);

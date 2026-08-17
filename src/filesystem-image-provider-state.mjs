@@ -440,6 +440,16 @@ function assertLosslessString(value, code, maxBytes = MAX_CANONICAL_BYTES) {
   return value;
 }
 
+function assertCanonicalArrayPrecursorCapacity(length, state, code) {
+  ensure(numberIsSafeIntegerIntrinsic(length) && length >= 0, code);
+  const minimumBytes = length === 0 ? 2 : (2 * length) + 1;
+  ensure(
+    length <= MAX_CANONICAL_NODES - state.budget.nodes &&
+      state.budget.bytes <= MAX_CANONICAL_BYTES - minimumBytes,
+    code,
+  );
+}
+
 function canonicalize(
   value,
   code,
@@ -495,6 +505,11 @@ function canonicalize(
   callIntrinsic(setAddIntrinsic, state.seen, [value]);
   const nestedState = () => ({ ...state, depth: state.depth + 1 });
   if (callIntrinsic(arrayIsArrayIntrinsic, ArrayConstructor, [value])) {
+    const length = value.length;
+    // Bound both the later recursive work and the own-key/Set precursor before
+    // enumerating an untrusted dense array. Every canonical element consumes at
+    // least one node and one JSON byte in addition to the array punctuation.
+    assertCanonicalArrayPrecursorCapacity(length, state, code);
     let keys;
     try {
       keys = reflectOwnKeys(value);
@@ -504,20 +519,19 @@ function canonicalize(
     const keySet = new SetConstructor();
     for (const key of keys) callIntrinsic(setAddIntrinsic, keySet, [key]);
     ensure(
-      numberIsSafeIntegerIntrinsic(value.length) &&
-        keys.length === value.length + 1 &&
+      keys.length === length + 1 &&
         callIntrinsic(setHasIntrinsic, keySet, ["length"]),
       code,
     );
-    for (let index = 0; index < value.length; index += 1) {
+    for (let index = 0; index < length; index += 1) {
       ensure(
         callIntrinsic(setHasIntrinsic, keySet, [StringConstructor(index)]),
         code,
       );
     }
-    consumeBudget(state, 2 + mathMaxIntrinsic(0, value.length - 1), code);
+    consumeBudget(state, 2 + mathMaxIntrinsic(0, length - 1), code);
     const result = [];
-    for (let index = 0; index < value.length; index += 1) {
+    for (let index = 0; index < length; index += 1) {
       const descriptor = objectGetOwnPropertyDescriptor(
         value,
         StringConstructor(index),
