@@ -118,6 +118,31 @@ removal, and `syncfs`. The only external storage command is `mkfs.ext4`, which
 receives a pinned `/proc/self/fd/<n>` image descriptor and a fixed argument
 vector without a shell or ambient `PATH`.
 
+Formatting has its own deadline inside the native helper, measured from the
+start of the complete format operation. The trusted formatter runs in a new
+process group with stdin, stdout, and stderr redirected to a verified
+`/dev/null`; only the pinned image descriptor remains available at fd 3. The
+helper allows 40 seconds for ordinary execution, then two seconds after
+`SIGTERM`, and finally uses the remaining five seconds to send `SIGKILL`, reap
+the retained group leader, and require the process group to become quiescent.
+`waitid(..., WNOWAIT)` keeps the leader PID/PGID reserved until the final group
+signal has been sent. A parent-death signal plus a parent-PID race check covers
+the direct formatter leader when the outer helper is killed before its own
+deadline. The fixed, reviewed formatter invocation must not leave a long-lived
+descendant in that outer-kill fallback; parent-death signaling is not a
+process-group broadcast. The JavaScript 60-second timeout is an independent
+backstop, not the formatter-settlement proof.
+
+This boundary protects image-content stability after the helper returns
+success: every formatter process that can retain the image descriptor must be
+reaped or gone from the formatter PGID. It assumes the reviewed `mkfs.ext4`
+and any formatter descendants do not call `setsid(2)` or move to another
+process group during ordinary inner supervision, and do not outlive the leader
+when the outer timeout wins. An unreadable clock/wait/group state or a task
+that cannot be proved quiescent remains `operation_outcome_uncertain`;
+timestamp or other ordinary `stat` changes are not used as content-mutation
+evidence.
+
 Mount propagation is a lifecycle property of the deployment process, not a
 property that a short-lived helper can create after the fact. The namespace
 owner and Node process must remain inside one host-created private mount
@@ -132,6 +157,16 @@ unreadable or malformed record is an observation failure. These checks detect
 misconfiguration or replacement. They do not replace the host's exclusive
 authority over propagation changes by another `CAP_SYS_ADMIN` process in the
 same namespace.
+
+Within one process and one loaded driver module, every operation acquires both
+its canonical image-path key and mount-path key in a stable global order. This
+keeps requests for the same image serialized while also preventing two
+different images from concurrently observing one mount point as empty and
+creating stacked mounts. The lock covers the complete observation and mutation
+sequence and releases both keys on failure. It protects mount-target
+exclusivity, not path metadata stability. Separate processes or separately
+loaded module copies do not share this queue, so deployment must still enforce
+one cooperating mutator for each private mount namespace.
 
 For non-lazy unmount, the mounted-root descriptor remains authoritative
 through `syncfs` and a final runtime, persistent-identity, access-policy, and

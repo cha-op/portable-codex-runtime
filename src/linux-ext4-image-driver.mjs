@@ -315,7 +315,9 @@ const ERROR_MESSAGES = objectFreezeIntrinsic({
   unsupported_platform: "Linux ext4 image driver requires Linux",
 });
 const internalErrors = new WeakSet();
-const imageOperationTails = new MapConstructor();
+// This queue coordinates cooperating driver instances in this process only.
+// Deployment still owns the single-mutator boundary for one mount namespace.
+const operationLockTails = new MapConstructor();
 
 export class LinuxExt4ImageDriverError extends Error {
   constructor(code) {
@@ -2645,29 +2647,54 @@ async function destroyInternal(state, requestValue) {
   });
 }
 
-async function withImageOperationLock(imagePath, operation) {
+async function acquireOperationLock(key) {
   const previous =
-    mapGet(imageOperationTails, imagePath) ??
+    mapGet(operationLockTails, key) ??
     callIntrinsic(promiseResolveIntrinsic, PromiseConstructor, [undefined]);
   let release;
   const gate = new PromiseConstructor((resolveGate) => {
     release = resolveGate;
   });
-  mapSet(imageOperationTails, imagePath, gate);
+  mapSet(operationLockTails, key, gate);
   await previous;
-  try {
-    return await operation();
-  } finally {
+  let released = false;
+  return function releaseOperationLock() {
+    if (released) return;
+    released = true;
     release();
-    if (mapGet(imageOperationTails, imagePath) === gate) {
-      mapDelete(imageOperationTails, imagePath);
+    if (mapGet(operationLockTails, key) === gate) {
+      mapDelete(operationLockTails, key);
     }
+  };
+}
+
+function orderedOperationLockKeys(request) {
+  const imageKey = `image:${request.imagePath}`;
+  const mountKey = `mount:${request.mountPath}`;
+  return imageKey < mountKey
+    ? frozenRecord({ first: imageKey, second: mountKey })
+    : frozenRecord({ first: mountKey, second: imageKey });
+}
+
+async function withOperationLocks(request, operation) {
+  const keys = orderedOperationLockKeys(request);
+  const releaseFirst = await acquireOperationLock(keys.first);
+  let releaseSecond;
+  try {
+    releaseSecond = await acquireOperationLock(keys.second);
+    try {
+      return await operation();
+    } finally {
+      releaseSecond();
+    }
+  } finally {
+    releaseFirst();
   }
 }
 
 async function serializeRequest(input, normalize, operation) {
   const request = normalize(input);
-  return await withImageOperationLock(request.imagePath, () => operation(request));
+  return await withOperationLocks(request, () => operation(request));
 }
 
 export function createLinuxExt4ImageDriver(options) {

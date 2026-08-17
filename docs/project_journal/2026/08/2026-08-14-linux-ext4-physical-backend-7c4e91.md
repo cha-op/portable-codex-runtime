@@ -560,6 +560,27 @@ change and does not attest the current head:
   `/session` as the only application-writable storage whose contents enter the
   checkpoint and restore contract. The authority-free ordinary-bind control
   retains the same create option for diagnostic comparability.
+- A subsequent whole-range review found that the outer helper timeout could
+  kill the native process while `mkfs.ext4` still retained the image descriptor,
+  and that image-only request serialization did not exclude different images
+  from racing on one mount point. Formatting now uses one operation-wide
+  47-second monotonic deadline inside the native helper: 40 seconds of normal
+  execution, two seconds after `SIGTERM`, and five seconds for process-group
+  `SIGKILL`, leader reap, and quiescence proof. Formatter stdio is redirected to
+  a verified `/dev/null`; `PR_SET_PDEATHSIG` covers the direct formatter leader
+  if the outer helper dies, while the fixed formatter invocation must not leave
+  a long-lived descendant in that fallback. Ordinary success requires the
+  trusted formatter tree to remain in and leave its dedicated PGID. The
+  Linux-only harness proves that a same-group descendant holding the image and
+  a pipe stops, while a leader-only negative control continues writing and
+  therefore fails the protected property.
+- Driver operations now acquire canonical image and mount keys in stable order
+  across all cooperating driver instances in one module/process. A negative
+  image-only mutation makes the same-mount regression fail before the first
+  request releases its gate; the fixed path observes the completed mount and
+  rejects the second image without another mount dispatch. Cross-process
+  exclusion remains the deployment's single-mutator responsibility for the
+  private mount namespace.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

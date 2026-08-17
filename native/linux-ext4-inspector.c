@@ -2,17 +2,23 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 #if defined(__linux__) && defined(__has_include)
 #if __has_include(<fcntl.h>) && __has_include(<linux/fs.h>) &&                 \
     __has_include(<linux/close_range.h>) && __has_include(<linux/loop.h>) && \
     __has_include(<linux/magic.h>) &&                                       \
     __has_include(<linux/openat2.h>) && __has_include(<sys/ioctl.h>) &&      \
-    __has_include(<sys/mount.h>) && __has_include(<sys/syscall.h>) &&        \
+    __has_include(<sys/mount.h>) && __has_include(<sys/prctl.h>) &&          \
+    __has_include(<sys/syscall.h>) &&                                       \
     __has_include(<sys/sysmacros.h>) && __has_include(<sys/vfs.h>) &&        \
     __has_include(<sys/wait.h>) && __has_include(<sys/xattr.h>) &&           \
     __has_include(<unistd.h>)
@@ -38,14 +44,12 @@
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
-#include <sys/wait.h>
 #include <sys/xattr.h>
-#include <time.h>
-#include <unistd.h>
 #endif
 
 enum inspector_exit_code {
@@ -68,13 +72,246 @@ enum inspector_exit_code {
     defined(LOOP_CONFIGURE) && defined(LOOP_CTL_GET_FREE) &&                 \
     defined(BLKGETSIZE64) && defined(BLKSSZGET) && defined(BLKGETDISKSEQ) && \
     defined(CLOSE_RANGE_UNSHARE) && defined(STATX_MNT_ID) &&                \
-    defined(UMOUNT_NOFOLLOW) &&                                             \
+    defined(UMOUNT_NOFOLLOW) && defined(PR_SET_PDEATHSIG) &&                 \
     (defined(SYS_close_range) || defined(__NR_close_range)) &&              \
     (defined(SYS_openat2) || defined(__NR_openat2))
 #define PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI 1
 #endif
 
-#if !defined(PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI)
+#if defined(PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI) ||                      \
+    defined(PORTABLE_CODEX_FORMATTER_SUPERVISOR_TEST)
+
+#define FORMATTER_OPERATION_TIMEOUT_MS UINT64_C(47000)
+#define FORMATTER_EXECUTION_TIMEOUT_MS UINT64_C(40000)
+#define FORMATTER_TERM_GRACE_MS UINT64_C(2000)
+#define FORMATTER_KILL_REAP_TIMEOUT_MS UINT64_C(5000)
+#define FORMATTER_OUTER_RESERVE_MS UINT64_C(10000)
+#define FORMATTER_WAIT_POLL_MS UINT64_C(5)
+
+_Static_assert(FORMATTER_EXECUTION_TIMEOUT_MS + FORMATTER_TERM_GRACE_MS +
+                       FORMATTER_KILL_REAP_TIMEOUT_MS ==
+                   FORMATTER_OPERATION_TIMEOUT_MS,
+               "formatter phases must fill the operation deadline");
+_Static_assert(FORMATTER_OPERATION_TIMEOUT_MS + FORMATTER_OUTER_RESERVE_MS <
+                   UINT64_C(60000),
+               "formatter supervision must precede the JS helper timeout");
+
+enum formatter_supervision_result {
+  FORMATTER_SUPERVISION_ERROR = -1,
+  FORMATTER_SUPERVISION_REAPED = 0,
+  FORMATTER_SUPERVISION_TIMED_OUT = 1,
+};
+
+static int monotonic_milliseconds(uint64_t *output) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return -1;
+  if ((uint64_t)now.tv_sec > (UINT64_MAX - (uint64_t)now.tv_nsec / 1000000U) /
+                                 UINT64_C(1000)) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  *output = (uint64_t)now.tv_sec * UINT64_C(1000) +
+            (uint64_t)now.tv_nsec / UINT64_C(1000000);
+  return 0;
+}
+
+static int deadline_after(uint64_t duration_ms, uint64_t *deadline) {
+  uint64_t now;
+  if (monotonic_milliseconds(&now) != 0 || now > UINT64_MAX - duration_ms) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  *deadline = now + duration_ms;
+  return 0;
+}
+
+static int phase_deadline(uint64_t hard_deadline, uint64_t phase_ms,
+                          uint64_t reserved_ms, uint64_t *deadline) {
+  uint64_t now;
+  uint64_t phase_end;
+  uint64_t latest_end;
+  if (reserved_ms >= hard_deadline ||
+      monotonic_milliseconds(&now) != 0 || now >= hard_deadline - reserved_ms ||
+      now > UINT64_MAX - phase_ms) {
+    errno = ETIMEDOUT;
+    return -1;
+  }
+  phase_end = now + phase_ms;
+  latest_end = hard_deadline - reserved_ms;
+  *deadline = phase_end < latest_end ? phase_end : latest_end;
+  return 0;
+}
+
+static int formatter_child_terminal_until(pid_t child, uint64_t deadline) {
+  for (;;) {
+    siginfo_t information;
+    uint64_t now;
+    uint64_t remaining;
+    uint64_t sleep_ms;
+    struct timespec delay;
+    int wait_result;
+
+    memset(&information, 0, sizeof(information));
+    do {
+      wait_result = waitid(P_PID, (id_t)child, &information,
+                           WEXITED | WNOHANG | WNOWAIT);
+    } while (wait_result != 0 && errno == EINTR);
+    if (wait_result != 0) return -1;
+    if (information.si_pid == child) return 1;
+    if (monotonic_milliseconds(&now) != 0) return -1;
+    if (now >= deadline) return 0;
+    remaining = deadline - now;
+    sleep_ms = remaining < FORMATTER_WAIT_POLL_MS ? remaining
+                                                  : FORMATTER_WAIT_POLL_MS;
+    delay.tv_sec = (time_t)(sleep_ms / UINT64_C(1000));
+    delay.tv_nsec = (long)((sleep_ms % UINT64_C(1000)) * UINT64_C(1000000));
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+  }
+}
+
+static int establish_formatter_process_group(pid_t child) {
+  pid_t group;
+  if (setpgid(child, child) == 0) return 0;
+  if (errno != EACCES && errno != EPERM) return -1;
+  group = getpgid(child);
+  return group == child ? 0 : -1;
+}
+
+#if defined(__linux__)
+static int configure_formatter_parent_death(pid_t expected_parent) {
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) return -1;
+  if (getppid() != expected_parent) {
+    errno = ESRCH;
+    return -1;
+  }
+  return 0;
+}
+#endif
+
+static int signal_unreaped_formatter_group(pid_t leader, int signal_number) {
+  /* The unreaped leader reserves both its PID and PGID against reuse. */
+  if (kill(-leader, signal_number) == 0 || errno == ESRCH) return 0;
+  return -1;
+}
+
+static int formatter_group_quiescent(pid_t leader) {
+#if defined(__linux__)
+  if (kill(-leader, 0) == 0 || errno == EPERM) return 0;
+  return errno == ESRCH ? 1 : -1;
+#else
+  return getpgid(leader) < 0 && errno == ESRCH ? 1 : 0;
+#endif
+}
+
+static int formatter_group_quiescent_until(pid_t leader, uint64_t deadline) {
+  for (;;) {
+    uint64_t now;
+    struct timespec delay;
+    int state = formatter_group_quiescent(leader);
+    if (state != 0) return state;
+    if (monotonic_milliseconds(&now) != 0) return -1;
+    if (now >= deadline) return 0;
+    delay.tv_sec = 0;
+    delay.tv_nsec = (long)(FORMATTER_WAIT_POLL_MS * UINT64_C(1000000));
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+  }
+}
+
+static int reap_formatter_leader(pid_t leader, int *wait_status) {
+  pid_t waited;
+  do {
+    waited = waitpid(leader, wait_status, WNOHANG);
+  } while (waited < 0 && errno == EINTR);
+  return waited == leader ? 0 : -1;
+}
+
+static int finish_formatter_group(pid_t leader, uint64_t deadline,
+                                  int *wait_status) {
+  int quiescent;
+
+  if (signal_unreaped_formatter_group(leader, SIGKILL) != 0 ||
+      reap_formatter_leader(leader, wait_status) != 0) {
+    return -1;
+  }
+  /* No further signal is sent after reap, so a reused PGID is never harmed. */
+  quiescent = formatter_group_quiescent_until(leader, deadline);
+  return quiescent > 0 ? 0 : -1;
+}
+
+static void force_formatter_group_cleanup(pid_t leader,
+                                          uint64_t hard_deadline,
+                                          int *wait_status) {
+  if (signal_unreaped_formatter_group(leader, SIGKILL) != 0 ||
+      formatter_child_terminal_until(leader, hard_deadline) <= 0) {
+    return;
+  }
+  (void)finish_formatter_group(leader, hard_deadline, wait_status);
+}
+
+static int supervise_formatter(pid_t leader, uint64_t hard_deadline,
+                               uint64_t execution_timeout_ms,
+                               uint64_t term_grace_ms,
+                               uint64_t kill_reap_timeout_ms,
+                               int *wait_status) {
+  uint64_t deadline;
+  uint64_t termination_reserve;
+  int wait_result;
+
+  if (term_grace_ms > UINT64_MAX - kill_reap_timeout_ms) {
+    force_formatter_group_cleanup(leader, hard_deadline, wait_status);
+    return FORMATTER_SUPERVISION_ERROR;
+  }
+  termination_reserve = term_grace_ms + kill_reap_timeout_ms;
+  if (phase_deadline(hard_deadline, execution_timeout_ms,
+                     termination_reserve, &deadline) != 0) {
+    force_formatter_group_cleanup(leader, hard_deadline, wait_status);
+    return FORMATTER_SUPERVISION_ERROR;
+  }
+  wait_result = formatter_child_terminal_until(leader, deadline);
+  if (wait_result > 0) {
+    return finish_formatter_group(leader, hard_deadline, wait_status) == 0
+               ? FORMATTER_SUPERVISION_REAPED
+               : FORMATTER_SUPERVISION_ERROR;
+  }
+  if (wait_result < 0 ||
+      signal_unreaped_formatter_group(leader, SIGTERM) != 0) {
+    force_formatter_group_cleanup(leader, hard_deadline, wait_status);
+    return FORMATTER_SUPERVISION_ERROR;
+  }
+
+  if (phase_deadline(hard_deadline, term_grace_ms, kill_reap_timeout_ms,
+                     &deadline) != 0) {
+    force_formatter_group_cleanup(leader, hard_deadline, wait_status);
+    return FORMATTER_SUPERVISION_ERROR;
+  }
+  wait_result = formatter_child_terminal_until(leader, deadline);
+  if (wait_result > 0) {
+    return finish_formatter_group(leader, hard_deadline, wait_status) == 0
+               ? FORMATTER_SUPERVISION_TIMED_OUT
+               : FORMATTER_SUPERVISION_ERROR;
+  }
+  if (wait_result < 0 ||
+      signal_unreaped_formatter_group(leader, SIGKILL) != 0) {
+    force_formatter_group_cleanup(leader, hard_deadline, wait_status);
+    return FORMATTER_SUPERVISION_ERROR;
+  }
+
+  wait_result = formatter_child_terminal_until(leader, hard_deadline);
+  if (wait_result <= 0) {
+    force_formatter_group_cleanup(leader, hard_deadline, wait_status);
+    return FORMATTER_SUPERVISION_ERROR;
+  }
+  return finish_formatter_group(leader, hard_deadline, wait_status) == 0
+             ? FORMATTER_SUPERVISION_TIMED_OUT
+             : FORMATTER_SUPERVISION_ERROR;
+}
+
+#endif
+
+#if !defined(PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI) &&                     \
+    !defined(PORTABLE_CODEX_FORMATTER_SUPERVISOR_TEST)
 
 int main(int argc, char **argv) {
   (void)argc;
@@ -82,7 +319,8 @@ int main(int argc, char **argv) {
   return INSPECTOR_EXIT_UNSUPPORTED;
 }
 
-#else
+#elif defined(PORTABLE_CODEX_HAS_EXT4_INSPECTION_ABI) &&                    \
+    !defined(PORTABLE_CODEX_FORMATTER_SUPERVISOR_TEST)
 
 #define FILE_HANDLE_LIMIT_BYTES 128U
 #define FILESYSTEM_UUID_BYTES 16U
@@ -459,6 +697,37 @@ static int close_helper_authorities_for_exec(int retained_fd) {
 #endif
 }
 
+static int open_verified_dev_null(void) {
+  struct stat metadata;
+  int null_fd = open("/dev/null", O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+  if (null_fd < 0) return -1;
+  if (fstat(null_fd, &metadata) != 0 || !S_ISCHR(metadata.st_mode) ||
+      major(metadata.st_rdev) != 1U || minor(metadata.st_rdev) != 3U) {
+    (void)close(null_fd);
+    errno = ENODEV;
+    return -1;
+  }
+  return null_fd;
+}
+
+static int redirect_formatter_standard_descriptors(int null_fd) {
+  int descriptor;
+  for (descriptor = STDIN_FILENO; descriptor <= STDERR_FILENO;
+       descriptor += 1) {
+    if (dup3(null_fd, descriptor, 0) < 0) return -1;
+  }
+  return 0;
+}
+
+static void terminate_unestablished_formatter(pid_t child,
+                                               uint64_t hard_deadline) {
+  int wait_status;
+  if (kill(child, SIGKILL) != 0 && errno != ESRCH) return;
+  if (formatter_child_terminal_until(child, hard_deadline) > 0) {
+    (void)reap_formatter_leader(child, &wait_status);
+  }
+}
+
 static int standard_descriptors_present(void) {
   int descriptor;
   for (descriptor = STDIN_FILENO; descriptor <= STDERR_FILENO;
@@ -468,15 +737,19 @@ static int standard_descriptors_present(void) {
   return 1;
 }
 
-static int run_mkfs_on_fd(const char *executable, int image_fd) {
+static int run_mkfs_on_fd(const char *executable, int image_fd,
+                          uint64_t hard_deadline) {
   static char *const environment[] = {(char *)"LANG=C", (char *)"LC_ALL=C",
                                       NULL};
   char proc_path[64];
   char root_owner[96];
   pid_t child;
+  pid_t expected_parent;
+  int null_fd = -1;
+  int supervision;
   int wait_status = 0;
   int root_owner_length;
-  pid_t waited;
+  uint64_t launch_deadline;
   root_owner_length = snprintf(root_owner, sizeof(root_owner),
                                "root_owner=%ju:%ju", (uintmax_t)getuid(),
                                (uintmax_t)getgid());
@@ -485,20 +758,53 @@ static int run_mkfs_on_fd(const char *executable, int image_fd) {
       (size_t)root_owner_length >= sizeof(root_owner)) {
     return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
   }
+  null_fd = open_verified_dev_null();
+  if (null_fd < 0) return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  if (phase_deadline(hard_deadline, FORMATTER_EXECUTION_TIMEOUT_MS,
+                     FORMATTER_TERM_GRACE_MS +
+                         FORMATTER_KILL_REAP_TIMEOUT_MS,
+                     &launch_deadline) != 0) {
+    (void)close(null_fd);
+    return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  }
+  (void)launch_deadline;
+  expected_parent = getpid();
   child = fork();
-  if (child < 0) return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  if (child < 0) {
+    (void)close(null_fd);
+    return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  }
   if (child == 0) {
     char *const arguments[] = {(char *)executable, (char *)"-F", (char *)"-q",
                                (char *)"-E", root_owner, (char *)"--",
                                proc_path, NULL};
-    if (close_helper_authorities_for_exec(image_fd) != 0) _exit(126);
+    /*
+     * Group supervision requires the reviewed formatter tree to remain in this
+     * PGID. If the outer timeout kills this helper first, PDEATHSIG covers only
+     * this direct leader, so the configured formatter must not leave long-lived
+     * descendants, even in the same PGID.
+     */
+    if (configure_formatter_parent_death(expected_parent) != 0 ||
+        setpgid(0, 0) != 0 ||
+        redirect_formatter_standard_descriptors(null_fd) != 0 ||
+        close_helper_authorities_for_exec(image_fd) != 0) {
+      _exit(126);
+    }
     execve(executable, arguments, environment);
     _exit(127);
   }
-  do {
-    waited = waitpid(child, &wait_status, 0);
-  } while (waited < 0 && errno == EINTR);
-  if (waited != child || !WIFEXITED(wait_status) ||
+  if (establish_formatter_process_group(child) != 0) {
+    (void)close(null_fd);
+    terminate_unestablished_formatter(child, hard_deadline);
+    return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  }
+  (void)close(null_fd);
+  supervision = supervise_formatter(
+      child, hard_deadline, FORMATTER_EXECUTION_TIMEOUT_MS,
+      FORMATTER_TERM_GRACE_MS, FORMATTER_KILL_REAP_TIMEOUT_MS, &wait_status);
+  /* This proves stability only for the trusted tree that remains in its PGID. */
+  if (supervision != FORMATTER_SUPERVISION_REAPED ||
+      !WIFEXITED(wait_status) ||
       WEXITSTATUS(wait_status) != 0) {
     return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
   }
@@ -907,6 +1213,10 @@ static int format_ext4_image(const char *root_path,
   int parent_fd = -1;
   int image_fd = -1;
   int status;
+  uint64_t hard_deadline;
+  if (deadline_after(FORMATTER_OPERATION_TIMEOUT_MS, &hard_deadline) != 0) {
+    return INSPECTOR_EXIT_OUTCOME_UNCERTAIN;
+  }
   if (!valid_direct_name(name) || !valid_absolute_executable(executable)) {
     return INSPECTOR_EXIT_USAGE;
   }
@@ -924,7 +1234,7 @@ static int format_ext4_image(const char *root_path,
   if (status != EXIT_SUCCESS) goto cleanup;
   status = require_fd_identity(image_fd, device, inode, 0);
   if (status != EXIT_SUCCESS) goto cleanup;
-  status = run_mkfs_on_fd(executable, image_fd);
+  status = run_mkfs_on_fd(executable, image_fd, hard_deadline);
   if (status != EXIT_SUCCESS) goto cleanup;
   if (require_private_policy(image_fd, S_IFREG, IMAGE_MODE, 1, 1) !=
           EXIT_SUCCESS ||

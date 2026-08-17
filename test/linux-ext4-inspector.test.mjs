@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
@@ -203,7 +206,9 @@ test("inspector returns exact frozen filesystem and object identity records", as
     assert.equal(Object.isFrozen(args), true);
     assert.equal(options.shell, false);
     assert.equal(options.encoding, "buffer");
+    assert.equal(options.killSignal, "SIGKILL");
     assert.equal(options.maxBuffer, 4096);
+    assert.equal(options.timeout, 60_000);
     assert.deepEqual(options.env, { LANG: "C", LC_ALL: "C" });
     assert.equal(Object.hasOwn(options.env, "PATH"), false);
     assert.equal(Object.isFrozen(options), true);
@@ -459,6 +464,59 @@ test("native helper source binds mutation authority, loop geometry, and settle c
     /\(char \*\)"-E", root_owner, \(char \*\)"--"/u,
   );
   assert.match(source, /execve\(executable, arguments, environment\)/u);
+  assert.match(source, /FORMATTER_OPERATION_TIMEOUT_MS UINT64_C\(47000\)/u);
+  assert.match(source, /FORMATTER_EXECUTION_TIMEOUT_MS UINT64_C\(40000\)/u);
+  assert.match(source, /FORMATTER_TERM_GRACE_MS UINT64_C\(2000\)/u);
+  assert.match(source, /FORMATTER_KILL_REAP_TIMEOUT_MS UINT64_C\(5000\)/u);
+  assert.match(source, /FORMATTER_OUTER_RESERVE_MS UINT64_C\(10000\)/u);
+  assert.match(
+    source,
+    /FORMATTER_OPERATION_TIMEOUT_MS \+ FORMATTER_OUTER_RESERVE_MS <\s+UINT64_C\(60000\)/u,
+  );
+  assert.match(
+    source,
+    /deadline_after\(FORMATTER_OPERATION_TIMEOUT_MS, &hard_deadline\)/u,
+  );
+  assert.match(
+    source,
+    /force_formatter_group_cleanup\(leader, hard_deadline, wait_status\)/u,
+  );
+  const forceCleanupStart = source.indexOf(
+    "static void force_formatter_group_cleanup(",
+  );
+  const supervisorStart = source.indexOf(
+    "static int supervise_formatter(",
+    forceCleanupStart,
+  );
+  const supervisionEnd = source.indexOf("\n}\n\n#endif", supervisorStart);
+  assert(forceCleanupStart >= 0);
+  assert(supervisorStart > forceCleanupStart);
+  assert(supervisionEnd > supervisorStart);
+  const forceCleanupBody = source.slice(forceCleanupStart, supervisorStart);
+  const supervisionBody = source.slice(forceCleanupStart, supervisionEnd);
+  assert.match(
+    forceCleanupBody,
+    /formatter_child_terminal_until\(leader, hard_deadline\)/u,
+  );
+  assert.match(
+    forceCleanupBody,
+    /finish_formatter_group\(leader, hard_deadline, wait_status\)/u,
+  );
+  assert.match(supervisionBody, /phase_deadline\(hard_deadline,/u);
+  assert.doesNotMatch(supervisionBody, /deadline_after\(/u);
+  assert.match(
+    source,
+    /PDEATHSIG covers only\s+\* this direct leader/u,
+  );
+  assert.match(source, /waitid\(P_PID, \(id_t\)child/u);
+  assert.match(source, /WEXITED \| WNOHANG \| WNOWAIT/u);
+  assert.match(source, /kill\(-leader, signal_number\)/u);
+  assert.match(source, /setpgid\(0, 0\)/u);
+  assert.match(source, /setpgid\(child, child\)/u);
+  assert.match(source, /prctl\(PR_SET_PDEATHSIG, SIGKILL\)/u);
+  assert.match(source, /getppid\(\) != expected_parent/u);
+  assert.match(source, /open\("\/dev\/null", O_RDWR \| O_NOFOLLOW \| O_CLOEXEC\)/u);
+  assert.match(source, /redirect_formatter_standard_descriptors\(null_fd\)/u);
   assert.match(source, /dup3\(retained_fd, 3, 0\)/u);
   assert.match(source, /retained_fd <= STDERR_FILENO/u);
   assert.match(source, /standard_descriptors_present\(\)/u);
@@ -472,6 +530,67 @@ test("native helper source binds mutation authority, loop geometry, and settle c
   assert.match(source, /"\/proc\/self\/fd\/%d"/u);
   assert.doesNotMatch(source, /execlp?\(/u);
 });
+
+test(
+  "native formatter supervisor terminates the process group, reaps it, and stabilizes the image",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "portable-codex-formatter-supervisor-"),
+    );
+    const executable = join(directory, "formatter-supervisor-test");
+    const harness = fileURLToPath(
+      new URL(
+        "./fixtures/linux-ext4-formatter-supervisor-harness.c",
+        import.meta.url,
+      ),
+    );
+    try {
+      await execFileAsync(
+        "cc",
+        [
+          "-O2",
+          "-std=c11",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-DPORTABLE_CODEX_FORMATTER_SUPERVISOR_TEST",
+          harness,
+          "-o",
+          executable,
+        ],
+        {
+          encoding: "buffer",
+          env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+          maxBuffer: 16 * 1024,
+          shell: false,
+          timeout: 10_000,
+        },
+      );
+      const { stderr, stdout } = await execFileAsync(executable, [], {
+        encoding: "buffer",
+        env: { LANG: "C", LC_ALL: "C" },
+        maxBuffer: 16 * 1024,
+        shell: false,
+        timeout: 5_000,
+      });
+      assert.equal(stderr.length, 0);
+      assert.deepEqual(JSON.parse(stdout.toString("utf8")), {
+        descendantGroupStopped: true,
+        execFailureReaped: true,
+        imageStable: true,
+        leaderOnlyMutationDetected: true,
+        nonzeroReaped: true,
+        pipeClosed: true,
+        reaped: true,
+        parentDeathKill: true,
+        termThenKill: true,
+      });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  },
+);
 
 test("native loop detach settles on authoritative kernel state", async () => {
   const source = await readFile(

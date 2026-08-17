@@ -695,7 +695,7 @@ test("publication control identity is pinned, persistent, and replay-bound", asy
   );
 });
 
-test("same-image operations are serialized across driver instances", async () => {
+test("same-image operations with different mounts serialize across drivers", async () => {
   const paths = await createPaths();
   let armed = false;
   let releaseFirst;
@@ -716,29 +716,165 @@ test("same-image operations are serialized across driver instances", async () =>
   });
   await fixture.driver.provision(provisionRequest(paths));
   fixture.fdCalls.length = 0;
+  const secondMountPath = join(paths.root, "mounts", "volume-two");
+  await mkdir(secondMountPath, { mode: 0o700 });
+  const secondPaths = {
+    ...paths,
+    attachmentRootPath: join(secondMountPath, "attachment-two"),
+    mountPath: secondMountPath,
+  };
+  const secondFixture = createFixture(secondPaths, {
+    associatedLoops: [LOOP_DEVICE],
+    initiallyMounted: true,
+    loopAttached: true,
+  });
   armed = true;
   const first = fixture.driver.syncFilesystem(mountRequest(paths));
   await firstReached;
   const callsAtGate = fixture.fdCalls.length;
-  const secondDriver = createLinuxExt4ImageDriver({
-    commandRunner: async (executable) => {
-      if (executable === "/usr/bin/getfacl") {
-        return completion("user::rwx\ngroup::---\nother::---\n");
-      }
-      throw new Error("unexpected external command");
-    },
-    inspector: createInspector(paths, fixture.state, fixture.fdCalls, {}),
-    platform: "linux",
-    readMountInfo: async () => {
-      const options = "rw,nosuid,nodev,noexec,noatime";
-      return Buffer.from(
-        `29 23 0:25 / / rw - ext4 /dev/root rw\n36 29 7:7 / ${encodeMountField(paths.mountPath)} ${options} - ext4 ${LOOP_DEVICE} rw,errors=remount-ro\n`,
-      );
-    },
-  });
-  const second = secondDriver.syncFilesystem(mountRequest(paths));
+  const second = secondFixture.driver.syncFilesystem(mountRequest(secondPaths));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fixture.fdCalls.length, callsAtGate);
+  assert.equal(secondFixture.fdCalls.length, 0);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.equal(
+    fixture.fdCalls.filter(({ operation }) => operation === "syncfs").length,
+    1,
+  );
+  assert.equal(
+    secondFixture.fdCalls.filter(({ operation }) => operation === "syncfs")
+      .length,
+    1,
+  );
+});
+
+test("same-mount remounts for different images reject a stacked mount", async () => {
+  const firstPaths = await createPaths();
+  const secondRootPaths = await createPaths();
+  const secondPaths = {
+    ...secondRootPaths,
+    attachmentRootPath: join(firstPaths.mountPath, "attachment-two"),
+    mountPath: firstPaths.mountPath,
+  };
+  await writeFile(firstPaths.imagePath, Buffer.alloc(1024), { mode: 0o600 });
+  await writeFile(secondPaths.imagePath, Buffer.alloc(1024), { mode: 0o600 });
+  await mkdir(firstPaths.mountPath, { mode: 0o700 });
+
+  let sharedMounted = false;
+  let releaseFirstMount;
+  let markFirstMount;
+  let firstMountDispatches = 0;
+  let secondMountInfoReads = 0;
+  let secondMountDispatches = 0;
+  const firstMountReached = new Promise((resolve) => {
+    markFirstMount = resolve;
+  });
+  const firstMountRelease = new Promise((resolve) => {
+    releaseFirstMount = resolve;
+  });
+  const readSharedMountInfo = async () => {
+    const rootLine = "29 23 0:25 / / rw,relatime - ext4 /dev/root rw\n";
+    if (!sharedMounted) return Buffer.from(rootLine, "utf8");
+    return Buffer.from(
+      `${rootLine}36 29 7:7 / ${encodeMountField(firstPaths.mountPath)} ` +
+        `rw,nosuid,nodev,noexec,noatime - ext4 ${LOOP_DEVICE} ` +
+        "rw,errors=remount-ro\n",
+      "utf8",
+    );
+  };
+  const firstFixture = createFixture(firstPaths, {
+    associatedLoops: [LOOP_DEVICE],
+    async beforeFdOperation(request) {
+      if (request.operation !== "mount-ext4") return;
+      firstMountDispatches += 1;
+      markFirstMount();
+      await firstMountRelease;
+      sharedMounted = true;
+    },
+    loopAttached: true,
+    readMountInfo: readSharedMountInfo,
+  });
+  const secondLoopDevice = "/dev/loop8";
+  const secondFixture = createFixture(secondPaths, {
+    associatedLoops: [secondLoopDevice],
+    beforeFdOperation(request) {
+      if (request.operation !== "mount-ext4") return;
+      secondMountDispatches += 1;
+      sharedMounted = true;
+    },
+    loopAttached: true,
+    loopDevice: secondLoopDevice,
+    loopRdev: "7:8",
+    readMountInfo: async () => {
+      secondMountInfoReads += 1;
+      return await readSharedMountInfo();
+    },
+  });
+
+  const first = firstFixture.driver.remount(mountRequest(firstPaths));
+  await firstMountReached;
+  const second = assert.rejects(
+    secondFixture.driver.remount(mountRequest(secondPaths)),
+    driverError("mount_mismatch"),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstMountDispatches, 1);
+  assert.equal(secondMountInfoReads, 0);
+  assert.equal(secondMountDispatches, 0);
+  assert.equal(secondFixture.fdCalls.length, 0);
+
+  releaseFirstMount();
+  await Promise.all([first, second]);
+  assert.equal(firstMountDispatches, 1);
+  assert.equal(secondMountInfoReads > 0, true);
+  assert.equal(secondMountDispatches, 0);
+  assert.equal(secondFixture.fdCalls.length, 0);
+  assert.equal(sharedMounted, true);
+});
+
+test("a failed operation releases both keys to its queued successor", async () => {
+  const paths = await createPaths();
+  let armed = false;
+  let failFirstSync = false;
+  let releaseFirst;
+  let markFirst;
+  const firstReached = new Promise((resolve) => {
+    markFirst = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const fixture = createFixture(paths, {
+    async beforeFdOperation(request) {
+      if (!armed || request.operation !== "syncfs") return;
+      armed = false;
+      markFirst();
+      await release;
+    },
+    fdOperationError(request) {
+      if (!failFirstSync || request.operation !== "syncfs") return false;
+      failFirstSync = false;
+      return true;
+    },
+  });
+  await fixture.driver.provision(provisionRequest(paths));
+  fixture.fdCalls.length = 0;
+  armed = true;
+  failFirstSync = true;
+
+  const first = assert.rejects(
+    fixture.driver.syncFilesystem(mountRequest(paths)),
+    driverError("operation_outcome_uncertain"),
+  );
+  await firstReached;
+  const second = fixture.driver.syncFilesystem(mountRequest(paths));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    fixture.fdCalls.filter(({ operation }) => operation === "syncfs").length,
+    1,
+  );
+
   releaseFirst();
   await Promise.all([first, second]);
   assert.equal(
