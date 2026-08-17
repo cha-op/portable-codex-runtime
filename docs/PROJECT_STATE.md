@@ -447,7 +447,8 @@
   authority, plus same-process conformance evidence, remains pending. Within
   the narrower default boundary, parent-held directory FDs are matched to a
   temporary holder in Podman's rootless namespace, create must preserve that
-  exact procfd source before start, a new create must return its complete
+  exact procfd source in Podman's external `created` state before start, a new
+  create must return its complete
   64-hex container identity, and image `Config.User` drives the explicit non-
   root `keep-id` UID/GID mapping used by the conformance writer. Ordinary
   failures observed before child exit request whole-group termination; every

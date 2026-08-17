@@ -326,9 +326,11 @@ own pinned observations and independently stats the exact
 Each heartbeat repeats the helper-side FD observation and is followed by that
 parent-side object and policy proof.
 
-The configured container must inspect as non-running `configured`, with one
-read-write `rprivate` `/session` bind whose source is exactly that holder FD,
-before `start` is dispatched. A new create receipt must contain the complete
+The internally configured container must inspect as non-running external
+`created`—Podman 4.9.3's Docker-compatible encoding of
+`ContainerStateConfigured`—with one read-write `rprivate` `/session` bind whose
+source is exactly that holder FD before `start` is dispatched. A new create
+receipt must contain the complete
 64-lowercase-hex container ID; a short compatibility identity cannot reach
 start. The immutable image's own `Config.User` must be a canonical non-root
 numeric `uid:gid`; create maps that pair through

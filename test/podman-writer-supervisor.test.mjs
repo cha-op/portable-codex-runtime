@@ -219,7 +219,7 @@ case "$1" in
     else
       pid=0
       running=false
-      status=configured
+      status=created
     fi
     printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":%s,"Running":%s,"Status":"%s"}}]\\n' \\
       ${shellQuote(containerId)} ${shellQuote(DIGEST)} \\
@@ -270,7 +270,7 @@ case "$1" in
     ;;
   container)
     name=$(cat ${shellQuote(namePath)})
-    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":0,"Running":false,"Status":"configured"}}]\\n' \\
+    printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":0,"Running":false,"Status":"created"}}]\\n' \\
       ${shellQuote(CONTAINER_ID)} ${shellQuote(DIGEST)} \\
       ${shellQuote(HELD_MOUNT_SOURCE)} "$name"
     ;;
@@ -354,7 +354,7 @@ case "$1" in
     else
       pid=0
       running=false
-      status=configured
+      status=created
     fi
     printf '[{"Id":"%s","ImageDigest":"%s","Mounts":[{"Destination":"/session","Propagation":"rprivate","RW":true,"Source":"%s","Type":"bind"}],"Name":"%s","State":{"Pid":%s,"Running":%s,"Status":"%s"}}]\\n' \\
       ${shellQuote(CONTAINER_ID)} ${shellQuote(DIGEST)} "$source_path" \\
@@ -845,7 +845,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
             ? false
             : running,
         settings.inspectionStatus ??
-          (exists && !running && !hasStarted ? "configured" : undefined),
+          (exists && !running && !hasStarted ? "created" : undefined),
       );
       value.Name = name ?? settings.containerName;
       settings.mutateInspection?.(value);
@@ -1340,7 +1340,7 @@ test("missing-state reconciliation probes the exact name and fails closed on liv
 
   const created = await fixture(t, {
     forceStopped: true,
-    inspectionStatus: "configured",
+    inspectionStatus: "created",
     psEntries: (name) => [{ Id: CONTAINER_ID, Names: [name], State: "created" }],
   });
   await assert.rejects(
@@ -1469,7 +1469,7 @@ test("preparing reconciliation observes stopped state without mutation", async (
       {
         containerName: configured.name,
         forceStopped: true,
-        inspectionStatus: "configured",
+        inspectionStatus: "created",
         psEntries: [{
           Id: CONTAINER_ID,
           Names: [configured.name],
@@ -1769,22 +1769,26 @@ test("running mount proof is bracketed by stable exact-container PID inspections
   );
 });
 
-test("pre-start inspection requires the exact configured state", async (t) => {
-  const base = await fixture(t, { inspectionStatus: "exited" });
-  await assert.rejects(
-    base.supervisor.launchWriter(base.input),
-    assertSupervisorError("podman_writer_output_invalid"),
-  );
-  assert.equal(
-    base.events.some((event) => event.arguments_[0] === "start"),
-    false,
-  );
-  assert.equal(
-    (await base.state.read(
-      exact({ launchAttemptId: "launch-attempt-001" }),
-    )).status,
-    "created",
-  );
+test("pre-start inspection requires Podman's exact external created state", async (t) => {
+  for (const inspectionStatus of ["configured", "exited"]) {
+    await t.test(inspectionStatus, async (t) => {
+      const base = await fixture(t, { inspectionStatus });
+      await assert.rejects(
+        base.supervisor.launchWriter(base.input),
+        assertSupervisorError("podman_writer_output_invalid"),
+      );
+      assert.equal(
+        base.events.some((event) => event.arguments_[0] === "start"),
+        false,
+      );
+      assert.equal(
+        (await base.state.read(
+          exact({ launchAttemptId: "launch-attempt-001" }),
+        )).status,
+        "created",
+      );
+    });
+  }
 });
 
 test("Linux default authority holds a rootless helper procfd and reaps it on close", {

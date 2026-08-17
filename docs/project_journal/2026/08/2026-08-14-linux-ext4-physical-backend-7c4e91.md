@@ -329,7 +329,8 @@ change and does not attest the current head:
   domain. Paths cross one bounded private-stdin frame rather than argv; the
   helper's bounded PID/FD/`dev`/`ino` receipt and heartbeats are independently
   checked from the parent before create and start.
-- Create is followed by a non-running configured-container inspection that
+- Create is followed by a non-running inspection whose external `created`
+  status is Podman 4.9.3's encoding of its internal Configured state and that
   requires the exact holder procfd as the sole read-write `rprivate` session
   bind. Image `Config.User` must be a canonical non-root numeric `uid:gid` and
   drives the exact `keep-id:uid=...,gid=...` mapping. Stable exact-container
@@ -367,11 +368,11 @@ change and does not attest the current head:
   after exit it waits through direct close for kernel `ESRCH` without
   signalling a potentially reused PGID. A wrapper-plus-helper fixture must
   prove group absence before authority close.
-- On the final local bytes, supervisor/state focused tests passed 57/64 with
+- On the final local bytes, supervisor/state focused tests passed 59/66 with
   seven Linux-only skips. The supervisor/state, logical-launcher, and physical-
-  binding set passed 224/231 with the same seven skips. Full Node discovery with
+  binding set passed 226/233 with the same seven skips. Full Node discovery with
   only the independently reproduced `chatgptAuthTokens` watcher-`EMFILE` case
-  skipped passed 2,910/2,920 with ten skips and no failures. The supervisor,
+  skipped passed 2,912/2,922 with ten skips and no failures. The supervisor,
   holder helper, integration, and test files passed `node --check`; the bundled
   project-journal validator and tracked/untracked whitespace checks passed.
   Darwin did not execute the new Linux procfd/process-group tests or the real

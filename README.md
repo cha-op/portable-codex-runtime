@@ -562,7 +562,8 @@ and same-process evidence for the combined components, remain pending. For its
 narrower local boundary, the default authority keeps parent-held directory FDs
 and a temporary FD holder inside Podman's rootless namespace, compares both
 sides' object identity and access policy, proves the exact configured bind
-before start, and brackets the live bind proof with stable container ID/PID
+in Podman's external `created` state before start, and brackets the live bind
+proof with stable container ID/PID
 observations. A new create receipt must contain the complete 64-hex container
 ID before start is admitted. Image `Config.User` supplies the exact non-root
 numeric UID/GID mapped by `keep-id`; the Linux conformance writer must create a

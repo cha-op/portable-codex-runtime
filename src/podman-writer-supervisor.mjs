@@ -2439,7 +2439,7 @@ function validatePsContainer(value, expectedName, code) {
       regexpTest(CONTAINER_ID_PATTERN, id) &&
       typeof state === "string" &&
       arrayIncludes(
-        ["configured", "created", "exited", "running", "stopped"],
+        ["created", "exited", "running", "stopped"],
         state,
       ),
     code,
@@ -2462,8 +2462,8 @@ function validatePsInspectionState(candidate, inspection, code) {
   const running = ownJsonValue(state, "Running", code);
   ensure(
     (candidate.state === "running" && running === true && status === "running") ||
-      (arrayIncludes(["configured", "created"], candidate.state) &&
-        running === false && status === "configured") ||
+      (candidate.state === "created" &&
+        running === false && status === "created") ||
       (arrayIncludes(["exited", "stopped"], candidate.state) &&
         running === false && arrayIncludes(["exited", "stopped"], status)),
     code,
@@ -2542,7 +2542,7 @@ function validateContainerInspection(
   } else {
     ensure(
       statePid === 0 &&
-        arrayIncludes(["configured", "exited", "stopped"], stateStatus),
+        arrayIncludes(["created", "exited", "stopped"], stateStatus),
       code,
     );
   }
@@ -3139,6 +3139,8 @@ export function createPodmanWriterSupervisor(...args) {
         }),
         false,
       );
+      // Podman 4.9.3 serializes its internal ContainerStateConfigured as
+      // "created" for Docker-compatible inspect output.
       ensure(
         ownJsonValue(
           ownJsonValue(
@@ -3148,7 +3150,7 @@ export function createPodmanWriterSupervisor(...args) {
           ),
           "Status",
           "podman_writer_output_invalid",
-        ) === "configured",
+        ) === "created",
         "podman_writer_output_invalid",
       );
       await verifyCurrentFilesystemAuthority(
@@ -3374,7 +3376,7 @@ export function createPodmanWriterSupervisor(...args) {
           ),
         });
         ensure(
-          observedStatus !== "configured",
+          observedStatus !== "created",
           "podman_writer_supervisor_outcome_uncertain",
         );
         // This is terminal observation, not a durable supervisor tombstone.
@@ -3450,7 +3452,7 @@ export function createPodmanWriterSupervisor(...args) {
         "podman_writer_supervisor_outcome_uncertain",
       );
       ensure(
-        observedStatus !== "configured",
+        observedStatus !== "created",
         "podman_writer_supervisor_outcome_uncertain",
       );
       return frozenRecord({

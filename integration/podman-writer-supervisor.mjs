@@ -255,7 +255,7 @@ async function observeCreatedContainer() {
     ) {
       return "unreadable";
     }
-    return descriptor.value === "configured" ? "configured" : "other-state";
+    return descriptor.value === "created" ? "created" : "other-state";
   } catch {
     return "unreadable";
   }
