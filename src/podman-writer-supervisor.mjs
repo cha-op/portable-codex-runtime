@@ -980,7 +980,13 @@ function normalizeCommand(value, code) {
     );
     arrayPush(command, argument);
   }
-  ensure(callIntrinsic(stringStartsWithIntrinsic, command[0], ["/"]), code);
+  ensure(
+    validHostPathnameBytes(command[0]) &&
+      command[0].length > 1 &&
+      pathIsAbsoluteIntrinsic(command[0]) &&
+      pathResolveIntrinsic(command[0]) === command[0],
+    code,
+  );
   return callIntrinsic(objectFreezeIntrinsic, Object, [command]);
 }
 
@@ -3109,6 +3115,7 @@ export function createPodmanWriterSupervisor(...args) {
         "--image-volume=ignore",
         "--log-driver=none",
         "--read-only",
+        "--read-only-tmpfs=false",
         "--security-opt=no-new-privileges",
         "--cap-drop=all",
         `--userns=keep-id:uid=${imageRuntimeIdentity.userId},` +

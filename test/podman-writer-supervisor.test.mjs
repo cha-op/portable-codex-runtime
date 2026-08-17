@@ -1105,6 +1105,7 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     "--image-volume=ignore",
     "--log-driver=none",
     "--read-only",
+    "--read-only-tmpfs=false",
     "--security-opt=no-new-privileges",
     "--cap-drop=all",
     "--userns=keep-id:uid=1000,gid=1000",
@@ -1720,6 +1721,10 @@ test("native pathname ingress accepts 4095 UTF-8 bytes and rejects 4096", async 
     ...base.options,
     podmanExecutable: maximumPath,
   })));
+  assert.doesNotThrow(() => createPodmanWriterSupervisor(exact({
+    ...base.options,
+    writerCommand: Object.freeze([maximumPath]),
+  })));
   assert.throws(
     () => createPodmanWriterSupervisor(exact({
       ...base.options,
@@ -1734,8 +1739,23 @@ test("native pathname ingress accepts 4095 UTF-8 bytes and rejects 4096", async 
     })),
     assertSupervisorError("invalid_podman_writer_supervisor_options"),
   );
+  for (const writerExecutable of [
+    oversizedPath,
+    `/${"x".repeat(4_095)}`,
+    "/usr/local/../bin/writer",
+    "/usr/local/bin/\ud800",
+  ]) {
+    assert.throws(
+      () => createPodmanWriterSupervisor(exact({
+        ...base.options,
+        writerCommand: Object.freeze([writerExecutable]),
+      })),
+      assertSupervisorError("invalid_podman_writer_supervisor_options"),
+    );
+  }
   assert.equal(base.events.length, 0);
   assert.equal(base.filesystemEvents.length, 0);
+  assert.equal(existsSync(base.stateRoot), false);
 
   const prefix = `${base.parent}/`;
   const maximumRequestedRoot =

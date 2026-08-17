@@ -551,6 +551,15 @@ change and does not attest the current head:
   the complete Node test suite passed outside the desktop sandbox. The same
   auth-monitor case returned `EMFILE` only inside that sandbox and passed when
   rerun alone under the same unsandboxed gate.
+- Current-head review then found two remaining Podman option-domain gaps. The
+  configured writer executable is now rejected at supervisor construction
+  unless it is an absolute canonical, lossless UTF-8 native pathname of at
+  most 4095 bytes, so an invalid entrypoint cannot reach filesystem authority,
+  durable state claim, or Podman dispatch. The fixed create shape also passes
+  `--read-only-tmpfs=false`; together with `--image-volume=ignore`, this keeps
+  `/session` as the only application-writable storage whose contents enter the
+  checkpoint and restore contract. The authority-free ordinary-bind control
+  retains the same create option for diagnostic comparability.
 
 - `docs/architecture/linux-ext4-physical-backend.md`
 - `src/linux-ext4-inspector.mjs`

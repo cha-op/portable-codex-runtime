@@ -345,12 +345,14 @@ The internally configured container must inspect as non-running external
 source is exactly that holder FD before `start` is dispatched. A new create
 receipt must contain the complete
 64-lowercase-hex container ID; a short compatibility identity cannot reach
-start. The fixed create shape ignores image-declared volumes, replaces both
-image entrypoint and command with the configured writer command, and selects
-Podman's `none` log driver. Container output is not authority evidence; exact
-configured/running inspection and the live attachment bracket remain the
-success proof, independent of host log-tag or default log-driver policy. The
-immutable image's own `Config.User` must be a canonical non-root
+start. The fixed create shape ignores image-declared volumes, disables
+Podman's implicit writable read-only tmpfs mounts, validates the configured
+writer executable in the same lossless 4095-byte native pathname domain,
+replaces both image entrypoint and command with that writer command, and
+selects Podman's `none` log driver. Container output is not authority evidence;
+exact configured/running inspection and the live attachment bracket remain
+the success proof, independent of host log-tag or default log-driver policy.
+The immutable image's own `Config.User` must be a canonical non-root
 numeric `uid:gid`; create maps that pair through
 `keep-id:uid=...,gid=...`, so the process can write the current-service-UID
 `0700` attachment without broadening its host policy. After start, exact
