@@ -11,6 +11,7 @@ import {
   createPodmanWriterSupervisor,
 } from "../src/podman-writer-supervisor.mjs";
 import {
+  assertPodmanWriterSupervisorStateRecord,
   createPodmanWriterSupervisorState,
 } from "../src/podman-writer-supervisor-state.mjs";
 
@@ -2333,10 +2334,39 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     assert.equal(markerStat.gid, process.getgid());
     assert.equal(markerStat.mode & 0o7777, 0o600);
     phase = "stop";
-    assert.deepEqual(await receipt.stopWriter(stopInput(input, receipt)), exact({
-      contractVersion: 2,
-      status: "stopped",
-    }));
+    const stopRequest = stopInput(input, receipt);
+    const stopped = await receipt.stopWriter(stopRequest);
+    assert.deepEqual(Reflect.ownKeys(stopped), [
+      "contractVersion",
+      "status",
+      "terminalRecord",
+    ]);
+    assert.equal(Object.getPrototypeOf(stopped), null);
+    assert.equal(Object.isFrozen(stopped), true);
+    assert.equal(
+      stopped.contractVersion,
+      PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    );
+    assert.equal(stopped.status, "stopped");
+    const terminalRecord = assertPodmanWriterSupervisorStateRecord(
+      stopped.terminalRecord,
+    );
+    assert.equal(terminalRecord.status, "stopped");
+    assert.equal(terminalRecord.revision, 4);
+    assert.equal(
+      terminalRecord.launchAttemptId,
+      receipt.evidence.launchAttemptId,
+    );
+    assert.equal(terminalRecord.stopOperationId, stopRequest.stopOperationId);
+    assert.equal(
+      terminalRecord.processIncarnationId,
+      receipt.evidence.processIncarnationId,
+    );
+    assert.equal(
+      terminalRecord.writerIncarnationId,
+      receipt.evidence.writerIncarnationId,
+    );
+    assert.equal(terminalRecord.proofId, receipt.evidence.proofId);
     const restarted = createPodmanWriterSupervisor(options);
     phase = "reconcile";
     const reconciled = await restarted.reconcileWriterLaunch(reconcileInput(input));

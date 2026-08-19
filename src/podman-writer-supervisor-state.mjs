@@ -16,6 +16,7 @@ const { isPromise, isProxy } = utilTypes;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArrayIntrinsic = Array.isArray;
 const arrayEveryIntrinsic = Array.prototype.every;
+const bufferAllocIntrinsic = Buffer.alloc;
 const bufferEqualsIntrinsic = Buffer.prototype.equals;
 const bufferFromIntrinsic = Buffer.from;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
@@ -70,6 +71,7 @@ function regexpTest(pattern, value) {
 }
 
 export const PODMAN_WRITER_SUPERVISOR_STATE_CONTRACT_VERSION = 1;
+export const PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION = 1;
 
 const MAX_RECORD_BYTES = 16 * 1024;
 const MAX_NATIVE_PATH_BYTES = 4_095;
@@ -101,6 +103,7 @@ const TRANSITION_KEYS = Object.freeze([
   "expectedStatus",
   "record",
 ]);
+const COLLECTION_KEYS = Object.freeze(["terminalRecord"]);
 const OPTION_KEYS = Object.freeze(["faultHooks", "root"]);
 const REQUIRED_OPTION_KEYS = Object.freeze(["root"]);
 const FAULT_HOOK_KEYS = Object.freeze([
@@ -112,6 +115,12 @@ const FAULT_HOOK_KEYS = Object.freeze([
   "afterRootDirectorySync",
   "afterTemporarySync",
   "afterTemporaryWrite",
+  "afterCollectionArtifactUnlink",
+  "afterCollectionFileFirstRead",
+  "afterCollectionFirstDirectorySync",
+  "afterCollectionTerminalRevalidation",
+  "afterCollectionTerminalUnlink",
+  "afterCollectionFinalDirectorySync",
 ]);
 const STATUS_REVISION = Object.freeze({
   created: 1,
@@ -133,9 +142,13 @@ const ERROR_MESSAGES = Object.freeze({
     "Podman writer supervisor state input or durable record is invalid",
   podman_writer_state_io_failed:
     "Podman writer supervisor state could not be read or persisted safely",
+  podman_writer_state_collection_outcome_uncertain:
+    "Podman writer supervisor state collection outcome is uncertain",
 });
 
 const stateBrands = new WeakSet();
+const stateBundleBrands = new WeakSet();
+const stateCollectorBrands = new WeakSet();
 const stateErrorBrands = new WeakSet();
 
 export class PodmanWriterSupervisorStateError extends Error {
@@ -721,6 +734,338 @@ async function readPlainSafeFile(path, maximumLinks = 1n) {
   }
 }
 
+async function openCollectionFile(
+  path,
+  maximumLinks,
+  faultHooks,
+) {
+  let handle;
+  try {
+    const before = await lstat(path, { bigint: true });
+    ensure(safeFileStat(before, maximumLinks), "podman_writer_state_io_failed");
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat({ bigint: true });
+    ensure(
+      safeFileStat(opened, maximumLinks) && sameIdentity(before, opened),
+      "podman_writer_state_io_failed",
+    );
+    const bytes = await handle.readFile();
+    await runFaultHook(faultHooks, "afterCollectionFileFirstRead");
+    const after = await handle.stat({ bigint: true });
+    ensure(
+      safeFileStat(after, maximumLinks) &&
+        sameIdentity(before, after),
+      "podman_writer_state_io_failed",
+    );
+    const repeated = callIntrinsic(bufferAllocIntrinsic, Buffer, [
+      bytes.length,
+    ]);
+    const repeatedRead = await handle.read(
+      repeated,
+      0,
+      repeated.length,
+      0,
+    );
+    const finalHeld = await handle.stat({ bigint: true });
+    const current = await readPlainSafeFile(path, maximumLinks);
+    ensure(
+      current !== null &&
+        safeFileStat(finalHeld, maximumLinks) &&
+        sameIdentity(before, finalHeld) &&
+        sameIdentity(finalHeld, current.stat) &&
+        finalHeld.size === BigInt(bytes.length) &&
+        current.stat.size === finalHeld.size &&
+        repeatedRead.bytesRead === bytes.length &&
+        callIntrinsic(bufferEqualsIntrinsic, bytes, [repeated]) &&
+        callIntrinsic(bufferEqualsIntrinsic, bytes, [current.bytes]),
+      "podman_writer_state_io_failed",
+    );
+    return { bytes, handle, path, stat: finalHeld };
+  } catch (error) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        fail("podman_writer_state_io_failed");
+      }
+    }
+    if (errorCode(error) === "ENOENT") return null;
+    if (isStateError(error)) throw error;
+    fail("podman_writer_state_io_failed");
+  }
+}
+
+async function closeCollectionFiles(files) {
+  let failed = false;
+  for (let index = 0; index < files.length; index += 1) {
+    try {
+      await files[index].handle.close();
+    } catch {
+      failed = true;
+    }
+  }
+  return failed;
+}
+
+function collectionRecordRaw(artifact, launchAttemptId, revision) {
+  if (artifact === null) return null;
+  try {
+    return parseRecord(
+      callIntrinsic(bufferToStringIntrinsic, artifact.bytes, ["utf8"]),
+      launchAttemptId,
+      revision,
+    );
+  } catch (error) {
+    if (
+      isStateError(error) &&
+      error.code === "podman_writer_state_invalid"
+    ) {
+      fail("podman_writer_state_conflict");
+    }
+    throw error;
+  }
+}
+
+function validateCollectionChainRecord(record, terminalRecord, revision) {
+  ensure(
+    record.revision === revision &&
+      record.launchAttemptId === terminalRecord.launchAttemptId &&
+      record.requestSha256 === terminalRecord.requestSha256 &&
+      record.containerName === terminalRecord.containerName,
+    "podman_writer_state_conflict",
+  );
+  if (revision === 0) return;
+  ensure(
+    record.containerId === terminalRecord.containerId &&
+      record.processIncarnationId === terminalRecord.processIncarnationId &&
+      record.writerIncarnationId === terminalRecord.writerIncarnationId,
+    "podman_writer_state_conflict",
+  );
+  if (revision >= 2) {
+    ensure(
+      record.proofId === terminalRecord.proofId,
+      "podman_writer_state_conflict",
+    );
+  }
+  if (revision >= 3) {
+    ensure(
+      record.stopOperationId === terminalRecord.stopOperationId,
+      "podman_writer_state_conflict",
+    );
+  }
+}
+
+async function openCollectionRevision(
+  root,
+  launchAttemptId,
+  revision,
+  held,
+  files,
+  faultHooks,
+) {
+  const path = recordPath(root, launchAttemptId, revision);
+  const record = await openCollectionFile(path, 2n, faultHooks);
+  if (record !== null) files[files.length] = record;
+  const pending = await openCollectionFile(
+    pendingRecordPath(path),
+    2n,
+    faultHooks,
+  );
+  if (pending !== null) files[files.length] = pending;
+  const ready = await openCollectionFile(`${path}.ready`, 1n, faultHooks);
+  if (ready !== null) files[files.length] = ready;
+
+  if (record === null) {
+    ensure(
+      pending === null && ready === null,
+      "podman_writer_state_conflict",
+    );
+    return { path, pending, ready, record, parsed: null };
+  }
+
+  if (pending === null) {
+    const current = await record.handle.stat({ bigint: true });
+    ensure(
+      safeFileStat(current) && sameIdentity(record.stat, current),
+      "podman_writer_state_io_failed",
+    );
+  } else {
+    ensure(
+      record.stat.nlink === 2n &&
+        pending.stat.nlink === 2n &&
+        sameIdentity(record.stat, pending.stat) &&
+        callIntrinsic(bufferEqualsIntrinsic, record.bytes, [pending.bytes]),
+      "podman_writer_state_conflict",
+    );
+  }
+  if (ready !== null) {
+    const readyHash = createHashIntrinsic("sha256");
+    callIntrinsic(hashUpdateIntrinsic, readyHash, [record.bytes]);
+    const expected = `${callIntrinsic(hashDigestIntrinsic, readyHash, ["hex"])}\n`;
+    ensure(
+      callIntrinsic(bufferToStringIntrinsic, ready.bytes, ["utf8"]) === expected,
+      "podman_writer_state_conflict",
+    );
+  }
+  await assertDirectoryHeld(root, held);
+  return {
+    path,
+    pending,
+    ready,
+    record,
+    parsed: collectionRecordRaw(record, launchAttemptId, revision),
+  };
+}
+
+async function revalidateUnlinkedCollectionArtifact(
+  artifact,
+  maximumLinkCount,
+) {
+  // Another collector for the same immutable authorization may remove the
+  // recognized sibling alias after this collector's unlink. That transition
+  // can only lower nlink. Object identity, exact content, UID, and mode remain
+  // fixed here, and the final collection boundary still requires nlink zero
+  // for every held artifact.
+  const before = await artifact.handle.stat({ bigint: true });
+  const bytes = callIntrinsic(bufferAllocIntrinsic, Buffer, [
+    artifact.bytes.length,
+  ]);
+  const readResult = await artifact.handle.read(
+    bytes,
+    0,
+    bytes.length,
+    0,
+  );
+  const after = await artifact.handle.stat({ bigint: true });
+  const uid = effectiveUid();
+  ensure(
+    before.isFile() &&
+      !before.isSymbolicLink() &&
+      sameIdentity(artifact.stat, before) &&
+      sameIdentity(before, after) &&
+      before.nlink >= 0n &&
+      before.nlink <= maximumLinkCount &&
+      after.nlink >= 0n &&
+      after.nlink <= before.nlink &&
+      uid !== null &&
+      before.uid === uid &&
+      after.uid === uid &&
+      Number(before.mode & 0o7777n) === 0o600 &&
+      Number(after.mode & 0o7777n) === 0o600 &&
+      before.size === BigInt(artifact.bytes.length) &&
+      after.size === before.size &&
+      readResult.bytesRead === artifact.bytes.length &&
+      callIntrinsic(bufferEqualsIntrinsic, artifact.bytes, [bytes]),
+    "podman_writer_state_io_failed",
+  );
+}
+
+async function unlinkCollectionArtifact(
+  root,
+  held,
+  artifact,
+  faultHooks,
+) {
+  if (artifact === null) return false;
+  let removed = false;
+  await assertDirectoryHeld(root, held);
+  const current = await readPlainSafeFile(artifact.path, 2n);
+  if (current === null) return false;
+  ensure(
+    sameIdentity(current.stat, artifact.stat) &&
+      callIntrinsic(bufferEqualsIntrinsic, current.bytes, [artifact.bytes]),
+    "podman_writer_state_io_failed",
+  );
+  try {
+    await unlink(artifact.path);
+    removed = true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+  try {
+    await runFaultHook(faultHooks, "afterCollectionArtifactUnlink");
+    ensure(await collectionPathAbsent(artifact.path), "podman_writer_state_io_failed");
+    await revalidateUnlinkedCollectionArtifact(
+      artifact,
+      current.stat.nlink - 1n,
+    );
+    await assertDirectoryHeld(root, held);
+    return true;
+  } catch (error) {
+    if (removed) fail("podman_writer_state_collection_outcome_uncertain");
+    throw error;
+  }
+}
+
+function collectionReceipt(terminalRecord, status) {
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    "portable-codex-runtime:podman-writer-state-collection:v1\0",
+    "utf8",
+  ]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    callIntrinsic(jsonStringifyIntrinsic, JsonObject, [terminalRecord]),
+    "utf8",
+  ]);
+  return frozenRecord({
+    contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+    launchAttemptId: terminalRecord.launchAttemptId,
+    status,
+    terminalRecordSha256: callIntrinsic(hashDigestIntrinsic, hash, ["hex"]),
+  });
+}
+
+async function collectionPathAbsent(path) {
+  try {
+    await lstat(path, { bigint: true });
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return true;
+    throw error;
+  }
+  return false;
+}
+
+async function assertCollectionRevisionAbsent(root, launchAttemptId, revision) {
+  const path = recordPath(root, launchAttemptId, revision);
+  ensure(
+    (await collectionPathAbsent(path)) &&
+      (await collectionPathAbsent(pendingRecordPath(path))) &&
+      (await collectionPathAbsent(`${path}.ready`)),
+    "podman_writer_state_io_failed",
+  );
+}
+
+async function assertFutureCollectionRevisionsAbsent(root, launchAttemptId) {
+  for (let revision = 5; revision <= 9; revision += 1) {
+    const path = recordPath(root, launchAttemptId, revision);
+    ensure(
+      (await collectionPathAbsent(path)) &&
+        (await collectionPathAbsent(pendingRecordPath(path))) &&
+        (await collectionPathAbsent(`${path}.ready`)),
+      "podman_writer_state_conflict",
+    );
+  }
+}
+
+async function assertCollectionFilesUnlinked(files) {
+  const uid = effectiveUid();
+  for (let index = 0; index < files.length; index += 1) {
+    const stat = await files[index].handle.stat({ bigint: true });
+    ensure(
+      stat.isFile() &&
+        !stat.isSymbolicLink() &&
+        stat.nlink === 0n &&
+        uid !== null &&
+        stat.uid === uid &&
+        Number(stat.mode & 0o7777n) === 0o600 &&
+        stat.size > 0n &&
+        stat.size <= BigInt(MAX_RECORD_BYTES),
+      "podman_writer_state_io_failed",
+    );
+  }
+}
+
 // Published record content is immutable. A normal publication has one link;
 // the only accepted two-link transition is the byte-identical pending alias in
 // this owner-private directory. Link-count churn alone is not content mutation,
@@ -1128,7 +1473,7 @@ function validStateRoot(value) {
   );
 }
 
-export function createPodmanWriterSupervisorState(...args) {
+function createPodmanWriterSupervisorStateBundleInternal(args) {
   ensure(args.length === 1);
   const options = optionalDataObject(
     args[0],
@@ -1247,6 +1592,245 @@ export function createPodmanWriterSupervisorState(...args) {
     });
   });
 
+  const collect = frozenFunction(async function collect(inputValue) {
+    ensure(arguments.length === 1);
+    const input = exactDataObject(inputValue, COLLECTION_KEYS);
+    const terminalRecord = normalizeRecord(input.terminalRecord);
+    ensure(
+      terminalRecord.status === "stopped" && terminalRecord.revision === 4,
+    );
+    return withAttemptLock(terminalRecord.launchAttemptId, async () => {
+      const files = [];
+      let held = null;
+      let mutationStarted = false;
+      let primaryError = null;
+      let result = null;
+      try {
+        held = await heldPrivateDirectory(
+          root,
+          { create: false },
+          faultHooks,
+        );
+        if (held === null) {
+          result = collectionReceipt(terminalRecord, "absent");
+        } else {
+          await assertFutureCollectionRevisionsAbsent(
+            root,
+            terminalRecord.launchAttemptId,
+          );
+          const revisions = [];
+          for (let revision = 0; revision <= 4; revision += 1) {
+            revisions[revision] = await openCollectionRevision(
+              root,
+              terminalRecord.launchAttemptId,
+              revision,
+              held,
+              files,
+              faultHooks,
+            );
+          }
+          const terminal = revisions[4];
+          if (terminal.record === null) {
+            for (let revision = 0; revision < 4; revision += 1) {
+              ensure(
+                revisions[revision].record === null,
+                "podman_writer_state_conflict",
+              );
+            }
+            await assertDirectoryHeld(root, held);
+            await held.handle.sync();
+            await runFaultHook(
+              faultHooks,
+              "afterCollectionFinalDirectorySync",
+            );
+            for (let revision = 0; revision <= 9; revision += 1) {
+              await assertCollectionRevisionAbsent(
+                root,
+                terminalRecord.launchAttemptId,
+                revision,
+              );
+            }
+            await assertDirectoryHeld(root, held);
+            result = collectionReceipt(terminalRecord, "absent");
+          } else {
+            ensure(
+              sameRecord(terminal.parsed, terminalRecord),
+              "podman_writer_state_conflict",
+            );
+            let lowerRecordObserved = false;
+            let partialPrefixObserved = false;
+            for (let revision = 0; revision < 4; revision += 1) {
+              const current = revisions[revision].parsed;
+              if (current === null) {
+                partialPrefixObserved = true;
+                ensure(
+                  !lowerRecordObserved,
+                  "podman_writer_state_conflict",
+                );
+              } else {
+                lowerRecordObserved = true;
+                validateCollectionChainRecord(
+                  current,
+                  terminalRecord,
+                  revision,
+                );
+              }
+            }
+            mutationStarted = partialPrefixObserved;
+
+            // Phase A preserves revision 4 as the durable terminal anchor. A
+            // missing lower prefix is an allowed retry shape because lower
+            // revisions are removed oldest-first. All sidecars were validated
+            // before the first unlink, so no mismatched alias can be hidden by
+            // the collection itself.
+            for (let revision = 0; revision < 4; revision += 1) {
+              const current = revisions[revision];
+              mutationStarted =
+                (await unlinkCollectionArtifact(
+                  root,
+                  held,
+                  current.ready,
+                  faultHooks,
+                )) ||
+                mutationStarted;
+              mutationStarted =
+                (await unlinkCollectionArtifact(
+                  root,
+                  held,
+                  current.pending,
+                  faultHooks,
+                )) ||
+                mutationStarted;
+              mutationStarted =
+                (await unlinkCollectionArtifact(
+                  root,
+                  held,
+                  current.record,
+                  faultHooks,
+                )) ||
+                mutationStarted;
+            }
+            mutationStarted =
+              (await unlinkCollectionArtifact(
+                root,
+                held,
+                terminal.ready,
+                faultHooks,
+              )) ||
+              mutationStarted;
+            mutationStarted =
+              (await unlinkCollectionArtifact(
+                root,
+                held,
+                terminal.pending,
+                faultHooks,
+              )) ||
+              mutationStarted;
+
+            for (let revision = 0; revision < 4; revision += 1) {
+              await assertCollectionRevisionAbsent(
+                root,
+                terminalRecord.launchAttemptId,
+                revision,
+              );
+            }
+            await assertDirectoryHeld(root, held);
+            await held.handle.sync();
+            await runFaultHook(
+              faultHooks,
+              "afterCollectionFirstDirectorySync",
+            );
+            await assertDirectoryHeld(root, held);
+
+            let terminalPathStat;
+            try {
+              terminalPathStat = await lstat(terminal.path, { bigint: true });
+            } catch (error) {
+              if (errorCode(error) !== "ENOENT") throw error;
+              terminalPathStat = null;
+            }
+            if (terminalPathStat !== null) {
+              const terminalHandleStat = await terminal.record.handle.stat({
+                bigint: true,
+              });
+              const terminalCurrent = await readPlainSafeFile(terminal.path);
+              ensure(
+                terminalCurrent !== null &&
+                safeFileStat(terminalPathStat) &&
+                  safeFileStat(terminalHandleStat) &&
+                  sameIdentity(terminal.record.stat, terminalPathStat) &&
+                  sameIdentity(terminal.record.stat, terminalHandleStat) &&
+                  sameIdentity(terminal.record.stat, terminalCurrent.stat) &&
+                  callIntrinsic(bufferEqualsIntrinsic, terminal.record.bytes, [
+                    terminalCurrent.bytes,
+                  ]),
+                "podman_writer_state_io_failed",
+              );
+              await runFaultHook(
+                faultHooks,
+                "afterCollectionTerminalRevalidation",
+              );
+              const removedTerminal = await unlinkCollectionArtifact(
+                root,
+                held,
+                terminal.record,
+                faultHooks,
+              );
+              mutationStarted = removedTerminal || mutationStarted;
+              if (removedTerminal) {
+                await runFaultHook(
+                  faultHooks,
+                  "afterCollectionTerminalUnlink",
+                );
+              }
+            }
+
+            for (let revision = 0; revision <= 9; revision += 1) {
+              await assertCollectionRevisionAbsent(
+                root,
+                terminalRecord.launchAttemptId,
+                revision,
+              );
+            }
+            await assertCollectionFilesUnlinked(files);
+            await assertDirectoryHeld(root, held);
+            await held.handle.sync();
+            await runFaultHook(
+              faultHooks,
+              "afterCollectionFinalDirectorySync",
+            );
+            await assertDirectoryHeld(root, held);
+            result = collectionReceipt(terminalRecord, "collected");
+          }
+        }
+      } catch (error) {
+        primaryError = error;
+      }
+
+      if (await closeCollectionFiles(files)) {
+        primaryError ??= new PodmanWriterSupervisorStateError(
+          "podman_writer_state_io_failed",
+        );
+      }
+      if (held !== null) {
+        try {
+          await closeHeldDirectory(held);
+        } catch (error) {
+          primaryError ??= error;
+        }
+      }
+      if (primaryError !== null) {
+        if (mutationStarted) {
+          fail("podman_writer_state_collection_outcome_uncertain");
+        }
+        if (isStateError(primaryError)) throw primaryError;
+        fail("podman_writer_state_io_failed");
+      }
+      ensure(result !== null, "podman_writer_state_io_failed");
+      return result;
+    });
+  });
+
   const state = frozenRecord({
     claim,
     contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_CONTRACT_VERSION,
@@ -1254,11 +1838,48 @@ export function createPodmanWriterSupervisorState(...args) {
     transition,
   });
   callIntrinsic(weakSetAddIntrinsic, stateBrands, [state]);
-  return state;
+  const terminalCollector = frozenRecord({
+    collect,
+    contractVersion:
+      PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+  });
+  callIntrinsic(weakSetAddIntrinsic, stateCollectorBrands, [terminalCollector]);
+  const bundle = frozenRecord({ state, terminalCollector });
+  callIntrinsic(weakSetAddIntrinsic, stateBundleBrands, [bundle]);
+  return bundle;
+}
+
+export function createPodmanWriterSupervisorState(...args) {
+  return createPodmanWriterSupervisorStateBundleInternal(args).state;
+}
+
+export function createPodmanWriterSupervisorStateBundle(...args) {
+  return createPodmanWriterSupervisorStateBundleInternal(args);
+}
+
+export function isPodmanWriterSupervisorStateBundle(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !isProxy(value) &&
+    callIntrinsic(weakSetHasIntrinsic, stateBundleBrands, [value])
+  );
+}
+
+export function isPodmanWriterSupervisorStateTerminalCollector(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !isProxy(value) &&
+    callIntrinsic(weakSetHasIntrinsic, stateCollectorBrands, [value])
+  );
 }
 
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorStateError.prototype]);
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorStateError]);
 callIntrinsic(objectFreezeIntrinsic, Object, [assertPodmanWriterSupervisorStateRecord]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorState]);
+callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorStateBundle]);
+callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorStateBundle]);
 callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorState]);
+callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorStateTerminalCollector]);

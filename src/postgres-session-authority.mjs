@@ -6,6 +6,10 @@ import {
   PostgresSerializableStore,
 } from "./postgres-serializable-store.mjs";
 import {
+  PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+  assertPodmanWriterSupervisorStateRecord,
+} from "./podman-writer-supervisor-state.mjs";
+import {
   isPostgresDetachedRestorePlan,
 } from "./postgres-detached-restore-plan.mjs";
 import {
@@ -45,6 +49,7 @@ export const RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND =
 export const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND =
   "writer-launch-attempt-v1";
 export const WRITER_LAUNCH_STOP_OPERATION_KIND = "writer-launch-stop-v1";
+export const WRITER_SUPERVISOR_STATE_GC_CONTRACT_VERSION = 1;
 export const WRITER_LAUNCH_PRE_DISPATCH_CANCELLATION_REASON =
   "launch-dispatch-not-started";
 export const MAX_WRITER_LEASE_DURATION_MILLISECONDS = 86_400_000;
@@ -509,6 +514,22 @@ const WRITER_LAUNCH_STOP_OPERATION_REQUEST_V3_KEYS = Object.freeze([
 ]);
 const WRITER_LAUNCH_STOP_CLAIM_DOMAIN =
   "portable-codex-runtime:writer-launch-stop-claim:v1";
+const PODMAN_WRITER_REQUEST_DOMAIN =
+  "portable-codex-runtime:podman-writer-request:v1";
+const PODMAN_WRITER_CONTAINER_DOMAIN =
+  "portable-codex-runtime:podman-container:v1";
+const PODMAN_WRITER_INCARNATION_DOMAIN =
+  "portable-codex-runtime:podman-writer:v1";
+const PODMAN_WRITER_START_PROOF_DOMAIN =
+  "portable-codex-runtime:podman-start-proof:v1";
+const PODMAN_WRITER_STOPPED_PROOF_DOMAIN =
+  "portable-codex-runtime:podman-stopped-proof:v1";
+const PODMAN_WRITER_STATE_COLLECTION_DOMAIN =
+  "portable-codex-runtime:podman-writer-state-collection:v1";
+const WRITER_SUPERVISOR_STATE_GC_AUTHORIZATION_DOMAIN =
+  "portable-codex-runtime:writer-supervisor-state-gc-authorization:v1";
+const WRITER_SUPERVISOR_STATE_GC_COLLECTION_RECEIPT_DOMAIN =
+  "portable-codex-runtime:writer-supervisor-state-gc-collection-receipt:v1";
 const WRITER_LAUNCH_GENERATION_KEYS = Object.freeze([
   "bindingSha256",
   "checkpointId",
@@ -569,6 +590,10 @@ const WRITER_LAUNCH_FINALIZATION_INPUT_KEYS = Object.freeze([
   "operationId",
   "request",
 ]);
+const WRITER_LAUNCH_GC_FINALIZATION_INPUT_KEYS = Object.freeze([
+  ...WRITER_LAUNCH_FINALIZATION_INPUT_KEYS,
+  "terminalRecord",
+]);
 const WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS = Object.freeze([
   "evidence",
   "expectedOperationRevision",
@@ -576,6 +601,10 @@ const WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS = Object.freeze([
   "kind",
   "operationId",
   "request",
+]);
+const WRITER_LAUNCH_STOP_GC_FINALIZATION_INPUT_KEYS = Object.freeze([
+  ...WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS,
+  "terminalRecord",
 ]);
 const WRITER_LAUNCH_TERMINAL_RESULT_KEYS = Object.freeze([
   "evidence",
@@ -612,6 +641,61 @@ const WRITER_LAUNCH_RECOVERY_LIST_KEYS = Object.freeze([
 const CURRENT_WRITER_LAUNCH_RECOVERY_LIST_KEYS = Object.freeze([
   "afterSessionId",
   "limit",
+]);
+const WRITER_SUPERVISOR_STATE_GC_READ_KEYS = Object.freeze([
+  "terminalOperationId",
+]);
+const WRITER_SUPERVISOR_STATE_GC_LIST_KEYS = Object.freeze([
+  "afterSessionId",
+  "limit",
+]);
+const WRITER_SUPERVISOR_STATE_GC_COMPLETION_INPUT_KEYS = Object.freeze([
+  "authorization",
+  "collectionReceipt",
+]);
+const WRITER_SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS = Object.freeze([
+  "authorizationSha256",
+  "authorizedAt",
+  "contractVersion",
+  "launchAttemptId",
+  "sessionId",
+  "terminalKind",
+  "terminalOperationId",
+  "terminalRecord",
+  "terminalRecordSha256",
+]);
+const WRITER_SUPERVISOR_STATE_GC_COLLECTION_RECEIPT_KEYS = Object.freeze([
+  "contractVersion",
+  "launchAttemptId",
+  "status",
+  "terminalRecordSha256",
+]);
+const WRITER_SUPERVISOR_STATE_GC_ROW_KEYS = Object.freeze([
+  "authorization_sha256",
+  "authorized_at",
+  "collected_at",
+  "collection_receipt_sha256",
+  "collection_status",
+  "launch_attempt_id",
+  "session_id",
+  "terminal_kind",
+  "terminal_operation_id",
+  "terminal_record",
+  "terminal_record_sha256",
+]);
+const PODMAN_WRITER_SUPERVISOR_TERMINAL_RECORD_KEYS = Object.freeze([
+  "containerId",
+  "containerName",
+  "contractVersion",
+  "launchAttemptId",
+  "processIncarnationId",
+  "proofId",
+  "requestSha256",
+  "revision",
+  "status",
+  "stopOperationId",
+  "stopProofId",
+  "writerIncarnationId",
 ]);
 const WRITER_ATTACHMENT_REQUEST_KEYS = Object.freeze([
   "contractVersion",
@@ -848,6 +932,12 @@ const ERROR_MESSAGES = Object.freeze({
     "Restore destination generation version 2 requires confirmed fleet compatibility",
   writer_launch_attempt_not_authorized:
     "Writer launch attempt is not actively authorized",
+  writer_supervisor_state_gc_authorization_conflict:
+    "Writer supervisor state collection authorization conflicts with canonical authority",
+  writer_supervisor_state_gc_collection_conflict:
+    "Writer supervisor state collection completion conflicts with canonical authority",
+  writer_supervisor_state_gc_not_authorized:
+    "Writer supervisor state collection is not authorized",
   writer_launch_stop_v3_fleet_capability_required:
     "Writer launch stop version 3 requires confirmed fleet compatibility",
   session_identity_conflict:
@@ -911,6 +1001,7 @@ const runSerializableIntrinsic =
   PostgresSerializableStore.prototype.runSerializable;
 const StringConstructor = String;
 const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
+const stringSliceIntrinsic = String.prototype.slice;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
@@ -1006,6 +1097,19 @@ const RESERVATION_RETURNING_COLUMNS = [
   "updated_at",
   "expires_at",
   "released_at",
+].join(", ");
+const WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS = [
+  "terminal_operation_id",
+  "session_id",
+  "launch_attempt_id",
+  "terminal_kind",
+  "terminal_record",
+  "terminal_record_sha256",
+  "authorization_sha256",
+  "authorized_at",
+  "collection_status",
+  "collection_receipt_sha256",
+  "collected_at",
 ].join(", ");
 const READ_OPERATION_QUERY = Object.freeze({
   queryMode: "extended",
@@ -1142,6 +1246,38 @@ const LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY = Object.freeze({
     "AND retired_at IS NULL",
     "AND session_id > $1::uuid",
     "ORDER BY session_id ASC",
+    "LIMIT $2::integer",
+  ].join(" "),
+});
+const READ_WRITER_SUPERVISOR_STATE_GC_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
+    "FROM session_authority.writer_supervisor_state_gc",
+    "WHERE terminal_operation_id = $1",
+  ].join(" "),
+});
+const READ_WRITER_SUPERVISOR_STATE_GC_FOR_UPDATE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: `${READ_WRITER_SUPERVISOR_STATE_GC_QUERY.text} FOR UPDATE`,
+});
+const LIST_WRITER_SUPERVISOR_STATE_GC_FIRST_PAGE_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT DISTINCT ON (session_id) ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
+    "FROM session_authority.writer_supervisor_state_gc",
+    "WHERE collected_at IS NULL",
+    "ORDER BY session_id ASC, authorized_at ASC, terminal_operation_id ASC",
+    "LIMIT $1::integer",
+  ].join(" "),
+});
+const LIST_WRITER_SUPERVISOR_STATE_GC_AFTER_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    `SELECT DISTINCT ON (session_id) ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
+    "FROM session_authority.writer_supervisor_state_gc",
+    "WHERE collected_at IS NULL AND session_id > $1::uuid",
+    "ORDER BY session_id ASC, authorized_at ASC, terminal_operation_id ASC",
     "LIMIT $2::integer",
   ].join(" "),
 });
@@ -1634,6 +1770,29 @@ const COMMIT_RESTORE_GENERATION_QUERY = Object.freeze({
     "WHERE operation_id = $1 AND state = 'authorized'",
     "AND document IS NULL AND committed_at IS NULL",
     `RETURNING ${RESTORE_GENERATION_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const INSERT_WRITER_SUPERVISOR_STATE_GC_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.writer_supervisor_state_gc",
+    "(terminal_operation_id, session_id, launch_attempt_id, terminal_kind,",
+    "terminal_record, terminal_record_sha256, authorization_sha256, authorized_at,",
+    "collection_status, collection_receipt_sha256, collected_at)",
+    "VALUES ($1, $2::uuid, $3, $4, $5::jsonb, $6, $7, $8, NULL, NULL, NULL)",
+    "ON CONFLICT (terminal_operation_id) DO NOTHING",
+    `RETURNING ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
+const COMPLETE_WRITER_SUPERVISOR_STATE_GC_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "UPDATE session_authority.writer_supervisor_state_gc",
+    "SET collection_status = $3, collection_receipt_sha256 = $4, collected_at = $5",
+    "WHERE terminal_operation_id = $1 AND authorization_sha256 = $2",
+    "AND collection_status IS NULL AND collection_receipt_sha256 IS NULL",
+    "AND collected_at IS NULL",
+    `RETURNING ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
   ].join(" "),
 });
 
@@ -2645,6 +2804,16 @@ function deepFreeze(value) {
     objectFreeze(value);
   }
   return value;
+}
+
+function frozenNullPrototypeRecord(value) {
+  const record = objectCreate(null);
+  const keys = reflectOwnKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    record[key] = ownDataValue(value, key, "operation_state_invalid");
+  }
+  return deepFreeze(record);
 }
 
 function nullPrototypeJsonDataTree(value) {
@@ -5464,6 +5633,293 @@ function currentWriterLaunchRecoveryListInput(options) {
   return deepFreeze({ afterSessionId, limit: normalized.limit });
 }
 
+function canonicalWriterSupervisorStateGcTerminalRecord(value, code) {
+  let asserted;
+  try {
+    asserted = assertPodmanWriterSupervisorStateRecord(value);
+  } catch {
+    fail(code);
+  }
+  ensure(asserted.revision === 4 && asserted.status === "stopped", code);
+  const record = objectCreate(null);
+  for (
+    let index = 0;
+    index < PODMAN_WRITER_SUPERVISOR_TERMINAL_RECORD_KEYS.length;
+    index += 1
+  ) {
+    const key = PODMAN_WRITER_SUPERVISOR_TERMINAL_RECORD_KEYS[index];
+    record[key] = ownDataValue(asserted, key, code);
+  }
+  return deepFreeze(record);
+}
+
+function writerLaunchAttemptGcFinalizationInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_GC_FINALIZATION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const base = objectCreate(null);
+  for (
+    let index = 0;
+    index < WRITER_LAUNCH_FINALIZATION_INPUT_KEYS.length;
+    index += 1
+  ) {
+    const key = WRITER_LAUNCH_FINALIZATION_INPUT_KEYS[index];
+    base[key] = normalized[key];
+  }
+  const input = writerLaunchAttemptFinalizationInput(base, [
+    "complete-stopped",
+  ]);
+  return deepFreeze({
+    ...input,
+    terminalRecord: canonicalWriterSupervisorStateGcTerminalRecord(
+      normalized.terminalRecord,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function writerLaunchStopGcFinalizationInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_LAUNCH_STOP_GC_FINALIZATION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const base = objectCreate(null);
+  for (
+    let index = 0;
+    index < WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS.length;
+    index += 1
+  ) {
+    const key = WRITER_LAUNCH_STOP_FINALIZATION_INPUT_KEYS[index];
+    base[key] = normalized[key];
+  }
+  const input = writerLaunchStopFinalizationInput(base);
+  return deepFreeze({
+    ...input,
+    terminalRecord: canonicalWriterSupervisorStateGcTerminalRecord(
+      normalized.terminalRecord,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function writerSupervisorStateGcReadInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_SUPERVISOR_STATE_GC_READ_KEYS,
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    terminalOperationId: canonicalOpaqueId(
+      normalized.terminalOperationId,
+      128,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function writerSupervisorStateGcListInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_SUPERVISOR_STATE_GC_LIST_KEYS,
+    "invalid_operation_request",
+  );
+  const afterSessionId =
+    normalized.afterSessionId === null
+      ? null
+      : canonicalSessionId(
+          normalized.afterSessionId,
+          "invalid_operation_request",
+        );
+  ensure(
+    numberIsSafeInteger(normalized.limit) &&
+      normalized.limit >= 1 &&
+      normalized.limit <= 100,
+    "invalid_operation_request",
+  );
+  return deepFreeze({ afterSessionId, limit: normalized.limit });
+}
+
+function writerSupervisorStateGcRecordSha256(record) {
+  return sha256(canonicalSerialize(record));
+}
+
+function podmanWriterStateCollectionRecordSha256(record) {
+  return sha256(
+    `${PODMAN_WRITER_STATE_COLLECTION_DOMAIN}\0${canonicalSerialize(record)}`,
+  );
+}
+
+function writerSupervisorStateGcAuthorizationSha256(projection) {
+  return sha256(
+    `${WRITER_SUPERVISOR_STATE_GC_AUTHORIZATION_DOMAIN}\0${canonicalSerialize(
+      projection,
+    )}\n`,
+  );
+}
+
+function writerSupervisorStateGcCollectionReceiptSha256(receipt) {
+  return sha256(
+    `${WRITER_SUPERVISOR_STATE_GC_COLLECTION_RECEIPT_DOMAIN}\0${canonicalSerialize(
+      receipt,
+    )}\n`,
+  );
+}
+
+function writerSupervisorStateGcAuthorizationProjection({
+  authorizedAt,
+  launchAttemptId,
+  sessionId,
+  terminalKind,
+  terminalOperationId,
+  terminalRecord,
+  terminalRecordSha256,
+}) {
+  return frozenNullPrototypeRecord({
+    authorizedAt,
+    contractVersion: WRITER_SUPERVISOR_STATE_GC_CONTRACT_VERSION,
+    launchAttemptId,
+    sessionId,
+    terminalKind,
+    terminalOperationId,
+    terminalRecord,
+    terminalRecordSha256,
+  });
+}
+
+function writerSupervisorStateGcAuthorizationFor({
+  authorizedAt,
+  launchAttemptId,
+  sessionId,
+  terminalKind,
+  terminalOperationId,
+  terminalRecord,
+}) {
+  const terminalRecordSha256 =
+    writerSupervisorStateGcRecordSha256(terminalRecord);
+  const projection = writerSupervisorStateGcAuthorizationProjection({
+    authorizedAt,
+    launchAttemptId,
+    sessionId,
+    terminalKind,
+    terminalOperationId,
+    terminalRecord,
+    terminalRecordSha256,
+  });
+  return frozenNullPrototypeRecord({
+    authorizationSha256:
+      writerSupervisorStateGcAuthorizationSha256(projection),
+    ...projection,
+  });
+}
+
+function canonicalWriterSupervisorStateGcAuthorization(value, code) {
+  const normalized = exactPlainObject(
+    value,
+    WRITER_SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS,
+    code,
+  );
+  const terminalRecord = canonicalWriterSupervisorStateGcTerminalRecord(
+    normalized.terminalRecord,
+    code,
+  );
+  const authorizedAt = canonicalTimestampString(normalized.authorizedAt, code);
+  const sessionId = canonicalSessionId(normalized.sessionId, code);
+  const launchAttemptId = canonicalOpaqueId(
+    normalized.launchAttemptId,
+    128,
+    code,
+  );
+  const terminalOperationId = canonicalOpaqueId(
+    normalized.terminalOperationId,
+    128,
+    code,
+  );
+  ensure(
+    normalized.contractVersion ===
+        WRITER_SUPERVISOR_STATE_GC_CONTRACT_VERSION &&
+      (normalized.terminalKind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND ||
+        normalized.terminalKind === WRITER_LAUNCH_STOP_OPERATION_KIND) &&
+      typeof normalized.terminalRecordSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, normalized.terminalRecordSha256) &&
+      typeof normalized.authorizationSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, normalized.authorizationSha256) &&
+      terminalRecord.launchAttemptId === launchAttemptId &&
+      normalized.terminalRecordSha256 ===
+        writerSupervisorStateGcRecordSha256(terminalRecord),
+    code,
+  );
+  const expected = writerSupervisorStateGcAuthorizationFor({
+    authorizedAt,
+    launchAttemptId,
+    sessionId,
+    terminalKind: normalized.terminalKind,
+    terminalOperationId,
+    terminalRecord,
+  });
+  ensure(
+    normalized.authorizationSha256 === expected.authorizationSha256,
+    code,
+  );
+  return expected;
+}
+
+function canonicalWriterSupervisorStateGcCollectionReceipt(value, code) {
+  const normalized = exactPlainObject(
+    value,
+    WRITER_SUPERVISOR_STATE_GC_COLLECTION_RECEIPT_KEYS,
+    code,
+  );
+  const launchAttemptId = canonicalOpaqueId(
+    normalized.launchAttemptId,
+    128,
+    code,
+  );
+  ensure(
+    normalized.contractVersion ===
+        PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION &&
+      (normalized.status === "collected" || normalized.status === "absent") &&
+      typeof normalized.terminalRecordSha256 === "string" &&
+      regexpTest(SHA256_PATTERN, normalized.terminalRecordSha256),
+    code,
+  );
+  return frozenNullPrototypeRecord({
+    contractVersion:
+      PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+    launchAttemptId,
+    status: normalized.status,
+    terminalRecordSha256: normalized.terminalRecordSha256,
+  });
+}
+
+function writerSupervisorStateGcCompletionInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_SUPERVISOR_STATE_GC_COMPLETION_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  const authorization = canonicalWriterSupervisorStateGcAuthorization(
+    normalized.authorization,
+    "invalid_operation_request",
+  );
+  const collectionReceipt =
+    canonicalWriterSupervisorStateGcCollectionReceipt(
+      normalized.collectionReceipt,
+      "invalid_operation_request",
+    );
+  ensure(
+    collectionReceipt.launchAttemptId === authorization.launchAttemptId &&
+      collectionReceipt.terminalRecordSha256 ===
+        podmanWriterStateCollectionRecordSha256(
+          authorization.terminalRecord,
+        ),
+    "invalid_operation_request",
+  );
+  return deepFreeze({ authorization, collectionReceipt });
+}
+
 function canonicalCheckpointArtifactProof(value, operationId, code) {
   const proof = exactPlainObject(
     value,
@@ -7795,6 +8251,247 @@ function writerLaunchStopRecord(input, operation) {
     result: operation.result,
     state: operation.state,
     stopOperationId: operation.operationId,
+  });
+}
+
+function podmanWriterRequestSha256(request) {
+  return sha256(
+    `${PODMAN_WRITER_REQUEST_DOMAIN}\0${canonicalSerialize(request)}`,
+  );
+}
+
+function podmanWriterContainerName(supervisorId, launchAttemptId) {
+  const digest = sha256(
+    `${PODMAN_WRITER_CONTAINER_DOMAIN}\0${supervisorId}\0${launchAttemptId}`,
+  );
+  return `codex-writer-${reflectApply(stringSliceIntrinsic, digest, [0, 48])}`;
+}
+
+function podmanWriterProcessIncarnationId(containerId) {
+  return `podman-process:${containerId}`;
+}
+
+function podmanWriterIncarnationId(
+  supervisorId,
+  launchAttemptId,
+  requestSha256,
+  containerId,
+) {
+  return `podman-writer:${sha256(
+    `${PODMAN_WRITER_INCARNATION_DOMAIN}\0${supervisorId}\0${launchAttemptId}\0${requestSha256}\0${containerId}`,
+  )}`;
+}
+
+function podmanWriterStartProofId(
+  supervisorId,
+  launchAttemptId,
+  requestSha256,
+  containerId,
+) {
+  return `podman-start:${sha256(
+    `${PODMAN_WRITER_START_PROOF_DOMAIN}\0${supervisorId}\0${launchAttemptId}\0${requestSha256}\0${containerId}`,
+  )}`;
+}
+
+function podmanWriterStoppedProofId(
+  launchAttemptId,
+  requestSha256,
+  containerId,
+) {
+  return `podman-stopped:${sha256(
+    `${PODMAN_WRITER_STOPPED_PROOF_DOMAIN}\0${launchAttemptId}\0${requestSha256}\0${containerId}`,
+  )}`;
+}
+
+function validateWriterSupervisorStateGcOperationRelation(
+  authorization,
+  terminalOperation,
+  launchOperation,
+  session,
+  code,
+) {
+  ensure(
+    terminalOperation.state === "committed" &&
+      terminalOperation.retiredAt !== null &&
+      terminalOperation.operationId === authorization.terminalOperationId &&
+      terminalOperation.sessionId === authorization.sessionId &&
+      terminalOperation.kind === authorization.terminalKind &&
+      launchOperation.state === "committed" &&
+      launchOperation.retiredAt !== null &&
+      launchOperation.operationId === authorization.launchAttemptId &&
+      launchOperation.sessionId === authorization.sessionId &&
+      launchOperation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+      authorization.authorizedAt === terminalOperation.updatedAt,
+    code,
+  );
+  validateCommittedOperationHistory(terminalOperation, session);
+  if (launchOperation !== terminalOperation) {
+    validateCommittedOperationHistory(launchOperation, session);
+  }
+  const launchInput = writerLaunchAttemptInput(
+    inputForOperation(launchOperation),
+    OPERATION_INPUT_KEYS,
+    code,
+  );
+  const record = authorization.terminalRecord;
+  const supervisorId = launchInput.request.supervisor.supervisorId;
+  const requestSha256 = podmanWriterRequestSha256(launchInput.request);
+  const processIncarnationId = podmanWriterProcessIncarnationId(
+    record.containerId,
+  );
+  const writerIncarnationId = podmanWriterIncarnationId(
+    supervisorId,
+    launchOperation.operationId,
+    requestSha256,
+    record.containerId,
+  );
+  const startProofId = podmanWriterStartProofId(
+    supervisorId,
+    launchOperation.operationId,
+    requestSha256,
+    record.containerId,
+  );
+  const stoppedProofId = podmanWriterStoppedProofId(
+    launchOperation.operationId,
+    requestSha256,
+    record.containerId,
+  );
+  ensure(
+    record.launchAttemptId === launchOperation.operationId &&
+      record.requestSha256 === requestSha256 &&
+      record.containerName ===
+        podmanWriterContainerName(
+          supervisorId,
+          launchOperation.operationId,
+        ) &&
+      record.processIncarnationId === processIncarnationId &&
+      record.writerIncarnationId === writerIncarnationId &&
+      record.proofId === startProofId &&
+      record.stopProofId === stoppedProofId,
+    code,
+  );
+  if (terminalOperation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND) {
+    const evidence = terminalOperation.result?.evidence;
+    ensure(
+      terminalOperation.operationId === launchOperation.operationId &&
+        canonicalSerialize(terminalOperation) ===
+          canonicalSerialize(launchOperation) &&
+        terminalOperation.result?.outcome ===
+          "writer-launch-complete-stopped" &&
+        evidence?.launchAttemptId === launchOperation.operationId &&
+        evidence.supervisorId === supervisorId &&
+        evidence.processIncarnationId === processIncarnationId &&
+        evidence.writerIncarnationId === writerIncarnationId &&
+        evidence.proofId === stoppedProofId,
+      code,
+    );
+  } else {
+    const launchEvidence = launchOperation.result?.evidence;
+    const stopEvidence = terminalOperation.result?.evidence;
+    const stopInput = writerLaunchStopInput(
+      inputForOperation(terminalOperation),
+      OPERATION_INPUT_KEYS,
+      code,
+    );
+    const expectedLaunch = writerLaunchPointerFor(
+      launchInput,
+      launchOperation.result,
+      launchOperation.updatedAt,
+      code,
+    );
+    ensure(
+      launchOperation.result?.outcome === "writer-launch-started" &&
+        record.stopOperationId === terminalOperation.operationId &&
+        canonicalSerialize(stopInput.request.launch) ===
+          canonicalSerialize(expectedLaunch) &&
+        terminalOperation.result?.outcome === "writer-launch-stopped" &&
+        launchEvidence.launchAttemptId === launchOperation.operationId &&
+        launchEvidence.supervisorId === supervisorId &&
+        launchEvidence.processIncarnationId === processIncarnationId &&
+        launchEvidence.writerIncarnationId === writerIncarnationId &&
+        launchEvidence.proofId === startProofId &&
+        stopEvidence.launchAttemptId === launchOperation.operationId &&
+        stopEvidence.supervisorId === supervisorId &&
+        stopEvidence.processIncarnationId === processIncarnationId &&
+        stopEvidence.writerIncarnationId === writerIncarnationId &&
+        stopEvidence.proofId === terminalOperation.operationId,
+      code,
+    );
+  }
+  const expectedAuthorization = writerSupervisorStateGcAuthorizationFor({
+    authorizedAt: terminalOperation.updatedAt,
+    launchAttemptId: launchOperation.operationId,
+    sessionId: terminalOperation.sessionId,
+    terminalKind: terminalOperation.kind,
+    terminalOperationId: terminalOperation.operationId,
+    terminalRecord: record,
+  });
+  ensure(
+    canonicalSerialize(authorization) ===
+      canonicalSerialize(expectedAuthorization),
+    code,
+  );
+}
+
+function writerSupervisorStateGcSnapshotFromRow(row) {
+  const code = "operation_state_invalid";
+  const normalized = exactPlainObject(
+    row,
+    WRITER_SUPERVISOR_STATE_GC_ROW_KEYS,
+    code,
+  );
+  const authorization = canonicalWriterSupervisorStateGcAuthorization(
+    {
+      authorizationSha256: normalized.authorization_sha256,
+      authorizedAt: canonicalTimestampForCode(normalized.authorized_at, code),
+      contractVersion: WRITER_SUPERVISOR_STATE_GC_CONTRACT_VERSION,
+      launchAttemptId: normalized.launch_attempt_id,
+      sessionId: normalized.session_id,
+      terminalKind: normalized.terminal_kind,
+      terminalOperationId: normalized.terminal_operation_id,
+      terminalRecord: normalized.terminal_record,
+      terminalRecordSha256: normalized.terminal_record_sha256,
+    },
+    code,
+  );
+  const collectionStatus = normalized.collection_status;
+  const collectionReceiptSha256 = normalized.collection_receipt_sha256;
+  const collectedAt =
+    normalized.collected_at === null
+      ? null
+      : canonicalTimestampForCode(normalized.collected_at, code);
+  if (collectionStatus === null) {
+    ensure(collectionReceiptSha256 === null && collectedAt === null, code);
+  } else {
+    ensure(
+      (collectionStatus === "collected" || collectionStatus === "absent") &&
+        typeof collectionReceiptSha256 === "string" &&
+        regexpTest(SHA256_PATTERN, collectionReceiptSha256) &&
+        collectedAt !== null &&
+        timestampMilliseconds(collectedAt) >=
+          timestampMilliseconds(authorization.authorizedAt),
+      code,
+    );
+    const durableReceipt = deepFreeze({
+      contractVersion:
+        PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      launchAttemptId: authorization.launchAttemptId,
+      status: collectionStatus,
+      terminalRecordSha256: podmanWriterStateCollectionRecordSha256(
+        authorization.terminalRecord,
+      ),
+    });
+    ensure(
+      collectionReceiptSha256 ===
+        writerSupervisorStateGcCollectionReceiptSha256(durableReceipt),
+      code,
+    );
+  }
+  return deepFreeze({
+    authorization,
+    collectedAt,
+    collectionReceiptSha256,
+    collectionStatus,
   });
 }
 
@@ -11217,15 +11914,156 @@ function runSerializable(store, callback) {
   return reflectApply(runSerializableIntrinsic, store, [callback]);
 }
 
+async function readWriterSupervisorStateGcSnapshot(
+  transaction,
+  terminalOperationId,
+  forUpdate,
+) {
+  const query = forUpdate
+    ? READ_WRITER_SUPERVISOR_STATE_GC_FOR_UPDATE_QUERY
+    : READ_WRITER_SUPERVISOR_STATE_GC_QUERY;
+  const rows = rowsFromResult(
+    await transaction.query(query.text, [terminalOperationId]),
+    "operation_state_invalid",
+  );
+  return rows.length === 0
+    ? null
+    : writerSupervisorStateGcSnapshotFromRow(rows[0]);
+}
+
+async function writerSupervisorStateGcCandidateForSnapshot(
+  transaction,
+  snapshot,
+) {
+  const authorization = snapshot.authorization;
+  const session = await readSessionSnapshot(
+    transaction,
+    authorization.sessionId,
+    false,
+  );
+  const launchOperation = await readOperationSnapshot(
+    transaction,
+    authorization.launchAttemptId,
+    false,
+  );
+  ensure(launchOperation !== null, "operation_state_invalid");
+  const terminalOperation =
+    authorization.terminalOperationId === authorization.launchAttemptId
+      ? launchOperation
+      : await readOperationSnapshot(
+          transaction,
+          authorization.terminalOperationId,
+          false,
+        );
+  ensure(terminalOperation !== null, "operation_state_invalid");
+  validateWriterSupervisorStateGcOperationRelation(
+    authorization,
+    terminalOperation,
+    launchOperation,
+    session,
+    "operation_state_invalid",
+  );
+  return frozenNullPrototypeRecord({
+    authorization,
+    launchOperation,
+    session,
+    terminalOperation,
+  });
+}
+
+async function insertWriterSupervisorStateGcAuthorization(
+  transaction,
+  terminalOperation,
+  launchOperation,
+  session,
+  terminalRecord,
+) {
+  const authorization = writerSupervisorStateGcAuthorizationFor({
+    authorizedAt: terminalOperation.updatedAt,
+    launchAttemptId: launchOperation.operationId,
+    sessionId: terminalOperation.sessionId,
+    terminalKind: terminalOperation.kind,
+    terminalOperationId: terminalOperation.operationId,
+    terminalRecord,
+  });
+  validateWriterSupervisorStateGcOperationRelation(
+    authorization,
+    terminalOperation,
+    launchOperation,
+    session,
+    "writer_supervisor_state_gc_authorization_conflict",
+  );
+  const rows = rowsFromResult(
+    await transaction.query(INSERT_WRITER_SUPERVISOR_STATE_GC_QUERY.text, [
+      authorization.terminalOperationId,
+      authorization.sessionId,
+      authorization.launchAttemptId,
+      authorization.terminalKind,
+      canonicalSerialize(authorization.terminalRecord),
+      authorization.terminalRecordSha256,
+      authorization.authorizationSha256,
+      authorization.authorizedAt,
+    ]),
+    "operation_state_invalid",
+  );
+  ensure(
+    rows.length === 1,
+    "writer_supervisor_state_gc_authorization_conflict",
+  );
+  const snapshot = writerSupervisorStateGcSnapshotFromRow(rows[0]);
+  ensure(
+    snapshot.collectionStatus === null &&
+      canonicalSerialize(snapshot.authorization) ===
+        canonicalSerialize(authorization),
+    "writer_supervisor_state_gc_authorization_conflict",
+  );
+  return snapshot.authorization;
+}
+
+async function readExistingWriterSupervisorStateGcAuthorization(
+  transaction,
+  terminalOperation,
+  launchOperation,
+  session,
+  terminalRecord,
+) {
+  const expected = writerSupervisorStateGcAuthorizationFor({
+    authorizedAt: terminalOperation.updatedAt,
+    launchAttemptId: launchOperation.operationId,
+    sessionId: terminalOperation.sessionId,
+    terminalKind: terminalOperation.kind,
+    terminalOperationId: terminalOperation.operationId,
+    terminalRecord,
+  });
+  const snapshot = await readWriterSupervisorStateGcSnapshot(
+    transaction,
+    terminalOperation.operationId,
+    true,
+  );
+  ensure(
+    snapshot !== null &&
+      canonicalSerialize(snapshot.authorization) === canonicalSerialize(expected),
+    "writer_supervisor_state_gc_authorization_conflict",
+  );
+  validateWriterSupervisorStateGcOperationRelation(
+    snapshot.authorization,
+    terminalOperation,
+    launchOperation,
+    session,
+    "writer_supervisor_state_gc_authorization_conflict",
+  );
+  return snapshot.authorization;
+}
+
 async function finalizeWriterLaunchAttempt(
   store,
   options,
   acceptedStatuses,
+  authorizeSupervisorStateGc = false,
 ) {
-  const input = writerLaunchAttemptFinalizationInput(
-    options,
-    acceptedStatuses,
-  );
+  const input = authorizeSupervisorStateGc
+    ? writerLaunchAttemptGcFinalizationInput(options)
+    : writerLaunchAttemptFinalizationInput(options, acceptedStatuses);
   return runSerializable(store, async (transaction) => {
     const session = await readSessionSnapshot(
       transaction,
@@ -11260,6 +12098,15 @@ async function finalizeWriterLaunchAttempt(
           canonicalSerialize(result),
         "operation_result_conflict",
       );
+      const supervisorStateGcAuthorization = authorizeSupervisorStateGc
+        ? await readExistingWriterSupervisorStateGcAuthorization(
+            transaction,
+            observed.operation,
+            observed.operation,
+            session,
+            input.terminalRecord,
+          )
+        : null;
       const currentLaunch =
         session.document.launch?.launchAttemptId === input.operationId
           ? session.document.launch
@@ -11271,6 +12118,9 @@ async function finalizeWriterLaunchAttempt(
         operation: observed.operation,
         reservation: observed.reservation,
         session,
+        ...(authorizeSupervisorStateGc
+          ? { supervisorStateGcAuthorization }
+          : {}),
       });
     }
     ensure(
@@ -11358,6 +12208,15 @@ async function finalizeWriterLaunchAttempt(
       nextDocument,
     );
     validateLastOperationPointer(updatedSession, operation, reservation);
+    const supervisorStateGcAuthorization = authorizeSupervisorStateGc
+      ? await insertWriterSupervisorStateGcAuthorization(
+          transaction,
+          operation,
+          operation,
+          updatedSession,
+          input.terminalRecord,
+        )
+      : null;
     return operationReceipt({
       attempt: writerLaunchAttemptRecord(input, operation),
       finalized: true,
@@ -11365,12 +12224,21 @@ async function finalizeWriterLaunchAttempt(
       operation,
       reservation,
       session: updatedSession,
+      ...(authorizeSupervisorStateGc
+        ? { supervisorStateGcAuthorization }
+        : {}),
     });
   });
 }
 
-async function finalizeWriterLaunchStop(store, options) {
-  const input = writerLaunchStopFinalizationInput(options);
+async function finalizeWriterLaunchStop(
+  store,
+  options,
+  authorizeSupervisorStateGc = false,
+) {
+  const input = authorizeSupervisorStateGc
+    ? writerLaunchStopGcFinalizationInput(options)
+    : writerLaunchStopFinalizationInput(options);
   ensure(
     input.request.contractVersion !==
       WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3,
@@ -11410,6 +12278,15 @@ async function finalizeWriterLaunchStop(store, options) {
           canonicalSerialize(result),
         "operation_result_conflict",
       );
+      const supervisorStateGcAuthorization = authorizeSupervisorStateGc
+        ? await readExistingWriterSupervisorStateGcAuthorization(
+            transaction,
+            observed.operation,
+            observed.launchStop.originalLaunch.operation,
+            session,
+            input.terminalRecord,
+          )
+        : null;
       return operationReceipt({
         finalized: false,
         launch: currentWriterLaunchForAttempt(
@@ -11420,6 +12297,9 @@ async function finalizeWriterLaunchStop(store, options) {
         reservation: observed.reservation,
         session,
         stop: writerLaunchStopRecord(input, observed.operation),
+        ...(authorizeSupervisorStateGc
+          ? { supervisorStateGcAuthorization }
+          : {}),
       });
     }
     ensure(
@@ -11475,6 +12355,15 @@ async function finalizeWriterLaunchStop(store, options) {
       nextDocument,
     );
     validateLastOperationPointer(updatedSession, operation, reservation);
+    const supervisorStateGcAuthorization = authorizeSupervisorStateGc
+      ? await insertWriterSupervisorStateGcAuthorization(
+          transaction,
+          operation,
+          observed.launchStop.originalLaunch.operation,
+          updatedSession,
+          input.terminalRecord,
+        )
+      : null;
     return operationReceipt({
       finalized: true,
       launch: null,
@@ -11482,6 +12371,9 @@ async function finalizeWriterLaunchStop(store, options) {
       reservation,
       session: updatedSession,
       stop: writerLaunchStopRecord(input, operation),
+      ...(authorizeSupervisorStateGc
+        ? { supervisorStateGcAuthorization }
+        : {}),
     });
   });
 }
@@ -11489,8 +12381,11 @@ async function finalizeWriterLaunchStop(store, options) {
 async function finalizeWriterLaunchStopAndReserveCheckpointCapture(
   store,
   options,
+  authorizeSupervisorStateGc = false,
 ) {
-  const input = writerLaunchStopFinalizationInput(options);
+  const input = authorizeSupervisorStateGc
+    ? writerLaunchStopGcFinalizationInput(options)
+    : writerLaunchStopFinalizationInput(options);
   ensure(
     input.request.contractVersion ===
       WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3,
@@ -11531,12 +12426,24 @@ async function finalizeWriterLaunchStopAndReserveCheckpointCapture(
           canonicalSerialize(result),
         "operation_result_conflict",
       );
-      return readWriterStopCaptureHandoffReplay(
+      const supervisorStateGcAuthorization = authorizeSupervisorStateGc
+        ? await readExistingWriterSupervisorStateGcAuthorization(
+            transaction,
+            observed.operation,
+            observed.launchStop.originalLaunch.operation,
+            session,
+            input.terminalRecord,
+          )
+        : null;
+      const replay = await readWriterStopCaptureHandoffReplay(
         transaction,
         session,
         input,
         observed,
       );
+      return authorizeSupervisorStateGc
+        ? deepFreeze({ ...replay, supervisorStateGcAuthorization })
+        : replay;
     }
     ensure(
       (observed.operation.state === "starting" ||
@@ -11623,6 +12530,15 @@ async function finalizeWriterLaunchStopAndReserveCheckpointCapture(
       terminalDocument,
     );
     validateLastOperationPointer(terminalSession, operation, reservation);
+    const supervisorStateGcAuthorization = authorizeSupervisorStateGc
+      ? await insertWriterSupervisorStateGcAuthorization(
+          transaction,
+          operation,
+          observed.launchStop.originalLaunch.operation,
+          terminalSession,
+          input.terminalRecord,
+        )
+      : null;
 
     const captureInput = checkpointCaptureInputForWriterStopHandoff(
       input,
@@ -11687,7 +12603,7 @@ async function finalizeWriterLaunchStopAndReserveCheckpointCapture(
       captureOperation,
       captureReservation,
     );
-    return writerStopCaptureHandoffReceipt({
+    const receipt = writerStopCaptureHandoffReceipt({
       captureInput,
       captureOperation,
       captureReservation,
@@ -11697,6 +12613,9 @@ async function finalizeWriterLaunchStopAndReserveCheckpointCapture(
       stopOperation: operation,
       stopReservation: reservation,
     });
+    return authorizeSupervisorStateGc
+      ? deepFreeze({ ...receipt, supervisorStateGcAuthorization })
+      : receipt;
   });
 }
 
@@ -14546,6 +15465,17 @@ export class PostgresSessionAuthority {
     ]);
   }
 
+  async finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc(
+    options,
+  ) {
+    return finalizeWriterLaunchAttempt(
+      this.#store,
+      options,
+      ["complete-stopped"],
+      true,
+    );
+  }
+
   async claimWriterLaunchStopDispatch(options) {
     const input = writerLaunchStopTransitionInput(options);
     return runSerializable(this.#store, async (transaction) => {
@@ -14689,11 +15619,176 @@ export class PostgresSessionAuthority {
     return finalizeWriterLaunchStop(this.#store, options);
   }
 
+  async finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc(options) {
+    return finalizeWriterLaunchStop(this.#store, options, true);
+  }
+
   async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(options) {
     return finalizeWriterLaunchStopAndReserveCheckpointCapture(
       this.#store,
       options,
     );
+  }
+
+  async finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc(
+    options,
+  ) {
+    return finalizeWriterLaunchStopAndReserveCheckpointCapture(
+      this.#store,
+      options,
+      true,
+    );
+  }
+
+  async readWriterSupervisorStateGcAuthorization(options) {
+    const readInput = writerSupervisorStateGcReadInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const snapshot = await readWriterSupervisorStateGcSnapshot(
+        transaction,
+        readInput.terminalOperationId,
+        false,
+      );
+      ensure(snapshot !== null, "writer_supervisor_state_gc_not_authorized");
+      await writerSupervisorStateGcCandidateForSnapshot(
+        transaction,
+        snapshot,
+      );
+      return snapshot.authorization;
+    });
+  }
+
+  async listWriterSupervisorStateGcCandidates(options) {
+    const listInput = writerSupervisorStateGcListInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const maximumRows = listInput.limit + 1;
+      const afterCursor = listInput.afterSessionId;
+      const query =
+        afterCursor === null
+          ? LIST_WRITER_SUPERVISOR_STATE_GC_FIRST_PAGE_QUERY
+          : LIST_WRITER_SUPERVISOR_STATE_GC_AFTER_QUERY;
+      const values =
+        afterCursor === null
+          ? [maximumRows]
+          : [afterCursor, maximumRows];
+      const rows = pageRowsFromResult(
+        await transaction.query(query.text, values),
+        maximumRows,
+        "operation_state_invalid",
+      );
+      const candidateCount =
+        rows.length > listInput.limit ? listInput.limit : rows.length;
+      const candidates = new ArrayConstructor(candidateCount);
+      objectSetPrototypeOf(candidates, null);
+      let previousSessionId = afterCursor;
+      let lastCandidateSessionId = null;
+      for (let index = 0; index < rows.length; index += 1) {
+        const snapshot = writerSupervisorStateGcSnapshotFromRow(
+          ownDataValue(
+            rows,
+            reflectApply(StringConstructor, undefined, [index]),
+            "operation_state_invalid",
+          ),
+        );
+        ensure(
+          snapshot.collectionStatus === null &&
+            (previousSessionId === null ||
+              snapshot.authorization.sessionId > previousSessionId),
+          "operation_state_invalid",
+        );
+        const candidate = await writerSupervisorStateGcCandidateForSnapshot(
+          transaction,
+          snapshot,
+        );
+        if (index < candidateCount) {
+          candidates[index] = candidate;
+          lastCandidateSessionId = snapshot.authorization.sessionId;
+        }
+        previousSessionId = snapshot.authorization.sessionId;
+      }
+      objectSetPrototypeOf(candidates, arrayPrototype);
+      return frozenNullPrototypeRecord({
+        candidates,
+        nextAfterSessionId:
+          rows.length > listInput.limit ? lastCandidateSessionId : null,
+      });
+    });
+  }
+
+  async completeWriterSupervisorStateGc(options) {
+    const input = writerSupervisorStateGcCompletionInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const observed = await readWriterSupervisorStateGcSnapshot(
+        transaction,
+        input.authorization.terminalOperationId,
+        false,
+      );
+      ensure(
+        observed !== null &&
+          canonicalSerialize(observed.authorization) ===
+            canonicalSerialize(input.authorization),
+        "writer_supervisor_state_gc_collection_conflict",
+      );
+      await writerSupervisorStateGcCandidateForSnapshot(
+        transaction,
+        observed,
+      );
+      const snapshot = await readWriterSupervisorStateGcSnapshot(
+        transaction,
+        input.authorization.terminalOperationId,
+        true,
+      );
+      ensure(
+        snapshot !== null &&
+          canonicalSerialize(snapshot.authorization) ===
+            canonicalSerialize(input.authorization),
+        "writer_supervisor_state_gc_collection_conflict",
+      );
+      if (snapshot.collectionStatus !== null) {
+        return frozenNullPrototypeRecord({
+          authorization: snapshot.authorization,
+          collectedAt: snapshot.collectedAt,
+          collectionReceiptSha256: snapshot.collectionReceiptSha256,
+          collectionStatus: snapshot.collectionStatus,
+          finalized: false,
+        });
+      }
+      const collectionReceiptSha256 =
+        writerSupervisorStateGcCollectionReceiptSha256(
+          input.collectionReceipt,
+        );
+      const rows = rowsFromResult(
+        await transaction.query(
+          COMPLETE_WRITER_SUPERVISOR_STATE_GC_QUERY.text,
+          [
+            input.authorization.terminalOperationId,
+            input.authorization.authorizationSha256,
+            input.collectionReceipt.status,
+            collectionReceiptSha256,
+            transaction.now,
+          ],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(
+        rows.length === 1,
+        "writer_supervisor_state_gc_collection_conflict",
+      );
+      const completed = writerSupervisorStateGcSnapshotFromRow(rows[0]);
+      ensure(
+        completed.collectionStatus === input.collectionReceipt.status &&
+          completed.collectionReceiptSha256 === collectionReceiptSha256 &&
+          canonicalSerialize(completed.authorization) ===
+            canonicalSerialize(input.authorization),
+        "writer_supervisor_state_gc_collection_conflict",
+      );
+      return frozenNullPrototypeRecord({
+        authorization: completed.authorization,
+        collectedAt: completed.collectedAt,
+        collectionReceiptSha256: completed.collectionReceiptSha256,
+        collectionStatus: completed.collectionStatus,
+        finalized: true,
+      });
+    });
   }
 
   async readWriterLaunchAttempt(options) {

@@ -40,6 +40,7 @@ const LANES = objectFreeze([
   "activation",
   "launch-attempt",
   "current-launch",
+  "supervisor-state-gc",
 ]);
 const READ_KEYS = objectFreeze(["lane", "recoveryScopeId"]);
 const ADVANCE_KEYS = objectFreeze([

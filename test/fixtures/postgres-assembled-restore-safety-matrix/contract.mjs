@@ -131,6 +131,13 @@ export function createAssembledRestorePublicationCallback(publication) {
 const leaves = frozen([
   leaf(
     "mutator",
+    "supervisor-state-gc",
+    "supervisorStateCollector.collectTerminalState",
+    "collectTerminalState",
+    "supervisorStateCollectionSettlement",
+  ),
+  leaf(
+    "mutator",
     "writer-stop",
     "supervisor.stopWriter",
     "stopWriter",
@@ -265,6 +272,11 @@ const leaves = frozen([
 ]);
 
 const cutKeys = frozen([
+  cut(
+    "authorization.terminalOperationId",
+    "supervisor-state-gc",
+    "supervisorStateCollector.collectTerminalState",
+  ),
   cut("stopOperationId", "writer-stop", "supervisor.stopWriter"),
   cut(
     "plan.captureOperationId",
@@ -299,6 +311,9 @@ const cutKeys = frozen([
 ]);
 
 const overlayFamilies = frozen([
+  overlay("supervisor-state-mutator", [
+    "supervisorStateCollector.collectTerminalState",
+  ]),
   overlay("supervisor-mutator", [
     "supervisor.stopWriter",
     "supervisor.launchWriter",

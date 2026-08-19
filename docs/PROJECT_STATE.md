@@ -267,18 +267,35 @@
   available after that gate closes.
 - A bounded restore recovery coordinator and service now cover retained
   destination generations, attachment activations, prepared or active launch
-  attempts, and current-launch inventory through four independent keyset
-  cursors. Recovery is source-free and no-relaunch: it never republishes,
-  reserves or consumes an image, invokes a launcher, or reconstructs an opaque
-  writer capability. Current-launch handling is inventory only.
-- PostgreSQL now persists those four cursors independently for each configured
+  attempts, current-launch inventory, and authorized terminal supervisor-state
+  collection through five independent keyset cursors. Recovery is source-free
+  and no-relaunch: it never republishes, reserves or consumes an image, invokes
+  a launcher, or reconstructs an opaque writer capability. Current-launch
+  handling is inventory only.
+- PostgreSQL now persists those five cursors independently for each configured
   recovery scope. A bounded single-flight runner advances each settled lane by
   revision/cycle compare-and-swap, survives restart and commit-acknowledgement
   loss, and preserves earlier lane progress when a later lane fails.
+- Migration 009 permanently records terminal local supervisor-state GC
+  authorization and completion against both the terminal operation and launch
+  attempt. Only the owner launch/stop finalizers that commit exact
+  `complete-stopped` evidence may create that authorization; stopped-only
+  reconciliation remains read-only. In the assembled production runner, the
+  fifth lane pages pending rows last while that runner holds the database-global
+  exclusive lifecycle lease, invokes the separately settled physical collector
+  with the exact terminal record, and then records `collected` or `absent`. An
+  acknowledgement-loss retry may observe `collected` followed by `absent`
+  without losing the durable completion. The destructive collector's grace
+  expiry aborts and reports fatal failure but does not release its invocation,
+  aggregate physical shutdown, or the normally held lifecycle lease until the
+  raw native Promise settles. Connection or database loss may release that
+  advisory lease earlier; a same-authorization cold retry is then safe only
+  through the exact concurrent idempotent-or-fail-closed collector protocol and
+  does not prove the older callback quiesced.
 - One database-global versioned restore lifecycle lock now gives foreground
   composition a shared lease and the recovery runner an exclusive lease. The
-  runner and service revalidate the lease around lane, candidate, and cursor
-  boundaries. A fixed-delay scheduler starts with one immediate bounded
+  runner and guarded service calls revalidate the lease around lane, candidate,
+  and cursor boundaries. A fixed-delay scheduler starts with one immediate bounded
   pass, prevents overlapping passes, coalesces concurrent kicks, reports busy
   or uncertain ticks through a synchronous observer, and drains admitted work
   during shutdown. The observer must return `undefined`; Promise and thenable
@@ -373,21 +390,24 @@
   hook. Neither abort nor that hook proves physical quiescence, makes attempted
   dependency cleanup a clean stopped result, or authorizes another dispatch.
 - A deployment-private physical-binding graph now extends the same contract to
-  three supervisor methods, nine storage-lifecycle methods, four publication
-  methods, and restore-destination resolution. Together with image resolution
-  and inspection, deployment owns nineteen method-specific settlement stops.
+  three supervisor methods, a separate supervisor-state collector, nine
+  storage-lifecycle methods, four publication methods, and restore-destination
+  resolution. Together with image resolution and inspection, deployment owns
+  twenty method-specific settlement stops.
   Transient invocation identities and abort signals remain outside durable
   requests/results; all existing grants, readbacks, stopped-only reconciliation,
   committed-only verification, and no-second-dispatch rules remain authoritative.
   Stop requests every settlement drain before awaiting them and closes pools
   only after controller and settlement drain; any failure is sticky.
 - The completed assembled-restore safety matrix fixes the distinction
-  between all nineteen settlement contracts and the fourteen leaves on the
-  private restore protocol surface. Seven grant-bearing mutators remain at-most-
-  once per durable operation; seven resolver, verifier, inspector, or
+  between all twenty settlement contracts and the fifteen leaves on the
+  private restore protocol surface. Seven dispatch mutators remain at-most-once
+  per durable operation; terminal-state GC authorizes one exact chain whose
+  acknowledgement-loss retry may prove it absent but cannot perform a second
+  deletion. Seven resolver, verifier, inspector, or
   reconciler observations may repeat across independent recovery attempts but
   cannot manufacture a grant. The five remaining generic lifecycle contracts
-  stay outside the current saga. The evidence shape combines seven existing
+  stay outside the current saga. The evidence shape combines eight
   real-PostgreSQL durable-cut and commit-acknowledgement-loss paths, separate
   same-database/stable-plan retry through fresh physical bindings, image
   binding, runtime, and controller, stable-plan-registry rehydration, and
@@ -396,6 +416,11 @@
   callback seam. The immutable public backend now owns that routing in
   production without accepting a caller callback. The matrix does not claim
   one whole-saga deployment restart or operating-system crash coverage.
+  The eighth mutator is
+  `supervisorStateCollector.collectTerminalState`; its cut is
+  `supervisor-state-gc`, durable key is
+  `authorization.terminalOperationId`, and independent overlay is
+  `supervisor-state-mutator`.
 - Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
   grant entirely inside one coordinator-owned per-operation guard. The storage
   backend exposes a separate version 1 read-only reconciliation contract keyed
@@ -460,6 +485,25 @@
   wrapper close plus group absence; a dispatched exact start only advances on
   a zero exit and otherwise remains pending because conmon may leave the CLI
   group.
+- Terminal local Podman supervisor state now has a bounded two-phase collector.
+  It validates the exact stopped revision 4 terminal record and revisions 0
+  through 3 or their admitted oldest-first missing retry prefix, removes the
+  lower revisions plus publication sidecars and syncs
+  the held directory, then compares revision 4's named object and bytes with
+  its held FD before unlink. After unlink it positionally rereads exact bytes
+  through that FD, revalidates identity and access policy, proves absence, and
+  syncs the directory again. Object identity (`dev`/`ino` plus held FDs),
+  content stability, and access policy remain separate protected properties.
+  That policy checks same-UID regular files at `0600` with required `nlink`,
+  the same-UID state root and immediate parent at `0700`, and safe traversal-
+  ancestor ownership/write/sticky constraints; child-entry and generic `stat`
+  churn are not change evidence.
+  I/O or unreadable state, canonical conflict, and post-mutation outcome
+  uncertainty remain distinct. PostgreSQL finalization and outer lifecycle/
+  settlement provide authority and normal-path quiescence while the owning
+  session remains live; same-authorization monotonic collection handles the
+  explicitly non-quiescent session-loss overlap. The collector does not mint
+  either outer property.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -470,6 +514,8 @@
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - ext4-to-Podman attachment composition:
   `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
+- Terminal writer-supervisor state GC:
+  `docs/project_journal/2026/08/2026-08-19-writer-supervisor-state-gc-b7d4e2.md`
 - Final public restore backend:
   `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - Assembled restore safety matrix:
@@ -579,8 +625,9 @@
   to injected runtime collaborators. Its image-plan binding owns exact OCI
   bytes, trusted inspection, opaque reservation identity, and separate bounded
   settlement policy for provider resolution and inspection. The same owner now
-  binds every assembled supervisor, storage-lifecycle, publication, and
-  restore-destination resolver Promise into the common settlement lifecycle.
+  binds every assembled supervisor, terminal-state collector,
+  storage-lifecycle, publication, and restore-destination resolver Promise
+  into the common settlement lifecycle.
   The deployment now also derives and admits one exact operational lease
   policy across the two database-clock windows, including physical deadline/
   grace bounds, an aggregate database allowance, and a safety margin.
@@ -600,8 +647,10 @@
   receipt—not container stop alone—for physical quiescence. This release step
   is forbidden on a shared UID or Podman engine. The independent Podman job
   remains as narrower supervisor coverage. These jobs do not make crash-prefix
-  state durable, revoke a stale remote writer automatically, or supply differential/
-  compressed export, encryption, retention, or registry trust. The next slice
-  is terminal supervisor-state GC after PostgreSQL terminal commit and callback
-  quiescence. Provider history retention remains separate and must preserve
-  every current attachment's origin operation.
+  state durable, revoke a stale remote writer automatically, or supply
+  differential/compressed export, encryption, provider-state retention, or
+  registry trust. Terminal supervisor-state GC safety after PostgreSQL terminal
+  commit is complete for both healthy-session callback quiescence and exact
+  same-authorization session-loss overlap. Provider history retention is the
+  next independent slice and must preserve every current attachment's origin
+  operation.

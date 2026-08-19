@@ -11,6 +11,7 @@ import {
   createPodmanWriterSupervisor,
 } from "../src/podman-writer-supervisor.mjs";
 import {
+  assertPodmanWriterSupervisorStateRecord,
   createPodmanWriterSupervisorState,
 } from "../src/podman-writer-supervisor-state.mjs";
 
@@ -37,6 +38,7 @@ const objectGetOwnPropertyDescriptorIntrinsic =
   Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectHasOwnIntrinsic = Object.hasOwn;
+const objectIsFrozenIntrinsic = Object.isFrozen;
 const objectPrototypeIntrinsic = Object.prototype;
 
 const ROOTLESS_NAMESPACE_CONFIGURATION_KEYS = Object.freeze([
@@ -441,10 +443,39 @@ export async function runExt4PodmanWriterIntegration({
     assert.equal(marker.gid, process.getgid());
     assert.equal(marker.mode & 0o7777, 0o600);
   } finally {
-    assert.deepEqual(await receipt.stopWriter(stopInput(input, receipt)), exact({
-      contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-      status: "stopped",
-    }));
+    const stopRequest = stopInput(input, receipt);
+    const stopped = await receipt.stopWriter(stopRequest);
+    assert.deepEqual(reflectOwnKeysIntrinsic(stopped), [
+      "contractVersion",
+      "status",
+      "terminalRecord",
+    ]);
+    assert.equal(objectGetPrototypeOfIntrinsic(stopped), null);
+    assert.equal(objectIsFrozenIntrinsic(stopped), true);
+    assert.equal(
+      stopped.contractVersion,
+      PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    );
+    assert.equal(stopped.status, "stopped");
+    const terminalRecord = assertPodmanWriterSupervisorStateRecord(
+      stopped.terminalRecord,
+    );
+    assert.equal(terminalRecord.status, "stopped");
+    assert.equal(terminalRecord.revision, 4);
+    assert.equal(
+      terminalRecord.launchAttemptId,
+      receipt.evidence.launchAttemptId,
+    );
+    assert.equal(terminalRecord.stopOperationId, stopRequest.stopOperationId);
+    assert.equal(
+      terminalRecord.processIncarnationId,
+      receipt.evidence.processIncarnationId,
+    );
+    assert.equal(
+      terminalRecord.writerIncarnationId,
+      receipt.evidence.writerIncarnationId,
+    );
+    assert.equal(terminalRecord.proofId, receipt.evidence.proofId);
   }
   assert.equal(process.pid, servicePid);
   assert.equal(process.getuid(), serviceUid);

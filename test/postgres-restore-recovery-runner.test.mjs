@@ -28,6 +28,7 @@ const LANE_SPECS = [
   { field: "activation", lane: "activation" },
   { field: "launchAttempt", lane: "launch-attempt" },
   { field: "currentLaunch", lane: "current-launch" },
+  { field: "supervisorStateGc", lane: "supervisor-state-gc" },
 ];
 
 class RecoveryLockManager {
@@ -343,6 +344,14 @@ function createRecoveryService({
     listWriterLaunchAttemptCandidates(input) {
       return list("launchAttempt", input);
     },
+    listWriterSupervisorStateGcCandidates(input) {
+      return list("supervisorStateGc", input);
+    },
+    collectWriterSupervisorStateGc(candidate) {
+      if (recordCalls) {
+        reconcileCalls.push(["supervisorStateGc", candidate]);
+      }
+    },
     reconcileRestoreAttachmentActivation(candidate) {
       if (recordCalls) reconcileCalls.push(["activation", candidate]);
     },
@@ -364,6 +373,7 @@ function limits(overrides = {}) {
     activation: 3,
     launchAttempt: 4,
     currentLaunch: 5,
+    supervisorStateGc: 6,
     ...overrides,
   };
 }
@@ -464,7 +474,7 @@ function assertDeepFrozen(value, seen = new Set()) {
   for (const child of Object.values(value)) assertDeepFrozen(child, seen);
 }
 
-test("runs and durably advances four recovery lanes in fixed order", async () => {
+test("runs and durably advances five recovery lanes in fixed order", async () => {
   const events = [];
   const cursorFixture = createCursorStore({
     onAdvance(input) {
@@ -496,6 +506,9 @@ test("runs and durably advances four recovery lanes in fixed order", async () =>
     "read:current-launch",
     "batch:currentLaunch",
     "advance:current-launch",
+    "read:supervisor-state-gc",
+    "batch:supervisorStateGc",
+    "advance:supervisor-state-gc",
   ]);
   assert.equal(result.status, "sweep-complete");
   assert.equal(result.recoveryScopeId, RECOVERY_SCOPE_ID);
@@ -756,7 +769,7 @@ test("waits for reconciliation to drain before advancing the cursor", async () =
   finish.resolve();
   await pending;
   assert.equal(reconcilerExited, true);
-  assert.equal(advanceCalls, 4);
+  assert.equal(advanceCalls, 5);
   assert.equal(cursorFixture.state.get("generation").revision, "1");
 });
 
@@ -860,7 +873,7 @@ test(
 
     reconciliation.resolve();
     await pending;
-    assert.equal(advanceCalls, 4);
+    assert.equal(advanceCalls, 5);
     assert.equal(cursorFixture.state.get("generation").revision, "1");
     assert.equal(fixture.lifecycleFixture.manager.holder, null);
   },
@@ -1213,6 +1226,7 @@ test("passes startup-fixed lane limits and persists each settled continuation", 
       ["activation", 3],
       ["launchAttempt", 4],
       ["currentLaunch", 5],
+      ["supervisorStateGc", 6],
     ],
   );
   for (const [, input] of serviceFixture.calls) {
@@ -1454,6 +1468,7 @@ test("abort before the first read performs no cursor initialization or recovery 
     activation: null,
     launchAttempt: null,
     currentLaunch: null,
+    supervisorStateGc: null,
     status: "aborted",
   });
   assert.deepEqual(cursorFixture.calls, []);

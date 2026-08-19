@@ -77,8 +77,9 @@
 - [done] Compose detached restore activation and recovery: source-free verify
   only an exact committed destination, bind version 1 provider attachment
   evidence without treating pathname equality as authority, atomically install
-  the canonical attachment plus prepared launch, and sweep four bounded
-  generation/activation/launch/current-inventory lanes without relaunching.
+  the canonical attachment plus prepared launch, and sweep five bounded
+  generation, activation, launch, current-inventory, and
+  `supervisor-state-gc` lanes without relaunching.
 - [done] Add a fleet-gated capture-bound activation request that proves
   the exact current-writer stop, clean checkpoint capture, and subsequent
   release or force-fence before a distinct target restore generation can
@@ -134,14 +135,15 @@
   optional first attach, and finalization inside one coordinator-owned
   per-operation guard; retained, ambiguous, or copied caller state cannot
   reconstruct a second attach dispatch. A deployment-private physical binding
-  graph now gives the three supervisor methods, nine storage-lifecycle methods,
-  four publication methods, and restore-destination resolver independent
+  graph now gives the three supervisor methods, a separate supervisor-state
+  collector, nine storage-lifecycle methods, four publication methods, and
+  restore-destination resolver independent
   deadlines and grace periods while preserving existing durable authority.
   Deployment now derives the two database-clock critical-window bounds from
   those method policies, an explicit aggregate database allowance, and a
   positive safety margin; stable-plan provision and every resolution enforce
-  the exact admitted lease. The completed safety matrix classifies all nineteen
-  settlement leaves, maps the seven protocol-surface mutators to seven
+  the exact admitted lease. The completed safety matrix classifies all twenty
+  settlement leaves, maps the eight protocol-surface mutators to eight
   real-PostgreSQL acknowledgement-loss paths, and binds a
   same-database/stable-plan retry
   through fresh physical bindings, image binding, runtime, and controller plus
@@ -163,10 +165,14 @@
   into a trusted Podman filesystem authority and exercise that bridge with the
   initialized backend in one non-root process. This closes the current
   production identity gap without depending on either retention track below.
-- [pending] Second, add authority-owned bounded retention or garbage collection
-  for terminal local supervisor state, but only after PostgreSQL has permanently
-  committed the exact terminal attempt and every callback for that attempt is
-  quiescent. The stopped-only reconciler remains read-only and cannot authorize
+- [done] Second, add authority-owned bounded retention or garbage collection
+  for terminal local supervisor state. Migration 009 permanently records exact
+  owner-finalizer authorization and collection completion; the fifth recovery
+  lane is paged by the assembled production cold-start runner while it holds
+  the database-global exclusive lifecycle guard, with a dedicated physical
+  settlement. The collector deletes exact stopped revisions in two directory-
+  synced phases and accepts acknowledgement-loss replay from `collected` to
+  `absent`. The stopped-only reconciler remains read-only and cannot authorize
   this mutation.
 - [pending] Third, define an authority-safe provider-state exact-replay
   retention floor or move permanent operation history to a PostgreSQL-indexed

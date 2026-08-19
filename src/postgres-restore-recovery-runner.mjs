@@ -98,6 +98,7 @@ const LIMIT_KEYS = objectFreeze([
   "currentLaunch",
   "generation",
   "launchAttempt",
+  "supervisorStateGc",
 ]);
 const RUN_REQUEST_KEYS = objectFreeze(["signal"]);
 const CURSOR_KEYS = objectFreeze([
@@ -135,12 +136,18 @@ const LANE_ORDER = objectFreeze([
     "current-launch",
     "scanCurrentLaunchBatch",
   ]),
+  objectFreeze([
+    "supervisorStateGc",
+    "supervisor-state-gc",
+    "runSupervisorStateGcBatch",
+  ]),
 ]);
 const RESULT_LANE_KEYS = objectFreeze([
   "generation",
   "activation",
   "launchAttempt",
   "currentLaunch",
+  "supervisorStateGc",
 ]);
 
 const ERROR_MESSAGES = objectFreeze({
@@ -941,6 +948,7 @@ function emptyResult(recoveryScopeId) {
     activation: null,
     launchAttempt: null,
     currentLaunch: null,
+    supervisorStateGc: null,
     status: "aborted",
   });
 }
@@ -1209,6 +1217,7 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       activation: laneReceipts.activation,
       launchAttempt: laneReceipts.launchAttempt,
       currentLaunch: laneReceipts.currentLaunch,
+      supervisorStateGc: laneReceipts.supervisorStateGc,
       status,
     });
   }

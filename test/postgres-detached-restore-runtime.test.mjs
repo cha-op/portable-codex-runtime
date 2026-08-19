@@ -14,11 +14,13 @@ import {
   isPostgresDetachedRestoreOperationalLeaseBudget,
 } from "../src/postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
 import {
-  LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
@@ -219,6 +221,7 @@ function createTestOperationalLeaseBudget() {
 }
 
 function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
+  const supervisorId = "runtime-physical-supervisor-001";
   const lifecycleBackend = Object.freeze({
     ...rawLifecycle,
     physicalInvocationContractVersion: 1,
@@ -240,12 +243,23 @@ function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
       settlementGraceMilliseconds: 1_000,
     }),
     supervisor: Object.freeze({
-      contractVersion: 2,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
-      supervisorId: "runtime-physical-supervisor-001",
+      supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisorStateCollector: Object.freeze({
+      collectTerminalState: unexpected,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      supervisorId,
+    }),
   });
 }
 
@@ -418,7 +432,7 @@ function createRuntimeFixture() {
   );
   const stoppedWriterCoordinator = new StoppedWriterCapabilityCoordinator();
   const supervisor = Object.freeze({
-    contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+    contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
     async launchWriter() {
       calls.supervisor += 1;
       throw new Error("writer supervisor must not launch");
@@ -428,6 +442,17 @@ function createRuntimeFixture() {
       throw new Error("writer supervisor must not reconcile");
     },
     supervisorId: "runtime-supervisor-001",
+  });
+  const supervisorStateCollector = Object.freeze({
+    collectTerminalState: Object.freeze(
+      async function collectTerminalState() {
+        calls.supervisor += 1;
+        throw new Error("writer supervisor state collector must not run");
+      },
+    ),
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    supervisorId: supervisor.supervisorId,
   });
   const options = {
     authority: {
@@ -447,6 +472,7 @@ function createRuntimeFixture() {
       imagePlanBinding,
       stoppedWriterCoordinator,
       supervisor,
+      supervisorStateCollector,
     },
     pools,
     planRegistry: {
@@ -463,6 +489,7 @@ function createRuntimeFixture() {
         currentLaunch: 1,
         generation: 1,
         launchAttempt: 1,
+        supervisorStateGc: 1,
       },
       onStep() {
         calls.onStep += 1;
@@ -495,6 +522,7 @@ function createRuntimeFixture() {
       publication,
       stoppedWriterCoordinator,
       supervisor,
+      supervisorStateCollector,
     },
     options,
     pools,

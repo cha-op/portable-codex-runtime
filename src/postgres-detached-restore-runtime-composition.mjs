@@ -13,6 +13,7 @@ import {
   isPostgresDetachedRestoreOperationalLeaseBudget,
 } from "./postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   isPostgresDetachedRestorePublicationBinding,
 } from "./postgres-detached-restore-physical-bindings.mjs";
 import {
@@ -134,6 +135,11 @@ const listRestoreGenerationCandidatesIntrinsic =
 const listWriterLaunchAttemptCandidatesIntrinsic =
   PostgresSessionAuthority.prototype
     .listWriterLaunchAttemptRecoveryCandidates;
+const listWriterSupervisorStateGcCandidatesIntrinsic =
+  PostgresSessionAuthority.prototype
+    .listWriterSupervisorStateGcCandidates;
+const completeWriterSupervisorStateGcIntrinsic =
+  PostgresSessionAuthority.prototype.completeWriterSupervisorStateGc;
 const markOperationUncertainIntrinsic =
   PostgresSessionAuthority.prototype.markOperationUncertain;
 const readRestoreAttachmentActivationIntrinsic =
@@ -179,6 +185,18 @@ const LAUNCH_OPTION_KEYS = objectFreeze([
   "imagePlanBinding",
   "stoppedWriterCoordinator",
   "supervisor",
+  "supervisorStateCollector",
+]);
+const SUPERVISOR_STATE_COLLECTOR_KEYS = objectFreeze([
+  "collectTerminalState",
+  "contractVersion",
+  "supervisorId",
+]);
+const SUPERVISOR_KEYS = objectFreeze([
+  "contractVersion",
+  "launchWriter",
+  "reconcileWriterLaunch",
+  "supervisorId",
 ]);
 const FOREGROUND_OPTION_KEYS = objectFreeze(["fleetCapabilityGate"]);
 const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
@@ -639,7 +657,12 @@ function createRestoreActivationAuthority(authority) {
   });
 }
 
-function createRecoveryService(authority, coordinator, launcher) {
+function createRecoveryService(
+  authority,
+  coordinator,
+  launcher,
+  supervisorStateCollector,
+) {
   const reconcileRestoreAttachmentActivationMethod = ownFrozenDataFunction(
     coordinator,
     "reconcileRestoreAttachmentActivation",
@@ -651,6 +674,10 @@ function createRecoveryService(authority, coordinator, launcher) {
   const reconcileWriterLaunchAttemptMethod = ownFrozenDataFunction(
     launcher,
     "reconcileLaunchAttempt",
+  );
+  const collectTerminalStateMethod = ownFrozenDataFunction(
+    supervisorStateCollector,
+    "collectTerminalState",
   );
 
   const listCurrentWriterLaunchCandidates =
@@ -685,6 +712,14 @@ function createRecoveryService(authority, coordinator, launcher) {
         args,
       );
     };
+  const listWriterSupervisorStateGcCandidates =
+    function listWriterSupervisorStateGcCandidates(...args) {
+      return callIntrinsic(
+        listWriterSupervisorStateGcCandidatesIntrinsic,
+        authority,
+        args,
+      );
+    };
   const reconcileRestoreAttachmentActivation =
     function reconcileRestoreAttachmentActivation(...args) {
       return callIntrinsic(
@@ -709,11 +744,35 @@ function createRecoveryService(authority, coordinator, launcher) {
         args,
       );
     };
+  const collectWriterSupervisorStateGc =
+    async function collectWriterSupervisorStateGc(candidate) {
+      const collectionReceipt = await callIntrinsic(
+        collectTerminalStateMethod,
+        supervisorStateCollector,
+        [
+          exactFrozenRecord({
+            terminalRecord: candidate.authorization.terminalRecord,
+          }),
+        ],
+      );
+      return callIntrinsic(
+        completeWriterSupervisorStateGcIntrinsic,
+        authority,
+        [
+          exactFrozenRecord({
+            authorization: candidate.authorization,
+            collectionReceipt,
+          }),
+        ],
+      );
+    };
 
   objectFreeze(listCurrentWriterLaunchCandidates);
   objectFreeze(listRestoreAttachmentActivationCandidates);
   objectFreeze(listRestoreGenerationCandidates);
   objectFreeze(listWriterLaunchAttemptCandidates);
+  objectFreeze(listWriterSupervisorStateGcCandidates);
+  objectFreeze(collectWriterSupervisorStateGc);
   objectFreeze(reconcileRestoreAttachmentActivation);
   objectFreeze(reconcileRestoreGeneration);
   objectFreeze(reconcileWriterLaunchAttempt);
@@ -725,6 +784,8 @@ function createRecoveryService(authority, coordinator, launcher) {
       listRestoreAttachmentActivationCandidates,
       listRestoreGenerationCandidates,
       listWriterLaunchAttemptCandidates,
+      listWriterSupervisorStateGcCandidates,
+      collectWriterSupervisorStateGc,
       reconcileRestoreAttachmentActivation,
       reconcileRestoreGeneration,
       reconcileWriterLaunchAttempt,
@@ -746,6 +807,24 @@ function assemble(options) {
     isPostgresDetachedRestoreImagePlanBinding(
       options.launch.imagePlanBinding,
     ),
+  );
+  const supervisor = exactDataObject(
+    options.launch.supervisor,
+    SUPERVISOR_KEYS,
+  );
+  const supervisorStateCollector = exactDataObject(
+    options.launch.supervisorStateCollector,
+    SUPERVISOR_STATE_COLLECTOR_KEYS,
+  );
+  ensure(
+    objectIsFrozen(options.launch.supervisorStateCollector) &&
+      supervisorStateCollector.contractVersion ===
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
+      supervisorStateCollector.supervisorId === supervisor.supervisorId,
+  );
+  ownFrozenDataFunction(
+    options.launch.supervisorStateCollector,
+    "collectTerminalState",
   );
   preflightPrototypeChain(options.launch.stoppedWriterCoordinator);
   preflightPublication(options.storage.publication);
@@ -925,6 +1004,7 @@ function assemble(options) {
     authority,
     restoreActivationCoordinator,
     launcher,
+    options.launch.supervisorStateCollector,
   );
   const cursorStore = callFactory(
     createRestoreRecoveryCursorStoreIntrinsic,

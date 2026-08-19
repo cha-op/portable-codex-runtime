@@ -14,6 +14,7 @@ import {
   SESSION_AUTHORITY_DOCUMENT_VERSION,
   WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND,
   WRITER_FORCE_FENCE_OPERATION_KIND,
+  WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
   assertSessionOperationBinding,
   assertSessionOperationTransitionProof,
@@ -21,6 +22,7 @@ import {
   createRestoreAttachmentActivationOperationRequestV2,
   createRestoreDestinationGenerationOperationRequest,
   createRestoreDestinationGenerationOperationRequestV2,
+  createWriterLaunchAttemptOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   createSessionManifest,
@@ -192,14 +194,14 @@ function legacyDocument(overrides = {}) {
   return value;
 }
 
-function attachedSnapshot() {
+function attachedSnapshot(sessionId = SESSION_ID) {
   const lease = {
     contractVersion: 1,
     expiresAt: "2026-07-29T13:34:56.789Z",
     fencingEpoch: "2",
     holderId: "host-001",
     leaseId: "lease-001",
-    sessionId: SESSION_ID,
+    sessionId,
   };
   const attachment = {
     attachmentId: "attachment-001",
@@ -212,14 +214,15 @@ function attachedSnapshot() {
     mode: "read-write",
     operationId: "attachment-operation-001",
     proofId: "attachment-proof-001",
-    rootPath: "/var/lib/portable-codex/session-001",
-    sessionId: SESSION_ID,
+    rootPath: `/var/lib/portable-codex/${sessionId}`,
+    sessionId,
     storageId: "volume-001",
   };
   return {
     createdAt: NOW,
     document: document({
       attachment,
+      manifest: JSON.parse(serializeSessionManifest(manifest(sessionId))),
       lastOperation: {
         conflictClass: "session-mutation",
         expectedSessionRevision: "0",
@@ -233,10 +236,11 @@ function attachedSnapshot() {
       },
       lease,
       lifecycle: "ATTACHED",
+      storageRef: storageRef(sessionId),
       writerEpoch: lease.fencingEpoch,
     }),
     revision: "3",
-    sessionId: SESSION_ID,
+    sessionId,
     updatedAt: NOW,
   };
 }
@@ -245,6 +249,175 @@ function sha256Json(value) {
   return createHash("sha256")
     .update(JSON.stringify(value), "utf8")
     .digest("hex");
+}
+
+function sha256Text(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function writerSupervisorStateGcFixture({
+  authorizedAt = OPERATION_RETIRED_AT,
+  operationId = "writer-launch-gc-001",
+  sessionId = SESSION_ID,
+} = {}) {
+  const expectedSession = attachedSnapshot(sessionId);
+  const intent = writerLaunchIntentFixture(expectedSession);
+  const request = createWriterLaunchAttemptOperationRequest({
+    expectedSession,
+    generation: {
+      binding: { marker: `binding-${sessionId}` },
+      checkpointId: `checkpoint-${sessionId}`,
+      claimedAt: "2026-07-29T12:34:57.000Z",
+      committedAt: "2026-07-29T12:34:58.000Z",
+      document: { marker: `document-${sessionId}` },
+      generationId: `generation-${sessionId}`,
+      operationId: `generation-operation-${sessionId}`,
+      sessionId,
+      state: "committed",
+    },
+    measuredImage: intent.measuredImage,
+    supervisor: intent.supervisor,
+  });
+  const requestSha256 = sha256Text(
+    `portable-codex-runtime:podman-writer-request:v1\0${JSON.stringify(
+      request,
+    )}`,
+  );
+  const containerId = "a".repeat(64);
+  const containerName = `codex-writer-${sha256Text(
+    `portable-codex-runtime:podman-container:v1\0${intent.supervisor.supervisorId}\0${operationId}`,
+  ).slice(0, 48)}`;
+  const processIncarnationId = `podman-process:${containerId}`;
+  const writerIncarnationId = `podman-writer:${sha256Text(
+    `portable-codex-runtime:podman-writer:v1\0${intent.supervisor.supervisorId}\0${operationId}\0${requestSha256}\0${containerId}`,
+  )}`;
+  const proofId = `podman-start:${sha256Text(
+    `portable-codex-runtime:podman-start-proof:v1\0${intent.supervisor.supervisorId}\0${operationId}\0${requestSha256}\0${containerId}`,
+  )}`;
+  const stopProofId = `podman-stopped:${sha256Text(
+    `portable-codex-runtime:podman-stopped-proof:v1\0${operationId}\0${requestSha256}\0${containerId}`,
+  )}`;
+  const terminalRecord = {
+    containerId,
+    containerName,
+    contractVersion: 1,
+    launchAttemptId: operationId,
+    processIncarnationId,
+    proofId,
+    requestSha256,
+    revision: 4,
+    status: "stopped",
+    stopOperationId: `local-stop-${operationId}`,
+    stopProofId,
+    writerIncarnationId,
+  };
+  const result = {
+    evidence: {
+      contractVersion: 1,
+      launchAttemptId: operationId,
+      processIncarnationId,
+      proofId: stopProofId,
+      status: "complete-stopped",
+      supervisorId: intent.supervisor.supervisorId,
+      writerIncarnationId,
+    },
+    outcome: "writer-launch-complete-stopped",
+    resultVersion: 1,
+  };
+  const envelope = {
+    conflictClass: "session-mutation",
+    expectedSession,
+    payload: request,
+    requestVersion: 1,
+  };
+  const operationRequestSha256 = sha256Json(envelope);
+  const reservationId = `reservation-${sha256Text(operationId)}`;
+  const operationRow = {
+    operation_id: operationId,
+    session_id: sessionId,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    request: envelope,
+    result,
+    state: "committed",
+    revision: "2",
+    created_at: new Date(OPERATION_STARTED_AT),
+    updated_at: new Date(authorizedAt),
+    retired_at: new Date(authorizedAt),
+  };
+  const terminalDocument = structuredClone(expectedSession.document);
+  terminalDocument.activeOperation = null;
+  terminalDocument.lastOperation = {
+    conflictClass: "session-mutation",
+    expectedSessionRevision: expectedSession.revision,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    operationId,
+    operationRevision: "2",
+    requestSha256: operationRequestSha256,
+    reservationId,
+    resultSha256: sha256Json(result),
+    state: "committed",
+  };
+  terminalDocument.launch = null;
+  const sessionRow = {
+    session_id: sessionId,
+    revision: "6",
+    document: terminalDocument,
+    created_at: new Date(expectedSession.createdAt),
+    updated_at: new Date(authorizedAt),
+  };
+  const terminalRecordSha256 = sha256Json(terminalRecord);
+  const authorizationProjection = {
+    authorizedAt,
+    contractVersion: 1,
+    launchAttemptId: operationId,
+    sessionId,
+    terminalKind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    terminalOperationId: operationId,
+    terminalRecord,
+    terminalRecordSha256,
+  };
+  const authorization = {
+    authorizationSha256: sha256Text(
+      `portable-codex-runtime:writer-supervisor-state-gc-authorization:v1\0${JSON.stringify(
+        authorizationProjection,
+      )}\n`,
+    ),
+    ...authorizationProjection,
+  };
+  const gcRow = {
+    terminal_operation_id: operationId,
+    session_id: sessionId,
+    launch_attempt_id: operationId,
+    terminal_kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    terminal_record: terminalRecord,
+    terminal_record_sha256: terminalRecordSha256,
+    authorization_sha256: authorization.authorizationSha256,
+    authorized_at: new Date(authorizedAt),
+    collection_status: null,
+    collection_receipt_sha256: null,
+    collected_at: null,
+  };
+  const collectionReceipt = {
+    contractVersion: 1,
+    launchAttemptId: operationId,
+    status: "collected",
+    terminalRecordSha256: sha256Text(
+      `portable-codex-runtime:podman-writer-state-collection:v1\0${JSON.stringify(
+        terminalRecord,
+      )}`,
+    ),
+  };
+  return {
+    authorization,
+    collectionReceipt,
+    evidence: result.evidence,
+    expectedSession,
+    gcRow,
+    operationRow,
+    request,
+    sessionRow,
+    terminalRecord,
+  };
 }
 
 function writerOperationTransitionFixture({ kind, outcome, state }) {
@@ -1592,4 +1765,219 @@ test("restore attachment activation rejects epoch exhaustion explicitly", async 
     "writer_epoch_exhausted",
   );
   assert.equal(pool.connectCalls, 0);
+});
+
+test("writer supervisor state GC lists one validated pending authorization per session", async () => {
+  const first = writerSupervisorStateGcFixture();
+  const second = writerSupervisorStateGcFixture({
+    operationId: "writer-launch-gc-002",
+    sessionId: OTHER_SESSION_ID,
+  });
+  const { authority, clients } = authorityWithScripts([
+    { rows: [first.gcRow, second.gcRow] },
+    { rows: [first.sessionRow] },
+    { rows: [first.operationRow] },
+    { rows: [second.sessionRow] },
+    { rows: [second.operationRow] },
+  ]);
+
+  const page = await authority.listWriterSupervisorStateGcCandidates({
+    afterSessionId: null,
+    limit: 1,
+  });
+
+  assert.equal(Object.getPrototypeOf(page), null);
+  assert.equal(page.candidates.length, 1);
+  assert.equal(Object.getPrototypeOf(page.candidates[0]), null);
+  assert.equal(
+    Object.getPrototypeOf(page.candidates[0].authorization),
+    null,
+  );
+  assert.equal(
+    page.candidates[0].authorization.authorizationSha256,
+    first.authorization.authorizationSha256,
+  );
+  assert.equal(
+    page.candidates[0].launchOperation.operationId,
+    first.authorization.launchAttemptId,
+  );
+  assert.equal(
+    page.candidates[0].terminalOperation.operationId,
+    first.authorization.terminalOperationId,
+  );
+  assert.equal(page.candidates[0].session.sessionId, SESSION_ID);
+  assert.equal(page.nextAfterSessionId, SESSION_ID);
+  assert.ok(Object.isFrozen(page));
+  assert.ok(Object.isFrozen(page.candidates[0]));
+  assert.ok(
+    queryTexts(clients[0]).some((text) =>
+      text?.startsWith("SELECT DISTINCT ON (session_id)"),
+    ),
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer supervisor state GC finalizer entrypoints preserve the legacy exact input ABI", async () => {
+  const fixture = writerSupervisorStateGcFixture();
+  const base = {
+    evidence: fixture.evidence,
+    expectedOperationRevision: "1",
+    expectedSession: fixture.expectedSession,
+    kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+    operationId: fixture.authorization.terminalOperationId,
+    request: fixture.request,
+  };
+  const { authority, pool } = authorityWithScripts();
+  await assertAuthorityError(
+    authority.finalizeWriterLaunchAttemptStopped({
+      ...base,
+      terminalRecord: fixture.terminalRecord,
+    }),
+    "invalid_operation_request",
+  );
+  await assertAuthorityError(
+    authority.finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc(
+      base,
+    ),
+    "invalid_operation_request",
+  );
+  await assertAuthorityError(
+    authority.finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc({
+      ...base,
+      terminalRecord: {
+        ...fixture.terminalRecord,
+        revision: 3,
+        status: "stopping",
+        stopProofId: null,
+      },
+    }),
+    "invalid_operation_request",
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer supervisor state GC authorization read validates the exact terminal relation", async () => {
+  const fixture = writerSupervisorStateGcFixture();
+  const { authority, clients } = authorityWithScripts([
+    { rows: [fixture.gcRow] },
+    { rows: [fixture.sessionRow] },
+    { rows: [fixture.operationRow] },
+  ]);
+  const authorization =
+    await authority.readWriterSupervisorStateGcAuthorization({
+      terminalOperationId: fixture.authorization.terminalOperationId,
+    });
+  assert.equal(Object.getPrototypeOf(authorization), null);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(authorization)),
+    fixture.authorization,
+  );
+  assert.ok(Object.isFrozen(authorization));
+  assert.ok(Object.isFrozen(authorization.terminalRecord));
+  clients[0].assertExhausted();
+});
+
+test("writer supervisor state GC does not infer candidates from naked terminal operations", async () => {
+  const { authority, clients } = authorityWithScripts([{ rows: [] }]);
+  const page = await authority.listWriterSupervisorStateGcCandidates({
+    afterSessionId: null,
+    limit: 10,
+  });
+  assert.deepEqual([...page.candidates], []);
+  assert.equal(page.nextAfterSessionId, null);
+  assert.equal(
+    queryTexts(clients[0]).filter((text) =>
+      text?.includes("session_authority.operation_claims"),
+    ).length,
+    0,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer supervisor state GC completion accepts collected-to-absent acknowledgement-loss replay", async () => {
+  const fixture = writerSupervisorStateGcFixture();
+  const collectionReceiptSha256 = sha256Text(
+    `portable-codex-runtime:writer-supervisor-state-gc-collection-receipt:v1\0${JSON.stringify(
+      fixture.collectionReceipt,
+    )}\n`,
+  );
+  const completedRow = {
+    ...fixture.gcRow,
+    collection_status: "collected",
+    collection_receipt_sha256: collectionReceiptSha256,
+    collected_at: new Date(OPERATION_RETIRED_AT),
+  };
+  const { authority, clients } = authorityWithScripts(
+    [
+      { rows: [fixture.gcRow] },
+      { rows: [fixture.sessionRow] },
+      { rows: [fixture.operationRow] },
+      { rows: [fixture.gcRow] },
+      { rows: [completedRow] },
+    ],
+    [
+      { rows: [completedRow] },
+      { rows: [fixture.sessionRow] },
+      { rows: [fixture.operationRow] },
+      { rows: [completedRow] },
+    ],
+  );
+
+  const completed = await authority.completeWriterSupervisorStateGc({
+    authorization: fixture.authorization,
+    collectionReceipt: fixture.collectionReceipt,
+  });
+  assert.equal(Object.getPrototypeOf(completed), null);
+  assert.equal(completed.finalized, true);
+  assert.equal(completed.collectionStatus, "collected");
+  assert.equal(completed.collectionReceiptSha256, collectionReceiptSha256);
+
+  const replay = await authority.completeWriterSupervisorStateGc({
+    authorization: fixture.authorization,
+    collectionReceipt: {
+      ...fixture.collectionReceipt,
+      status: "absent",
+    },
+  });
+  assert.equal(replay.finalized, false);
+  assert.equal(replay.collectionStatus, "collected");
+  assert.equal(replay.collectionReceiptSha256, collectionReceiptSha256);
+  clients[0].assertExhausted();
+  clients[1].assertExhausted();
+});
+
+test("writer supervisor state GC completion rejects a different canonical authorization before update", async () => {
+  const stored = writerSupervisorStateGcFixture();
+  const foreign = writerSupervisorStateGcFixture({
+    operationId: "writer-launch-gc-foreign",
+    sessionId: OTHER_SESSION_ID,
+  });
+  const { authority, clients } = authorityWithScripts([{ rows: [] }]);
+  await assertAuthorityError(
+    authority.completeWriterSupervisorStateGc({
+      authorization: foreign.authorization,
+      collectionReceipt: foreign.collectionReceipt,
+    }),
+    "writer_supervisor_state_gc_collection_conflict",
+  );
+  assert.equal(
+    queryTexts(clients[0]).some((text) =>
+      text?.startsWith(
+        "UPDATE session_authority.writer_supervisor_state_gc",
+      ),
+    ),
+    false,
+  );
+  assert.notEqual(
+    foreign.authorization.authorizationSha256,
+    stored.authorization.authorizationSha256,
+  );
+  assert.equal(
+    queryTexts(clients[0]).some((text) =>
+      text?.includes("session_authority.sessions") ||
+      text?.includes("session_authority.operation_claims"),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
 });

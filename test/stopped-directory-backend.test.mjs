@@ -30,6 +30,8 @@ import {
   restoreCleanCheckpoint,
 } from "../src/session-snapshot-core.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -603,6 +605,7 @@ function physicalPolicies(methods) {
 }
 
 function createPhysicalPublicationBinding(rawPublication) {
+  const supervisorId = "backend-physical-supervisor-001";
   const rawLifecycle = createLifecycleBackend({ restoreActivation: true }).backend;
   const unexpected = async function unexpectedPhysicalProvider() {
     throw new Error("unrelated physical provider must not run");
@@ -623,12 +626,23 @@ function createPhysicalPublicationBinding(rawPublication) {
       settlementGraceMilliseconds: 1_000,
     }),
     supervisor: Object.freeze({
-      contractVersion: 2,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
-      supervisorId: "backend-physical-supervisor-001",
+      supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisorStateCollector: Object.freeze({
+      collectTerminalState: unexpected,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      supervisorId,
+    }),
   }).publication;
 }
 

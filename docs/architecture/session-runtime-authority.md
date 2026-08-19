@@ -39,7 +39,8 @@ The implemented authority provides:
   atomically, and resumes that fixed capture without a new capability;
 - capture-bound detached activation with atomic prepared-launch
   materialization; and
-- bounded no-relaunch restore recovery with durable cursor primitives.
+- bounded no-relaunch restore recovery with five durable cursor lanes,
+  including authority-owned terminal supervisor-state collection.
 
 Registration binds one immutable session manifest, storage reference, and
 backend capability set to a canonical initial `DETACHED` document. The
@@ -1050,6 +1051,17 @@ reads, checks the canonical session and every stored identity/digest, and
 rehydrates the authentic in-process plan from its canonical inputs. It never
 provisions, repairs, updates, or materializes a missing plan.
 
+Migration 009 (schema version 9) adds the permanent
+`session_authority.writer_supervisor_state_gc` authorization/completion ledger.
+Its terminal operation and launch attempt are separate same-session composite
+foreign keys to permanent operation claims. Each row binds terminal kind, the
+exact stopped revision 4 record and its SHA-256, an authorization digest and
+database timestamp, then optionally one `collected` or `absent` receipt digest
+and completion timestamp. A partial index pages only incomplete rows. The same
+migration extends durable recovery cursors with the fifth
+`supervisor-state-gc` lane. No local file deletion removes or weakens this
+PostgreSQL evidence, and this slice exposes no ledger-retirement API.
+
 These constraints are necessary but not sufficient authority. The typed
 restore-generation layer now retains the backend's exact
 `{checkpoint, request}` admission unchanged inside an operation payload that
@@ -1221,12 +1233,16 @@ fails before `reserveOperation` can create durable state. The remaining
 `invalid_logical_writer_launch_request`, `logical_writer_handle_unavailable`,
 and `logical_writer_launch_outcome_uncertain` codes are non-retryable.
 
-The supervisor contract is version 1. `launchWriter` must return exact
-`{ receiptVersion: 1, evidence, stopWriter }`: a `started` result requires one
-trusted asynchronous `stopWriter`, while `not-started` or `complete-stopped`
-requires `stopWriter: null`. `reconcileWriterLaunch` returns exact
+The durable logical launch request remains contract version 1, while the
+transient supervisor facade is version 2. `launchWriter` must return exact
+`{ receiptVersion: 2, evidence, stopWriter, terminalRecord }`: a `started`
+result requires one trusted asynchronous `stopWriter` and a null terminal
+record, `not-started` requires both fields to be null, and
+`complete-stopped` requires a null callback plus the exact stopped revision 4
+record. `reconcileWriterLaunch` still returns exact
 `{ receiptVersion: 1, evidence }` and accepts only `not-started` or
-`complete-stopped`; recovery cannot report a newly adopted started writer.
+`complete-stopped`; recovery cannot report a newly adopted started writer or
+authorize supervisor-state collection.
 
 A new launch follows this order:
 
@@ -1359,6 +1375,88 @@ contain fewer candidates, including none, while still carrying a continuation
 cursor. Discovery records are recovery inputs only: they cannot consume an
 image, invoke a launcher, reconstruct a writer handle, or prove a stopped
 boundary.
+
+## Implemented Terminal Supervisor-State Collection Authority
+
+Terminal-state collection is authorized only inside the owner finalizer that
+commits an exact stopped result. A complete-stopped launch attempt uses
+`finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc()`. A V1/V2
+owner stop uses
+`finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc()`, while the V3
+stop-to-prepared-capture transaction uses
+`finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc()`.
+Each transaction preserves its original terminal transition and atomically
+inserts or exactly replays the migration 009 authorization. The returned
+`supervisorStateGcAuthorization` binds its SHA-256, PostgreSQL authorization
+time, terminal and launch operation identities, terminal kind, exact revision
+4 `terminalRecord`, and its SHA-256.
+
+The logical launcher obtains that terminal record only from the owner launch
+or returned physical stop receipt. The record must be exact stopped revision 4
+state for the same attempt, process/writer incarnations, start and stop proofs,
+and stop operation where the terminal kind requires it. Runtime composition
+separately requires the launch supervisor and collector `supervisorId` values
+to agree. The raw collector validates canonically exact record data but does not
+attest its provenance; the PostgreSQL authorization and production composition
+supply that authority boundary. An already-complete owner replay reads the
+exact authorization. By contrast,
+`reconcileWriterLaunch()` remains a pure stopped-only observation: it cannot
+return or insert a collection authorization and never calls the collector.
+
+`listWriterSupervisorStateGcCandidates()` returns bounded keyset pages of only
+uncompleted authorizations and revalidates both referenced permanent operation
+relations before exposing each exact authorization. The physical leaf is
+`supervisorStateCollector.collectTerminalState`; its sole durable input is the
+authorization's exact `terminalRecord`, while its transient invocation and
+abort signal remain outside the ledger. A valid result is the exact four-field
+receipt `{ contractVersion, launchAttemptId, status,
+terminalRecordSha256 }`, where status is `collected` or `absent`.
+`completeWriterSupervisorStateGc()` first proves the exact authorization tuple,
+then records the receipt digest and completion timestamp. Exact committed
+replay returns the durable first completion without reauthorizing a deletion.
+
+The local collector removes only an exact stopped revision 4 chain. Phase 1
+validates the intact revisions 0 through 4 and their present sidecars, or admits only
+an oldest-first missing lower retry prefix while exact revision 4 remains.
+It removes revisions 0 through 3 plus all sidecars, proves the lower prefix
+absent, and syncs the held directory while preserving revision 4. Phase 2
+compares the named revision 4 object and bytes with its held FD, unlinks it,
+then positionally rereads exact bytes through that descriptor while
+revalidating identity and access policy. It finally proves complete absence and
+syncs the directory again. Object identity (`dev`/`ino` plus held descriptors),
+content stability (including that post-unlink held-FD positional reread), and
+access policy are independent protected properties. Access policy checks same-
+UID regular files at `0600` with required `nlink`, the same-UID state root and
+immediate parent at `0700`, and safe ownership/write/sticky constraints on
+traversal ancestors. Child-entry or generic `stat` churn triggers revalidation
+but is not change evidence. Pre-mutation I/O or unreadable state, exact-chain
+conflict, and post-mutation outcome uncertainty stay distinct.
+For a same-authorization cold overlap, the sole additional benign transition is
+removal of a prevalidated record/pending sibling alias. Held-FD `nlink` may
+decrease monotonically within the previously proven bound, never increase, and
+all held artifacts must reach zero links at the final absence boundary.
+
+The collector is not its own authority or quiescence proof. In the assembled
+production runner, the fifth recovery lane runs after current-launch inventory
+inside the runner's database-global exclusive restore lifecycle lease,
+excluding shared foreground callbacks from the complete pass. The service API
+does not independently acquire that outer lease. Its physical collector also
+has an independent settlement boundary that must drain before the lane settles.
+A deadline-plus-grace breach on this destructive leaf aborts and invokes the
+fatal hook but retains the active invocation and aggregate settlement stop until
+the raw native Promise reaches a terminal state. Consequently the recovery
+callback cannot return and the exclusive lifecycle lease remains held while the
+original callback can still delete state during normal operation. A provider
+that never settles blocks normal deployment shutdown and pool closure. As with
+other session advisory locks, connection or database loss can still release the
+lease before callback quiescence. A later process may then retry only the same
+immutable authorization; concurrent cold collectors are idempotent or fail
+closed around exact held-object and canonical-byte proofs, but reacquisition
+does not attest that the older callback stopped.
+A collector result may be lost after deletion, so a later exact retry can
+observe `absent` after `collected`; either may complete the permanent PostgreSQL
+ledger, and a lost database completion acknowledgement resolves through exact
+durable readback.
 
 ## Implemented Durable Stop-to-Capture Compositions
 
@@ -1725,16 +1823,20 @@ provider result crosses an exact bounded data boundary; unsafe Promises,
 generators, Proxies, accessors, malformed receipts, object replacement,
 changed content, or changed access policy fail closed as an uncertain outcome.
 
-`PostgresRestoreActivationRecoveryService` runs four independently paginated
+`PostgresRestoreActivationRecoveryService` runs five independently paginated
 keyset lanes in fixed order: generation reconciliation, activation
-reconciliation, prepared/active launch-attempt reconciliation, and current
-launch inventory. One service instance admits only one batch or sweep at a
-time. Abort stops new admission but drains the one in-flight candidate before
-advancing its settled cursor. Generation, activation, and launch-attempt
-failures remain `pending`; current launches are reported only as
-`requires-stop-or-fence`. The service accepts no image resolver, launch
-callback, writer handle, publication callback, or opaque capability and can
-neither relaunch nor adopt a running process. Its internal rest arrays are
+reconciliation, prepared/active launch-attempt reconciliation, current-launch
+inventory, and terminal supervisor-state GC. One service
+instance admits only one batch or sweep at a time. Abort stops new admission
+but drains the one in-flight candidate before advancing its settled cursor.
+Generation, activation, and launch-attempt failures remain `pending`; current
+launches are reported only as `requires-stop-or-fence`; a completed GC
+callback is `reconciled`, while any callback failure remains `pending` without
+changing the already committed terminal operation. The permanent GC ledger
+separately records the collector's `collected` or `absent` status. The service
+accepts no image resolver, launch callback, writer handle, publication
+callback, or opaque capability and can neither relaunch nor adopt a running
+process. Its internal rest arrays are
 forwarded through explicit dense slots rather than call spread, so post-import
 Array iterator replacement cannot substitute a list or reconciliation
 callback, null out the lifecycle lease, or mint a receipt for different
@@ -1748,10 +1850,11 @@ keyset cursor form one serializable compare-and-swap; the committed row also
 binds the transition UUID and canonical request digest so exact replay after a
 lost commit acknowledgement cannot advance twice. Null continuation wraps the
 lane to a new cycle. `PostgresRestoreRecoveryRunner` reads, reconciles, and
-immediately persists generation, activation, launch-attempt, and current-launch
-in that fixed order. Before each compare-and-swap, it consumes an authentic,
-one-use service receipt bound to that lane's exact input cursor and limit. The
-store is only cursor concurrency and replay authority; it cannot independently
+immediately persists generation, activation, launch-attempt, current-launch,
+and `supervisor-state-gc` in that fixed order. Before each compare-and-swap, it
+consumes an authentic, one-use service receipt bound to that lane's exact input
+cursor and limit. The store is only cursor concurrency and replay authority; it
+cannot independently
 prove candidate settlement. “Settled” here means that reconciliation attempt
 has drained even when its business result remains `pending`, which the next
 cursor cycle revisits. A later failure preserves already-settled lanes, while
@@ -1775,7 +1878,7 @@ asynchronous lifecycle callback must therefore fulfill with
 original result only after the underlying operation guard has drained its
 probe and release path.
 
-The runner acquires the exclusive recovery lease for its complete four-lane
+The runner acquires the exclusive recovery lease for its complete five-lane
 pass and revalidates it before and after cursor reads, service batches, and
 cursor compare-and-swap. Guarded service calls revalidate the exact same lease
 around list operations and every admitted candidate reconciliation. The batch
@@ -2018,9 +2121,9 @@ The deployment controller owns the next lifecycle boundary. It invokes the
 low-level runtime's same-store bootstrap migration,
 starts the scheduler, and coalesces with the scheduler's immediate pass. It
 opens checkpoint-backend, image-plan-reservation, stable-plan-provisioning, and
-writer-launch admission only after an exact completed receipt proves a full four-lane
-sweep. A failed, busy, uncertain, or malformed initial result leaves the
-controller permanently closed. Exactly one controller claims each assembled
+writer-launch admission only after an exact completed receipt proves a full
+five-lane sweep. A failed, busy, uncertain, or malformed initial result leaves
+the controller permanently closed. Exactly one controller claims each assembled
 runtime for its lifetime, so one shutdown barrier cannot race a second
 admission ledger over the same scheduler and pools. Stop first closes those
 facets, requests scheduler shutdown, and then drains the scheduler plus every
@@ -2108,24 +2211,34 @@ isolation must run behind a process boundary with an ordinary observable native
 Promise adapter.
 
 Deployment now extends that settlement lifecycle across the complete currently
-assembled physical graph through one private branded binding. Seventeen
+assembled physical graph through one private branded binding. Eighteen
 additional method-specific coordinators cover supervisor launch, stopped-only
-launch reconciliation, returned writer stop, nine storage-lifecycle methods,
-four publication methods, and restore-destination resolution. Together with
-image resolution and inspection, shutdown owns nineteen settlement stops.
-Every method has an independent exact deadline/grace policy selected by
-deployment.
+launch reconciliation, returned writer stop, terminal supervisor-state
+collection, nine storage-lifecycle methods, four publication methods, and
+restore-destination resolution. Together with image resolution and inspection,
+shutdown owns twenty settlement stops. Every method has an independent exact
+deadline/grace policy selected by deployment.
 
-The raw supervisor boundary is transient contract version 2: launch,
+The raw supervisor boundary is transient contract version 3: launch,
 reconciliation, and returned stop receive fresh opaque invocation identity and
 authentic abort signal fields. Its adapter exposes the logical launcher's
-existing version 1 facade and translates successful physical receipts without
-changing any durable attempt, operation, reservation, or evidence shape. A
-returned physical stop capability succeeds only with exact transient receipt
-`{ contractVersion: 2, status: "stopped" }`; the adapter maps that receipt to
-the launcher's existing opaque stop sentinel. The capability is itself wrapped
-by the shared stop settlement boundary before it becomes the launcher's
-one-shot local callback.
+version 2 facade and translates successful physical receipts without
+changing any pre-existing durable attempt, operation, reservation, or evidence
+shape. A returned physical stop capability succeeds only with exact transient
+receipt `{ contractVersion: 3, status: "stopped", terminalRecord }`; the
+adapter returns exact facade result
+`{ confirmation, contractVersion: 2, terminalRecord }`, where confirmation is
+the existing opaque sentinel and the stopped revision 4 record is passed to
+the owner finalizer. The capability is itself wrapped by the shared stop
+settlement boundary before it becomes the launcher's one-shot local callback.
+
+The matching `supervisorStateCollector` is a separate transient contract
+version 1 boundary with its own deadline/grace settlement. Its
+`collectTerminalState()` input is exact
+`{ contractVersion, invocation, signal, terminalRecord }`, and its result is
+exact `{ contractVersion, launchAttemptId, status, terminalRecordSha256 }`.
+Neither the settlement identity nor abort signal enters migration 009's
+authorization or completion ledger.
 
 Storage keeps durable lifecycle contract version 1. Each raw method instead
 receives a separate frozen invocation-context argument with contract version 1,
@@ -2138,9 +2251,10 @@ read-only reconciliation under the same guarded one-shot grant. Settlement
 cannot promote a verifier or reconciler into mutation authority.
 
 The safety matrix classifies these contracts before measuring reachability.
-The fourteen leaves on the private assembled protocol surface are:
+The fifteen leaves on the private assembled protocol surface are:
 
-- grant-bearing mutators: supervisor `stopWriter()`, publication
+- grant-bearing mutators: supervisor `stopWriter()`, collector
+  `supervisorStateCollector.collectTerminalState`, publication
   `publishFreshCheckpointArtifact()` and `publishRestoreDestination()`,
   lifecycle `detachAttachment()`, `forceFence()`, and
   `prepareRestoreAttachment()`, and supervisor `launchWriter()`;
@@ -2150,6 +2264,14 @@ The fourteen leaves on the private assembled protocol surface are:
   `verifyCommittedRestoreDestination()`, restore-destination resolution,
   image-plan resolution, and trusted Codex inspection.
 
+The collector is the eighth mutator. Its safety-matrix durable cut is
+`supervisor-state-gc`, keyed by `authorization.terminalOperationId`, and its
+independent acknowledgement-loss overlay is `supervisor-state-mutator`.
+Together the matrix now has twenty settlement leaves, fifteen protocol leaves,
+eight mutators, eight durable cuts, and six independent overlays. This naming
+keeps the PostgreSQL authorization boundary distinct from the local physical
+leaf and from the read-only supervisor reconciler.
+
 The five remaining lifecycle leaves, `captureCheckpoint()`, `destroySession()`,
 `prepareWritableAttachment()`, `provisionSession()`, and `restoreCheckpoint()`,
 are still settled production contracts but are not called by the private
@@ -2158,7 +2280,10 @@ not aliases for the stopped-directory publication paths.
 
 "No second dispatch" is not a ban on every later physical observation. The
 same settlement invocation is never automatically reissued after deadline,
-and each durable mutator remains at-most-once for the exact operation grant.
+and the seven dispatch mutators remain at-most-once for the exact operation
+grant. Terminal-state GC instead authorizes one exact terminal chain; after
+acknowledgement loss, another settled invocation may prove the already-deleted
+chain `absent` but cannot select different state or perform a second deletion.
 A later recovery attempt may repeat a trusted read-only resolver, verifier,
 inspector, or reconciler, including image resolution and inspection that mint a
 new process-local reservation for one fixed prepared plan. Those observations
@@ -2168,7 +2293,7 @@ mutator.
 Deployment keeps only the aggregate graph stop and two image-binding stop
 capabilities in a private fixed registry. Shutdown first closes controller
 admission and synchronously starts all three without short-circuiting; the graph
-stop starts its seventeen method stops before it awaits any one. Deployment
+stop starts its eighteen method stops before it awaits any one. Deployment
 then awaits admitted-work and settlement drain before closing any PostgreSQL
 pool. Startup failure, explicit stop, and fatal shutdown use the same drain
 rule; construction failure best-effort starts cleanup because no deployment
@@ -2203,7 +2328,7 @@ construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
 Deployment now admits the explicit operational lease budget across the bounded
-critical path. The completed assembled matrix binds seven real-PostgreSQL
+critical path. The completed assembled matrix binds eight real-PostgreSQL
 durable cuts to their existing acknowledgement-loss/replay evidence, adds a
 same-database/stable-plan retry through fresh physical bindings, image binding,
 runtime, and controller, references separate stable-plan-registry rehydration,
@@ -2233,7 +2358,7 @@ repeating the request.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
-The injected Podman v2 supervisor holds the sole session-directory bind,
+The injected Podman v3 supervisor holds the sole session-directory bind,
 requires rootless execution and a digest-pinned image, publishes immutable
 local revisions, and supports stop/join plus read-only cold reconciliation.
 The generic PostgreSQL deployment still constructs neither collaborator; a
@@ -2387,14 +2512,15 @@ provisioning, restart readback, private read-only resolver, deployment-owned
 migration/admission/drain controller, explicit PostgreSQL pool-owning
 deployment, and deployment-owned image-plan binding now exist. The physical-
 collaborator settlement foundation and the complete assembled image,
-supervisor, storage-lifecycle, publication, and restore-destination resolver
-binding graph and operational lease admission also exist. The completed safety
-matrix has an exact nineteen-contract/fourteen-protocol-surface scope and binds its
-seven durable-cut aggregation, same-database/stable-plan fresh-object retry,
-separate registry rehydration, and representative settlement timer/drain
-evidence. The final public backend is wired through controller and deployment
-admission. Production-injectable Linux components now add FD-bound raw-image
-lifecycle and detach settlement, externally anchored provider-state
+supervisor, supervisor-state collector, storage-lifecycle, publication, and
+restore-destination resolver binding graph and operational lease admission also
+exist. The completed safety matrix has an exact twenty-contract/fifteen-
+protocol-surface scope and binds its eight durable-cut aggregation, six
+independent acknowledgement-loss overlays, same-database/stable-plan fresh-
+object retry, separate registry rehydration, and representative settlement
+timer/drain evidence. The final public backend is wired through controller and
+deployment admission. Production-injectable Linux components now add FD-bound
+raw-image lifecycle and detach settlement, externally anchored provider-state
 reconciliation, distinct mount-root and artifact-child publication-control
 identity, and rootless Podman launch/stop coverage. Their producer/consumer jobs
 verify a clean two-host image transfer and verification-only first remount.
@@ -2403,6 +2529,11 @@ and stops a real rootless Podman writer through the trusted ext4 attachment
 binding, and the consumer verifies its transferred marker. The ext4 producer
 additionally gates whether live child-namespace mounts propagate to its parent
 namespace under the required host-owned long-lived namespace contract.
+Terminal supervisor-state validation covers migration 009 relational and
+canonical constraints, owner-only authorization, stopped-only reconciliation
+non-authority, exact candidate paging and completion replay, cold-start fifth-
+lane collection, independent settlement, two-phase local deletion, protected-
+property revalidation, and `collected` to `absent` acknowledgement loss.
 Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
-export/compression, encryption, retention, and registry trust remain unproved
-or unimplemented by design.
+export/compression, encryption, provider-state retention, and registry trust
+remain unproved or unimplemented by design.

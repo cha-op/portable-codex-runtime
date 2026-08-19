@@ -29,6 +29,7 @@ const LANE_SPECS = Object.freeze([
   Object.freeze({ field: "activation", lane: "activation" }),
   Object.freeze({ field: "launchAttempt", lane: "launch-attempt" }),
   Object.freeze({ field: "currentLaunch", lane: "current-launch" }),
+  Object.freeze({ field: "supervisorStateGc", lane: "supervisor-state-gc" }),
 ]);
 
 function freezeRecord(value) {
@@ -345,6 +346,13 @@ function createService({ generationPage = null, reconcileGeneration } = {}) {
       calls.push(["list:launchAttempt", input]);
       return { candidates: [], nextAfterSessionId: null };
     },
+    listWriterSupervisorStateGcCandidates(input) {
+      calls.push(["list:supervisorStateGc", input]);
+      return { candidates: [], nextAfterSessionId: null };
+    },
+    collectWriterSupervisorStateGc(candidate) {
+      calls.push(["collect:supervisorStateGc", candidate]);
+    },
     reconcileRestoreAttachmentActivation(candidate) {
       calls.push(["reconcile:activation", candidate]);
     },
@@ -372,6 +380,7 @@ function createRunnerFixture({
       currentLaunch: 1,
       generation: 1,
       launchAttempt: 1,
+      supervisorStateGc: 1,
     },
     recoveryScopeId: RECOVERY_SCOPE_ID,
     recoveryService: serviceFixture.service,
@@ -630,7 +639,7 @@ test("stop joins an explicit step admitted while the loop waits", async () => {
   assert.equal(
     runnerFixture.cursorFixture.calls.filter(([kind]) => kind === "advance")
       .length,
-    5,
+    6,
   );
 });
 

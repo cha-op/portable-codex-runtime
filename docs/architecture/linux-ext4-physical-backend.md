@@ -67,7 +67,7 @@ The physical implementation remains split into small authorities:
   restore-destination publication, and source-free committed verification.
   The ext4 inspector supplies its atomic filesystem/object observation, while
   provider state supplies the expected destination control identity.
-- `PodmanWriterSupervisor` implements the raw version 2 writer-supervisor
+- `PodmanWriterSupervisor` implements the raw version 3 writer-supervisor
   surface with a digest-pinned image reference, rootless execution, a private
   bind, immutable revision publication, stop/join, and stopped-only read-only
   launch reconciliation. Every Podman child invocation is explicitly local
@@ -77,6 +77,10 @@ The physical implementation remains split into small authorities:
   Podman child environment adds the fixed `/usr/bin:/bin` search path required
   by reviewed rootless helpers; it never inherits or accepts an ambient
   caller-controlled `PATH`.
+- The matching contract version 1 terminal-state collector removes only one
+  exact stopped revision 4 chain through the separately settled
+  `supervisorStateCollector.collectTerminalState` leaf. It does not share the
+  reconciler surface or infer mutation authority from local state.
 
 No one component is a grant authority. PostgreSQL continues to decide whether
 one physical mutator may run; these components only validate and execute the
@@ -588,20 +592,82 @@ or physical fence resolves it. Container retirement occurs only after the
 grant-bearing returned stop callback has durably reached its private stopped
 record.
 
-The supervisor state currently retains immutable per-attempt revisions for
-exact acknowledgement-loss replay and has no authority-owned compactor. A
-production host must place that owner-private root on monitored dedicated
-storage. The configured root is a canonical, lossless UTF-8 native pathname of
-at most 4,015 bytes, reserving the remaining 80 bytes of Linux's 4,095-byte
-domain for `/<64-hex>.<revision>.json.pending`. Record-key hashing and all path
+## Terminal Supervisor-State Collection
+
+The owner-private state root still publishes immutable per-attempt revisions
+for exact acknowledgement-loss replay, but terminal stopped state now has a
+separate bounded collector. `createPodmanWriterSupervisorStateBundle()` keeps
+the original state ABI separate from its terminal collector. The raw
+`supervisorStateCollector.collectTerminalState` physical leaf accepts the exact
+immutable stopped revision 4 `terminalRecord` data; a path or attempt ID is not
+sufficient input. The raw collector validates the canonical record but cannot
+attest its provenance. Production authorization obtains it from the owner
+launch or returned stop receipt, while `reconcileWriterLaunch()` remains a pure
+stopped-only observation and receives no collection authority.
+
+An intact first collection validates the complete revision 0 through 4 chain,
+every present publication sidecar, the exact terminal record, and the absence of
+revisions 5 through 9 before the first unlink. A retry admits only the
+oldest-first missing lower prefix produced by phase 1 while revision 4 remains
+the exact terminal anchor. Collection then performs two durable phases:
+
+1. Remove revisions 0 through 3 and their sidecars, remove the revision 4
+   sidecars while retaining the revision 4 data file as the terminal anchor,
+   prove the lower prefix absent, and `fsync` the held state directory.
+2. Compare the named revision 4 object and bytes with its already held file
+   descriptor, unlink it, then positionally reread its exact canonical bytes
+   through that descriptor while revalidating identity and access policy.
+   Prove all revision and sidecar names absent and `fsync` the held directory
+   again.
+
+A retry may begin from that durable phase-1 prefix. If collection completed but
+its acknowledgement was lost, the next exact attempt returns `absent`; the
+outer PostgreSQL completion ledger can therefore accept a `collected` to
+`absent` replay without restoring deleted local files.
+
+The collector separates three protected properties. Object identity uses
+`dev`/`ino` together with the held directory and file descriptors. Content
+stability includes the post-unlink held-file positional reread of the exact
+canonical bytes. Access policy separately checks same-UID regular/non-symlink
+record and sidecar files at exact mode `0600` with required `nlink`, the same-
+UID state root and immediate parent at exact mode `0700`, and remaining named
+traversal ancestors owned by root/current UID with group/other write permitted
+only when sticky. Directory child-entry churn or another generic `stat` delta
+is not mutation evidence; it triggers the relevant identity, content, and
+policy revalidation. During same-authorization cold overlap, only removal of a
+prevalidated record/pending sibling alias is benign: held-FD `nlink` may fall
+monotonically within its prior bound, never rise, and every held artifact must
+finish at zero links. A pre-mutation I/O or unreadable-state failure, including
+a failed pre-mutation object/content/policy revalidation, is
+`podman_writer_state_io_failed`; a conflicting canonical chain, supplied
+terminal record, sidecar, or future revision is
+`podman_writer_state_conflict`; and a failure after any unlink may have begun
+becomes `podman_writer_state_collection_outcome_uncertain`, including failure
+of the post-unlink held-FD proof. These classes remain distinct from a proved
+already-absent result.
+
+The raw collector does not prove that PostgreSQL committed the terminal attempt
+or that other callbacks are quiescent. In production, migration 009's owner-
+finalizer authorization, the assembled runner's database-global exclusive
+restore lifecycle guard, and the collector's independent physical settlement
+provide those outer properties.
+For this destructive leaf, deadline-plus-grace expiry requests abort and fatal
+deployment shutdown but deliberately keeps the invocation and aggregate stop
+pending until the raw native Promise settles. The fifth lane therefore keeps
+the exclusive lifecycle lease during normal operation while the original
+callback can still unlink, and normal pool closure cannot release it early.
+PostgreSQL session, connection, or database loss can release the advisory lease
+before that callback settles. A later process may then overlap only on the same
+immutable authorization; the cold collectors' exact concurrent
+idempotent-or-fail-closed protocol preserves state safety without claiming that
+the older callback quiesced.
+The configured root remains a canonical, lossless UTF-8 native pathname of at
+most 4,015 bytes, reserving the remaining 80 bytes of Linux's 4,095-byte domain
+for `/<64-hex>.<revision>.json.pending`. Record-key hashing and all path
 operations use module-load-captured `node:crypto` and `node:path` intrinsics, so
 post-import builtin synchronization cannot redirect or rename durable state.
 This is a lexical nameability and persistent-derivation property, independent
-of the held-directory object-identity and access-policy proofs. Bounded
-retention or garbage collection requires a separate callback after PostgreSQL
-has permanently committed the exact terminal attempt and all callbacks for
-that attempt are quiescent; the read-only reconciler cannot be used as that
-authority.
+of the held-directory identity, content-stability, and access-policy proofs.
 
 ## Production Injection
 
@@ -612,8 +678,11 @@ initialized backend and Podman filesystem authority cannot diverge. It
 constructs publication and the supervisor before creating the deployment. It
 maps them as follows:
 
-- `runtime.launch.supervisor` receives the Podman v2 surface constructed with
+- `runtime.launch.supervisor` receives the Podman v3 surface constructed with
   the binding's `filesystemAuthority`;
+- `runtime.launch.supervisorStateCollector` receives the matching contract
+  version 1 collector, and deployment gives
+  `collectTerminalState()` its own deadline/grace settlement policy;
 - `runtime.storage.lifecycleBackend` receives
   `binding.backend.lifecycleBackend`;
 - `runtime.storage.publication` receives the stopped-directory publication;

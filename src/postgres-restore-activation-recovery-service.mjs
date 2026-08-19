@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { Hash, createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import { isAbsolute, resolve } from "node:path";
 
@@ -9,6 +10,9 @@ import {
   assertStorageMutationRequest,
 } from "./session-storage-contracts.mjs";
 import {
+  assertPodmanWriterSupervisorStateRecord,
+} from "./podman-writer-supervisor-state.mjs";
+import {
   assertPostgresRestoreLifecycleLeaseHeld,
   isPostgresRestoreLifecycleLease,
 } from "./postgres-restore-lifecycle-guard.mjs";
@@ -17,6 +21,7 @@ const arrayIsArray = Array.isArray;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayPrototype = Array.prototype;
+const arraySortIntrinsic = Array.prototype.sort;
 const bufferByteLength = Buffer.byteLength;
 const bufferFrom = Buffer.from;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
@@ -24,10 +29,15 @@ const DateConstructor = Date;
 const dateParse = Date.parse;
 const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const ErrorConstructor = Error;
+const createHashIntrinsic = createHash;
+const hashDigestIntrinsic = Hash.prototype.digest;
+const hashUpdateIntrinsic = Hash.prototype.update;
 const isGeneratorFunctionValue = utilTypes.isGeneratorFunction;
 const isGeneratorObjectValue = utilTypes.isGeneratorObject;
 const isPromiseValue = utilTypes.isPromise;
 const isProxyValue = utilTypes.isProxy;
+const jsonStringifyIntrinsic = JSON.stringify;
+const JsonObject = JSON;
 const numberIsFinite = Number.isFinite;
 const numberIsSafeInteger = Number.isSafeInteger;
 const pathIsAbsoluteIntrinsic = isAbsolute;
@@ -40,6 +50,7 @@ const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.hasOwn;
 const objectIsFrozen = Object.isFrozen;
+const objectIs = Object.is;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const promisePrototype = Promise.prototype;
@@ -78,6 +89,7 @@ const abortSignalAbortedGetter = objectGetOwnPropertyDescriptor(
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const REVISION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const OCI_SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const MAX_BATCH_SIZE = 100;
@@ -92,7 +104,9 @@ const OPTION_KEYS = objectFreeze([
   "listCurrentWriterLaunchCandidates",
   "listRestoreAttachmentActivationCandidates",
   "listRestoreGenerationCandidates",
+  "listWriterSupervisorStateGcCandidates",
   "listWriterLaunchAttemptCandidates",
+  "collectWriterSupervisorStateGc",
   "reconcileRestoreAttachmentActivation",
   "reconcileRestoreGeneration",
   "reconcileWriterLaunchAttempt",
@@ -114,6 +128,7 @@ const SWEEP_REQUEST_KEYS = objectFreeze([
   "generation",
   "launchAttempt",
   "signal",
+  "supervisorStateGc",
 ]);
 const GUARDED_SWEEP_REQUEST_KEYS = objectFreeze([
   "activation",
@@ -122,6 +137,7 @@ const GUARDED_SWEEP_REQUEST_KEYS = objectFreeze([
   "launchAttempt",
   "lifecycleLease",
   "signal",
+  "supervisorStateGc",
 ]);
 const SWEEP_LANE_KEYS = objectFreeze(["afterSessionId", "limit"]);
 const PAGE_KEYS = objectFreeze(["candidates", "nextAfterSessionId"]);
@@ -218,6 +234,48 @@ const CURRENT_LAUNCH_CANDIDATE_KEYS = objectFreeze([
   "launchAttemptId",
   "request",
 ]);
+const SUPERVISOR_STATE_GC_CANDIDATE_KEYS = objectFreeze([
+  "authorization",
+  "launchOperation",
+  "session",
+  "terminalOperation",
+]);
+const SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS = objectFreeze([
+  "authorizationSha256",
+  "authorizedAt",
+  "contractVersion",
+  "launchAttemptId",
+  "sessionId",
+  "terminalKind",
+  "terminalOperationId",
+  "terminalRecord",
+  "terminalRecordSha256",
+]);
+const OPERATION_SNAPSHOT_KEYS = objectFreeze([
+  "conflictClass",
+  "createdAt",
+  "expectedSession",
+  "kind",
+  "operationId",
+  "request",
+  "requestSha256",
+  "result",
+  "retiredAt",
+  "revision",
+  "sessionId",
+  "state",
+  "updatedAt",
+]);
+const SESSION_SNAPSHOT_KEYS = objectFreeze([
+  "createdAt",
+  "document",
+  "revision",
+  "sessionId",
+  "updatedAt",
+]);
+const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND = "writer-launch-attempt-v1";
+const WRITER_LAUNCH_STOP_OPERATION_KIND = "writer-launch-stop-v1";
+const SUPERVISOR_STATE_GC_CONTRACT_VERSION = 1;
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_postgres_restore_activation_recovery_service_options:
@@ -286,7 +344,8 @@ export function isPostgresRestoreActivationRecoveryService(value) {
  * Proxies cannot run user traps.
  *
  * @param {unknown} service
- * @param {unknown} lane One of generation, activation, launchAttempt, or currentLaunch.
+ * @param {unknown} lane One of generation, activation, launchAttempt,
+ * currentLaunch, or supervisorStateGc.
  * @param {unknown} afterSessionId
  * @param {unknown} limit
  * @param {unknown} lifecycleLeaseOrReceipt Legacy receipt or guarded recovery lease.
@@ -663,6 +722,84 @@ function clonePlainJson(value, code) {
   return visit(value, 0);
 }
 
+function canonicalPodmanRequestData(value, code, depth = 0) {
+  ensure(depth <= MAX_JSON_DEPTH, code);
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number") {
+    ensure(numberIsFinite(value) && !objectIs(value, -0), code);
+    return value;
+  }
+  ensure(typeof value === "object", code);
+  if (arrayIsArray(value)) {
+    const result = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = objectGetOwnPropertyDescriptor(value, `${index}`);
+      ensure(
+        descriptor?.enumerable === true &&
+          objectHasOwn(descriptor, "value"),
+        code,
+      );
+      defineArrayElement(
+        result,
+        index,
+        canonicalPodmanRequestData(
+          descriptor.value,
+          code,
+          depth + 1,
+        ),
+      );
+    }
+    return result;
+  }
+  const keys = reflectOwnKeys(value);
+  ensure(arrayEvery(keys, (key) => typeof key === "string"), code);
+  callIntrinsic(arraySortIntrinsic, keys, []);
+  const result = objectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const descriptor = objectGetOwnPropertyDescriptor(value, key);
+    ensure(
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+      code,
+    );
+    objectDefineProperty(result, key, {
+      enumerable: true,
+      value: canonicalPodmanRequestData(
+        descriptor.value,
+        code,
+        depth + 1,
+      ),
+    });
+  }
+  return result;
+}
+
+function podmanWriterRequestSha256(request, code) {
+  let serialized;
+  try {
+    serialized = callIntrinsic(jsonStringifyIntrinsic, JsonObject, [
+      canonicalPodmanRequestData(request, code),
+    ]);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    typeof serialized === "string" &&
+      callIntrinsic(bufferByteLength, Buffer, [serialized, "utf8"]) <=
+        MAX_JSON_BYTES,
+    code,
+  );
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    "portable-codex-runtime:podman-writer-request:v1\0",
+    "utf8",
+  ]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [serialized, "utf8"]);
+  return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+}
+
 function normalizeCallback(value, code) {
   ensure(
     typeof value === "function" &&
@@ -961,6 +1098,10 @@ function normalizeSweepRequest(value, code) {
     launchAttempt: normalizeLaneRequest(normalized.launchAttempt, code),
     lifecycleLease,
     signal: normalized.signal,
+    supervisorStateGc: normalizeLaneRequest(
+      normalized.supervisorStateGc,
+      code,
+    ),
   });
 }
 
@@ -1147,6 +1288,140 @@ function launchCandidate(value, code, current) {
   });
 }
 
+function supervisorStateGcSessionSnapshot(value, code) {
+  const session = exactDataObject(value, SESSION_SNAPSHOT_KEYS, code);
+  const createdAt = canonicalTimestamp(session.createdAt, code);
+  const updatedAt = canonicalTimestamp(session.updatedAt, code);
+  ensure(
+    typeof session.revision === "string" &&
+      regexpTest(REVISION_PATTERN, session.revision) &&
+      session.document !== null &&
+      typeof session.document === "object" &&
+      !arrayIsArray(session.document) &&
+      callIntrinsic(dateParse, DateConstructor, [updatedAt]) >=
+        callIntrinsic(dateParse, DateConstructor, [createdAt]),
+    code,
+  );
+  canonicalSessionId(session.sessionId, code);
+  return session;
+}
+
+function supervisorStateGcOperation(value, code) {
+  const operation = exactDataObject(value, OPERATION_SNAPSHOT_KEYS, code);
+  const createdAt = canonicalTimestamp(operation.createdAt, code);
+  const updatedAt = canonicalTimestamp(operation.updatedAt, code);
+  const retiredAt = canonicalTimestamp(operation.retiredAt, code);
+  ensure(
+    operation.conflictClass === "session-mutation" &&
+      operation.state === "committed" &&
+      retiredAt === updatedAt &&
+      callIntrinsic(dateParse, DateConstructor, [updatedAt]) >=
+        callIntrinsic(dateParse, DateConstructor, [createdAt]) &&
+      typeof operation.revision === "string" &&
+      regexpTest(REVISION_PATTERN, operation.revision) &&
+      operation.result !== null,
+    code,
+  );
+  canonicalOpaqueId(operation.operationId, code);
+  canonicalSessionId(operation.sessionId, code);
+  canonicalSha256(operation.requestSha256, code);
+  supervisorStateGcSessionSnapshot(operation.expectedSession, code);
+  return operation;
+}
+
+function supervisorStateGcCandidate(value, code) {
+  const raw = clonePlainJson(value, code);
+  const normalized = exactDataObject(
+    raw,
+    SUPERVISOR_STATE_GC_CANDIDATE_KEYS,
+    code,
+  );
+  const authorization = exactDataObject(
+    normalized.authorization,
+    SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS,
+    code,
+  );
+  ensure(
+    authorization.contractVersion ===
+      SUPERVISOR_STATE_GC_CONTRACT_VERSION &&
+      (authorization.terminalKind ===
+        WRITER_LAUNCH_ATTEMPT_OPERATION_KIND ||
+        authorization.terminalKind === WRITER_LAUNCH_STOP_OPERATION_KIND),
+    code,
+  );
+  const sessionId = canonicalSessionId(authorization.sessionId, code);
+  const launchAttemptId = canonicalOpaqueId(
+    authorization.launchAttemptId,
+    code,
+  );
+  const terminalOperationId = canonicalOpaqueId(
+    authorization.terminalOperationId,
+    code,
+  );
+  canonicalSha256(authorization.authorizationSha256, code);
+  canonicalSha256(authorization.terminalRecordSha256, code);
+  canonicalTimestamp(authorization.authorizedAt, code);
+
+  let terminalRecord;
+  let session;
+  try {
+    terminalRecord = assertPodmanWriterSupervisorStateRecord(
+      authorization.terminalRecord,
+    );
+    session = supervisorStateGcSessionSnapshot(normalized.session, code);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    terminalRecord.status === "stopped" &&
+      terminalRecord.revision === 4 &&
+      terminalRecord.launchAttemptId === launchAttemptId &&
+      session.sessionId === sessionId,
+    code,
+  );
+
+  const launchOperation = supervisorStateGcOperation(
+    normalized.launchOperation,
+    code,
+  );
+  const launchRelation = launchCandidate(
+    exactFrozenRecord({
+      launchAttemptId,
+      request: launchOperation.request,
+      state: "prepared",
+    }),
+    code,
+    false,
+  );
+  const terminalOperation = supervisorStateGcOperation(
+    normalized.terminalOperation,
+    code,
+  );
+  ensure(
+    launchOperation.kind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND &&
+      launchOperation.operationId === launchAttemptId &&
+      launchOperation.sessionId === sessionId &&
+      launchRelation.operationId === launchAttemptId &&
+      launchRelation.sessionId === sessionId &&
+      terminalRecord.requestSha256 ===
+        podmanWriterRequestSha256(launchRelation.candidate.request, code) &&
+      terminalOperation.kind === authorization.terminalKind &&
+      terminalOperation.operationId === terminalOperationId &&
+      terminalOperation.sessionId === sessionId,
+    code,
+  );
+  if (authorization.terminalKind === WRITER_LAUNCH_ATTEMPT_OPERATION_KIND) {
+    ensure(terminalOperationId === launchAttemptId, code);
+  } else {
+    ensure(terminalRecord.stopOperationId === terminalOperationId, code);
+  }
+  return exactFrozenRecord({
+    candidate: raw,
+    operationId: terminalOperationId,
+    sessionId,
+  });
+}
+
 function normalizePage(value, request, kind, code) {
   const raw = exactDataObject(value, PAGE_KEYS, code);
   const rawCandidates = clonePlainJson(raw.candidates, code);
@@ -1162,6 +1437,7 @@ function normalizePage(value, request, kind, code) {
     generation: generationCandidate,
     launchAttempt: (candidate, candidateCode) =>
       launchCandidate(candidate, candidateCode, false),
+    supervisorStateGc: supervisorStateGcCandidate,
   }[kind];
   const candidates = [];
   let previousSessionId = request.afterSessionId;
@@ -1378,6 +1654,16 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         optionCode,
       ),
     }),
+    supervisorStateGc: exactFrozenRecord({
+      list: normalizeCallback(
+        options.listWriterSupervisorStateGcCandidates,
+        optionCode,
+      ),
+      reconcile: normalizeCallback(
+        options.collectWriterSupervisorStateGc,
+        optionCode,
+      ),
+    }),
   });
 
   const requestCode =
@@ -1538,6 +1824,11 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   ) {
     return publicBatch("currentLaunch", runArgs);
   };
+  const runSupervisorStateGcBatch = function runSupervisorStateGcBatch(
+    ...runArgs
+  ) {
+    return publicBatch("supervisorStateGc", runArgs);
+  };
   const runSweepInternal = async function runSweepInternal(runArgs) {
     ensure(runArgs.length === 1, requestCode);
     const request = normalizeSweepRequest(runArgs[0], requestCode);
@@ -1548,6 +1839,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         ["activation", "activation"],
         ["launchAttempt", "launchAttempt"],
         ["currentLaunch", "currentLaunch"],
+        ["supervisorStateGc", "supervisorStateGc"],
       ];
       for (let index = 0; index < laneOrder.length; index += 1) {
         const laneEntry = laneOrder[index];
@@ -1569,6 +1861,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         results.activation.status,
         results.launchAttempt.status,
         results.currentLaunch.status,
+        results.supervisorStateGc.status,
       ];
       const status = arrayIncludes(statuses, "aborted")
         ? "aborted"
@@ -1581,6 +1874,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         generation: results.generation,
         launchAttempt: results.launchAttempt,
         status,
+        supervisorStateGc: results.supervisorStateGc,
       });
     });
   };
@@ -1592,11 +1886,13 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   objectFreeze(runActivationBatch);
   objectFreeze(runLaunchAttemptBatch);
   objectFreeze(scanCurrentLaunchBatch);
+  objectFreeze(runSupervisorStateGcBatch);
   objectFreeze(runSweep);
   serviceInstance = exactFrozenRecord({
     runActivationBatch,
     runGenerationBatch,
     runLaunchAttemptBatch,
+    runSupervisorStateGcBatch,
     runSweep,
     scanCurrentLaunchBatch,
   });

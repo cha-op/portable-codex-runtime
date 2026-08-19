@@ -270,7 +270,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      republishes, reserves or consumes an image, invokes a launcher, or
      reconstructs an opaque writer capability.
 8. **Production restore adapter enablement (complete)**
-   - The durable four-lane recovery cursor prerequisite is complete: one
+   - The durable five-lane recovery cursor prerequisite is complete: one
      PostgreSQL row per recovery scope and lane persists keyset position,
      cycle, revision, and exact transition replay evidence. A bounded runner
      processes the lanes in order and commits each settled continuation before
@@ -310,7 +310,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      retired only after the exact predetermined committed result returns.
    - The cross-process restore lifecycle guard and recovery scheduler are
      complete. One database-global versioned advisory-lock identity gives
-     foreground work a shared lease and each bounded four-lane pass an
+     foreground work a shared lease and each bounded five-lane pass an
      exclusive lease. The runner and service revalidate that lease at their
      lane, candidate, and cursor boundaries. Startup runs one immediate pass;
      later fixed-delay ticks do not overlap, and shutdown drains admitted
@@ -367,7 +367,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      capability for the deployment lifecycle owner.
    - The deployment controller now performs migration before serving, starts
      the scheduler, requires its immediate coalesced pass to prove a complete
-     four-lane sweep, and only then opens the gated checkpoint backend, image-plan-
+     five-lane sweep, and only then opens the gated checkpoint backend, image-plan-
      reservation, stable-plan, and writer-launch facets. Stop closes
      admission, stops the scheduler, and drains all accepted calls without
      closing the four borrowed pools.
@@ -411,11 +411,19 @@ Restore and launcher authority are now split into eight serial pull requests:
      activation request/result version 1 and the schema are unchanged.
    - The complete currently assembled physical graph now has deployment-owned
      method-specific settlement: supervisor launch/reconcile/returned stop,
-     nine storage-lifecycle calls, four publication calls, and restore-
-     destination resolution, in addition to the two image-provider calls.
+     `supervisorStateCollector.collectTerminalState`, nine storage-lifecycle
+     calls, four publication calls, and restore-destination resolution, in
+     addition to the two image-provider calls.
      Transient invocation context never enters durable records. Deployment
-     stops all nineteen boundaries before pool closure, and any failed drain is
+     stops all twenty boundaries before pool closure, and any failed drain is
      a sticky failed deployment rather than proof of physical quiescence.
+     The destructive supervisor-state collector additionally retains its
+     invocation and aggregate stop after a fatal grace breach until the raw
+     native Promise settles. Its fifth recovery lane therefore keeps the
+     database-global exclusive lifecycle lease during normal operation.
+     Connection or database loss may release that advisory lease without
+     proving callback quiescence; a same-authorization cold overlap then relies
+     on exact concurrent idempotent-or-fail-closed collection.
    - Operational lease admission is now complete. Deployment derives separate
      renewal-to-generation-claim and activation-to-launch-claim bounds from the
      applicable method-specific deadline plus grace periods, an explicit
@@ -423,15 +431,20 @@ Restore and launcher authority are now split into eight serial pull requests:
      two independently minted leases use the maximum window rather than a sum;
      stable-plan provisioning and every resolution enforce the same exact
      configured duration before physical work.
-   - The completed assembled safety-matrix slice classifies the nineteen physical
-     contracts before claiming coverage. Fourteen belong to the private
-     protocol surface: seven grant-bearing mutators and seven repeatable read-only
-     resolver, verifier, inspector, or reconciler observations. The other five
-     generic lifecycle methods remain contract-only in this saga. Its evidence
-     combines seven real-PostgreSQL durable-cut/commit-acknowledgement-loss paths
-     with a same-database/stable-plan retry through fresh physical bindings,
-     image binding, runtime, and controller plus separate stable-plan-registry
-     rehydration. Settlement evidence remains layered: the foundation
+   - The completed assembled safety-matrix slice classifies the twenty physical
+     contracts before claiming coverage. Fifteen belong to the private
+     protocol surface: eight grant-bearing mutators and seven repeatable
+     read-only resolver, verifier, inspector, or reconciler observations. The
+     supervisor-state collector is the eighth mutator, with cut
+     `supervisor-state-gc`, durable key
+     `authorization.terminalOperationId`, and independent overlay
+     `supervisor-state-mutator`; the matrix now has eight durable cuts and six
+     overlays. The other five generic lifecycle methods remain contract-only in
+     this saga. Its evidence combines eight real-PostgreSQL durable-cut/commit-
+     acknowledgement-loss paths with a same-database/stable-plan retry through
+     fresh physical bindings, image binding, runtime, and controller plus
+     separate stable-plan-registry rehydration. Settlement evidence remains
+     layered: the foundation
      proves aggregate stop ownership and representative deadline/grace
      semantics, while deployment fake-PostgreSQL scenarios exercise the image
      boundary, late settlement, abort/drain, fatal grace breach, and zero calls

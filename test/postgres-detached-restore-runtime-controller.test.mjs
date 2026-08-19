@@ -16,6 +16,7 @@ import {
   isPostgresDetachedRestoreOperationalLeaseBudget,
 } from "../src/postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -36,7 +37,7 @@ import {
   PostgresDetachedRestoreStablePlanRegistryError,
 } from "../src/postgres-detached-restore-stable-plan-registry.mjs";
 import {
-  LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
@@ -64,12 +65,14 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../migrations/authority/006-writer-stop-capture-handoff.sql", import.meta.url),
   new URL("../migrations/authority/007-detached-restore-stable-plans.sql", import.meta.url),
   new URL("../migrations/authority/008-filesystem-image-provider-heads.sql", import.meta.url),
+  new URL("../migrations/authority/009-writer-supervisor-state-gc.sql", import.meta.url),
 ]);
 const LANES = Object.freeze([
   "generation",
   "activation",
   "launch-attempt",
   "current-launch",
+  "supervisor-state-gc",
 ]);
 const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
   "publishFreshCheckpointArtifact",
@@ -181,12 +184,22 @@ function createTestPhysicalBindings(fixture, rawPublication, rawLifecycle) {
       settlementGraceMilliseconds: 1_000,
     }),
     supervisor: Object.freeze({
-      contractVersion: 2,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
-      supervisorId: "controller-physical-supervisor-001",
+      supervisorId: "controller-supervisor-001",
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisorStateCollector: Object.freeze({
+      collectTerminalState: unexpected,
+      contractVersion: 1,
+      supervisorId: "controller-supervisor-001",
+    }),
   });
 }
 
@@ -727,7 +740,7 @@ async function createFixture({
       imagePlanBinding,
       stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
       supervisor: Object.freeze({
-        contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+        contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
         async launchWriter() {
           fixture.calls.supervisor += 1;
           throw new Error("supervisor must not launch");
@@ -738,6 +751,7 @@ async function createFixture({
         },
         supervisorId: "controller-supervisor-001",
       }),
+      supervisorStateCollector: physicalBindings.supervisorStateCollector,
     },
     planRegistry: {
       operationalLeaseBudget,
@@ -761,6 +775,7 @@ async function createFixture({
         currentLaunch: 1,
         generation: 1,
         launchAttempt: 1,
+        supervisorStateGc: 1,
       },
       onStep,
       recoveryScopeId: RECOVERY_SCOPE_ID,
@@ -1009,7 +1024,7 @@ test("start migrates and completes one coalesced initial sweep before opening in
     );
   });
   assert.deepEqual(await first, freezeRecord({ status: "ready" }));
-  assert.equal(fixture.cursors.size, 4);
+  assert.equal(fixture.cursors.size, 5);
   for (const lane of LANES) {
     assert.equal(fixture.cursors.get(lane).cycle, "1");
     assert.equal(fixture.cursors.get(lane).revision, "1");

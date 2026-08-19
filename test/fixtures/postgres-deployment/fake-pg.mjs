@@ -16,6 +16,7 @@ const LANES = Object.freeze([
   "activation",
   "launch-attempt",
   "current-launch",
+  "supervisor-state-gc",
 ]);
 
 const state = {

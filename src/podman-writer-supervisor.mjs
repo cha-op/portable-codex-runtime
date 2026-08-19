@@ -23,8 +23,10 @@ import {
   WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
 } from "./postgres-session-authority.mjs";
 import {
+  PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
   PODMAN_WRITER_SUPERVISOR_STATE_CONTRACT_VERSION,
   assertPodmanWriterSupervisorStateRecord,
+  isPodmanWriterSupervisorStateBundle,
 } from "./podman-writer-supervisor-state.mjs";
 
 const { isGeneratorFunction, isPromise, isProxy } = utilTypes;
@@ -155,7 +157,9 @@ function firstPromiseOfThree(first, second, third) {
   });
 }
 
-export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 2;
+export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 3;
+export const PODMAN_WRITER_LAUNCH_RECEIPT_VERSION = 2;
+export const PODMAN_WRITER_RECONCILE_RECEIPT_VERSION = 1;
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -197,12 +201,37 @@ const OPTION_KEYS = Object.freeze([
   "writerCommand",
   "writerEnvironment",
 ]);
+const BUNDLE_OPTION_KEYS = Object.freeze([
+  "commandRunner",
+  "commandTimeoutMilliseconds",
+  "configuredAttachmentRoot",
+  "filesystemAuthority",
+  "images",
+  "maxOutputBytes",
+  "podmanEnvironment",
+  "podmanExecutable",
+  "stateBundle",
+  "stopTimeoutSeconds",
+  "supervisorId",
+  "writerCommand",
+  "writerEnvironment",
+]);
 const REQUIRED_OPTION_KEYS = Object.freeze([
   "configuredAttachmentRoot",
   "images",
   "podmanEnvironment",
   "podmanExecutable",
   "state",
+  "supervisorId",
+  "writerCommand",
+  "writerEnvironment",
+]);
+const REQUIRED_BUNDLE_OPTION_KEYS = Object.freeze([
+  "configuredAttachmentRoot",
+  "images",
+  "podmanEnvironment",
+  "podmanExecutable",
+  "stateBundle",
   "supervisorId",
   "writerCommand",
   "writerEnvironment",
@@ -411,6 +440,18 @@ const WRITER_FENCE_KEYS = Object.freeze([
   "sessionId",
 ]);
 const STATE_CLAIM_RECEIPT_KEYS = Object.freeze(["created", "record"]);
+const STATE_COLLECTION_KEYS = Object.freeze([
+  "contractVersion",
+  "invocation",
+  "signal",
+  "terminalRecord",
+]);
+const STATE_COLLECTION_RECEIPT_KEYS = Object.freeze([
+  "contractVersion",
+  "launchAttemptId",
+  "status",
+  "terminalRecordSha256",
+]);
 const ALLOWED_PODMAN_ENVIRONMENT = Object.freeze([
   "HOME",
   "LANG",
@@ -3276,6 +3317,7 @@ export function createPodmanWriterSupervisor(...args) {
         return frozenRecord({
           contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
           status: "stopped",
+          terminalRecord: record,
         });
       }
       if (record.status === "started") {
@@ -3366,6 +3408,7 @@ export function createPodmanWriterSupervisor(...args) {
       return frozenRecord({
         contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
         status: "stopped",
+        terminalRecord: record,
       });
     });
     return stopWriter;
@@ -3407,12 +3450,13 @@ export function createPodmanWriterSupervisor(...args) {
       if (record.status === "started") {
         return frozenRecord({
           evidence: evidence(supervisorId, record, "started", record.proofId),
-          receiptVersion: 1,
+          receiptVersion: PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
           stopWriter: makeStopWriter({
             ...expected,
             processIncarnationId: record.processIncarnationId,
             writerIncarnationId: record.writerIncarnationId,
           }),
+          terminalRecord: null,
         });
       }
       if (record.status === "stopped") {
@@ -3424,8 +3468,9 @@ export function createPodmanWriterSupervisor(...args) {
             "complete-stopped",
             record.stopProofId,
           ),
-          receiptVersion: 1,
+          receiptVersion: PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
           stopWriter: null,
+          terminalRecord: record,
         });
       }
       fail("podman_writer_supervisor_outcome_uncertain");
@@ -3478,12 +3523,13 @@ export function createPodmanWriterSupervisor(...args) {
         if (record.status === "started") {
           return frozenRecord({
             evidence: evidence(supervisorId, record, "started", record.proofId),
-            receiptVersion: 1,
+            receiptVersion: PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
             stopWriter: makeStopWriter({
               ...expected,
               processIncarnationId: record.processIncarnationId,
               writerIncarnationId: record.writerIncarnationId,
             }),
+            terminalRecord: null,
           });
         }
         fail("podman_writer_supervisor_outcome_uncertain");
@@ -3663,12 +3709,13 @@ export function createPodmanWriterSupervisor(...args) {
       );
       return frozenRecord({
         evidence: evidence(supervisorId, record, "started", record.proofId),
-        receiptVersion: 1,
+        receiptVersion: PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
         stopWriter: makeStopWriter({
           ...expected,
           processIncarnationId: record.processIncarnationId,
           writerIncarnationId: record.writerIncarnationId,
         }),
+        terminalRecord: null,
       });
     } catch (error) {
       if (startMayHaveExecuted) {
@@ -3719,7 +3766,7 @@ export function createPodmanWriterSupervisor(...args) {
             "complete-stopped",
             record.stopProofId,
           ),
-          receiptVersion: 1,
+          receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
         });
       }
       if (record === null || record.status === "preparing") {
@@ -3753,7 +3800,7 @@ export function createPodmanWriterSupervisor(...args) {
               launchAttemptId,
               digestOfRequest,
             ),
-            receiptVersion: 1,
+            receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
           });
         }
         ensure(
@@ -3859,7 +3906,7 @@ export function createPodmanWriterSupervisor(...args) {
               observedContainerId,
             ),
           ),
-          receiptVersion: 1,
+          receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
         });
       }
       ensure(
@@ -3932,7 +3979,7 @@ export function createPodmanWriterSupervisor(...args) {
           "complete-stopped",
           stoppedProofId(launchAttemptId, digestOfRequest, record.containerId),
         ),
-        receiptVersion: 1,
+        receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
       });
     },
   );
@@ -3945,9 +3992,96 @@ export function createPodmanWriterSupervisor(...args) {
   });
 }
 
+export function createPodmanWriterSupervisorBundle(...args) {
+  const optionCode = "invalid_podman_writer_supervisor_options";
+  ensure(args.length === 1, optionCode);
+  const options = dataObject(
+    args[0],
+    BUNDLE_OPTION_KEYS,
+    REQUIRED_BUNDLE_OPTION_KEYS,
+    optionCode,
+  );
+  ensure(isPodmanWriterSupervisorStateBundle(options.stateBundle), optionCode);
+  const stateBundle = options.stateBundle;
+  const supervisorOptions = callIntrinsic(objectCreateIntrinsic, Object, [null]);
+  for (let index = 0; index < OPTION_KEYS.length; index += 1) {
+    const key = OPTION_KEYS[index];
+    if (key === "state") {
+      supervisorOptions.state = stateBundle.state;
+    } else if (objectHasOwnIntrinsic(options, key)) {
+      supervisorOptions[key] = options[key];
+    }
+  }
+  const supervisor = createPodmanWriterSupervisor(
+    callIntrinsic(objectFreezeIntrinsic, Object, [supervisorOptions]),
+  );
+  const supervisorId = supervisor.supervisorId;
+  const collect = assertFunction(stateBundle.terminalCollector.collect, optionCode);
+
+  const collectTerminalState = frozenFunction(
+    async function collectTerminalState(inputValue) {
+      ensure(arguments.length === 1, "invalid_podman_writer_supervisor_request");
+      const code = "invalid_podman_writer_supervisor_request";
+      const input = exactDataObject(inputValue, STATE_COLLECTION_KEYS, code);
+      ensure(
+        input.contractVersion ===
+          PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+        code,
+      );
+      assertInvocation(input.invocation, code);
+      const signal = assertAbortSignal(input.signal, code);
+      let record;
+      try {
+        record = assertPodmanWriterSupervisorStateRecord(input.terminalRecord);
+      } catch {
+        fail(code);
+      }
+      ensure(record.status === "stopped" && record.revision === 4, code);
+      record = validateRecord(record, frozenRecord({
+        containerName: containerName(supervisorId, record.launchAttemptId),
+        launchAttemptId: record.launchAttemptId,
+        requestSha256: record.requestSha256,
+        supervisorId,
+      }));
+      ensureNotAborted(signal);
+      const raw = await invokeState(
+        collect,
+        frozenRecord({ terminalRecord: record }),
+      );
+      if (signalAborted(signal)) {
+        fail("podman_writer_supervisor_outcome_uncertain");
+      }
+      const receipt = exactDataObject(
+        raw,
+        STATE_COLLECTION_RECEIPT_KEYS,
+        "podman_writer_supervisor_outcome_uncertain",
+      );
+      ensure(
+        receipt.contractVersion ===
+            PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION &&
+          receipt.launchAttemptId === record.launchAttemptId &&
+          arrayIncludes(["absent", "collected"], receipt.status) &&
+          assertSha256(
+              receipt.terminalRecordSha256,
+              "podman_writer_supervisor_outcome_uncertain",
+            ) === receipt.terminalRecordSha256,
+        "podman_writer_supervisor_outcome_uncertain",
+      );
+      return frozenRecord(receipt);
+    },
+  );
+  const supervisorStateCollector = frozenRecord({
+    collectTerminalState,
+    contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+    supervisorId,
+  });
+  return frozenRecord({ supervisor, supervisorStateCollector });
+}
+
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError.prototype]);
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError]);
 callIntrinsic(objectFreezeIntrinsic, Object, [
   createPodmanWriterFilesystemAuthorityComposition,
 ]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisor]);
+callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorBundle]);

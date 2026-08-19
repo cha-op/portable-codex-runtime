@@ -49,6 +49,8 @@ import {
   createPostgresDetachedRestoreOperationalLeaseBudget,
 } from "../src/postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
 import {
@@ -70,6 +72,8 @@ import {
   createPostgresWriterDetachComposition,
 } from "../src/postgres-writer-detach-composition.mjs";
 import {
+  LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION,
+  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
 } from "../src/postgres-logical-writer-launcher.mjs";
@@ -193,6 +197,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 8,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/009-writer-supervisor-state-gc.sql",
+      import.meta.url,
+    ),
+    version: 9,
   }),
 ]);
 
@@ -942,7 +953,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 8,
+    version: 9,
   });
   const registry = await pool.query(
     [
@@ -1826,6 +1837,7 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
     "activation",
     "launch-attempt",
     "current-launch",
+    "supervisor-state-gc",
   ];
   const lazyScopeId = `lazy-${randomUUID()}`;
   const concurrentScopeId = `concurrent-${randomUUID()}`;
@@ -1891,6 +1903,7 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
       { lane: "current-launch", revision: "0" },
       { lane: "generation", revision: "0" },
       { lane: "launch-attempt", revision: "0" },
+      { lane: "supervisor-state-gc", revision: "0" },
     ]);
 
     const initial = await cursorStore.readLane({
@@ -2202,6 +2215,7 @@ function integrationDeploymentPhysicalSettlementPolicies() {
       "reconcileWriterLaunch",
       "stopWriter",
     ]),
+    supervisorStateCollectionSettlement: policy(),
   };
 }
 
@@ -3517,6 +3531,92 @@ function writerLaunchEvidence(input, status) {
   };
 }
 
+function canonicalJsonForPodmanFixture(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJsonForPodmanFixture).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJsonForPodmanFixture(value[key])}`,
+    )
+    .join(",")}}`;
+}
+
+function sha256Text(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function podmanWriterTerminalFixture({
+  evidenceContractVersion =
+    POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  launchAttemptId,
+  request,
+  stopOperationId = null,
+  supervisorId,
+}) {
+  const containerId = sha256Text(
+    `portable-codex-runtime:integration-podman-container:v1\0${launchAttemptId}`,
+  );
+  const requestSha256 = sha256Text(
+    `portable-codex-runtime:podman-writer-request:v1\0${canonicalJsonForPodmanFixture(
+      request,
+    )}`,
+  );
+  const processIncarnationId = `podman-process:${containerId}`;
+  const writerIncarnationId = `podman-writer:${sha256Text(
+    `portable-codex-runtime:podman-writer:v1\0${supervisorId}\0${launchAttemptId}\0${requestSha256}\0${containerId}`,
+  )}`;
+  const proofId = `podman-start:${sha256Text(
+    `portable-codex-runtime:podman-start-proof:v1\0${supervisorId}\0${launchAttemptId}\0${requestSha256}\0${containerId}`,
+  )}`;
+  const stopProofId = `podman-stopped:${sha256Text(
+    `portable-codex-runtime:podman-stopped-proof:v1\0${launchAttemptId}\0${requestSha256}\0${containerId}`,
+  )}`;
+  return {
+    evidence: frozenNullPrototypeRecord({
+      contractVersion: evidenceContractVersion,
+      launchAttemptId,
+      processIncarnationId,
+      proofId,
+      status: "started",
+      supervisorId,
+      writerIncarnationId,
+    }),
+    terminalRecord:
+      stopOperationId === null
+        ? null
+        : frozenNullPrototypeRecord({
+            containerId,
+            containerName: `codex-writer-${sha256Text(
+              `portable-codex-runtime:podman-container:v1\0${supervisorId}\0${launchAttemptId}`,
+            ).slice(0, 48)}`,
+            contractVersion: 1,
+            launchAttemptId,
+            processIncarnationId,
+            proofId,
+            requestSha256,
+            revision: 4,
+            status: "stopped",
+            stopOperationId,
+            stopProofId,
+            writerIncarnationId,
+          }),
+  };
+}
+
+function podmanWriterStateCollectionSha256(terminalRecord) {
+  return sha256Text(
+    `portable-codex-runtime:podman-writer-state-collection:v1\0${JSON.stringify(
+      terminalRecord,
+    )}`,
+  );
+}
+
 function writerLaunchStopInput(
   expectedSession,
   { operationId = `writer-launch-stop-${randomUUID()}` } = {},
@@ -4043,10 +4143,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 8);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 9);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7, 8],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9],
     );
 
     await pool.query(
@@ -4056,7 +4156,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 8,
+      version: 9,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -4069,7 +4169,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 8,
+      version: 9,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -4084,7 +4184,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 8,
+      version: 9,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -4096,7 +4196,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 8,
+      version: 9,
     });
     await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
     await assertLegacyRestoreV2MigrationGate(
@@ -4568,6 +4668,13 @@ test(
           await pool.query(
             [
               "DELETE FROM session_authority.capture_attempt_claims",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.writer_supervisor_state_gc",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
             [sessionIds],
@@ -9491,13 +9598,34 @@ test(
           async finalizeWriterLaunchAttemptStopped(options) {
             return authority.finalizeWriterLaunchAttemptStopped(options);
           },
+          async finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc(
+              options,
+            );
+          },
           async finalizeWriterLaunchStopped(options) {
             return authority.finalizeWriterLaunchStopped(options);
+          },
+          async finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc(
+              options,
+            );
           },
           async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
             options,
           ) {
             return authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+              options,
+            );
+          },
+          async finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc(
               options,
             );
           },
@@ -9509,6 +9637,9 @@ test(
           },
           async readWriterLaunchAttempt(options) {
             return authority.readWriterLaunchAttempt(options);
+          },
+          async readWriterSupervisorStateGcAuthorization(options) {
+            return authority.readWriterSupervisorStateGcAuthorization(options);
           },
           async reconcileWriterLaunchStopOperation(options) {
             return authority.reconcileWriterLaunchStopOperation(options);
@@ -9525,22 +9656,35 @@ test(
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: {
-            contractVersion: 1,
+            contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
             launchWriter: async (context) => {
               launchCalls += 1;
               launchedRequest = context.attempt.request;
+              const launchFixture = podmanWriterTerminalFixture({
+                evidenceContractVersion: 1,
+                launchAttemptId,
+                request: context.attempt.request,
+                supervisorId,
+              });
               return {
-                receiptVersion: 1,
-                evidence: writerLaunchEvidence(
-                  {
-                    operationId: launchAttemptId,
+                receiptVersion: LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION,
+                evidence: launchFixture.evidence,
+                stopWriter: async function stopWriter(stopInput) {
+                  const stoppedFixture = podmanWriterTerminalFixture({
+                    evidenceContractVersion: 1,
+                    launchAttemptId,
                     request: context.attempt.request,
-                  },
-                  "started",
-                ),
-                stopWriter: async function stopWriter() {
-                  return STOPPED_WRITER_STOP_CONFIRMED;
+                    stopOperationId: stopInput.stopOperationId,
+                    supervisorId,
+                  });
+                  return frozenNullPrototypeRecord({
+                    confirmation: STOPPED_WRITER_STOP_CONFIRMED,
+                    contractVersion:
+                      LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+                    terminalRecord: stoppedFixture.terminalRecord,
+                  });
                 },
+                terminalRecord: null,
               };
             },
             reconcileWriterLaunch: async () => {
@@ -9969,13 +10113,34 @@ test(
           async finalizeWriterLaunchAttemptStopped(options) {
             return authority.finalizeWriterLaunchAttemptStopped(options);
           },
+          async finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc(
+              options,
+            );
+          },
           async finalizeWriterLaunchStopped(options) {
             return authority.finalizeWriterLaunchStopped(options);
+          },
+          async finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc(
+              options,
+            );
           },
           async finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
             options,
           ) {
             return authority.finalizeWriterLaunchStoppedAndReserveCheckpointCapture(
+              options,
+            );
+          },
+          async finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc(
+            options,
+          ) {
+            return authority.finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc(
               options,
             );
           },
@@ -9991,6 +10156,9 @@ test(
           },
           async readWriterLaunchAttempt(options) {
             return authority.readWriterLaunchAttempt(options);
+          },
+          async readWriterSupervisorStateGcAuthorization(options) {
+            return authority.readWriterSupervisorStateGcAuthorization(options);
           },
           async reconcileWriterLaunchStopOperation(options) {
             return authority.reconcileWriterLaunchStopOperation(options);
@@ -10020,16 +10188,16 @@ test(
             context.attempt.launchAttemptId,
             launchAttemptId,
           );
+          const launchFixture = podmanWriterTerminalFixture({
+            evidenceContractVersion: 1,
+            launchAttemptId,
+            request: context.attempt.request,
+            supervisorId,
+          });
           return {
-            receiptVersion: 1,
-            evidence: writerLaunchEvidence(
-              {
-                operationId: launchAttemptId,
-                request: context.attempt.request,
-              },
-              "started",
-            ),
-            stopWriter: async function stopWriter() {
+            receiptVersion: LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION,
+            evidence: launchFixture.evidence,
+            stopWriter: async function stopWriter(stopInput) {
               stopCalls += 1;
               assert.notEqual(stopUncertaintyInput, null);
               const uncertain = await authority.markOperationUncertain({
@@ -10037,8 +10205,21 @@ test(
                 expectedOperationRevision: "1",
               });
               assertOperationReceipt(uncertain, "uncertain");
-              return STOPPED_WRITER_STOP_CONFIRMED;
+              const stoppedFixture = podmanWriterTerminalFixture({
+                evidenceContractVersion: 1,
+                launchAttemptId,
+                request: context.attempt.request,
+                stopOperationId: stopInput.stopOperationId,
+                supervisorId,
+              });
+              return frozenNullPrototypeRecord({
+                confirmation: STOPPED_WRITER_STOP_CONFIRMED,
+                contractVersion:
+                  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+                terminalRecord: stoppedFixture.terminalRecord,
+              });
             },
+            terminalRecord: null,
           };
         };
         const reconcileWriterLaunch = async () => {
@@ -10051,7 +10232,7 @@ test(
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: {
-            contractVersion: 1,
+            contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
             launchWriter,
             reconcileWriterLaunch,
             supervisorId,
@@ -10394,22 +10575,35 @@ test(
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: {
-            contractVersion: 1,
+            contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
             launchWriter: async (context) => {
               launchCalls += 1;
               launchedRequest = context.attempt.request;
+              const launchFixture = podmanWriterTerminalFixture({
+                evidenceContractVersion: 1,
+                launchAttemptId,
+                request: context.attempt.request,
+                supervisorId,
+              });
               return {
-                receiptVersion: 1,
-                evidence: writerLaunchEvidence(
-                  {
-                    operationId: launchAttemptId,
+                receiptVersion: LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION,
+                evidence: launchFixture.evidence,
+                stopWriter: async function stopWriter(stopInput) {
+                  const stoppedFixture = podmanWriterTerminalFixture({
+                    evidenceContractVersion: 1,
+                    launchAttemptId,
                     request: context.attempt.request,
-                  },
-                  "started",
-                ),
-                stopWriter: async function stopWriter() {
-                  return STOPPED_WRITER_STOP_CONFIRMED;
+                    stopOperationId: stopInput.stopOperationId,
+                    supervisorId,
+                  });
+                  return frozenNullPrototypeRecord({
+                    confirmation: STOPPED_WRITER_STOP_CONFIRMED,
+                    contractVersion:
+                      LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+                    terminalRecord: stoppedFixture.terminalRecord,
+                  });
                 },
+                terminalRecord: null,
               };
             },
             reconcileWriterLaunch: async () => {
@@ -10654,7 +10848,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6, 7, 8],
+          [1, 2, 3, 4, 5, 6, 7, 8, 9],
         );
 
         const input = writerLaunchAttemptInput(
@@ -11969,6 +12163,10 @@ test(
     const imagePlanProviderId =
       `runtime-image-provider-${randomUUID()}`;
     const supervisorId = `runtime-supervisor-${randomUUID()}`;
+    const collectedSupervisorState = new Set();
+    const supervisorStateCollectionInvocations = new Set();
+    const supervisorStateCollectionSignals = new Set();
+    const supervisorStateCollections = [];
     let controller = null;
     let physicalBindings = null;
     let restartedController = null;
@@ -12035,6 +12233,13 @@ test(
           await cleanupClient.query(
             [
               "DELETE FROM session_authority.restore_destination_generations",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.writer_supervisor_state_gc",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
             [sessionIds],
@@ -12223,6 +12428,41 @@ test(
     const physicalSignals = new Set();
     const physicalPolicies =
       integrationDeploymentPhysicalSettlementPolicies();
+    const rawSupervisorStateCollector = Object.freeze({
+      async collectTerminalState(input) {
+        assert.equal(arguments.length, 1);
+        assert.deepEqual(Reflect.ownKeys(input).sort(), [
+          "contractVersion",
+          "invocation",
+          "signal",
+          "terminalRecord",
+        ]);
+        assert.equal(input.contractVersion, 1);
+        assertFreshOpaqueInvocation(
+          input.invocation,
+          supervisorStateCollectionInvocations,
+        );
+        assert.equal(input.signal instanceof AbortSignal, true);
+        assert.equal(input.signal.aborted, false);
+        assert.equal(supervisorStateCollectionSignals.has(input.signal), false);
+        supervisorStateCollectionSignals.add(input.signal);
+        const launchAttemptId = input.terminalRecord.launchAttemptId;
+        const status = collectedSupervisorState.has(launchAttemptId)
+          ? "absent"
+          : "collected";
+        collectedSupervisorState.add(launchAttemptId);
+        supervisorStateCollections.push({ launchAttemptId, status });
+        return frozenNullPrototypeRecord({
+          contractVersion: 1,
+          launchAttemptId,
+          status,
+          terminalRecordSha256:
+            podmanWriterStateCollectionSha256(input.terminalRecord),
+        });
+      },
+      contractVersion: 1,
+      supervisorId,
+    });
     const imagePlanProviderSettlement =
       integrationImagePlanSettlementPolicies();
     const operationalLeaseBudget =
@@ -12297,11 +12537,15 @@ test(
       resolveRestoreDestinationSettlement:
         physicalPolicies.resolveRestoreDestinationSettlement,
       supervisor: Object.freeze({
-        contractVersion: 2,
+        contractVersion:
+          POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
         async launchWriter(context) {
           calls.supervisorLaunch += 1;
           assert.equal(arguments.length, 1);
-          assert.equal(context.contractVersion, 2);
+          assert.equal(
+            context.contractVersion,
+            POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+          );
           assertFreshOpaqueInvocation(
             context.invocation,
             physicalInvocations,
@@ -12314,18 +12558,15 @@ test(
             context.attempt.request.supervisor.supervisorId,
             supervisorId,
           );
+          const launchFixture = podmanWriterTerminalFixture({
+            launchAttemptId: context.attempt.launchAttemptId,
+            request: context.attempt.request,
+            supervisorId,
+          });
           return frozenNullPrototypeRecord({
-            receiptVersion: 1,
-            evidence: frozenNullPrototypeRecord({
-              ...writerLaunchEvidence(
-                {
-                  operationId: context.attempt.launchAttemptId,
-                  request: context.attempt.request,
-                },
-                "started",
-              ),
-              contractVersion: 2,
-            }),
+            receiptVersion:
+              POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+            evidence: launchFixture.evidence,
             stopWriter: async function stopWriter(stopInput) {
               calls.supervisorStop += 1;
               assert.equal(arguments.length, 1);
@@ -12339,7 +12580,10 @@ test(
                 "writerFence",
                 "writerIncarnationId",
               ]);
-              assert.equal(stopInput.contractVersion, 2);
+              assert.equal(
+                stopInput.contractVersion,
+                POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+              );
               assertFreshOpaqueInvocation(
                 stopInput.invocation,
                 physicalInvocations,
@@ -12348,17 +12592,29 @@ test(
               assert.equal(stopInput.signal.aborted, false);
               assert.equal(physicalSignals.has(stopInput.signal), false);
               physicalSignals.add(stopInput.signal);
+              const stoppedFixture = podmanWriterTerminalFixture({
+                launchAttemptId: context.attempt.launchAttemptId,
+                request: context.attempt.request,
+                stopOperationId: stopInput.stopOperationId,
+                supervisorId,
+              });
               return frozenNullPrototypeRecord({
-                contractVersion: 2,
+                contractVersion:
+                  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
                 status: "stopped",
+                terminalRecord: stoppedFixture.terminalRecord,
               });
             },
+            terminalRecord: null,
           });
         },
         async reconcileWriterLaunch(context) {
           calls.supervisorReconcile += 1;
           assert.equal(arguments.length, 1);
-          assert.equal(context.contractVersion, 2);
+          assert.equal(
+            context.contractVersion,
+            POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+          );
           assertFreshOpaqueInvocation(
             context.invocation,
             physicalInvocations,
@@ -12374,6 +12630,9 @@ test(
         supervisorId,
       }),
       supervisorSettlement: physicalPolicies.supervisorSettlement,
+      supervisorStateCollectionSettlement:
+        physicalPolicies.supervisorStateCollectionSettlement,
+      supervisorStateCollector: rawSupervisorStateCollector,
     });
     const runtimeOptions = {
       authority: {
@@ -12451,6 +12710,8 @@ test(
         stoppedWriterCoordinator:
           new StoppedWriterCapabilityCoordinator(),
         supervisor: physicalBindings.supervisor,
+        supervisorStateCollector:
+          physicalBindings.supervisorStateCollector,
       },
       pools: {
         authority: interruptedAuthorityPool,
@@ -12481,6 +12742,7 @@ test(
           currentLaunch: 10,
           generation: 10,
           launchAttempt: 10,
+          supervisorStateGc: 10,
         },
         onStep(receipt) {
           steps.push(receipt);
@@ -12619,6 +12881,7 @@ test(
       "activation",
       "launchAttempt",
       "currentLaunch",
+      "supervisorStateGc",
     ]) {
       assert.equal(
         controllerFirst.recovery[field].batch.status,
@@ -12752,6 +13015,7 @@ test(
       "activation",
       "launchAttempt",
       "currentLaunch",
+      "supervisorStateGc",
     ]) {
       assert.equal(first.recovery[field].batch.status, "sweep-complete");
       assert.equal(first.recovery[field].batch.results.length, 0);
@@ -13711,6 +13975,12 @@ test(
         lane: "launch-attempt",
         revision: "1",
       },
+      {
+        after_session_id: null,
+        cycle: "1",
+        lane: "supervisor-state-gc",
+        revision: "1",
+      },
     ]);
 
     assert.deepEqual(
@@ -13770,7 +14040,8 @@ test(
         resolveRestoreDestinationSettlement:
           physicalPolicies.resolveRestoreDestinationSettlement,
         supervisor: Object.freeze({
-          contractVersion: 2,
+          contractVersion:
+            POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
           async launchWriter(input) {
             restartedCalls.supervisorLaunch += 1;
             void input;
@@ -13785,9 +14056,12 @@ test(
               "committed restore retry must not reconcile a writer",
             );
           },
-          supervisorId: `restarted-supervisor-${randomUUID()}`,
+          supervisorId,
         }),
         supervisorSettlement: physicalPolicies.supervisorSettlement,
+        supervisorStateCollectionSettlement:
+          physicalPolicies.supervisorStateCollectionSettlement,
+        supervisorStateCollector: rawSupervisorStateCollector,
       });
     const restartedImagePlanProviderId =
       `restarted-image-provider-${randomUUID()}`;
@@ -13959,6 +14233,8 @@ test(
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: restartedPhysicalBindings.supervisor,
+          supervisorStateCollector:
+            restartedPhysicalBindings.supervisorStateCollector,
         },
         planRegistry: {
           operationalLeaseBudget,
@@ -14023,6 +14299,38 @@ test(
       ),
       { status: "ready" },
     );
+    assert.deepEqual(supervisorStateCollections, [
+      { launchAttemptId, status: "collected" },
+    ]);
+    assert.equal(supervisorStateCollectionInvocations.size, 1);
+    assert.equal(supervisorStateCollectionSignals.size, 1);
+    const completedSupervisorStateGc = await authorityPool.query(
+      [
+        "SELECT launch_attempt_id, terminal_kind, collection_status,",
+        "collection_receipt_sha256, collected_at IS NOT NULL AS collected",
+        "FROM session_authority.writer_supervisor_state_gc",
+        "WHERE launch_attempt_id = $1",
+      ].join(" "),
+      [launchAttemptId],
+    );
+    assert.equal(completedSupervisorStateGc.rows.length, 1);
+    assert.equal(
+      completedSupervisorStateGc.rows[0].launch_attempt_id,
+      launchAttemptId,
+    );
+    assert.equal(
+      completedSupervisorStateGc.rows[0].terminal_kind,
+      WRITER_LAUNCH_STOP_OPERATION_KIND,
+    );
+    assert.equal(
+      completedSupervisorStateGc.rows[0].collection_status,
+      "collected",
+    );
+    assert.match(
+      completedSupervisorStateGc.rows[0].collection_receipt_sha256,
+      /^[0-9a-f]{64}$/u,
+    );
+    assert.equal(completedSupervisorStateGc.rows[0].collected, true);
 
     const captureRecoveryCountsBefore = {
       artifactResolver: restartedCalls.artifactResolver,
@@ -14572,6 +14880,8 @@ test(
     };
     const physicalPolicies =
       integrationDeploymentPhysicalSettlementPolicies();
+    const deploymentSupervisorId =
+      `deployment-supervisor-${randomUUID()}`;
     const deployment = createPostgresDetachedRestoreDeployment({
       postgres: {
         applicationNamePrefix,
@@ -14720,7 +15030,8 @@ test(
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
           supervisor: Object.freeze({
-            contractVersion: 2,
+            contractVersion:
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
             async launchWriter(input) {
               calls.supervisor += 1;
               void input;
@@ -14731,9 +15042,22 @@ test(
               void input;
               throw new Error("deployment supervisor must not reconcile");
             },
-            supervisorId: `deployment-supervisor-${randomUUID()}`,
+            supervisorId: deploymentSupervisorId,
           }),
           supervisorSettlement: physicalPolicies.supervisorSettlement,
+          supervisorStateCollectionSettlement:
+            physicalPolicies.supervisorStateCollectionSettlement,
+          supervisorStateCollector: Object.freeze({
+            async collectTerminalState(input) {
+              calls.supervisor += 1;
+              void input;
+              throw new Error(
+                "deployment supervisor state collection must not run",
+              );
+            },
+            contractVersion: 1,
+            supervisorId: deploymentSupervisorId,
+          }),
         },
         operationalLease: {
           databaseRequestMilliseconds:
@@ -14760,6 +15084,7 @@ test(
             currentLaunch: 10,
             generation: 10,
             launchAttempt: 10,
+            supervisorStateGc: 10,
           },
           onStep(receipt) {
             steps.push(receipt);
@@ -14806,6 +15131,13 @@ test(
           await cleanupClient.query(
             [
               "DELETE FROM session_authority.detached_restore_stable_plans",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.writer_supervisor_state_gc",
               "WHERE session_id = $1::uuid",
             ].join(" "),
             [sessionId],
@@ -14893,6 +15225,7 @@ test(
       { cycle: "1", lane: "current-launch", revision: "1" },
       { cycle: "1", lane: "generation", revision: "1" },
       { cycle: "1", lane: "launch-attempt", revision: "1" },
+      { cycle: "1", lane: "supervisor-state-gc", revision: "1" },
     ]);
     const activeSessions = await waitForDeploymentApplicationSessions(
       inspectionPool,

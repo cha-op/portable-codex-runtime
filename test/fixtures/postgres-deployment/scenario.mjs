@@ -14,6 +14,10 @@ import {
   POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED,
 } from "../../../src/postgres-detached-restore-stable-plan-registry.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+} from "../../../src/postgres-detached-restore-physical-bindings.mjs";
+import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   assertCheckpointBackend,
@@ -53,6 +57,7 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../../../migrations/authority/006-writer-stop-capture-handoff.sql", import.meta.url),
   new URL("../../../migrations/authority/007-detached-restore-stable-plans.sql", import.meta.url),
   new URL("../../../migrations/authority/008-filesystem-image-provider-heads.sql", import.meta.url),
+  new URL("../../../migrations/authority/009-writer-supervisor-state-gc.sql", import.meta.url),
 ]);
 const LIFECYCLE_PHYSICAL_METHODS = Object.freeze([
   "captureCheckpoint",
@@ -243,13 +248,14 @@ function physicalPolicyFixture() {
     publicationSettlement: physicalPolicyGroup(PUBLICATION_PHYSICAL_METHODS),
     resolveRestoreDestinationSettlement: physicalPolicy(),
     supervisorSettlement: physicalPolicyGroup(SUPERVISOR_PHYSICAL_METHODS),
+    supervisorStateCollectionSettlement: physicalPolicy(),
   };
   assert.equal(
     Object.values(fixture)
       .flatMap((group) =>
         "deadlineMilliseconds" in group ? [group] : Object.values(group),
       ).length,
-    19,
+    20,
   );
   return fixture;
 }
@@ -258,6 +264,7 @@ function deploymentPhysicalPolicyLeaves(options) {
   return [
     ...Object.values(options.runtime.launch.imagePlanProviderSettlement),
     ...Object.values(options.runtime.launch.supervisorSettlement),
+    options.runtime.launch.supervisorStateCollectionSettlement,
     ...Object.values(options.runtime.storage.lifecycleBackendSettlement),
     ...Object.values(options.runtime.storage.publicationSettlement),
     options.runtime.storage.resolveRestoreDestinationSettlement,
@@ -280,10 +287,10 @@ function assertPhysicalInvocationContext(context, seen) {
   seen.add(context.invocation);
 }
 
-function assertSupervisorPhysicalRequest(input, seen) {
+function assertSupervisorPhysicalRequest(input, seen, expectedVersion) {
   assert.equal(Object.getPrototypeOf(input), null);
   assert.equal(Object.isFrozen(input), true);
-  assert.equal(input.contractVersion, 2);
+  assert.equal(input.contractVersion, expectedVersion);
   assert.equal(Object.getPrototypeOf(input.invocation), null);
   assert.equal(Object.isFrozen(input.invocation), true);
   assert.deepEqual(Reflect.ownKeys(input.invocation), []);
@@ -462,13 +469,15 @@ function validOptions() {
         imagePlanProviderSettlement: policies.imagePlanProviderSettlement,
         stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
         supervisor: Object.freeze({
-          contractVersion: 2,
+          contractVersion:
+            POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
           async launchWriter(input) {
             calls.supervisor += 1;
             assert.equal(arguments.length, 1);
             assertSupervisorPhysicalRequest(
               input,
               controls.physicalInvocationContexts,
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
             );
             controls.supervisorContexts.push({
               input,
@@ -485,6 +494,7 @@ function validOptions() {
             assertSupervisorPhysicalRequest(
               input,
               controls.physicalInvocationContexts,
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
             );
             controls.supervisorContexts.push({
               input,
@@ -498,6 +508,27 @@ function validOptions() {
           supervisorId: "deployment-supervisor-001",
         }),
         supervisorSettlement: policies.supervisorSettlement,
+        supervisorStateCollectionSettlement:
+          policies.supervisorStateCollectionSettlement,
+        supervisorStateCollector: Object.freeze({
+          async collectTerminalState(input) {
+            calls.supervisor += 1;
+            assert.equal(arguments.length, 1);
+            assertSupervisorPhysicalRequest(
+              input,
+              controls.physicalInvocationContexts,
+              POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+            );
+            controls.supervisorContexts.push({
+              input,
+              method: "collectTerminalState",
+            });
+            throw new Error("supervisor state collection must not run");
+          },
+          contractVersion:
+            POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+          supervisorId: "deployment-supervisor-001",
+        }),
       },
       operationalLease: {
         databaseRequestMilliseconds: 30_000,
@@ -520,6 +551,7 @@ function validOptions() {
           currentLaunch: 1,
           generation: 1,
           launchAttempt: 1,
+          supervisorStateGc: 1,
         },
         onStep() {
           calls.onStep += 1;
@@ -919,7 +951,7 @@ async function zeroIoAndLifecycle() {
       assert.equal(client.listenerCount("error"), 1);
     }
   }
-  assert.equal(fakePgState().cursors.size, 4);
+  assert.equal(fakePgState().cursors.size, 5);
   assert.equal(calls.onStep >= 1, true);
   for (const key of ["image", "provider", "publication", "supervisor"]) {
     assert.equal(calls[key], 0);
@@ -1282,7 +1314,7 @@ async function hostileOptions() {
     options.postgres.timeouts.queryMilliseconds = value;
     cases.push(options);
   }
-  for (let leafIndex = 0; leafIndex < 19; leafIndex += 1) {
+  for (let leafIndex = 0; leafIndex < 20; leafIndex += 1) {
     for (const field of [
       "deadlineMilliseconds",
       "settlementGraceMilliseconds",

@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 import {
   PHYSICAL_COLLABORATOR_SETTLEMENT_CONTRACT_VERSION,
   createPhysicalCollaboratorSettlement,
+  createQuiescentPhysicalCollaboratorSettlement,
 } from "./physical-collaborator-settlement.mjs";
 import {
   assertRestoreAttachmentReconciliationBackend,
@@ -13,6 +14,9 @@ import {
 import {
   STOPPED_WRITER_STOP_CONFIRMED,
 } from "./stopped-writer-capability.mjs";
+import {
+  assertPodmanWriterSupervisorStateRecord,
+} from "./podman-writer-supervisor-state.mjs";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
@@ -41,8 +45,13 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 const WeakSetConstructor = WeakSet;
 const { isGeneratorFunction, isPromise, isProxy } = utilTypes;
 
-export const POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION = 1;
-export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION = 2;
+export const POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION = 2;
+export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION = 3;
+export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION = 2;
+export const POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION = 2;
+export const POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION = 1;
+export const POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION =
+  1;
 export const POSTGRES_SESSION_STORAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION = 1;
 export const POSTGRES_RESTORE_DESTINATION_RESOLVER_PHYSICAL_CONTRACT_VERSION = 1;
 
@@ -57,6 +66,8 @@ const OPTION_KEYS = objectFreeze([
   "resolveRestoreDestinationSettlement",
   "supervisor",
   "supervisorSettlement",
+  "supervisorStateCollectionSettlement",
+  "supervisorStateCollector",
 ]);
 const POLICY_KEYS = objectFreeze([
   "deadlineMilliseconds",
@@ -78,6 +89,11 @@ const SUPERVISOR_METHODS = objectFreeze([
   "launchWriter",
   "reconcileWriterLaunch",
   "stopWriter",
+]);
+const SUPERVISOR_STATE_COLLECTOR_KEYS = objectFreeze([
+  "collectTerminalState",
+  "contractVersion",
+  "supervisorId",
 ]);
 const LIFECYCLE_METHODS = objectFreeze([
   "captureCheckpoint",
@@ -123,18 +139,28 @@ const LAUNCH_RECEIPT_KEYS = objectFreeze([
   "evidence",
   "receiptVersion",
   "stopWriter",
+  "terminalRecord",
 ]);
 const RECONCILE_RECEIPT_KEYS = objectFreeze([
   "evidence",
   "receiptVersion",
 ]);
-const STOP_RECEIPT_KEYS = objectFreeze(["contractVersion", "status"]);
+const STOP_RECEIPT_KEYS = objectFreeze([
+  "contractVersion",
+  "status",
+  "terminalRecord",
+]);
 const STOP_FACADE_REQUEST_KEYS = objectFreeze([
   "attachment",
   "processIncarnationId",
   "stopOperationId",
   "writerFence",
   "writerIncarnationId",
+]);
+const STOP_CARRIER_KEYS = objectFreeze([
+  "callback",
+  "launchAttemptId",
+  "request",
 ]);
 const EVIDENCE_KEYS = objectFreeze([
   "contractVersion",
@@ -145,9 +171,17 @@ const EVIDENCE_KEYS = objectFreeze([
   "supervisorId",
   "writerIncarnationId",
 ]);
+const STATE_COLLECTION_REQUEST_KEYS = objectFreeze(["terminalRecord"]);
+const STATE_COLLECTION_RECEIPT_KEYS = objectFreeze([
+  "contractVersion",
+  "launchAttemptId",
+  "status",
+  "terminalRecordSha256",
+]);
 const MAX_MILLISECONDS = 86_400_000;
 const MAX_SHALLOW_KEYS = 256;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_postgres_detached_restore_physical_bindings_options:
@@ -677,6 +711,16 @@ function createSettlement(policy, onFatal, code) {
   }
 }
 
+function createStateCollectionSettlement(policy, onFatal, code) {
+  try {
+    return createQuiescentPhysicalCollaboratorSettlement(
+      exactFrozenRecord({ ...policy, onFatal }),
+    );
+  } catch {
+    fail(code);
+  }
+}
+
 function invokeSettlement(settlement, start, code) {
   let pending;
   try {
@@ -763,6 +807,17 @@ function physicalStopRequest(request, context, code) {
   });
 }
 
+function physicalStateCollectionRequest(request, context, code) {
+  const input = shallowSnapshot(request, code);
+  return exactFrozenRecord({
+    ...input,
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    invocation: context.invocation,
+    signal: context.signal,
+  });
+}
+
 function facadeEvidence(value, statuses, code) {
   const evidence = dataObject(value, EVIDENCE_KEYS, code);
   ensure(
@@ -785,6 +840,22 @@ function facadeEvidence(value, statuses, code) {
     code,
   );
   return exactFrozenRecord({ ...evidence, contractVersion: 1 });
+}
+
+function terminalStateRecord(value, launchAttemptId, code) {
+  let record;
+  try {
+    record = assertPodmanWriterSupervisorStateRecord(value);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    record.status === "stopped" &&
+      record.revision === 4 &&
+      (launchAttemptId === null || record.launchAttemptId === launchAttemptId),
+    code,
+  );
+  return record;
 }
 
 function constructionCleanup(settlements) {
@@ -836,6 +907,25 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
     ),
     supervisorId: supervisorValue.supervisorId,
   });
+  const stateCollectorValue = dataObject(
+    options.supervisorStateCollector,
+    SUPERVISOR_STATE_COLLECTOR_KEYS,
+    optionCode,
+  );
+  ensure(
+    stateCollectorValue.contractVersion ===
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
+      stateCollectorValue.supervisorId === rawSupervisor.supervisorId,
+    optionCode,
+  );
+  const rawStateCollector = exactFrozenRecord({
+    collectTerminalState: trustedFunction(
+      stateCollectorValue.collectTerminalState,
+      optionCode,
+    ),
+    contractVersion: stateCollectorValue.contractVersion,
+    supervisorId: stateCollectorValue.supervisorId,
+  });
   let rawLifecycle;
   try {
     preflightLifecycleBackend(options.lifecycleBackend, optionCode);
@@ -875,6 +965,10 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
     SUPERVISOR_METHODS,
     optionCode,
   );
+  const stateCollectionPolicy = normalizePolicy(
+    options.supervisorStateCollectionSettlement,
+    optionCode,
+  );
   const lifecyclePolicies = normalizePolicies(
     options.lifecycleSettlement,
     LIFECYCLE_METHODS,
@@ -902,6 +996,13 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       settlements[settlements.length] = settlement;
       settlementByName[`supervisor:${method}`] = settlement;
     }
+    const stateCollectionSettlement = createStateCollectionSettlement(
+      stateCollectionPolicy,
+      onFatal,
+      optionCode,
+    );
+    settlements[settlements.length] = stateCollectionSettlement;
+    settlementByName.supervisorStateCollector = stateCollectionSettlement;
     for (let index = 0; index < LIFECYCLE_METHODS.length; index += 1) {
       const method = LIFECYCLE_METHODS[index];
       const settlement = createSettlement(
@@ -930,14 +1031,19 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
     if (isInternalError(error)) throw error;
     fail(optionCode);
   }
-  ensure(settlements.length === 17, optionCode);
+  ensure(settlements.length === 18, optionCode);
 
   function assembleBindings() {
     const stopWriter = objectFreeze(async function stopWriter(...methodArgs) {
       ensure(methodArgs.length === 1, requestCode);
       const stop = dataObject(
         methodArgs[0],
-        objectFreeze(["callback", "request"]),
+        STOP_CARRIER_KEYS,
+        requestCode,
+      );
+      ensure(
+        typeof stop.launchAttemptId === "string" &&
+          regexpTest(OPAQUE_ID_PATTERN, stop.launchAttemptId),
         requestCode,
       );
       const carrier = await settledValue(
@@ -957,7 +1063,25 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
           receipt.status === "stopped",
         outcomeCode,
       );
-      return STOPPED_WRITER_STOP_CONFIRMED;
+      const terminalRecord = terminalStateRecord(
+        receipt.terminalRecord,
+        stop.launchAttemptId,
+        outcomeCode,
+      );
+      ensure(
+        terminalRecord.processIncarnationId ===
+            stop.request.processIncarnationId &&
+          terminalRecord.stopOperationId === stop.request.stopOperationId &&
+          terminalRecord.writerIncarnationId ===
+            stop.request.writerIncarnationId,
+        outcomeCode,
+      );
+      return exactFrozenRecord({
+        confirmation: STOPPED_WRITER_STOP_CONFIRMED,
+        contractVersion:
+          POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION,
+        terminalRecord,
+      });
     });
 
     const launchWriter = objectFreeze(async function launchWriter(...methodArgs) {
@@ -975,12 +1099,34 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       );
       const value = carrier.value;
       const receipt = dataObject(value, LAUNCH_RECEIPT_KEYS, outcomeCode);
-      ensure(receipt.receiptVersion === 1, outcomeCode);
+      ensure(
+        receipt.receiptVersion ===
+          POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+        outcomeCode,
+      );
       const evidence = facadeEvidence(
         receipt.evidence,
         objectFreeze(["complete-stopped", "not-started", "started"]),
         outcomeCode,
       );
+      let terminalRecord = null;
+      if (evidence.status === "complete-stopped") {
+        terminalRecord = terminalStateRecord(
+          receipt.terminalRecord,
+          evidence.launchAttemptId,
+          outcomeCode,
+        );
+        ensure(
+          terminalRecord.processIncarnationId ===
+              evidence.processIncarnationId &&
+            terminalRecord.stopProofId === evidence.proofId &&
+            terminalRecord.writerIncarnationId ===
+              evidence.writerIncarnationId,
+          outcomeCode,
+        );
+      } else {
+        ensure(receipt.terminalRecord === null, outcomeCode);
+      }
       let facadeStopWriter = null;
       if (evidence.status === "started") {
         const rawStop = trustedFunction(receipt.stopWriter, outcomeCode);
@@ -992,7 +1138,11 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
               STOP_FACADE_REQUEST_KEYS,
               requestCode,
             );
-            return stopWriter(exactFrozenRecord({ callback: rawStop, request }));
+            return stopWriter(exactFrozenRecord({
+              callback: rawStop,
+              launchAttemptId: evidence.launchAttemptId,
+              request,
+            }));
           },
         );
       } else {
@@ -1000,8 +1150,10 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       }
       return exactFrozenRecord({
         evidence,
-        receiptVersion: receipt.receiptVersion,
+        receiptVersion:
+          POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
         stopWriter: facadeStopWriter,
+        terminalRecord,
       });
     });
 
@@ -1021,22 +1173,75 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
         );
         const value = carrier.value;
         const receipt = dataObject(value, RECONCILE_RECEIPT_KEYS, outcomeCode);
-        ensure(receipt.receiptVersion === 1, outcomeCode);
+        ensure(
+          receipt.receiptVersion ===
+            POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+          outcomeCode,
+        );
         return exactFrozenRecord({
           evidence: facadeEvidence(
             receipt.evidence,
             objectFreeze(["complete-stopped", "not-started"]),
             outcomeCode,
           ),
-          receiptVersion: receipt.receiptVersion,
+          receiptVersion:
+            POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
         });
       },
     );
     const supervisor = exactFrozenRecord({
-      contractVersion: 1,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION,
       launchWriter,
       reconcileWriterLaunch,
       supervisorId: rawSupervisor.supervisorId,
+    });
+
+    const collectTerminalState = objectFreeze(
+      async function collectTerminalState(...methodArgs) {
+        ensure(methodArgs.length === 1, requestCode);
+        const request = dataObject(
+          methodArgs[0],
+          STATE_COLLECTION_REQUEST_KEYS,
+          requestCode,
+        );
+        const terminalRecord = terminalStateRecord(
+          request.terminalRecord,
+          null,
+          requestCode,
+        );
+        const carrier = await settledValue(
+          settlementByName.supervisorStateCollector,
+          rawStateCollector.collectTerminalState,
+          undefined,
+          exactFrozenRecord({ terminalRecord }),
+          (input, context) =>
+            physicalStateCollectionRequest(input, context, requestCode),
+          false,
+          outcomeCode,
+        );
+        const receipt = dataObject(
+          carrier.value,
+          STATE_COLLECTION_RECEIPT_KEYS,
+          outcomeCode,
+        );
+        ensure(
+          receipt.contractVersion ===
+              POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
+            receipt.launchAttemptId === terminalRecord.launchAttemptId &&
+            includes(["absent", "collected"], receipt.status) &&
+            typeof receipt.terminalRecordSha256 === "string" &&
+            regexpTest(SHA256_PATTERN, receipt.terminalRecordSha256),
+          outcomeCode,
+        );
+        return exactFrozenRecord(receipt);
+      },
+    );
+    const supervisorStateCollector = exactFrozenRecord({
+      collectTerminalState,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      supervisorId: rawStateCollector.supervisorId,
     });
 
     const lifecycleRecord = {
@@ -1196,6 +1401,7 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       resolveRestoreDestination,
       stop,
       supervisor,
+      supervisorStateCollector,
     });
     weakSetAdd(bindingBrands, binding);
     return binding;
