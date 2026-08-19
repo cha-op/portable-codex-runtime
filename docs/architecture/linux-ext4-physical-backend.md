@@ -410,6 +410,8 @@ with unique operations. This slice has no retention floor or garbage
 collection; a production host must monitor `inspectCapacity()` and the
 provider-state filesystem. Future work may define an authority-safe retention
 floor or move exact replay history to an indexed PostgreSQL representation.
+That floor must preserve the origin operation for every current attachment so
+its committed attachment identity remains reconstructable.
 
 A prepared provision has not exposed a storage result. Its retry may adopt a
 currently valid control object on the same deterministic image and mount; the
@@ -520,18 +522,28 @@ The exact local `start <full-container-id>` shape has a stricter mutation
 barrier. Podman may already have launched conmon in another process group, so
 the runner neither attaches the caller's abort signal nor applies its command
 timer after dispatch. A zero exit can continue to exact inspect and live
-attachment proof. Any post-spawn error, signal, or nonzero exit remains pending
-even after same-group cleanup: Podman's internal runtime-create timeout can
-return while a
-separate conmon/crun process is still resolving the holder source, and this
-surface has no authenticated conmon PID or cgroup fence. A Podman or kernel
-hang therefore keeps the filesystem authority held instead of returning an
-error that would release the holder while escaped runtime work might still use
-its FD. This is intentionally an availability non-guarantee. Pre-spawn failure
-can still return normally because no Podman process accepted the mutation. The
-claim is scoped to the reviewed Podman 4.9.3/conmon/crun execution contract and
-to a live supervisor/holder; process crash, host loss, or runtime/configuration
-drift still requires the documented external physical fence.
+attachment proof. In the default runner, a post-spawn error, signal, or nonzero
+exit remains pending even after same-group cleanup: Podman's internal runtime-
+create timeout can return while a separate conmon/crun process is still
+resolving the holder source, and this surface has no authenticated conmon PID
+or cgroup fence. A Podman or kernel hang therefore keeps the filesystem
+authority held instead of returning an error that would release the holder
+while escaped runtime work might still use its FD. This is intentionally an
+availability non-guarantee. Pre-spawn failure can still return normally because
+no Podman process accepted the mutation. The claim is scoped to the reviewed
+Podman 4.9.3/conmon/crun execution contract and to a live supervisor/holder;
+process crash, host loss, or runtime/configuration drift still requires the
+documented external physical fence.
+
+Once exact `start` has crossed that possible-execution boundary, any failure
+that reaches the supervisor from later inspect, live-mount, persistent-
+authority, durable-transition, or authority-close work is reported only as
+`podman_writer_supervisor_outcome_uncertain`; it cannot be downgraded to a
+conclusive missing or mismatch result. Likewise, after reconciliation has
+observed the exact container running, failure of its subsequent bind or
+authority proof is uncertain rather than conclusive. This preserves the
+distinction between a proved pre-dispatch rejection and an unverified post-
+execution state.
 
 Holder shutdown likewise requires both direct Podman-wrapper close and kernel
 `ESRCH` for its detached process group. Forced cleanup signals that group only
@@ -552,17 +564,20 @@ Podman rejects that command in remote or rootful mode. A failed or timed-out
 probe is an uncertain observation, while directly observed root real or
 effective credentials are a deterministic rootless-policy mismatch.
 
-That default does not reconstruct the provider state's persistent ext4
-`rootIdentity` from an opaque attachment proof. Production must inject the
-trusted `filesystemAuthority` seam and bind the complete attachment tuple to
-the provider's committed filesystem/file-handle identity before it authorizes
-the held object. The current Podman conformance job deliberately exercises the
-narrower default authority with a synthetic attachment; the ext4 conformance
-jobs exercise the persistent identity independently. They are
-production-injectable components, not evidence of that final same-process
-identity bridge. The built-in namespace holder is coupled to the built-in
-command runner; a deployment that injects a different runner must also inject
-its matching trusted filesystem authority instead of mixing execution domains.
+`createExt4PodmanAttachmentBinding()` now closes the production composition
+gap for the initialized ext4 backend. Its persistent authority reconstructs
+the complete attachment tuple from the origin operation and current provider
+storage record, requires their committed persistent filesystem/file-handle
+identity to agree, and asks the driver for a same-sample
+`rootRuntimeIdentity`. The Podman composition compares that runtime
+`device`/`inode` directly with its held attachment FD and revalidates the live
+bind around start. This protects persistent and runtime object identity;
+current-user ownership, exact `0700`, link/type, and ACL policy remain an
+independent access-policy property. Child-entry, file-content, and timestamp
+churn do not replace the directory and are deliberately allowed. The built-in
+namespace holder is coupled to the built-in command runner; a deployment that
+injects a different runner must also inject its matching trusted filesystem
+authority instead of mixing execution domains.
 
 `reconcileWriterLaunch()` is a repeatable stopped-only observation. It may
 enumerate and inspect the exact container and prove the live bind identity, but
@@ -591,13 +606,16 @@ authority.
 ## Production Injection
 
 The generic deployment already exposes the required injection points. A host
-constructs the inspector, driver, paths, externally anchored provider state,
-raw backend, initialized backend, publication, and supervisor before creating
-the deployment. It maps them as follows:
+constructs the inspector, driver, paths, and externally anchored provider
+state, then passes them through `createExt4PodmanAttachmentBinding()` so the
+initialized backend and Podman filesystem authority cannot diverge. It
+constructs publication and the supervisor before creating the deployment. It
+maps them as follows:
 
-- `runtime.launch.supervisor` receives the Podman v2 surface;
+- `runtime.launch.supervisor` receives the Podman v2 surface constructed with
+  the binding's `filesystemAuthority`;
 - `runtime.storage.lifecycleBackend` receives
-  `initializedBackend.lifecycleBackend`;
+  `binding.backend.lifecycleBackend`;
 - `runtime.storage.publication` receives the stopped-directory publication;
 - `runtime.storage.resolveArtifactPaths` and
   `resolveSourceOwnedRoot` receive the ext4 path functions; and
@@ -614,13 +632,26 @@ and keep the deployment plus every helper or broker invocation in that
 namespace until shutdown. Creating the namespace inside one helper call is
 invalid because its mounts would disappear when that helper exits.
 
+Rootless Podman's pause process retains the user and mount namespaces created
+by the first `podman unshare`. When that creation happens after the ext4 mounts
+exist, the pause namespace holds real references to those filesystems even
+after the exact writer container is stopped and removed. A deployment that
+uses this shape must give the service an exclusive Unix UID and Podman engine,
+prove the complete container and pod inventories empty after every Podman
+callback is quiescent, and retire the user-wide pause namespace before physical
+ext4 quiescence. `podman system migrate` is not a container-scoped operation
+and is forbidden for a shared UID or shared engine. A different production
+host must instead supply a separately proved scoped namespace-release design.
+
 Shutdown order is also host-owned:
 
 1. stop the generic deployment and wait for admission and settlement drain;
-2. enumerate provider state and quiesce every non-destroyed session image;
-3. quiesce the archive image and the Podman supervisor state; and
-4. close the dedicated provider-state PostgreSQL pool; then
-5. drain any namespace-entered helper broker and let the service process exit
+2. after proving an exclusive Podman engine empty, retire its rootless pause
+   namespace without issuing another Podman command;
+3. enumerate provider state and quiesce every non-destroyed session image;
+4. quiesce the archive image and the Podman supervisor state; and
+5. close the dedicated provider-state PostgreSQL pool; then
+6. drain any namespace-entered helper broker and let the service process exit
    the private mount namespace.
 
 The generic deployment cannot prove that collaborators owned outside its
@@ -639,27 +670,37 @@ long-lived private mount namespace, prepares separate `rprivate` archive and
 session self-bind roots, then drops to the ordinary service user before Node
 starts. While both producer images are mounted, a parent/child barrier proves
 that the child namespace sees each exact ext4 mount and the parent namespace
-does not when the privileged workflow gate runs. The producer publishes a
-fresh checkpoint and restore destination,
-verifies both, cleanly unmounts and detaches both loop devices, and uploads the
-sparse raw images plus anchored receipts. The consumer remounts those same
+does not when the privileged workflow gate runs. After committed attach and
+before detach, that same non-root producer Node process uses the initialized
+ext4-to-Podman binding to launch a real rootless Podman writer, verifies its
+owned `0600` marker, and stops it. Marker polling treats an existing partial
+write as transient until the bounded deadline rather than as immediate
+corruption. The dedicated hosted runner next proves the complete rootless
+container and pod inventories empty and retires the user-wide pause namespace;
+no later Podman call can recreate it. The flow then detaches the writer root,
+publishes and verifies a fresh checkpoint and restore destination, cleanly
+settles both images, and uploads the sparse raw images plus anchored receipts.
+The consumer remounts those same
 bytes on a new host, verifies the provider head and archive mount-root and
 artifact-child control tuples from independent job outputs, rejects a
 transferred receipt unless its service UID equals the consumer's, performs
-source-free committed checkpoint and restore verification, reattaches the
-writer root at a higher epoch, and destroys both images.
+source-free committed checkpoint and restore verification including the
+Podman-written marker, reattaches the writer root at a higher epoch, and
+destroys both images.
 
 A separate Ubuntu job builds a digest-pinned scratch image and exercises the
 rootless Podman launch, bind write, ready proof, stop, and cold reconciliation
 surface.
 
-The ext4 and Podman jobs prove privilege-compatible components, not one
-same-process end-to-end deployment. A production composition must still bind
-the initialized ext4 attachment's persistent identity to the Podman filesystem
-authority in the same non-root process and satisfy the generic deployment's
-independent PostgreSQL gates.
+The composed producer proves the ext4 attachment and Podman writer share one
+same-process authority boundary. It does not assemble the generic deployment's
+independent PostgreSQL gates into one whole-saga run.
 
 These jobs prove clean detach, remount, publication, and cross-host identity.
+The namespace retirement only releases the hosted runner's exclusive Podman
+engine. Final physical quiescence still comes from the native loop receipt:
+unused device identity, advanced disk sequence, and absent sysfs backing.
+Container stop/removal alone is not loop-detach evidence.
 They do not simulate sudden power loss, storage-controller cache loss,
 partitioned stale-writer revocation, or an automatic force fence. Crash-prefix
 checkpointing, epoch-enforced fencing, differential export, compression,

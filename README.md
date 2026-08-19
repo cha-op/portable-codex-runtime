@@ -20,7 +20,8 @@ The Linux production-injection surface now has independent clean/manual-
 fencing components: FD-bound raw ext4 images, externally anchored provider
 state, separate publication-control identities, and a rootless Podman writer
 supervisor. The ext4 component requires a host-owned long-lived private mount
-namespace; the persistent ext4-to-Podman identity bridge remains pending.
+namespace. The initialized ext4 backend now composes its committed attachment
+identity with the Podman filesystem authority in the same non-root process.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -80,7 +81,8 @@ directory binds, and recovery checkpoint classes. These contracts remain
 provider-neutral; the Linux ext4 and Podman components supply independent
 clean, manually fenced seams without turning a lease or database epoch into
 physical authority. Their trusted persistent-identity bridge and same-process
-conformance evidence remain pending.
+conformance evidence are now implemented for the clean/manual-fencing Linux
+boundary.
 An optional version 1 restore-attachment activation extension binds the exact
 committed publication object and materialization digest to the provider's
 attach mutation, canonical attachment, and proof. Path equality remains
@@ -546,33 +548,42 @@ destroyed tombstone; exact replay therefore makes checkpoint and aggregate
 provider-state storage grow with unique operations. This slice supplies no
 retention or garbage collection, so hosts must monitor `inspectCapacity()` and
 the provider-state directory until a retention floor or PostgreSQL-indexed
-history is designed.
+history is designed. Any future retention floor must preserve the origin
+operation for every current attachment so its committed identity remains
+reconstructable.
 
 The two-host Ubuntu conformance flow runs each Node process and helper in one
 long-lived private mount namespace with dedicated `rprivate` archive and
 session roots. A live-mount barrier proves the producer's ext4 mounts are
 visible in that child namespace and absent from its parent when the privileged
-workflow gate runs. The flow then cleanly detaches and transfers both images.
-On the consumer host, the externally anchored archive mount-root tuple makes
-the first remount verification-only; the distinct artifact-child tuple then
-authorizes publication verification for that exact owned root. The default
-Podman filesystem authority protects the object selected for a call; a trusted
-adapter that binds the provider's committed ext4 identity into that authority,
-and same-process evidence for the combined components, remain pending. For its
-narrower local boundary, the default authority keeps parent-held directory FDs
-and a temporary FD holder inside Podman's rootless namespace, compares both
-sides' object identity and access policy, proves the exact configured bind
-in Podman's external `created` state before start, and brackets the live bind
-proof with stable container ID/PID
-observations. A new create receipt must contain the complete 64-hex container
-ID before start is admitted. Image `Config.User` supplies the exact non-root
-numeric UID/GID mapped by `keep-id`; the Linux conformance writer must create a
-current-service-owned `0600` marker through that bind. Custom command runners
-must provide their own matching trusted filesystem authority. An ordinary
-Podman failure observed before direct-child exit requests whole-group
-termination; every failed command waits for direct close and kernel-proved
-group absence, and never signals the frozen numeric PGID after exit. Holder
-shutdown likewise requires its wrapper to close and its group to disappear;
+workflow gate runs. After the committed attach and before detach, that same
+Linux producer job authorizes a real rootless Podman writer through the
+initialized ext4 backend in the same non-root Node process. The flow then
+proves the dedicated runner's rootless container and pod inventories empty,
+retires Podman's user-wide pause namespace, and issues no further Podman
+command before it cleanly detaches and transfers both images. This retirement
+is safe only for an exclusive service UID and Podman engine; container
+stop/removal alone does not prove that no namespace still references the ext4
+filesystem. On the consumer host, the
+externally anchored archive mount-root tuple makes the first remount
+verification-only; the distinct artifact-child tuple authorizes publication
+verification for that exact owned root. The composition matches the provider's
+committed persistent filesystem/file-handle identity to a driver observation whose
+runtime `device`/`inode` sample is compared with Podman's held attachment FD
+and live bind. Access policy remains a separate authority check; ordinary
+child-entry, content, and timestamp churn are allowed. The default authority
+keeps parent-held directory FDs and a temporary FD holder inside Podman's
+rootless namespace, proves the exact configured bind in Podman's external
+`created` state before start, and brackets the live bind proof with stable
+container ID/PID observations. A new create receipt must contain the complete
+64-hex container ID before start is admitted. Image `Config.User` supplies the
+exact non-root numeric UID/GID mapped by `keep-id`; the Linux conformance writer
+must create a current-service-owned `0600` marker through that bind. Custom
+command runners must provide their own matching trusted filesystem authority.
+An ordinary Podman failure observed before direct-child exit requests whole-
+group termination; every failed command waits for direct close and kernel-
+proved group absence, and never signals the frozen numeric PGID after exit.
+Holder shutdown likewise requires its wrapper to close and its group to disappear;
 the exact `start` mutation is not force-cancelled after dispatch because conmon
 may have moved outside the CLI group, so an unresponsive or failed dispatched
 start deliberately remains pending and holds authority instead of returning an

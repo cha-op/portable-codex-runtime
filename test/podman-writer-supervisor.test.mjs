@@ -7,6 +7,7 @@ import {
   existsSync,
   openSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -29,6 +30,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PodmanWriterSupervisorError,
+  createPodmanWriterFilesystemAuthorityComposition,
   createPodmanWriterSupervisor,
 } from "../src/podman-writer-supervisor.mjs";
 import {
@@ -294,6 +296,7 @@ function defaultAuthorityPodmanScript({
   createMarker,
   createMutation = "",
   holderArgvPath = "/dev/null",
+  holderPidPath = "/dev/null",
   mountPath,
   namePath,
   startedPath,
@@ -314,6 +317,7 @@ case "$1" in
       exit 0
     fi
     printf '%s\\n' "$@" > ${shellQuote(holderArgvPath)}
+    printf '%s\\n' "$$" > ${shellQuote(holderPidPath)}
     shift
     exec "$@"
     ;;
@@ -939,6 +943,58 @@ function successfulFilesystemAuthority(
   });
 }
 
+function persistentCurrentReceipt(rootPath, bindingSha256 = "7".repeat(64)) {
+  const root = statSync(rootPath, { bigint: true });
+  return exact({
+    bindingSha256,
+    rootRuntimeIdentity: exact({
+      device: String(root.dev),
+      inode: String(root.ino),
+    }),
+    status: "current",
+  });
+}
+
+function persistentFilesystemAuthority(rootPath, events, settings = {}) {
+  return exact({
+    contractVersion: 1,
+    async verify(input) {
+      assert.deepEqual(Reflect.ownKeys(input), ["attachment"]);
+      assert.equal(Object.getPrototypeOf(input), null);
+      assert.equal(Object.isFrozen(input), true);
+      assert.equal(input.attachment.rootPath, rootPath);
+      events.push({ input, receiver: this });
+      if (settings.verify !== undefined) {
+        return settings.verify(input, events.length);
+      }
+      return persistentCurrentReceipt(
+        rootPath,
+        settings.bindingSha256 ?? "7".repeat(64),
+      );
+    },
+  });
+}
+
+function directCompositionAcquireInput(base) {
+  return exact({
+    attachment: base.input.attempt.request.attachment,
+    configuredAttachmentRoot: base.parent,
+    holder: exact({
+      environment: exact({
+        ...base.options.podmanEnvironment,
+        PATH: "/usr/bin:/bin",
+      }),
+      podmanExecutable: base.options.podmanExecutable,
+      signal: new AbortController().signal,
+      timeoutMilliseconds: base.options.commandTimeoutMilliseconds,
+    }),
+  });
+}
+
+function invokeFilesystemAuthorityMethod(authority, method, input) {
+  return Reflect.apply(authority[method], undefined, [input]);
+}
+
 async function fixture(t, settings = {}) {
   const parent = await mkdtemp(
     join(await realpath(tmpdir()), "podman-writer-supervisor-test-"),
@@ -1033,6 +1089,100 @@ async function preparingFixture(t) {
     .arguments_[2];
   return { ...base, name };
 }
+
+test("filesystem authority composition is exact, branded, and default-runner-only", async (t) => {
+  const persistentAuthority = exact({
+    contractVersion: 1,
+    async verify() {
+      return exact({
+        bindingSha256: null,
+        rootRuntimeIdentity: null,
+        status: "missing",
+      });
+    },
+  });
+  const authority = createPodmanWriterFilesystemAuthorityComposition(exact({
+    persistentAuthority,
+  }));
+  assert.equal(Object.getPrototypeOf(authority), null);
+  assert.equal(Object.isFrozen(authority), true);
+  assert.equal(
+    Object.isFrozen(createPodmanWriterFilesystemAuthorityComposition),
+    true,
+  );
+  assert.deepEqual(Reflect.ownKeys(authority), [
+    "contractVersion",
+    "acquire",
+    "close",
+    "verifyCurrent",
+    "verifyRunningMount",
+  ]);
+  for (const key of ["acquire", "close", "verifyCurrent", "verifyRunningMount"]) {
+    assert.equal(Object.isFrozen(authority[key]), true);
+    assert.equal(authority[key].length, 1);
+  }
+
+  for (const invalidFactoryCall of [
+    () => createPodmanWriterFilesystemAuthorityComposition(),
+    () => createPodmanWriterFilesystemAuthorityComposition(exact({
+      extra: true,
+      persistentAuthority,
+    })),
+    () => createPodmanWriterFilesystemAuthorityComposition(exact({
+      persistentAuthority: exact({ ...persistentAuthority, contractVersion: 2 }),
+    })),
+    () => createPodmanWriterFilesystemAuthorityComposition(exact({
+      persistentAuthority: exact({
+        contractVersion: 1,
+        verify: function* verify() {},
+      }),
+    })),
+    () => createPodmanWriterFilesystemAuthorityComposition(exact({
+      persistentAuthority: new Proxy(persistentAuthority, {}),
+    })),
+  ]) {
+    assert.throws(
+      invalidFactoryCall,
+      assertSupervisorError("invalid_podman_writer_supervisor_options"),
+    );
+  }
+  for (const method of [
+    "acquire",
+    "close",
+    "verifyCurrent",
+    "verifyRunningMount",
+  ]) {
+    await assert.rejects(
+      authority[method](exact({})),
+      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+    );
+    await assert.rejects(
+      Reflect.apply(authority[method], undefined, []),
+      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+    );
+    await assert.rejects(
+      Reflect.apply(authority[method], undefined, [exact({}), exact({})]),
+      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+    );
+  }
+
+  const base = await fixture(t);
+  assert.doesNotThrow(() => createPodmanWriterSupervisor(base.options));
+  assert.throws(
+    () => createPodmanWriterSupervisor(exact({
+      ...base.options,
+      filesystemAuthority: authority,
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+  // Copying the public shape does not copy the private default-backed brand.
+  // The copy remains a legacy custom authority and is not granted holder input.
+  const forged = exact({ ...authority });
+  assert.doesNotThrow(() => createPodmanWriterSupervisor(exact({
+    ...base.options,
+    filesystemAuthority: forged,
+  })));
+});
 
 test("launches with the fixed rootless digest-pinned argv and joins the container on stop", async (t) => {
   const base = await fixture(t);
@@ -1770,7 +1920,7 @@ test("attachment replacement, access-policy change, and unreadable revalidation 
   });
   await assert.rejects(
     policyChanged.supervisor.launchWriter(policyChanged.input),
-    assertSupervisorError("podman_writer_attachment_mismatch"),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
   );
   assert.deepEqual(
     policyChanged.filesystemEvents.map((event) => event.operation),
@@ -2098,7 +2248,7 @@ test("running reconciliation requires the live session bind to match the current
   }));
   await assert.rejects(
     supervisor.reconcileWriterLaunch(reconcileInput(base.input)),
-    assertSupervisorError("podman_writer_attachment_mismatch"),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
   );
   assert.deepEqual(commandEvents.map((event) => event.arguments_[0]), ["container"]);
   assert.deepEqual(
@@ -2119,7 +2269,7 @@ test("running mount proof is bracketed by stable exact-container PID inspections
   });
   await assert.rejects(
     base.supervisor.launchWriter(base.input),
-    assertSupervisorError("podman_writer_output_invalid"),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
   );
   assert.equal(runningInspections, 2);
   assert.equal(
@@ -2150,6 +2300,421 @@ test("pre-start inspection requires Podman's exact external created state", asyn
       );
     });
   }
+});
+
+test("Linux composed authority pins the default handle and persistent binding for its lifetime", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  let holderPidPath;
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 2_000,
+    defaultCommandRunnerScript({ parent }) {
+      holderPidPath = join(parent, "composition-holder-pid");
+      return defaultAuthorityPodmanScript({
+        createMarker: join(parent, "composition-create"),
+        holderPidPath,
+        mountPath: join(parent, "composition-mount"),
+        namePath: join(parent, "composition-name"),
+        startedPath: join(parent, "composition-started"),
+      });
+    },
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+    useDefaultFilesystemAuthority: true,
+  });
+  let receiptMode = "current";
+  const persistentEvents = [];
+  const persistentAuthority = persistentFilesystemAuthority(
+    base.attachmentRoot,
+    persistentEvents,
+    {
+      verify() {
+        const current = persistentCurrentReceipt(base.attachmentRoot);
+        if (receiptMode === "binding-mismatch") {
+          return exact({ ...current, bindingSha256: "8".repeat(64) });
+        }
+        if (receiptMode === "runtime-mismatch") {
+          return exact({
+            ...current,
+            rootRuntimeIdentity: exact({
+              ...current.rootRuntimeIdentity,
+              inode: String(BigInt(current.rootRuntimeIdentity.inode) + 1n),
+            }),
+          });
+        }
+        if (receiptMode === "missing") {
+          return exact({
+            bindingSha256: null,
+            rootRuntimeIdentity: null,
+            status: "missing",
+          });
+        }
+        return current;
+      },
+    },
+  );
+  const authority = createPodmanWriterFilesystemAuthorityComposition(exact({
+    persistentAuthority,
+  }));
+  receiptMode = "missing";
+  const normalizedSupervisor = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    filesystemAuthority: authority,
+  }));
+  await assert.rejects(
+    normalizedSupervisor.launchWriter(base.input),
+    assertSupervisorError("podman_writer_attachment_missing"),
+  );
+  assert.equal(persistentEvents.length, 1);
+  assert.equal(
+    processExists(Number(readFileSync(holderPidPath, "utf8").trim())),
+    false,
+  );
+
+  receiptMode = "current";
+  const acquireInput = directCompositionAcquireInput(base);
+  const pendingAcquisition = invokeFilesystemAuthorityMethod(
+    authority,
+    "acquire",
+    acquireInput,
+  );
+  assert.equal(Object.getPrototypeOf(pendingAcquisition), Promise.prototype);
+  const acquired = await pendingAcquisition;
+  assert.match(acquired.mountSource, /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+$/u);
+  assert.deepEqual(Reflect.ownKeys(acquired.handle), []);
+  assert.equal(Object.getPrototypeOf(acquired.handle), null);
+  assert.equal(Object.isFrozen(acquired.handle), true);
+  assert.equal(persistentEvents.length, 2);
+
+  const currentInput = exact({
+    attachment: acquireInput.attachment,
+    configuredAttachmentRoot: acquireInput.configuredAttachmentRoot,
+    handle: acquired.handle,
+  });
+  assert.equal(
+    await invokeFilesystemAuthorityMethod(authority, "verifyCurrent", currentInput),
+    true,
+  );
+  assert.equal(persistentEvents.length, 3);
+
+  receiptMode = "binding-mismatch";
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(authority, "verifyCurrent", currentInput),
+    assertSupervisorError("podman_writer_attachment_mismatch"),
+  );
+  receiptMode = "runtime-mismatch";
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(authority, "verifyCurrent", currentInput),
+    assertSupervisorError("podman_writer_attachment_mismatch"),
+  );
+  receiptMode = "missing";
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(authority, "verifyCurrent", currentInput),
+    assertSupervisorError("podman_writer_attachment_missing"),
+  );
+
+  const forgedHandle = exact({ ...acquired.handle });
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(
+      authority,
+      "close",
+      exact({ handle: forgedHandle }),
+    ),
+    assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+  );
+  const secondAuthority = createPodmanWriterFilesystemAuthorityComposition(exact({
+    persistentAuthority,
+  }));
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(
+      secondAuthority,
+      "close",
+      exact({ handle: acquired.handle }),
+    ),
+    assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+  );
+
+  assert.equal(
+    await invokeFilesystemAuthorityMethod(
+      authority,
+      "close",
+      exact({ handle: acquired.handle }),
+    ),
+    true,
+  );
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(
+      authority,
+      "close",
+      exact({ handle: acquired.handle }),
+    ),
+    assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+  );
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(authority, "verifyCurrent", currentInput),
+    assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+  );
+  for (const event of persistentEvents) assert.equal(event.receiver, undefined);
+  const holderPid = Number((await readFile(holderPidPath, "utf8")).trim());
+  assert.equal(processExists(holderPid), false);
+});
+
+test("Linux composed authority makes post-start persistent failures outcome-uncertain", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  const scenarios = [
+    {
+      name: "missing",
+      result: exact({
+        bindingSha256: null,
+        rootRuntimeIdentity: null,
+        status: "missing",
+      }),
+    },
+    {
+      name: "mismatch",
+      result: exact({
+        bindingSha256: null,
+        rootRuntimeIdentity: null,
+        status: "mismatch",
+      }),
+    },
+    { name: "rejected" },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async (t) => {
+      let holderPidPath;
+      let startedPath;
+      const base = await fixture(t, {
+        commandTimeoutMilliseconds: 2_000,
+        defaultCommandRunnerScript({ parent }) {
+          holderPidPath = join(parent, `${scenario.name}-post-start-holder-pid`);
+          startedPath = join(parent, `${scenario.name}-post-start-started`);
+          return defaultAuthorityPodmanScript({
+            createMarker: join(parent, `${scenario.name}-post-start-create`),
+            holderPidPath,
+            mountPath: join(parent, `${scenario.name}-post-start-mount`),
+            namePath: join(parent, `${scenario.name}-post-start-name`),
+            startedPath,
+          });
+        },
+        stopTimeoutSeconds: 1,
+        useDefaultCommandRunner: true,
+        useDefaultFilesystemAuthority: true,
+      });
+      let verifyCount = 0;
+      const persistentAuthority = exact({
+        contractVersion: 1,
+        async verify() {
+          verifyCount += 1;
+          if (existsSync(startedPath)) {
+            if (scenario.result === undefined) {
+              throw new Error("post-start persistent proof failed");
+            }
+            return scenario.result;
+          }
+          return persistentCurrentReceipt(base.attachmentRoot);
+        },
+      });
+      const authority = createPodmanWriterFilesystemAuthorityComposition(exact({
+        persistentAuthority,
+      }));
+      const supervisor = createPodmanWriterSupervisor(exact({
+        ...base.options,
+        filesystemAuthority: authority,
+      }));
+
+      await assert.rejects(
+        supervisor.launchWriter(base.input),
+        assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+      );
+      assert.equal(existsSync(startedPath), true);
+      assert.equal(verifyCount, 4);
+      assert.equal(
+        (await base.state.read(
+          exact({ launchAttemptId: "launch-attempt-001" }),
+        )).status,
+        "created",
+      );
+      const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
+      assert.equal(processExists(holderPid), false);
+    });
+  }
+});
+
+test("Linux composed authority maps persistent receipts and closes failed acquisitions", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  const cases = [
+    {
+      code: "podman_writer_attachment_missing",
+      name: "missing",
+      verify() {
+        return Promise.resolve(exact({
+          bindingSha256: null,
+          rootRuntimeIdentity: null,
+          status: "missing",
+        }));
+      },
+    },
+    {
+      code: "podman_writer_attachment_mismatch",
+      name: "mismatch",
+      verify() {
+        return Promise.resolve(exact({
+          bindingSha256: null,
+          rootRuntimeIdentity: null,
+          status: "mismatch",
+        }));
+      },
+    },
+    {
+      code: "podman_writer_attachment_mismatch",
+      name: "runtime-mismatch",
+      verify(rootPath) {
+        const current = persistentCurrentReceipt(rootPath);
+        return Promise.resolve(exact({
+          ...current,
+          rootRuntimeIdentity: exact({
+            ...current.rootRuntimeIdentity,
+            inode: String(BigInt(current.rootRuntimeIdentity.inode) + 1n),
+          }),
+        }));
+      },
+    },
+    {
+      code: "podman_writer_attachment_revalidation_failed",
+      name: "malformed",
+      verify(rootPath) {
+        const current = persistentCurrentReceipt(rootPath);
+        return Promise.resolve(exact({
+          ...current,
+          rootRuntimeIdentity: exact({
+            ...current.rootRuntimeIdentity,
+            inode: "00",
+          }),
+        }));
+      },
+    },
+    {
+      code: "podman_writer_attachment_revalidation_failed",
+      name: "synchronous-throw",
+      verify() {
+        throw new Error("persistent authority failed synchronously");
+      },
+    },
+    {
+      code: "podman_writer_attachment_revalidation_failed",
+      name: "rejected-promise",
+      verify() {
+        return Promise.reject(new Error("persistent authority rejected"));
+      },
+    },
+    {
+      code: "podman_writer_attachment_revalidation_failed",
+      name: "non-native-promise",
+      verify() {
+        return { then() {} };
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      let holderPidPath;
+      const base = await fixture(t, {
+        commandTimeoutMilliseconds: 2_000,
+        defaultCommandRunnerScript({ parent }) {
+          holderPidPath = join(parent, `${scenario.name}-holder-pid`);
+          return defaultAuthorityPodmanScript({
+            createMarker: join(parent, `${scenario.name}-create`),
+            holderPidPath,
+            mountPath: join(parent, `${scenario.name}-mount`),
+            namePath: join(parent, `${scenario.name}-name`),
+            startedPath: join(parent, `${scenario.name}-started`),
+          });
+        },
+        stopTimeoutSeconds: 1,
+        useDefaultCommandRunner: true,
+        useDefaultFilesystemAuthority: true,
+      });
+      let receiver = null;
+      const persistentAuthority = exact({
+        contractVersion: 1,
+        verify(input) {
+          receiver = this;
+          assert.deepEqual(Reflect.ownKeys(input), ["attachment"]);
+          return scenario.verify(base.attachmentRoot);
+        },
+      });
+      const authority = createPodmanWriterFilesystemAuthorityComposition(exact({
+        persistentAuthority,
+      }));
+      await assert.rejects(
+        invokeFilesystemAuthorityMethod(
+          authority,
+          "acquire",
+          directCompositionAcquireInput(base),
+        ),
+        assertSupervisorError(scenario.code),
+      );
+      assert.equal(receiver, undefined);
+      const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
+      assert.equal(processExists(holderPid), false);
+    });
+  }
+});
+
+test("Linux composed authority does not hide holder-close uncertainty behind a persistent rejection", {
+  skip: process.platform !== "linux" || !existsSync("/usr/bin/getfacl"),
+}, async (t) => {
+  let holderPidPath;
+  const base = await fixture(t, {
+    commandTimeoutMilliseconds: 2_000,
+    defaultCommandRunnerScript({ parent }) {
+      holderPidPath = join(parent, "uncertain-close-holder-pid");
+      return defaultAuthorityPodmanScript({
+        createMarker: join(parent, "uncertain-close-create"),
+        holderPidPath,
+        mountPath: join(parent, "uncertain-close-mount"),
+        namePath: join(parent, "uncertain-close-name"),
+        startedPath: join(parent, "uncertain-close-started"),
+      });
+    },
+    stopTimeoutSeconds: 1,
+    useDefaultCommandRunner: true,
+    useDefaultFilesystemAuthority: true,
+  });
+  const persistentAuthority = exact({
+    contractVersion: 1,
+    async verify() {
+      const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
+      process.kill(-holderPid, "SIGKILL");
+      for (let attempt = 0; attempt < 100 && processExists(holderPid); attempt += 1) {
+        await delay(10);
+      }
+      await delay(20);
+      return exact({
+        bindingSha256: null,
+        rootRuntimeIdentity: null,
+        status: "missing",
+      });
+    },
+  });
+  const authority = createPodmanWriterFilesystemAuthorityComposition(exact({
+    persistentAuthority,
+  }));
+  await assert.rejects(
+    invokeFilesystemAuthorityMethod(
+      authority,
+      "acquire",
+      directCompositionAcquireInput(base),
+    ),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
+  const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
+  assert.equal(processExists(holderPid), false);
 });
 
 test("Linux default authority holds a rootless helper procfd and reaps it on close", {
@@ -2215,7 +2780,7 @@ test("Linux default authority holds a rootless helper procfd and reaps it on clo
   try {
     await assert.rejects(
       base.supervisor.launchWriter(base.input),
-      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
     );
   } finally {
     Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
@@ -2643,7 +3208,7 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
   try {
     await assert.rejects(
       base.supervisor.launchWriter(base.input),
-      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
     );
   } finally {
     childProcess.spawnSync = originalSpawnSync;
@@ -3007,7 +3572,10 @@ test("exact Podman start abort and timeout hold authority until natural CLI clos
   assert.equal(closeCount, 0);
 
   await writeFile(releasePath, "release\n", { mode: 0o600 });
-  await assert.rejects(pending, assertSupervisorError("podman_writer_supervisor_aborted"));
+  await assert.rejects(
+    pending,
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
   assert.equal(settled, true);
   assert.equal(closeCount, 1);
 });

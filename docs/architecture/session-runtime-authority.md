@@ -71,18 +71,20 @@ implemented under the database-global shared/exclusive lifecycle guard and
 bounded recovery scheduler. The invocation-time detached-production gate,
 durable read-only stable-plan lookup, deployment bindings, and final immutable
 public checkpoint backend are now complete. The production-injectable Linux
-physical components are also complete independently for clean/manual-fencing
-operation: they supply an FD-bound ext4 raw-image lifecycle, an externally
-anchored provider ledger, separate persistent publication-control identities,
-and a rootless Podman supervisor. Their two-host conformance boundary verifies
-clean detach, raw-image transfer, a verification-only first remount, and
+physical components and their ext4-to-Podman composition are complete for
+clean/manual-fencing operation: they supply an FD-bound ext4 raw-image
+lifecycle, an externally anchored provider ledger, separate persistent
+publication-control identities, and a rootless Podman supervisor. Their
+two-host conformance boundary verifies clean detach, raw-image transfer, a
+verification-only first remount, and
 distinct archive mount-root and artifact-child identity readback. The ext4
 component operates only below host-prepared `rprivate` carriers in one
 long-lived private mount namespace; a live producer barrier gates whether
-those ext4 mounts propagate to its parent namespace. A trusted
-bridge from committed ext4 identity to Podman filesystem authority and
-same-process conformance evidence remain pending; the current evidence does not
-claim power-loss/crash-prefix recovery or automatic stale-writer fencing.
+those ext4 mounts propagate to its parent namespace. The initialized ext4
+backend now binds committed persistent identity and a driver same-sample
+runtime identity into Podman's held FD and live mount authority in that same
+non-root producer process; the current evidence does not claim power-loss/
+crash-prefix recovery or automatic stale-writer fencing.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -2237,9 +2239,19 @@ local revisions, and supports stop/join plus read-only cold reconciliation.
 The generic PostgreSQL deployment still constructs neither collaborator; a
 production host injects them and owns their additional provider-state pool and
 shutdown order.
-Binding the provider's committed ext4 root identity into a trusted Podman
-filesystem authority, together with same-process conformance evidence, remains
-required before describing those components as one production graph.
+The initialized ext4-to-Podman binding now reconstructs the committed
+attachment from provider state, binds its persistent filesystem/file-handle
+identity to the driver's same-sample runtime `device`/`inode`, and matches that
+runtime identity to Podman's held FD and live mount in one non-root process.
+Access policy is checked independently; child-entry, content, and timestamp
+churn are not object replacement and remain allowed. The generic PostgreSQL
+deployment still owns separate gates and is not one whole-saga conformance run.
+The rootless Podman pause process is a separate filesystem-reference holder,
+not metadata churn. The conformance host therefore uses an exclusive service
+UID and Podman engine, proves the complete container and pod inventories empty
+after stop, and retires the user-wide pause namespace before ext4 detach. A
+shared engine cannot use this global release operation; production must own the
+whole engine lifecycle or provide another scoped namespace-release proof.
 
 The provider-state checkpoint above is a control-plane replay snapshot, not a
 physical image checkpoint, published checkpoint artifact, or content root.
@@ -2248,7 +2260,9 @@ makes later provider-state checkpoints and aggregate persistent storage grow
 with unique operations. This slice has no retention floor or garbage
 collection: deployment hosts must monitor `inspectCapacity()` and the backing
 directory until an authority-safe retention floor or PostgreSQL-indexed history
-is designed.
+is designed. Any such floor must retain the origin operation referenced by
+each current attachment so the committed attachment identity remains
+reconstructable.
 
 The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child
@@ -2383,11 +2397,12 @@ admission. Production-injectable Linux components now add FD-bound raw-image
 lifecycle and detach settlement, externally anchored provider-state
 reconciliation, distinct mount-root and artifact-child publication-control
 identity, and rootless Podman launch/stop coverage. Their producer/consumer jobs
-verify a clean two-host image transfer and verification-only first remount; a
-trusted persistent-identity bridge and same-process conformance evidence remain
-pending. The ext4 producer additionally gates whether live child-namespace
-mounts propagate to its parent namespace under the required host-owned
-long-lived namespace contract.
+verify a clean two-host image transfer and verification-only first remount.
+After attach and before detach, the same Linux producer process now launches
+and stops a real rootless Podman writer through the trusted ext4 attachment
+binding, and the consumer verifies its transferred marker. The ext4 producer
+additionally gates whether live child-namespace mounts propagate to its parent
+namespace under the required host-owned long-lived namespace contract.
 Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
 export/compression, encryption, retention, and registry trust remain unproved
 or unimplemented by design.

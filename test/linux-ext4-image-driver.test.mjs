@@ -23,6 +23,7 @@ import test, { afterEach } from "node:test";
 import { promisify } from "node:util";
 
 import {
+  LINUX_EXT4_ATTACHMENT_ROOT_AUTHORITY_CONTRACT_VERSION,
   LINUX_EXT4_IMAGE_DRIVER_CONTRACT_VERSION,
   LinuxExt4ImageDriverError,
   createLinuxExt4ImageDriver,
@@ -453,9 +454,11 @@ test("surface and successful results are exact frozen data with native Promises"
   assert.equal(Object.isFrozen(fixture.driver), true);
   assert.deepEqual(Reflect.ownKeys(fixture.driver), [
     "contractVersion",
+    "attachmentRootAuthorityContractVersion",
     "provision",
     "observeMount",
     "observeAttachmentRoot",
+    "observeAttachmentRootAuthority",
     "remount",
     "ensureAttachmentRoot",
     "ensurePublicationRoot",
@@ -466,6 +469,10 @@ test("surface and successful results are exact frozen data with native Promises"
   assert.equal(
     fixture.driver.contractVersion,
     LINUX_EXT4_IMAGE_DRIVER_CONTRACT_VERSION,
+  );
+  assert.equal(
+    fixture.driver.attachmentRootAuthorityContractVersion,
+    LINUX_EXT4_ATTACHMENT_ROOT_AUTHORITY_CONTRACT_VERSION,
   );
   for (const key of Reflect.ownKeys(fixture.driver).slice(1)) {
     assert.equal(Object.isFrozen(fixture.driver[key]), true);
@@ -1530,6 +1537,13 @@ test("observeAttachmentRoot is read-only and distinguishes an absent child", asy
     }),
     driverError("attachment_root_absent"),
   );
+  await assert.rejects(
+    fixture.driver.observeAttachmentRootAuthority({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    }),
+    driverError("attachment_root_absent"),
+  );
   await assert.rejects(stat(paths.attachmentRootPath), { code: "ENOENT" });
   assert.equal(fixture.calls.length, 0);
 
@@ -1555,6 +1569,62 @@ test("observeAttachmentRoot is read-only and distinguishes an absent child", asy
     ),
     false,
   );
+});
+
+test("attachment authority observations extend the exact legacy receipt with the final runtime identity", async () => {
+  const paths = await createPaths();
+  const fixture = createFixture(paths);
+  await fixture.driver.provision(provisionRequest(paths));
+  await fixture.driver.ensureAttachmentRoot({
+    ...mountRequest(paths),
+    attachmentRootPath: paths.attachmentRootPath,
+  });
+
+  const request = {
+    ...mountRequest(paths),
+    attachmentRootPath: paths.attachmentRootPath,
+  };
+  const legacy = await fixture.driver.observeAttachmentRoot(request);
+  const pending = fixture.driver.observeAttachmentRootAuthority(request);
+  assert.strictEqual(Object.getPrototypeOf(pending), Promise.prototype);
+  const authority = await pending;
+  const metadata = await stat(paths.attachmentRootPath, { bigint: true });
+
+  assert.deepEqual(Reflect.ownKeys(legacy), [
+    "attachmentRootPath",
+    "filesystem",
+    "imageIdentity",
+    "imagePath",
+    "loopDevice",
+    "mountEvidence",
+    "mountPath",
+    "mountRootIdentity",
+    "rootIdentity",
+  ]);
+  assert.deepEqual(Reflect.ownKeys(authority), [
+    ...Reflect.ownKeys(legacy),
+    "rootRuntimeIdentity",
+  ]);
+  assert.equal(Object.getPrototypeOf(authority), null);
+  assert.equal(Object.isFrozen(authority), true);
+  assert.deepEqual(Reflect.ownKeys(authority.rootRuntimeIdentity), [
+    "device",
+    "inode",
+  ]);
+  assert.equal(Object.getPrototypeOf(authority.rootRuntimeIdentity), null);
+  assert.equal(Object.isFrozen(authority.rootRuntimeIdentity), true);
+  assert.deepEqual({ ...authority.rootRuntimeIdentity }, {
+    device: String(metadata.dev),
+    inode: String(metadata.ino),
+  });
+  assert.equal(
+    Object.hasOwn(authority.rootIdentity, "device") ||
+      Object.hasOwn(authority.rootIdentity, "inode"),
+    false,
+  );
+  const { rootRuntimeIdentity, ...authorityLegacy } = authority;
+  assert.deepEqual(authorityLegacy, { ...legacy });
+  assert.equal(rootRuntimeIdentity, authority.rootRuntimeIdentity);
 });
 
 test("attachment inspection separates stable mismatch from unreadable proof", async (t) => {
@@ -1610,13 +1680,18 @@ test("attachment inspection separates stable mismatch from unreadable proof", as
       });
       rejectAttachment = true;
 
-      await assert.rejects(
-        fixture.driver.observeAttachmentRoot({
-          ...mountRequest(paths),
-          attachmentRootPath: paths.attachmentRootPath,
-        }),
-        driverError(candidate.driverCode),
-      );
+      for (const method of [
+        "observeAttachmentRoot",
+        "observeAttachmentRootAuthority",
+      ]) {
+        await assert.rejects(
+          fixture.driver[method]({
+            ...mountRequest(paths),
+            attachmentRootPath: paths.attachmentRootPath,
+          }),
+          driverError(candidate.driverCode),
+        );
+      }
     });
   }
 });
@@ -1695,6 +1770,79 @@ test("attachment observation rejects persistent incarnation change with reused r
   );
 
   assert.equal(attachmentInspections, 2);
+});
+
+test("attachment authority observation rejects runtime replacement and persistent incarnation drift", async (t) => {
+  await t.test("runtime replacement", async () => {
+    const paths = await createPaths();
+    let armed = false;
+    let attachmentProofs = 0;
+    const fixture = createFixture(paths, {
+      async beforeFdOperation(request) {
+        if (
+          !armed ||
+          request.operation !== "inspect-private-path" ||
+          request.path !== paths.attachmentRootPath
+        ) {
+          return;
+        }
+        attachmentProofs += 1;
+        if (attachmentProofs === 3) {
+          await replaceDirectoryWithDistinctIdentity(paths.attachmentRootPath);
+        }
+      },
+    });
+    await fixture.driver.provision(provisionRequest(paths));
+    await fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    });
+    armed = true;
+
+    await assert.rejects(
+      fixture.driver.observeAttachmentRootAuthority({
+        ...mountRequest(paths),
+        attachmentRootPath: paths.attachmentRootPath,
+      }),
+      driverError("attachment_root_unsafe"),
+    );
+    assert.equal(attachmentProofs, 3);
+  });
+
+  await t.test("persistent incarnation drift with stable runtime identity", async () => {
+    const paths = await createPaths();
+    let armed = false;
+    let attachmentInspections = 0;
+    const fixture = createFixture(paths, {
+      inspectFilesystemObject(path, inspected) {
+        if (!armed || path !== paths.attachmentRootPath) return inspected;
+        attachmentInspections += 1;
+        if (attachmentInspections !== 2) return inspected;
+        return Object.freeze({
+          filesystem: inspected.filesystem,
+          identity: Object.freeze({
+            ...inspected.identity,
+            objectId: `${inspected.identity.objectId}-new-incarnation`,
+          }),
+        });
+      },
+    });
+    await fixture.driver.provision(provisionRequest(paths));
+    await fixture.driver.ensureAttachmentRoot({
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    });
+    armed = true;
+
+    await assert.rejects(
+      fixture.driver.observeAttachmentRootAuthority({
+        ...mountRequest(paths),
+        attachmentRootPath: paths.attachmentRootPath,
+      }),
+      driverError("attachment_root_unsafe"),
+    );
+    assert.equal(attachmentInspections, 2);
+  });
 });
 
 test("observeAttachmentRoot reports absence only across one stable mount", async () => {
@@ -2165,6 +2313,16 @@ test("hostile Proxy/accessor inputs execute no traps and receivers are authentic
   const proxyPending = fixture.driver.observeMount(new Proxy({}, traps));
   assert.strictEqual(Object.getPrototypeOf(proxyPending), Promise.prototype);
   await assert.rejects(proxyPending, driverError("invalid_request"));
+  const authorityProxyPending =
+    fixture.driver.observeAttachmentRootAuthority(new Proxy({}, traps));
+  assert.strictEqual(
+    Object.getPrototypeOf(authorityProxyPending),
+    Promise.prototype,
+  );
+  await assert.rejects(
+    authorityProxyPending,
+    driverError("invalid_request"),
+  );
   assert.equal(trapCalls, 0);
 
   let getterCalls = 0;
@@ -2191,6 +2349,10 @@ test("hostile Proxy/accessor inputs execute no traps and receivers are authentic
     },
     ensurePublicationRoot: mountRequest(paths),
     observeAttachmentRoot: {
+      ...mountRequest(paths),
+      attachmentRootPath: paths.attachmentRootPath,
+    },
+    observeAttachmentRootAuthority: {
       ...mountRequest(paths),
       attachmentRootPath: paths.attachmentRootPath,
     },
