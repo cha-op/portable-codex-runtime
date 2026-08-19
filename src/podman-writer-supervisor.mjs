@@ -82,6 +82,8 @@ const stringTrimIntrinsic = String.prototype.trim;
 const StringConstructor = String;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
 const processObject = process;
 const processGetUserIdIntrinsic = typeof processObject.getuid === "function"
   ? processObject.getuid
@@ -172,6 +174,7 @@ const FILESYSTEM_HOLDER_MAX_OUTPUT_BYTES = 1024;
 const FILESYSTEM_HOLDER_MAX_ACQUISITION_BYTES = 64 * 1024;
 const FILESYSTEM_HOLDER_CLOSE_MESSAGE = "close\n";
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
+const POSITIVE_DECIMAL_PATTERN = /^[1-9][0-9]*$/u;
 const COMMAND_PROCESS_GROUP_POLL_MILLISECONDS = 20;
 const MAX_DATA_DEPTH = 32;
 const MAX_DATA_NODES = 32_768;
@@ -218,7 +221,34 @@ const FILESYSTEM_AUTHORITY_KEYS = Object.freeze([
   "verifyCurrent",
   "verifyRunningMount",
 ]);
+const FILESYSTEM_AUTHORITY_COMPOSITION_OPTION_KEYS = Object.freeze([
+  "persistentAuthority",
+]);
 const FILESYSTEM_ACQUISITION_KEYS = Object.freeze(["handle", "mountSource"]);
+const COMPOSITE_ACQUIRE_KEYS = Object.freeze([
+  "attachment",
+  "configuredAttachmentRoot",
+  "holder",
+]);
+const COMPOSITE_CLOSE_KEYS = Object.freeze(["handle"]);
+const COMPOSITE_CURRENT_KEYS = Object.freeze([
+  "attachment",
+  "configuredAttachmentRoot",
+  "handle",
+]);
+const COMPOSITE_RUNNING_KEYS = Object.freeze([
+  "attachment",
+  "configuredAttachmentRoot",
+  "containerPid",
+  "handle",
+]);
+const PERSISTENT_AUTHORITY_KEYS = Object.freeze(["contractVersion", "verify"]);
+const PERSISTENT_AUTHORITY_RECEIPT_KEYS = Object.freeze([
+  "bindingSha256",
+  "rootRuntimeIdentity",
+  "status",
+]);
+const ROOT_RUNTIME_IDENTITY_KEYS = Object.freeze(["device", "inode"]);
 const HOLDER_DIRECTORY_RECEIPT_KEYS = Object.freeze(["dev", "fd", "ino"]);
 const HOLDER_READY_RECEIPT_KEYS = Object.freeze([
   "attachment",
@@ -416,6 +446,9 @@ const ERROR_MESSAGES = Object.freeze({
 });
 
 const errorBrands = new WeakSet();
+const compositeFilesystemAuthorities = new WeakSet();
+const compositeFilesystemAuthorityHandleStates = new WeakMap();
+const closedCompositeFilesystemAuthorityHandles = new WeakSet();
 const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(
   AbortSignal.prototype,
   "aborted",
@@ -1019,13 +1052,17 @@ function normalizeState(value, code) {
 function normalizeFilesystemAuthority(value, code) {
   const authority = exactDataObject(value, FILESYSTEM_AUTHORITY_KEYS, code);
   ensure(authority.contractVersion === 1, code);
-  return frozenRecord({
+  const normalized = frozenRecord({
     acquire: assertFunction(authority.acquire, code),
     close: assertFunction(authority.close, code),
     contractVersion: authority.contractVersion,
     verifyCurrent: assertFunction(authority.verifyCurrent, code),
     verifyRunningMount: assertFunction(authority.verifyRunningMount, code),
   });
+  if (callIntrinsic(weakSetHasIntrinsic, compositeFilesystemAuthorities, [value])) {
+    callIntrinsic(weakSetAddIntrinsic, compositeFilesystemAuthorities, [normalized]);
+  }
+  return normalized;
 }
 
 function filesystemErrorCode(error) {
@@ -1889,6 +1926,338 @@ const defaultFilesystemAuthority = frozenRecord({
   }),
 });
 
+async function invokePersistentFilesystemAuthority(authority, attachment) {
+  let pending;
+  try {
+    pending = callIntrinsic(authority.verify, undefined, [
+      frozenRecord({ attachment }),
+    ]);
+  } catch {
+    fail("podman_writer_attachment_revalidation_failed");
+  }
+  ensure(
+    isNativePromise(pending),
+    "podman_writer_attachment_revalidation_failed",
+  );
+  let raw;
+  try {
+    raw = await pending;
+  } catch {
+    fail("podman_writer_attachment_revalidation_failed");
+  }
+  const receipt = exactDataObject(
+    raw,
+    PERSISTENT_AUTHORITY_RECEIPT_KEYS,
+    "podman_writer_attachment_revalidation_failed",
+  );
+  ensure(
+    receipt.status === "current" ||
+      receipt.status === "missing" ||
+      receipt.status === "mismatch",
+    "podman_writer_attachment_revalidation_failed",
+  );
+  if (receipt.status !== "current") {
+    ensure(
+      receipt.bindingSha256 === null && receipt.rootRuntimeIdentity === null,
+      "podman_writer_attachment_revalidation_failed",
+    );
+    return frozenRecord({
+      bindingSha256: null,
+      rootRuntimeIdentity: null,
+      status: receipt.status,
+    });
+  }
+  const rootRuntimeIdentity = exactDataObject(
+    receipt.rootRuntimeIdentity,
+    ROOT_RUNTIME_IDENTITY_KEYS,
+    "podman_writer_attachment_revalidation_failed",
+  );
+  ensure(
+    typeof rootRuntimeIdentity.device === "string" &&
+      regexpTest(DECIMAL_PATTERN, rootRuntimeIdentity.device) &&
+      typeof rootRuntimeIdentity.inode === "string" &&
+      regexpTest(POSITIVE_DECIMAL_PATTERN, rootRuntimeIdentity.inode),
+    "podman_writer_attachment_revalidation_failed",
+  );
+  return frozenRecord({
+    bindingSha256: assertSha256(
+      receipt.bindingSha256,
+      "podman_writer_attachment_revalidation_failed",
+    ),
+    rootRuntimeIdentity: frozenRecord(rootRuntimeIdentity),
+    status: "current",
+  });
+}
+
+async function requireCurrentPersistentFilesystemAuthority(
+  authority,
+  attachment,
+) {
+  const receipt = await invokePersistentFilesystemAuthority(authority, attachment);
+  if (receipt.status === "missing") fail("podman_writer_attachment_missing");
+  if (receipt.status === "mismatch") fail("podman_writer_attachment_mismatch");
+  return receipt;
+}
+
+function persistentReceiptMatchesHeld(receipt, defaultHandle) {
+  return receipt.rootRuntimeIdentity.device ===
+      StringConstructor(defaultHandle.attachment.snapshot.dev) &&
+    receipt.rootRuntimeIdentity.inode ===
+      StringConstructor(defaultHandle.attachment.snapshot.ino);
+}
+
+function persistentReceiptMatchesInitial(receipt, handle) {
+  return receipt.bindingSha256 === handle.bindingSha256 &&
+    receipt.rootRuntimeIdentity.device === handle.rootRuntimeIdentity.device &&
+    receipt.rootRuntimeIdentity.inode === handle.rootRuntimeIdentity.inode &&
+    persistentReceiptMatchesHeld(receipt, handle.defaultHandle);
+}
+
+async function verifyDefaultFilesystemAuthorityCurrent(
+  defaultHandle,
+  configuredAttachmentRoot,
+  attachment,
+) {
+  const verified = await invokeFilesystemAuthority(
+    defaultFilesystemAuthority.verifyCurrent,
+    frozenRecord({
+      attachment,
+      configuredAttachmentRoot,
+      handle: defaultHandle,
+    }),
+  );
+  ensure(verified === true, "podman_writer_attachment_mismatch");
+}
+
+async function closeDefaultFilesystemAuthority(defaultHandle) {
+  const closed = await invokeFilesystemAuthority(
+    defaultFilesystemAuthority.close,
+    frozenRecord({ handle: defaultHandle }),
+  );
+  ensure(closed === true, "podman_writer_attachment_revalidation_failed");
+}
+
+export function createPodmanWriterFilesystemAuthorityComposition(...args) {
+  const code = "invalid_podman_writer_supervisor_options";
+  ensure(args.length === 1, code);
+  const options = exactDataObject(
+    args[0],
+    FILESYSTEM_AUTHORITY_COMPOSITION_OPTION_KEYS,
+    code,
+  );
+  const persistent = exactDataObject(
+    options.persistentAuthority,
+    PERSISTENT_AUTHORITY_KEYS,
+    code,
+  );
+  ensure(persistent.contractVersion === 1, code);
+  const persistentAuthority = frozenRecord({
+    contractVersion: persistent.contractVersion,
+    verify: assertFunction(persistent.verify, code),
+  });
+  const compositionToken = frozenRecord({});
+
+  async function verifyCompositeCurrent(input) {
+    const value = exactDataObject(
+      input,
+      COMPOSITE_CURRENT_KEYS,
+      "podman_writer_attachment_revalidation_failed",
+    );
+    const handle = value.handle;
+    const handleState = callIntrinsic(
+      weakMapGetIntrinsic,
+      compositeFilesystemAuthorityHandleStates,
+      [handle],
+    );
+    ensure(
+      handleState !== undefined &&
+        !callIntrinsic(
+          weakSetHasIntrinsic,
+          closedCompositeFilesystemAuthorityHandles,
+          [handle],
+        ) &&
+        handleState.compositionToken === compositionToken &&
+        value.attachment === handleState.attachmentAuthorization &&
+        value.configuredAttachmentRoot === handleState.configuredAttachmentRoot,
+      "podman_writer_attachment_revalidation_failed",
+    );
+    await verifyDefaultFilesystemAuthorityCurrent(
+      handleState.defaultHandle,
+      value.configuredAttachmentRoot,
+      value.attachment,
+    );
+    const receipt = await requireCurrentPersistentFilesystemAuthority(
+      persistentAuthority,
+      value.attachment,
+    );
+    ensure(
+      persistentReceiptMatchesInitial(receipt, handleState),
+      "podman_writer_attachment_mismatch",
+    );
+    await verifyDefaultFilesystemAuthorityCurrent(
+      handleState.defaultHandle,
+      value.configuredAttachmentRoot,
+      value.attachment,
+    );
+    return true;
+  }
+
+  const authority = frozenRecord({
+    contractVersion: 1,
+    acquire: frozenFunction(async function acquire(input) {
+      ensure(
+        this === undefined && arguments.length === 1,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      const value = exactDataObject(
+        input,
+        COMPOSITE_ACQUIRE_KEYS,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      let defaultAcquired = null;
+      try {
+        const raw = await invokeFilesystemAuthority(
+          defaultFilesystemAuthority.acquire,
+          frozenRecord(value),
+        );
+        defaultAcquired = frozenRecord(exactDataObject(
+          raw,
+          FILESYSTEM_ACQUISITION_KEYS,
+          "podman_writer_attachment_revalidation_failed",
+        ));
+        await verifyDefaultFilesystemAuthorityCurrent(
+          defaultAcquired.handle,
+          value.configuredAttachmentRoot,
+          value.attachment,
+        );
+        const receipt = await requireCurrentPersistentFilesystemAuthority(
+          persistentAuthority,
+          value.attachment,
+        );
+        ensure(
+          persistentReceiptMatchesHeld(receipt, defaultAcquired.handle),
+          "podman_writer_attachment_mismatch",
+        );
+        await verifyDefaultFilesystemAuthorityCurrent(
+          defaultAcquired.handle,
+          value.configuredAttachmentRoot,
+          value.attachment,
+        );
+        const handle = frozenRecord({});
+        const handleState = frozenRecord({
+          attachmentAuthorization: value.attachment,
+          bindingSha256: receipt.bindingSha256,
+          compositionToken,
+          configuredAttachmentRoot: value.configuredAttachmentRoot,
+          defaultHandle: defaultAcquired.handle,
+          rootRuntimeIdentity: receipt.rootRuntimeIdentity,
+        });
+        callIntrinsic(
+          weakMapSetIntrinsic,
+          compositeFilesystemAuthorityHandleStates,
+          [handle, handleState],
+        );
+        return frozenRecord({
+          handle,
+          mountSource: defaultAcquired.mountSource,
+        });
+      } catch (error) {
+        if (defaultAcquired !== null) {
+          // Once the private holder has been acquired, a close failure is an
+          // outcome-uncertainty boundary and must not be hidden behind the
+          // earlier persistent-authority rejection.
+          await closeDefaultFilesystemAuthority(defaultAcquired.handle);
+        }
+        throw error;
+      }
+    }),
+    close: frozenFunction(async function close(input) {
+      ensure(
+        this === undefined && arguments.length === 1,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      const value = exactDataObject(
+        input,
+        COMPOSITE_CLOSE_KEYS,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      const handleState = callIntrinsic(
+        weakMapGetIntrinsic,
+        compositeFilesystemAuthorityHandleStates,
+        [value.handle],
+      );
+      ensure(
+        handleState !== undefined &&
+          !callIntrinsic(
+            weakSetHasIntrinsic,
+            closedCompositeFilesystemAuthorityHandles,
+            [value.handle],
+          ) &&
+          handleState.compositionToken === compositionToken,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      callIntrinsic(
+        weakSetAddIntrinsic,
+        closedCompositeFilesystemAuthorityHandles,
+        [value.handle],
+      );
+      await closeDefaultFilesystemAuthority(handleState.defaultHandle);
+      return true;
+    }),
+    verifyCurrent: frozenFunction(async function verifyCurrent(input) {
+      ensure(
+        this === undefined && arguments.length === 1,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      return verifyCompositeCurrent(input);
+    }),
+    verifyRunningMount: frozenFunction(async function verifyRunningMount(input) {
+      ensure(
+        this === undefined && arguments.length === 1,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      const value = exactDataObject(
+        input,
+        COMPOSITE_RUNNING_KEYS,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      await verifyCompositeCurrent(frozenRecord({
+        attachment: value.attachment,
+        configuredAttachmentRoot: value.configuredAttachmentRoot,
+        handle: value.handle,
+      }));
+      const handleState = callIntrinsic(
+        weakMapGetIntrinsic,
+        compositeFilesystemAuthorityHandleStates,
+        [value.handle],
+      );
+      ensure(
+        handleState !== undefined &&
+          handleState.compositionToken === compositionToken,
+        "podman_writer_attachment_revalidation_failed",
+      );
+      const verified = await invokeFilesystemAuthority(
+        defaultFilesystemAuthority.verifyRunningMount,
+        frozenRecord({
+          attachment: value.attachment,
+          configuredAttachmentRoot: value.configuredAttachmentRoot,
+          containerPid: value.containerPid,
+          handle: handleState.defaultHandle,
+        }),
+      );
+      ensure(verified === true, "podman_writer_attachment_mismatch");
+      await verifyCompositeCurrent(frozenRecord({
+        attachment: value.attachment,
+        configuredAttachmentRoot: value.configuredAttachmentRoot,
+        handle: value.handle,
+      }));
+      return true;
+    }),
+  });
+  callIntrinsic(weakSetAddIntrinsic, compositeFilesystemAuthorities, [authority]);
+  return authority;
+}
+
 function isNativePromise(value) {
   if (!isPromise(value) || isProxy(value)) return false;
   try {
@@ -1965,7 +2334,9 @@ async function acquireFilesystemAuthority(
     "podman_writer_attachment_mismatch",
   );
   ensureNotAborted(signal);
-  const acquireInput = authority === defaultFilesystemAuthority
+  const usesDefaultHolder = authority === defaultFilesystemAuthority ||
+    callIntrinsic(weakSetHasIntrinsic, compositeFilesystemAuthorities, [authority]);
+  const acquireInput = usesDefaultHolder
     ? frozenRecord({
       attachment,
       configuredAttachmentRoot,
@@ -2680,6 +3051,13 @@ export function createPodmanWriterSupervisor(...args) {
   const filesystemAuthority = options.filesystemAuthority === undefined
     ? defaultFilesystemAuthority
     : normalizeFilesystemAuthority(options.filesystemAuthority, optionCode);
+  ensure(
+    options.commandRunner === undefined ||
+      !callIntrinsic(weakSetHasIntrinsic, compositeFilesystemAuthorities, [
+        filesystemAuthority,
+      ]),
+    optionCode,
+  );
   const runner = options.commandRunner === undefined
     ? defaultCommandRunner
     : assertFunction(options.commandRunner, optionCode);
@@ -3075,6 +3453,7 @@ export function createPodmanWriterSupervisor(...args) {
       input.signal,
       defaultHolderOptions,
     );
+    let startMayHaveExecuted = false;
     try {
       const preparing = newStateRecord({
         containerName: name,
@@ -3225,6 +3604,8 @@ export function createPodmanWriterSupervisor(...args) {
         attachment,
         input.signal,
       );
+      ensureNotAborted(input.signal);
+      startMayHaveExecuted = true;
       await runPodman(["start", containerId], input.signal);
       const inspected = await runPodman(
         ["container", "inspect", "--format=json", containerId],
@@ -3289,8 +3670,24 @@ export function createPodmanWriterSupervisor(...args) {
           writerIncarnationId: record.writerIncarnationId,
         }),
       });
+    } catch (error) {
+      if (startMayHaveExecuted) {
+        // Once the exact start dispatch boundary is crossed, the writer may
+        // already have changed the attachment. A later inspection, live-mount
+        // proof, persistent-authority revalidation, or durable state failure
+        // cannot be reported as a conclusive attachment classification.
+        fail("podman_writer_supervisor_outcome_uncertain");
+      }
+      throw error;
     } finally {
-      await closeFilesystemAuthority(filesystemAuthority, acquired);
+      try {
+        await closeFilesystemAuthority(filesystemAuthority, acquired);
+      } catch (error) {
+        if (startMayHaveExecuted) {
+          fail("podman_writer_supervisor_outcome_uncertain");
+        }
+        throw error;
+      }
     }
   });
 
@@ -3408,14 +3805,18 @@ export function createPodmanWriterSupervisor(...args) {
           "podman_writer_supervisor_outcome_uncertain",
         );
         if (isRunning) {
-          await proveRunningAttachment(
-            attachment,
-            inspection,
-            name,
-            inspectionExpected,
-            input.signal,
-            "podman_writer_supervisor_outcome_uncertain",
-          );
+          try {
+            await proveRunningAttachment(
+              attachment,
+              inspection,
+              name,
+              inspectionExpected,
+              input.signal,
+              "podman_writer_supervisor_outcome_uncertain",
+            );
+          } catch {
+            fail("podman_writer_supervisor_outcome_uncertain");
+          }
         }
         validatePsInspectionState(
           candidate,
@@ -3501,14 +3902,18 @@ export function createPodmanWriterSupervisor(...args) {
         "podman_writer_supervisor_outcome_uncertain",
       );
       if (isRunning) {
-        await proveRunningAttachment(
-          attachment,
-          inspection,
-          record.containerId,
-          inspectionExpected,
-          input.signal,
-          "podman_writer_supervisor_outcome_uncertain",
-        );
+        try {
+          await proveRunningAttachment(
+            attachment,
+            inspection,
+            record.containerId,
+            inspectionExpected,
+            input.signal,
+            "podman_writer_supervisor_outcome_uncertain",
+          );
+        } catch {
+          fail("podman_writer_supervisor_outcome_uncertain");
+        }
         fail("podman_writer_supervisor_outcome_uncertain");
       }
       const observedStatus = ownJsonValue(
@@ -3542,4 +3947,7 @@ export function createPodmanWriterSupervisor(...args) {
 
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError.prototype]);
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError]);
+callIntrinsic(objectFreezeIntrinsic, Object, [
+  createPodmanWriterFilesystemAuthorityComposition,
+]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisor]);

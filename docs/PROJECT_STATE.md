@@ -442,16 +442,19 @@
   namespace non-propagation. This remains a clean/manual-fencing
   boundary: it does not prove power-loss or crash-prefix recovery,
   automatically fence a stale writer, or implement differential export/
-  compression, encryption, retention, or registry trust. A trusted adapter
-  that binds committed ext4 attachment identity into Podman filesystem
-  authority, plus same-process conformance evidence, remains pending. Within
-  the narrower default boundary, parent-held directory FDs are matched to a
-  temporary holder in Podman's rootless namespace, create must preserve that
-  exact procfd source in Podman's external `created` state before start, a new
-  create must return its complete
-  64-hex container identity, and image `Config.User` drives the explicit non-
-  root `keep-id` UID/GID mapping used by the conformance writer. Ordinary
-  failures observed before child exit request whole-group termination; every
+  compression, encryption, retention, or registry trust. The initialized ext4
+  backend now binds committed attachment identity into Podman filesystem
+  authority in the same non-root producer process. Provider persistent
+  filesystem/file-handle identity and the driver's same-sample runtime
+  `device`/`inode` are matched to Podman's held FD and live bind; access policy
+  is checked separately, while child-entry and content churn remain allowed.
+  Within the default authority boundary, parent-held directory FDs are matched
+  to a temporary holder in Podman's rootless namespace, create must preserve
+  that exact procfd source in Podman's external `created` state before start,
+  a new create must return its complete 64-hex container identity, and image
+  `Config.User` drives the explicit non-root `keep-id` UID/GID mapping used by
+  the conformance writer. Ordinary failures observed before child exit request
+  whole-group termination; every
   failure waits for direct close and kernel-proved group absence without ever
   signalling the frozen PGID after exit. Holder shutdown separately requires
   wrapper close plus group absence; a dispatched exact start only advances on
@@ -465,6 +468,8 @@
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
 - Linux ext4 physical backend:
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
+- ext4-to-Podman attachment composition:
+  `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
 - Final public restore backend:
   `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - Assembled restore safety matrix:
@@ -586,10 +591,13 @@
   separately anchored archive control tuples. Each ext4 job runs below
   dedicated `rprivate` carriers in one long-lived private mount namespace and
   the producer gates whether its live mounts propagate to the parent
-  namespace. The ext4 and Podman conformance jobs remain separate: the default
-  Podman filesystem authority binds only the current
-  held directory object and access policy, while a production composition must
-  supply a trusted authority that maps the durable ext4 attachment identity to
-  that held object. They do not make crash-prefix state durable, revoke a stale
-  remote writer automatically, or supply differential/compressed export,
-  encryption, retention, or registry trust.
+  namespace. The producer now invokes the initialized ext4-to-Podman
+  composition after attach and before detach, launches a real rootless Podman
+  writer in that same non-root process, and carries its marker through the
+  clean transfer for consumer verification. The independent Podman job remains
+  as narrower supervisor coverage. These jobs do not make crash-prefix state
+  durable, revoke a stale remote writer automatically, or supply differential/
+  compressed export, encryption, retention, or registry trust. The next slice
+  is terminal supervisor-state GC after PostgreSQL terminal commit and callback
+  quiescence. Provider history retention remains separate and must preserve
+  every current attachment's origin operation.

@@ -159,7 +159,7 @@
   control identities, rootless digest-pinned Podman launch/stop, and two-host
   clean detach, transfer, verification-only first remount, identity
   verification, and a peer-namespace non-propagation gate.
-- [pending] First, bind the provider state's committed ext4 attachment identity
+- [done] First, bind the provider state's committed ext4 attachment identity
   into a trusted Podman filesystem authority and exercise that bridge with the
   initialized backend in one non-root process. This closes the current
   production identity gap without depending on either retention track below.
@@ -171,9 +171,10 @@
 - [pending] Third, define an authority-safe provider-state exact-replay
   retention floor or move permanent operation history to a PostgreSQL-indexed
   representation. This track has its own replay authority and does not inherit
-  authority from the bridge or supervisor retention. Until then, monitor
-  checkpoint bytes, retained operation counts, and aggregate provider-state
-  storage; automatic active-log rotation is not retention or garbage
+  authority from the bridge or supervisor retention. Its retention floor must
+  preserve the origin operation for every current attachment. Until then,
+  monitor checkpoint bytes, retained operation counts, and aggregate provider-
+  state storage; automatic active-log rotation is not retention or garbage
   collection.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer

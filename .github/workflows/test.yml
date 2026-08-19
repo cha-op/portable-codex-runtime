@@ -125,7 +125,10 @@ jobs:
       - name: Install the privileged ext4 test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes acl build-essential e2fsprogs jq libcap2-bin udev util-linux
+          sudo apt-get install --yes acl build-essential e2fsprogs fuse-overlayfs jq libcap2-bin podman slirp4netns udev uidmap util-linux
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          printf 'XDG_RUNTIME_DIR=%s\n' "$runtime_dir" >> "$GITHUB_ENV"
           cc -O2 -std=c11 -Wall -Wextra -Werror \
             native/linux-ext4-inspector.c \
             -o "$RUNNER_TEMP/linux-ext4-inspector"
@@ -160,6 +163,26 @@ jobs:
           set -e
           sudo rm -f /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
           test "$identity_status" -eq 69
+      - name: Build the digest-pinned writer image for the ext4 composition
+        id: ext4-podman-image
+        run: |
+          cc -O2 -std=c11 -Wall -Wextra -Werror -static \
+            native/podman-writer-probe.c \
+            -o integration/fixtures/podman-writer/podman-writer-probe
+          test "$(id -u)" -ne 0
+          /usr/bin/timeout --signal=KILL 10s \
+            /usr/bin/podman --remote=false unshare /usr/bin/true
+          /usr/bin/podman --remote=false build \
+            --file integration/fixtures/podman-writer/Containerfile \
+            --tag localhost/portable-codex-writer:ext4-integration \
+            integration/fixtures/podman-writer
+          digest="$(/usr/bin/podman --remote=false image inspect --format '{{.Digest}}' localhost/portable-codex-writer:ext4-integration)"
+          test -n "$digest"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          # Retire the build-time rootless pause namespace. The supervisor's
+          # first `podman unshare` must create its namespace after entering the
+          # private ext4 mount namespace below.
+          /usr/bin/podman --remote=false system migrate
       - name: Publish and verify on a real ext4 loop image
         timeout-minutes: 15
         env:
@@ -168,6 +191,9 @@ jobs:
           LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE: "1"
           LINUX_EXT4_TEST_MODE: producer
           LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+          PODMAN_EXECUTABLE: /usr/bin/podman
+          PODMAN_WRITER_IMAGE_DIGEST: ${{ steps.ext4-podman-image.outputs.digest }}
+          PODMAN_WRITER_IMAGE_REFERENCE: localhost/portable-codex-writer@${{ steps.ext4-podman-image.outputs.digest }}
         run: |
           service_uid="$(id -u)"
           service_gid="$(id -g)"
@@ -225,16 +251,21 @@ jobs:
           probe_pid="$!"
           set +e
           sudo /usr/bin/env \
+            HOME="$HOME" \
             LINUX_EXT4_INSPECTOR_HELPER="$LINUX_EXT4_INSPECTOR_HELPER" \
             LINUX_EXT4_PEER_NAMESPACE_BARRIER="$LINUX_EXT4_PEER_NAMESPACE_BARRIER" \
             LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE="$LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE" \
             LINUX_EXT4_TEST_MODE="$LINUX_EXT4_TEST_MODE" \
             LINUX_EXT4_TEST_ROOT="$LINUX_EXT4_TEST_ROOT" \
+            PODMAN_EXECUTABLE="$PODMAN_EXECUTABLE" \
+            PODMAN_WRITER_IMAGE_DIGEST="$PODMAN_WRITER_IMAGE_DIGEST" \
+            PODMAN_WRITER_IMAGE_REFERENCE="$PODMAN_WRITER_IMAGE_REFERENCE" \
             PORTABLE_CODEX_NAMESPACE_PID_PATH="$namespace_pid_path" \
             PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH="$namespace_pid_pending_path" \
             PORTABLE_CODEX_NODE="$node_path" \
             PORTABLE_CODEX_SERVICE_GID="$service_gid" \
             PORTABLE_CODEX_SERVICE_UID="$service_uid" \
+            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
             /usr/bin/unshare --mount --propagation private -- /bin/bash -c '
               set -euo pipefail
               /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/archive-mounts" "$LINUX_EXT4_TEST_ROOT/archive-mounts"
@@ -302,6 +333,13 @@ jobs:
           path: ${{ runner.temp }}/linux-ext4-transfer.tar
           if-no-files-found: error
           retention-days: 1
+      - name: Remove the ext4 composition writer image
+        if: always()
+        timeout-minutes: 1
+        run: |
+          /usr/bin/timeout --signal=KILL 30s \
+            /usr/bin/podman --remote=false image rm --force localhost/portable-codex-writer:ext4-integration || true
+          /usr/bin/podman --remote=false system migrate
       - name: Clean the scoped producer resources
         if: always()
         env:

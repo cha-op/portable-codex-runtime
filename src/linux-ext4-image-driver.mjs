@@ -159,6 +159,7 @@ function bigIntToString(value) {
 }
 
 export const LINUX_EXT4_IMAGE_DRIVER_CONTRACT_VERSION = 1;
+export const LINUX_EXT4_ATTACHMENT_ROOT_AUTHORITY_CONTRACT_VERSION = 1;
 
 const DEFAULT_EXECUTABLES = objectFreezeIntrinsic({
   getfacl: "/usr/bin/getfacl",
@@ -2250,6 +2251,22 @@ async function observeAttachmentRootInternal(state, requestValue) {
     mountPath: request.mountPath,
     mountRootIdentity: after.rootIdentity,
     rootIdentity: finalInspected.identity,
+    rootRuntimeIdentity: finalInspected.runtimeIdentity,
+  });
+}
+
+async function observeAttachmentRootLegacyInternal(state, request) {
+  const observed = await observeAttachmentRootInternal(state, request);
+  return frozenRecord({
+    attachmentRootPath: observed.attachmentRootPath,
+    filesystem: observed.filesystem,
+    imageIdentity: observed.imageIdentity,
+    imagePath: observed.imagePath,
+    loopDevice: observed.loopDevice,
+    mountEvidence: observed.mountEvidence,
+    mountPath: observed.mountPath,
+    mountRootIdentity: observed.mountRootIdentity,
+    rootIdentity: observed.rootIdentity,
   });
 }
 
@@ -2764,6 +2781,19 @@ export function createLinuxExt4ImageDriver(options) {
         throw new TypeError("expected one request argument");
       }
       return serializeRequest(input, attachmentRequest, (request) =>
+        observeAttachmentRootLegacyInternal(state, request),
+      );
+    },
+  );
+  const observeAttachmentRootAuthority = objectFreezeIntrinsic(
+    function observeAttachmentRootAuthority(input) {
+      if (this !== surface) {
+        throw new TypeError("invalid Linux ext4 image driver receiver");
+      }
+      if (arguments.length !== 1) {
+        throw new TypeError("expected one request argument");
+      }
+      return serializeRequest(input, attachmentRequest, (request) =>
         observeAttachmentRootInternal(state, request),
       );
     },
@@ -2824,9 +2854,12 @@ export function createLinuxExt4ImageDriver(options) {
   });
   surface = frozenRecord({
     contractVersion: LINUX_EXT4_IMAGE_DRIVER_CONTRACT_VERSION,
+    attachmentRootAuthorityContractVersion:
+      LINUX_EXT4_ATTACHMENT_ROOT_AUTHORITY_CONTRACT_VERSION,
     provision,
     observeMount,
     observeAttachmentRoot,
+    observeAttachmentRootAuthority,
     remount,
     ensureAttachmentRoot,
     ensurePublicationRoot,

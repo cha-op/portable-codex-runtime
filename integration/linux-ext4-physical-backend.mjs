@@ -17,8 +17,8 @@ import {
   FilesystemOperationJournal,
 } from "../src/filesystem-operation-journal.mjs";
 import {
-  createExt4FilesystemImageBackend,
-} from "../src/ext4-filesystem-image-backend.mjs";
+  createExt4PodmanAttachmentBinding,
+} from "../src/ext4-podman-attachment-binding.mjs";
 import {
   createExt4FilesystemImagePaths,
 } from "../src/ext4-filesystem-image-paths.mjs";
@@ -37,6 +37,9 @@ import {
   STOPPED_DIRECTORY_PUBLICATION_LOCK_NAME,
   StoppedDirectoryPublication,
 } from "../src/stopped-directory-publication.mjs";
+import {
+  runExt4PodmanWriterIntegration,
+} from "./ext4-podman-writer.mjs";
 
 const BACKEND_ID = "linux-ext4-physical-v1";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
@@ -52,6 +55,7 @@ const PAYLOAD = Buffer.from(
   "portable-codex-runtime linux ext4 cross-host evidence\n",
   "utf8",
 );
+const PODMAN_MARKER = Buffer.from("ready\n", "utf8");
 const MODE = process.env.LINUX_EXT4_TEST_MODE ?? "lifecycle";
 const ROOT = resolve(
   process.env.LINUX_EXT4_TEST_ROOT ??
@@ -61,6 +65,11 @@ const HELPER = resolve(
   process.env.LINUX_EXT4_INSPECTOR_HELPER ??
     "/usr/local/libexec/portable-codex-linux-ext4-inspector",
 );
+const PODMAN = resolve(process.env.PODMAN_EXECUTABLE ?? "/usr/bin/podman");
+const PODMAN_WRITER_IMAGE_DIGEST =
+  process.env.PODMAN_WRITER_IMAGE_DIGEST ?? null;
+const PODMAN_WRITER_IMAGE_REFERENCE =
+  process.env.PODMAN_WRITER_IMAGE_REFERENCE ?? null;
 const TRANSFER_PATH = join(ROOT, "transfer.json");
 const PRIVATE_MOUNT_NAMESPACE =
   process.env.LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE === "1";
@@ -477,6 +486,15 @@ async function verifyTransferredPublication(fixed, storage, receipt) {
     receipt.artifactProof.artifactManifestDigest,
   );
   assert.deepEqual(await readFile(receipt.restoredPayloadPath), PAYLOAD);
+  const markerPath = join(storage.dataRoot.rootPath, "podman-writer-ready");
+  const restoredMarkerPath = join(
+    receipt.destinationDirectory,
+    "podman-writer-ready",
+  );
+  assert.equal(markerPath, receipt.podmanMarkerPath);
+  assert.equal(receipt.podmanMarkerSha256, sha256(PODMAN_MARKER));
+  assert.deepEqual(await readFile(markerPath), PODMAN_MARKER);
+  assert.deepEqual(await readFile(restoredMarkerPath), PODMAN_MARKER);
 }
 
 async function syncFileAndDirectory(path) {
@@ -693,13 +711,14 @@ async function createFixture({
     directory: directories.state,
     headAnchor: createProviderStateHeadAnchor(),
   });
-  const backend = createExt4FilesystemImageBackend({
+  const binding = createExt4PodmanAttachmentBinding({
     backendId: BACKEND_ID,
     driver,
     imageSizeBytes: IMAGE_SIZE_BYTES,
     paths,
     state,
   });
+  const backend = binding.backend;
   const journal = new FilesystemOperationJournal({
     directory: directories.journal,
   });
@@ -747,6 +766,7 @@ async function createFixture({
     backend,
     directories,
     driver,
+    filesystemAuthority: binding.filesystemAuthority,
     inspector,
     journal,
     paths,
@@ -783,6 +803,45 @@ async function produce() {
   const payloadPath = join(attached.rootPath, "portable.txt");
   await writeFile(payloadPath, PAYLOAD, { flag: "wx", mode: 0o600 });
   await syncFileAndDirectory(payloadPath);
+  assert.notEqual(PODMAN_WRITER_IMAGE_DIGEST, null);
+  assert.notEqual(PODMAN_WRITER_IMAGE_REFERENCE, null);
+  const podmanAttachment = exact({
+    attachmentId: attached.target.attachmentId,
+    backendId: attached.backendId,
+    contractVersion: attached.contractVersion,
+    fencingEpoch: attached.fencingEpoch,
+    holderId: attached.holderId,
+    kind: "directory",
+    leaseId: attached.leaseId,
+    mode: "read-write",
+    operationId: attached.operationId,
+    proofId: attached.proofId,
+    rootPath: attached.rootPath,
+    sessionId: attached.sessionId,
+    storageId: attached.storageId,
+  });
+  // The composition protects the committed persistent identity, the held
+  // dev/inode identity, and the exact access policy. The writer marker is
+  // intentional child/content churn and must remain permitted.
+  const podmanWriter = await runExt4PodmanWriterIntegration({
+    attachment: podmanAttachment,
+    configuredAttachmentRoot: fixed.directories.mounts,
+    filesystemAuthority: fixed.filesystemAuthority,
+    imageDigest: PODMAN_WRITER_IMAGE_DIGEST,
+    imageReference: PODMAN_WRITER_IMAGE_REFERENCE,
+    podmanEnvironment: exact({
+      HOME: process.env.HOME,
+      LANG: "C.UTF-8",
+      XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+    }),
+    podmanExecutable: PODMAN,
+    stateRoot: join(ROOT, "podman-state"),
+  });
+  assert.equal(podmanWriter.servicePid, process.pid);
+  assert.equal(podmanWriter.serviceUid, process.getuid());
+  await syncFileAndDirectory(podmanWriter.markerPath);
+  assert.deepEqual(await readFile(podmanWriter.markerPath), PODMAN_MARKER);
+  assert.deepEqual(await readFile(payloadPath), PAYLOAD);
   await fixed.backend.lifecycleBackend.detachAttachment(
     detachRequest(attached, "001"),
     context(),
@@ -803,6 +862,8 @@ async function produce() {
     filesystemId: storage.filesystemId,
     payloadPath,
     payloadSha256: sha256(PAYLOAD),
+    podmanMarkerPath: podmanWriter.markerPath,
+    podmanMarkerSha256: sha256(PODMAN_MARKER),
     providerStateHead,
     restoredPayloadPath: publication.restoredPayloadPath,
     serviceUid: process.getuid(),
