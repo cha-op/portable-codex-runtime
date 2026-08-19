@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { Hash, createHash } from "node:crypto";
+import { Hash, createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
   chmod,
@@ -21,6 +21,7 @@ const bufferEqualsIntrinsic = Buffer.prototype.equals;
 const bufferFromIntrinsic = Buffer.from;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
 const createHashIntrinsic = createHash;
+const randomBytesIntrinsic = randomBytes;
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
 const JsonObject = JSON;
@@ -54,6 +55,9 @@ const stringIncludesIntrinsic = String.prototype.includes;
 const stringIndexOfIntrinsic = String.prototype.indexOf;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const WeakMapConstructor = WeakMap;
 const runtimePlatform = process.platform;
 
 function callIntrinsic(intrinsic, receiver, arguments_) {
@@ -73,7 +77,8 @@ function regexpTest(pattern, value) {
 }
 
 export const PODMAN_WRITER_SUPERVISOR_STATE_CONTRACT_VERSION = 1;
-export const PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION = 1;
+export const PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION = 2;
+export const PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION = 1;
 
 const MAX_RECORD_BYTES = 16 * 1024;
 const MAX_NATIVE_PATH_BYTES = 4_095;
@@ -84,6 +89,8 @@ const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,127}$/u;
 const CONTAINER_ID_PATTERN = /^[0-9a-f]{12,64}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
+const STATE_OWNER_MARKER_NAME = ".state-owner-v1.json";
 const RECORD_KEYS = Object.freeze([
   "containerId",
   "containerName",
@@ -105,9 +112,15 @@ const TRANSITION_KEYS = Object.freeze([
   "expectedStatus",
   "record",
 ]);
-const COLLECTION_KEYS = Object.freeze(["terminalRecord"]);
-const OPTION_KEYS = Object.freeze(["faultHooks", "root"]);
-const REQUIRED_OPTION_KEYS = Object.freeze(["root"]);
+const COLLECTION_KEYS = Object.freeze(["stateOwnerId", "terminalRecord"]);
+const LEGACY_OPTION_KEYS = Object.freeze(["faultHooks", "root"]);
+const LEGACY_REQUIRED_OPTION_KEYS = Object.freeze(["root"]);
+const BUNDLE_OPTION_KEYS = Object.freeze(["faultHooks", "owner"]);
+const BUNDLE_REQUIRED_OPTION_KEYS = Object.freeze(["owner"]);
+const STATE_OWNER_PREPARATION_KEYS = Object.freeze([
+  "expectedStateOwnerId",
+  "root",
+]);
 const FAULT_HOOK_KEYS = Object.freeze([
   "afterCleanup",
   "afterCleanupDirectorySync",
@@ -153,6 +166,8 @@ const stateBrands = new WeakSet();
 const stateBundleBrands = new WeakSet();
 const stateCollectorBrands = new WeakSet();
 const stateErrorBrands = new WeakSet();
+const stateOwnerBrands = new WeakSet();
+const stateOwnerBindings = new WeakMapConstructor();
 
 export class PodmanWriterSupervisorStateError extends Error {
   constructor(code) {
@@ -463,6 +478,66 @@ function safeFileStat(stat, maximumLinks = 1n) {
   );
 }
 
+function safeStateOwnerMarkerStat(stat, expectedSize) {
+  const uid = effectiveUid();
+  return (
+    stat.isFile() &&
+    !stat.isSymbolicLink() &&
+    stat.nlink === 1n &&
+    uid !== null &&
+    stat.uid === uid &&
+    Number(stat.mode & 0o7777n) === 0o600 &&
+    stat.size === BigInt(expectedSize)
+  );
+}
+
+function assertStateOwnerId(value) {
+  ensure(
+    typeof value === "string" && regexpTest(STATE_OWNER_ID_PATTERN, value),
+  );
+  return value;
+}
+
+function stateOwnerMarkerBytes(stateOwnerId) {
+  assertStateOwnerId(stateOwnerId);
+  return callIntrinsic(bufferFromIntrinsic, Buffer, [
+    `{"contractVersion":${PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION},"stateOwnerId":"${stateOwnerId}"}\n`,
+    "utf8",
+  ]);
+}
+
+function parseStateOwnerMarker(bytes) {
+  ensure(
+    bytes.length > 0 && bytes.length <= MAX_RECORD_BYTES,
+    "podman_writer_state_io_failed",
+  );
+  const raw = callIntrinsic(bufferToStringIntrinsic, bytes, ["utf8"]);
+  let parsed;
+  try {
+    parsed = callIntrinsic(jsonParseIntrinsic, JsonObject, [raw]);
+  } catch {
+    fail("podman_writer_state_io_failed");
+  }
+  const marker = exactDataObject(
+    parsed,
+    ["contractVersion", "stateOwnerId"],
+    "podman_writer_state_io_failed",
+  );
+  ensure(
+    marker.contractVersion ===
+        PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION &&
+      typeof marker.stateOwnerId === "string" &&
+      regexpTest(STATE_OWNER_ID_PATTERN, marker.stateOwnerId),
+    "podman_writer_state_io_failed",
+  );
+  const canonical = stateOwnerMarkerBytes(marker.stateOwnerId);
+  ensure(
+    callIntrinsic(bufferEqualsIntrinsic, bytes, [canonical]),
+    "podman_writer_state_io_failed",
+  );
+  return marker.stateOwnerId;
+}
+
 function recordKey(launchAttemptId) {
   const hash = createHashIntrinsic("sha256");
   callIntrinsic(hashUpdateIntrinsic, hash, [
@@ -687,6 +762,7 @@ async function heldPrivateDirectory(root, { create }, faultHooks) {
     await assertPrivateParentHeld(parent);
     const heldDirectory = callIntrinsic(objectFreezeIntrinsic, Object, [
       {
+        created,
         handle,
         identity: held,
         parentHandle: parent.handle,
@@ -760,6 +836,342 @@ async function closeHeldDirectory(held) {
     failed = true;
   }
   if (failed) fail("podman_writer_state_io_failed");
+}
+
+function stateOwnerMarkerPath(root) {
+  return `${root}/${STATE_OWNER_MARKER_NAME}`;
+}
+
+async function withStateOwnerMarkerLookupPath(root, held, callback) {
+  let descriptorHandle = null;
+  let primaryError = null;
+  let result;
+  try {
+    await assertDirectoryHeld(root, held);
+    let path = stateOwnerMarkerPath(root);
+    if (runtimePlatform === "linux") {
+      const descriptor = held.handle.fd;
+      ensure(
+        numberIsSafeIntegerIntrinsic(descriptor) && descriptor >= 0,
+        "podman_writer_state_io_failed",
+      );
+      descriptorHandle = await open(
+        `/proc/self/fd/${descriptor}`,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY,
+      );
+      const descriptorStat = await descriptorHandle.stat({ bigint: true });
+      const rootStat = await held.handle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(descriptorStat) &&
+          safeDirectoryStat(rootStat) &&
+          sameIdentity(held.identity, descriptorStat) &&
+          sameIdentity(held.identity, rootStat),
+        "podman_writer_state_io_failed",
+      );
+      const anchoredDescriptor = descriptorHandle.fd;
+      ensure(
+        numberIsSafeIntegerIntrinsic(anchoredDescriptor) &&
+          anchoredDescriptor >= 0,
+        "podman_writer_state_io_failed",
+      );
+      path = `/proc/self/fd/${anchoredDescriptor}/${STATE_OWNER_MARKER_NAME}`;
+    }
+    result = await callback(path);
+    if (descriptorHandle !== null) {
+      const descriptorStat = await descriptorHandle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(descriptorStat) &&
+          sameIdentity(held.identity, descriptorStat),
+        "podman_writer_state_io_failed",
+      );
+    }
+    // Node has no portable openat/fstatat API. Non-Linux marker lookup is
+    // therefore bracketed by held-versus-named root and parent identity/policy
+    // validation. This detects one-way replacement but does not claim to
+    // exclude an active same-uid ABA between the pathname operation and the
+    // second bracket.
+    await assertDirectoryHeld(root, held);
+  } catch (error) {
+    primaryError = error;
+  }
+  if (descriptorHandle !== null) {
+    try {
+      await descriptorHandle.close();
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (primaryError !== null) {
+    if (isStateError(primaryError)) throw primaryError;
+    fail("podman_writer_state_io_failed");
+  }
+  return result;
+}
+
+function lstatStateOwnerMarker(root, held) {
+  return withStateOwnerMarkerLookupPath(root, held, (path) =>
+    lstat(path, { bigint: true }));
+}
+
+async function openStateOwnerMarkerPath(root, held, flags, mode = undefined) {
+  let handle = null;
+  try {
+    await withStateOwnerMarkerLookupPath(root, held, async (path) => {
+      handle = mode === undefined
+        ? await open(path, flags)
+        : await open(path, flags, mode);
+    });
+    return handle;
+  } catch (error) {
+    if (handle !== null) {
+      try {
+        await handle.close();
+      } catch {
+        // Preserve the root/parent revalidation failure.
+      }
+    }
+    throw error;
+  }
+}
+
+function stateOwnerBinding(root, held, marker) {
+  return frozenRecord({
+    markerBytes: callIntrinsic(bufferFromIntrinsic, Buffer, [marker.bytes]),
+    markerDev: marker.stat.dev,
+    markerIno: marker.stat.ino,
+    markerPath: marker.path,
+    parentDev: held.parentIdentity.dev,
+    parentIno: held.parentIdentity.ino,
+    root,
+    rootDev: held.identity.dev,
+    rootIno: held.identity.ino,
+    stateOwnerId: marker.stateOwnerId,
+  });
+}
+
+function assertStateOwnerRootBaseline(held, binding) {
+  ensure(
+    held.identity.dev === binding.rootDev &&
+      held.identity.ino === binding.rootIno &&
+      held.parentIdentity.dev === binding.parentDev &&
+      held.parentIdentity.ino === binding.parentIno,
+    "podman_writer_state_io_failed",
+  );
+}
+
+async function readHeldFileExactly(handle, size) {
+  ensure(
+    numberIsSafeIntegerIntrinsic(size) && size > 0 && size <= MAX_RECORD_BYTES,
+    "podman_writer_state_io_failed",
+  );
+  const bytes = callIntrinsic(bufferAllocIntrinsic, Buffer, [size]);
+  const result = await handle.read(bytes, 0, size, 0);
+  ensure(result.bytesRead === size, "podman_writer_state_io_failed");
+  return bytes;
+}
+
+// The owner marker protects three independent properties. Object identity is
+// the held root/marker fd pair plus dev+ino equality with their names. Content
+// stability is the exact canonical marker byte string. Access policy is the
+// current-uid 0700 root/parent and current-uid 0600, nlink-one marker. Ordinary
+// timestamp or child-entry churn is not mutation evidence; it only causes the
+// content and policy properties to be revalidated through held descriptors.
+async function assertStateOwnerMarkerHeld(root, held, marker, binding = null) {
+  await assertDirectoryHeld(root, held);
+  if (binding !== null) assertStateOwnerRootBaseline(held, binding);
+  const handleStat = await marker.handle.stat({ bigint: true });
+  const pathStat = await lstatStateOwnerMarker(root, held);
+  const expectedBytes = binding === null ? marker.bytes : binding.markerBytes;
+  ensure(
+    safeStateOwnerMarkerStat(handleStat, expectedBytes.length) &&
+      safeStateOwnerMarkerStat(pathStat, expectedBytes.length) &&
+      sameIdentity(marker.stat, handleStat) &&
+      sameIdentity(marker.stat, pathStat) &&
+      (binding === null ||
+        (handleStat.dev === binding.markerDev &&
+          handleStat.ino === binding.markerIno)),
+    "podman_writer_state_io_failed",
+  );
+  const bytes = await readHeldFileExactly(marker.handle, expectedBytes.length);
+  const finalStat = await marker.handle.stat({ bigint: true });
+  ensure(
+    safeStateOwnerMarkerStat(finalStat, expectedBytes.length) &&
+      sameIdentity(marker.stat, finalStat) &&
+      callIntrinsic(bufferEqualsIntrinsic, bytes, [expectedBytes]),
+    "podman_writer_state_io_failed",
+  );
+  const stateOwnerId = parseStateOwnerMarker(bytes);
+  ensure(
+    stateOwnerId === marker.stateOwnerId &&
+      (binding === null || stateOwnerId === binding.stateOwnerId),
+    "podman_writer_state_io_failed",
+  );
+  await assertDirectoryHeld(root, held);
+  if (binding !== null) assertStateOwnerRootBaseline(held, binding);
+}
+
+async function openStateOwnerMarker(
+  root,
+  held,
+  binding = null,
+  { writable = false } = {},
+) {
+  let handle;
+  const path = stateOwnerMarkerPath(root);
+  try {
+    await assertDirectoryHeld(root, held);
+    if (binding !== null) {
+      assertStateOwnerRootBaseline(held, binding);
+      ensure(path === binding.markerPath, "podman_writer_state_io_failed");
+    }
+    const before = await lstatStateOwnerMarker(root, held);
+    ensure(safeFileStat(before), "podman_writer_state_io_failed");
+    handle = await openStateOwnerMarkerPath(
+      root,
+      held,
+      (writable ? fsConstants.O_RDWR : fsConstants.O_RDONLY) |
+        fsConstants.O_NOFOLLOW,
+    );
+    const opened = await handle.stat({ bigint: true });
+    ensure(
+      safeFileStat(opened) && sameIdentity(before, opened),
+      "podman_writer_state_io_failed",
+    );
+    const initialSize = Number(opened.size);
+    const bytes = await readHeldFileExactly(handle, initialSize);
+    const stateOwnerId = parseStateOwnerMarker(bytes);
+    const after = await handle.stat({ bigint: true });
+    const current = await lstatStateOwnerMarker(root, held);
+    ensure(
+      safeStateOwnerMarkerStat(after, bytes.length) &&
+        safeStateOwnerMarkerStat(current, bytes.length) &&
+        sameIdentity(before, after) &&
+        sameIdentity(before, current),
+      "podman_writer_state_io_failed",
+    );
+    const marker = callIntrinsic(objectFreezeIntrinsic, Object, [
+      { bytes, handle, path, stat: after, stateOwnerId },
+    ]);
+    await assertStateOwnerMarkerHeld(root, held, marker, binding);
+    return marker;
+  } catch (error) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        // Preserve the primary fail-closed result.
+      }
+    }
+    if (isStateError(error)) throw error;
+    fail("podman_writer_state_io_failed");
+  }
+}
+
+async function createStateOwnerMarker(root, held, stateOwnerId) {
+  let handle;
+  const path = stateOwnerMarkerPath(root);
+  const bytes = stateOwnerMarkerBytes(stateOwnerId);
+  try {
+    await assertDirectoryHeld(root, held);
+    handle = await openStateOwnerMarkerPath(
+      root,
+      held,
+      fsConstants.O_RDWR |
+        fsConstants.O_CREAT |
+        fsConstants.O_EXCL |
+        fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(bytes);
+    await handle.chmod(0o600);
+    await handle.sync();
+    const opened = await handle.stat({ bigint: true });
+    const current = await lstatStateOwnerMarker(root, held);
+    ensure(
+      safeStateOwnerMarkerStat(opened, bytes.length) &&
+        safeStateOwnerMarkerStat(current, bytes.length) &&
+        sameIdentity(opened, current),
+      "podman_writer_state_io_failed",
+    );
+    const marker = callIntrinsic(objectFreezeIntrinsic, Object, [
+      { bytes, handle, path, stat: opened, stateOwnerId },
+    ]);
+    await assertStateOwnerMarkerHeld(root, held, marker);
+    await held.handle.sync();
+    await held.parentHandle.sync();
+    await assertStateOwnerMarkerHeld(root, held, marker);
+    return marker;
+  } catch (error) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        // Preserve the primary fail-closed result.
+      }
+    }
+    if (isStateError(error)) throw error;
+    fail("podman_writer_state_io_failed");
+  }
+}
+
+async function closeStateOwnerMarker(marker) {
+  try {
+    await marker.handle.close();
+  } catch {
+    fail("podman_writer_state_io_failed");
+  }
+}
+
+async function withStateDirectory(
+  root,
+  create,
+  faultHooks,
+  ownerBinding,
+  callback,
+) {
+  let held = null;
+  let marker = null;
+  let primaryError = null;
+  let result;
+  try {
+    held = await heldPrivateDirectory(
+      root,
+      { create: ownerBinding === null && create },
+      faultHooks,
+    );
+    if (ownerBinding !== null) {
+      ensure(held !== null, "podman_writer_state_io_failed");
+      assertStateOwnerRootBaseline(held, ownerBinding);
+      marker = await openStateOwnerMarker(root, held, ownerBinding);
+    }
+    result = await callback(held);
+  } catch (error) {
+    primaryError = error;
+  }
+  if (marker !== null) {
+    try {
+      await assertStateOwnerMarkerHeld(root, held, marker, ownerBinding);
+    } catch (error) {
+      primaryError = error;
+    }
+    try {
+      await closeStateOwnerMarker(marker);
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (held !== null) {
+    try {
+      await closeHeldDirectory(held);
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (primaryError !== null) {
+    if (isStateError(primaryError)) throw primaryError;
+    fail("podman_writer_state_io_failed");
+  }
+  return result;
 }
 
 async function readPlainSafeFile(path, maximumLinks = 1n) {
@@ -1089,12 +1501,14 @@ async function unlinkCollectionArtifact(
   }
 }
 
-function collectionReceipt(terminalRecord, status) {
+function collectionReceipt(stateOwnerId, terminalRecord, status) {
   const hash = createHashIntrinsic("sha256");
   callIntrinsic(hashUpdateIntrinsic, hash, [
-    "portable-codex-runtime:podman-writer-state-collection:v1\0",
+    "portable-codex-runtime:podman-writer-state-collection:v2\0",
     "utf8",
   ]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [stateOwnerId, "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
   callIntrinsic(hashUpdateIntrinsic, hash, [
     callIntrinsic(jsonStringifyIntrinsic, JsonObject, [terminalRecord]),
     "utf8",
@@ -1102,6 +1516,7 @@ function collectionReceipt(terminalRecord, status) {
   return frozenRecord({
     contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
     launchAttemptId: terminalRecord.launchAttemptId,
+    stateOwnerId,
     status,
     terminalRecordSha256: callIntrinsic(hashDigestIntrinsic, hash, ["hex"]),
   });
@@ -1564,16 +1979,95 @@ function validStateRoot(value) {
   );
 }
 
-function createPodmanWriterSupervisorStateBundleInternal(args) {
-  ensure(args.length === 1);
-  const options = optionalDataObject(
-    args[0],
-    OPTION_KEYS,
-    REQUIRED_OPTION_KEYS,
+export async function preparePodmanWriterSupervisorStateOwner(inputValue) {
+  ensure(arguments.length === 1);
+  const input = exactDataObject(inputValue, STATE_OWNER_PREPARATION_KEYS);
+  ensure(validStateRoot(input.root));
+  ensure(
+    input.expectedStateOwnerId === null ||
+      (typeof input.expectedStateOwnerId === "string" &&
+        regexpTest(STATE_OWNER_ID_PATTERN, input.expectedStateOwnerId)),
   );
-  ensure(validStateRoot(options.root));
-  const root = options.root;
-  const faultHooks = normalizeFaultHooks(options.faultHooks);
+  const root = input.root;
+  let held = null;
+  let marker = null;
+  let primaryError = null;
+  let owner = null;
+  try {
+    held = await heldPrivateDirectory(root, { create: false }, frozenRecord({}));
+    if (held === null) {
+      ensure(
+        input.expectedStateOwnerId === null,
+        "podman_writer_state_io_failed",
+      );
+      held = await heldPrivateDirectory(root, { create: true }, frozenRecord({}));
+      ensure(held.created, "podman_writer_state_io_failed");
+      const random = callIntrinsic(randomBytesIntrinsic, undefined, [32]);
+      const stateOwnerId = `state-owner:${callIntrinsic(
+        bufferToStringIntrinsic,
+        random,
+        ["hex"],
+      )}`;
+      assertStateOwnerId(stateOwnerId);
+      marker = await createStateOwnerMarker(root, held, stateOwnerId);
+    } else {
+      marker = await openStateOwnerMarker(root, held, null, { writable: true });
+    }
+    if (input.expectedStateOwnerId !== null) {
+      ensure(
+        marker.stateOwnerId === input.expectedStateOwnerId,
+        "podman_writer_state_io_failed",
+      );
+    }
+    // Repeat all three durability barriers when adopting an existing marker.
+    // A previous initialization may have completed but lost any one fsync
+    // acknowledgement before returning its capability.
+    await marker.handle.sync();
+    await held.handle.sync();
+    await held.parentHandle.sync();
+    await assertStateOwnerMarkerHeld(root, held, marker);
+    const binding = stateOwnerBinding(root, held, marker);
+    owner = frozenRecord({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION,
+      stateOwnerId: binding.stateOwnerId,
+    });
+    callIntrinsic(weakSetAddIntrinsic, stateOwnerBrands, [owner]);
+    callIntrinsic(weakMapSetIntrinsic, stateOwnerBindings, [owner, binding]);
+  } catch (error) {
+    primaryError = error;
+  }
+  if (marker !== null) {
+    try {
+      await closeStateOwnerMarker(marker);
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (held !== null) {
+    try {
+      await closeHeldDirectory(held);
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (primaryError !== null) {
+    if (isStateError(primaryError)) throw primaryError;
+    fail("podman_writer_state_io_failed");
+  }
+  ensure(owner !== null, "podman_writer_state_io_failed");
+  return owner;
+}
+
+export function isPodmanWriterSupervisorStateOwner(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !isProxy(value) &&
+    callIntrinsic(weakSetHasIntrinsic, stateOwnerBrands, [value])
+  );
+}
+
+function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBinding) {
   const operationTails = new MapConstructor();
 
   async function withAttemptLock(launchAttemptId, callback) {
@@ -1600,19 +2094,17 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
     ensure(arguments.length === 1);
     const input = exactDataObject(inputValue, READ_KEYS);
     const launchAttemptId = assertOpaqueId(input.launchAttemptId);
-    return withAttemptLock(launchAttemptId, async () => {
-      const held = await heldPrivateDirectory(
+    return withAttemptLock(launchAttemptId, () =>
+      withStateDirectory(
         root,
-        { create: false },
+        false,
         faultHooks,
-      );
-      if (held === null) return null;
-      try {
-        return await readCurrent(root, launchAttemptId, held);
-      } finally {
-        await closeHeldDirectory(held);
-      }
-    });
+        ownerBinding,
+        async (held) => {
+          if (held === null) return null;
+          return await readCurrent(root, launchAttemptId, held);
+        },
+      ));
   });
 
   const claim = frozenFunction(async function claim(inputValue) {
@@ -1620,21 +2112,20 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
     const input = exactDataObject(inputValue, CLAIM_KEYS);
     const record = normalizeRecord(input.record);
     ensure(record.status === "preparing" && record.revision === 0);
-    return withAttemptLock(record.launchAttemptId, async () => {
-      const held = await heldPrivateDirectory(
+    return withAttemptLock(record.launchAttemptId, () =>
+      withStateDirectory(
         root,
-        { create: true },
+        true,
         faultHooks,
-      );
-      try {
-        const created = await writeExclusive(root, record, held, faultHooks);
-        const current = await readCurrent(root, record.launchAttemptId, held);
-        ensure(current !== null, "podman_writer_state_io_failed");
-        return frozenRecord({ created, record: current });
-      } finally {
-        await closeHeldDirectory(held);
-      }
-    });
+        ownerBinding,
+        async (held) => {
+          ensure(held !== null, "podman_writer_state_io_failed");
+          const created = await writeExclusive(root, record, held, faultHooks);
+          const current = await readCurrent(root, record.launchAttemptId, held);
+          ensure(current !== null, "podman_writer_state_io_failed");
+          return frozenRecord({ created, record: current });
+        },
+      ));
   });
 
   const transition = frozenFunction(async function transition(inputValue) {
@@ -1652,40 +2143,43 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
       record.revision === input.expectedRevision + 1 &&
         isNextStatus(input.expectedStatus, record.status),
     );
-    return withAttemptLock(record.launchAttemptId, async () => {
-      const held = await heldPrivateDirectory(
+    return withAttemptLock(record.launchAttemptId, () =>
+      withStateDirectory(
         root,
-        { create: false },
+        false,
         faultHooks,
-      );
-      ensure(held !== null, "podman_writer_state_conflict");
-      try {
-        const current = await readCurrent(root, record.launchAttemptId, held);
-        if (
-          current === null ||
-          current.revision !== input.expectedRevision ||
-          current.status !== input.expectedStatus
-        ) {
-          if (current !== null && sameRecord(current, record)) return current;
-          fail("podman_writer_state_conflict");
-        }
-        const created = await writeExclusive(root, record, held, faultHooks);
-        const after = await readCurrent(root, record.launchAttemptId, held);
-        ensure(after !== null, "podman_writer_state_io_failed");
-        if (!created && !sameRecord(after, record)) {
-          fail("podman_writer_state_conflict");
-        }
-        ensure(sameRecord(after, record), "podman_writer_state_conflict");
-        return after;
-      } finally {
-        await closeHeldDirectory(held);
-      }
-    });
+        ownerBinding,
+        async (held) => {
+          ensure(held !== null, "podman_writer_state_conflict");
+          const current = await readCurrent(root, record.launchAttemptId, held);
+          if (
+            current === null ||
+            current.revision !== input.expectedRevision ||
+            current.status !== input.expectedStatus
+          ) {
+            if (current !== null && sameRecord(current, record)) return current;
+            fail("podman_writer_state_conflict");
+          }
+          const created = await writeExclusive(root, record, held, faultHooks);
+          const after = await readCurrent(root, record.launchAttemptId, held);
+          ensure(after !== null, "podman_writer_state_io_failed");
+          if (!created && !sameRecord(after, record)) {
+            fail("podman_writer_state_conflict");
+          }
+          ensure(sameRecord(after, record), "podman_writer_state_conflict");
+          return after;
+        },
+      ));
   });
 
   const collect = frozenFunction(async function collect(inputValue) {
     ensure(arguments.length === 1);
     const input = exactDataObject(inputValue, COLLECTION_KEYS);
+    ensure(
+      ownerBinding !== null &&
+        input.stateOwnerId === ownerBinding.stateOwnerId,
+    );
+    const stateOwnerId = ownerBinding.stateOwnerId;
     const terminalRecord = normalizeRecord(input.terminalRecord);
     ensure(
       terminalRecord.status === "stopped" && terminalRecord.revision === 4,
@@ -1693,6 +2187,7 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
     return withAttemptLock(terminalRecord.launchAttemptId, async () => {
       const files = [];
       let held = null;
+      let marker = null;
       let mutationStarted = false;
       let primaryError = null;
       let result = null;
@@ -1702,197 +2197,196 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
           { create: false },
           faultHooks,
         );
-        if (held === null) {
-          result = collectionReceipt(terminalRecord, "absent");
-        } else {
-          await assertFutureCollectionRevisionsAbsent(
+        ensure(held !== null, "podman_writer_state_io_failed");
+        assertStateOwnerRootBaseline(held, ownerBinding);
+        marker = await openStateOwnerMarker(root, held, ownerBinding);
+        await assertFutureCollectionRevisionsAbsent(
+          root,
+          terminalRecord.launchAttemptId,
+        );
+        const revisions = [];
+        for (let revision = 0; revision <= 4; revision += 1) {
+          revisions[revision] = await openCollectionRevision(
             root,
             terminalRecord.launchAttemptId,
+            revision,
+            held,
+            files,
+            faultHooks,
           );
-          const revisions = [];
-          for (let revision = 0; revision <= 4; revision += 1) {
-            revisions[revision] = await openCollectionRevision(
+        }
+        const terminal = revisions[4];
+        if (terminal.record === null) {
+          for (let revision = 0; revision < 4; revision += 1) {
+            ensure(
+              revisions[revision].record === null,
+              "podman_writer_state_conflict",
+            );
+          }
+          await assertDirectoryHeld(root, held);
+          await held.handle.sync();
+          await runFaultHook(
+            faultHooks,
+            "afterCollectionFinalDirectorySync",
+          );
+          for (let revision = 0; revision <= 9; revision += 1) {
+            await assertCollectionRevisionAbsent(
               root,
               terminalRecord.launchAttemptId,
               revision,
-              held,
-              files,
-              faultHooks,
             );
           }
-          const terminal = revisions[4];
-          if (terminal.record === null) {
-            for (let revision = 0; revision < 4; revision += 1) {
+          await assertDirectoryHeld(root, held);
+          result = collectionReceipt(stateOwnerId, terminalRecord, "absent");
+        } else {
+          ensure(
+            sameRecord(terminal.parsed, terminalRecord),
+            "podman_writer_state_conflict",
+          );
+          let lowerRecordObserved = false;
+          let partialPrefixObserved = false;
+          for (let revision = 0; revision < 4; revision += 1) {
+            const current = revisions[revision].parsed;
+            if (current === null) {
+              partialPrefixObserved = true;
               ensure(
-                revisions[revision].record === null,
+                !lowerRecordObserved,
                 "podman_writer_state_conflict",
               );
-            }
-            await assertDirectoryHeld(root, held);
-            await held.handle.sync();
-            await runFaultHook(
-              faultHooks,
-              "afterCollectionFinalDirectorySync",
-            );
-            for (let revision = 0; revision <= 9; revision += 1) {
-              await assertCollectionRevisionAbsent(
-                root,
-                terminalRecord.launchAttemptId,
+            } else {
+              lowerRecordObserved = true;
+              validateCollectionChainRecord(
+                current,
+                terminalRecord,
                 revision,
               );
             }
-            await assertDirectoryHeld(root, held);
-            result = collectionReceipt(terminalRecord, "absent");
-          } else {
+          }
+          mutationStarted = partialPrefixObserved;
+
+          // Phase A preserves revision 4 as the durable terminal anchor. A
+          // missing lower prefix is an allowed retry shape because lower
+          // revisions are removed oldest-first. All sidecars were validated
+          // before the first unlink, so no mismatched alias can be hidden by
+          // the collection itself.
+          for (let revision = 0; revision < 4; revision += 1) {
+            const current = revisions[revision];
+            mutationStarted =
+              (await unlinkCollectionArtifact(
+                root,
+                held,
+                current.ready,
+                faultHooks,
+              )) ||
+              mutationStarted;
+            mutationStarted =
+              (await unlinkCollectionArtifact(
+                root,
+                held,
+                current.pending,
+                faultHooks,
+              )) ||
+              mutationStarted;
+            mutationStarted =
+              (await unlinkCollectionArtifact(
+                root,
+                held,
+                current.record,
+                faultHooks,
+              )) ||
+              mutationStarted;
+          }
+          mutationStarted =
+            (await unlinkCollectionArtifact(
+              root,
+              held,
+              terminal.ready,
+              faultHooks,
+            )) ||
+            mutationStarted;
+          mutationStarted =
+            (await unlinkCollectionArtifact(
+              root,
+              held,
+              terminal.pending,
+              faultHooks,
+            )) ||
+            mutationStarted;
+
+          for (let revision = 0; revision < 4; revision += 1) {
+            await assertCollectionRevisionAbsent(
+              root,
+              terminalRecord.launchAttemptId,
+              revision,
+            );
+          }
+          await assertDirectoryHeld(root, held);
+          await held.handle.sync();
+          await runFaultHook(
+            faultHooks,
+            "afterCollectionFirstDirectorySync",
+          );
+          await assertDirectoryHeld(root, held);
+
+          let terminalPathStat;
+          try {
+            terminalPathStat = await lstat(terminal.path, { bigint: true });
+          } catch (error) {
+            if (errorCode(error) !== "ENOENT") throw error;
+            terminalPathStat = null;
+          }
+          if (terminalPathStat !== null) {
+            const terminalHandleStat = await terminal.record.handle.stat({
+              bigint: true,
+            });
+            const terminalCurrent = await readPlainSafeFile(terminal.path);
             ensure(
-              sameRecord(terminal.parsed, terminalRecord),
-              "podman_writer_state_conflict",
+              terminalCurrent !== null &&
+                safeFileStat(terminalPathStat) &&
+                safeFileStat(terminalHandleStat) &&
+                sameIdentity(terminal.record.stat, terminalPathStat) &&
+                sameIdentity(terminal.record.stat, terminalHandleStat) &&
+                sameIdentity(terminal.record.stat, terminalCurrent.stat) &&
+                callIntrinsic(bufferEqualsIntrinsic, terminal.record.bytes, [
+                  terminalCurrent.bytes,
+                ]),
+              "podman_writer_state_io_failed",
             );
-            let lowerRecordObserved = false;
-            let partialPrefixObserved = false;
-            for (let revision = 0; revision < 4; revision += 1) {
-              const current = revisions[revision].parsed;
-              if (current === null) {
-                partialPrefixObserved = true;
-                ensure(
-                  !lowerRecordObserved,
-                  "podman_writer_state_conflict",
-                );
-              } else {
-                lowerRecordObserved = true;
-                validateCollectionChainRecord(
-                  current,
-                  terminalRecord,
-                  revision,
-                );
-              }
-            }
-            mutationStarted = partialPrefixObserved;
-
-            // Phase A preserves revision 4 as the durable terminal anchor. A
-            // missing lower prefix is an allowed retry shape because lower
-            // revisions are removed oldest-first. All sidecars were validated
-            // before the first unlink, so no mismatched alias can be hidden by
-            // the collection itself.
-            for (let revision = 0; revision < 4; revision += 1) {
-              const current = revisions[revision];
-              mutationStarted =
-                (await unlinkCollectionArtifact(
-                  root,
-                  held,
-                  current.ready,
-                  faultHooks,
-                )) ||
-                mutationStarted;
-              mutationStarted =
-                (await unlinkCollectionArtifact(
-                  root,
-                  held,
-                  current.pending,
-                  faultHooks,
-                )) ||
-                mutationStarted;
-              mutationStarted =
-                (await unlinkCollectionArtifact(
-                  root,
-                  held,
-                  current.record,
-                  faultHooks,
-                )) ||
-                mutationStarted;
-            }
-            mutationStarted =
-              (await unlinkCollectionArtifact(
-                root,
-                held,
-                terminal.ready,
-                faultHooks,
-              )) ||
-              mutationStarted;
-            mutationStarted =
-              (await unlinkCollectionArtifact(
-                root,
-                held,
-                terminal.pending,
-                faultHooks,
-              )) ||
-              mutationStarted;
-
-            for (let revision = 0; revision < 4; revision += 1) {
-              await assertCollectionRevisionAbsent(
-                root,
-                terminalRecord.launchAttemptId,
-                revision,
-              );
-            }
-            await assertDirectoryHeld(root, held);
-            await held.handle.sync();
             await runFaultHook(
               faultHooks,
-              "afterCollectionFirstDirectorySync",
+              "afterCollectionTerminalRevalidation",
             );
-            await assertDirectoryHeld(root, held);
-
-            let terminalPathStat;
-            try {
-              terminalPathStat = await lstat(terminal.path, { bigint: true });
-            } catch (error) {
-              if (errorCode(error) !== "ENOENT") throw error;
-              terminalPathStat = null;
-            }
-            if (terminalPathStat !== null) {
-              const terminalHandleStat = await terminal.record.handle.stat({
-                bigint: true,
-              });
-              const terminalCurrent = await readPlainSafeFile(terminal.path);
-              ensure(
-                terminalCurrent !== null &&
-                safeFileStat(terminalPathStat) &&
-                  safeFileStat(terminalHandleStat) &&
-                  sameIdentity(terminal.record.stat, terminalPathStat) &&
-                  sameIdentity(terminal.record.stat, terminalHandleStat) &&
-                  sameIdentity(terminal.record.stat, terminalCurrent.stat) &&
-                  callIntrinsic(bufferEqualsIntrinsic, terminal.record.bytes, [
-                    terminalCurrent.bytes,
-                  ]),
-                "podman_writer_state_io_failed",
-              );
+            const removedTerminal = await unlinkCollectionArtifact(
+              root,
+              held,
+              terminal.record,
+              faultHooks,
+            );
+            mutationStarted = removedTerminal || mutationStarted;
+            if (removedTerminal) {
               await runFaultHook(
                 faultHooks,
-                "afterCollectionTerminalRevalidation",
-              );
-              const removedTerminal = await unlinkCollectionArtifact(
-                root,
-                held,
-                terminal.record,
-                faultHooks,
-              );
-              mutationStarted = removedTerminal || mutationStarted;
-              if (removedTerminal) {
-                await runFaultHook(
-                  faultHooks,
-                  "afterCollectionTerminalUnlink",
-                );
-              }
-            }
-
-            for (let revision = 0; revision <= 9; revision += 1) {
-              await assertCollectionRevisionAbsent(
-                root,
-                terminalRecord.launchAttemptId,
-                revision,
+                "afterCollectionTerminalUnlink",
               );
             }
-            await assertCollectionFilesUnlinked(files);
-            await assertDirectoryHeld(root, held);
-            await held.handle.sync();
-            await runFaultHook(
-              faultHooks,
-              "afterCollectionFinalDirectorySync",
-            );
-            await assertDirectoryHeld(root, held);
-            result = collectionReceipt(terminalRecord, "collected");
           }
+
+          for (let revision = 0; revision <= 9; revision += 1) {
+            await assertCollectionRevisionAbsent(
+              root,
+              terminalRecord.launchAttemptId,
+              revision,
+            );
+          }
+          await assertCollectionFilesUnlinked(files);
+          await assertDirectoryHeld(root, held);
+          await held.handle.sync();
+          await runFaultHook(
+            faultHooks,
+            "afterCollectionFinalDirectorySync",
+          );
+          await assertDirectoryHeld(root, held);
+          result = collectionReceipt(stateOwnerId, terminalRecord, "collected");
         }
       } catch (error) {
         primaryError = error;
@@ -1902,6 +2396,18 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
         primaryError ??= new PodmanWriterSupervisorStateError(
           "podman_writer_state_io_failed",
         );
+      }
+      if (marker !== null) {
+        try {
+          await assertStateOwnerMarkerHeld(root, held, marker, ownerBinding);
+        } catch (error) {
+          primaryError = error;
+        }
+        try {
+          await closeStateOwnerMarker(marker);
+        } catch (error) {
+          primaryError ??= error;
+        }
       }
       if (held !== null) {
         try {
@@ -1929,23 +2435,52 @@ function createPodmanWriterSupervisorStateBundleInternal(args) {
     transition,
   });
   callIntrinsic(weakSetAddIntrinsic, stateBrands, [state]);
+  if (ownerBinding === null) return frozenRecord({ state });
+  const stateOwnerId = ownerBinding.stateOwnerId;
   const terminalCollector = frozenRecord({
     collect,
     contractVersion:
       PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+    stateOwnerId,
   });
   callIntrinsic(weakSetAddIntrinsic, stateCollectorBrands, [terminalCollector]);
-  const bundle = frozenRecord({ state, terminalCollector });
+  const bundle = frozenRecord({ state, stateOwnerId, terminalCollector });
   callIntrinsic(weakSetAddIntrinsic, stateBundleBrands, [bundle]);
   return bundle;
 }
 
 export function createPodmanWriterSupervisorState(...args) {
-  return createPodmanWriterSupervisorStateBundleInternal(args).state;
+  ensure(args.length === 1);
+  const options = optionalDataObject(
+    args[0],
+    LEGACY_OPTION_KEYS,
+    LEGACY_REQUIRED_OPTION_KEYS,
+  );
+  ensure(validStateRoot(options.root));
+  return createPodmanWriterSupervisorStateInternal(
+    options.root,
+    normalizeFaultHooks(options.faultHooks),
+    null,
+  ).state;
 }
 
 export function createPodmanWriterSupervisorStateBundle(...args) {
-  return createPodmanWriterSupervisorStateBundleInternal(args);
+  ensure(args.length === 1);
+  const options = optionalDataObject(
+    args[0],
+    BUNDLE_OPTION_KEYS,
+    BUNDLE_REQUIRED_OPTION_KEYS,
+  );
+  ensure(isPodmanWriterSupervisorStateOwner(options.owner));
+  const ownerBinding = callIntrinsic(weakMapGetIntrinsic, stateOwnerBindings, [
+    options.owner,
+  ]);
+  ensure(ownerBinding !== undefined, "podman_writer_state_io_failed");
+  return createPodmanWriterSupervisorStateInternal(
+    ownerBinding.root,
+    normalizeFaultHooks(options.faultHooks),
+    ownerBinding,
+  );
 }
 
 export function isPodmanWriterSupervisorStateBundle(value) {
@@ -1971,6 +2506,8 @@ callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorStateError])
 callIntrinsic(objectFreezeIntrinsic, Object, [assertPodmanWriterSupervisorStateRecord]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorState]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorStateBundle]);
+callIntrinsic(objectFreezeIntrinsic, Object, [preparePodmanWriterSupervisorStateOwner]);
 callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorStateBundle]);
 callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorState]);
+callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorStateOwner]);
 callIntrinsic(objectFreezeIntrinsic, Object, [isPodmanWriterSupervisorStateTerminalCollector]);

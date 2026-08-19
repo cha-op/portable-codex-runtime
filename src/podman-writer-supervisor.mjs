@@ -157,11 +157,12 @@ function firstPromiseOfThree(first, second, third) {
   });
 }
 
-export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 3;
+export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 4;
 export const PODMAN_WRITER_LAUNCH_RECEIPT_VERSION = 2;
 export const PODMAN_WRITER_RECONCILE_RECEIPT_VERSION = 1;
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const OCI_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const IMAGE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -196,6 +197,7 @@ const OPTION_KEYS = Object.freeze([
   "podmanEnvironment",
   "podmanExecutable",
   "state",
+  "stateOwnerId",
   "stopTimeoutSeconds",
   "supervisorId",
   "writerCommand",
@@ -222,6 +224,7 @@ const REQUIRED_OPTION_KEYS = Object.freeze([
   "podmanEnvironment",
   "podmanExecutable",
   "state",
+  "stateOwnerId",
   "supervisorId",
   "writerCommand",
   "writerEnvironment",
@@ -444,11 +447,13 @@ const STATE_COLLECTION_KEYS = Object.freeze([
   "contractVersion",
   "invocation",
   "signal",
+  "stateOwnerId",
   "terminalRecord",
 ]);
 const STATE_COLLECTION_RECEIPT_KEYS = Object.freeze([
   "contractVersion",
   "launchAttemptId",
+  "stateOwnerId",
   "status",
   "terminalRecordSha256",
 ]);
@@ -490,6 +495,7 @@ const errorBrands = new WeakSet();
 const compositeFilesystemAuthorities = new WeakSet();
 const compositeFilesystemAuthorityHandleStates = new WeakMap();
 const closedCompositeFilesystemAuthorityHandles = new WeakSet();
+const markerBackedSupervisorStateCollectors = new WeakMap();
 const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(
   AbortSignal.prototype,
   "aborted",
@@ -3056,6 +3062,15 @@ export function createPodmanWriterSupervisor(...args) {
     optionCode,
   );
   const supervisorId = assertOpaqueId(options.supervisorId, optionCode);
+  // This direct factory only validates the routing identifier supplied by its
+  // caller. Marker-backed provenance is established by the bundle factory,
+  // which derives both state and owner identity from one branded state bundle.
+  ensure(
+    typeof options.stateOwnerId === "string" &&
+      regexpTest(STATE_OWNER_ID_PATTERN, options.stateOwnerId),
+    optionCode,
+  );
+  const stateOwnerId = options.stateOwnerId;
   ensure(
     validHostPathnameBytes(options.podmanExecutable) &&
       options.podmanExecutable.length > 1 &&
@@ -3986,9 +4001,10 @@ export function createPodmanWriterSupervisor(...args) {
 
   return frozenRecord({
     contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-    supervisorId,
     launchWriter,
     reconcileWriterLaunch,
+    stateOwnerId,
+    supervisorId,
   });
 }
 
@@ -4008,6 +4024,8 @@ export function createPodmanWriterSupervisorBundle(...args) {
     const key = OPTION_KEYS[index];
     if (key === "state") {
       supervisorOptions.state = stateBundle.state;
+    } else if (key === "stateOwnerId") {
+      supervisorOptions.stateOwnerId = stateBundle.stateOwnerId;
     } else if (objectHasOwnIntrinsic(options, key)) {
       supervisorOptions[key] = options[key];
     }
@@ -4016,6 +4034,12 @@ export function createPodmanWriterSupervisorBundle(...args) {
     callIntrinsic(objectFreezeIntrinsic, Object, [supervisorOptions]),
   );
   const supervisorId = supervisor.supervisorId;
+  const stateOwnerId = supervisor.stateOwnerId;
+  ensure(
+    stateBundle.stateOwnerId === stateOwnerId &&
+      stateBundle.terminalCollector.stateOwnerId === stateOwnerId,
+    optionCode,
+  );
   const collect = assertFunction(stateBundle.terminalCollector.collect, optionCode);
 
   const collectTerminalState = frozenFunction(
@@ -4025,7 +4049,8 @@ export function createPodmanWriterSupervisorBundle(...args) {
       const input = exactDataObject(inputValue, STATE_COLLECTION_KEYS, code);
       ensure(
         input.contractVersion ===
-          PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+            PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION &&
+          input.stateOwnerId === stateOwnerId,
         code,
       );
       assertInvocation(input.invocation, code);
@@ -4046,7 +4071,7 @@ export function createPodmanWriterSupervisorBundle(...args) {
       ensureNotAborted(signal);
       const raw = await invokeState(
         collect,
-        frozenRecord({ terminalRecord: record }),
+        frozenRecord({ stateOwnerId, terminalRecord: record }),
       );
       if (signalAborted(signal)) {
         fail("podman_writer_supervisor_outcome_uncertain");
@@ -4060,6 +4085,7 @@ export function createPodmanWriterSupervisorBundle(...args) {
         receipt.contractVersion ===
             PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION &&
           receipt.launchAttemptId === record.launchAttemptId &&
+          receipt.stateOwnerId === stateOwnerId &&
           arrayIncludes(["absent", "collected"], receipt.status) &&
           assertSha256(
               receipt.terminalRecordSha256,
@@ -4073,9 +4099,31 @@ export function createPodmanWriterSupervisorBundle(...args) {
   const supervisorStateCollector = frozenRecord({
     collectTerminalState,
     contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+    stateOwnerId,
     supervisorId,
   });
+  callIntrinsic(weakMapSetIntrinsic, markerBackedSupervisorStateCollectors, [
+    supervisor,
+    supervisorStateCollector,
+  ]);
   return frozenRecord({ supervisor, supervisorStateCollector });
+}
+
+export function isPodmanWriterSupervisorBundlePair(...args) {
+  if (args.length !== 2) return false;
+  const supervisor = args[0];
+  const supervisorStateCollector = args[1];
+  return (
+    supervisor !== null &&
+    typeof supervisor === "object" &&
+    !isProxy(supervisor) &&
+    supervisorStateCollector !== null &&
+    typeof supervisorStateCollector === "object" &&
+    !isProxy(supervisorStateCollector) &&
+    callIntrinsic(weakMapGetIntrinsic, markerBackedSupervisorStateCollectors, [
+      supervisor,
+    ]) === supervisorStateCollector
+  );
 }
 
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError.prototype]);
@@ -4085,3 +4133,6 @@ callIntrinsic(objectFreezeIntrinsic, Object, [
 ]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisor]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorBundle]);
+callIntrinsic(objectFreezeIntrinsic, Object, [
+  isPodmanWriterSupervisorBundlePair,
+]);

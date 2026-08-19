@@ -23,6 +23,7 @@ const SCENARIOS = Object.freeze([
   "zero-io-and-lifecycle",
   "partial-construction-failure",
   "stop-waits-for-pool-acknowledgements",
+  "supervisor-bundle-provenance",
   "topology-failure",
   "all-pool-ends-attempted",
   "all-settlement-stops-start-before-await",

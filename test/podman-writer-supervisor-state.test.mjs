@@ -23,13 +23,16 @@ import test from "node:test";
 import {
   PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
   PODMAN_WRITER_SUPERVISOR_STATE_CONTRACT_VERSION,
+  PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION,
   PodmanWriterSupervisorStateError,
   assertPodmanWriterSupervisorStateRecord,
   createPodmanWriterSupervisorState,
   createPodmanWriterSupervisorStateBundle,
   isPodmanWriterSupervisorState,
   isPodmanWriterSupervisorStateBundle,
+  isPodmanWriterSupervisorStateOwner,
   isPodmanWriterSupervisorStateTerminalCollector,
+  preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
 
 const REQUEST_SHA256 = "a".repeat(64);
@@ -94,6 +97,27 @@ function stateWithFaultHooks(root, faultHooks) {
   return createPodmanWriterSupervisorState(exact({ faultHooks, root }));
 }
 
+async function prepareOwner(root, expectedStateOwnerId = null) {
+  return preparePodmanWriterSupervisorStateOwner(
+    exact({ expectedStateOwnerId, root }),
+  );
+}
+
+async function stateBundle(root, faultHooks = undefined) {
+  const owner = await prepareOwner(root);
+  return createPodmanWriterSupervisorStateBundle(
+    faultHooks === undefined
+      ? exact({ owner })
+      : exact({ faultHooks, owner }),
+  );
+}
+
+function collect(bundle, terminalRecord) {
+  return bundle.terminalCollector.collect(
+    exact({ stateOwnerId: bundle.stateOwnerId, terminalRecord }),
+  );
+}
+
 function stateIoError(error) {
   return (
     error instanceof PodmanWriterSupervisorStateError &&
@@ -105,6 +129,13 @@ function stateConflict(error) {
   return (
     error instanceof PodmanWriterSupervisorStateError &&
     error.code === "podman_writer_state_conflict"
+  );
+}
+
+function stateInvalid(error) {
+  return (
+    error instanceof PodmanWriterSupervisorStateError &&
+    error.code === "podman_writer_state_invalid"
   );
 }
 
@@ -175,18 +206,214 @@ test("creates an exact owner-private append-only state surface", async (t) => {
   }
 });
 
+test("prepares a durable branded state owner and adopts it after restart or lost acknowledgement", async (t) => {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-owner-test-"),
+  );
+  const root = join(parent, "state");
+  t.after(() => rm(parent, { force: true, recursive: true }));
+
+  const owner = await prepareOwner(root);
+  assert.equal(isPodmanWriterSupervisorStateOwner(owner), true);
+  assert.equal(Object.getPrototypeOf(owner), null);
+  assert.equal(Object.isFrozen(owner), true);
+  assert.deepEqual(Reflect.ownKeys(owner), ["contractVersion", "stateOwnerId"]);
+  assert.equal(
+    owner.contractVersion,
+    PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION,
+  );
+  assert.match(owner.stateOwnerId, /^state-owner:[0-9a-f]{64}$/u);
+
+  const markerPath = join(root, ".state-owner-v1.json");
+  const markerBytes = await readFile(markerPath, "utf8");
+  assert.equal(
+    markerBytes,
+    `${JSON.stringify({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION,
+      stateOwnerId: owner.stateOwnerId,
+    })}\n`,
+  );
+  const markerStat = await lstat(markerPath, { bigint: true });
+  assert.equal(Number(markerStat.mode & 0o7777n), 0o600);
+  assert.equal(markerStat.nlink, 1n);
+  assert.equal(markerStat.uid, BigInt(process.getuid()));
+  const rootStat = await lstat(root, { bigint: true });
+  assert.equal(Number(rootStat.mode & 0o7777n), 0o700);
+  assert.equal(rootStat.uid, BigInt(process.getuid()));
+
+  // Both calls model a retry after the initializer completed but its final
+  // acknowledgement was lost. Neither retry rewrites the immutable marker.
+  const restarted = await prepareOwner(root, owner.stateOwnerId);
+  const ackLossRetry = await prepareOwner(root);
+  assert.equal(restarted.stateOwnerId, owner.stateOwnerId);
+  assert.equal(ackLossRetry.stateOwnerId, owner.stateOwnerId);
+  assert.equal(await readFile(markerPath, "utf8"), markerBytes);
+  assert.equal(isPodmanWriterSupervisorStateOwner({ ...owner }), false);
+});
+
+test("state owner initialization is root-local and never creates for an expected owner", async (t) => {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-owner-scope-test-"),
+  );
+  const leftRoot = join(parent, "left");
+  const rightRoot = join(parent, "right");
+  const missingRoot = join(parent, "missing");
+  const unmarkedRoot = join(parent, "unmarked");
+  t.after(() => rm(parent, { force: true, recursive: true }));
+
+  const left = await prepareOwner(leftRoot);
+  const right = await prepareOwner(rightRoot);
+  assert.notEqual(left.stateOwnerId, right.stateOwnerId);
+  await assert.rejects(
+    prepareOwner(leftRoot, right.stateOwnerId),
+    stateIoError,
+  );
+  await assert.rejects(
+    prepareOwner(missingRoot, left.stateOwnerId),
+    stateIoError,
+  );
+  await assert.rejects(lstat(missingRoot), (error) => error?.code === "ENOENT");
+  await mkdir(unmarkedRoot, { mode: 0o700 });
+  await assert.rejects(prepareOwner(unmarkedRoot), stateIoError);
+  assert.deepEqual(await readdir(unmarkedRoot), []);
+});
+
+test("owned operations reject root or marker identity, content, and access-policy drift", async (t) => {
+  for (const scenario of [
+    "missing",
+    "replaced",
+    "mismatched",
+    "mode",
+    "hardlink",
+    "root-mode",
+    "parent-mode",
+    "root-replaced",
+  ]) {
+    await t.test(scenario, async (subtest) => {
+      const parent = await mkdtemp(
+        join(await realpath(tmpdir()), "podman-writer-state-owner-tamper-test-"),
+      );
+      const root = join(parent, "state");
+      const markerPath = join(root, ".state-owner-v1.json");
+      subtest.after(() => rm(parent, { force: true, recursive: true }));
+      const owner = await prepareOwner(root);
+      const bundle = createPodmanWriterSupervisorStateBundle(exact({ owner }));
+      const original = await readFile(markerPath);
+      if (scenario === "missing") {
+        await rm(markerPath);
+      } else if (scenario === "replaced") {
+        await rename(markerPath, `${markerPath}.displaced`);
+        await writeFile(markerPath, original, { flag: "wx", mode: 0o600 });
+      } else if (scenario === "mismatched") {
+        const replacementDigit = owner.stateOwnerId.endsWith("f".repeat(64))
+          ? "e"
+          : "f";
+        await writeFile(
+          markerPath,
+          `{"contractVersion":1,"stateOwnerId":"state-owner:${replacementDigit.repeat(64)}"}\n`,
+        );
+      } else if (scenario === "mode") {
+        await chmod(markerPath, 0o400);
+      } else if (scenario === "hardlink") {
+        await link(markerPath, `${markerPath}.alias`);
+      } else if (scenario === "root-mode") {
+        await chmod(root, 0o750);
+      } else if (scenario === "parent-mode") {
+        await chmod(parent, 0o750);
+      } else {
+        await rename(root, `${root}.displaced`);
+        await mkdir(root, { mode: 0o700 });
+        await writeFile(markerPath, original, { flag: "wx", mode: 0o600 });
+      }
+      await assert.rejects(
+        bundle.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+        stateIoError,
+      );
+    });
+  }
+});
+
+test("the durable owner marker outlives the in-memory capability", async (t) => {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-owner-lifetime-test-"),
+  );
+  const root = join(parent, "state");
+  t.after(() => rm(parent, { force: true, recursive: true }));
+  let stateOwnerId;
+  {
+    const owner = await prepareOwner(root);
+    stateOwnerId = owner.stateOwnerId;
+  }
+  if (typeof globalThis.gc === "function") globalThis.gc();
+  assert.equal(typeof (await lstat(join(root, ".state-owner-v1.json"))).ino, "number");
+  assert.equal((await prepareOwner(root)).stateOwnerId, stateOwnerId);
+});
+
+test("owner preparation survives post-import crypto and path intrinsic poisoning", { concurrency: false }, async (t) => {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-owner-poison-test-"),
+  );
+  const root = join(parent, "state");
+  t.after(() => rm(parent, { force: true, recursive: true }));
+  const specifications = [
+    [crypto, "randomBytes"],
+    [path, "basename"],
+    [path, "dirname"],
+    [path, "isAbsolute"],
+    [path, "resolve"],
+  ];
+  const descriptors = specifications.map(([target, key]) =>
+    Object.getOwnPropertyDescriptor(target, key)
+  );
+  const poisonCalls = new Map(specifications.map(([, key]) => [key, 0]));
+  try {
+    for (let index = 0; index < specifications.length; index += 1) {
+      const [target, key] = specifications[index];
+      const descriptor = descriptors[index];
+      assert.equal(typeof descriptor?.value, "function");
+      Object.defineProperty(target, key, {
+        ...descriptor,
+        value() {
+          poisonCalls.set(key, poisonCalls.get(key) + 1);
+          throw new Error(`poisoned node intrinsic: ${key}`);
+        },
+      });
+    }
+    syncBuiltinESMExports();
+    assert.match(
+      (await prepareOwner(root)).stateOwnerId,
+      /^state-owner:[0-9a-f]{64}$/u,
+    );
+  } finally {
+    for (let index = 0; index < specifications.length; index += 1) {
+      Object.defineProperty(
+        specifications[index][0],
+        specifications[index][1],
+        descriptors[index],
+      );
+    }
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual([...poisonCalls.values()], [0, 0, 0, 0, 0]);
+});
+
 test("creates a separate exact terminal collection capability without changing the state ABI", async (t) => {
   const parent = await mkdtemp(
     join(await realpath(tmpdir()), "podman-writer-state-bundle-test-"),
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const bundle = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const bundle = await stateBundle(root);
 
   assert.equal(isPodmanWriterSupervisorStateBundle(bundle), true);
   assert.equal(Object.getPrototypeOf(bundle), null);
   assert.equal(Object.isFrozen(bundle), true);
-  assert.deepEqual(Reflect.ownKeys(bundle), ["state", "terminalCollector"]);
+  assert.deepEqual(Reflect.ownKeys(bundle), [
+    "state",
+    "stateOwnerId",
+    "terminalCollector",
+  ]);
+  assert.match(bundle.stateOwnerId, /^state-owner:[0-9a-f]{64}$/u);
   assert.equal(isPodmanWriterSupervisorState(bundle.state), true);
   assert.deepEqual(Reflect.ownKeys(bundle.state), [
     "claim",
@@ -201,7 +428,9 @@ test("creates a separate exact terminal collection capability without changing t
   assert.deepEqual(Reflect.ownKeys(bundle.terminalCollector), [
     "collect",
     "contractVersion",
+    "stateOwnerId",
   ]);
+  assert.equal(bundle.terminalCollector.stateOwnerId, bundle.stateOwnerId);
   assert.equal(
     bundle.terminalCollector.contractVersion,
     PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
@@ -215,6 +444,19 @@ test("creates a separate exact terminal collection capability without changing t
     }),
     false,
   );
+  assert.throws(
+    () => createPodmanWriterSupervisorStateBundle(exact({ root })),
+    stateInvalid,
+  );
+  assert.throws(
+    () => createPodmanWriterSupervisorStateBundle(exact({
+      owner: exact({
+        contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_OWNER_CONTRACT_VERSION,
+        stateOwnerId: bundle.stateOwnerId,
+      }),
+    })),
+    stateInvalid,
+  );
 });
 
 test("collects an exact stopped chain in two durable phases and replays absence", async (t) => {
@@ -223,7 +465,7 @@ test("collects an exact stopped chain in two durable phases and replays absence"
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const bundle = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const bundle = await stateBundle(root);
   const records = await createStoppedChain(bundle.state);
   const other = record("preparing", {
     launchAttemptId: "launch-attempt-other",
@@ -231,19 +473,29 @@ test("collects an exact stopped chain in two durable phases and replays absence"
   });
   await bundle.state.claim(exact({ record: other }));
 
-  const receipt = await bundle.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
+  const receipt = await collect(bundle, records[4]);
   assert.equal(Object.getPrototypeOf(receipt), null);
   assert.equal(Object.isFrozen(receipt), true);
   assert.deepEqual(Reflect.ownKeys(receipt), [
     "contractVersion",
     "launchAttemptId",
+    "stateOwnerId",
     "status",
     "terminalRecordSha256",
   ]);
   assert.equal(receipt.status, "collected");
-  assert.match(receipt.terminalRecordSha256, /^[0-9a-f]{64}$/u);
+  assert.equal(
+    receipt.terminalRecordSha256,
+    createHash("sha256")
+      .update(
+        "portable-codex-runtime:podman-writer-state-collection:v2\0",
+        "utf8",
+      )
+      .update(bundle.stateOwnerId, "utf8")
+      .update("\0", "utf8")
+      .update(JSON.stringify(records[4]), "utf8")
+      .digest("hex"),
+  );
   assert.equal(
     await bundle.state.read(
       exact({ launchAttemptId: records[4].launchAttemptId }),
@@ -255,12 +507,14 @@ test("collects an exact stopped chain in two durable phases and replays absence"
     other,
   );
   const remaining = await readdir(root);
-  assert.equal(remaining.length, 1);
-  assert.match(remaining[0], /^[0-9a-f]{64}\.0\.json$/u);
-
-  const replay = await bundle.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
+  assert.equal(remaining.length, 2);
+  assert.equal(remaining.includes(".state-owner-v1.json"), true);
+  assert.equal(
+    remaining.some((entry) => /^[0-9a-f]{64}\.0\.json$/u.test(entry)),
+    true,
   );
+
+  const replay = await collect(bundle, records[4]);
   assert.deepEqual(replay, exact({ ...receipt, status: "absent" }));
 });
 
@@ -270,9 +524,11 @@ test("collection preflights the full chain and recognized aliases before unlink"
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const bundle = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const bundle = await stateBundle(root);
   const records = await createStoppedChain(bundle.state);
-  const entries = (await readdir(root)).sort();
+  const entries = (await readdir(root))
+    .filter((entry) => /^[0-9a-f]{64}\.[0-4]\.json$/u.test(entry))
+    .sort();
   for (let index = 0; index < entries.length; index += 1) {
     const file = join(root, entries[index]);
     const bytes = await readFile(file);
@@ -289,11 +545,9 @@ test("collection preflights the full chain and recognized aliases before unlink"
     `${join(root, terminalEntry)}.pending`,
   );
 
-  const receipt = await bundle.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
+  const receipt = await collect(bundle, records[4]);
   assert.equal(receipt.status, "collected");
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
 });
 
 test("collection rejects wrong authority and sidecar tamper before deleting anything", async (t) => {
@@ -302,16 +556,25 @@ test("collection rejects wrong authority and sidecar tamper before deleting anyt
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const bundle = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const bundle = await stateBundle(root);
   const records = await createStoppedChain(bundle.state);
   const before = (await readdir(root)).sort();
 
+  const wrongStateOwnerId = bundle.stateOwnerId === `state-owner:${"0".repeat(64)}`
+    ? `state-owner:${"1".repeat(64)}`
+    : `state-owner:${"0".repeat(64)}`;
   await assert.rejects(
-    bundle.terminalCollector.collect(
-      exact({
-        terminalRecord: record("stopped", {
+    bundle.terminalCollector.collect(exact({
+      stateOwnerId: wrongStateOwnerId,
+      terminalRecord: records[4],
+    })),
+    stateInvalid,
+  );
+  await assert.rejects(
+    collect(
+      bundle,
+      record("stopped", {
           requestSha256: "f".repeat(64),
-        }),
       }),
     ),
     stateConflict,
@@ -326,9 +589,7 @@ test("collection rejects wrong authority and sidecar tamper before deleting anyt
   });
   const tampered = (await readdir(root)).sort();
   await assert.rejects(
-    bundle.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    ),
+    collect(bundle, records[4]),
     stateConflict,
   );
   assert.deepEqual((await readdir(root)).sort(), tampered);
@@ -340,7 +601,7 @@ test("collection classifies readable non-canonical durable bytes as conflict", a
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const bundle = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const bundle = await stateBundle(root);
   const records = await createStoppedChain(bundle.state);
   const revisionTwo = (await readdir(root)).find((entry) =>
     entry.endsWith(".2.json"),
@@ -350,9 +611,7 @@ test("collection classifies readable non-canonical durable bytes as conflict", a
   const before = (await readdir(root)).sort();
 
   await assert.rejects(
-    bundle.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    ),
+    collect(bundle, records[4]),
     stateConflict,
   );
   assert.deepEqual((await readdir(root)).sort(), before);
@@ -371,7 +630,7 @@ test("collection rejects future revisions and broken terminal chains before dele
       );
       const root = join(parent, "state");
       subtest.after(() => rm(parent, { force: true, recursive: true }));
-      const bundle = createPodmanWriterSupervisorStateBundle(exact({ root }));
+      const bundle = await stateBundle(root);
       const records = await createStoppedChain(bundle.state);
       const entries = (await readdir(root)).sort();
       const terminalEntry = entries.find((entry) => entry.endsWith(".4.json"));
@@ -399,9 +658,7 @@ test("collection rejects future revisions and broken terminal chains before dele
       }
       const before = (await readdir(root)).sort();
       await assert.rejects(
-        bundle.terminalCollector.collect(
-          exact({ terminalRecord: records[4] }),
-        ),
+        collect(bundle, records[4]),
         stateConflict,
       );
       assert.deepEqual((await readdir(root)).sort(), before);
@@ -415,7 +672,7 @@ test("collection revalidates terminal content through its held file after unlink
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
   const terminalEntry = (await readdir(root)).find((entry) =>
     entry.endsWith(".4.json"),
@@ -429,9 +686,9 @@ test("collection revalidates terminal content through its held file after unlink
   const attackerHandle = await open(terminalPath, "r+");
   t.after(() => attackerHandle.close());
   let unlinks = 0;
-  const collector = createPodmanWriterSupervisorStateBundle(
+  const collector = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         async afterCollectionArtifactUnlink() {
           unlinks += 1;
           if (unlinks === 5) {
@@ -439,15 +696,11 @@ test("collection revalidates terminal content through its held file after unlink
             await attackerHandle.sync();
           }
         },
-      }),
-      root,
     }),
   );
 
   await assert.rejects(
-    collector.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    ),
+    collect(collector, records[4]),
     collectionUncertain,
   );
   await assert.rejects(lstat(terminalPath), (error) => error?.code === "ENOENT");
@@ -470,35 +723,31 @@ test("partial collection retries retain the uncertain-outcome fence", async (t) 
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const initial = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const initial = await stateBundle(root);
   const records = await createStoppedChain(initial.state);
-  const partial = createPodmanWriterSupervisorStateBundle(
+  const partial = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         afterCollectionFirstDirectorySync() {
           throw new Error("simulated first-phase crash");
         },
-      }),
-      root,
     }),
   );
   await assert.rejects(
-    partial.terminalCollector.collect(exact({ terminalRecord: records[4] })),
+    collect(partial, records[4]),
     collectionUncertain,
   );
 
-  const retry = createPodmanWriterSupervisorStateBundle(
+  const retry = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         afterCollectionTerminalRevalidation() {
           throw new Error("simulated retry crash");
         },
-      }),
-      root,
     }),
   );
   await assert.rejects(
-    retry.terminalCollector.collect(exact({ terminalRecord: records[4] })),
+    collect(retry, records[4]),
     collectionUncertain,
   );
 });
@@ -509,43 +758,35 @@ test("an absent retry fsyncs the state root before completing", async (t) => {
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const initial = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const initial = await stateBundle(root);
   const records = await createStoppedChain(initial.state);
-  const interrupted = createPodmanWriterSupervisorStateBundle(
+  const interrupted = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         afterCollectionTerminalUnlink() {
           throw new Error("simulated crash before final directory sync");
         },
-      }),
-      root,
     }),
   );
   await assert.rejects(
-    interrupted.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    ),
+    collect(interrupted, records[4]),
     collectionUncertain,
   );
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
 
   let finalSyncs = 0;
-  const recovery = createPodmanWriterSupervisorStateBundle(
+  const recovery = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         afterCollectionFinalDirectorySync() {
           finalSyncs += 1;
         },
-      }),
-      root,
     }),
   );
-  const receipt = await recovery.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
+  const receipt = await collect(recovery, records[4]);
   assert.equal(receipt.status, "absent");
   assert.equal(finalSyncs, 1);
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
 });
 
 test("a missing-root collection rejects parent replacement before reporting absence", async (t) => {
@@ -557,28 +798,24 @@ test("a missing-root collection rejects parent replacement before reporting abse
   const root = join(parent, "state");
   await mkdir(parent, { mode: 0o700 });
   t.after(() => rm(sandbox, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
   const before = (await readdir(root)).sort();
 
   let replacements = 0;
-  const collector = createPodmanWriterSupervisorStateBundle(
+  const collector = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         async afterPrivateParentHold() {
           await rename(parent, displacedParent);
           await mkdir(parent, { mode: 0o700 });
           replacements += 1;
         },
-      }),
-      root,
     }),
   );
 
   await assert.rejects(
-    collector.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    ),
+    collect(collector, records[4]),
     stateIoError,
   );
   assert.equal(replacements, 1);
@@ -594,9 +831,7 @@ test("a missing-root collection rejects parent replacement before reporting abse
     (await readdir(join(displacedParent, "state"))).sort(),
     before,
   );
-  const retained = createPodmanWriterSupervisorStateBundle(
-    exact({ root: join(displacedParent, "state") }),
-  );
+  const retained = await stateBundle(join(displacedParent, "state"));
   assert.deepEqual(
     await retained.state.read(
       exact({ launchAttemptId: records[4].launchAttemptId }),
@@ -605,35 +840,27 @@ test("a missing-root collection rejects parent replacement before reporting abse
   );
 });
 
-test("a missing-root collection requires parent fsync acknowledgement before absence", async (t) => {
+test("an owned collector never reports absence for a missing state root", async (t) => {
   const parent = await mkdtemp(
     join(await realpath(tmpdir()), "podman-writer-state-missing-root-sync-test-"),
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
   const terminalRecord = record("stopped");
-  const interrupted = createPodmanWriterSupervisorStateBundle(
-    exact({
-      faultHooks: exact({
-        afterParentDirectorySync() {
-          throw new Error("simulated missing-root parent fsync acknowledgement loss");
-        },
-      }),
-      root,
-    }),
-  );
+  const owner = await prepareOwner(root);
+  const bundle = createPodmanWriterSupervisorStateBundle(exact({ owner }));
+  await rm(root, { recursive: true });
 
   await assert.rejects(
-    interrupted.terminalCollector.collect(exact({ terminalRecord })),
+    collect(bundle, terminalRecord),
     stateIoError,
   );
   await assert.rejects(lstat(root), (error) => error?.code === "ENOENT");
-
-  const cold = createPodmanWriterSupervisorStateBundle(exact({ root }));
-  assert.equal(
-    (await cold.terminalCollector.collect(exact({ terminalRecord }))).status,
-    "absent",
+  await assert.rejects(
+    prepareOwner(root, owner.stateOwnerId),
+    stateIoError,
   );
+  await assert.rejects(lstat(root), (error) => error?.code === "ENOENT");
 });
 
 test("every collection unlink and fsync crash prefix is recoverable without state rollback", async (t) => {
@@ -657,30 +884,26 @@ test("every collection unlink and fsync crash prefix is recoverable without stat
       );
       const root = join(parent, "state");
       subtest.after(() => rm(parent, { force: true, recursive: true }));
-      const initial = createPodmanWriterSupervisorStateBundle(exact({ root }));
+      const initial = await stateBundle(root);
       const records = await createStoppedChain(initial.state);
       let calls = 0;
-      const crashing = createPodmanWriterSupervisorStateBundle(
+      const crashing = await stateBundle(
+        root,
         exact({
-          faultHooks: exact({
             [scenario.hook]() {
               calls += 1;
               if (calls === scenario.ordinal) {
                 throw new Error("simulated collection crash");
               }
             },
-          }),
-          root,
         }),
       );
       await assert.rejects(
-        crashing.terminalCollector.collect(
-          exact({ terminalRecord: records[4] }),
-        ),
+        collect(crashing, records[4]),
         collectionUncertain,
       );
 
-      const recovery = createPodmanWriterSupervisorStateBundle(exact({ root }));
+      const recovery = await stateBundle(root);
       try {
         const observed = await recovery.state.read(
           exact({ launchAttemptId: records[4].launchAttemptId }),
@@ -693,14 +916,12 @@ test("every collection unlink and fsync crash prefix is recoverable without stat
           true,
         );
       }
-      const receipt = await recovery.terminalCollector.collect(
-        exact({ terminalRecord: records[4] }),
-      );
+      const receipt = await collect(recovery, records[4]);
       assert.equal(
         receipt.status === "collected" || receipt.status === "absent",
         true,
       );
-      assert.deepEqual(await readdir(root), []);
+      assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
       assert.equal(
         await recovery.state.read(
           exact({ launchAttemptId: records[4].launchAttemptId }),
@@ -717,7 +938,7 @@ test("collection allows benign directory churn and serializes same-instance read
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
   let observedTerminal;
   const terminalObserved = new Promise((resolve) => {
@@ -727,23 +948,19 @@ test("collection allows benign directory churn and serializes same-instance read
   const terminalGate = new Promise((resolve) => {
     releaseTerminal = resolve;
   });
-  const collecting = createPodmanWriterSupervisorStateBundle(
+  const collecting = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
-        async afterCollectionTerminalRevalidation() {
-          const churn = join(root, "benign-child-churn");
-          await writeFile(churn, "benign\n", { flag: "wx", mode: 0o600 });
-          await rm(churn);
-          observedTerminal();
-          await terminalGate;
-        },
-      }),
-      root,
+      async afterCollectionTerminalRevalidation() {
+        const churn = join(root, "benign-child-churn");
+        await writeFile(churn, "benign\n", { flag: "wx", mode: 0o600 });
+        await rm(churn);
+        observedTerminal();
+        await terminalGate;
+      },
     }),
   );
-  const pendingCollection = collecting.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
+  const pendingCollection = collect(collecting, records[4]);
   await terminalObserved;
   let readSettled = false;
   const pendingRead = collecting.state
@@ -758,13 +975,37 @@ test("collection allows benign directory churn and serializes same-instance read
   assert.equal(await pendingRead, null);
 });
 
+test("collection fails closed when marker content changes during the operation", async (t) => {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-marker-race-test-"),
+  );
+  const root = join(parent, "state");
+  const markerPath = join(root, ".state-owner-v1.json");
+  t.after(() => rm(parent, { force: true, recursive: true }));
+  const writer = await stateBundle(root);
+  const records = await createStoppedChain(writer.state);
+  const replacementDigit = writer.stateOwnerId.endsWith("f".repeat(64))
+    ? "e"
+    : "f";
+  const collector = await stateBundle(root, exact({
+    async afterCollectionTerminalRevalidation() {
+      await writeFile(
+        markerPath,
+        `{"contractVersion":1,"stateOwnerId":"state-owner:${replacementDigit.repeat(64)}"}\n`,
+      );
+    },
+  }));
+
+  await assert.rejects(collect(collector, records[4]), collectionUncertain);
+});
+
 test("collection revalidates benign file link churn without treating ctime as content", async (t) => {
   const parent = await mkdtemp(
     join(await realpath(tmpdir()), "podman-writer-state-file-churn-test-"),
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
   const revisionZero = (await readdir(root)).find((entry) =>
     entry.endsWith(".0.json"),
@@ -775,23 +1016,19 @@ test("collection revalidates benign file link churn without treating ctime as co
   await link(revisionZeroPath, pendingPath);
 
   let reads = 0;
-  const collector = createPodmanWriterSupervisorStateBundle(
+  const collector = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
-        async afterCollectionFileFirstRead() {
-          reads += 1;
-          if (reads === 1) await rm(pendingPath);
-        },
-      }),
-      root,
+      async afterCollectionFileFirstRead() {
+        reads += 1;
+        if (reads === 1) await rm(pendingPath);
+      },
     }),
   );
-  const receipt = await collector.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
+  const receipt = await collect(collector, records[4]);
   assert.equal(receipt.status, "collected");
   assert.equal(reads >= 5, true);
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
 });
 
 test("collection rejects file content mutation during held-file revalidation", async (t) => {
@@ -800,7 +1037,7 @@ test("collection rejects file content mutation during held-file revalidation", a
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
   const revisionZero = (await readdir(root)).find((entry) =>
     entry.endsWith(".0.json"),
@@ -810,23 +1047,19 @@ test("collection rejects file content mutation during held-file revalidation", a
   const before = (await readdir(root)).sort();
 
   let reads = 0;
-  const collector = createPodmanWriterSupervisorStateBundle(
+  const collector = await stateBundle(
+    root,
     exact({
-      faultHooks: exact({
         async afterCollectionFileFirstRead() {
           reads += 1;
           if (reads === 1) {
             await writeFile(revisionZeroPath, "mutated\n");
           }
         },
-      }),
-      root,
     }),
   );
   await assert.rejects(
-    collector.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    ),
+    collect(collector, records[4]),
     stateIoError,
   );
   assert.equal(reads, 1);
@@ -839,20 +1072,18 @@ test("concurrent cold collectors cannot expose an earlier valid prefix", async (
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
-  const left = createPodmanWriterSupervisorStateBundle(exact({ root }));
-  const right = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const left = await stateBundle(root);
+  const right = await stateBundle(root);
   const results = await Promise.allSettled([
-    left.terminalCollector.collect(exact({ terminalRecord: records[4] })),
-    right.terminalCollector.collect(exact({ terminalRecord: records[4] })),
+    collect(left, records[4]),
+    collect(right, records[4]),
   ]);
   assert.equal(results.some((result) => result.status === "fulfilled"), true);
-  const recovery = createPodmanWriterSupervisorStateBundle(exact({ root }));
-  await recovery.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
-  assert.deepEqual(await readdir(root), []);
+  const recovery = await stateBundle(root);
+  await collect(recovery, records[4]);
+  assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
   assert.equal(
     await recovery.state.read(
       exact({ launchAttemptId: records[4].launchAttemptId }),
@@ -867,7 +1098,7 @@ test("concurrent cold collectors accept only monotonic deletion of recognized al
   );
   const root = join(parent, "state");
   t.after(() => rm(parent, { force: true, recursive: true }));
-  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const writer = await stateBundle(root);
   const records = await createStoppedChain(writer.state);
   const terminalEntry = (await readdir(root)).find((entry) =>
     entry.endsWith(".4.json"),
@@ -891,8 +1122,7 @@ test("concurrent cold collectors accept only monotonic deletion of recognized al
     releaseFirstCollector = resolve;
   });
   let unlinks = 0;
-  const first = createPodmanWriterSupervisorStateBundle(exact({
-    faultHooks: exact({
+  const first = await stateBundle(root, exact({
       async afterCollectionArtifactUnlink() {
         unlinks += 1;
         if (unlinks === 6) {
@@ -900,30 +1130,22 @@ test("concurrent cold collectors accept only monotonic deletion of recognized al
           await firstCollectorGate;
         }
       },
-    }),
-    root,
   }));
-  const firstResult = first.terminalCollector.collect(
-    exact({ terminalRecord: records[4] }),
-  );
+  const firstResult = collect(first, records[4]);
   await terminalPendingRemoval;
 
-  const second = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const second = await stateBundle(root);
   assert.equal(
-    (await second.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    )).status,
+    (await collect(second, records[4])).status,
     "collected",
   );
   releaseFirstCollector();
   assert.equal((await firstResult).status, "collected");
-  assert.deepEqual(await readdir(root), []);
+  assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
 
-  const replay = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const replay = await stateBundle(root);
   assert.equal(
-    (await replay.terminalCollector.collect(
-      exact({ terminalRecord: records[4] }),
-    )).status,
+    (await collect(replay, records[4])).status,
     "absent",
   );
 });

@@ -43,6 +43,13 @@ import {
   createPostgresDetachedRestorePlan,
 } from "../src/postgres-detached-restore-plan.mjs";
 import {
+  createPodmanWriterSupervisorBundle,
+} from "../src/podman-writer-supervisor.mjs";
+import {
+  createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
+} from "../src/podman-writer-supervisor-state.mjs";
+import {
   createPostgresDetachedRestoreDeployment,
 } from "../src/postgres-detached-restore-deployment.mjs";
 import {
@@ -51,6 +58,7 @@ import {
 import {
   POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
   POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
 import {
@@ -131,6 +139,7 @@ import {
 
 const EMPTY_JSON_OBJECT = "{}";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const INTEGRATION_STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
 const CHECKPOINT_GUARD_APPLICATION_NAME =
   "portable-codex-runtime-checkpoint-guard-integration-test";
 const SESSION_AUTHORITY_APPLICATION_NAME =
@@ -3551,6 +3560,16 @@ function sha256Text(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+function recoveryOwnerScopeId(recoveryScopeId, stateOwnerId) {
+  return `recovery-owner:${sha256Text(
+    [
+      "portable-codex-runtime:postgres-restore-recovery-owner-scope:v1",
+      recoveryScopeId,
+      stateOwnerId,
+    ].join("\0"),
+  )}`;
+}
+
 function podmanWriterTerminalFixture({
   evidenceContractVersion =
     POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
@@ -3609,9 +3628,9 @@ function podmanWriterTerminalFixture({
   };
 }
 
-function podmanWriterStateCollectionSha256(terminalRecord) {
+function podmanWriterStateCollectionSha256(terminalRecord, stateOwnerId) {
   return sha256Text(
-    `portable-codex-runtime:podman-writer-state-collection:v1\0${JSON.stringify(
+    `portable-codex-runtime:podman-writer-state-collection:v2\0${stateOwnerId}\0${JSON.stringify(
       terminalRecord,
     )}`,
   );
@@ -4675,6 +4694,13 @@ test(
           await pool.query(
             [
               "DELETE FROM session_authority.writer_supervisor_state_gc",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await pool.query(
+            [
+              "DELETE FROM session_authority.writer_supervisor_state_owners",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
             [sessionIds],
@@ -8769,6 +8795,7 @@ test(
         await authority.claimWriterLaunchAttemptDispatch({
           ...structuredClone(firstLaunchInput),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         const launched = await authority.finalizeWriterLaunchAttemptStarted({
           ...structuredClone(firstLaunchInput),
@@ -8990,6 +9017,7 @@ test(
           await authority.claimWriterLaunchAttemptDispatch({
             ...structuredClone(activationLaunchInput),
             expectedOperationRevision: "0",
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assertOperationReceipt(activationLaunchClaimed, "starting");
         const activationLaunched =
@@ -9032,6 +9060,7 @@ test(
           await authority.claimWriterLaunchAttemptDispatch({
             ...structuredClone(successor),
             expectedOperationRevision: "0",
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assertOperationReceipt(successorClaimed, "starting");
       },
@@ -9104,6 +9133,7 @@ test(
         await authority.claimWriterLaunchAttemptDispatch({
           ...structuredClone(currentLaunchInput),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         const currentLaunchEvidence = writerLaunchEvidence(
           currentLaunchInput,
@@ -9438,6 +9468,7 @@ test(
         await authority.claimWriterLaunchAttemptDispatch({
           ...structuredClone(currentLaunchInput),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         const currentLaunchEvidence = writerLaunchEvidence(
           currentLaunchInput,
@@ -9692,6 +9723,7 @@ test(
                 "an activation-prepared launch must not reconcile before dispatch",
               );
             },
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
             supervisorId,
           },
         });
@@ -9919,6 +9951,7 @@ test(
         assert.equal(launchCalls, 1);
         const active = await authority.readWriterLaunchAttempt({
           operationId: launchAttemptId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(active, "committed");
         assert.equal(
@@ -9989,6 +10022,7 @@ test(
             blockedAuthority.claimWriterLaunchAttemptDispatch({
               ...structuredClone(input),
               expectedOperationRevision: "0",
+              stateOwnerId: INTEGRATION_STATE_OWNER_ID,
             });
           const expectedRejection = assert.rejects(
             claimPromise,
@@ -10023,6 +10057,7 @@ test(
 
         const read = await authority.readWriterLaunchAttempt({
           operationId: input.operationId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(read, "prepared");
         assert.equal(read.attempt.state, "prepared");
@@ -10235,6 +10270,7 @@ test(
             contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
             launchWriter,
             reconcileWriterLaunch,
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
             supervisorId,
           },
         });
@@ -10254,6 +10290,7 @@ test(
 
         const read = await authority.readWriterLaunchAttempt({
           operationId: launchAttemptId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(read, "committed");
         assert.equal(
@@ -10327,6 +10364,7 @@ test(
 
         const historical = await authority.readWriterLaunchAttempt({
           operationId: launchAttemptId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(historical, "committed", {
           currentTerminal: false,
@@ -10611,6 +10649,7 @@ test(
                 "a prepared handoff must not reconcile before launch",
               );
             },
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
             supervisorId,
           },
         });
@@ -10793,6 +10832,7 @@ test(
 
         const read = await authority.readWriterLaunchAttempt({
           operationId: launchAttemptId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(read, "committed");
         assert.equal(
@@ -10867,6 +10907,7 @@ test(
         const claimInput = {
           ...structuredClone(input),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         };
         const claimed =
           await authority.claimWriterLaunchAttemptDispatch(claimInput);
@@ -10909,6 +10950,7 @@ test(
 
         const read = await authority.readWriterLaunchAttempt({
           operationId: input.operationId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(read, "committed");
         assert.equal(read.attempt.launchAttemptId, input.operationId);
@@ -10960,6 +11002,7 @@ test(
           await authority.claimWriterLaunchAttemptDispatch({
             ...structuredClone(input),
             expectedOperationRevision: "0",
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assertOperationReceipt(claimed, "starting");
         const evidence = writerLaunchEvidence(input, "started");
@@ -10979,6 +11022,7 @@ test(
           const currentAttempt =
             await authority.readWriterLaunchAttempt({
               operationId: input.operationId,
+              stateOwnerId: INTEGRATION_STATE_OWNER_ID,
             });
           assert.deepEqual(currentSession.document.launch, launch);
           assert.deepEqual(currentAttempt.launch, launch);
@@ -11091,6 +11135,7 @@ test(
         const historicalAttempt =
           await authority.readWriterLaunchAttempt({
             operationId: input.operationId,
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assert.equal(detachedSession.document.launch, null);
         assert.equal(historicalAttempt.launch, null);
@@ -11147,6 +11192,7 @@ test(
               await authority.claimWriterLaunchAttemptDispatch({
                 ...structuredClone(input),
                 expectedOperationRevision: "0",
+                stateOwnerId: INTEGRATION_STATE_OWNER_ID,
               });
             assertOperationReceipt(starting, "starting");
 
@@ -11225,6 +11271,7 @@ test(
               await authority.claimWriterLaunchAttemptDispatch({
                 ...structuredClone(input),
                 expectedOperationRevision: "0",
+                stateOwnerId: INTEGRATION_STATE_OWNER_ID,
               });
             assertOperationReceipt(claimed, "starting");
 
@@ -11294,6 +11341,7 @@ test(
         const claimInput = {
           ...structuredClone(input),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         };
         const claimLossAuthority = new PostgresSessionAuthority({
           store: new PostgresSerializableStore({
@@ -11310,6 +11358,7 @@ test(
         const restarted = new PostgresSessionAuthority({ store });
         const starting = await restarted.readWriterLaunchAttempt({
           operationId: input.operationId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(starting, "starting");
         assert.equal(starting.attempt.state, "starting");
@@ -11339,6 +11388,7 @@ test(
 
         const committed = await restarted.readWriterLaunchAttempt({
           operationId: input.operationId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(committed, "committed");
         assert.equal(
@@ -11414,6 +11464,7 @@ test(
           await authority.claimWriterLaunchAttemptDispatch({
             ...structuredClone(launchInput),
             expectedOperationRevision: "0",
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assertOperationReceipt(launchClaim, "starting");
         const launchEvidence = writerLaunchEvidence(
@@ -11603,6 +11654,7 @@ test(
         assert.deepEqual(originalAfter.rows, originalBefore.rows);
         const historical = await authority.readWriterLaunchAttempt({
           operationId: launchInput.operationId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(historical, "committed", {
           currentTerminal: false,
@@ -11671,6 +11723,7 @@ test(
         await authority.claimWriterLaunchAttemptDispatch({
           ...structuredClone(launchInput),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         const launched =
           await authority.finalizeWriterLaunchAttemptStarted({
@@ -11893,6 +11946,7 @@ test(
         const concurrentClaimInput = {
           ...structuredClone(inputs[0]),
           expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         };
         const concurrentReceipts = await Promise.all([
           concurrentAuthority.claimWriterLaunchAttemptDispatch(
@@ -11923,6 +11977,7 @@ test(
           await authority.claimWriterLaunchAttemptDispatch({
             ...structuredClone(inputs[1]),
             expectedOperationRevision: "0",
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assertOperationReceipt(uncertainStarting, "starting");
         const uncertain = await authority.markOperationUncertain({
@@ -11935,6 +11990,7 @@ test(
           await authority.listWriterLaunchAttemptRecoveryCandidates({
             afterSessionId: consecutive.afterSessionId,
             limit: 1,
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assert.deepEqual(firstPage.candidates, [
           {
@@ -11952,6 +12008,7 @@ test(
           await authority.listWriterLaunchAttemptRecoveryCandidates({
             afterSessionId: firstPage.nextAfterSessionId,
             limit: 1,
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assert.deepEqual(secondPage.candidates, [
           {
@@ -11969,6 +12026,7 @@ test(
           await authority.listWriterLaunchAttemptRecoveryCandidates({
             afterSessionId: orderedSessionIds[1],
             limit: 1,
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
           });
         assert.deepEqual(terminalPage.candidates, [
           {
@@ -12154,8 +12212,7 @@ test(
     const recoveryScopeId = `integration-restore-${randomUUID()}`;
     const controllerRecoveryScopeId =
       `integration-restore-controller-${randomUUID()}`;
-    const restartedRecoveryScopeId =
-      `integration-restore-restarted-${randomUUID()}`;
+    const restartedRecoveryScopeId = recoveryScopeId;
     const sessionId = randomUUID();
     const blockedSessionId = randomUUID();
     const sessionIds = [sessionId, blockedSessionId];
@@ -12163,6 +12220,30 @@ test(
     const imagePlanProviderId =
       `runtime-image-provider-${randomUUID()}`;
     const supervisorId = `runtime-supervisor-${randomUUID()}`;
+    const stateOwnerId = `state-owner:${sha256Text(randomUUID())}`;
+    const effectiveRecoveryScopeId = recoveryOwnerScopeId(
+      recoveryScopeId,
+      stateOwnerId,
+    );
+    const effectiveControllerRecoveryScopeId = recoveryOwnerScopeId(
+      controllerRecoveryScopeId,
+      stateOwnerId,
+    );
+    const effectiveRestartedRecoveryScopeId = recoveryOwnerScopeId(
+      restartedRecoveryScopeId,
+      stateOwnerId,
+    );
+    assert.equal(
+      effectiveRestartedRecoveryScopeId,
+      effectiveRecoveryScopeId,
+    );
+    assert.notEqual(
+      recoveryOwnerScopeId(
+        recoveryScopeId,
+        `state-owner:${sha256Text(`foreign-${randomUUID()}`)}`,
+      ),
+      effectiveRecoveryScopeId,
+    );
     const collectedSupervisorState = new Set();
     const supervisorStateCollectionInvocations = new Set();
     const supervisorStateCollectionSignals = new Set();
@@ -12218,9 +12299,9 @@ test(
               "WHERE recovery_scope_id = ANY($1::text[])",
             ].join(" "),
             [[
-              recoveryScopeId,
-              controllerRecoveryScopeId,
-              restartedRecoveryScopeId,
+              effectiveRecoveryScopeId,
+              effectiveControllerRecoveryScopeId,
+              effectiveRestartedRecoveryScopeId,
             ]],
           );
           await cleanupClient.query(
@@ -12240,6 +12321,13 @@ test(
           await cleanupClient.query(
             [
               "DELETE FROM session_authority.writer_supervisor_state_gc",
+              "WHERE session_id = ANY($1::uuid[])",
+            ].join(" "),
+            [sessionIds],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.writer_supervisor_state_owners",
               "WHERE session_id = ANY($1::uuid[])",
             ].join(" "),
             [sessionIds],
@@ -12435,9 +12523,14 @@ test(
           "contractVersion",
           "invocation",
           "signal",
+          "stateOwnerId",
           "terminalRecord",
         ]);
-        assert.equal(input.contractVersion, 1);
+        assert.equal(
+          input.contractVersion,
+          POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+        );
+        assert.equal(input.stateOwnerId, stateOwnerId);
         assertFreshOpaqueInvocation(
           input.invocation,
           supervisorStateCollectionInvocations,
@@ -12453,14 +12546,21 @@ test(
         collectedSupervisorState.add(launchAttemptId);
         supervisorStateCollections.push({ launchAttemptId, status });
         return frozenNullPrototypeRecord({
-          contractVersion: 1,
+          contractVersion:
+            POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
           launchAttemptId,
+          stateOwnerId,
           status,
           terminalRecordSha256:
-            podmanWriterStateCollectionSha256(input.terminalRecord),
+            podmanWriterStateCollectionSha256(
+              input.terminalRecord,
+              stateOwnerId,
+            ),
         });
       },
-      contractVersion: 1,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId,
       supervisorId,
     });
     const imagePlanProviderSettlement =
@@ -12627,6 +12727,7 @@ test(
             "same-process runtime launch must not reconcile",
           );
         },
+        stateOwnerId,
         supervisorId,
       }),
       supervisorSettlement: physicalPolicies.supervisorSettlement,
@@ -13010,6 +13111,7 @@ test(
     );
     assert.equal(first.status, "completed");
     assert.equal(first.recovery.status, "sweep-complete");
+    assert.equal(first.recovery.recoveryScopeId, effectiveRecoveryScopeId);
     for (const field of [
       "generation",
       "activation",
@@ -13864,10 +13966,12 @@ test(
         sessionManifest:
           recoveryFixture.finalized.session.document.manifest,
       });
+    const recoveryLaunchAttemptId = `writer-launch-${randomUUID()}`;
+    assert.notEqual(recoveryLaunchAttemptId, launchAttemptId);
     const recoveryLaunched = await runtime.writerLaunch.runLaunch({
       generation: recoveryFixture.finalized.generation,
       imageReservation: recoveryImageReservation,
-      launchAttemptId: `writer-launch-${randomUUID()}`,
+      launchAttemptId: recoveryLaunchAttemptId,
     });
     assert.equal(recoveryLaunched.status, "started");
     const recoveryAdmission = restoreGenerationAdmission(
@@ -13948,7 +14052,7 @@ test(
         "WHERE recovery_scope_id = $1",
         "ORDER BY lane",
       ].join(" "),
-      [recoveryScopeId],
+      [effectiveRecoveryScopeId],
     );
     assert.deepEqual(stored.rows, [
       {
@@ -14056,6 +14160,7 @@ test(
               "committed restore retry must not reconcile a writer",
             );
           },
+          stateOwnerId,
           supervisorId,
         }),
         supervisorSettlement: physicalPolicies.supervisorSettlement,
@@ -14195,6 +14300,7 @@ test(
         });
       },
     });
+    const restartedSteps = [];
     const restartedRuntime =
       createPostgresDetachedRestoreRuntimeComposition({
         ...runtimeOptions,
@@ -14251,7 +14357,9 @@ test(
         },
         recovery: {
           ...runtimeOptions.recovery,
-          onStep() {},
+          onStep(receipt) {
+            restartedSteps.push(receipt);
+          },
           recoveryScopeId: restartedRecoveryScopeId,
         },
         storage: {
@@ -14299,38 +14407,53 @@ test(
       ),
       { status: "ready" },
     );
-    assert.deepEqual(supervisorStateCollections, [
-      { launchAttemptId, status: "collected" },
-    ]);
-    assert.equal(supervisorStateCollectionInvocations.size, 1);
-    assert.equal(supervisorStateCollectionSignals.size, 1);
+    assert.equal(restartedSteps.length >= 1, true);
+    assert.equal(
+      restartedSteps[0].recovery.recoveryScopeId,
+      effectiveRestartedRecoveryScopeId,
+    );
+    const expectedCollectedLaunchAttemptIds = [
+      launchAttemptId,
+      recoveryLaunchAttemptId,
+    ].sort();
+    assert.deepEqual(
+      [...supervisorStateCollections].sort((left, right) =>
+        left.launchAttemptId.localeCompare(right.launchAttemptId),
+      ),
+      expectedCollectedLaunchAttemptIds.map((collectedLaunchAttemptId) => ({
+        launchAttemptId: collectedLaunchAttemptId,
+        status: "collected",
+      })),
+    );
+    assert.equal(supervisorStateCollectionInvocations.size, 2);
+    assert.equal(supervisorStateCollectionSignals.size, 2);
     const completedSupervisorStateGc = await authorityPool.query(
       [
         "SELECT launch_attempt_id, terminal_kind, collection_status,",
         "collection_receipt_sha256, collected_at IS NOT NULL AS collected",
         "FROM session_authority.writer_supervisor_state_gc",
-        "WHERE launch_attempt_id = $1",
+        "WHERE launch_attempt_id = ANY($1::text[])",
+        "ORDER BY launch_attempt_id",
       ].join(" "),
-      [launchAttemptId],
+      [[launchAttemptId, recoveryLaunchAttemptId]],
     );
-    assert.equal(completedSupervisorStateGc.rows.length, 1);
-    assert.equal(
-      completedSupervisorStateGc.rows[0].launch_attempt_id,
-      launchAttemptId,
+    assert.deepEqual(
+      completedSupervisorStateGc.rows.map((row) => ({
+        collected: row.collected,
+        collection_status: row.collection_status,
+        launch_attempt_id: row.launch_attempt_id,
+        terminal_kind: row.terminal_kind,
+      })),
+      expectedCollectedLaunchAttemptIds.map((collectedLaunchAttemptId) => ({
+        collected: true,
+        collection_status: "collected",
+        launch_attempt_id: collectedLaunchAttemptId,
+        terminal_kind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+      })),
     );
-    assert.equal(
-      completedSupervisorStateGc.rows[0].terminal_kind,
-      WRITER_LAUNCH_STOP_OPERATION_KIND,
-    );
-    assert.equal(
-      completedSupervisorStateGc.rows[0].collection_status,
-      "collected",
-    );
-    assert.match(
-      completedSupervisorStateGc.rows[0].collection_receipt_sha256,
-      /^[0-9a-f]{64}$/u,
-    );
-    assert.equal(completedSupervisorStateGc.rows[0].collected, true);
+    for (const row of completedSupervisorStateGc.rows) {
+      assert.match(row.collection_receipt_sha256, /^[0-9a-f]{64}$/u);
+    }
 
     const captureRecoveryCountsBefore = {
       artifactResolver: restartedCalls.artifactResolver,
@@ -14882,6 +15005,109 @@ test(
       integrationDeploymentPhysicalSettlementPolicies();
     const deploymentSupervisorId =
       `deployment-supervisor-${randomUUID()}`;
+    const deploymentSupervisorStateParent = await mkdtemp(
+      join(
+        await realpath(tmpdir()),
+        "portable-codex-runtime-deployment-supervisor-",
+      ),
+    );
+    const deploymentSupervisorStateParentIdentity = await lstat(
+      deploymentSupervisorStateParent,
+      { bigint: true },
+    );
+    t.after(async () => {
+      // Cleanup protects the private parent's object identity. Child-entry
+      // churn is expected state content, so ctime/size are deliberately not
+      // treated as replacement evidence.
+      const currentIdentity = await lstat(
+        deploymentSupervisorStateParent,
+        { bigint: true },
+      );
+      assert.equal(
+        currentIdentity.dev,
+        deploymentSupervisorStateParentIdentity.dev,
+      );
+      assert.equal(
+        currentIdentity.ino,
+        deploymentSupervisorStateParentIdentity.ino,
+      );
+      assert.equal(
+        currentIdentity.birthtimeNs,
+        deploymentSupervisorStateParentIdentity.birthtimeNs,
+      );
+      await rm(deploymentSupervisorStateParent, {
+        force: true,
+        recursive: true,
+      });
+    });
+    const deploymentSupervisorStateRoot = join(
+      deploymentSupervisorStateParent,
+      "state",
+    );
+    const initialDeploymentStateOwner =
+      await preparePodmanWriterSupervisorStateOwner({
+        expectedStateOwnerId: null,
+        root: deploymentSupervisorStateRoot,
+      });
+    const initialDeploymentStateBundle =
+      createPodmanWriterSupervisorStateBundle({
+        owner: initialDeploymentStateOwner,
+      });
+    const createDeploymentSupervisorBundle = (stateBundle) =>
+      createPodmanWriterSupervisorBundle({
+        configuredAttachmentRoot: deploymentSupervisorStateParent,
+        images: Object.freeze({
+          [deploymentImage.descriptor.digest]: Object.freeze({
+            architecture: "arm64",
+            codexVersion: "0.142.4",
+            imageReference:
+              `localhost/portable-codex@${deploymentImage.descriptor.digest}`,
+            os: "linux",
+          }),
+        }),
+        podmanEnvironment: Object.freeze({
+          HOME: "/var/empty/podman",
+          XDG_RUNTIME_DIR: "/run/user/1000",
+        }),
+        podmanExecutable: "/usr/bin/podman",
+        stateBundle,
+        supervisorId: deploymentSupervisorId,
+        writerCommand: Object.freeze([
+          "/usr/local/bin/codex",
+          "app-server",
+        ]),
+        writerEnvironment: Object.freeze({
+          CODEX_HOME: "/session/.codex",
+          LANG: "C.UTF-8",
+        }),
+      });
+    const initialDeploymentSupervisorBundle =
+      createDeploymentSupervisorBundle(initialDeploymentStateBundle);
+    const restartedDeploymentStateOwner =
+      await preparePodmanWriterSupervisorStateOwner({
+        expectedStateOwnerId: initialDeploymentStateBundle.stateOwnerId,
+        root: deploymentSupervisorStateRoot,
+      });
+    const restartedDeploymentStateBundle =
+      createPodmanWriterSupervisorStateBundle({
+        owner: restartedDeploymentStateOwner,
+      });
+    const deploymentSupervisorBundle =
+      createDeploymentSupervisorBundle(restartedDeploymentStateBundle);
+    const deploymentStateOwnerId =
+      deploymentSupervisorBundle.supervisor.stateOwnerId;
+    assert.equal(
+      deploymentStateOwnerId,
+      initialDeploymentSupervisorBundle.supervisor.stateOwnerId,
+    );
+    assert.notStrictEqual(
+      deploymentSupervisorBundle.supervisor,
+      initialDeploymentSupervisorBundle.supervisor,
+    );
+    const deploymentEffectiveRecoveryScopeId = recoveryOwnerScopeId(
+      recoveryScopeId,
+      deploymentStateOwnerId,
+    );
     const deployment = createPostgresDetachedRestoreDeployment({
       postgres: {
         applicationNamePrefix,
@@ -15029,35 +15255,12 @@ test(
           },
           stoppedWriterCoordinator:
             new StoppedWriterCapabilityCoordinator(),
-          supervisor: Object.freeze({
-            contractVersion:
-              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
-            async launchWriter(input) {
-              calls.supervisor += 1;
-              void input;
-              throw new Error("deployment supervisor must not launch");
-            },
-            async reconcileWriterLaunch(input) {
-              calls.supervisor += 1;
-              void input;
-              throw new Error("deployment supervisor must not reconcile");
-            },
-            supervisorId: deploymentSupervisorId,
-          }),
+          supervisor: deploymentSupervisorBundle.supervisor,
           supervisorSettlement: physicalPolicies.supervisorSettlement,
           supervisorStateCollectionSettlement:
             physicalPolicies.supervisorStateCollectionSettlement,
-          supervisorStateCollector: Object.freeze({
-            async collectTerminalState(input) {
-              calls.supervisor += 1;
-              void input;
-              throw new Error(
-                "deployment supervisor state collection must not run",
-              );
-            },
-            contractVersion: 1,
-            supervisorId: deploymentSupervisorId,
-          }),
+          supervisorStateCollector:
+            deploymentSupervisorBundle.supervisorStateCollector,
         },
         operationalLease: {
           databaseRequestMilliseconds:
@@ -15126,7 +15329,7 @@ test(
               "DELETE FROM session_authority.restore_recovery_cursors",
               "WHERE recovery_scope_id = $1",
             ].join(" "),
-            [recoveryScopeId],
+            [deploymentEffectiveRecoveryScopeId],
           );
           await cleanupClient.query(
             [
@@ -15138,6 +15341,13 @@ test(
           await cleanupClient.query(
             [
               "DELETE FROM session_authority.writer_supervisor_state_gc",
+              "WHERE session_id = $1::uuid",
+            ].join(" "),
+            [sessionId],
+          );
+          await cleanupClient.query(
+            [
+              "DELETE FROM session_authority.writer_supervisor_state_owners",
               "WHERE session_id = $1::uuid",
             ].join(" "),
             [sessionId],
@@ -15205,6 +15415,10 @@ test(
     assert.equal(steps.length >= 1, true);
     assert.equal(steps[0].status, "completed");
     assert.equal(steps[0].recovery.status, "sweep-complete");
+    assert.equal(
+      steps[0].recovery.recoveryScopeId,
+      deploymentEffectiveRecoveryScopeId,
+    );
 
     const ledger = await readMigrationLedger(inspectionPool);
     assert.deepEqual(
@@ -15218,7 +15432,7 @@ test(
         "WHERE recovery_scope_id = $1",
         "ORDER BY lane",
       ].join(" "),
-      [recoveryScopeId],
+      [deploymentEffectiveRecoveryScopeId],
     );
     assert.deepEqual(cursors.rows, [
       { cycle: "1", lane: "activation", revision: "1" },

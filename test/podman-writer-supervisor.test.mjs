@@ -34,9 +34,12 @@ import {
   createPodmanWriterFilesystemAuthorityComposition,
   createPodmanWriterSupervisor,
   createPodmanWriterSupervisorBundle,
+  isPodmanWriterSupervisorBundlePair,
 } from "../src/podman-writer-supervisor.mjs";
 import {
+  PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
   createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -1007,10 +1010,11 @@ async function fixture(t, settings = {}) {
   t.after(() => rm(parent, { force: true, recursive: true }));
   const events = [];
   const filesystemEvents = [];
-  const stateOptions = { root: stateRoot };
-  if (settings.stateFaultHooks !== undefined) {
-    stateOptions.faultHooks = settings.stateFaultHooks;
-  }
+  const stateOwner = await preparePodmanWriterSupervisorStateOwner(
+    exact({ expectedStateOwnerId: null, root: stateRoot }),
+  );
+  const stateOptions = { owner: stateOwner };
+  if (settings.stateFaultHooks !== undefined) stateOptions.faultHooks = settings.stateFaultHooks;
   const stateBundle = createPodmanWriterSupervisorStateBundle(
     exact(stateOptions),
   );
@@ -1043,6 +1047,7 @@ async function fixture(t, settings = {}) {
     }),
     podmanExecutable,
     state,
+    stateOwnerId: stateBundle.stateOwnerId,
     stopTimeoutSeconds: settings.stopTimeoutSeconds ?? 7,
     supervisorId: SUPERVISOR_ID,
     writerCommand: settings.writerCommand ??
@@ -1083,6 +1088,7 @@ async function fixture(t, settings = {}) {
 function bundleOptions(options, stateBundle) {
   const value = { ...options, stateBundle };
   delete value.state;
+  delete value.stateOwnerId;
   return exact(value);
 }
 
@@ -1224,11 +1230,13 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   assert.equal(Object.isFrozen(supervisor), true);
   assert.deepEqual(Reflect.ownKeys(supervisor), [
     "contractVersion",
-    "supervisorId",
     "launchWriter",
     "reconcileWriterLaunch",
+    "stateOwnerId",
+    "supervisorId",
   ]);
-  assert.equal(supervisor.contractVersion, 3);
+  assert.equal(supervisor.contractVersion, 4);
+  assert.equal(supervisor.stateOwnerId, base.stateBundle.stateOwnerId);
   assert.equal(supervisor.launchWriter.length, 1);
   assert.equal(supervisor.reconcileWriterLaunch.length, 1);
 
@@ -1348,6 +1356,110 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   }
 });
 
+test("direct supervisor owner IDs are caller-asserted while bundle owners are branded-derived", async (t) => {
+  const base = await fixture(t);
+  const assertedStateOwnerId = `state-owner:${"9".repeat(64)}`;
+  const direct = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    stateOwnerId: assertedStateOwnerId,
+  }));
+  assert.equal(direct.stateOwnerId, assertedStateOwnerId);
+  assert.notEqual(direct.stateOwnerId, base.stateBundle.stateOwnerId);
+
+  for (const stateOwnerId of [
+    undefined,
+    null,
+    "state-owner:short",
+    `state-owner:${"A".repeat(64)}`,
+    "owner:" + "a".repeat(64),
+  ]) {
+    assert.throws(
+      () => createPodmanWriterSupervisor(exact({
+        ...base.options,
+        stateOwnerId,
+      })),
+      assertSupervisorError("invalid_podman_writer_supervisor_options"),
+    );
+  }
+
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  assert.equal(bundle.supervisor.stateOwnerId, base.stateBundle.stateOwnerId);
+  assert.equal(
+    bundle.supervisorStateCollector.stateOwnerId,
+    base.stateBundle.stateOwnerId,
+  );
+});
+
+test("bundle pair provenance is exact, unforgeable, and re-established from the durable marker", async (t) => {
+  const base = await fixture(t);
+  const first = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      first.supervisor,
+      first.supervisorStateCollector,
+    ),
+    true,
+  );
+
+  const direct = createPodmanWriterSupervisor(base.options);
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      direct,
+      first.supervisorStateCollector,
+    ),
+    false,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      Object.freeze({ ...first.supervisor }),
+      Object.freeze({ ...first.supervisorStateCollector }),
+    ),
+    false,
+  );
+  assert.equal(isPodmanWriterSupervisorBundlePair(first), false);
+  assert.equal(isPodmanWriterSupervisorBundlePair(null, null), false);
+
+  const restartedOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+    expectedStateOwnerId: base.stateBundle.stateOwnerId,
+    root: base.stateRoot,
+  }));
+  const restartedStateBundle = createPodmanWriterSupervisorStateBundle(exact({
+    owner: restartedOwner,
+  }));
+  const restarted = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, restartedStateBundle),
+  );
+  assert.equal(
+    restarted.supervisor.stateOwnerId,
+    first.supervisor.stateOwnerId,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      restarted.supervisor,
+      restarted.supervisorStateCollector,
+    ),
+    true,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      first.supervisor,
+      restarted.supervisorStateCollector,
+    ),
+    false,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      restarted.supervisor,
+      first.supervisorStateCollector,
+    ),
+    false,
+  );
+});
+
 test("constructs an atomic supervisor/state-collector bundle and collects only its owner receipt", async (t) => {
   const base = await fixture(t);
   const bundle = createPodmanWriterSupervisorBundle(
@@ -1361,17 +1473,23 @@ test("constructs an atomic supervisor/state-collector bundle and collects only i
   ]);
   assert.deepEqual(Reflect.ownKeys(bundle.supervisor), [
     "contractVersion",
-    "supervisorId",
     "launchWriter",
     "reconcileWriterLaunch",
+    "stateOwnerId",
+    "supervisorId",
   ]);
   assert.deepEqual(Reflect.ownKeys(bundle.supervisorStateCollector), [
     "collectTerminalState",
     "contractVersion",
+    "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(bundle.supervisor.contractVersion, 3);
-  assert.equal(bundle.supervisorStateCollector.contractVersion, 1);
+  assert.equal(bundle.supervisor.contractVersion, 4);
+  assert.equal(bundle.supervisorStateCollector.contractVersion, 2);
+  assert.equal(
+    bundle.supervisorStateCollector.stateOwnerId,
+    bundle.supervisor.stateOwnerId,
+  );
   assert.equal(
     bundle.supervisorStateCollector.supervisorId,
     bundle.supervisor.supervisorId,
@@ -1383,21 +1501,41 @@ test("constructs an atomic supervisor/state-collector bundle and collects only i
   const stopped = await launch.stopWriter(stopInput(base.input, launch));
   assert.equal(stopped.terminalRecord.status, "stopped");
   assert.equal(stopped.terminalRecord.revision, 4);
-  const collection = await bundle.supervisorStateCollector.collectTerminalState(
-    exact({
-      contractVersion: 1,
+  const wrongStateOwnerId = bundle.supervisor.stateOwnerId ===
+      `state-owner:${"8".repeat(64)}`
+    ? `state-owner:${"7".repeat(64)}`
+    : `state-owner:${"8".repeat(64)}`;
+  await assert.rejects(
+    bundle.supervisorStateCollector.collectTerminalState(exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
       invocation: exact({}),
       signal: new AbortController().signal,
+      stateOwnerId: wrongStateOwnerId,
+      terminalRecord: stopped.terminalRecord,
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_request"),
+  );
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
+  );
+  const collection = await bundle.supervisorStateCollector.collectTerminalState(
+    exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: new AbortController().signal,
+      stateOwnerId: bundle.supervisor.stateOwnerId,
       terminalRecord: stopped.terminalRecord,
     }),
   );
   assert.deepEqual(Reflect.ownKeys(collection), [
     "contractVersion",
     "launchAttemptId",
+    "stateOwnerId",
     "status",
     "terminalRecordSha256",
   ]);
-  assert.equal(collection.contractVersion, 1);
+  assert.equal(collection.contractVersion, 2);
   assert.equal(collection.launchAttemptId, "launch-attempt-001");
   assert.equal(collection.status, "collected");
   assert.match(collection.terminalRecordSha256, /^[0-9a-f]{64}$/u);
@@ -1407,9 +1545,10 @@ test("constructs an atomic supervisor/state-collector bundle and collects only i
   );
   const replay = await bundle.supervisorStateCollector.collectTerminalState(
     exact({
-      contractVersion: 1,
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
       invocation: exact({}),
       signal: new AbortController().signal,
+      stateOwnerId: bundle.supervisor.stateOwnerId,
       terminalRecord: stopped.terminalRecord,
     }),
   );
@@ -1452,9 +1591,10 @@ test("rejects a wrongly derived terminal record without deleting durable state",
   });
   await assert.rejects(
     bundle.supervisorStateCollector.collectTerminalState(exact({
-      contractVersion: 1,
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
       invocation: exact({}),
       signal: new AbortController().signal,
+      stateOwnerId: bundle.supervisor.stateOwnerId,
       terminalRecord: wrong,
     })),
     assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
@@ -1476,9 +1616,10 @@ test("distinguishes pre-call abort from post-call collection uncertainty", async
   preController.abort();
   await assert.rejects(
     preBundle.supervisorStateCollector.collectTerminalState(exact({
-      contractVersion: 1,
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
       invocation: exact({}),
       signal: preController.signal,
+      stateOwnerId: preBundle.supervisor.stateOwnerId,
       terminalRecord: preStopped.terminalRecord,
     })),
     assertSupervisorError("podman_writer_supervisor_aborted"),
@@ -1503,9 +1644,10 @@ test("distinguishes pre-call abort from post-call collection uncertainty", async
   const postStopped = await postLaunch.stopWriter(stopInput(post.input, postLaunch));
   await assert.rejects(
     postBundle.supervisorStateCollector.collectTerminalState(exact({
-      contractVersion: 1,
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
       invocation: exact({}),
       signal: postController.signal,
+      stateOwnerId: postBundle.supervisor.stateOwnerId,
       terminalRecord: postStopped.terminalRecord,
     })),
     assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
@@ -1596,7 +1738,8 @@ test("environment values preserve lossless UTF-8 at the code-unit boundary", asy
   }
   assert.equal(base.events.length, 0);
   assert.equal(base.filesystemEvents.length, 0);
-  assert.equal(existsSync(base.stateRoot), false);
+  assert.equal(existsSync(base.stateRoot), true);
+  assert.deepEqual(await readdir(base.stateRoot), [".state-owner-v1.json"]);
 
   const supervisor = createPodmanWriterSupervisor(exact({
     ...base.options,
@@ -2207,7 +2350,8 @@ test("native pathname ingress accepts 4095 UTF-8 bytes and rejects 4096", async 
   }
   assert.equal(base.events.length, 0);
   assert.equal(base.filesystemEvents.length, 0);
-  assert.equal(existsSync(base.stateRoot), false);
+  assert.equal(existsSync(base.stateRoot), true);
+  assert.deepEqual(await readdir(base.stateRoot), [".state-owner-v1.json"]);
 
   const prefix = `${base.parent}/`;
   const maximumRequestedRoot =

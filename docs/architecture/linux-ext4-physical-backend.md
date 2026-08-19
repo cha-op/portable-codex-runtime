@@ -67,7 +67,7 @@ The physical implementation remains split into small authorities:
   restore-destination publication, and source-free committed verification.
   The ext4 inspector supplies its atomic filesystem/object observation, while
   provider state supplies the expected destination control identity.
-- `PodmanWriterSupervisor` implements the raw version 3 writer-supervisor
+- `PodmanWriterSupervisor` implements the raw version 4 writer-supervisor
   surface with a digest-pinned image reference, rootless execution, a private
   bind, immutable revision publication, stop/join, and stopped-only read-only
   launch reconciliation. Every Podman child invocation is explicitly local
@@ -77,7 +77,7 @@ The physical implementation remains split into small authorities:
   Podman child environment adds the fixed `/usr/bin:/bin` search path required
   by reviewed rootless helpers; it never inherits or accepts an ambient
   caller-controlled `PATH`.
-- The matching contract version 1 terminal-state collector removes only one
+- The matching contract version 2 terminal-state collector removes only one
   exact stopped revision 4 chain through the separately settled
   `supervisorStateCollector.collectTerminalState` leaf. It does not share the
   reconciler surface or infer mutation authority from local state.
@@ -597,10 +597,27 @@ record.
 The owner-private state root still publishes immutable per-attempt revisions
 for exact acknowledgement-loss replay, but terminal stopped state now has a
 separate bounded collector. `createPodmanWriterSupervisorStateBundle()` keeps
-the original state ABI separate from its terminal collector. The raw
+the original state ABI separate from its terminal collector and exposes the
+root's persistent high-entropy `stateOwnerId`, whose exact syntax is
+`state-owner:<64 lowercase hex>`. Owner preparation first reads or initializes
+and durably validates that marker; the branded state bundle then supplies
+`createPodmanWriterSupervisorBundle()`, which returns the raw supervisor and
+collector as one exact process-local branded pair. Production deployment
+checks that pair before constructing the physical adapter. Equal
+`supervisorId` and `stateOwnerId` strings are necessary but not sufficient, and
+direct `createPodmanWriterSupervisor()` validates only a caller-asserted owner
+so it cannot satisfy the production deployment boundary. Production does not
+derive the owner from the root pathname, `supervisorId`, or `recoveryScopeId`;
+missing, malformed, or mismatched markers fail owner preparation or bundle
+construction before physical dispatch. This marker is persistent routing
+identity, not cryptographic host attestation. An administrator who clones both
+the private root and its marker is outside the property it proves. The raw
 `supervisorStateCollector.collectTerminalState` physical leaf accepts the exact
 immutable stopped revision 4 `terminalRecord` data; a path or attempt ID is not
-sufficient input. The raw collector validates the canonical record but cannot
+sufficient input. Its exact version-2 request also carries the bundle's
+`stateOwnerId`, and its exact version-2 receipt repeats that owner beside the
+attempt ID, status, and terminal-record collection digest. The raw collector
+validates the canonical record but cannot
 attest its provenance. Production authorization obtains it from the owner
 launch or returned stop receipt, while `reconcileWriterLaunch()` remains a pure
 stopped-only observation and receives no collection authority.
@@ -675,13 +692,17 @@ The generic deployment already exposes the required injection points. A host
 constructs the inspector, driver, paths, and externally anchored provider
 state, then passes them through `createExt4PodmanAttachmentBinding()` so the
 initialized backend and Podman filesystem authority cannot diverge. It
-constructs publication and the supervisor before creating the deployment. It
-maps them as follows:
+constructs publication, prepares the supervisor-state owner, constructs its
+branded state bundle, and passes that bundle through
+`createPodmanWriterSupervisorBundle()` before creating the deployment. The
+deployment rejects independently assembled lookalikes before its physical
+adapter is constructed. It maps the accepted pair as follows:
 
-- `runtime.launch.supervisor` receives the Podman v3 surface constructed with
-  the binding's `filesystemAuthority`;
+- the physical binding consumes the Podman raw-v4 surface constructed with the
+  binding's `filesystemAuthority` and exposes the logical version-3 supervisor
+  to `runtime.launch.supervisor`;
 - `runtime.launch.supervisorStateCollector` receives the matching contract
-  version 1 collector, and deployment gives
+  version 2 collector with the identical `stateOwnerId`, and deployment gives
   `collectTerminalState()` its own deadline/grace settlement policy;
 - `runtime.storage.lifecycleBackend` receives
   `binding.backend.lifecycleBackend`;

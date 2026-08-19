@@ -111,7 +111,7 @@ const {
 } = utilTypes;
 
 export const LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION = 1;
-export const LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION = 2;
+export const LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION = 3;
 export const LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION = 2;
 export const LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION = 1;
 const MAX_DATA_TREE_DEPTH = 24;
@@ -121,6 +121,7 @@ const NATIVE_FUNCTION_SOURCE_PATTERN =
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REVISION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -140,6 +141,7 @@ const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
   "reconcileWriterLaunch",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const AUTHORITY_METHODS = objectFreeze([
@@ -568,6 +570,7 @@ const SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS = objectFreeze([
   "contractVersion",
   "launchAttemptId",
   "sessionId",
+  "stateOwnerId",
   "terminalKind",
   "terminalOperationId",
   "terminalRecord",
@@ -1114,6 +1117,14 @@ function sameContent(left, right, code) {
 
 function assertOpaqueId(value, code) {
   ensure(typeof value === "string" && regexpTest(OPAQUE_ID_PATTERN, value), code);
+  return value;
+}
+
+function assertStateOwnerId(value, code) {
+  ensure(
+    typeof value === "string" && regexpTest(STATE_OWNER_ID_PATTERN, value),
+    code,
+  );
   return value;
 }
 
@@ -2325,6 +2336,7 @@ function normalizeFinalizeGcReceipt(
   expectedRequest,
   expectedEvidence,
   terminalRecord,
+  stateOwnerId,
   code,
 ) {
   const receipt = exactDataObject(value, FINALIZE_GC_RECEIPT_KEYS, code);
@@ -2348,6 +2360,7 @@ function normalizeFinalizeGcReceipt(
     {
       launchAttemptId,
       sessionId: normalized.operation.sessionId,
+      stateOwnerId,
       terminalKind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
       terminalOperationId: normalized.operation.operationId,
       terminalRecord,
@@ -2652,6 +2665,7 @@ function normalizeStopFinalizationGcReceipt(
   baseInput,
   expectedEvidence,
   terminalRecord,
+  stateOwnerId,
   code,
 ) {
   const receipt = exactDataObject(
@@ -2678,6 +2692,7 @@ function normalizeStopFinalizationGcReceipt(
     {
       launchAttemptId: baseInput.request.launch.launchAttemptId,
       sessionId: normalized.operation.sessionId,
+      stateOwnerId,
       terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
       terminalOperationId: normalized.operation.operationId,
       terminalRecord,
@@ -3072,6 +3087,7 @@ function normalizeSupervisorStateGcAuthorization(
   {
     launchAttemptId,
     sessionId,
+    stateOwnerId,
     terminalKind,
     terminalOperationId,
     terminalRecord,
@@ -3084,9 +3100,10 @@ function normalizeSupervisorStateGcAuthorization(
     code,
   );
   ensure(
-    authorization.contractVersion === 1 &&
+    authorization.contractVersion === 2 &&
       authorization.launchAttemptId === launchAttemptId &&
       authorization.sessionId === sessionId &&
+      authorization.stateOwnerId === stateOwnerId &&
       authorization.terminalKind === terminalKind &&
       authorization.terminalOperationId === terminalOperationId &&
       assertSha256(authorization.authorizationSha256, code) ===
@@ -3110,6 +3127,7 @@ async function readSupervisorStateGcAuthorization(
     "readWriterSupervisorStateGcAuthorization",
     [
       exactFrozenRecord({
+        stateOwnerId: expected.stateOwnerId,
         terminalOperationId: expected.terminalOperationId,
       }),
     ],
@@ -3246,6 +3264,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
       supervisorOptions.reconcileWriterLaunch,
       { asynchronous: true, code: optionCode },
     ),
+    stateOwnerId: assertStateOwnerId(
+      supervisorOptions.stateOwnerId,
+      optionCode,
+    ),
     supervisorId: assertOpaqueId(supervisorOptions.supervisorId, optionCode),
   });
   const imagePlanBinding = options.imagePlanBinding;
@@ -3303,7 +3325,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
       await invokeAsync(
         authority,
         "readWriterLaunchAttempt",
-        [exactFrozenRecord({ operationId: launchAttemptId })],
+        [
+          exactFrozenRecord({
+            operationId: launchAttemptId,
+            stateOwnerId: supervisor.stateOwnerId,
+          }),
+        ],
         outcomeCode,
       ),
       launchAttemptId,
@@ -3531,6 +3558,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
               readLike.operation.request,
               evidence,
               terminalRecord,
+              supervisor.stateOwnerId,
               outcomeCode,
             );
       const writer =
@@ -3558,6 +3586,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
             {
               launchAttemptId: readback.attempt.launchAttemptId,
               sessionId: readback.operation.sessionId,
+              stateOwnerId: supervisor.stateOwnerId,
               terminalKind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
               terminalOperationId: readback.operation.operationId,
               terminalRecord,
@@ -4104,6 +4133,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                     exactFrozenRecord({
                       ...baseInput,
                       expectedOperationRevision: "0",
+                      stateOwnerId: supervisor.stateOwnerId,
                     }),
                   ],
                   outcomeCode,
@@ -4234,7 +4264,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 await invokeAsync(
                   authority,
                   "claimWriterLaunchAttemptDispatch",
-                  [transitionInput(read.operation)],
+                  [
+                    exactFrozenRecord({
+                      ...transitionInput(read.operation),
+                      stateOwnerId: supervisor.stateOwnerId,
+                    }),
+                  ],
                   outcomeCode,
                 ),
                 input.launchAttemptId,
@@ -4638,6 +4673,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
         {
           launchAttemptId: baseInput.request.launch.launchAttemptId,
           sessionId: proof.stop.operation.sessionId,
+          stateOwnerId: supervisor.stateOwnerId,
           terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
           terminalOperationId: proof.stop.operation.operationId,
           terminalRecord,
@@ -4701,6 +4737,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 launchAttemptId:
                   baseInput.request.launch.launchAttemptId,
                 sessionId: committed.stop.operation.sessionId,
+                stateOwnerId: supervisor.stateOwnerId,
                 terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
                 terminalOperationId: committed.stop.operation.operationId,
                 terminalRecord,
@@ -4749,6 +4786,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       {
         launchAttemptId: baseInput.request.launch.launchAttemptId,
         sessionId: committed.stop.operation.sessionId,
+        stateOwnerId: supervisor.stateOwnerId,
         terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
         terminalOperationId: committed.stop.operation.operationId,
         terminalRecord,
@@ -4787,6 +4825,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
           baseInput,
           evidence,
           terminalRecord,
+          supervisor.stateOwnerId,
           outcomeCode,
         );
       } catch {
@@ -4835,6 +4874,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       {
         launchAttemptId: baseInput.request.launch.launchAttemptId,
         sessionId: committed.operation.sessionId,
+        stateOwnerId: supervisor.stateOwnerId,
         terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
         terminalOperationId: committed.operation.operationId,
         terminalRecord,

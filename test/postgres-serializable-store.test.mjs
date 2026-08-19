@@ -2774,6 +2774,30 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.doesNotMatch(imageProviderMigration.sql, /\bsequence\b/u);
   assert.doesNotMatch(imageProviderMigration.sql, /jsonb/u);
+  assert.match(
+    latestMigration.sql,
+    /CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /launch_attempt_id character varying\(128\) PRIMARY KEY[\s\S]+state_owner_id character varying\(76\) NOT NULL[\s\S]+bound_at timestamp with time zone NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /writer_supervisor_state_owners_launch_attempt_fk[\s\S]+FOREIGN KEY \(launch_attempt_id, session_id\)[\s\S]+REFERENCES session_authority\.operation_claims/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /writer_supervisor_state_owners_state_owner_id_format[\s\S]+\^state-owner:\[0-9a-f\]\{64\}\$/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /writer_supervisor_state_owners_launch_session_owner_unique[\s\S]+UNIQUE \(launch_attempt_id, session_id, state_owner_id\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TRIGGER writer_supervisor_state_owners_reject_update[\s\S]+BEFORE UPDATE ON session_authority\.writer_supervisor_state_owners/u,
+  );
   assert.match(latestMigration.sql, /writer_supervisor_state_gc/u);
   assert.match(
     latestMigration.sql,
@@ -2785,7 +2809,11 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
-    /FOREIGN KEY \(launch_attempt_id, session_id\)[\s\S]+REFERENCES session_authority\.operation_claims/u,
+    /writer_supervisor_state_gc_state_owner_fk[\s\S]+FOREIGN KEY \(launch_attempt_id, session_id, state_owner_id\)[\s\S]+REFERENCES session_authority\.writer_supervisor_state_owners/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /writer_supervisor_state_gc_state_owner_id_format[\s\S]+\^state-owner:\[0-9a-f\]\{64\}\$/u,
   );
   for (const terminalKind of [
     "writer-launch-attempt-v1",
@@ -2821,7 +2849,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
-    /CREATE INDEX writer_supervisor_state_gc_pending_page[\s\S]+\(\s*session_id,[\s\S]+authorized_at,[\s\S]+terminal_operation_id[\s\S]+WHERE collected_at IS NULL/u,
+    /CREATE INDEX writer_supervisor_state_gc_pending_page[\s\S]+\(\s*state_owner_id,[\s\S]+session_id,[\s\S]+authorized_at,[\s\S]+terminal_operation_id[\s\S]+WHERE collected_at IS NULL/u,
   );
   assert.match(
     latestMigration.sql,

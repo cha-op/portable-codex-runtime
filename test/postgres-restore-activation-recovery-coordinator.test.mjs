@@ -1802,6 +1802,7 @@ function createTestOperationalLeaseBudget() {
 }
 
 function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
+  const stateOwnerId = `state-owner:${"a".repeat(64)}`;
   const supervisorId = "coordinator-physical-supervisor-001";
   const unexpected = async function unexpectedPhysicalProvider() {
     throw new Error("unrelated physical provider must not run");
@@ -1826,6 +1827,7 @@ function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
         POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
+      stateOwnerId,
       supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
@@ -1837,6 +1839,7 @@ function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
       collectTerminalState: unexpected,
       contractVersion:
         POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId,
       supervisorId,
     }),
   }).publication;

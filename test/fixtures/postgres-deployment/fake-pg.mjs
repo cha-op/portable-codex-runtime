@@ -455,7 +455,7 @@ export class Client extends EventEmitter {
           lane,
           last_request_sha256: null,
           last_transition_id: null,
-          recovery_scope_id: state.recoveryScopeId,
+          recovery_scope_id: values[0],
           revision: "0",
           updated_at: new Date("2026-08-12T00:00:00.000Z"),
         });

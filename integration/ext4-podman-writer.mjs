@@ -8,11 +8,12 @@ import { promisify } from "node:util";
 
 import {
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-  createPodmanWriterSupervisor,
+  createPodmanWriterSupervisorBundle,
 } from "../src/podman-writer-supervisor.mjs";
 import {
   assertPodmanWriterSupervisorStateRecord,
-  createPodmanWriterSupervisorState,
+  createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
 
 const READY_MARKER = "ready\n";
@@ -407,28 +408,54 @@ export async function runExt4PodmanWriterIntegration({
   assert.match(podmanEnvironment.XDG_RUNTIME_DIR, /^\//u);
   const servicePid = process.pid;
   const serviceUid = process.getuid();
-  const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
-  const supervisor = createPodmanWriterSupervisor(exact({
-    commandTimeoutMilliseconds: 30_000,
-    configuredAttachmentRoot,
-    filesystemAuthority,
-    images: exact({
-      [imageDigest]: exact({
-        architecture: "amd64",
-        codexVersion: "1.0.0",
-        imageReference,
-        os: "linux",
-      }),
-    }),
-    maxOutputBytes: 1024 * 1024,
-    podmanEnvironment,
-    podmanExecutable,
-    state,
-    stopTimeoutSeconds: 10,
-    supervisorId: SUPERVISOR_ID,
-    writerCommand: Object.freeze(["/usr/local/bin/writer"]),
-    writerEnvironment: exact({ LANG: "C.UTF-8" }),
+  const stateOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+    expectedStateOwnerId: null,
+    root: stateRoot,
   }));
+  const stateBundle = createPodmanWriterSupervisorStateBundle(exact({
+    owner: stateOwner,
+  }));
+  const { supervisor, supervisorStateCollector } =
+    createPodmanWriterSupervisorBundle(exact({
+      commandTimeoutMilliseconds: 30_000,
+      configuredAttachmentRoot,
+      filesystemAuthority,
+      images: exact({
+        [imageDigest]: exact({
+          architecture: "amd64",
+          codexVersion: "1.0.0",
+          imageReference,
+          os: "linux",
+        }),
+      }),
+      maxOutputBytes: 1024 * 1024,
+      podmanEnvironment,
+      podmanExecutable,
+      stateBundle,
+      stopTimeoutSeconds: 10,
+      supervisorId: SUPERVISOR_ID,
+      writerCommand: Object.freeze(["/usr/local/bin/writer"]),
+      writerEnvironment: exact({ LANG: "C.UTF-8" }),
+    }));
+  assert.deepEqual(reflectOwnKeysIntrinsic(supervisor), [
+    "contractVersion",
+    "launchWriter",
+    "reconcileWriterLaunch",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.deepEqual(reflectOwnKeysIntrinsic(supervisorStateCollector), [
+    "collectTerminalState",
+    "contractVersion",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.equal(supervisor.stateOwnerId, stateOwner.stateOwnerId);
+  assert.equal(
+    supervisorStateCollector.stateOwnerId,
+    supervisor.stateOwnerId,
+  );
+  assert.equal(supervisorStateCollector.supervisorId, supervisor.supervisorId);
   const input = launchInput(attachment, imageDigest);
   const receipt = await supervisor.launchWriter(input);
   assert.equal(process.pid, servicePid);

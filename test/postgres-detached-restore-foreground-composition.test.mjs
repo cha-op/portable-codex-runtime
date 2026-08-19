@@ -54,6 +54,8 @@ import {
 const SESSION_ID = "019f7f40-0000-7000-8000-000000000001";
 const THREAD_ID = "019f7f40-0000-7000-8000-000000000002";
 const BASE_TIME = "2026-08-11T08:00:00.000Z";
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"b".repeat(64)}`;
 const OCI_MANIFEST_MEDIA_TYPE =
   "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG_MEDIA_TYPE =
@@ -135,6 +137,24 @@ function deepFreeze(value) {
 
 function exactRecord(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
+}
+
+function assertStateOwnerRead(input, operationId) {
+  assert.deepEqual(Reflect.ownKeys(input), ["operationId", "stateOwnerId"]);
+  assert.equal(Object.getPrototypeOf(input), null);
+  assert.equal(Object.isFrozen(input), true);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(input, "operationId"), {
+    configurable: false,
+    enumerable: true,
+    value: operationId,
+    writable: false,
+  });
+  assert.deepEqual(Object.getOwnPropertyDescriptor(input, "stateOwnerId"), {
+    configurable: false,
+    enumerable: true,
+    value: STATE_OWNER_ID,
+    writable: false,
+  });
 }
 
 function sha256Json(value) {
@@ -817,10 +837,12 @@ function absent(code) {
 function facadeFixture({
   captureBackendValue,
   gate,
+  includeStateOwnerId = true,
   readCheckpointCaptureAttempt,
   readSession = async () => runningSession(),
   renewWriterLease,
   selectOperationGuard,
+  stateOwnerId = STATE_OWNER_ID,
   transformAuthority,
 } = {}) {
   const plan = fixturePlan();
@@ -851,7 +873,8 @@ function facadeFixture({
       trace.push("session-read");
       return Reflect.apply(readSession, this, args);
     },
-    async readWriterLaunchAttempt() {
+    async readWriterLaunchAttempt(input) {
+      assertStateOwnerRead(input, plan.launchAttemptId);
       return absent("writer_launch_attempt_not_authorized");
     },
     async renewWriterLease(input) {
@@ -912,6 +935,7 @@ function facadeFixture({
         throw new Error("unexpected activation reconciliation");
       },
     },
+    ...(includeStateOwnerId ? { stateOwnerId } : {}),
     writerDetach: {
       async detachWriter() {
         throw new Error("unexpected detach");
@@ -1374,7 +1398,8 @@ function happyFacadeFixture({
     async readSession() {
       return preparedGenerationSession ?? initial;
     },
-    async readWriterLaunchAttempt() {
+    async readWriterLaunchAttempt(input) {
+      assertStateOwnerRead(input, plan.launchAttemptId);
       if (launchReceipt !== null) return launchReceipt;
       return absent("writer_launch_attempt_not_authorized");
     },
@@ -1859,6 +1884,7 @@ function happyFacadeFixture({
         });
       },
     },
+    stateOwnerId: STATE_OWNER_ID,
     writerDetach: {
       async detachWriter(input) {
         events.push("detach");
@@ -2272,9 +2298,49 @@ test("factory returns an exact branded frozen V3 facade", () => {
   );
 });
 
+test("factory rejects a missing or malformed state owner before collaborator inspection", async (t) => {
+  const cases = [
+    ["missing", { includeStateOwnerId: false }],
+    ["malformed", { stateOwnerId: "runtime-recovery-001" }],
+  ];
+
+  for (const [name, fixtureOptions] of cases) {
+    await t.test(name, () => {
+      let authorityMethodReads = 0;
+      assert.throws(
+        () =>
+          facadeFixture({
+            ...fixtureOptions,
+            gate: () => null,
+            transformAuthority(authority) {
+              Object.defineProperty(authority, "readWriterLaunchAttempt", {
+                configurable: true,
+                enumerable: true,
+                get() {
+                  authorityMethodReads += 1;
+                  throw new Error("authority method accessor must not run");
+                },
+              });
+              return authority;
+            },
+          }),
+        (error) =>
+          error instanceof PostgresDetachedRestoreForegroundCompositionError &&
+          error.code ===
+            "invalid_postgres_detached_restore_foreground_composition_options",
+      );
+      assert.equal(authorityMethodReads, 0);
+    });
+  }
+});
+
 test("shared restore admission rejects malformed or crossed identities before effects", async (t) => {
   const cases = [
     ["extra admission field", { ...admission(), extra: true }],
+    [
+      "caller-selected state owner",
+      deepFreeze({ ...admission(), stateOwnerId: OTHER_STATE_OWNER_ID }),
+    ],
     [
       "non-clean checkpoint",
       deepFreeze({

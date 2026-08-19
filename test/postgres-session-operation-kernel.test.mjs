@@ -66,6 +66,8 @@ const DESTINATION_ISOLATION_PROOF_ID = "destination-isolation-proof-001";
 const LAUNCH_ATTEMPT_OPERATION_ID = "writer-launch-attempt-operation-001";
 const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const SUPERVISOR_ID = "supervisor-001";
+const STATE_OWNER_ID = `state-owner:${"1".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"2".repeat(64)}`;
 const SUPERVISOR_PROOF_ID = "supervisor-proof-001";
 const STOP_OPERATION_ID = "stop-operation-001";
 const RESTORE_ACTIVATION_OPERATION_ID =
@@ -192,6 +194,18 @@ const OPERATION_COLUMNS = [
   "updated_at",
   "retired_at",
 ].join(", ");
+const QUALIFIED_WRITER_LAUNCH_OPERATION_COLUMNS = [
+  "launch.operation_id AS operation_id",
+  "launch.session_id AS session_id",
+  "launch.kind AS kind",
+  "launch.request AS request",
+  "launch.result AS result",
+  "launch.state AS state",
+  "launch.revision AS revision",
+  "launch.created_at AS created_at",
+  "launch.updated_at AS updated_at",
+  "launch.retired_at AS retired_at",
+].join(", ");
 const OPERATION_ID_CLAIM_COLUMNS = [
   "operation_id",
   "session_id",
@@ -286,23 +300,33 @@ const LIST_RESTORE_ATTACHMENT_ACTIVATION_RECOVERY_FIRST_PAGE_QUERY = [
   "LIMIT $1::integer",
 ].join(" ");
 const LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY = [
-  `SELECT ${OPERATION_COLUMNS}`,
-  "FROM session_authority.operation_claims",
-  "WHERE kind = 'writer-launch-attempt-v1'",
-  "AND state IN ('prepared', 'starting', 'uncertain')",
-  "AND retired_at IS NULL",
-  "ORDER BY session_id ASC",
-  "LIMIT $1::integer",
+  `SELECT ${QUALIFIED_WRITER_LAUNCH_OPERATION_COLUMNS}`,
+  "FROM session_authority.operation_claims AS launch",
+  "LEFT JOIN session_authority.writer_supervisor_state_owners AS owner",
+  "ON owner.launch_attempt_id = launch.operation_id",
+  "AND owner.session_id = launch.session_id",
+  "WHERE launch.kind = 'writer-launch-attempt-v1'",
+  "AND ((launch.state = 'prepared' AND owner.launch_attempt_id IS NULL)",
+  "OR (launch.state IN ('starting', 'uncertain')",
+  "AND owner.state_owner_id = $1))",
+  "AND launch.retired_at IS NULL",
+  "ORDER BY launch.session_id ASC",
+  "LIMIT $2::integer",
 ].join(" ");
 const LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY = [
-  `SELECT ${OPERATION_COLUMNS}`,
-  "FROM session_authority.operation_claims",
-  "WHERE kind = 'writer-launch-attempt-v1'",
-  "AND state IN ('prepared', 'starting', 'uncertain')",
-  "AND retired_at IS NULL",
-  "AND session_id > $1::uuid",
-  "ORDER BY session_id ASC",
-  "LIMIT $2::integer",
+  `SELECT ${QUALIFIED_WRITER_LAUNCH_OPERATION_COLUMNS}`,
+  "FROM session_authority.operation_claims AS launch",
+  "LEFT JOIN session_authority.writer_supervisor_state_owners AS owner",
+  "ON owner.launch_attempt_id = launch.operation_id",
+  "AND owner.session_id = launch.session_id",
+  "WHERE launch.kind = 'writer-launch-attempt-v1'",
+  "AND ((launch.state = 'prepared' AND owner.launch_attempt_id IS NULL)",
+  "OR (launch.state IN ('starting', 'uncertain')",
+  "AND owner.state_owner_id = $1))",
+  "AND launch.retired_at IS NULL",
+  "AND launch.session_id > $2::uuid",
+  "ORDER BY launch.session_id ASC",
+  "LIMIT $3::integer",
 ].join(" ");
 const READ_RESERVATION_QUERY = [
   `SELECT ${RESERVATION_COLUMNS}`,
@@ -631,10 +655,30 @@ const COMMIT_RESTORE_GENERATION_QUERY = [
   "AND document IS NULL AND committed_at IS NULL",
   `RETURNING ${RESTORE_GENERATION_COLUMNS}`,
 ].join(" ");
+const WRITER_SUPERVISOR_STATE_OWNER_COLUMNS = [
+  "launch_attempt_id",
+  "session_id",
+  "supervisor_id",
+  "state_owner_id",
+  "bound_at",
+].join(", ");
+const READ_WRITER_SUPERVISOR_STATE_OWNER_QUERY = [
+  `SELECT ${WRITER_SUPERVISOR_STATE_OWNER_COLUMNS}`,
+  "FROM session_authority.writer_supervisor_state_owners",
+  "WHERE launch_attempt_id = $1",
+].join(" ");
+const INSERT_WRITER_SUPERVISOR_STATE_OWNER_QUERY = [
+  "INSERT INTO session_authority.writer_supervisor_state_owners",
+  "(launch_attempt_id, session_id, supervisor_id, state_owner_id, bound_at)",
+  "VALUES ($1, $2::uuid, $3, $4, $5)",
+  "ON CONFLICT (launch_attempt_id) DO NOTHING",
+  `RETURNING ${WRITER_SUPERVISOR_STATE_OWNER_COLUMNS}`,
+].join(" ");
 const WRITER_SUPERVISOR_STATE_GC_COLUMNS = [
   "terminal_operation_id",
   "session_id",
   "launch_attempt_id",
+  "state_owner_id",
   "terminal_kind",
   "terminal_record",
   "terminal_record_sha256",
@@ -647,14 +691,14 @@ const WRITER_SUPERVISOR_STATE_GC_COLUMNS = [
 const READ_WRITER_SUPERVISOR_STATE_GC_QUERY = [
   `SELECT ${WRITER_SUPERVISOR_STATE_GC_COLUMNS}`,
   "FROM session_authority.writer_supervisor_state_gc",
-  "WHERE terminal_operation_id = $1",
+  "WHERE terminal_operation_id = $1 AND state_owner_id = $2",
 ].join(" ");
 const INSERT_WRITER_SUPERVISOR_STATE_GC_QUERY = [
   "INSERT INTO session_authority.writer_supervisor_state_gc",
-  "(terminal_operation_id, session_id, launch_attempt_id, terminal_kind,",
+  "(terminal_operation_id, session_id, launch_attempt_id, state_owner_id, terminal_kind,",
   "terminal_record, terminal_record_sha256, authorization_sha256, authorized_at,",
   "collection_status, collection_receipt_sha256, collected_at)",
-  "VALUES ($1, $2::uuid, $3, $4, $5::jsonb, $6, $7, $8, NULL, NULL, NULL)",
+  "VALUES ($1, $2::uuid, $3, $4, $5, $6::jsonb, $7, $8, $9, NULL, NULL, NULL)",
   "ON CONFLICT (terminal_operation_id) DO NOTHING",
   `RETURNING ${WRITER_SUPERVISOR_STATE_GC_COLUMNS}`,
 ].join(" ");
@@ -680,6 +724,8 @@ class ScriptedClient {
       commitResult = { command: "COMMIT" },
       now = NOW,
       authorityNow = now,
+      stateOwnerBindingMode = "synthetic",
+      stateOwnerId = STATE_OWNER_ID,
       transactionId = "100",
     } = {},
   ) {
@@ -688,10 +734,60 @@ class ScriptedClient {
     this.connection = new EventEmitter();
     this.authorityNow = authorityNow;
     this.now = now;
+    this.observedOperationRows = new Map();
     this.queries = [];
     this.releaseCalls = [];
     this.transactionId = transactionId;
+    this.stateOwnerBindingMode = stateOwnerBindingMode;
+    this.stateOwnerBindings = new Map();
+    this.stateOwnerId = stateOwnerId;
     this.userSteps = [...userSteps];
+  }
+
+  observeOperationRows(result) {
+    if (result === null || typeof result !== "object" || result.rows === undefined) {
+      return result;
+    }
+    for (const row of result.rows) {
+      if (
+        row !== null &&
+        typeof row === "object" &&
+        typeof row.operation_id === "string" &&
+        typeof row.kind === "string" &&
+        typeof row.state === "string" &&
+        Object.prototype.hasOwnProperty.call(row, "request")
+      ) {
+        this.observedOperationRows.set(row.operation_id, row);
+      }
+    }
+    return result;
+  }
+
+  stateOwnerBindingFor(launchAttemptId) {
+    if (this.stateOwnerBindingMode === "missing") return null;
+    const durable = this.stateOwnerBindings.get(launchAttemptId);
+    if (durable !== undefined) return durable;
+    const operation = this.observedOperationRows.get(launchAttemptId);
+    if (
+      operation === undefined ||
+      operation.kind !== WRITER_LAUNCH_ATTEMPT_OPERATION_KIND ||
+      (operation.state === "prepared" &&
+        this.stateOwnerBindingMode !== "prepared-binding") ||
+      (operation.state === "committed" &&
+        operation.result?.outcome === "cancelled-before-dispatch")
+    ) {
+      return null;
+    }
+    return {
+      bound_at:
+        operation.state === "starting"
+          ? operation.updated_at
+          : operation.created_at,
+      launch_attempt_id: launchAttemptId,
+      session_id: operation.session_id,
+      state_owner_id: this.stateOwnerId,
+      supervisor_id: operation.request?.payload?.supervisor?.supervisorId,
+    };
   }
 
   async query(...args) {
@@ -717,6 +813,31 @@ class ScriptedClient {
         rows: [{ authority_now: new Date(this.authorityNow) }],
       };
     }
+    if (text === INSERT_WRITER_SUPERVISOR_STATE_OWNER_QUERY) {
+      const [
+        launchAttemptId,
+        sessionId,
+        supervisorId,
+        stateOwnerId,
+        boundAt,
+      ] = args[0]?.values ?? [];
+      const row = {
+        bound_at: new Date(boundAt),
+        launch_attempt_id: launchAttemptId,
+        session_id: sessionId,
+        state_owner_id: stateOwnerId,
+        supervisor_id: supervisorId,
+      };
+      if (this.stateOwnerBindingMode === "insert-conflict") {
+        return rows();
+      }
+      this.stateOwnerBindings.set(launchAttemptId, row);
+      return rows(row);
+    }
+    if (text === READ_WRITER_SUPERVISOR_STATE_OWNER_QUERY) {
+      const binding = this.stateOwnerBindingFor(args[0]?.values?.[0]);
+      return binding === null ? rows() : rows(binding);
+    }
     if (text === DURABLE_COMMIT_QUERY) return { command: "SET" };
     if (text === "COMMIT") {
       if (this.commitError !== undefined) throw this.commitError;
@@ -729,9 +850,11 @@ class ScriptedClient {
       `unexpected authority query: ${text}`,
     );
     const step = this.userSteps.shift();
-    if (typeof step === "function") return step(args);
+    if (typeof step === "function") {
+      return this.observeOperationRows(await step(args));
+    }
     if (step instanceof Error) throw step;
-    return step;
+    return this.observeOperationRows(step);
   }
 
   async release(...args) {
@@ -4925,36 +5048,38 @@ function writerSupervisorStateGcInsertStep({
     assert.equal(queryText(args), INSERT_WRITER_SUPERVISOR_STATE_GC_QUERY);
     const values = args[0]?.values;
     assert.equal(Array.isArray(values), true);
-    assert.deepEqual(values.slice(0, 4), [
+    assert.deepEqual(values.slice(0, 5), [
       terminalOperationId,
       sessionId,
       launchAttemptId,
+      STATE_OWNER_ID,
       terminalKind,
     ]);
-    const storedRecord = JSON.parse(values[4]);
+    const storedRecord = JSON.parse(values[5]);
     assert.deepEqual(
       storedRecord,
       JSON.parse(JSON.stringify(terminalRecord)),
     );
     const terminalRecordSha256 = canonicalSha256(terminalRecord);
-    assert.equal(values[5], terminalRecordSha256);
-    assert.equal(values[7], authorizedAt);
+    assert.equal(values[6], terminalRecordSha256);
+    assert.equal(values[8], authorizedAt);
     const authorizationProjection = canonicalPayload({
       authorizedAt,
-      contractVersion: 1,
+      contractVersion: 2,
       launchAttemptId,
       sessionId,
+      stateOwnerId: STATE_OWNER_ID,
       terminalKind,
       terminalOperationId,
       terminalRecord,
       terminalRecordSha256,
     });
     const authorizationSha256 = sha256(
-      `portable-codex-runtime:writer-supervisor-state-gc-authorization:v1\0${JSON.stringify(
+      `portable-codex-runtime:writer-supervisor-state-gc-authorization:v2\0${JSON.stringify(
         authorizationProjection,
       )}\n`,
     );
-    assert.equal(values[6], authorizationSha256);
+    assert.equal(values[7], authorizationSha256);
     capture.authorization = JSON.parse(
       JSON.stringify({
         authorizationSha256,
@@ -4969,6 +5094,7 @@ function writerSupervisorStateGcInsertStep({
       collection_status: null,
       launch_attempt_id: launchAttemptId,
       session_id: sessionId,
+      state_owner_id: STATE_OWNER_ID,
       terminal_kind: terminalKind,
       terminal_operation_id: terminalOperationId,
       terminal_record: storedRecord,
@@ -4988,6 +5114,7 @@ function writerSupervisorStateGcReadStep(capture, { forUpdate = true } = {}) {
     );
     assert.deepEqual(args[0]?.values, [
       capture.row.terminal_operation_id,
+      STATE_OWNER_ID,
     ]);
     return rows(capture.row);
   };
@@ -5003,6 +5130,7 @@ function assertWriterSupervisorStateGcAuthorization(
     "contractVersion",
     "launchAttemptId",
     "sessionId",
+    "stateOwnerId",
     "terminalKind",
     "terminalOperationId",
     "terminalRecord",
@@ -9889,6 +10017,7 @@ test("writer launch request builder rejects hostile or mismatched bindings witho
       ...fixture.options,
       expectedOperationRevision: "0",
       extra: true,
+      stateOwnerId: STATE_OWNER_ID,
     }),
     { code: "invalid_operation_request" },
   );
@@ -9916,6 +10045,7 @@ test("writer launch request builder rejects hostile or mismatched bindings witho
       afterSessionId: null,
       limit: 1,
       extra: true,
+      stateOwnerId: STATE_OWNER_ID,
     }),
     { code: "invalid_operation_request" },
   );
@@ -10131,10 +10261,12 @@ test("writer launch dispatch grants once from the exact committed generation and
   const claimed = await authority.claimWriterLaunchAttemptDispatch({
     ...fixture.options,
     expectedOperationRevision: "0",
+    stateOwnerId: STATE_OWNER_ID,
   });
   const replayed = await authority.claimWriterLaunchAttemptDispatch({
     ...fixture.options,
     expectedOperationRevision: "0",
+    stateOwnerId: STATE_OWNER_ID,
   });
 
   assert.equal(claimed.dispatchGranted, true);
@@ -10150,6 +10282,200 @@ test("writer launch dispatch grants once from the exact committed generation and
     false,
   );
   for (const client of clients) client.assertExhausted();
+});
+
+test("writer launch owner binding survives insert acknowledgement loss and rejects owner mutation", async (t) => {
+  const dispatchSteps = (fixture) => [
+    ...writerLaunchActiveSteps(fixture, "prepared"),
+    ...writerLaunchGenerationReferenceSteps(fixture),
+    rows(writerLaunchOperationRow(fixture, "starting")),
+    rows(writerLaunchReservationRow(fixture, "starting")),
+    rows(writerLaunchPhaseSessionRow(fixture, "starting")),
+  ];
+
+  await t.test("exact immutable readback", async () => {
+    const fixture = writerLaunchFixture();
+    const { authority, clients } = authorityWithScripts({
+      options: {
+        authorityNow: LAUNCH_DISPATCH_NOW,
+        now: LAUNCH_DISPATCH_NOW,
+        stateOwnerBindingMode: "insert-conflict",
+      },
+      steps: dispatchSteps(fixture),
+    });
+
+    const receipt = await authority.claimWriterLaunchAttemptDispatch({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+      stateOwnerId: STATE_OWNER_ID,
+    });
+
+    assert.equal(receipt.dispatchGranted, true);
+    const ownerQueries = authorityQueries(clients[0]).filter((args) =>
+      queryText(args).includes("writer_supervisor_state_owners"),
+    );
+    assert.deepEqual(
+      ownerQueries.map(queryText),
+      [
+        READ_WRITER_SUPERVISOR_STATE_OWNER_QUERY,
+        INSERT_WRITER_SUPERVISOR_STATE_OWNER_QUERY,
+        READ_WRITER_SUPERVISOR_STATE_OWNER_QUERY,
+      ],
+    );
+    assert.deepEqual(ownerQueries[1][0].values, [
+      fixture.options.operationId,
+      fixture.options.expectedSession.sessionId,
+      fixture.supervisor.supervisorId,
+      STATE_OWNER_ID,
+      LAUNCH_DISPATCH_NOW,
+    ]);
+    clients[0].assertExhausted();
+  });
+
+  await t.test("foreign immutable readback", async () => {
+    const fixture = writerLaunchFixture();
+    const { authority, clients } = authorityWithScripts({
+      options: {
+        authorityNow: LAUNCH_DISPATCH_NOW,
+        now: LAUNCH_DISPATCH_NOW,
+        stateOwnerBindingMode: "insert-conflict",
+        stateOwnerId: OTHER_STATE_OWNER_ID,
+      },
+      steps: dispatchSteps(fixture),
+    });
+
+    await assertAuthorityError(
+      authority.claimWriterLaunchAttemptDispatch({
+        ...fixture.options,
+        expectedOperationRevision: "0",
+        stateOwnerId: STATE_OWNER_ID,
+      }),
+      { code: "operation_transition_conflict" },
+    );
+    assert.equal(queryTexts(clients[0]).includes("COMMIT"), false);
+    assert.equal(queryTexts(clients[0]).includes("ROLLBACK"), true);
+    clients[0].assertExhausted();
+  });
+
+  await t.test("transaction commit acknowledgement loss", async () => {
+    const fixture = writerLaunchFixture();
+    const { authority, clients } = authorityWithScripts(
+      {
+        options: {
+          authorityNow: LAUNCH_DISPATCH_NOW,
+          commitError: new Error("writer launch claim acknowledgement lost"),
+          now: LAUNCH_DISPATCH_NOW,
+        },
+        steps: dispatchSteps(fixture),
+      },
+      writerLaunchActiveSteps(fixture, "starting"),
+    );
+
+    await assert.rejects(
+      authority.claimWriterLaunchAttemptDispatch({
+        ...fixture.options,
+        expectedOperationRevision: "0",
+        stateOwnerId: STATE_OWNER_ID,
+      }),
+      assertStoreCommitUncertain,
+    );
+    const replay = await authority.claimWriterLaunchAttemptDispatch({
+      ...fixture.options,
+      expectedOperationRevision: "0",
+      stateOwnerId: STATE_OWNER_ID,
+    });
+
+    assert.equal(replay.dispatchGranted, false);
+    assert.equal(replay.attempt.state, "starting");
+    assert.equal(
+      authorityQueries(clients[1]).some((args) =>
+        /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[0].assertExhausted({ destroyed: true });
+    clients[1].assertExhausted();
+  });
+});
+
+test("writer launch owner relation quarantines foreign, missing, and premature bindings", async (t) => {
+  for (const action of ["read", "claim"]) {
+    await t.test(`foreign owner ${action}`, async () => {
+      const fixture = writerLaunchFixture();
+      const { authority, clients } = authorityWithScripts(
+        action === "read"
+          ? [
+              rows(writerLaunchOperationRow(fixture, "starting")),
+              ...writerLaunchActiveSteps(fixture, "starting"),
+            ]
+          : writerLaunchActiveSteps(fixture, "starting"),
+      );
+      const invocation =
+        action === "read"
+          ? authority.readWriterLaunchAttempt({
+              operationId: fixture.options.operationId,
+              stateOwnerId: OTHER_STATE_OWNER_ID,
+            })
+          : authority.claimWriterLaunchAttemptDispatch({
+              ...fixture.options,
+              expectedOperationRevision: "0",
+              stateOwnerId: OTHER_STATE_OWNER_ID,
+            });
+      await assertAuthorityError(invocation, {
+        code:
+          action === "read"
+            ? "writer_launch_attempt_not_authorized"
+            : "operation_transition_conflict",
+      });
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE|DELETE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+
+  for (const state of ["starting", "uncertain"]) {
+    await t.test(`${state} without binding`, async () => {
+      const fixture = writerLaunchFixture();
+      const { authority, clients } = authorityWithScripts({
+        options: { stateOwnerBindingMode: "missing" },
+        steps: [
+          rows(writerLaunchOperationRow(fixture, state)),
+          ...writerLaunchActiveSteps(fixture, state),
+        ],
+      });
+      await assertAuthorityError(
+        authority.readWriterLaunchAttempt({
+          operationId: fixture.options.operationId,
+          stateOwnerId: STATE_OWNER_ID,
+        }),
+        { code: "writer_launch_attempt_not_authorized" },
+      );
+      clients[0].assertExhausted();
+    });
+  }
+
+  await t.test("prepared with binding", async () => {
+    const fixture = writerLaunchFixture();
+    const { authority, clients } = authorityWithScripts({
+      options: { stateOwnerBindingMode: "prepared-binding" },
+      steps: [
+        rows(writerLaunchOperationRow(fixture, "prepared")),
+        ...writerLaunchActiveSteps(fixture, "prepared"),
+      ],
+    });
+    await assertAuthorityError(
+      authority.readWriterLaunchAttempt({
+        operationId: fixture.options.operationId,
+        stateOwnerId: STATE_OWNER_ID,
+      }),
+      { code: "writer_launch_attempt_not_authorized" },
+    );
+    clients[0].assertExhausted();
+  });
 });
 
 test("writer launch dispatch rejects an expired lease and cross-session generation identity before phase mutation", async (t) => {
@@ -10170,6 +10496,7 @@ test("writer launch dispatch rejects an expired lease and cross-session generati
       authority.claimWriterLaunchAttemptDispatch({
         ...fixture.options,
         expectedOperationRevision: "0",
+        stateOwnerId: STATE_OWNER_ID,
       }),
       { code: "writer_lease_expired" },
     );
@@ -10207,6 +10534,7 @@ test("writer launch dispatch rejects an expired lease and cross-session generati
       authority.claimWriterLaunchAttemptDispatch({
         ...fixture.options,
         expectedOperationRevision: "0",
+        stateOwnerId: STATE_OWNER_ID,
       }),
       { code: "operation_state_invalid" },
     );
@@ -10265,6 +10593,7 @@ test("writer launch claim rejects forged committed generation history and claime
         authority.claimWriterLaunchAttemptDispatch({
           ...fixture.options,
           expectedOperationRevision: "0",
+          stateOwnerId: STATE_OWNER_ID,
         }),
         { code: "operation_state_invalid" },
       );
@@ -10323,6 +10652,7 @@ test("writer launch claim rejects forged committed generation history and claime
         authority.claimWriterLaunchAttemptDispatch({
           ...fixture.options,
           expectedOperationRevision: "0",
+          stateOwnerId: STATE_OWNER_ID,
         }),
         { code: "operation_state_invalid" },
       );
@@ -10429,11 +10759,13 @@ test("V1 writer launch prepared intent remains readable and cancellable with a s
   const reserved = await authority.reserveOperation(fixture.options);
   const read = await authority.readWriterLaunchAttempt({
     operationId: fixture.options.operationId,
+    stateOwnerId: STATE_OWNER_ID,
   });
   await assertAuthorityError(
     authority.claimWriterLaunchAttemptDispatch({
       ...fixture.options,
       expectedOperationRevision: "0",
+      stateOwnerId: STATE_OWNER_ID,
     }),
     { code: "operation_state_invalid" },
   );
@@ -11136,9 +11468,11 @@ test("writer launch readback validates the durable operation relation and expose
 
   const startedRead = await authority.readWriterLaunchAttempt({
     operationId: started.options.operationId,
+    stateOwnerId: STATE_OWNER_ID,
   });
   const stoppedRead = await authority.readWriterLaunchAttempt({
     operationId: stopped.options.operationId,
+    stateOwnerId: STATE_OWNER_ID,
   });
 
   assert.equal(startedRead.attempt.state, "committed");
@@ -11226,6 +11560,7 @@ test("writer lease renewal preserves the current launch identity while extending
   });
   const readAttempt = await authority.readWriterLaunchAttempt({
     operationId: launch.options.operationId,
+    stateOwnerId: STATE_OWNER_ID,
   });
 
   assert.equal(receipt.renewed, true);
@@ -11310,6 +11645,7 @@ test("checkpoint last-operation replacement preserves and independently validate
   });
   const readAttempt = await authority.readWriterLaunchAttempt({
     operationId: launch.options.operationId,
+    stateOwnerId: STATE_OWNER_ID,
   });
 
   assert.equal(
@@ -13033,7 +13369,8 @@ test("writer launch stop readback rejects a forged historical lease relation", a
   clients[0].assertExhausted();
 });
 
-test("writer launch recovery enumeration returns validated active attempts with state and keyset pagination", async () => {
+test("writer launch recovery enumeration isolates same-supervisor owners across first and after pages", async () => {
+  const first = writerLaunchFixture();
   const second = writerLaunchFixture({
     destinationIsolationProofId: "destination-isolation-proof-002",
     generationId: "restore-generation-002",
@@ -13061,17 +13398,32 @@ test("writer launch recovery enumeration returns validated active attempts with 
       rows(writerLaunchOperationRow(third, "uncertain")),
       ...writerLaunchActiveSteps(third, "uncertain"),
     ],
+    {
+      options: { stateOwnerId: OTHER_STATE_OWNER_ID },
+      steps: [
+        rows(writerLaunchOperationRow(first, "starting")),
+        ...writerLaunchActiveSteps(first, "starting"),
+      ],
+    },
   );
 
   const firstPage =
     await authority.listWriterLaunchAttemptRecoveryCandidates({
       afterSessionId: SESSION_ID,
       limit: 1,
+      stateOwnerId: STATE_OWNER_ID,
     });
   const secondPage =
     await authority.listWriterLaunchAttemptRecoveryCandidates({
       afterSessionId: firstPage.nextAfterSessionId,
       limit: 1,
+      stateOwnerId: STATE_OWNER_ID,
+    });
+  const otherOwnerPage =
+    await authority.listWriterLaunchAttemptRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
     });
 
   assert.deepEqual(firstPage, {
@@ -13094,11 +13446,23 @@ test("writer launch recovery enumeration returns validated active attempts with 
     ],
     nextAfterSessionId: null,
   });
+  assert.deepEqual(otherOwnerPage, {
+    candidates: [
+      {
+        launchAttemptId: first.options.operationId,
+        request: first.request,
+        state: "starting",
+      },
+    ],
+    nextAfterSessionId: null,
+  });
   assertDeepFrozen(firstPage);
   assertDeepFrozen(secondPage);
+  assertDeepFrozen(otherOwnerPage);
   assert.deepEqual(
     authorityQueries(clients[0])[0],
     extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY, [
+      STATE_OWNER_ID,
       SESSION_ID,
       2,
     ]),
@@ -13106,7 +13470,15 @@ test("writer launch recovery enumeration returns validated active attempts with 
   assert.deepEqual(
     authorityQueries(clients[1])[0],
     extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_AFTER_QUERY, [
+      STATE_OWNER_ID,
       OTHER_SESSION_ID,
+      2,
+    ]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[2])[0],
+    extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY, [
+      OTHER_STATE_OWNER_ID,
       2,
     ]),
   );
@@ -13123,6 +13495,7 @@ test("writer launch recovery enumeration includes exact prepared intents", async
   const page = await authority.listWriterLaunchAttemptRecoveryCandidates({
     afterSessionId: null,
     limit: 1,
+    stateOwnerId: STATE_OWNER_ID,
   });
 
   assert.deepEqual(page, {
@@ -13137,10 +13510,74 @@ test("writer launch recovery enumeration includes exact prepared intents", async
   });
   assert.deepEqual(
     authorityQueries(clients[0])[0],
-    extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY, [2]),
+    extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY, [
+      STATE_OWNER_ID,
+      2,
+    ]),
   );
   assertDeepFrozen(page);
   clients[0].assertExhausted();
+});
+
+test("unbound prepared writer launches are globally visible and cancellable across owners", async () => {
+  const fixture = writerLaunchFixture();
+  const reason = "caller-abandoned-before-launch-dispatch";
+  const cancelled = writerLaunchCancelledFixture(fixture, { reason });
+  const preparedSteps = [
+    rows(writerLaunchOperationRow(fixture, "prepared")),
+    ...writerLaunchActiveSteps(fixture, "prepared"),
+  ];
+  const { authority, clients } = authorityWithScripts(
+    preparedSteps,
+    preparedSteps,
+    {
+      options: { now: LAUNCH_FINALIZE_NOW },
+      steps: [
+        ...writerLaunchActiveSteps(fixture, "prepared"),
+        rows(cancelled.operation),
+        rows(cancelled.reservation),
+        rows(cancelled.session),
+      ],
+    },
+  );
+
+  const ownerPage =
+    await authority.listWriterLaunchAttemptRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+      stateOwnerId: STATE_OWNER_ID,
+    });
+  const otherOwnerPage =
+    await authority.listWriterLaunchAttemptRecoveryCandidates({
+      afterSessionId: null,
+      limit: 1,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    });
+  const receipt = await authority.cancelPreparedOperation({
+    ...fixture.options,
+    expectedOperationRevision: "0",
+    reason,
+  });
+
+  assert.deepEqual(otherOwnerPage, ownerPage);
+  assert.equal(ownerPage.candidates[0].state, "prepared");
+  assert.equal(receipt.cancelled, true);
+  assert.equal(receipt.operation.result.outcome, "cancelled-before-dispatch");
+  assert.deepEqual(
+    authorityQueries(clients[0])[0],
+    extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY, [
+      STATE_OWNER_ID,
+      2,
+    ]),
+  );
+  assert.deepEqual(
+    authorityQueries(clients[1])[0],
+    extendedQuery(LIST_WRITER_LAUNCH_RECOVERY_FIRST_PAGE_QUERY, [
+      OTHER_STATE_OWNER_ID,
+      2,
+    ]),
+  );
+  for (const client of clients) client.assertExhausted();
 });
 
 test("writer launch recovery enumeration validates activation-created handoff provenance", async (t) => {
@@ -13156,6 +13593,7 @@ test("writer launch recovery enumeration validates activation-created handoff pr
       const page = await authority.listWriterLaunchAttemptRecoveryCandidates({
         afterSessionId: null,
         limit: 1,
+        stateOwnerId: STATE_OWNER_ID,
       });
 
       assert.deepEqual(page, {
@@ -13226,6 +13664,7 @@ test("writer launch recovery enumeration validates activation-created handoff pr
         authority.listWriterLaunchAttemptRecoveryCandidates({
           afterSessionId: null,
           limit: 1,
+          stateOwnerId: STATE_OWNER_ID,
         }),
         { code: "operation_state_invalid" },
       );
@@ -13262,6 +13701,7 @@ test("writer launch read and claim validate activation-created handoff provenanc
   await assertAuthorityError(
     authority.readWriterLaunchAttempt({
       operationId: fixture.launchIntent.launchAttemptId,
+      stateOwnerId: STATE_OWNER_ID,
     }),
     { code: "operation_state_invalid" },
   );
@@ -13269,6 +13709,7 @@ test("writer launch read and claim validate activation-created handoff provenanc
     authority.claimWriterLaunchAttemptDispatch({
       ...restoreAttachmentActivationLaunchFixture(fixture).options,
       expectedOperationRevision: "0",
+      stateOwnerId: STATE_OWNER_ID,
     }),
     { code: "operation_state_invalid" },
   );
@@ -15623,6 +16064,7 @@ test("restore generation V2 claim at bigint max-7 covers both handoff routes", a
       const launchClaimed = await authority.claimWriterLaunchAttemptDispatch({
         ...fixture.options,
         expectedOperationRevision: "0",
+        stateOwnerId: STATE_OWNER_ID,
       });
       const launchUncertain = await authority.markOperationUncertain({
         ...fixture.options,
@@ -15816,6 +16258,7 @@ test("restore-to-launch handoff at bigint max-5 reaches terminal through uncerta
   const claimed = await authority.claimWriterLaunchAttemptDispatch({
     ...fixture.options,
     expectedOperationRevision: "0",
+    stateOwnerId: STATE_OWNER_ID,
   });
   const uncertain = await authority.markOperationUncertain({
     ...fixture.options,

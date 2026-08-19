@@ -167,13 +167,26 @@
   production identity gap without depending on either retention track below.
 - [done] Second, add authority-owned bounded retention or garbage collection
   for terminal local supervisor state. Migration 009 permanently records exact
-  owner-finalizer authorization and collection completion; the fifth recovery
-  lane is paged by the assembled production cold-start runner while it holds
-  the database-global exclusive lifecycle guard, with a dedicated physical
+  owner-finalizer authorization, an immutable pre-dispatch route to the
+  private root's persistent `state-owner:<64 lowercase hex>` marker, and
+  collection completion. The third and fifth recovery lanes are filtered by
+  that local owner, while the assembled production cold-start runner hashes
+  the caller's base recovery scope with the marker for cursor isolation and
+  holds the database-global exclusive lifecycle guard, with a dedicated physical
   settlement. The collector deletes exact stopped revisions in two directory-
   synced phases and accepts acknowledgement-loss replay from `collected` to
-  `absent`. The stopped-only reconciler remains read-only and cannot authorize
-  this mutation.
+  `absent`. Production deployment accepts only the exact process-local
+  supervisor/collector pair returned by
+  `createPodmanWriterSupervisorBundle()`; matching IDs and owner strings are
+  necessary but insufficient, and direct `createPodmanWriterSupervisor()` is
+  caller-asserted/raw only. Owner preparation and state/supervisor bundle
+  construction fail closed before physical dispatch. Runtime fixes that owner
+  into foreground launch-attempt reads as exact
+  `{ operationId, stateOwnerId }`, outside public restore admission.
+  The stopped-only reconciler remains read-only and cannot authorize this
+  mutation. This marker is routing identity, not cryptographic host
+  attestation or protection against an administrator cloning both root and
+  marker.
 - [pending] Third, define an authority-safe provider-state exact-replay
   retention floor or move permanent operation history to a PostgreSQL-indexed
   representation. This track has its own replay authority and does not inherit

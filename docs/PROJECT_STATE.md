@@ -272,18 +272,29 @@
   and no-relaunch: it never republishes, reserves or consumes an image, invokes
   a launcher, or reconstructs an opaque writer capability. Current-launch
   handling is inventory only.
-- PostgreSQL now persists those five cursors independently for each configured
-  recovery scope. A bounded single-flight runner advances each settled lane by
+- PostgreSQL now persists those five cursors independently for each effective
+  recovery scope. Runtime derives that opaque scope with domain-separated
+  SHA-256 from the caller's base `recoveryScopeId` and the local persistent
+  `stateOwnerId`; the base remains a fairness/replay label and is never treated
+  as root identity. This prevents two roots reusing one base label from
+  advancing each other's third/fifth-lane cursors while keeping same-root
+  restart stable. A bounded single-flight runner advances each settled lane by
   revision/cycle compare-and-swap, survives restart and commit-acknowledgement
   loss, and preserves earlier lane progress when a later lane fails.
 - Migration 009 permanently records terminal local supervisor-state GC
   authorization and completion against both the terminal operation and launch
-  attempt. Only the owner launch/stop finalizers that commit exact
+  attempt, plus one immutable pre-dispatch owner binding in
+  `writer_supervisor_state_owners`. Each private state root supplies a
+  persistent high-entropy marker matching `state-owner:<64 lowercase hex>`.
+  Only the owner launch/stop finalizers that commit exact
   `complete-stopped` evidence may create that authorization; stopped-only
   reconciliation remains read-only. In the assembled production runner, the
   fifth lane pages pending rows last while that runner holds the database-global
   exclusive lifecycle lease, invokes the separately settled physical collector
-  with the exact terminal record, and then records `collected` or `absent`. An
+  with exact `{ stateOwnerId, terminalRecord }`, verifies the version-2 receipt
+  carries the same owner before completion, and then records `collected` or
+  `absent`. The third and fifth authority lists are owner-filtered by
+  runtime-private wrappers, so callers cannot select a foreign root. An
   acknowledgement-loss retry may observe `collected` followed by `absent`
   without losing the durable completion. The destructive collector's grace
   expiry aborts and reports fatal failure but does not release its invocation,
@@ -292,6 +303,18 @@
   advisory lease earlier; a same-authorization cold retry is then safe only
   through the exact concurrent idempotent-or-fail-closed collector protocol and
   does not prove the older callback quiesced.
+  Production deployment accepts only the exact process-local supervisor and
+  collector pair returned by `createPodmanWriterSupervisorBundle()` before it
+  constructs the physical adapter; matching IDs and owner strings alone are
+  insufficient. Owner preparation and state/supervisor bundle construction
+  fail closed before physical dispatch. Direct
+  `createPodmanWriterSupervisor()` carries only a caller-asserted owner and is
+  not a production deployment input. Active
+  legacy attempts without a binding are quarantined with no adoption API;
+  only unbound `prepared` work remains owner-neutral for read/cancel cleanup.
+  The marker prevents accidental routing but is neither cryptographic host
+  attestation nor protection against an administrator cloning the root and
+  marker together.
 - One database-global versioned restore lifecycle lock now gives foreground
   composition a shared lease and the recovery runner an exclusive lease. The
   runner and guarded service calls revalidate the lease around lane, candidate,
@@ -321,6 +344,10 @@
   an autonomous cross-stage saga. The plan's source checkpoint artefact path
   is distinct from the fresh safety-capture path selected by the capture
   backend from derived IDs.
+  The assembled runtime fixes the configured state owner into this private
+  foreground composition. Its launch-attempt read uses exact
+  `{ operationId, stateOwnerId }`; public restore admission cannot choose or
+  override that owner.
 - The facade requires its nested per-operation guard pool to be distinct from
   both lifecycle pools before any connection is acquired. This prevents a
   max-one foreground lifecycle pool from self-deadlocking while its shared
@@ -394,6 +421,12 @@
   storage-lifecycle methods, four publication methods, and restore-destination
   resolution. Together with image resolution and inspection, deployment owns
   twenty method-specific settlement stops.
+  The raw supervisor, logical facade, collection surface/receipt, and aggregate
+  binding are now versions 4, 3, 2, and 3 respectively. Supervisor and
+  collector exact surfaces both expose the same `stateOwnerId`; the durable
+  launch request remains version 1 and owner-free. Production additionally
+  requires their marker-backed process-local pair provenance; structural
+  equality alone does not establish it.
   Transient invocation identities and abort signals remain outside durable
   requests/results; all existing grants, readbacks, stopped-only reconciliation,
   committed-only verification, and no-second-dispatch rules remain authoritative.

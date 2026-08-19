@@ -1233,8 +1233,9 @@ fails before `reserveOperation` can create durable state. The remaining
 `invalid_logical_writer_launch_request`, `logical_writer_handle_unavailable`,
 and `logical_writer_launch_outcome_uncertain` codes are non-retryable.
 
-The durable logical launch request remains contract version 1, while the
-transient supervisor facade is version 2. `launchWriter` must return exact
+The durable logical launch request remains contract version 1 and does not
+embed local-root identity, while the transient supervisor facade is version 3
+and carries the configured `stateOwnerId`. `launchWriter` must return exact
 `{ receiptVersion: 2, evidence, stopWriter, terminalRecord }`: a `started`
 result requires one trusted asynchronous `stopWriter` and a null terminal
 record, `not-started` requires both fields to be null, and
@@ -1243,6 +1244,13 @@ record. `reconcileWriterLaunch` still returns exact
 `{ receiptVersion: 1, evidence }` and accepts only `not-started` or
 `complete-stopped`; recovery cannot report a newly adopted started writer or
 authorize supervisor-state collection.
+
+Before the first physical dispatch, authority atomically binds the launch
+attempt to that persistent owner marker. Public `reconcileLaunchAttempt()`
+keeps its exact `{ launchAttemptId }` input; callers cannot choose an owner.
+The configured supervisor supplies it internally for authority read/claim and
+physical routing. Missing or mismatched bindings fail before the physical
+reconciler runs.
 
 A new launch follows this order:
 
@@ -1386,34 +1394,62 @@ owner stop uses
 stop-to-prepared-capture transaction uses
 `finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc()`.
 Each transaction preserves its original terminal transition and atomically
-inserts or exactly replays the migration 009 authorization. The returned
-`supervisorStateGcAuthorization` binds its SHA-256, PostgreSQL authorization
-time, terminal and launch operation identities, terminal kind, exact revision
-4 `terminalRecord`, and its SHA-256.
+inserts or exactly replays the migration 009 authorization. Migration 009 also
+stores one immutable `writer_supervisor_state_owners` row before physical
+dispatch, binding `(launchAttemptId, sessionId)` to the private root's
+persistent high-entropy `stateOwnerId` (`state-owner:<64 lowercase hex>`).
+The returned contract-version-2 `supervisorStateGcAuthorization` binds that
+owner with its SHA-256, PostgreSQL authorization time, terminal and launch
+operation identities, terminal kind, exact revision 4 `terminalRecord`, and
+its SHA-256.
 
 The logical launcher obtains that terminal record only from the owner launch
 or returned physical stop receipt. The record must be exact stopped revision 4
 state for the same attempt, process/writer incarnations, start and stop proofs,
-and stop operation where the terminal kind requires it. Runtime composition
-separately requires the launch supervisor and collector `supervisorId` values
-to agree. The raw collector validates canonically exact record data but does not
-attest its provenance; the PostgreSQL authorization and production composition
-supply that authority boundary. An already-complete owner replay reads the
+and stop operation where the terminal kind requires it. The raw collector
+validates canonically exact record data but does not attest its provenance;
+the PostgreSQL authorization and production composition supply that authority
+boundary. Runtime composition requires both `supervisorId` and `stateOwnerId`
+to match across the configured supervisor and collector, but those strings are
+only necessary structural checks. Production deployment additionally requires
+the exact process-local pair returned by
+`createPodmanWriterSupervisorBundle()` and validates that brand before
+constructing the physical adapter. Direct `createPodmanWriterSupervisor()`
+accepts only a caller-asserted routing owner and cannot enter that deployment
+path. Owner preparation and state/supervisor bundle construction fail closed
+before physical dispatch. The marker is a persistent routing identity, not
+cryptographic host attestation, and does not detect an administrator cloning
+both the private root and marker. An already-complete owner replay reads the
 exact authorization. By contrast,
 `reconcileWriterLaunch()` remains a pure stopped-only observation: it cannot
 return or insert a collection authorization and never calls the collector.
 
-`listWriterSupervisorStateGcCandidates()` returns bounded keyset pages of only
-uncompleted authorizations and revalidates both referenced permanent operation
-relations before exposing each exact authorization. The physical leaf is
+`listWriterLaunchAttemptRecoveryCandidates()` and
+`listWriterSupervisorStateGcCandidates()` require the local owner and return
+only its third/fifth-lane rows. Runtime-private wrappers add that owner to the
+otherwise cursor/limit-only list call, so external recovery callers cannot
+select another root. The GC list returns bounded keyset pages of only
+uncompleted authorizations and revalidates the owner binding plus both
+referenced permanent operation relations before exposing each exact
+authorization. The physical leaf is
 `supervisorStateCollector.collectTerminalState`; its sole durable input is the
-authorization's exact `terminalRecord`, while its transient invocation and
-abort signal remain outside the ledger. A valid result is the exact four-field
-receipt `{ contractVersion, launchAttemptId, status,
-terminalRecordSha256 }`, where status is `collected` or `absent`.
+authorization's exact `terminalRecord`, while `stateOwnerId` selects the local
+capability and its transient invocation and abort signal remain outside the
+ledger. A valid result is the exact five-field receipt
+`{ contractVersion, launchAttemptId, stateOwnerId, status,
+terminalRecordSha256 }`, where contract version is 2 and status is `collected`
+or `absent`.
 `completeWriterSupervisorStateGc()` first proves the exact authorization tuple,
-then records the receipt digest and completion timestamp. Exact committed
+rechecks that authorization and receipt carry the same bound owner, then
+records the receipt digest and completion timestamp. Exact committed
 replay returns the durable first completion without reauthorizing a deletion.
+
+There is no legacy owner-adoption API. An active `starting`/`uncertain` or
+dispatch-derived committed launch without a binding is quarantined: direct
+claim/read fails closed and owner-filtered recovery omits it. An unbound
+`prepared` attempt remains owner-neutral only for read/cancel cleanup and
+cannot be adopted for dispatch; a prepared row with a binding for another
+owner is likewise hidden/fail-closed.
 
 The local collector removes only an exact stopped revision 4 chain. Phase 1
 validates the intact revisions 0 through 4 and their present sidecars, or admits only
@@ -1845,7 +1881,13 @@ service, lane, input cursor, limit, and lifecycle lease; the cursor store below
 remains the durable compare-and-swap authority.
 
 `PostgresRestoreRecoveryCursorStore` persists each lane outside session
-storage under a startup-selected recovery scope. Revision, cycle, and prior
+storage under an effective recovery scope. Runtime treats the configured
+`recoveryScopeId` only as a base fairness/replay label, then derives the opaque
+`recovery-owner:<64 hex>` scope with domain-separated SHA-256 over that base
+and the configured supervisor/collector `stateOwnerId`. Two private roots may
+therefore reuse one base label without their owner-filtered third/fifth lanes
+skipping each other's rows; a restart with the same marker derives the same
+scope. Revision, cycle, and prior
 keyset cursor form one serializable compare-and-swap; the committed row also
 binds the transition UUID and canonical request digest so exact replay after a
 lost commit acknowledgement cannot advance twice. Null continuation wraps the
@@ -1866,10 +1908,12 @@ adapter.
 the full authority candidate universe in an authoritative database. It wraps a
 pair of `PostgresOperationGuard` instances with distinct dedicated pools:
 foreground composition receives a shared lease from one, while recovery
-receives the matching exclusive lease from the other. Cursor
-`recoveryScopeId` is deliberately absent from this key because the authority
-candidate queries are database-global; two cursor scopes can enumerate the
-same durable operation.
+receives the matching exclusive lease from the other. Neither the base nor
+effective recovery scope enters this lifecycle key. The first, second, and
+fourth authority candidate universes remain database-global; the third and
+fifth lists are instead filtered by the independently persisted state owner.
+Cursor identity still does not partition the database-global foreground/
+recovery exclusion.
 
 Lifecycle callbacks receive `(lease, complete)` and pass the operation guard's
 same callback-scoped `complete` function through the lifecycle boundary. An
@@ -2104,6 +2148,12 @@ or a durable committed-started row cannot reconstruct that handle. Stop,
 retire, prepared-launch, handle-resolution, read-only plan resolution, and
 internal map capabilities remain private.
 
+Runtime fixes the validated supervisor-state owner into the private foreground
+composition. Its authority read uses exact
+`{ operationId, stateOwnerId }` for `readWriterLaunchAttempt()`. Neither the
+public checkpoint facade nor restore admission exposes an owner selector, so a
+restore caller cannot redirect foreground readback to another root.
+
 The low-level assembly itself does not migrate the store, own scheduler or
 pool lifecycle, or resolve deployment configuration. It keeps the original
 capture backend private, constructs the foreground composition over that
@@ -2219,24 +2269,36 @@ restore-destination resolution. Together with image resolution and inspection,
 shutdown owns twenty settlement stops. Every method has an independent exact
 deadline/grace policy selected by deployment.
 
-The raw supervisor boundary is transient contract version 3: launch,
+Before that physical adapter is constructed, deployment requires the raw
+supervisor and collector to be the exact process-local pair produced by
+`createPodmanWriterSupervisorBundle()`. Matching IDs, owner strings, versions,
+and method shapes do not recreate this provenance. The direct raw
+`createPodmanWriterSupervisor()` factory validates only a caller-asserted owner
+and is therefore excluded from production deployment.
+
+The aggregate physical binding is version 3. The raw supervisor boundary is
+transient contract version 4: launch,
 reconciliation, and returned stop receive fresh opaque invocation identity and
 authentic abort signal fields. Its adapter exposes the logical launcher's
-version 2 facade and translates successful physical receipts without
+version 3 facade, including the configured `stateOwnerId`, and translates
+successful physical receipts without
 changing any pre-existing durable attempt, operation, reservation, or evidence
 shape. A returned physical stop capability succeeds only with exact transient
-receipt `{ contractVersion: 3, status: "stopped", terminalRecord }`; the
+receipt `{ contractVersion: 4, status: "stopped", terminalRecord }`; the
 adapter returns exact facade result
-`{ confirmation, contractVersion: 2, terminalRecord }`, where confirmation is
+`{ confirmation, contractVersion: 3, terminalRecord }`, where confirmation is
 the existing opaque sentinel and the stopped revision 4 record is passed to
 the owner finalizer. The capability is itself wrapped by the shared stop
 settlement boundary before it becomes the launcher's one-shot local callback.
 
 The matching `supervisorStateCollector` is a separate transient contract
-version 1 boundary with its own deadline/grace settlement. Its
+version 2 boundary with the same owner marker and its own deadline/grace
+settlement. Its
 `collectTerminalState()` input is exact
-`{ contractVersion, invocation, signal, terminalRecord }`, and its result is
-exact `{ contractVersion, launchAttemptId, status, terminalRecordSha256 }`.
+`{ contractVersion, invocation, signal, stateOwnerId, terminalRecord }`, and
+its result is exact
+`{ contractVersion, launchAttemptId, stateOwnerId, status,
+terminalRecordSha256 }`.
 Neither the settlement identity nor abort signal enters migration 009's
 authorization or completion ledger.
 
@@ -2358,7 +2420,7 @@ repeating the request.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
-The injected Podman v3 supervisor holds the sole session-directory bind,
+The injected Podman v4 supervisor holds the sole session-directory bind,
 requires rootless execution and a digest-pinned image, publishes immutable
 local revisions, and supports stop/join plus read-only cold reconciliation.
 The generic PostgreSQL deployment still constructs neither collaborator; a

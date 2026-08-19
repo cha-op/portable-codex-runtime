@@ -21,6 +21,7 @@ const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 const THIRD_SESSION_ID = "019f2100-0000-7000-8000-000000000004";
 const CODEX_ID = "019f2100-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return value.map(canonicalJson);
@@ -428,9 +429,10 @@ function supervisorStateGcCandidate(sessionId = SESSION_ID) {
     authorization: {
       authorizationSha256: "a".repeat(64),
       authorizedAt: "2026-08-05T00:06:00.000Z",
-      contractVersion: 1,
+      contractVersion: 2,
       launchAttemptId,
       sessionId,
+      stateOwnerId: STATE_OWNER_ID,
       terminalKind: "writer-launch-stop-v1",
       terminalOperationId,
       terminalRecord,
@@ -676,6 +678,42 @@ test("runs five bounded recovery lanes without treating current launches as adop
     "scanCurrentLaunchBatch",
   ]);
   assertDeepFrozen(service);
+});
+
+test("supervisor-state GC candidates require an exact persistent state owner", async () => {
+  for (const mutate of [
+    (candidate) => {
+      delete candidate.authorization.stateOwnerId;
+    },
+    (candidate) => {
+      candidate.authorization.stateOwnerId = "runtime-recovery-001";
+    },
+    (candidate) => {
+      candidate.authorization.contractVersion = 1;
+    },
+  ]) {
+    const candidate = supervisorStateGcCandidate();
+    mutate(candidate);
+    let collections = 0;
+    const fixture = callbacks({
+      async listWriterSupervisorStateGcCandidates() {
+        return page([candidate]);
+      },
+      async collectWriterSupervisorStateGc() {
+        collections += 1;
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    await assert.rejects(
+      service.runSupervisorStateGcBatch(request()),
+      assertCode(
+        "postgres_restore_activation_recovery_service_outcome_uncertain",
+      ),
+    );
+    assert.equal(collections, 0);
+  }
 });
 
 test(

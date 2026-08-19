@@ -350,6 +350,25 @@ Restore and launcher authority are now split into eight serial pull requests:
      scheduler lifecycle action, provider action, or pool close. Its public
      backend remains a low-level uncontrolled capability until claimed by the
      controller.
+   - The assembled runtime now treats local supervisor state as an explicit
+     routed resource. Supervisor and collector exact surfaces carry the same
+     persistent high-entropy `stateOwnerId` from the private state-root marker;
+     matching strings are necessary but not sufficient in production.
+     Deployment requires the exact process-local pair returned by
+     `createPodmanWriterSupervisorBundle()` before constructing the physical
+     adapter. Owner preparation and state/supervisor bundle construction fail
+     closed before physical dispatch; direct
+     `createPodmanWriterSupervisor()` carries only a caller-asserted owner and
+     cannot satisfy that deployment boundary.
+     Private list wrappers inject that owner into the third launch-attempt and
+     fifth supervisor-state-GC authority queries, so neither external lane can
+     select a foreign root. Runtime derives the actual cursor scope with
+     domain-separated SHA-256 over the caller's base `recoveryScopeId` and the
+     owner marker: equal base labels remain isolated across roots, while a
+     same-root restart is stable. The base label is not reused as owner.
+     Runtime fixes the same owner into its private foreground composition, whose
+     launch-attempt read uses exact `{ operationId, stateOwnerId }`; public
+     restore admission has no owner selector.
    - The PostgreSQL durable stable-plan registry slice is complete. Migration
      7 adds immutable canonical admission and plan storage plus a permanent
      operation-ID claim. Separately gated provisioning performs insert or
@@ -424,6 +443,15 @@ Restore and launcher authority are now split into eight serial pull requests:
      Connection or database loss may release that advisory lease without
      proving callback quiescence; a same-authorization cold overlap then relies
      on exact concurrent idempotent-or-fail-closed collection.
+     The raw supervisor, logical facade, collection surface/receipt, and
+     aggregate binding are versions 4, 3, 2, and 3. Migration 009 binds each
+     launch attempt immutably to its local owner before dispatch; GC
+     authorization/request/receipt repeat the marker and completion rechecks it.
+     The durable launch request remains version 1. Active legacy work without
+     a binding is quarantined with no adoption API; only unbound prepared work
+     remains owner-neutral for read/cancel cleanup. The marker is routing
+     identity, not cryptographic host attestation or protection against an
+     administrator cloning the root and marker together.
    - Operational lease admission is now complete. Deployment derives separate
      renewal-to-generation-claim and activation-to-launch-claim bounds from the
      applicable method-specific deadline plus grace periods, an explicit

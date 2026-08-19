@@ -48,6 +48,7 @@ const POLICY = Object.freeze({
   deadlineMilliseconds: 1_000,
   settlementGraceMilliseconds: 1_000,
 });
+const STATE_OWNER_ID = `state-owner:${"d".repeat(64)}`;
 
 function terminalRecord({
   launchAttemptId = "attempt-001",
@@ -150,6 +151,7 @@ async function fixture(overrides = {}) {
   });
   const supervisor = {
     contractVersion: POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: "supervisor-001",
     async launchWriter(input) {
       events.push({ argumentsLength: arguments.length, input, method: "launchWriter" });
@@ -211,12 +213,14 @@ async function fixture(overrides = {}) {
         contractVersion:
           POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
         launchAttemptId: input.terminalRecord.launchAttemptId,
+        stateOwnerId: STATE_OWNER_ID,
         status: "collected",
         terminalRecordSha256: "c".repeat(64),
       });
     },
     contractVersion:
       POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: "supervisor-001",
   });
   const options = {
@@ -411,15 +415,15 @@ async function physicalPublicationFixture(t) {
   };
 }
 
-test("constructs exact branded facades and maps physical supervisor v3 to launcher v2", async () => {
+test("constructs exact branded facades and maps physical supervisor v4 to launcher v3", async () => {
   const { binding, events } = await fixture();
-  assert.equal(POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION, 2);
-  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION, 3);
-  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION, 2);
+  assert.equal(POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION, 3);
+  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION, 4);
+  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION, 3);
   assert.equal(POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION, 2);
   assert.equal(
     POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
-    1,
+    2,
   );
   assert.equal(POSTGRES_SESSION_STORAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION, 1);
   assert.equal(POSTGRES_RESTORE_DESTINATION_RESOLVER_PHYSICAL_CONTRACT_VERSION, 1);
@@ -438,15 +442,22 @@ test("constructs exact branded facades and maps physical supervisor v3 to launch
     "contractVersion",
     "launchWriter",
     "reconcileWriterLaunch",
+    "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(binding.supervisor.contractVersion, 2);
+  assert.equal(binding.supervisor.contractVersion, 3);
+  assert.equal(binding.supervisor.stateOwnerId, STATE_OWNER_ID);
   assertFrozenNullRecord(binding.supervisorStateCollector, [
     "collectTerminalState",
     "contractVersion",
+    "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(binding.supervisorStateCollector.contractVersion, 1);
+  assert.equal(binding.supervisorStateCollector.contractVersion, 2);
+  assert.equal(
+    binding.supervisorStateCollector.stateOwnerId,
+    binding.supervisor.stateOwnerId,
+  );
   assert.equal(
     binding.supervisorStateCollector.supervisorId,
     binding.supervisor.supervisorId,
@@ -499,12 +510,12 @@ test("constructs exact branded facades and maps physical supervisor v3 to launch
     "terminalRecord",
   ]);
   assert.equal(stopped.confirmation, STOPPED_WRITER_STOP_CONFIRMED);
-  assert.equal(stopped.contractVersion, 2);
+  assert.equal(stopped.contractVersion, 3);
   assert.equal(stopped.terminalRecord.status, "stopped");
   assert.equal(stopped.terminalRecord.revision, 4);
   const stopEvent = events.find((event) => event.method === "stopWriter");
   assert.equal(stopEvent.argumentsLength, 1);
-  assert.equal(stopEvent.input.contractVersion, 3);
+  assert.equal(stopEvent.input.contractVersion, 4);
   assertFrozenNullRecord(stopEvent.input, [
     "attachment",
     "contractVersion",
@@ -518,11 +529,15 @@ test("constructs exact branded facades and maps physical supervisor v3 to launch
   assertFrozenNullRecord(stopEvent.input.invocation, []);
 
   const collected = await binding.supervisorStateCollector.collectTerminalState(
-    exact({ terminalRecord: stopped.terminalRecord }),
+    exact({
+      stateOwnerId: binding.supervisor.stateOwnerId,
+      terminalRecord: stopped.terminalRecord,
+    }),
   );
   assertFrozenNullRecord(collected, [
     "contractVersion",
     "launchAttemptId",
+    "stateOwnerId",
     "status",
     "terminalRecordSha256",
   ]);
@@ -535,9 +550,11 @@ test("constructs exact branded facades and maps physical supervisor v3 to launch
     "contractVersion",
     "invocation",
     "signal",
+    "stateOwnerId",
     "terminalRecord",
   ]);
-  assert.equal(collectionEvent.input.contractVersion, 1);
+  assert.equal(collectionEvent.input.contractVersion, 2);
+  assert.equal(collectionEvent.input.stateOwnerId, STATE_OWNER_ID);
   assertFrozenNullRecord(collectionEvent.input.invocation, []);
   assert.equal(collectionEvent.input.signal instanceof AbortSignal, true);
 
@@ -807,6 +824,26 @@ test("rejects hostile values and exact option, policy, request, and outcome viol
     },
   );
   assert.throws(
+    () => createPostgresDetachedRestorePhysicalBindings({
+      ...options,
+      supervisor: Object.freeze({
+        ...options.supervisor,
+        stateOwnerId: "state-owner:short",
+      }),
+    }),
+    { code: "invalid_postgres_detached_restore_physical_bindings_options" },
+  );
+  assert.throws(
+    () => createPostgresDetachedRestorePhysicalBindings({
+      ...options,
+      supervisorStateCollector: Object.freeze({
+        ...options.supervisorStateCollector,
+        stateOwnerId: `state-owner:${"e".repeat(64)}`,
+      }),
+    }),
+    { code: "invalid_postgres_detached_restore_physical_bindings_options" },
+  );
+  assert.throws(
     () => createPostgresDetachedRestorePhysicalBindings({ ...options, extra: true }),
     (error) => error instanceof PostgresDetachedRestorePhysicalBindingsError &&
       error.code === "invalid_postgres_detached_restore_physical_bindings_options" &&
@@ -826,6 +863,35 @@ test("rejects hostile values and exact option, policy, request, and outcome viol
     binding.supervisor.launchWriter(),
     { code: "invalid_postgres_detached_restore_physical_bindings_request" },
   );
+  await assert.rejects(
+    binding.supervisorStateCollector.collectTerminalState(exact({
+      stateOwnerId: `state-owner:${"e".repeat(64)}`,
+      terminalRecord: terminalRecord(),
+    })),
+    { code: "invalid_postgres_detached_restore_physical_bindings_request" },
+  );
+  const wrongReceiptOwner = await fixture({
+    supervisorStateCollector: Object.freeze({
+      ...options.supervisorStateCollector,
+      async collectTerminalState(input) {
+        return exact({
+          contractVersion:
+            POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+          launchAttemptId: input.terminalRecord.launchAttemptId,
+          stateOwnerId: `state-owner:${"e".repeat(64)}`,
+          status: "collected",
+          terminalRecordSha256: "c".repeat(64),
+        });
+      },
+    }),
+  });
+  await assert.rejects(
+    wrongReceiptOwner.binding.supervisorStateCollector.collectTerminalState(
+      exact({ stateOwnerId: STATE_OWNER_ID, terminalRecord: terminalRecord() }),
+    ),
+    { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
+  );
+  await wrongReceiptOwner.binding.stop();
   assert.equal(isPostgresDetachedRestorePhysicalBindings(new Proxy({}, {})), false);
   assert.equal(isPostgresDetachedRestorePublicationBinding(Object.freeze(Object.create(null))), false);
 
@@ -1267,7 +1333,7 @@ test("aggregate stop retains state collection quiescence while aborting every ph
       exact({ candidate: 1, generation: 2, kind: "fresh" }),
     ),
     binding.supervisorStateCollector.collectTerminalState(
-      exact({ terminalRecord: terminalRecord() }),
+      exact({ stateOwnerId: STATE_OWNER_ID, terminalRecord: terminalRecord() }),
     ),
   ];
   const activeResults = Promise.allSettled(active);
@@ -1285,8 +1351,10 @@ test("aggregate stop retains state collection quiescence while aborting every ph
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(stopSettled, false);
   rawCollection.resolve(exact({
-    contractVersion: 1,
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
     launchAttemptId: "attempt-001",
+    stateOwnerId: STATE_OWNER_ID,
     status: "collected",
     terminalRecordSha256: "d".repeat(64),
   }));
@@ -1345,8 +1413,10 @@ test("state collection settlement retains quiescence through late and grace-brea
       collectTerminalState(input) {
         return new Promise((resolve) => {
           setTimeout(() => resolve(exact({
-            contractVersion: 1,
+            contractVersion:
+              POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
             launchAttemptId: input.terminalRecord.launchAttemptId,
+            stateOwnerId: STATE_OWNER_ID,
             status: "collected",
             terminalRecordSha256: "d".repeat(64),
           })), 10);
@@ -1356,7 +1426,7 @@ test("state collection settlement retains quiescence through late and grace-brea
   });
   await assert.rejects(
     late.binding.supervisorStateCollector.collectTerminalState(
-      exact({ terminalRecord: terminalRecord() }),
+      exact({ stateOwnerId: STATE_OWNER_ID, terminalRecord: terminalRecord() }),
     ),
     { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
   );
@@ -1384,7 +1454,10 @@ test("state collection settlement retains quiescence through late and grace-brea
   });
   let collectionSettled = false;
   const collection = breached.binding.supervisorStateCollector
-    .collectTerminalState(exact({ terminalRecord: terminalRecord() }))
+    .collectTerminalState(exact({
+      stateOwnerId: STATE_OWNER_ID,
+      terminalRecord: terminalRecord(),
+    }))
     .finally(() => {
       collectionSettled = true;
     });
@@ -1408,8 +1481,10 @@ test("state collection settlement retains quiescence through late and grace-brea
   assert.equal(stopSettled, false);
 
   raw.resolve(exact({
-    contractVersion: 1,
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
     launchAttemptId: "attempt-001",
+    stateOwnerId: STATE_OWNER_ID,
     status: "collected",
     terminalRecordSha256: "d".repeat(64),
   }));

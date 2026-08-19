@@ -32,6 +32,8 @@ import {
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const STATE_OWNER_ID = `state-owner:${"1".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"2".repeat(64)}`;
 const NOW = "2026-07-29T12:34:56.789Z";
 const OPERATION_CREATED_AT = "2026-07-29T12:35:01.000Z";
 const OPERATION_STARTED_AT = "2026-07-29T12:35:02.000Z";
@@ -259,6 +261,7 @@ function writerSupervisorStateGcFixture({
   authorizedAt = OPERATION_RETIRED_AT,
   operationId = "writer-launch-gc-001",
   sessionId = SESSION_ID,
+  stateOwnerId = STATE_OWNER_ID,
 } = {}) {
   const expectedSession = attachedSnapshot(sessionId);
   const intent = writerLaunchIntentFixture(expectedSession);
@@ -368,9 +371,10 @@ function writerSupervisorStateGcFixture({
   const terminalRecordSha256 = sha256Json(terminalRecord);
   const authorizationProjection = {
     authorizedAt,
-    contractVersion: 1,
+    contractVersion: 2,
     launchAttemptId: operationId,
     sessionId,
+    stateOwnerId,
     terminalKind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
     terminalOperationId: operationId,
     terminalRecord,
@@ -378,7 +382,7 @@ function writerSupervisorStateGcFixture({
   };
   const authorization = {
     authorizationSha256: sha256Text(
-      `portable-codex-runtime:writer-supervisor-state-gc-authorization:v1\0${JSON.stringify(
+      `portable-codex-runtime:writer-supervisor-state-gc-authorization:v2\0${JSON.stringify(
         authorizationProjection,
       )}\n`,
     ),
@@ -388,6 +392,7 @@ function writerSupervisorStateGcFixture({
     terminal_operation_id: operationId,
     session_id: sessionId,
     launch_attempt_id: operationId,
+    state_owner_id: stateOwnerId,
     terminal_kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
     terminal_record: terminalRecord,
     terminal_record_sha256: terminalRecordSha256,
@@ -398,14 +403,22 @@ function writerSupervisorStateGcFixture({
     collected_at: null,
   };
   const collectionReceipt = {
-    contractVersion: 1,
+    contractVersion: 2,
     launchAttemptId: operationId,
+    stateOwnerId,
     status: "collected",
     terminalRecordSha256: sha256Text(
-      `portable-codex-runtime:podman-writer-state-collection:v1\0${JSON.stringify(
+      `portable-codex-runtime:podman-writer-state-collection:v2\0${stateOwnerId}\0${JSON.stringify(
         terminalRecord,
       )}`,
     ),
+  };
+  const stateOwnerRow = {
+    bound_at: new Date(OPERATION_STARTED_AT),
+    launch_attempt_id: operationId,
+    session_id: sessionId,
+    state_owner_id: stateOwnerId,
+    supervisor_id: intent.supervisor.supervisorId,
   };
   return {
     authorization,
@@ -416,6 +429,7 @@ function writerSupervisorStateGcFixture({
     operationRow,
     request,
     sessionRow,
+    stateOwnerRow,
     terminalRecord,
   };
 }
@@ -1767,24 +1781,58 @@ test("restore attachment activation rejects epoch exhaustion explicitly", async 
   assert.equal(pool.connectCalls, 0);
 });
 
-test("writer supervisor state GC lists one validated pending authorization per session", async () => {
+test("writer supervisor state GC isolates same-supervisor owners across first and after pages", async () => {
   const first = writerSupervisorStateGcFixture();
   const second = writerSupervisorStateGcFixture({
     operationId: "writer-launch-gc-002",
     sessionId: OTHER_SESSION_ID,
   });
-  const { authority, clients } = authorityWithScripts([
-    { rows: [first.gcRow, second.gcRow] },
-    { rows: [first.sessionRow] },
-    { rows: [first.operationRow] },
-    { rows: [second.sessionRow] },
-    { rows: [second.operationRow] },
-  ]);
+  const otherOwner = writerSupervisorStateGcFixture({
+    operationId: "writer-launch-gc-owner-b",
+    sessionId: OTHER_SESSION_ID,
+    stateOwnerId: OTHER_STATE_OWNER_ID,
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      { rows: [first.gcRow, second.gcRow] },
+      { rows: [first.sessionRow] },
+      { rows: [first.operationRow] },
+      { rows: [first.stateOwnerRow] },
+      { rows: [second.sessionRow] },
+      { rows: [second.operationRow] },
+      { rows: [second.stateOwnerRow] },
+    ],
+    [
+      { rows: [second.gcRow] },
+      { rows: [second.sessionRow] },
+      { rows: [second.operationRow] },
+      { rows: [second.stateOwnerRow] },
+    ],
+    [
+      { rows: [otherOwner.gcRow] },
+      { rows: [otherOwner.sessionRow] },
+      { rows: [otherOwner.operationRow] },
+      { rows: [otherOwner.stateOwnerRow] },
+    ],
+  );
 
   const page = await authority.listWriterSupervisorStateGcCandidates({
     afterSessionId: null,
     limit: 1,
+    stateOwnerId: STATE_OWNER_ID,
   });
+  const afterPage =
+    await authority.listWriterSupervisorStateGcCandidates({
+      afterSessionId: page.nextAfterSessionId,
+      limit: 1,
+      stateOwnerId: STATE_OWNER_ID,
+    });
+  const otherOwnerPage =
+    await authority.listWriterSupervisorStateGcCandidates({
+      afterSessionId: null,
+      limit: 1,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    });
 
   assert.equal(Object.getPrototypeOf(page), null);
   assert.equal(page.candidates.length, 1);
@@ -1807,6 +1855,16 @@ test("writer supervisor state GC lists one validated pending authorization per s
   );
   assert.equal(page.candidates[0].session.sessionId, SESSION_ID);
   assert.equal(page.nextAfterSessionId, SESSION_ID);
+  assert.equal(
+    afterPage.candidates[0].authorization.authorizationSha256,
+    second.authorization.authorizationSha256,
+  );
+  assert.equal(afterPage.nextAfterSessionId, null);
+  assert.equal(
+    otherOwnerPage.candidates[0].authorization.authorizationSha256,
+    otherOwner.authorization.authorizationSha256,
+  );
+  assert.equal(otherOwnerPage.nextAfterSessionId, null);
   assert.ok(Object.isFrozen(page));
   assert.ok(Object.isFrozen(page.candidates[0]));
   assert.ok(
@@ -1814,7 +1872,23 @@ test("writer supervisor state GC lists one validated pending authorization per s
       text?.startsWith("SELECT DISTINCT ON (session_id)"),
     ),
   );
-  clients[0].assertExhausted();
+  const candidateQueries = clients.map((client) =>
+    client.queries.find((args) => {
+      const text = typeof args[0] === "string" ? args[0] : args[0]?.text;
+      return text?.startsWith("SELECT DISTINCT ON (session_id)");
+    }),
+  );
+  assert.deepEqual(candidateQueries[0][0].values, [STATE_OWNER_ID, 2]);
+  assert.deepEqual(candidateQueries[1][0].values, [
+    STATE_OWNER_ID,
+    SESSION_ID,
+    2,
+  ]);
+  assert.deepEqual(candidateQueries[2][0].values, [
+    OTHER_STATE_OWNER_ID,
+    2,
+  ]);
+  for (const client of clients) client.assertExhausted();
 });
 
 test("writer supervisor state GC finalizer entrypoints preserve the legacy exact input ABI", async () => {
@@ -1862,10 +1936,12 @@ test("writer supervisor state GC authorization read validates the exact terminal
     { rows: [fixture.gcRow] },
     { rows: [fixture.sessionRow] },
     { rows: [fixture.operationRow] },
+    { rows: [fixture.stateOwnerRow] },
   ]);
   const authorization =
     await authority.readWriterSupervisorStateGcAuthorization({
       terminalOperationId: fixture.authorization.terminalOperationId,
+      stateOwnerId: STATE_OWNER_ID,
     });
   assert.equal(Object.getPrototypeOf(authorization), null);
   assert.deepEqual(
@@ -1882,6 +1958,7 @@ test("writer supervisor state GC does not infer candidates from naked terminal o
   const page = await authority.listWriterSupervisorStateGcCandidates({
     afterSessionId: null,
     limit: 10,
+    stateOwnerId: STATE_OWNER_ID,
   });
   assert.deepEqual([...page.candidates], []);
   assert.equal(page.nextAfterSessionId, null);
@@ -1897,7 +1974,7 @@ test("writer supervisor state GC does not infer candidates from naked terminal o
 test("writer supervisor state GC completion accepts collected-to-absent acknowledgement-loss replay", async () => {
   const fixture = writerSupervisorStateGcFixture();
   const collectionReceiptSha256 = sha256Text(
-    `portable-codex-runtime:writer-supervisor-state-gc-collection-receipt:v1\0${JSON.stringify(
+    `portable-codex-runtime:writer-supervisor-state-gc-collection-receipt:v2\0${JSON.stringify(
       fixture.collectionReceipt,
     )}\n`,
   );
@@ -1912,6 +1989,7 @@ test("writer supervisor state GC completion accepts collected-to-absent acknowle
       { rows: [fixture.gcRow] },
       { rows: [fixture.sessionRow] },
       { rows: [fixture.operationRow] },
+      { rows: [fixture.stateOwnerRow] },
       { rows: [fixture.gcRow] },
       { rows: [completedRow] },
     ],
@@ -1919,6 +1997,7 @@ test("writer supervisor state GC completion accepts collected-to-absent acknowle
       { rows: [completedRow] },
       { rows: [fixture.sessionRow] },
       { rows: [fixture.operationRow] },
+      { rows: [fixture.stateOwnerRow] },
       { rows: [completedRow] },
     ],
   );
@@ -1944,6 +2023,57 @@ test("writer supervisor state GC completion accepts collected-to-absent acknowle
   assert.equal(replay.collectionReceiptSha256, collectionReceiptSha256);
   clients[0].assertExhausted();
   clients[1].assertExhausted();
+});
+
+test("writer supervisor state GC rejects owner mutation in rows, authorizations, and receipts", async (t) => {
+  const fixture = writerSupervisorStateGcFixture();
+
+  await t.test("stored authorization row", async () => {
+    const { authority, clients } = authorityWithScripts([
+      {
+        rows: [
+          {
+            ...fixture.gcRow,
+            state_owner_id: OTHER_STATE_OWNER_ID,
+          },
+        ],
+      },
+    ]);
+    await assertAuthorityError(
+      authority.readWriterSupervisorStateGcAuthorization({
+        stateOwnerId: STATE_OWNER_ID,
+        terminalOperationId: fixture.authorization.terminalOperationId,
+      }),
+      "operation_state_invalid",
+    );
+    clients[0].assertExhausted();
+  });
+
+  for (const field of ["authorization", "collection receipt"]) {
+    await t.test(field, async () => {
+      const { authority, pool } = authorityWithScripts();
+      await assertAuthorityError(
+        authority.completeWriterSupervisorStateGc({
+          authorization:
+            field === "authorization"
+              ? {
+                  ...fixture.authorization,
+                  stateOwnerId: OTHER_STATE_OWNER_ID,
+                }
+              : fixture.authorization,
+          collectionReceipt:
+            field === "collection receipt"
+              ? {
+                  ...fixture.collectionReceipt,
+                  stateOwnerId: OTHER_STATE_OWNER_ID,
+                }
+              : fixture.collectionReceipt,
+        }),
+        "invalid_operation_request",
+      );
+      assert.equal(pool.connectCalls, 0);
+    });
+  }
 });
 
 test("writer supervisor state GC completion rejects a different canonical authorization before update", async () => {

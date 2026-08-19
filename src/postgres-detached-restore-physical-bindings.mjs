@@ -45,13 +45,13 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 const WeakSetConstructor = WeakSet;
 const { isGeneratorFunction, isPromise, isProxy } = utilTypes;
 
-export const POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION = 2;
-export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION = 3;
-export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION = 2;
+export const POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION = 3;
+export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION = 4;
+export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION = 3;
 export const POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION = 2;
 export const POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION = 1;
 export const POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION =
-  1;
+  2;
 export const POSTGRES_SESSION_STORAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION = 1;
 export const POSTGRES_RESTORE_DESTINATION_RESOLVER_PHYSICAL_CONTRACT_VERSION = 1;
 
@@ -83,6 +83,7 @@ const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
   "reconcileWriterLaunch",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const SUPERVISOR_METHODS = objectFreeze([
@@ -93,6 +94,7 @@ const SUPERVISOR_METHODS = objectFreeze([
 const SUPERVISOR_STATE_COLLECTOR_KEYS = objectFreeze([
   "collectTerminalState",
   "contractVersion",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const LIFECYCLE_METHODS = objectFreeze([
@@ -171,16 +173,21 @@ const EVIDENCE_KEYS = objectFreeze([
   "supervisorId",
   "writerIncarnationId",
 ]);
-const STATE_COLLECTION_REQUEST_KEYS = objectFreeze(["terminalRecord"]);
+const STATE_COLLECTION_REQUEST_KEYS = objectFreeze([
+  "stateOwnerId",
+  "terminalRecord",
+]);
 const STATE_COLLECTION_RECEIPT_KEYS = objectFreeze([
   "contractVersion",
   "launchAttemptId",
+  "stateOwnerId",
   "status",
   "terminalRecordSha256",
 ]);
 const MAX_MILLISECONDS = 86_400_000;
 const MAX_SHALLOW_KEYS = 256;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 const ERROR_MESSAGES = objectFreeze({
@@ -894,7 +901,9 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
   ensure(
     supervisorValue.contractVersion ===
       POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION &&
+      typeof supervisorValue.stateOwnerId === "string" &&
       typeof supervisorValue.supervisorId === "string" &&
+      regexpTest(STATE_OWNER_ID_PATTERN, supervisorValue.stateOwnerId) &&
       regexpTest(OPAQUE_ID_PATTERN, supervisorValue.supervisorId),
     optionCode,
   );
@@ -905,6 +914,7 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       supervisorValue.reconcileWriterLaunch,
       optionCode,
     ),
+    stateOwnerId: supervisorValue.stateOwnerId,
     supervisorId: supervisorValue.supervisorId,
   });
   const stateCollectorValue = dataObject(
@@ -913,8 +923,9 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
     optionCode,
   );
   ensure(
-    stateCollectorValue.contractVersion ===
+      stateCollectorValue.contractVersion ===
         POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
+      stateCollectorValue.stateOwnerId === rawSupervisor.stateOwnerId &&
       stateCollectorValue.supervisorId === rawSupervisor.supervisorId,
     optionCode,
   );
@@ -924,6 +935,7 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       optionCode,
     ),
     contractVersion: stateCollectorValue.contractVersion,
+    stateOwnerId: stateCollectorValue.stateOwnerId,
     supervisorId: stateCollectorValue.supervisorId,
   });
   let rawLifecycle;
@@ -1194,6 +1206,7 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
         POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION,
       launchWriter,
       reconcileWriterLaunch,
+      stateOwnerId: rawSupervisor.stateOwnerId,
       supervisorId: rawSupervisor.supervisorId,
     });
 
@@ -1205,6 +1218,10 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
           STATE_COLLECTION_REQUEST_KEYS,
           requestCode,
         );
+        ensure(
+          request.stateOwnerId === rawStateCollector.stateOwnerId,
+          requestCode,
+        );
         const terminalRecord = terminalStateRecord(
           request.terminalRecord,
           null,
@@ -1214,7 +1231,10 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
           settlementByName.supervisorStateCollector,
           rawStateCollector.collectTerminalState,
           undefined,
-          exactFrozenRecord({ terminalRecord }),
+          exactFrozenRecord({
+            stateOwnerId: rawStateCollector.stateOwnerId,
+            terminalRecord,
+          }),
           (input, context) =>
             physicalStateCollectionRequest(input, context, requestCode),
           false,
@@ -1229,6 +1249,7 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
           receipt.contractVersion ===
               POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
             receipt.launchAttemptId === terminalRecord.launchAttemptId &&
+            receipt.stateOwnerId === rawStateCollector.stateOwnerId &&
             includes(["absent", "collected"], receipt.status) &&
             typeof receipt.terminalRecordSha256 === "string" &&
             regexpTest(SHA256_PATTERN, receipt.terminalRecordSha256),
@@ -1241,6 +1262,7 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
       collectTerminalState,
       contractVersion:
         POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId: rawStateCollector.stateOwnerId,
       supervisorId: rawStateCollector.supervisorId,
     });
 

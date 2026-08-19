@@ -605,6 +605,7 @@ function physicalPolicies(methods) {
 }
 
 function createPhysicalPublicationBinding(rawPublication) {
+  const stateOwnerId = `state-owner:${"b".repeat(64)}`;
   const supervisorId = "backend-physical-supervisor-001";
   const rawLifecycle = createLifecycleBackend({ restoreActivation: true }).backend;
   const unexpected = async function unexpectedPhysicalProvider() {
@@ -630,6 +631,7 @@ function createPhysicalPublicationBinding(rawPublication) {
         POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
+      stateOwnerId,
       supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
@@ -641,6 +643,7 @@ function createPhysicalPublicationBinding(rawPublication) {
       collectTerminalState: unexpected,
       contractVersion:
         POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId,
       supervisorId,
     }),
   }).publication;

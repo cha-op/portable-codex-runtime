@@ -334,7 +334,11 @@ work.
 
 Migration 009 adds the permanent
 `session_authority.writer_supervisor_state_gc` authorization/completion ledger
-and the fifth `supervisor-state-gc` cursor. Only the owner launch or stop
+and the immutable
+`session_authority.writer_supervisor_state_owners` launch-attempt route. Each
+private supervisor state root supplies one persistent high-entropy marker with
+the exact form `state-owner:<64 lowercase hex>`. The authority binds that
+`stateOwnerId` before physical launch dispatch, and only the owner launch or stop
 finalizer that commits exact `complete-stopped` evidence can insert an
 authorization; stopped-only reconciliation remains a pure read and cannot
 mint one. In the assembled production runner, the fifth lane runs last during
@@ -343,7 +347,34 @@ database-global exclusive restore lifecycle lease. It passes the
 authorization's exact revision 4 `terminalRecord` through its own settled
 physical collector and only then commits `collected` or `absent`. A lost
 `collected` acknowledgement may retry as `absent`; exact ledger readback still
-completes without reconstructing mutation authority.
+completes without reconstructing mutation authority. The physical collection
+request, its contract-version-2 receipt, and the authorization all carry the
+same owner marker.
+
+The third launch-attempt and fifth supervisor-state-GC recovery lanes are
+owner-filtered before a physical call. Runtime-private wrappers add the local
+marker to authority list requests; ordinary callers cannot select a foreign
+owner. Matching supervisor IDs and owner strings are necessary but not
+sufficient in production: deployment accepts only the exact process-local
+supervisor/collector pair returned by `createPodmanWriterSupervisorBundle()`
+and checks that provenance before constructing the physical adapter. Owner
+preparation and state/supervisor bundle construction must succeed before
+physical dispatch. Direct `createPodmanWriterSupervisor()` accepts only a
+caller-asserted routing owner and cannot enter production deployment. Runtime
+also fixes the configured owner into its private foreground composition:
+`readWriterLaunchAttempt()` receives exact `{ operationId, stateOwnerId }`,
+while public restore admission cannot select an owner.
+A correctly marked empty root therefore cannot reconcile or collect another
+root's row. The configured base `recoveryScopeId` remains an operator-facing
+fairness/replay label, not an owner identity: runtime hashes that base label
+with the local marker into the effective cursor scope, so two roots may safely
+reuse the same base label while restart of the same root reuses its cursor.
+There is no implicit legacy adoption API. An active `starting`/`uncertain` or
+dispatch-derived committed attempt without a binding is quarantined: direct
+claim/read fails closed and owner-filtered recovery omits it. An unbound
+`prepared` attempt remains owner-neutral only for read/cancel cleanup; it
+cannot be adopted for physical dispatch, and a prepared row with a conflicting
+binding is likewise hidden/fail-closed.
 
 A database-global restore lifecycle guard now uses one versioned PostgreSQL
 session advisory-lock identity for the complete authority candidate universe.
@@ -369,8 +400,11 @@ delay non-overlapping passes, coalesces concurrent kicks, and drains an
 admitted pass before shutdown settles. Its `onStep` hook is synchronous
 notification only and must return exactly `undefined`; Promise, thenable,
 generator, and other values fail the scheduler closed. A returned safe native
-Promise is rejection-drained but never awaited. Cursor recovery scopes remain
-fairness and replay identities only; they do not partition the lifecycle lock.
+Promise is rejection-drained but never awaited. Effective cursor recovery
+scopes remain fairness and replay identities only; they do not partition the
+lifecycle lock. The persistent marker prevents accidental cross-root routing;
+it is not cryptographic host attestation and cannot detect an administrator
+who clones both a private state root and its marker.
 
 Detached-restore foreground phase A now provides one caller-persisted stable
 root plan and a production-neutral composition facade. The plan binds the
@@ -620,7 +654,18 @@ Terminal Podman supervisor state now has a separate bounded collector. The
 production owner launch/stop path supplies the exact immutable stopped revision
 4 record; the raw collector accepts canonically exact `terminalRecord` data,
 not a pathname or attempt ID, but does not attest that record's provenance. It
-first validates exact revision 4, the intact lower chain and publication
+uses the marker-backed state bundle's persistent `stateOwnerId`. Production
+derives both raw capabilities through `createPodmanWriterSupervisorBundle()`;
+equal IDs and owner text on independently constructed objects do not substitute
+for that exact process-local pair. The raw supervisor is contract version 4,
+its logical facade is version 3, the collector and its receipt are version 2,
+and the aggregate physical binding is version 3. The durable launch request
+remains version 1 and does not embed the marker.
+The state-root marker must already be present and valid when the production
+state and supervisor bundles are assembled; an unmarked root is not assigned
+an identity from its path or from `recoveryScopeId`. It first validates exact
+revision 4, the intact
+lower chain and publication
 sidecars or the sole admitted oldest-first missing retry prefix, and the absence
 of future revisions. Phase A removes revisions 0 through 3 and all sidecars,
 proves the lower prefix absent, and syncs the held directory while preserving

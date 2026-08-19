@@ -59,6 +59,8 @@ const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
 const CAPTURE_OPERATION_ID = "checkpoint-capture-operation-001";
 const SUPERVISOR_ID = "supervisor-001";
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"b".repeat(64)}`;
 const PROCESS_INCARNATION_ID = "process-incarnation-001";
 const WRITER_INCARNATION_ID = "writer-incarnation-001";
 const PROOF_ID = "supervisor-proof-001";
@@ -555,16 +557,21 @@ function supervisorStateGcAuthorization({
   const terminalRecordSha256 = jsonSha256(terminalRecord);
   const authorization = {
     authorizedAt: STOP_COMMITTED_TIME,
-    contractVersion: 1,
+    contractVersion: 2,
     launchAttemptId,
     sessionId,
+    stateOwnerId: STATE_OWNER_ID,
     terminalKind,
     terminalOperationId,
     terminalRecord: clone(terminalRecord),
     terminalRecordSha256,
   };
   return {
-    authorizationSha256: jsonSha256(authorization),
+    authorizationSha256: textSha256(
+      `portable-codex-runtime:writer-supervisor-state-gc-authorization:v2\0${jsonStringify(
+        authorization,
+      )}\n`,
+    ),
     ...authorization,
   };
 }
@@ -574,6 +581,7 @@ class MemoryLaunchAuthority {
     this.events = events;
     this.expectedSession = clone(expectedSession);
     this.generation = clone(generation);
+    this.stateOwnerId = STATE_OWNER_ID;
     this.baseInput = null;
     this.state = "absent";
     this.result = null;
@@ -1153,6 +1161,7 @@ class MemoryLaunchAuthority {
         jsonStringify({
           ...this.baseInput,
           expectedOperationRevision: "0",
+          stateOwnerId: STATE_OWNER_ID,
         }),
       ),
     );
@@ -1279,9 +1288,14 @@ class MemoryLaunchAuthority {
     };
   }
 
-  async readWriterLaunchAttempt() {
+  async readWriterLaunchAttempt(input) {
     this.calls.read += 1;
     this.events.push("authority.read-attempt");
+    assert.deepEqual(Reflect.ownKeys(input), ["operationId", "stateOwnerId"]);
+    assert.equal(input.operationId, LAUNCH_ATTEMPT_ID);
+    if (input.stateOwnerId !== this.stateOwnerId) {
+      throw new Error("writer launch attempt belongs to another state owner");
+    }
     if (this.behaviour.readThrows) throw new Error("read unavailable");
     if (this.state === "absent") throw new Error("attempt absent");
     const receipt = this.receipt();
@@ -1424,7 +1438,11 @@ class MemoryLaunchAuthority {
   }
 
   async readWriterSupervisorStateGcAuthorization(input) {
-    assert.deepEqual(Reflect.ownKeys(input), ["terminalOperationId"]);
+    assert.deepEqual(Reflect.ownKeys(input), [
+      "stateOwnerId",
+      "terminalOperationId",
+    ]);
+    assert.equal(input.stateOwnerId, STATE_OWNER_ID);
     const authorization = this.supervisorStateGcAuthorizations.get(
       input.terminalOperationId,
     );
@@ -1909,6 +1927,7 @@ async function fixture({
   };
   const supervisor = {
     contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: SUPERVISOR_ID,
     launchWriter,
     reconcileWriterLaunch,
@@ -2202,7 +2221,7 @@ function cycleResolverInput(value, cycle) {
 test("exports one exact frozen facade and starts/registers before durable finalization", async () => {
   const value = await fixture();
   assert.equal(LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION, 1);
-  assert.equal(LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION, 2);
+  assert.equal(LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION, 3);
   assert.deepEqual(Reflect.ownKeys(value.facade).sort(), [
     "prepareLaunchIntent",
     "reconcileLaunchAttempt",
@@ -3384,6 +3403,7 @@ test("runs an activation-materialized prepared launch once without reserving", a
         kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
         operationId: LAUNCH_ATTEMPT_ID,
         request: seeded.request,
+        stateOwnerId: STATE_OWNER_ID,
       }),
     ),
   );
@@ -3440,6 +3460,7 @@ test("retains the legacy generation-materialized prepared launch handoff", async
         kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
         operationId: LAUNCH_ATTEMPT_ID,
         request: seeded.request,
+        stateOwnerId: STATE_OWNER_ID,
       }),
     ),
   );
@@ -4667,6 +4688,7 @@ test("keeps launch behavior stable after selected mutable intrinsics are poisone
     stoppedWriterCoordinator: value.stoppedWriterCoordinator,
     supervisor: {
       contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+      stateOwnerId: STATE_OWNER_ID,
       supervisorId: SUPERVISOR_ID,
       launchWriter,
       reconcileWriterLaunch: async () => ({
@@ -5353,6 +5375,50 @@ for (const state of ["starting", "uncertain"]) {
   });
 }
 
+test("foreign configured owner reconciliation fails before physical supervisor I/O", async () => {
+  const value = await fixture({ reconcileStatus: "complete-stopped" });
+  const typedRequest = createWriterLaunchAttemptOperationRequest({
+    expectedSession: value.expectedSession,
+    generation: value.generation,
+    measuredImage: {
+      projection: value.reserved.projection,
+      runtimeIdentity: value.reserved.runtimeIdentity,
+    },
+    supervisor: { contractVersion: 1, supervisorId: SUPERVISOR_ID },
+  });
+  value.authority.seed(typedRequest, "starting");
+  const foreignFacade = createPostgresLogicalWriterLauncher({
+    authority: value.authority,
+    imagePlanBinding: value.imagePlanBinding,
+    operationGuard: value.operationGuard,
+    stoppedWriterCoordinator: value.stoppedWriterCoordinator,
+    supervisor: {
+      ...value.supervisor,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    },
+  });
+
+  await assert.rejects(
+    foreignFacade.reconcileLaunchAttempt({
+      launchAttemptId: LAUNCH_ATTEMPT_ID,
+    }),
+    assertLauncherError("logical_writer_launch_outcome_uncertain"),
+  );
+  assert.equal(value.authority.calls.read, 1);
+  assert.equal(value.launchCalls, 0);
+  assert.equal(value.reconcileCalls, 0);
+
+  await assert.rejects(
+    foreignFacade.reconcileLaunchAttempt({
+      launchAttemptId: LAUNCH_ATTEMPT_ID,
+      stateOwnerId: STATE_OWNER_ID,
+    }),
+    assertLauncherError("invalid_logical_writer_launch_request"),
+  );
+  assert.equal(value.authority.calls.read, 1);
+  assert.equal(value.reconcileCalls, 0);
+});
+
 test("a committed started attempt without the original local handle requires stop or fence", async () => {
   const value = await fixture();
   const typedRequest = createWriterLaunchAttemptOperationRequest({
@@ -5393,6 +5459,7 @@ test("post-launch callback ambiguity marks uncertain once and recovery never rel
     stoppedWriterCoordinator: value.stoppedWriterCoordinator,
     supervisor: {
       contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+      stateOwnerId: STATE_OWNER_ID,
       supervisorId: SUPERVISOR_ID,
       launchWriter: throwingLaunch,
       reconcileWriterLaunch: async () => ({
@@ -5536,6 +5603,7 @@ test("rejects hostile proxy inputs and unsafe callback receipts without dispatch
     stoppedWriterCoordinator: value.stoppedWriterCoordinator,
     supervisor: {
       contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+      stateOwnerId: STATE_OWNER_ID,
       supervisorId: SUPERVISOR_ID,
       launchWriter: async () =>
         new Proxy(

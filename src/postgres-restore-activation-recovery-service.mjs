@@ -91,6 +91,7 @@ const UUID_PATTERN =
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REVISION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const OCI_SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const MAX_BATCH_SIZE = 100;
 const MAX_JSON_DEPTH = 32;
@@ -246,6 +247,7 @@ const SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS = objectFreeze([
   "contractVersion",
   "launchAttemptId",
   "sessionId",
+  "stateOwnerId",
   "terminalKind",
   "terminalOperationId",
   "terminalRecord",
@@ -275,7 +277,7 @@ const SESSION_SNAPSHOT_KEYS = objectFreeze([
 ]);
 const WRITER_LAUNCH_ATTEMPT_OPERATION_KIND = "writer-launch-attempt-v1";
 const WRITER_LAUNCH_STOP_OPERATION_KIND = "writer-launch-stop-v1";
-const SUPERVISOR_STATE_GC_CONTRACT_VERSION = 1;
+const SUPERVISOR_STATE_GC_CONTRACT_VERSION = 2;
 
 const ERROR_MESSAGES = objectFreeze({
   invalid_postgres_restore_activation_recovery_service_options:
@@ -1356,6 +1358,11 @@ function supervisorStateGcCandidate(value, code) {
   );
   const terminalOperationId = canonicalOpaqueId(
     authorization.terminalOperationId,
+    code,
+  );
+  ensure(
+    typeof authorization.stateOwnerId === "string" &&
+      regexpTest(STATE_OWNER_ID_PATTERN, authorization.stateOwnerId),
     code,
   );
   canonicalSha256(authorization.authorizationSha256, code);

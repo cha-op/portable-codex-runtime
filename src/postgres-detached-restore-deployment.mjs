@@ -17,12 +17,17 @@ import {
   createPostgresDetachedRestoreOperationalLeaseBudget,
 } from "./postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION,
   POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
 } from "./postgres-detached-restore-physical-bindings.mjs";
 import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
+import {
+  isPodmanWriterSupervisorBundlePair,
+} from "./podman-writer-supervisor.mjs";
 import {
   createCheckpointBackendFacade,
 } from "./session-storage-contracts.mjs";
@@ -94,6 +99,8 @@ const createPhysicalBindingsIntrinsic =
   createPostgresDetachedRestorePhysicalBindings;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
+const isPodmanWriterSupervisorBundlePairIntrinsic =
+  isPodmanWriterSupervisorBundlePair;
 const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 const createPhysicalSettlementIntrinsic =
   createPhysicalCollaboratorSettlement;
@@ -191,6 +198,7 @@ const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
   "reconcileWriterLaunch",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const SUPERVISOR_SETTLEMENT_KEYS = objectFreeze([
@@ -201,6 +209,7 @@ const SUPERVISOR_SETTLEMENT_KEYS = objectFreeze([
 const SUPERVISOR_STATE_COLLECTOR_KEYS = objectFreeze([
   "collectTerminalState",
   "contractVersion",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const PHYSICAL_SETTLEMENT_POLICY_KEYS = objectFreeze([
@@ -326,6 +335,7 @@ const MAX_APPLICATION_NAME_BYTES = 63;
 const MAX_CREDENTIAL_BYTES = 16 * 1024;
 const MAX_TLS_MATERIAL_BYTES = 4 * 1024 * 1024;
 const APPLICATION_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const HOST_PATTERN =
   /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$/u;
 const SERVER_VERSION_PATTERN = /^[0-9]{1,10}$/u;
@@ -1163,6 +1173,13 @@ function normalizeRuntimeOptions(value) {
     launch.imagePlanProviderSettlement,
     IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS,
   );
+  ensure(
+    callIntrinsic(isPodmanWriterSupervisorBundlePairIntrinsic, undefined, [
+      launch.supervisor,
+      launch.supervisorStateCollector,
+    ]),
+    OPTION_ERROR_CODE,
+  );
   const supervisor = exactDataObject(launch.supervisor, SUPERVISOR_KEYS);
   const supervisorStateCollector = exactDataObject(
     launch.supervisorStateCollector,
@@ -1203,8 +1220,12 @@ function normalizeRuntimeOptions(value) {
     OPTION_ERROR_CODE,
   );
   ensure(
-    supervisorStateCollector.contractVersion === 1 &&
-      supervisorStateCollector.supervisorId === supervisor.supervisorId,
+    supervisorStateCollector.contractVersion ===
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
+      supervisorStateCollector.supervisorId === supervisor.supervisorId &&
+      typeof supervisor.stateOwnerId === "string" &&
+      regexpTest(STATE_OWNER_ID_PATTERN, supervisor.stateOwnerId) &&
+      supervisorStateCollector.stateOwnerId === supervisor.stateOwnerId,
     OPTION_ERROR_CODE,
   );
   trustedFunction(supervisor.launchWriter);
@@ -2066,7 +2087,8 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       OPTION_ERROR_CODE,
     );
     ensure(
-      normalizedPhysicalBindings.contractVersion === 2,
+      normalizedPhysicalBindings.contractVersion ===
+        POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION,
       OPTION_ERROR_CODE,
     );
     physicalBindings = normalizedPhysicalBindings;

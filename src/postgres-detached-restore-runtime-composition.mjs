@@ -1,3 +1,4 @@
+import { Hash, createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -23,6 +24,7 @@ import {
   createPostgresDurableStopCaptureComposition,
 } from "./postgres-durable-stop-capture-composition.mjs";
 import {
+  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
   createPostgresLogicalWriterLauncher,
 } from "./postgres-logical-writer-launcher.mjs";
 import { PostgresOperationGuard } from "./postgres-operation-guard.mjs";
@@ -61,6 +63,9 @@ import {
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const ErrorConstructor = Error;
+const createHashIntrinsic = createHash;
+const hashDigestIntrinsic = Hash.prototype.digest;
+const hashUpdateIntrinsic = Hash.prototype.update;
 const isGeneratorFunctionValue = utilTypes.isGeneratorFunction;
 const isProxyValue = utilTypes.isProxy;
 const objectCreate = Object.create;
@@ -75,6 +80,7 @@ const objectPrototype = Object.prototype;
 const reflectApply = Reflect.apply;
 const reflectConstruct = Reflect.construct;
 const reflectOwnKeys = Reflect.ownKeys;
+const regexpExecIntrinsic = RegExp.prototype.exec;
 const TypeErrorConstructor = TypeError;
 const WeakSetConstructor = WeakSet;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
@@ -150,6 +156,11 @@ const readRestoreDestinationGenerationIntrinsic =
 const OPTION_ERROR_CODE =
   "invalid_postgres_detached_restore_runtime_composition_options";
 const MAX_PROTOTYPE_DEPTH = 64;
+const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
+const RECOVERY_OWNER_SCOPE_DOMAIN =
+  "portable-codex-runtime:postgres-restore-recovery-owner-scope:v1";
 
 const TOP_LEVEL_OPTION_KEYS = objectFreeze([
   "authority",
@@ -190,13 +201,49 @@ const LAUNCH_OPTION_KEYS = objectFreeze([
 const SUPERVISOR_STATE_COLLECTOR_KEYS = objectFreeze([
   "collectTerminalState",
   "contractVersion",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
   "reconcileWriterLaunch",
+  "stateOwnerId",
   "supervisorId",
+]);
+const RECOVERY_LIST_REQUEST_KEYS = objectFreeze([
+  "afterSessionId",
+  "limit",
+]);
+const RECOVERY_LAUNCH_ATTEMPT_CANDIDATE_KEYS = objectFreeze([
+  "launchAttemptId",
+  "request",
+  "state",
+]);
+const SUPERVISOR_STATE_GC_CANDIDATE_KEYS = objectFreeze([
+  "authorization",
+  "launchOperation",
+  "session",
+  "terminalOperation",
+]);
+const SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS = objectFreeze([
+  "authorizationSha256",
+  "authorizedAt",
+  "contractVersion",
+  "launchAttemptId",
+  "sessionId",
+  "stateOwnerId",
+  "terminalKind",
+  "terminalOperationId",
+  "terminalRecord",
+  "terminalRecordSha256",
+]);
+const SUPERVISOR_STATE_GC_COLLECTION_RECEIPT_KEYS = objectFreeze([
+  "contractVersion",
+  "launchAttemptId",
+  "stateOwnerId",
+  "status",
+  "terminalRecordSha256",
 ]);
 const FOREGROUND_OPTION_KEYS = objectFreeze(["fleetCapabilityGate"]);
 const PLAN_REGISTRY_OPTION_KEYS = objectFreeze([
@@ -243,6 +290,10 @@ function callIntrinsic(intrinsic, receiver, args) {
 
 function arrayIncludes(value, candidate) {
   return callIntrinsic(arrayIncludesIntrinsic, value, [candidate]);
+}
+
+function regexpTest(pattern, value) {
+  return callIntrinsic(regexpExecIntrinsic, pattern, [value]) !== null;
 }
 
 function weakSetAdd(value, entry) {
@@ -293,6 +344,35 @@ function fail() {
 
 function ensure(condition) {
   if (!condition) fail();
+}
+
+function canonicalStateOwnerId(value) {
+  ensure(
+    typeof value === "string" && regexpTest(STATE_OWNER_ID_PATTERN, value),
+  );
+  return value;
+}
+
+function effectiveRecoveryScopeId(recoveryScopeId, stateOwnerId) {
+  ensure(
+    typeof recoveryScopeId === "string" &&
+      regexpTest(OPAQUE_ID_PATTERN, recoveryScopeId),
+  );
+  canonicalStateOwnerId(stateOwnerId);
+  const hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    RECOVERY_OWNER_SCOPE_DOMAIN,
+    "utf8",
+  ]);
+  callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [recoveryScopeId, "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [stateOwnerId, "utf8"]);
+  const digest = callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+  ensure(
+    typeof digest === "string" && regexpTest(SHA256_PATTERN, digest),
+  );
+  return `recovery-owner:${digest}`;
 }
 
 function isInternalError(value) {
@@ -662,6 +742,7 @@ function createRecoveryService(
   coordinator,
   launcher,
   supervisorStateCollector,
+  stateOwnerId,
 ) {
   const reconcileRestoreAttachmentActivationMethod = ownFrozenDataFunction(
     coordinator,
@@ -706,18 +787,34 @@ function createRecoveryService(
     };
   const listWriterLaunchAttemptCandidates =
     function listWriterLaunchAttemptCandidates(...args) {
+      ensure(args.length === 1);
+      const request = exactDataObject(args[0], RECOVERY_LIST_REQUEST_KEYS);
       return callIntrinsic(
         listWriterLaunchAttemptCandidatesIntrinsic,
         authority,
-        args,
+        [
+          exactFrozenRecord({
+            afterSessionId: request.afterSessionId,
+            limit: request.limit,
+            stateOwnerId,
+          }),
+        ],
       );
     };
   const listWriterSupervisorStateGcCandidates =
     function listWriterSupervisorStateGcCandidates(...args) {
+      ensure(args.length === 1);
+      const request = exactDataObject(args[0], RECOVERY_LIST_REQUEST_KEYS);
       return callIntrinsic(
         listWriterSupervisorStateGcCandidatesIntrinsic,
         authority,
-        args,
+        [
+          exactFrozenRecord({
+            afterSessionId: request.afterSessionId,
+            limit: request.limit,
+            stateOwnerId,
+          }),
+        ],
       );
     };
   const reconcileRestoreAttachmentActivation =
@@ -736,31 +833,79 @@ function createRecoveryService(
         args,
       );
     };
-  const reconcileWriterLaunchAttempt =
-    function reconcileWriterLaunchAttempt(...args) {
-      return callIntrinsic(
-        reconcileWriterLaunchAttemptMethod,
-        launcher,
-        args,
-      );
-    };
+  const reconcileWriterLaunchAttempt = function reconcileWriterLaunchAttempt(
+    candidate,
+  ) {
+    ensure(arguments.length === 1);
+    const normalized = exactDataObject(
+      candidate,
+      RECOVERY_LAUNCH_ATTEMPT_CANDIDATE_KEYS,
+    );
+    return callIntrinsic(
+      reconcileWriterLaunchAttemptMethod,
+      launcher,
+      [
+        exactFrozenRecord({
+          launchAttemptId: normalized.launchAttemptId,
+        }),
+      ],
+    );
+  };
   const collectWriterSupervisorStateGc =
     async function collectWriterSupervisorStateGc(candidate) {
-      const collectionReceipt = await callIntrinsic(
+      ensure(arguments.length === 1);
+      const normalizedCandidate = exactDataObject(
+        candidate,
+        SUPERVISOR_STATE_GC_CANDIDATE_KEYS,
+      );
+      const authorization = exactDataObject(
+        normalizedCandidate.authorization,
+        SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS,
+      );
+      ensure(
+        authorization.contractVersion === 2 &&
+          authorization.stateOwnerId === stateOwnerId,
+      );
+      const rawCollectionReceipt = await callIntrinsic(
         collectTerminalStateMethod,
         supervisorStateCollector,
         [
           exactFrozenRecord({
-            terminalRecord: candidate.authorization.terminalRecord,
+            stateOwnerId,
+            terminalRecord: authorization.terminalRecord,
           }),
         ],
+      );
+      const collectionReceipt = exactDataObject(
+        rawCollectionReceipt,
+        SUPERVISOR_STATE_GC_COLLECTION_RECEIPT_KEYS,
+      );
+      ensure(
+        collectionReceipt.contractVersion === 2 &&
+          collectionReceipt.launchAttemptId ===
+            authorization.launchAttemptId &&
+          collectionReceipt.stateOwnerId === stateOwnerId &&
+          (collectionReceipt.status === "collected" ||
+            collectionReceipt.status === "absent") &&
+          typeof collectionReceipt.terminalRecordSha256 === "string" &&
+          regexpTest(
+            SHA256_PATTERN,
+            collectionReceipt.terminalRecordSha256,
+          ),
+      );
+      // Recheck the owner immediately before the durable completion call so
+      // neither an ACK-loss retry nor a foreign physical receipt can cross a
+      // private state-root boundary.
+      ensure(
+        authorization.stateOwnerId === stateOwnerId &&
+          collectionReceipt.stateOwnerId === stateOwnerId,
       );
       return callIntrinsic(
         completeWriterSupervisorStateGcIntrinsic,
         authority,
         [
           exactFrozenRecord({
-            authorization: candidate.authorization,
+            authorization,
             collectionReceipt,
           }),
         ],
@@ -816,11 +961,17 @@ function assemble(options) {
     options.launch.supervisorStateCollector,
     SUPERVISOR_STATE_COLLECTOR_KEYS,
   );
+  const stateOwnerId = canonicalStateOwnerId(supervisor.stateOwnerId);
   ensure(
-    objectIsFrozen(options.launch.supervisorStateCollector) &&
+    objectIsFrozen(options.launch.supervisor) &&
+      objectIsFrozen(options.launch.supervisorStateCollector) &&
+      supervisor.contractVersion ===
+        LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION &&
       supervisorStateCollector.contractVersion ===
         POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
-      supervisorStateCollector.supervisorId === supervisor.supervisorId,
+      supervisorStateCollector.supervisorId === supervisor.supervisorId &&
+      canonicalStateOwnerId(supervisorStateCollector.stateOwnerId) ===
+        stateOwnerId,
   );
   ownFrozenDataFunction(
     options.launch.supervisorStateCollector,
@@ -966,6 +1117,7 @@ function assemble(options) {
       operationGuard,
       resolveStablePlan,
       restoreActivationCoordinator,
+      stateOwnerId,
       writerDetach,
     }),
   );
@@ -1005,6 +1157,7 @@ function assemble(options) {
     restoreActivationCoordinator,
     launcher,
     options.launch.supervisorStateCollector,
+    stateOwnerId,
   );
   const cursorStore = callFactory(
     createRestoreRecoveryCursorStoreIntrinsic,
@@ -1016,7 +1169,10 @@ function assemble(options) {
       cursorStore,
       lifecycleGuard,
       limits: options.recovery.limits,
-      recoveryScopeId: options.recovery.recoveryScopeId,
+      recoveryScopeId: effectiveRecoveryScopeId(
+        options.recovery.recoveryScopeId,
+        stateOwnerId,
+      ),
       recoveryService,
     }),
   );

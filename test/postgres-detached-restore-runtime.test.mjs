@@ -60,6 +60,8 @@ const SOURCE_STORAGE_ID = "source-storage-001";
 const DESTINATION_STORAGE_ID = "destination-storage-001";
 const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"b".repeat(64)}`;
 const RUNTIME_OPTION_ERROR =
   "invalid_postgres_detached_restore_runtime_composition_options";
 const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
@@ -247,6 +249,7 @@ function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
         POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
+      stateOwnerId: STATE_OWNER_ID,
       supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
@@ -258,6 +261,7 @@ function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
       collectTerminalState: unexpected,
       contractVersion:
         POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId: STATE_OWNER_ID,
       supervisorId,
     }),
   });
@@ -441,6 +445,7 @@ function createRuntimeFixture() {
       calls.supervisor += 1;
       throw new Error("writer supervisor must not reconcile");
     },
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: "runtime-supervisor-001",
   });
   const supervisorStateCollector = Object.freeze({
@@ -452,6 +457,7 @@ function createRuntimeFixture() {
     ),
     contractVersion:
       POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: supervisor.supervisorId,
   });
   const options = {
@@ -1057,6 +1063,67 @@ test("runtime leaves lifecycle and pool shutdown ownership with the caller", asy
 });
 
 test("runtime composition rejects hostile options without leaking hostile behavior", async (t) => {
+  await t.test("supervisor and collector state owners differ", () => {
+    const fixture = createRuntimeFixture();
+    const supervisorStateCollector = Object.freeze({
+      ...fixture.options.launch.supervisorStateCollector,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    });
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          launch: {
+            ...fixture.options.launch,
+            supervisorStateCollector,
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
+  await t.test("foreground cannot override the configured state owner", () => {
+    const fixture = createRuntimeFixture();
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          foreground: {
+            ...fixture.options.foreground,
+            stateOwnerId: OTHER_STATE_OWNER_ID,
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
+  await t.test("recovery scope cannot substitute for a state owner", () => {
+    const fixture = createRuntimeFixture();
+    const supervisor = Object.freeze({
+      ...fixture.options.launch.supervisor,
+      stateOwnerId: fixture.options.recovery.recoveryScopeId,
+    });
+    const supervisorStateCollector = Object.freeze({
+      ...fixture.options.launch.supervisorStateCollector,
+      stateOwnerId: fixture.options.recovery.recoveryScopeId,
+    });
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          launch: {
+            ...fixture.options.launch,
+            supervisor,
+            supervisorStateCollector,
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
   await t.test("forged operational lease budget", () => {
     const fixture = createRuntimeFixture();
     assert.throws(
