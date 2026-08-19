@@ -2780,7 +2780,7 @@ test("Linux default authority holds a rootless helper procfd and reaps it on clo
   try {
     await assert.rejects(
       base.supervisor.launchWriter(base.input),
-      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
     );
   } finally {
     Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
@@ -3208,7 +3208,7 @@ test("secure Linux authority rejects missing roots and final or ancestor symlink
   try {
     await assert.rejects(
       base.supervisor.launchWriter(base.input),
-      assertSupervisorError("podman_writer_attachment_revalidation_failed"),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
     );
   } finally {
     childProcess.spawnSync = originalSpawnSync;
