@@ -1603,7 +1603,7 @@ test("registration captures path validators before builtin ESM synchronization",
         ),
       "invalid_stopped_writer_request",
     );
-    assert(poisonedResolveCalls > 0);
+    assert.equal(poisonedResolveCalls, 0);
     assert.equal(coordinator.dispose(), undefined);
   } finally {
     path.resolve = originalResolve;

@@ -1,0 +1,6 @@
+FROM scratch
+
+COPY podman-writer-probe /usr/local/bin/writer
+
+USER 1000:1000
+WORKDIR /session

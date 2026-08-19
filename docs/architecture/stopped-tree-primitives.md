@@ -116,6 +116,11 @@ mutation-authority fence/admission guard. It returns the exact descriptor and
 mutation envelope required by the snapshot and restore core. See
 `stopped-directory-backend.md`.
 
-The ext4 or filesystem-image backend, differential export, retention,
-encryption, periodic long-goal snapshots, cross-host verification, and Git
-Summary remain separate workstreams.
+The production-injectable Linux ext4 components are a separate completed
+workstream and do not widen these primitives when they are called
+independently. They provide only the clean/manual-fencing component boundaries
+described in `linux-ext4-physical-backend.md`; their trusted persistent-identity
+bridge and same-process evidence remain pending. Power-loss/crash-prefix
+evidence, automatic stale-writer fencing, differential export/compression,
+retention, encryption, periodic long-goal snapshots, registry trust, remote
+transport, and Git Summary remain separate workstreams.

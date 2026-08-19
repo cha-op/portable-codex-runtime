@@ -315,3 +315,9 @@ This work does not implement or claim:
 - authentication state handling; or
 - Git Summary. Git Summary remains deferred read-only user context and is not
   recovery authority.
+
+Separate production-injectable Linux ext4 and rootless Podman components now
+implement clean/manual-fencing physical seams. Their trusted persistent-
+identity bridge and same-process evidence remain pending. They do not compose
+this rollout repair primitive into capture, prove a crash-prefix, or change any
+non-goal above. See `linux-ext4-physical-backend.md`.

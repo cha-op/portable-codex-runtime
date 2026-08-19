@@ -192,7 +192,7 @@ rejected before dispatch.
 
 ## Explicitly Deferred Work
 
-This core does not yet provide or compose:
+This core does not itself provide or compose:
 
 - a production storage barrier for the graceful `turn/interrupt` boundary;
 - atomic `crash-prefix` capture or invocation of the separate pinned-runtime
@@ -207,7 +207,11 @@ This core does not yet provide or compose:
 - the read-only Git Summary.
 
 These are separate evidence and backend workstreams. In particular, Git state
-is user context and is not part of checkpoint correctness.
+is user context and is not part of checkpoint correctness. The separately
+injected Linux ext4 and rootless Podman components now supply the clean/manual-
+fencing physical boundary without moving those responsibilities into this
+core. Their trusted persistent-identity bridge and same-process conformance
+evidence remain pending; see `linux-ext4-physical-backend.md`.
 
 ## Dependency History and Remaining Order
 
@@ -227,9 +231,15 @@ pull-request order in the runtime delivery plan:
    foundation (completed separately from this core);
 10. exact generation publication, launcher/recovery, durable stop, assembled
     matrix, and immutable public restore-backend composition (completed);
-11. ext4 or filesystem-image physical backend; and
-12. differential export.
+11. production-injectable Linux ext4 raw-image lifecycle components,
+    externally anchored provider state, rootless Podman, and two-host clean
+    transfer verification (completed separately from this core, with their
+    persistent-identity bridge and same-process evidence remaining); and
+12. power-loss/crash-prefix evidence, automatic stale-writer fencing, and
+    differential export/compression (remaining).
 
-This order keeps orchestration semantics testable before selecting a physical
-format, and establishes pinned-executable Codex recovery evidence before
-adding production image resolution or optimising transport and retention.
+This ordering kept orchestration semantics testable before selecting the ext4
+physical format and established pinned-executable Codex recovery evidence
+before production image resolution. Transport, compression, encryption,
+retention, and registry trust remain separate from the completed clean physical
+slice.

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import test from "node:test";
 
 import { PostgresOperationGuard } from "../src/postgres-operation-guard.mjs";
@@ -826,6 +828,200 @@ test("guarded sweep probes around every list and candidate action", async () => 
   assert.equal(lifecycleFixture.manager.holder, null);
 });
 
+test(
+  "post-import targeted Array iterator pollution cannot rewrite guarded calls",
+  { concurrency: false },
+  async () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    assert.equal(typeof iteratorDescriptor?.value, "function");
+    const originalIterator = iteratorDescriptor.value;
+    const events = [];
+    let originalListCalls = 0;
+    let originalReconcileCalls = 0;
+    let forgedListCalls = 0;
+    let forgedReconcileCalls = 0;
+    let reconciledSessionId = null;
+    let activeLease = null;
+    let receipt;
+    let serviceError;
+    let lifecycleError;
+    const targetedIteratorCalls = {
+      assertLease: 0,
+      callList: 0,
+      reconcile: 0,
+      runLane: 0,
+    };
+    const lifecycleFixture = createLifecycleFixture({
+      events,
+      loseWhen() {
+        return originalReconcileCalls === 1 || forgedReconcileCalls === 1;
+      },
+    });
+    const forgedCandidate = generationCandidate(OTHER_SESSION_ID);
+    const forgedList = () => {
+      forgedListCalls += 1;
+      events.push("list:forged");
+      return page([forgedCandidate]);
+    };
+    const forgedReconcile = (candidate) => {
+      forgedReconcileCalls += 1;
+      events.push(`reconcile:forged:${candidate.request.sessionId}`);
+    };
+    const fixture = callbacks({
+      listRestoreGenerationCandidates(input) {
+        originalListCalls += 1;
+        events.push("list:original");
+        assert.deepEqual(Reflect.ownKeys(input), [
+          "afterSessionId",
+          "limit",
+        ]);
+        return page([generationCandidate(SESSION_ID)]);
+      },
+      reconcileRestoreGeneration(candidate) {
+        originalReconcileCalls += 1;
+        reconciledSessionId = candidate.request.sessionId;
+        events.push(`reconcile:original:${reconciledSessionId}`);
+      },
+    });
+    const originalList = fixture.options.listRestoreGenerationCandidates;
+    const originalReconcile = fixture.options.reconcileRestoreGeneration;
+    let service;
+
+    function iteratorFor(values) {
+      return Reflect.apply(originalIterator, values, []);
+    }
+
+    function targetedIterator() {
+      const outcomeCode =
+        "postgres_restore_activation_recovery_service_outcome_uncertain";
+      if (
+        this.length === 2 &&
+        this[0] === activeLease &&
+        this[1] === outcomeCode
+      ) {
+        targetedIteratorCalls.assertLease += 1;
+        return iteratorFor([null, outcomeCode]);
+      }
+      if (
+        this.length === 2 &&
+        this[0] === "generation" &&
+        this[1]?.lifecycleLease === activeLease
+      ) {
+        targetedIteratorCalls.runLane += 1;
+        return iteratorFor([this[0], this[1]]);
+      }
+      if (
+        this.length === 4 &&
+        this[0] === originalList &&
+        this[1]?.lifecycleLease === activeLease &&
+        this[2] === "generation" &&
+        this[3] === outcomeCode
+      ) {
+        targetedIteratorCalls.callList += 1;
+        return iteratorFor([forgedList, this[1], this[2], this[3]]);
+      }
+      if (
+        this.length === 3 &&
+        this[0] === originalReconcile &&
+        this[2] === outcomeCode
+      ) {
+        targetedIteratorCalls.reconcile += 1;
+        return iteratorFor([forgedReconcile, forgedCandidate, this[2]]);
+      }
+      return Reflect.apply(originalIterator, this, []);
+    }
+
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        ...iteratorDescriptor,
+        value: targetedIterator,
+      });
+      service = createPostgresRestoreActivationRecoveryService(
+        fixture.options,
+      );
+      try {
+        await lifecycleFixture.guard.runRecovery(async (
+          lifecycleLease,
+          complete,
+        ) => {
+          activeLease = lifecycleLease;
+          try {
+            receipt = await service.runGenerationBatch(
+              request({ lifecycleLease }),
+            );
+          } catch (error) {
+            serviceError = error;
+            throw error;
+          }
+          return complete(undefined);
+        });
+      } catch (error) {
+        lifecycleError = error;
+      }
+    } finally {
+      restoreOwnPropertyDescriptor(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator),
+      iteratorDescriptor,
+    );
+    assert.deepEqual(targetedIteratorCalls, {
+      assertLease: 0,
+      callList: 0,
+      reconcile: 0,
+      runLane: 0,
+    });
+    assert.equal(originalListCalls, 1);
+    assert.equal(originalReconcileCalls, 1);
+    assert.equal(forgedListCalls, 0);
+    assert.equal(forgedReconcileCalls, 0);
+    assert.equal(reconciledSessionId, SESSION_ID);
+    assert.deepEqual(events, [
+      "probe",
+      "probe",
+      "list:original",
+      "probe",
+      "probe",
+      `reconcile:original:${SESSION_ID}`,
+      "probe",
+      "probe",
+    ]);
+    assert.equal(
+      assertCode(
+        "postgres_restore_activation_recovery_service_outcome_uncertain",
+      )(serviceError),
+      true,
+    );
+    assert.equal(
+      lifecycleError instanceof PostgresRestoreLifecycleGuardError &&
+        lifecycleError.code ===
+          "postgres_restore_lifecycle_guard_outcome_uncertain",
+      true,
+    );
+    assert.equal(receipt, undefined);
+    assert.equal(
+      consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "generation",
+        null,
+        10,
+        activeLease,
+        receipt,
+      ),
+      false,
+    );
+    assert.equal(lifecycleFixture.manager.holder, null);
+  },
+);
+
 test("guarded receipts reject legacy arity, cross-lease use, and replay", async () => {
   const lifecycleFixture = createLifecycleFixture();
   const otherLifecycleFixture = createLifecycleFixture();
@@ -1465,6 +1661,135 @@ test("activation batches admit exact v1 and capture-bound v2 predecessors", asyn
   assertDeepFrozen(observed[1]);
   assertDeepFrozen(result);
 });
+
+test("recovery pathnames accept 4095 UTF-8 bytes and reject 4096", async () => {
+  const maximumPath = `/${"é".repeat(2_047)}`;
+  const oversizedPath = `${maximumPath}a`;
+  assert.equal(Buffer.byteLength(maximumPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedPath, "utf8"), 4_096);
+
+  const acceptedActivation = activationCandidate();
+  acceptedActivation.request.destinationRootPath = maximumPath;
+  let observedActivation;
+  const activationFixture = callbacks({
+    async listRestoreAttachmentActivationCandidates() {
+      return page([acceptedActivation]);
+    },
+    async reconcileRestoreAttachmentActivation(candidate) {
+      observedActivation = candidate;
+    },
+  });
+  const activationService = createPostgresRestoreActivationRecoveryService(
+    activationFixture.options,
+  );
+  const activationResult = await activationService.runActivationBatch(request());
+  assert.equal(activationResult.results[0].status, "reconciled");
+  assert.equal(observedActivation.request.destinationRootPath, maximumPath);
+
+  const rejectedActivation = activationCandidate();
+  rejectedActivation.request.destinationRootPath = oversizedPath;
+  const rejectedActivationFixture = callbacks({
+    async listRestoreAttachmentActivationCandidates() {
+      return page([rejectedActivation]);
+    },
+  });
+  await assert.rejects(
+    createPostgresRestoreActivationRecoveryService(
+      rejectedActivationFixture.options,
+    ).runActivationBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
+
+  const acceptedLaunch = launchCandidate();
+  acceptedLaunch.request.measuredImage.runtimeIdentity.codexBinaryPath =
+    maximumPath;
+  let observedLaunch;
+  const launchFixture = callbacks({
+    async listWriterLaunchAttemptCandidates() {
+      return page([acceptedLaunch]);
+    },
+    async reconcileWriterLaunchAttempt(candidate) {
+      observedLaunch = candidate;
+    },
+  });
+  const launchService = createPostgresRestoreActivationRecoveryService(
+    launchFixture.options,
+  );
+  const launchResult = await launchService.runLaunchAttemptBatch(request());
+  assert.equal(launchResult.results[0].status, "reconciled");
+  assert.equal(
+    observedLaunch.request.measuredImage.runtimeIdentity.codexBinaryPath,
+    maximumPath,
+  );
+
+  const rejectedLaunch = launchCandidate();
+  rejectedLaunch.request.measuredImage.runtimeIdentity.codexBinaryPath =
+    oversizedPath;
+  const rejectedLaunchFixture = callbacks({
+    async listWriterLaunchAttemptCandidates() {
+      return page([rejectedLaunch]);
+    },
+  });
+  await assert.rejects(
+    createPostgresRestoreActivationRecoveryService(
+      rejectedLaunchFixture.options,
+    ).runLaunchAttemptBatch(request()),
+    assertCode(
+      "postgres_restore_activation_recovery_service_outcome_uncertain",
+    ),
+  );
+});
+
+test(
+  "recovery validates candidate paths with captured node:path intrinsics",
+  { concurrency: false },
+  async () => {
+    const isAbsoluteDescriptor = Object.getOwnPropertyDescriptor(
+      path,
+      "isAbsolute",
+    );
+    const resolveDescriptor = Object.getOwnPropertyDescriptor(path, "resolve");
+    const candidate = activationCandidate();
+    candidate.request.destinationRootPath = "relative/session";
+    let poisonCalls = 0;
+    let reconcileCalls = 0;
+    const fixture = callbacks({
+      async listRestoreAttachmentActivationCandidates() {
+        path.isAbsolute = () => {
+          poisonCalls += 1;
+          return true;
+        };
+        path.resolve = (value) => {
+          poisonCalls += 1;
+          return value;
+        };
+        syncBuiltinESMExports();
+        return page([candidate]);
+      },
+      async reconcileRestoreAttachmentActivation() {
+        reconcileCalls += 1;
+      },
+    });
+    try {
+      await assert.rejects(
+        createPostgresRestoreActivationRecoveryService(
+          fixture.options,
+        ).runActivationBatch(request()),
+        assertCode(
+          "postgres_restore_activation_recovery_service_outcome_uncertain",
+        ),
+      );
+      assert.equal(poisonCalls, 0);
+      assert.equal(reconcileCalls, 0);
+    } finally {
+      Object.defineProperty(path, "isAbsolute", isAbsoluteDescriptor);
+      Object.defineProperty(path, "resolve", resolveDescriptor);
+      syncBuiltinESMExports();
+    }
+  },
+);
 
 test("runSweep preserves independent cursors and fixed lane order", async () => {
   const order = [];

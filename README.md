@@ -16,6 +16,11 @@ versioned provider attachment proof, atomic detached activation into a
 prepared launch, four bounded no-relaunch recovery lanes, and a
 production-neutral detached-restore foreground composition seam and runtime
 assembly with a narrow same-launcher writer-start ingress.
+The Linux production-injection surface now has independent clean/manual-
+fencing components: FD-bound raw ext4 images, externally anchored provider
+state, separate publication-control identities, and a rootless Podman writer
+supervisor. The ext4 component requires a host-owned long-lived private mount
+namespace; the persistent ext4-to-Podman identity bridge remains pending.
 The planned runtime keeps refresh tokens in a central auth authority, injects
 short-lived access tokens into session workers, and treats session data
 snapshots separately from monotonic credential state.
@@ -71,9 +76,11 @@ The runtime now has executable v1 record validators for a secret-free session
 manifest, trusted OCI-resolution matching, uint64 fencing epochs,
 lease/attachment matching, dedicated exact force-fence request/result
 envelopes, declared storage backend capabilities, structural rootless worker
-directory binds, and recovery checkpoint classes. Physical launch, fencing,
-and snapshot authorization remain the responsibility of later concrete
-adapters and their conformance tests.
+directory binds, and recovery checkpoint classes. These contracts remain
+provider-neutral; the Linux ext4 and Podman components supply independent
+clean, manually fenced seams without turning a lease or database epoch into
+physical authority. Their trusted persistent-identity bridge and same-process
+conformance evidence remain pending.
 An optional version 1 restore-attachment activation extension binds the exact
 committed publication object and materialization digest to the provider's
 attach mutation, canonical attachment, and proof. Path equality remains
@@ -522,9 +529,61 @@ it is not replay of a durable mutation. The generic lifecycle methods
 `provisionSession()`, and `restoreCheckpoint()` remain outside the currently
 assembled restore saga even though deployment settles their contracts.
 
-Crash-consistent ext4 or filesystem-image backend execution, differential
-compression, periodic backup, and cross-host restore verification remain later
-work; neither a database lease nor a higher epoch is a physical writer fence.
+Production-injectable Linux components now provide sparse raw ext4-image
+creation, FD-bound format/mount/sync/unmount/loop-detach settlement, an
+versioned provider-state checkpoint plus bounded active delta log checked
+against an external PostgreSQL v2 head, separate persistent publication-
+control identities, and a rootless Podman writer supervisor. Provider-state
+rotation first durably creates and syncs the next checkpoint and empty log,
+then advances the external head with a pure-maintenance CAS that preserves the
+logical state revision. The default soft rotation watermarks are 8 MiB or
+8,192 active frames; the hard per-generation envelope remains 64 MiB and
+65,535 frames, so ordinary active-log growth no longer requires a manual reset
+at that envelope. The provider-state checkpoint is a control-plane exact-
+replay snapshot, not a physical ext4 image checkpoint or content root. It
+retains every prepared and committed operation, current storage state, and
+destroyed tombstone; exact replay therefore makes checkpoint and aggregate
+provider-state storage grow with unique operations. This slice supplies no
+retention or garbage collection, so hosts must monitor `inspectCapacity()` and
+the provider-state directory until a retention floor or PostgreSQL-indexed
+history is designed.
+
+The two-host Ubuntu conformance flow runs each Node process and helper in one
+long-lived private mount namespace with dedicated `rprivate` archive and
+session roots. A live-mount barrier proves the producer's ext4 mounts are
+visible in that child namespace and absent from its parent when the privileged
+workflow gate runs. The flow then cleanly detaches and transfers both images.
+On the consumer host, the externally anchored archive mount-root tuple makes
+the first remount verification-only; the distinct artifact-child tuple then
+authorizes publication verification for that exact owned root. The default
+Podman filesystem authority protects the object selected for a call; a trusted
+adapter that binds the provider's committed ext4 identity into that authority,
+and same-process evidence for the combined components, remain pending. For its
+narrower local boundary, the default authority keeps parent-held directory FDs
+and a temporary FD holder inside Podman's rootless namespace, compares both
+sides' object identity and access policy, proves the exact configured bind
+in Podman's external `created` state before start, and brackets the live bind
+proof with stable container ID/PID
+observations. A new create receipt must contain the complete 64-hex container
+ID before start is admitted. Image `Config.User` supplies the exact non-root
+numeric UID/GID mapped by `keep-id`; the Linux conformance writer must create a
+current-service-owned `0600` marker through that bind. Custom command runners
+must provide their own matching trusted filesystem authority. An ordinary
+Podman failure observed before direct-child exit requests whole-group
+termination; every failed command waits for direct close and kernel-proved
+group absence, and never signals the frozen numeric PGID after exit. Holder
+shutdown likewise requires its wrapper to close and its group to disappear;
+the exact `start` mutation is not force-cancelled after dispatch because conmon
+may have moved outside the CLI group, so an unresponsive or failed dispatched
+start deliberately remains pending and holds authority instead of returning an
+unsafe error.
+
+That evidence is a clean operator-controlled transfer boundary, not sudden
+power-loss or crash-prefix evidence and not automatic stale-writer fencing.
+The backend remains `fencing: "manual"`; neither a database lease nor a higher
+epoch is a physical fence. Differential export/compression, encryption,
+retention, registry publisher/signature trust, and remote image transport
+remain outside this slice.
 
 A bounded runnable-image profile binds exact OCI/Docker platform-manifest and
 config bytes, validated layer descriptors and rootfs DiffIDs, the Linux
@@ -533,7 +592,9 @@ capability. This closes serialized image-identity substitution inside the
 authority boundary. It intentionally rejects artifact manifests and unsupported
 descriptor extensions; it does not implement registry signature policy, mount
 an image, launch Podman/Docker, or turn a database epoch into a physical
-stale-writer fence. The stopped-directory backend remains manual-fencing only.
+stale-writer fence. Those are limits of the image-profile component; the
+separately injected ext4 backend and Podman supervisor implement only the clean,
+manual-fencing component boundaries described above.
 See `docs/architecture/session-runtime-authority.md`.
 
 ## Snapshot and Restore Core
@@ -712,9 +773,15 @@ settlement foundation, complete deployment-owned physical binding graph, and
 operational lease admission are assembled;
 the safety matrix now binds the seven real-PostgreSQL durable cuts, separate
 new-object physical/runtime/controller retry and registry rehydration, and
-representative settlement timer/drain evidence. Filesystem-image execution is
-the next independent backend slice; differential backup remains later work.
-See
+representative settlement timer/drain evidence. The Linux ext4 physical slice
+now supplies the clean/manual-fencing storage and rootless Podman collaborators
+through those injection points, including host-owned long-lived private mount
+namespaces with dedicated `rprivate` carriers, a producer peer-namespace non-
+propagation gate, two-host clean detach and transfer, verification-only first remount,
+and separate mount-root/artifact-child identity verification. Crash-prefix
+recovery, automatic stale-writer fencing, and differential/compressed backup
+remain later independent work. See
+`docs/architecture/linux-ext4-physical-backend.md` and
 `docs/architecture/stopped-directory-backend.md`.
 
 ## Interrupted-Turn Recovery

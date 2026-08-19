@@ -418,12 +418,53 @@
   windows.
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
+- Production-injectable Linux ext4 physical components now supply sparse raw-
+  image lifecycle through native operations below host-owned `rprivate` mount
+  carriers, exact close-before-unmount and loop-detach settlement, an
+  automatically rotated provider-state checkpoint and bounded active delta log
+  checked against an external PostgreSQL v2 generation head, two distinct
+  persistent archive control identities, and a rootless digest-pinned Podman
+  writer supervisor. The head binds monotonic anchor/state revisions, the
+  generation and previous-head digest, checkpoint boundary/digest, and active-
+  log boundary/digest. Rotation syncs the next checkpoint, empty log, and
+  parent directory before a pure-maintenance CAS. Default 8 MiB/8,192-frame
+  soft watermarks rotate before the 64 MiB/65,535-frame hard envelope, and
+  `inspectCapacity()` exposes both boundaries. The control-plane checkpoint
+  retains all operations for exact replay plus current storage and destroyed
+  tombstones; it is not a physical image checkpoint. Consequently its size and
+  aggregate provider-state bytes grow with unique operations, and this slice
+  has no retention/GC path; hosts must monitor it. Producer outputs bind
+  the archive mount-root and artifact-child tuples separately; on the consumer,
+  the former makes the first remount verification-only and the latter
+  authorizes verification for the exact publication root. Two hosted Ubuntu
+  runners cover clean detach, transfer, remount, provider-head continuity, and
+  source-free committed verification; the producer additionally gates private-
+  namespace non-propagation. This remains a clean/manual-fencing
+  boundary: it does not prove power-loss or crash-prefix recovery,
+  automatically fence a stale writer, or implement differential export/
+  compression, encryption, retention, or registry trust. A trusted adapter
+  that binds committed ext4 attachment identity into Podman filesystem
+  authority, plus same-process conformance evidence, remains pending. Within
+  the narrower default boundary, parent-held directory FDs are matched to a
+  temporary holder in Podman's rootless namespace, create must preserve that
+  exact procfd source in Podman's external `created` state before start, a new
+  create must return its complete
+  64-hex container identity, and image `Config.User` drives the explicit non-
+  root `keep-id` UID/GID mapping used by the conformance writer. Ordinary
+  failures observed before child exit request whole-group termination; every
+  failure waits for direct close and kernel-proved group absence without ever
+  signalling the frozen PGID after exit. Holder shutdown separately requires
+  wrapper close plus group absence; a dispatched exact start only advances on
+  a zero exit and otherwise remains pending because conmon may leave the CLI
+  group.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Linux ext4 physical backend:
+  `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - Final public restore backend:
   `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - Assembled restore safety matrix:
@@ -539,6 +580,16 @@
   policy across the two database-clock windows, including physical deadline/
   grace bounds, an aggregate database allowance, and a safety margin.
   The scoped assembled safety matrix and immutable public adapter assembly are
-  complete. The next boundary is the concrete filesystem/ext4 physical
-  backend; the public adapter does not make the injected physical collaborators
-  filesystem-durable by itself.
+  complete. Production-injectable Linux ext4 and rootless Podman components
+  now implement the clean/manual-fencing physical boundary and verify clean
+  two-host detach, transfer, and a verification-only first remount against
+  separately anchored archive control tuples. Each ext4 job runs below
+  dedicated `rprivate` carriers in one long-lived private mount namespace and
+  the producer gates whether its live mounts propagate to the parent
+  namespace. The ext4 and Podman conformance jobs remain separate: the default
+  Podman filesystem authority binds only the current
+  held directory object and access policy, while a production composition must
+  supply a trusted authority that maps the durable ext4 attachment identity to
+  that held object. They do not make crash-prefix state durable, revoke a stale
+  remote writer automatically, or supply differential/compressed export,
+  encryption, retention, or registry trust.

@@ -460,9 +460,19 @@ Restore and launcher authority are now split into eight serial pull requests:
      restart, and ambiguous publication, launch, registration, stop, or
      finalisation outcomes.
 
-The next pull request owns an ext4 or filesystem-image backend. Later slices own differential
-export and content-addressed storage, cross-host migration, and operational
-hardening.
+The production-injectable Linux ext4 and rootless Podman components are now
+complete independently for clean, manually fenced operation. They supply an
+FD-bound raw-image lifecycle below host-owned `rprivate` carriers in one
+long-lived private mount namespace, externally anchored provider state,
+distinct publication-control identities, and two-host clean detach, transfer,
+and remount verification plus a producer peer-namespace non-propagation gate.
+Their trusted
+persistent-identity bridge and same-process conformance evidence remain
+pending. See
+`linux-ext4-physical-backend.md`. Later slices own power-loss/crash-prefix
+evidence, automatic stale-writer fencing, differential export/compression,
+content-addressed distribution, encryption, retention, registry trust, remote
+transport, and broader operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

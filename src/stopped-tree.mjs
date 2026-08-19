@@ -25,10 +25,11 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { promisify } from "node:util";
+import { promisify, types as utilTypes } from "node:util";
 
 const MAX_SYMLINK_RESOLUTION_DEPTH = 32;
 const execFileAsync = promisify(execFile);
+const { isProxy } = utilTypes;
 
 async function runSequentialCleanup(cleanups, primaryFailure) {
   let firstCleanupFailure;
@@ -884,6 +885,9 @@ export async function stoppedTreesShareAnyIdentity(
 }
 
 function assertPersistentObjectIdentity(value) {
+  if (isProxy(value)) {
+    throw new Error("persistent object identity is invalid");
+  }
   let descriptors;
   try {
     descriptors = Object.getOwnPropertyDescriptors(value);
@@ -928,6 +932,20 @@ function assertPersistentObjectIdentity(value) {
   });
 }
 
+export function bindStoppedTreeObjectIdentity(value, expectedIdentity) {
+  const inspected = assertPersistentObjectIdentity(value);
+  if (expectedIdentity !== undefined) {
+    // This binding protects runtime object identity: dev+ino must describe the
+    // same object. Size and timestamps belong to separate content-stability
+    // checks, so benign metadata churn alone is not object replacement.
+    assert(
+      sameFileIdentity(inspected.runtimeIdentity, expectedIdentity),
+      "persistent object identity does not match runtime object",
+    );
+  }
+  return inspected.objectId;
+}
+
 export async function inspectStoppedTreeObjectIdentity(
   path,
   inspectPersistentObjectIdentity,
@@ -945,12 +963,9 @@ export async function inspectStoppedTreeObjectIdentity(
       "persistent object identity path changed before inspection",
     );
   }
-  const inspected = assertPersistentObjectIdentity(
+  const objectId = bindStoppedTreeObjectIdentity(
     await inspectPersistentObjectIdentity(path),
-  );
-  assert(
-    sameFileIdentity(inspected.runtimeIdentity, before),
-    "persistent object identity does not match runtime object",
+    before,
   );
   const after = await lstat(path, { bigint: true });
   assertStableFileMetadata(
@@ -964,7 +979,7 @@ export async function inspectStoppedTreeObjectIdentity(
       "persistent object identity path changed during inspection",
     );
   }
-  return inspected.objectId;
+  return objectId;
 }
 
 function stoppedTreeEntryKind(metadata) {

@@ -5,7 +5,7 @@ import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 7;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 8;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
@@ -131,6 +131,13 @@ const MIGRATION_SOURCES = objectFreeze([
       import.meta.url,
     ),
     version: 7,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/008-filesystem-image-provider-heads.sql",
+      import.meta.url,
+    ),
+    version: 8,
   }),
 ]);
 
@@ -280,6 +287,7 @@ const COMMIT_STATES = new SetConstructor([
 ]);
 const PROTOCOL_ERROR_SQLSTATES = new WeakMapConstructor();
 const STORE_ERRORS = new WeakSetConstructor();
+const POSTGRES_SERIALIZABLE_STORES = new WeakSetConstructor();
 const ERROR_MESSAGES = objectFreeze({
   client_reset_failed: "PostgreSQL client reset failed",
   client_release_failed: "PostgreSQL client release failed",
@@ -369,6 +377,19 @@ function isPostgresSerializableStoreError(error) {
 
 function storeError(code, commitState = "not-committed") {
   return new PostgresSerializableStoreError(code, commitState);
+}
+
+export function isPostgresSerializableStore(value) {
+  try {
+    return (
+      value !== null &&
+      typeof value === "object" &&
+      !isProxy(value) &&
+      weakSetHas(POSTGRES_SERIALIZABLE_STORES, value)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function observedRejectedPromise(error) {
@@ -1208,6 +1229,7 @@ export class PostgresSerializableStore {
     this.#maxTransactionAttempts = validateAttemptLimit(
       normalized.maxTransactionAttempts ?? DEFAULT_TRANSACTION_ATTEMPTS,
     );
+    weakSetAdd(POSTGRES_SERIALIZABLE_STORES, this);
     objectFreeze(this);
   }
 
@@ -1608,3 +1630,5 @@ export class PostgresSerializableStore {
     throw new ErrorConstructor("unreachable transaction attempt state");
   }
 }
+
+objectFreeze(isPostgresSerializableStore);

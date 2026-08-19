@@ -151,8 +151,34 @@
   directory backend and exposed only through controller/deployment admission.
   Callers cannot inject the internal generation-publication callback, invoke
   raw lifecycle mutations, or reach operator/provider extensions.
-- [pending] Implement an ext4 or filesystem-image physical backend, followed by
-  differential compression, content-addressed storage, encryption, retention,
-  periodic long-goal snapshots, and cross-host restore verification.
+- [done] Implement production-injectable Linux ext4 physical components:
+  sparse raw-image lifecycle below host-owned `rprivate` carriers,
+  close-before-unmount clean detach settlement, externally anchored provider
+  state with automatic checkpoint/delta-log generation rotation and capacity
+  inspection, distinct archive mount-root and artifact-child publication-
+  control identities, rootless digest-pinned Podman launch/stop, and two-host
+  clean detach, transfer, verification-only first remount, identity
+  verification, and a peer-namespace non-propagation gate.
+- [pending] First, bind the provider state's committed ext4 attachment identity
+  into a trusted Podman filesystem authority and exercise that bridge with the
+  initialized backend in one non-root process. This closes the current
+  production identity gap without depending on either retention track below.
+- [pending] Second, add authority-owned bounded retention or garbage collection
+  for terminal local supervisor state, but only after PostgreSQL has permanently
+  committed the exact terminal attempt and every callback for that attempt is
+  quiescent. The stopped-only reconciler remains read-only and cannot authorize
+  this mutation.
+- [pending] Third, define an authority-safe provider-state exact-replay
+  retention floor or move permanent operation history to a PostgreSQL-indexed
+  representation. This track has its own replay authority and does not inherit
+  authority from the bridge or supervisor retention. Until then, monitor
+  checkpoint bytes, retained operation counts, and aggregate provider-state
+  storage; automatic active-log rotation is not retention or garbage
+  collection.
+- [pending] Extend beyond that clean/manual-fencing boundary only in separately
+  scoped work: power-loss/crash-prefix evidence, automatic stale-writer
+  fencing, differential export/compression, content-addressed distribution,
+  encryption, retention and periodic snapshots, registry publisher/signature
+  trust, and remote image transport.
 - [deferred] Add a read-only Git Summary for user context; it is not part of
   snapshot correctness or recovery.

@@ -70,9 +70,19 @@ launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
 bounded recovery scheduler. The invocation-time detached-production gate,
 durable read-only stable-plan lookup, deployment bindings, and final immutable
-public checkpoint backend are now complete. Only the concrete filesystem/ext4
-physical backend and its crash, detach/fence, container-launch, and cross-host
-conformance validation remain.
+public checkpoint backend are now complete. The production-injectable Linux
+physical components are also complete independently for clean/manual-fencing
+operation: they supply an FD-bound ext4 raw-image lifecycle, an externally
+anchored provider ledger, separate persistent publication-control identities,
+and a rootless Podman supervisor. Their two-host conformance boundary verifies
+clean detach, raw-image transfer, a verification-only first remount, and
+distinct archive mount-root and artifact-child identity readback. The ext4
+component operates only below host-prepared `rprivate` carriers in one
+long-lived private mount namespace; a live producer barrier gates whether
+those ext4 mounts propagate to its parent namespace. A trusted
+bridge from committed ext4 identity to Podman filesystem authority and
+same-process conformance evidence remain pending; the current evidence does not
+claim power-loss/crash-prefix recovery or automatic stale-writer fencing.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -133,8 +143,9 @@ one opaque same-process capability for the exact prepared tuple. V3 crosses
 instead into the exact durably prepared capture intent whose operation ID was
 claimed before stop; its local writer exclusion remains until the fixed
 committed capture result is returned. Ambiguity retains both durable and local
-blockers. Cross-host exclusion still must come from a capable storage backend
-or supervisor.
+blockers. The ext4 cross-host flow begins only after a clean detach; automatic
+exclusion of a partitioned or stale writer remains an operator/provider fencing
+responsibility.
 
 ## Implemented Canonical Session Registry
 
@@ -336,8 +347,11 @@ operation, storage identity, attachment ID, proof ID, and canonical host-local
 `rootPath`. The provider mutation result must carry the same `rootPath`; a
 caller cannot splice a different structurally valid directory into the
 attachment evidence. This writer-specific evidence validates its root-path-free
-projection against the unchanged generic storage contract v1 result shape. It
-can finalize an operation from `starting` revision 1 or `uncertain` revision 2.
+projection against the unchanged generic storage contract v1 result shape.
+The attachment and restore-destination pathname domain is canonical absolute,
+non-root, NUL-free, round-trip UTF-8 of at most 4095 bytes; PostgreSQL admission
+uses the same boundary before any query. With that bound, finalization can
+accept an operation from `starting` revision 1 or `uncertain` revision 2.
 In one
 transaction it commits the exact `writer-attached` result, retires the
 operation, releases the reservation, clears `activeOperation`, persists the
@@ -1397,6 +1411,8 @@ The portable identity is the existing manifest's exact platform-manifest
 digest, media type, Linux platform, and normalized Codex version. A trusted
 resolver may add measured descriptor and executable evidence, but cannot
 replace those four fields or accept an OCI index/tag as the portable identity.
+The measured Linux `codexBinaryPath` must be canonical absolute, NUL-free,
+round-trip UTF-8, and at most 4095 bytes before reservation or recovery.
 The current resolver accepts a bounded runnable-image profile rather than every
 OCI artifact extension: it validates the exact manifest and config bytes,
 required config/rootfs structure, one or more recognized layer descriptors,
@@ -1716,7 +1732,13 @@ advancing its settled cursor. Generation, activation, and launch-attempt
 failures remain `pending`; current launches are reported only as
 `requires-stop-or-fence`. The service accepts no image resolver, launch
 callback, writer handle, publication callback, or opaque capability and can
-neither relaunch nor adopt a running process.
+neither relaunch nor adopt a running process. Its internal rest arrays are
+forwarded through explicit dense slots rather than call spread, so post-import
+Array iterator replacement cannot substitute a list or reconciliation
+callback, null out the lifecycle lease, or mint a receipt for different
+candidate work. The receipt remains process-local provenance bound to the
+service, lane, input cursor, limit, and lifecycle lease; the cursor store below
+remains the durable compare-and-swap authority.
 
 `PostgresRestoreRecoveryCursorStore` persists each lane outside session
 storage under a startup-selected recovery scope. Revision, cycle, and prior
@@ -2185,14 +2207,57 @@ same-database/stable-plan retry through fresh physical bindings, image binding,
 runtime, and controller, references separate stable-plan-registry rehydration,
 and layers representative settlement-foundation/deployment timer and drain
 evidence. It does not claim one whole-saga deployment restart or operating-
-system crash. The immutable public backend is now complete; the next
-implementation boundary is the concrete filesystem/ext4 physical backend.
+system crash. The immutable public backend can now be supplied with the
+production-injectable Linux physical components. The ext4 driver keeps raw-
+image format, mount, sync, and loop-detach work bound to pinned descriptor
+authority below host-owned `rprivate` carriers; clean unmount closes the
+mounted-root descriptor before its non-lazy dispatch while retaining the
+pinned parent/direct-child authority;
+provider mutations and maintenance rotation require a version 2 generation
+head anchored outside the replaceable image; and publication checks separately
+authorized persistent control identities. That head binds monotonic anchor and
+logical state revisions, generation and previous-head digest, a streamed
+provider-state checkpoint boundary/digest, and the bounded active delta log.
+Rotation syncs the new checkpoint, empty log, and parent directory before its
+pure-maintenance CAS, preserving the logical state revision while advancing
+the anchor revision and generation. Default soft rotation occurs at 8 MiB or
+8,192 active frames, before the 64 MiB and 65,535-frame hard envelope.
+The hot-path cache is not authority: only an exact head and pinned unchanged
+metadata can reuse it, while metadata change triggers content revalidation and
+does not alone prove mutation. The checkpoint retains every prepared and
+committed operation for exact replay, current storage records, and destroyed
+tombstones; a committed delta references its prepared operation instead of
+repeating the request.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
-A later concrete Podman/Docker adapter must also hold directory identity
-through the bind, enforce rootless execution, and fix the Codex CLI/config
-surface.
+The injected Podman v2 supervisor holds the sole session-directory bind,
+requires rootless execution and a digest-pinned image, publishes immutable
+local revisions, and supports stop/join plus read-only cold reconciliation.
+The generic PostgreSQL deployment still constructs neither collaborator; a
+production host injects them and owns their additional provider-state pool and
+shutdown order.
+Binding the provider's committed ext4 root identity into a trusted Podman
+filesystem authority, together with same-process conformance evidence, remains
+required before describing those components as one production graph.
+
+The provider-state checkpoint above is a control-plane replay snapshot, not a
+physical image checkpoint, published checkpoint artifact, or content root.
+Automatic rotation bounds only the active delta log. Permanent exact replay
+makes later provider-state checkpoints and aggregate persistent storage grow
+with unique operations. This slice has no retention floor or garbage
+collection: deployment hosts must monitor `inspectCapacity()` and the backing
+directory until an authority-safe retention floor or PostgreSQL-indexed history
+is designed.
+
+The resulting scope is deliberately clean and manually fenced. Two hosted
+Ubuntu runners independently anchor the archive mount-root and artifact-child
+control tuples, then verify clean detach, transfer, a verification-only first
+remount, publication identity, and provider-head continuity. They do not prove
+sudden power-loss or crash-prefix recovery, and the backend does not revoke a
+partitioned stale writer automatically. Differential export/compression,
+encryption, retention, registry publisher/signature trust, and remote image
+transport remain separate work.
 
 ## Operational Boundary
 
@@ -2223,6 +2288,9 @@ Production deployment requires:
   proof;
 - migration application before serving authority requests;
 - durable database backups independent of session-volume snapshots;
+- provider-state capacity monitoring through `inspectCapacity()` plus backing-
+  directory byte monitoring; active-log rotation is automatic, but retained
+  exact operation history and checkpoint bytes are not bounded by this slice;
 - authority-ledger promotion and recovery that never admits mutations from a
   database state older than any retained artefact or session-volume
   generation. Recovery must preserve or replay every later operation,
@@ -2311,7 +2379,15 @@ matrix has an exact nineteen-contract/fourteen-protocol-surface scope and binds 
 seven durable-cut aggregation, same-database/stable-plan fresh-object retry,
 separate registry rehydration, and representative settlement timer/drain
 evidence. The final public backend is wired through controller and deployment
-admission. The concrete filesystem/ext4 physical backend is the next
-implementation boundary.
-Physical-backend pull requests must add crash, detach/fence, container-launch,
-and cross-host conformance evidence.
+admission. Production-injectable Linux components now add FD-bound raw-image
+lifecycle and detach settlement, externally anchored provider-state
+reconciliation, distinct mount-root and artifact-child publication-control
+identity, and rootless Podman launch/stop coverage. Their producer/consumer jobs
+verify a clean two-host image transfer and verification-only first remount; a
+trusted persistent-identity bridge and same-process conformance evidence remain
+pending. The ext4 producer additionally gates whether live child-namespace
+mounts propagate to its parent namespace under the required host-owned
+long-lived namespace contract.
+Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
+export/compression, encryption, retention, and registry trust remain unproved
+or unimplemented by design.

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { syncBuiltinESMExports } from "node:module";
+import path from "node:path";
 import { types as utilTypes } from "node:util";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
@@ -46,6 +48,7 @@ import {
   assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
   assertStorageMutationResult,
+  assertWriterAttachmentMutationResult,
   checkpointClassPolicy,
   compareFencingEpochs,
   createCheckpointBackendFacade,
@@ -761,6 +764,63 @@ test("storage references and attachments contain no host path in portable state"
     assert.throws(() => assertSessionAttachment(invalid), assertCode("invalid_storage_attachment"));
   }
 });
+
+test("attachment roots use the 4095-byte native pathname domain", () => {
+  const maximumRootPath = `/${"é".repeat(2_047)}`;
+  const oversizedRootPath = `${maximumRootPath}a`;
+  assert.equal(Buffer.byteLength(maximumRootPath, "utf8"), 4_095);
+  assert.equal(Buffer.byteLength(oversizedRootPath, "utf8"), 4_096);
+  assert.equal(
+    assertSessionAttachment(
+      attachment({ rootPath: maximumRootPath }),
+    ).rootPath,
+    maximumRootPath,
+  );
+  assert.throws(
+    () => assertSessionAttachment(attachment({ rootPath: oversizedRootPath })),
+    assertCode("invalid_storage_attachment"),
+  );
+});
+
+test(
+  "attachment root canonicality uses captured node:path intrinsics",
+  { concurrency: false },
+  () => {
+    const descriptors = {
+      isAbsolute: Object.getOwnPropertyDescriptor(path, "isAbsolute"),
+      parse: Object.getOwnPropertyDescriptor(path, "parse"),
+      resolve: Object.getOwnPropertyDescriptor(path, "resolve"),
+    };
+    let poisonCalls = 0;
+    path.isAbsolute = () => {
+      poisonCalls += 1;
+      return true;
+    };
+    path.parse = () => {
+      poisonCalls += 1;
+      return { root: "/poisoned-root" };
+    };
+    path.resolve = (value) => {
+      poisonCalls += 1;
+      return value;
+    };
+    syncBuiltinESMExports();
+    try {
+      for (const rootPath of ["relative/session", "/var/lib/../etc", "/"]) {
+        assert.throws(
+          () => assertSessionAttachment(attachment({ rootPath })),
+          assertCode("invalid_storage_attachment"),
+        );
+      }
+      assert.equal(poisonCalls, 0);
+    } finally {
+      Object.defineProperty(path, "isAbsolute", descriptors.isAbsolute);
+      Object.defineProperty(path, "parse", descriptors.parse);
+      Object.defineProperty(path, "resolve", descriptors.resolve);
+      syncBuiltinESMExports();
+    }
+  },
+);
 
 test("rootless worker template is structural and fixed-layout", () => {
   const currentLease = lease();
@@ -2507,6 +2567,108 @@ test("storage force-fence validation uses captured intrinsics", () => {
   assert(Object.isFrozen(checkedResult.target));
 });
 
+test(
+  "storage mutation target ID validation ignores post-import Array iterator poisoning",
+  { concurrency: false },
+  () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const targetIds = [
+      { field: "attachmentId", operation: "attach" },
+      { field: "artifactId", operation: "checkpoint" },
+      { field: "checkpointId", operation: "checkpoint" },
+      { field: "attachmentId", operation: "detach" },
+      { field: "artifactId", operation: "restore" },
+      { field: "checkpointId", operation: "restore" },
+    ];
+    const invalidIds = [
+      { label: "undefined", value: undefined },
+      { label: "NUL", value: "target\0id" },
+      { label: "slash", value: "target/id" },
+      { label: "noncanonical leading separator", value: "-target-id" },
+    ];
+    const invalidErrors = new Array(targetIds.length * invalidIds.length);
+    const validErrors = new Array(targetIds.length);
+    const validatedRequests = new Array(targetIds.length);
+    let poisonedCalls = 0;
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        ...iteratorDescriptor,
+        value() {
+          poisonedCalls += 1;
+          return {
+            next() {
+              return { done: true };
+            },
+          };
+        },
+      });
+      let invalidIndex = 0;
+      for (let targetIndex = 0; targetIndex < targetIds.length; targetIndex += 1) {
+        const targetId = targetIds[targetIndex];
+        const validRequest = mutationRequest({ operation: targetId.operation });
+        try {
+          validatedRequests[targetIndex] =
+            assertStorageMutationRequest(validRequest);
+        } catch (error) {
+          validErrors[targetIndex] = error;
+        }
+        for (
+          let invalidIdIndex = 0;
+          invalidIdIndex < invalidIds.length;
+          invalidIdIndex += 1
+        ) {
+          const invalidId = invalidIds[invalidIdIndex];
+          const invalidRequest = mutationRequest({
+            operation: targetId.operation,
+          });
+          invalidRequest.target = {
+            ...invalidRequest.target,
+            [targetId.field]: invalidId.value,
+          };
+          try {
+            assertStorageMutationRequest(invalidRequest);
+          } catch (error) {
+            invalidErrors[invalidIndex] = error;
+          }
+          invalidIndex += 1;
+        }
+      }
+    } finally {
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        iteratorDescriptor,
+      );
+    }
+
+    assert.equal(poisonedCalls, 0);
+    let invalidIndex = 0;
+    for (let targetIndex = 0; targetIndex < targetIds.length; targetIndex += 1) {
+      const targetId = targetIds[targetIndex];
+      assert.equal(validErrors[targetIndex], undefined);
+      assert.deepEqual(
+        validatedRequests[targetIndex],
+        mutationRequest({ operation: targetId.operation }),
+      );
+      for (
+        let invalidIdIndex = 0;
+        invalidIdIndex < invalidIds.length;
+        invalidIdIndex += 1
+      ) {
+        const invalidId = invalidIds[invalidIdIndex];
+        assert.ok(
+          assertCode("invalid_storage_mutation")(invalidErrors[invalidIndex]),
+          `${targetId.operation}.${targetId.field} accepted ${invalidId.label}`,
+        );
+        invalidIndex += 1;
+      }
+    }
+  },
+);
+
 test("storage mutation envelopes bind operation IDs to the complete writer fence", () => {
   const request = mutationRequest();
   assert.deepEqual(assertStorageMutationRequest(request), request);
@@ -2638,6 +2800,53 @@ test("storage mutation envelopes bind operation IDs to the complete writer fence
           rootPath: "/var/lib/portable-codex/session-001",
         },
         { request: attachRequest },
+      ),
+    assertCode("invalid_storage_mutation"),
+  );
+  const writerAttachmentResult = {
+    ...legacyAttachResult,
+    rootPath: "/var/lib/portable-codex/session-001",
+  };
+  assert.deepEqual(
+    assertWriterAttachmentMutationResult(writerAttachmentResult, {
+      request: attachRequest,
+    }),
+    writerAttachmentResult,
+  );
+  assert(Object.isFrozen(
+    assertWriterAttachmentMutationResult(writerAttachmentResult, {
+      request: attachRequest,
+    }),
+  ));
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, rootPath: "relative/session" },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, rootPath: `/${"é".repeat(2048)}` },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, rootPath: "/tmp/\ud800" },
+        { request: attachRequest },
+      ),
+    assertCode("invalid_storage_attachment"),
+  );
+  assert.throws(
+    () =>
+      assertWriterAttachmentMutationResult(
+        { ...writerAttachmentResult, operation: "detach", status: "detached" },
+        { request: mutationRequest({ operation: "detach" }) },
       ),
     assertCode("invalid_storage_mutation"),
   );

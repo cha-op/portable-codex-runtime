@@ -1,11 +1,17 @@
+import { Buffer } from "node:buffer";
 import { isAbsolute, parse, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const bigIntIntrinsic = BigInt;
+const bufferFromIntrinsic = Buffer.from;
+const bufferToStringIntrinsic = Buffer.prototype.toString;
 const isProxyValue = utilTypes.isProxy;
 const numberIsSafeInteger = Number.isSafeInteger;
+const pathIsAbsoluteIntrinsic = isAbsolute;
+const pathParseIntrinsic = parse;
+const pathResolveIntrinsic = resolve;
 const objectCreate = Object.create;
 const objectFreeze = Object.freeze;
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
@@ -110,6 +116,7 @@ const STORAGE_BACKEND_CAPABILITY_KEYS = Object.freeze([
   "normalDirectoryAttachment",
 ]);
 const MAX_BACKEND_PROTOTYPE_DEPTH = 64;
+const MAX_ATTACHMENT_ROOT_PATH_BYTES = 4095;
 const checkpointBackendProjections = new WeakSetConstructor();
 
 export class SessionStorageContractError extends Error {
@@ -241,10 +248,18 @@ function assertUuid(value, code, label) {
 function assertAttachmentRootPath(value, code, label) {
   ensure(
     typeof value === "string" &&
+      value.length <= MAX_ATTACHMENT_ROOT_PATH_BYTES,
+    code,
+    `${label} must be an absolute host-local directory path`,
+  );
+  const encoded = reflectApply(bufferFromIntrinsic, Buffer, [value, "utf8"]);
+  ensure(
+    encoded.length <= MAX_ATTACHMENT_ROOT_PATH_BYTES &&
+      reflectApply(bufferToStringIntrinsic, encoded, ["utf8"]) === value &&
       !containsNullCharacter(value) &&
-      isAbsolute(value) &&
-      resolve(value) === value &&
-      value !== parse(value).root,
+      pathIsAbsoluteIntrinsic(value) &&
+      pathResolveIntrinsic(value) === value &&
+      value !== pathParseIntrinsic(value).root,
     code,
     `${label} must be an absolute host-local directory path`,
   );
@@ -1575,7 +1590,10 @@ function assertStorageMutationTarget(value, { operation, storageId }) {
       ["checkpointId", "target checkpoint ID"],
     ],
   }[operation];
-  for (const [field, label] of requiredIds) {
+  for (let index = 0; index < requiredIds.length; index += 1) {
+    const requiredId = requiredIds[index];
+    const field = requiredId[0];
+    const label = requiredId[1];
     assertOpaqueId(value[field], "invalid_storage_mutation", label);
   }
   if (operation === "destroy") {
@@ -1812,6 +1830,66 @@ export function assertStorageMutationResult(value, options) {
   return deepFreeze(
     defensiveClone(value, "invalid_storage_mutation", "storage mutation result"),
   );
+}
+
+/**
+ * Validates the provider result used to finalize one writable directory
+ * attachment. The base v1 mutation result intentionally excludes host-local
+ * paths; this provider-only extension adds the exact root that the authority
+ * persists in the ephemeral attachment record.
+ */
+export function assertWriterAttachmentMutationResult(value, options) {
+  const code = "invalid_storage_attachment";
+  assertExactObject(
+    value,
+    [
+      "backendId",
+      "contractVersion",
+      "fencingEpoch",
+      "holderId",
+      "leaseId",
+      "operation",
+      "operationId",
+      "proofId",
+      "rootPath",
+      "sessionId",
+      "status",
+      "storageId",
+      "target",
+    ],
+    code,
+    "writer attachment mutation result",
+  );
+  const rootPath = plainDataDescriptor(
+    value,
+    "rootPath",
+    code,
+    "writer attachment mutation result",
+  ).value;
+  assertAttachmentRootPath(rootPath, code, "writer attachment root");
+  const mutation = assertStorageMutationResult(
+    {
+      backendId: value.backendId,
+      contractVersion: value.contractVersion,
+      fencingEpoch: value.fencingEpoch,
+      holderId: value.holderId,
+      leaseId: value.leaseId,
+      operation: value.operation,
+      operationId: value.operationId,
+      proofId: value.proofId,
+      sessionId: value.sessionId,
+      status: value.status,
+      storageId: value.storageId,
+      target: value.target,
+    },
+    options,
+  );
+  ensure(
+    mutation.operation === "attach" && mutation.status === "attached",
+    code,
+    "writer attachment mutation result is not an attach result",
+  );
+  return deepFreeze({ ...mutation, rootPath });
 }
 
 function isSha256Hex(value) {

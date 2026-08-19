@@ -60,3 +60,418 @@ jobs:
       - run: npm run test:postgres
         env:
           SESSION_AUTHORITY_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/portable_codex_runtime_test
+
+  podman-writer-integration:
+    name: Rootless Podman writer integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install rootless Podman prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes acl build-essential fuse-overlayfs podman slirp4netns uidmap
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          printf 'XDG_RUNTIME_DIR=%s\n' "$runtime_dir" >> "$GITHUB_ENV"
+      - name: Build the digest-pinned scratch writer image
+        id: image
+        run: |
+          cc -O2 -std=c11 -Wall -Wextra -Werror -static \
+            native/podman-writer-probe.c \
+            -o integration/fixtures/podman-writer/podman-writer-probe
+          test "$(id -u)" -ne 0
+          /usr/bin/timeout --signal=KILL 10s \
+            /usr/bin/podman --remote=false unshare /usr/bin/true
+          /usr/bin/podman --remote=false build \
+            --file integration/fixtures/podman-writer/Containerfile \
+            --tag localhost/portable-codex-writer:integration \
+            integration/fixtures/podman-writer
+          digest="$(/usr/bin/podman --remote=false image inspect --format '{{.Digest}}' localhost/portable-codex-writer:integration)"
+          test -n "$digest"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Exercise launch, bind write, stop, and cold reconcile
+        timeout-minutes: 2
+        run: node --test integration/podman-writer-supervisor.mjs
+        env:
+          PODMAN_EXECUTABLE: /usr/bin/podman
+          PODMAN_WRITER_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          PODMAN_WRITER_IMAGE_REFERENCE: localhost/portable-codex-writer@${{ steps.image.outputs.digest }}
+          PODMAN_WRITER_TEST_ROOT: /var/tmp/portable-codex-runtime-podman-${{ github.run_id }}
+      - name: Remove the integration image
+        if: always()
+        timeout-minutes: 1
+        run: /usr/bin/timeout --signal=KILL 30s /usr/bin/podman --remote=false image rm --force localhost/portable-codex-writer:integration || true
+
+  linux-ext4-producer:
+    name: Linux ext4 physical producer
+    runs-on: ubuntu-24.04
+    outputs:
+      archive-mount-publication-control-identity: ${{ steps.provider-state-head.outputs.archive-mount-control }}
+      archive-publication-control-identity: ${{ steps.provider-state-head.outputs.archive-control }}
+      provider-state-head: ${{ steps.provider-state-head.outputs.value }}
+      service-uid: ${{ steps.provider-state-head.outputs.service-uid }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install the privileged ext4 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes acl build-essential e2fsprogs jq libcap2-bin udev util-linux
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            native/linux-ext4-inspector.c \
+            -o "$RUNNER_TEMP/linux-ext4-inspector"
+          sudo groupadd --system portable-codex-ext4
+          sudo usermod --append --groups portable-codex-ext4 "$(id -un)"
+          sudo install -d -m 0755 /usr/local/libexec
+          sudo install -o root -g portable-codex-ext4 -m 0750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          sudo setcap cap_dac_override,cap_sys_admin=ep \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          test "$(stat -c '%U:%G:%a' /usr/local/libexec/portable-codex-linux-ext4-inspector)" = \
+            'root:portable-codex-ext4:750'
+          getcap /usr/local/libexec/portable-codex-linux-ext4-inspector |
+            grep -Fx '/usr/local/libexec/portable-codex-linux-ext4-inspector cap_dac_override,cap_sys_admin=ep'
+          if sudo -u nobody test -x /usr/local/libexec/portable-codex-linux-ext4-inspector; then
+            exit 1
+          fi
+          set +e
+          sudo /usr/local/libexec/portable-codex-linux-ext4-inspector
+          root_identity_status="$?"
+          set -e
+          test "$root_identity_status" -eq 69
+          sudo install -o root -g portable-codex-ext4 -m 4750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test -u /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          set +e
+          sg portable-codex-ext4 -c \
+            '/usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative'
+          identity_status="$?"
+          set -e
+          sudo rm -f /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test "$identity_status" -eq 69
+      - name: Publish and verify on a real ext4 loop image
+        timeout-minutes: 15
+        env:
+          LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
+          LINUX_EXT4_PEER_NAMESPACE_BARRIER: "1"
+          LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE: "1"
+          LINUX_EXT4_TEST_MODE: producer
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          service_uid="$(id -u)"
+          service_gid="$(id -g)"
+          node_path="$(command -v node)"
+          namespace_pid_path="${LINUX_EXT4_TEST_ROOT}.namespace-pid"
+          namespace_pid_pending_path="${namespace_pid_path}.pending"
+          peer_ready_path="${LINUX_EXT4_TEST_ROOT}.peer-ready"
+          peer_ready_pending_path="${peer_ready_path}.pending"
+          peer_release_path="${LINUX_EXT4_TEST_ROOT}.peer-release"
+          peer_release_pending_path="${peer_release_path}.pending"
+          sudo install -d -o "$service_uid" -g "$service_gid" -m 0700 \
+            "$LINUX_EXT4_TEST_ROOT" \
+            "$LINUX_EXT4_TEST_ROOT/archive-mounts" \
+            "$LINUX_EXT4_TEST_ROOT/images" \
+            "$LINUX_EXT4_TEST_ROOT/mounts" \
+            "$LINUX_EXT4_TEST_ROOT/state"
+          sudo rm -f -- \
+            "$namespace_pid_path" \
+            "$namespace_pid_pending_path" \
+            "$peer_ready_path" \
+            "$peer_ready_pending_path" \
+            "$peer_release_path" \
+            "$peer_release_pending_path"
+          publish_peer_release() {
+            umask 077
+            printf 'release\n' > "$peer_release_pending_path"
+            mv -f -- "$peer_release_pending_path" "$peer_release_path"
+          }
+          peer_namespace_probe() {
+            trap 'publish_peer_release || true' EXIT
+            deadline="$((SECONDS + 180))"
+            while ! test -s "$namespace_pid_path" || ! test -s "$peer_ready_path"; do
+              test "$SECONDS" -lt "$deadline"
+              sleep 0.1
+            done
+            namespace_pid="$(cat "$namespace_pid_path")"
+            archive_mount="$(jq -r '.archiveMount' "$peer_ready_path")"
+            storage_mount="$(jq -r '.storageMount' "$peer_ready_path")"
+            for target in "$archive_mount" "$storage_mount"; do
+              case "$target" in
+                "$LINUX_EXT4_TEST_ROOT"/archive-mounts/* | "$LINUX_EXT4_TEST_ROOT"/mounts/*) ;;
+                *) exit 1 ;;
+              esac
+              test "$(sudo /usr/bin/nsenter -t "$namespace_pid" -m -- \
+                /usr/bin/findmnt -rn -M "$target" -o FSTYPE)" = ext4
+              if /usr/bin/findmnt -rn -M "$target" -o FSTYPE >/dev/null; then
+                echo "ext4 mount propagated into the parent namespace: $target" >&2
+                exit 1
+              fi
+            done
+            publish_peer_release
+            trap - EXIT
+          }
+          peer_namespace_probe &
+          probe_pid="$!"
+          set +e
+          sudo /usr/bin/env \
+            LINUX_EXT4_INSPECTOR_HELPER="$LINUX_EXT4_INSPECTOR_HELPER" \
+            LINUX_EXT4_PEER_NAMESPACE_BARRIER="$LINUX_EXT4_PEER_NAMESPACE_BARRIER" \
+            LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE="$LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE" \
+            LINUX_EXT4_TEST_MODE="$LINUX_EXT4_TEST_MODE" \
+            LINUX_EXT4_TEST_ROOT="$LINUX_EXT4_TEST_ROOT" \
+            PORTABLE_CODEX_NAMESPACE_PID_PATH="$namespace_pid_path" \
+            PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH="$namespace_pid_pending_path" \
+            PORTABLE_CODEX_NODE="$node_path" \
+            PORTABLE_CODEX_SERVICE_GID="$service_gid" \
+            PORTABLE_CODEX_SERVICE_UID="$service_uid" \
+            /usr/bin/unshare --mount --propagation private -- /bin/bash -c '
+              set -euo pipefail
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/archive-mounts" "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/mounts" "$LINUX_EXT4_TEST_ROOT/mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/mounts"
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/archive-mounts" -o PROPAGATION)" = private
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/mounts" -o PROPAGATION)" = private
+              umask 022
+              printf "%s\n" "$$" > "$PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH"
+              chmod 0644 "$PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH"
+              /usr/bin/mv -f -- "$PORTABLE_CODEX_NAMESPACE_PID_PENDING_PATH" "$PORTABLE_CODEX_NAMESPACE_PID_PATH"
+              umask 077
+              exec /usr/bin/setpriv \
+                --reuid "$PORTABLE_CODEX_SERVICE_UID" \
+                --regid "$PORTABLE_CODEX_SERVICE_GID" \
+                --init-groups -- \
+                "$PORTABLE_CODEX_NODE" --test integration/linux-ext4-physical-backend.mjs
+            '
+          node_status="$?"
+          if test "$node_status" -ne 0; then
+            kill "$probe_pid" 2>/dev/null || true
+          fi
+          wait "$probe_pid"
+          probe_status="$?"
+          set -e
+          test "$node_status" -eq 0
+          test "$probe_status" -eq 0
+          sudo rm -f -- \
+            "$namespace_pid_path" \
+            "$namespace_pid_pending_path" \
+            "$peer_ready_path" \
+            "$peer_ready_pending_path" \
+            "$peer_release_path" \
+            "$peer_release_pending_path"
+      - name: Capture the provider head and sparse transfer image
+        id: provider-state-head
+        env:
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          value="$(sudo jq -c '.providerStateHead' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          archive_mount_control="$(sudo jq -c '.archiveMountPublicationControlIdentity' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          archive_control="$(sudo jq -c '.archivePublicationControlIdentity' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          service_uid="$(sudo jq -r '.serviceUid' "$LINUX_EXT4_TEST_ROOT/transfer.json")"
+          test -n "$value"
+          test -n "$archive_mount_control"
+          test -n "$archive_control"
+          test "$service_uid" = "$(id -u)"
+          printf 'archive-mount-control=%s\n' "$archive_mount_control" >> "$GITHUB_OUTPUT"
+          printf 'archive-control=%s\n' "$archive_control" >> "$GITHUB_OUTPUT"
+          printf 'service-uid=%s\n' "$service_uid" >> "$GITHUB_OUTPUT"
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
+          sudo tar \
+            --acls \
+            --numeric-owner \
+            --sparse \
+            --xattrs \
+            -C /var/tmp \
+            -cf "$RUNNER_TEMP/linux-ext4-transfer.tar" \
+            "portable-codex-runtime-linux-ext4-${{ github.run_id }}"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/linux-ext4-transfer.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-ext4-transfer-${{ github.run_id }}
+          path: ${{ runner.temp }}/linux-ext4-transfer.tar
+          if-no-files-found: error
+          retention-days: 1
+      - name: Clean the scoped producer resources
+        if: always()
+        env:
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          case "$LINUX_EXT4_TEST_ROOT" in
+            /var/tmp/portable-codex-runtime-linux-ext4-[1-9]*) ;;
+            *) exit 1 ;;
+          esac
+          findmnt -rn -o TARGET | sort -r | while IFS= read -r target; do
+            case "$target" in
+              "$LINUX_EXT4_TEST_ROOT"/archive-mounts/*) sudo umount -- "$target" ;;
+              "$LINUX_EXT4_TEST_ROOT"/mounts/*) sudo umount -- "$target" ;;
+            esac
+          done
+          if test -d "$LINUX_EXT4_TEST_ROOT/images"; then
+            find "$LINUX_EXT4_TEST_ROOT/images" -maxdepth 1 -type f -name '*.img' -print0 |
+              while IFS= read -r -d '' image; do
+                sudo losetup -j "$image" | cut -d: -f1 |
+                  while IFS= read -r loop; do
+                    test -z "$loop" || sudo losetup -d "$loop"
+                  done
+              done
+          fi
+          sudo udevadm settle
+          sudo rm -f -- \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid" \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release.pending"
+          sudo rm -rf -- "$LINUX_EXT4_TEST_ROOT"
+
+  linux-ext4-consumer:
+    name: Linux ext4 cross-host consumer
+    needs: linux-ext4-producer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install the privileged ext4 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes acl build-essential e2fsprogs libcap2-bin udev util-linux
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            native/linux-ext4-inspector.c \
+            -o "$RUNNER_TEMP/linux-ext4-inspector"
+          sudo groupadd --system portable-codex-ext4
+          sudo usermod --append --groups portable-codex-ext4 "$(id -un)"
+          sudo install -d -m 0755 /usr/local/libexec
+          sudo install -o root -g portable-codex-ext4 -m 0750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          sudo setcap cap_dac_override,cap_sys_admin=ep \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector
+          test "$(stat -c '%U:%G:%a' /usr/local/libexec/portable-codex-linux-ext4-inspector)" = \
+            'root:portable-codex-ext4:750'
+          getcap /usr/local/libexec/portable-codex-linux-ext4-inspector |
+            grep -Fx '/usr/local/libexec/portable-codex-linux-ext4-inspector cap_dac_override,cap_sys_admin=ep'
+          if sudo -u nobody test -x /usr/local/libexec/portable-codex-linux-ext4-inspector; then
+            exit 1
+          fi
+          set +e
+          sudo /usr/local/libexec/portable-codex-linux-ext4-inspector
+          root_identity_status="$?"
+          set -e
+          test "$root_identity_status" -eq 69
+          sudo install -o root -g portable-codex-ext4 -m 4750 \
+            "$RUNNER_TEMP/linux-ext4-inspector" \
+            /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test -u /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          set +e
+          sg portable-codex-ext4 -c \
+            '/usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative'
+          identity_status="$?"
+          set -e
+          sudo rm -f /usr/local/libexec/portable-codex-linux-ext4-inspector-setuid-negative
+          test "$identity_status" -eq 69
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-ext4-transfer-${{ github.run_id }}
+          path: ${{ runner.temp }}/linux-ext4-transfer
+      - name: Restore the sparse transfer image
+        run: |
+          sudo tar \
+            --acls \
+            --numeric-owner \
+            --same-owner \
+            --sparse \
+            --xattrs \
+            -C /var/tmp \
+            -xf "$RUNNER_TEMP/linux-ext4-transfer/linux-ext4-transfer.tar"
+      - name: Reconcile, verify, reattach, and destroy on a new host
+        timeout-minutes: 15
+        env:
+          LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY: ${{ needs.linux-ext4-producer.outputs.archive-mount-publication-control-identity }}
+          LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY: ${{ needs.linux-ext4-producer.outputs.archive-publication-control-identity }}
+          LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
+          LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE: "1"
+          LINUX_EXT4_PRODUCER_UID: ${{ needs.linux-ext4-producer.outputs.service-uid }}
+          LINUX_EXT4_PROVIDER_STATE_HEAD: ${{ needs.linux-ext4-producer.outputs.provider-state-head }}
+          LINUX_EXT4_TEST_MODE: consumer
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          service_uid="$(id -u)"
+          service_gid="$(id -g)"
+          node_path="$(command -v node)"
+          test -d "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+          test -d "$LINUX_EXT4_TEST_ROOT/mounts"
+          sudo /usr/bin/env \
+            LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY="$LINUX_EXT4_ARCHIVE_MOUNT_PUBLICATION_CONTROL_IDENTITY" \
+            LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY="$LINUX_EXT4_ARCHIVE_PUBLICATION_CONTROL_IDENTITY" \
+            LINUX_EXT4_INSPECTOR_HELPER="$LINUX_EXT4_INSPECTOR_HELPER" \
+            LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE="$LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE" \
+            LINUX_EXT4_PRODUCER_UID="$LINUX_EXT4_PRODUCER_UID" \
+            LINUX_EXT4_PROVIDER_STATE_HEAD="$LINUX_EXT4_PROVIDER_STATE_HEAD" \
+            LINUX_EXT4_TEST_MODE="$LINUX_EXT4_TEST_MODE" \
+            LINUX_EXT4_TEST_ROOT="$LINUX_EXT4_TEST_ROOT" \
+            PORTABLE_CODEX_NODE="$node_path" \
+            PORTABLE_CODEX_SERVICE_GID="$service_gid" \
+            PORTABLE_CODEX_SERVICE_UID="$service_uid" \
+            /usr/bin/unshare --mount --propagation private -- /bin/bash -c '
+              set -euo pipefail
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/archive-mounts" "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/archive-mounts"
+              /usr/bin/mount --bind "$LINUX_EXT4_TEST_ROOT/mounts" "$LINUX_EXT4_TEST_ROOT/mounts"
+              /usr/bin/mount --make-rprivate "$LINUX_EXT4_TEST_ROOT/mounts"
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/archive-mounts" -o PROPAGATION)" = private
+              test "$(/usr/bin/findmnt -rn -M "$LINUX_EXT4_TEST_ROOT/mounts" -o PROPAGATION)" = private
+              exec /usr/bin/setpriv \
+                --reuid "$PORTABLE_CODEX_SERVICE_UID" \
+                --regid "$PORTABLE_CODEX_SERVICE_GID" \
+                --init-groups -- \
+                "$PORTABLE_CODEX_NODE" --test integration/linux-ext4-physical-backend.mjs
+            '
+      - name: Clean the scoped consumer resources
+        if: always()
+        env:
+          LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
+        run: |
+          case "$LINUX_EXT4_TEST_ROOT" in
+            /var/tmp/portable-codex-runtime-linux-ext4-[1-9]*) ;;
+            *) exit 1 ;;
+          esac
+          findmnt -rn -o TARGET | sort -r | while IFS= read -r target; do
+            case "$target" in
+              "$LINUX_EXT4_TEST_ROOT"/archive-mounts/*) sudo umount -- "$target" ;;
+              "$LINUX_EXT4_TEST_ROOT"/mounts/*) sudo umount -- "$target" ;;
+            esac
+          done
+          if test -d "$LINUX_EXT4_TEST_ROOT/images"; then
+            find "$LINUX_EXT4_TEST_ROOT/images" -maxdepth 1 -type f -name '*.img' -print0 |
+              while IFS= read -r -d '' image; do
+                sudo losetup -j "$image" | cut -d: -f1 |
+                  while IFS= read -r loop; do
+                    test -z "$loop" || sudo losetup -d "$loop"
+                  done
+              done
+          fi
+          sudo udevadm settle
+          sudo rm -f -- \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid" \
+            "${LINUX_EXT4_TEST_ROOT}.namespace-pid.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-ready.pending" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release" \
+            "${LINUX_EXT4_TEST_ROOT}.peer-release.pending"
+          sudo rm -rf -- "$LINUX_EXT4_TEST_ROOT"
