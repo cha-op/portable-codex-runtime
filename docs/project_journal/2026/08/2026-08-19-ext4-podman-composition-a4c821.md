@@ -57,6 +57,7 @@ superseded_by:
 - Driver and Podman authority extensions: `src/linux-ext4-image-driver.mjs`,
   `src/podman-writer-supervisor.mjs`
 - Unit coverage: `test/ext4-podman-attachment-binding.test.mjs`,
+  `test/ext4-podman-writer-integration.test.mjs`,
   `test/linux-ext4-image-driver.test.mjs`,
   `test/podman-writer-supervisor.test.mjs`
 - Linux producer/consumer coverage: `integration/ext4-podman-writer.mjs`,

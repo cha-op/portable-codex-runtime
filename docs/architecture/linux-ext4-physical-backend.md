@@ -660,7 +660,9 @@ that the child namespace sees each exact ext4 mount and the parent namespace
 does not when the privileged workflow gate runs. After committed attach and
 before detach, that same non-root producer Node process uses the initialized
 ext4-to-Podman binding to launch a real rootless Podman writer, verifies its
-owned `0600` marker, and stops it. The flow then detaches the writer root,
+owned `0600` marker, and stops it. Marker polling treats an existing partial
+write as transient until the bounded deadline rather than as immediate
+corruption. The flow then detaches the writer root,
 publishes and verifies a fresh checkpoint and restore destination, cleanly
 settles both images, and uploads the sparse raw images plus anchored receipts.
 The consumer remounts those same

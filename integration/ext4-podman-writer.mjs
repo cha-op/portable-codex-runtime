@@ -173,14 +173,21 @@ function stopInput(input, receipt) {
   });
 }
 
-async function waitForReadyMarker(path) {
+export async function waitForExt4PodmanReadyMarker(path, readMarker = readFile) {
   const deadline = Date.now() + 10_000;
   while (true) {
+    let contents;
+    let missingError = null;
     try {
-      assert.equal(await readFile(path, "utf8"), READY_MARKER);
-      return;
+      contents = await readMarker(path, "utf8");
     } catch (error) {
-      if (error?.code !== "ENOENT" || Date.now() >= deadline) throw error;
+      if (error?.code !== "ENOENT") throw error;
+      missingError = error;
+    }
+    if (contents === READY_MARKER) return;
+    if (Date.now() >= deadline) {
+      if (missingError !== null) throw missingError;
+      assert.equal(contents, READY_MARKER);
     }
     await delay(50);
   }
@@ -234,7 +241,7 @@ export async function runExt4PodmanWriterIntegration({
   const markerPath = `${attachment.rootPath}/podman-writer-ready`;
   assert.equal(typeof receipt.stopWriter, "function");
   try {
-    await waitForReadyMarker(markerPath);
+    await waitForExt4PodmanReadyMarker(markerPath);
     const marker = await lstat(markerPath);
     assert.equal(marker.isFile(), true);
     assert.equal(marker.uid, serviceUid);
@@ -252,3 +259,4 @@ export async function runExt4PodmanWriterIntegration({
 }
 
 Object.freeze(runExt4PodmanWriterIntegration);
+Object.freeze(waitForExt4PodmanReadyMarker);
