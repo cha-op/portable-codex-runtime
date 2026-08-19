@@ -188,6 +188,10 @@ jobs:
         env:
           LINUX_EXT4_INSPECTOR_HELPER: /usr/local/libexec/portable-codex-linux-ext4-inspector
           LINUX_EXT4_PEER_NAMESPACE_BARRIER: "1"
+          # This hosted job owns the complete rootless Podman engine for its
+          # service UID, so the conformance harness may retire its user-wide
+          # pause namespace after proving that the engine inventory is empty.
+          LINUX_EXT4_PODMAN_ENGINE_EXCLUSIVE: "1"
           LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE: "1"
           LINUX_EXT4_TEST_MODE: producer
           LINUX_EXT4_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-${{ github.run_id }}
@@ -254,6 +258,7 @@ jobs:
             HOME="$HOME" \
             LINUX_EXT4_INSPECTOR_HELPER="$LINUX_EXT4_INSPECTOR_HELPER" \
             LINUX_EXT4_PEER_NAMESPACE_BARRIER="$LINUX_EXT4_PEER_NAMESPACE_BARRIER" \
+            LINUX_EXT4_PODMAN_ENGINE_EXCLUSIVE="$LINUX_EXT4_PODMAN_ENGINE_EXCLUSIVE" \
             LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE="$LINUX_EXT4_PRIVATE_MOUNT_NAMESPACE" \
             LINUX_EXT4_TEST_MODE="$LINUX_EXT4_TEST_MODE" \
             LINUX_EXT4_TEST_ROOT="$LINUX_EXT4_TEST_ROOT" \

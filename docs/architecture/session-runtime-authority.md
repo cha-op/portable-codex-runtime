@@ -2246,6 +2246,12 @@ runtime identity to Podman's held FD and live mount in one non-root process.
 Access policy is checked independently; child-entry, content, and timestamp
 churn are not object replacement and remain allowed. The generic PostgreSQL
 deployment still owns separate gates and is not one whole-saga conformance run.
+The rootless Podman pause process is a separate filesystem-reference holder,
+not metadata churn. The conformance host therefore uses an exclusive service
+UID and Podman engine, proves the complete container and pod inventories empty
+after stop, and retires the user-wide pause namespace before ext4 detach. A
+shared engine cannot use this global release operation; production must own the
+whole engine lifecycle or provide another scoped namespace-release proof.
 
 The provider-state checkpoint above is a control-plane replay snapshot, not a
 physical image checkpoint, published checkpoint artifact, or content root.

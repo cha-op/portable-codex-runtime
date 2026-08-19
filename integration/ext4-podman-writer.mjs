@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
+import { execFile } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
 
 import {
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
@@ -12,9 +16,198 @@ import {
 
 const READY_MARKER = "ready\n";
 const SUPERVISOR_ID = "ext4-podman-composition-v1";
+const PODMAN_EXECUTION_PATH = "/usr/bin:/bin";
+const PODMAN_COMMAND_TIMEOUT_MILLISECONDS = 30_000;
+const PODMAN_COMMAND_MAX_OUTPUT_BYTES = 1024 * 1024;
+const assertEqualIntrinsic = assert.equal;
+const assertNotEqualIntrinsic = assert.notEqual;
+const execFileAsync = promisify(execFile);
+const pathResolveIntrinsic = resolvePath;
+const reflectApplyIntrinsic = Reflect.apply;
+const reflectOwnKeysIntrinsic = Reflect.ownKeys;
+const arrayIsArrayIntrinsic = Array.isArray;
+const bufferConstructorIntrinsic = Buffer;
+const bufferFromIntrinsic = Buffer.from;
+const bufferToStringIntrinsic = Buffer.prototype.toString;
+const jsonParseIntrinsic = JSON.parse;
+const objectAssignIntrinsic = Object.assign;
+const objectCreateIntrinsic = Object.create;
+const objectFreezeIntrinsic = Object.freeze;
+const objectGetOwnPropertyDescriptorIntrinsic =
+  Object.getOwnPropertyDescriptor;
+const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
+const objectHasOwnIntrinsic = Object.hasOwn;
+const objectPrototypeIntrinsic = Object.prototype;
+
+const ROOTLESS_NAMESPACE_CONFIGURATION_KEYS = Object.freeze([
+  "exclusiveRootlessEngine",
+  "podmanEnvironment",
+  "podmanExecutable",
+]);
+const PODMAN_ENVIRONMENT_KEYS = Object.freeze([
+  "HOME",
+  "LANG",
+  "XDG_RUNTIME_DIR",
+]);
+const COMMAND_RESULT_KEYS = Object.freeze(["stderr", "stdout"]);
+const CONTAINER_INVENTORY_ARGUMENTS = Object.freeze([
+  "--remote=false",
+  "ps",
+  "--all",
+  "--external",
+  "--no-trunc",
+  "--format=json",
+]);
+const POD_INVENTORY_ARGUMENTS = Object.freeze([
+  "--remote=false",
+  "pod",
+  "ps",
+  "--no-trunc",
+  "--format=json",
+]);
+const MIGRATE_ARGUMENTS = Object.freeze([
+  "--remote=false",
+  "system",
+  "migrate",
+]);
 
 function exact(value) {
-  return Object.freeze(Object.assign(Object.create(null), value));
+  return objectFreezeIntrinsic(
+    objectAssignIntrinsic(objectCreateIntrinsic(null), value),
+  );
+}
+
+function exactDataRecord(value, expectedKeys) {
+  assertEqualIntrinsic(value !== null && typeof value === "object", true);
+  assertEqualIntrinsic(arrayIsArrayIntrinsic(value), false);
+  const prototype = objectGetPrototypeOfIntrinsic(value);
+  assertEqualIntrinsic(
+    prototype === null || prototype === objectPrototypeIntrinsic,
+    true,
+  );
+  const keys = reflectOwnKeysIntrinsic(value);
+  assertEqualIntrinsic(keys.length, expectedKeys.length);
+  const normalized = objectCreateIntrinsic(null);
+  for (let index = 0; index < expectedKeys.length; index += 1) {
+    const key = expectedKeys[index];
+    const descriptor = objectGetOwnPropertyDescriptorIntrinsic(value, key);
+    assertEqualIntrinsic(descriptor !== undefined, true);
+    assertEqualIntrinsic(objectHasOwnIntrinsic(descriptor, "value"), true);
+    assertEqualIntrinsic(descriptor.enumerable, true);
+    normalized[key] = descriptor.value;
+  }
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    assertEqualIntrinsic(typeof key, "string");
+    let recognized = false;
+    for (
+      let expectedIndex = 0;
+      expectedIndex < expectedKeys.length;
+      expectedIndex += 1
+    ) {
+      if (key === expectedKeys[expectedIndex]) recognized = true;
+    }
+    assertEqualIntrinsic(recognized, true);
+  }
+  return objectFreezeIntrinsic(normalized);
+}
+
+function canonicalAbsolutePath(value) {
+  assertEqualIntrinsic(typeof value, "string");
+  assertEqualIntrinsic(value.length > 0 && value.length <= 4_095, true);
+  for (let index = 0; index < value.length; index += 1) {
+    assertEqualIntrinsic(value[index] !== "\0", true);
+    assertEqualIntrinsic(value[index] !== "\r", true);
+    assertEqualIntrinsic(value[index] !== "\n", true);
+  }
+  assertEqualIntrinsic(value[0], "/");
+  const encoded = reflectApplyIntrinsic(
+    bufferFromIntrinsic,
+    bufferConstructorIntrinsic,
+    [value, "utf8"],
+  );
+  assertEqualIntrinsic(encoded.length <= 4_095, true);
+  assertEqualIntrinsic(
+    reflectApplyIntrinsic(bufferToStringIntrinsic, encoded, ["utf8"]),
+    value,
+  );
+  assertEqualIntrinsic(pathResolveIntrinsic(value), value);
+  return value;
+}
+
+function commandResultWithEmptyStderr(value) {
+  const result = exactDataRecord(value, COMMAND_RESULT_KEYS);
+  assertEqualIntrinsic(typeof result.stderr, "string");
+  assertEqualIntrinsic(typeof result.stdout, "string");
+  assertEqualIntrinsic(result.stderr, "");
+  return result;
+}
+
+function assertEmptyInventory(value) {
+  const result = commandResultWithEmptyStderr(value);
+  const inventory = jsonParseIntrinsic(result.stdout);
+  assertEqualIntrinsic(arrayIsArrayIntrinsic(inventory), true);
+  assertEqualIntrinsic(inventory.length, 0);
+}
+
+// This teardown is intentionally narrower than the production supervisor.
+// The explicit opt-in asserts that this conformance process owns the complete
+// rootless engine. Empty container and pod inventories prove that retiring its
+// pause process cannot disrupt another workload before releasing cloned mounts.
+export async function retireExt4PodmanRootlessNamespaceForConformance(
+  configuration,
+  runCommand = execFileAsync,
+) {
+  const normalizedConfiguration = exactDataRecord(
+    configuration,
+    ROOTLESS_NAMESPACE_CONFIGURATION_KEYS,
+  );
+  assertEqualIntrinsic(normalizedConfiguration.exclusiveRootlessEngine, true);
+  assertEqualIntrinsic(typeof runCommand, "function");
+  const podmanExecutable = canonicalAbsolutePath(
+    normalizedConfiguration.podmanExecutable,
+  );
+  assertNotEqualIntrinsic(podmanExecutable, "/");
+  const configuredEnvironment = exactDataRecord(
+    normalizedConfiguration.podmanEnvironment,
+    PODMAN_ENVIRONMENT_KEYS,
+  );
+  const home = canonicalAbsolutePath(configuredEnvironment.HOME);
+  const runtimeDirectory = canonicalAbsolutePath(
+    configuredEnvironment.XDG_RUNTIME_DIR,
+  );
+  assertEqualIntrinsic(configuredEnvironment.LANG, "C.UTF-8");
+  const options = exact({
+    cwd: "/",
+    encoding: "utf8",
+    env: exact({
+      HOME: home,
+      LANG: "C.UTF-8",
+      PATH: PODMAN_EXECUTION_PATH,
+      XDG_RUNTIME_DIR: runtimeDirectory,
+    }),
+    killSignal: "SIGKILL",
+    maxBuffer: PODMAN_COMMAND_MAX_OUTPUT_BYTES,
+    shell: false,
+    timeout: PODMAN_COMMAND_TIMEOUT_MILLISECONDS,
+  });
+
+  assertEmptyInventory(await runCommand(
+    podmanExecutable,
+    CONTAINER_INVENTORY_ARGUMENTS,
+    options,
+  ));
+  assertEmptyInventory(await runCommand(
+    podmanExecutable,
+    POD_INVENTORY_ARGUMENTS,
+    options,
+  ));
+  const migrated = commandResultWithEmptyStderr(await runCommand(
+    podmanExecutable,
+    MIGRATE_ARGUMENTS,
+    options,
+  ));
+  assertEqualIntrinsic(migrated.stdout, "");
 }
 
 function measuredImage(imageDigest) {
@@ -259,4 +452,5 @@ export async function runExt4PodmanWriterIntegration({
 }
 
 Object.freeze(runExt4PodmanWriterIntegration);
+Object.freeze(retireExt4PodmanRootlessNamespaceForConformance);
 Object.freeze(waitForExt4PodmanReadyMarker);

@@ -40,6 +40,13 @@ superseded_by:
   supervisor coverage. The composed producer closes the ext4-to-Podman
   identity gap but does not claim power-loss recovery, automatic stale-writer
   fencing, or one whole-saga generic PostgreSQL deployment run.
+- Rootless Podman's pause process retains a real mount-namespace reference
+  after the exact container is stopped and removed. The dedicated hosted
+  producer now proves its complete container and pod inventories empty, then
+  performs a bounded user-wide namespace retirement before ext4 detach and
+  makes no later Podman call. This is a conformance-host lifecycle barrier,
+  not a generic supervisor operation: a shared UID or engine cannot use it,
+  and final quiescence still requires the native loop-detach receipt.
 
 ## Next Steps
 

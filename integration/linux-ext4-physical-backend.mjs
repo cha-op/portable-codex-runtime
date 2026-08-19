@@ -38,6 +38,7 @@ import {
   StoppedDirectoryPublication,
 } from "../src/stopped-directory-publication.mjs";
 import {
+  retireExt4PodmanRootlessNamespaceForConformance,
   runExt4PodmanWriterIntegration,
 } from "./ext4-podman-writer.mjs";
 
@@ -66,6 +67,8 @@ const HELPER = resolve(
     "/usr/local/libexec/portable-codex-linux-ext4-inspector",
 );
 const PODMAN = resolve(process.env.PODMAN_EXECUTABLE ?? "/usr/bin/podman");
+const PODMAN_ENGINE_EXCLUSIVE =
+  process.env.LINUX_EXT4_PODMAN_ENGINE_EXCLUSIVE === "1";
 const PODMAN_WRITER_IMAGE_DIGEST =
   process.env.PODMAN_WRITER_IMAGE_DIGEST ?? null;
 const PODMAN_WRITER_IMAGE_REFERENCE =
@@ -823,17 +826,18 @@ async function produce() {
   // The composition protects the committed persistent identity, the held
   // dev/inode identity, and the exact access policy. The writer marker is
   // intentional child/content churn and must remain permitted.
+  const podmanEnvironment = exact({
+    HOME: process.env.HOME,
+    LANG: "C.UTF-8",
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+  });
   const podmanWriter = await runExt4PodmanWriterIntegration({
     attachment: podmanAttachment,
     configuredAttachmentRoot: fixed.directories.mounts,
     filesystemAuthority: fixed.filesystemAuthority,
     imageDigest: PODMAN_WRITER_IMAGE_DIGEST,
     imageReference: PODMAN_WRITER_IMAGE_REFERENCE,
-    podmanEnvironment: exact({
-      HOME: process.env.HOME,
-      LANG: "C.UTF-8",
-      XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
-    }),
+    podmanEnvironment,
     podmanExecutable: PODMAN,
     stateRoot: join(ROOT, "podman-state"),
   });
@@ -842,6 +846,14 @@ async function produce() {
   await syncFileAndDirectory(podmanWriter.markerPath);
   assert.deepEqual(await readFile(podmanWriter.markerPath), PODMAN_MARKER);
   assert.deepEqual(await readFile(payloadPath), PAYLOAD);
+  // This dedicated hosted engine has no remaining workload. Retiring its
+  // user-wide pause namespace must be the final Podman call before the ext4
+  // attachment and loop devices enter physical quiescence.
+  await retireExt4PodmanRootlessNamespaceForConformance({
+    exclusiveRootlessEngine: PODMAN_ENGINE_EXCLUSIVE,
+    podmanEnvironment,
+    podmanExecutable: PODMAN,
+  });
   await fixed.backend.lifecycleBackend.detachAttachment(
     detachRequest(attached, "001"),
     context(),

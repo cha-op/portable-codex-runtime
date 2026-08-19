@@ -594,9 +594,13 @@
   namespace. The producer now invokes the initialized ext4-to-Podman
   composition after attach and before detach, launches a real rootless Podman
   writer in that same non-root process, and carries its marker through the
-  clean transfer for consumer verification. The independent Podman job remains
-  as narrower supervisor coverage. These jobs do not make crash-prefix state
-  durable, revoke a stale remote writer automatically, or supply differential/
+  clean transfer for consumer verification. Before detach, the dedicated
+  producer proves its complete rootless container and pod inventories empty,
+  retires the user-wide Podman pause namespace, and relies on the native loop
+  receipt—not container stop alone—for physical quiescence. This release step
+  is forbidden on a shared UID or Podman engine. The independent Podman job
+  remains as narrower supervisor coverage. These jobs do not make crash-prefix
+  state durable, revoke a stale remote writer automatically, or supply differential/
   compressed export, encryption, retention, or registry trust. The next slice
   is terminal supervisor-state GC after PostgreSQL terminal commit and callback
   quiescence. Provider history retention remains separate and must preserve

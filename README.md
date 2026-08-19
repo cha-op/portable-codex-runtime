@@ -559,7 +559,12 @@ visible in that child namespace and absent from its parent when the privileged
 workflow gate runs. After the committed attach and before detach, that same
 Linux producer job authorizes a real rootless Podman writer through the
 initialized ext4 backend in the same non-root Node process. The flow then
-cleanly detaches and transfers both images. On the consumer host, the
+proves the dedicated runner's rootless container and pod inventories empty,
+retires Podman's user-wide pause namespace, and issues no further Podman
+command before it cleanly detaches and transfers both images. This retirement
+is safe only for an exclusive service UID and Podman engine; container
+stop/removal alone does not prove that no namespace still references the ext4
+filesystem. On the consumer host, the
 externally anchored archive mount-root tuple makes the first remount
 verification-only; the distinct artifact-child tuple authorizes publication
 verification for that exact owned root. The composition matches the provider's

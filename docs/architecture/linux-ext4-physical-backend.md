@@ -632,13 +632,26 @@ and keep the deployment plus every helper or broker invocation in that
 namespace until shutdown. Creating the namespace inside one helper call is
 invalid because its mounts would disappear when that helper exits.
 
+Rootless Podman's pause process retains the user and mount namespaces created
+by the first `podman unshare`. When that creation happens after the ext4 mounts
+exist, the pause namespace holds real references to those filesystems even
+after the exact writer container is stopped and removed. A deployment that
+uses this shape must give the service an exclusive Unix UID and Podman engine,
+prove the complete container and pod inventories empty after every Podman
+callback is quiescent, and retire the user-wide pause namespace before physical
+ext4 quiescence. `podman system migrate` is not a container-scoped operation
+and is forbidden for a shared UID or shared engine. A different production
+host must instead supply a separately proved scoped namespace-release design.
+
 Shutdown order is also host-owned:
 
 1. stop the generic deployment and wait for admission and settlement drain;
-2. enumerate provider state and quiesce every non-destroyed session image;
-3. quiesce the archive image and the Podman supervisor state; and
-4. close the dedicated provider-state PostgreSQL pool; then
-5. drain any namespace-entered helper broker and let the service process exit
+2. after proving an exclusive Podman engine empty, retire its rootless pause
+   namespace without issuing another Podman command;
+3. enumerate provider state and quiesce every non-destroyed session image;
+4. quiesce the archive image and the Podman supervisor state; and
+5. close the dedicated provider-state PostgreSQL pool; then
+6. drain any namespace-entered helper broker and let the service process exit
    the private mount namespace.
 
 The generic deployment cannot prove that collaborators owned outside its
@@ -662,7 +675,9 @@ before detach, that same non-root producer Node process uses the initialized
 ext4-to-Podman binding to launch a real rootless Podman writer, verifies its
 owned `0600` marker, and stops it. Marker polling treats an existing partial
 write as transient until the bounded deadline rather than as immediate
-corruption. The flow then detaches the writer root,
+corruption. The dedicated hosted runner next proves the complete rootless
+container and pod inventories empty and retires the user-wide pause namespace;
+no later Podman call can recreate it. The flow then detaches the writer root,
 publishes and verifies a fresh checkpoint and restore destination, cleanly
 settles both images, and uploads the sparse raw images plus anchored receipts.
 The consumer remounts those same
@@ -682,6 +697,10 @@ same-process authority boundary. It does not assemble the generic deployment's
 independent PostgreSQL gates into one whole-saga run.
 
 These jobs prove clean detach, remount, publication, and cross-host identity.
+The namespace retirement only releases the hosted runner's exclusive Podman
+engine. Final physical quiescence still comes from the native loop receipt:
+unused device identity, advanced disk sequence, and absent sysfs backing.
+Container stop/removal alone is not loop-detach evidence.
 They do not simulate sudden power loss, storage-controller cache loss,
 partitioned stale-writer revocation, or an automatic force fence. Crash-prefix
 checkpointing, epoch-enforced fencing, differential export, compression,
