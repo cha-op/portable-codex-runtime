@@ -9,7 +9,7 @@ import {
   open,
   unlink,
 } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
 const { isPromise, isProxy } = utilTypes;
@@ -39,6 +39,7 @@ const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectHasOwnIntrinsic = Object.hasOwn;
 const objectPrototype = Object.prototype;
+const pathBasenameIntrinsic = basename;
 const promiseResolveIntrinsic = Promise.resolve;
 const PromiseConstructor = Promise;
 const pathDirnameIntrinsic = dirname;
@@ -53,6 +54,7 @@ const stringIncludesIntrinsic = String.prototype.includes;
 const stringIndexOfIntrinsic = String.prototype.indexOf;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
+const runtimePlatform = process.platform;
 
 function callIntrinsic(intrinsic, receiver, arguments_) {
   return reflectApplyIntrinsic(intrinsic, receiver, arguments_);
@@ -121,6 +123,7 @@ const FAULT_HOOK_KEYS = Object.freeze([
   "afterCollectionTerminalRevalidation",
   "afterCollectionTerminalUnlink",
   "afterCollectionFinalDirectorySync",
+  "afterPrivateParentHold",
 ]);
 const STATUS_REVISION = Object.freeze({
   created: 1,
@@ -541,11 +544,105 @@ async function openPrivateParent(root) {
   }
 }
 
+async function assertPrivateParentHeld(parent) {
+  const held = await parent.handle.stat({ bigint: true });
+  const current = await validateParentChain(parent.path);
+  ensure(
+    safeDirectoryStat(held) &&
+      safeDirectoryStat(current) &&
+      sameIdentity(parent.identity, held) &&
+      sameIdentity(parent.identity, current),
+    "podman_writer_state_io_failed",
+  );
+}
+
+async function rootAbsentFromHeldParent(root, parent) {
+  let descriptorHandle;
+  try {
+    let path = root;
+    if (runtimePlatform === "linux") {
+      const descriptor = parent.handle.fd;
+      ensure(
+        numberIsSafeIntegerIntrinsic(descriptor) && descriptor >= 0,
+        "podman_writer_state_io_failed",
+      );
+      const name = pathBasenameIntrinsic(root);
+      ensure(
+        name.length > 0 &&
+          name !== "." &&
+          name !== ".." &&
+          pathDirnameIntrinsic(root) === parent.path,
+        "podman_writer_state_io_failed",
+      );
+      const descriptorPath = `/proc/self/fd/${descriptor}`;
+      descriptorHandle = await open(
+        descriptorPath,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY,
+      );
+      const descriptorStat = await descriptorHandle.stat({ bigint: true });
+      const parentStat = await parent.handle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(descriptorStat) &&
+          safeDirectoryStat(parentStat) &&
+          sameIdentity(parent.identity, descriptorStat) &&
+          sameIdentity(parent.identity, parentStat),
+        "podman_writer_state_io_failed",
+      );
+      const anchoredDescriptor = descriptorHandle.fd;
+      ensure(
+        numberIsSafeIntegerIntrinsic(anchoredDescriptor) &&
+          anchoredDescriptor >= 0,
+        "podman_writer_state_io_failed",
+      );
+      path = `/proc/self/fd/${anchoredDescriptor}/${name}`;
+    }
+    try {
+      await lstat(path, { bigint: true });
+      return false;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return true;
+      throw error;
+    }
+  } finally {
+    if (descriptorHandle) {
+      try {
+        await descriptorHandle.close();
+      } catch {
+        fail("podman_writer_state_io_failed");
+      }
+    }
+  }
+}
+
+// The protected properties for a missing root are the held parent object's
+// identity, its access policy, and the stability/durability of the missing
+// child entry. Linux can query the child through a validated clone of the held
+// fd. Node exposes no portable fstatat, so other hosts, including macOS,
+// bracket the pathname query with exact held versus named-parent identity and
+// policy checks. Parent stat timestamp churn is not mutation evidence and is
+// intentionally ignored. The non-Linux bracket detects one-way replacement;
+// it does not claim to exclude an active same-uid ABA.
+async function assertRootAbsentHeld(root, parent, faultHooks) {
+  ensure(
+    await rootAbsentFromHeldParent(root, parent),
+    "podman_writer_state_io_failed",
+  );
+  await assertPrivateParentHeld(parent);
+  await parent.handle.sync();
+  await runFaultHook(faultHooks, "afterParentDirectorySync");
+  ensure(
+    await rootAbsentFromHeldParent(root, parent),
+    "podman_writer_state_io_failed",
+  );
+  await assertPrivateParentHeld(parent);
+}
+
 async function heldPrivateDirectory(root, { create }, faultHooks) {
   let handle;
   let parent;
   try {
     parent = await openPrivateParent(root);
+    await runFaultHook(faultHooks, "afterPrivateParentHold");
     let created = false;
     if (create) {
       try {
@@ -561,6 +658,7 @@ async function heldPrivateDirectory(root, { create }, faultHooks) {
       before = await lstat(root, { bigint: true });
     } catch (error) {
       if (!create && errorCode(error) === "ENOENT") {
+        await assertRootAbsentHeld(root, parent, faultHooks);
         await parent.handle.close();
         return null;
       }
@@ -586,14 +684,7 @@ async function heldPrivateDirectory(root, { create }, faultHooks) {
         sameIdentity(before, current),
       "podman_writer_state_io_failed",
     );
-    const parentHeld = await parent.handle.stat({ bigint: true });
-    const parentCurrent = await validateParentChain(parent.path);
-    ensure(
-      safeDirectoryStat(parentHeld) &&
-        sameIdentity(parent.identity, parentHeld) &&
-        sameIdentity(parent.identity, parentCurrent),
-      "podman_writer_state_io_failed",
-    );
+    await assertPrivateParentHeld(parent);
     const heldDirectory = callIntrinsic(objectFreezeIntrinsic, Object, [
       {
         handle,

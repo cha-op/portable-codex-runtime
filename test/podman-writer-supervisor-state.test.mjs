@@ -10,6 +10,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -545,6 +546,94 @@ test("an absent retry fsyncs the state root before completing", async (t) => {
   assert.equal(receipt.status, "absent");
   assert.equal(finalSyncs, 1);
   assert.deepEqual(await readdir(root), []);
+});
+
+test("a missing-root collection rejects parent replacement before reporting absence", async (t) => {
+  const sandbox = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-missing-root-race-test-"),
+  );
+  const parent = join(sandbox, "private-parent");
+  const displacedParent = join(sandbox, "displaced-private-parent");
+  const root = join(parent, "state");
+  await mkdir(parent, { mode: 0o700 });
+  t.after(() => rm(sandbox, { force: true, recursive: true }));
+  const writer = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  const records = await createStoppedChain(writer.state);
+  const before = (await readdir(root)).sort();
+
+  let replacements = 0;
+  const collector = createPodmanWriterSupervisorStateBundle(
+    exact({
+      faultHooks: exact({
+        async afterPrivateParentHold() {
+          await rename(parent, displacedParent);
+          await mkdir(parent, { mode: 0o700 });
+          replacements += 1;
+        },
+      }),
+      root,
+    }),
+  );
+
+  await assert.rejects(
+    collector.terminalCollector.collect(
+      exact({ terminalRecord: records[4] }),
+    ),
+    stateIoError,
+  );
+  assert.equal(replacements, 1);
+  const heldParentStat = await lstat(displacedParent, { bigint: true });
+  const namedParentStat = await lstat(parent, { bigint: true });
+  assert.equal(
+    heldParentStat.dev === namedParentStat.dev &&
+      heldParentStat.ino === namedParentStat.ino,
+    false,
+  );
+  await assert.rejects(lstat(root), (error) => error?.code === "ENOENT");
+  assert.deepEqual(
+    (await readdir(join(displacedParent, "state"))).sort(),
+    before,
+  );
+  const retained = createPodmanWriterSupervisorStateBundle(
+    exact({ root: join(displacedParent, "state") }),
+  );
+  assert.deepEqual(
+    await retained.state.read(
+      exact({ launchAttemptId: records[4].launchAttemptId }),
+    ),
+    records[4],
+  );
+});
+
+test("a missing-root collection requires parent fsync acknowledgement before absence", async (t) => {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-state-missing-root-sync-test-"),
+  );
+  const root = join(parent, "state");
+  t.after(() => rm(parent, { force: true, recursive: true }));
+  const terminalRecord = record("stopped");
+  const interrupted = createPodmanWriterSupervisorStateBundle(
+    exact({
+      faultHooks: exact({
+        afterParentDirectorySync() {
+          throw new Error("simulated missing-root parent fsync acknowledgement loss");
+        },
+      }),
+      root,
+    }),
+  );
+
+  await assert.rejects(
+    interrupted.terminalCollector.collect(exact({ terminalRecord })),
+    stateIoError,
+  );
+  await assert.rejects(lstat(root), (error) => error?.code === "ENOENT");
+
+  const cold = createPodmanWriterSupervisorStateBundle(exact({ root }));
+  assert.equal(
+    (await cold.terminalCollector.collect(exact({ terminalRecord }))).status,
+    "absent",
+  );
 });
 
 test("every collection unlink and fsync crash prefix is recoverable without state rollback", async (t) => {
@@ -1410,6 +1499,7 @@ test(
       .digest("hex");
     const specifications = [
       [crypto, "createHash"],
+      [path, "basename"],
       [path, "dirname"],
       [path, "isAbsolute"],
       [path, "resolve"],
@@ -1433,6 +1523,10 @@ test(
       }
       syncBuiltinESMExports();
       const state = createPodmanWriterSupervisorState(exact({ root }));
+      assert.equal(
+        await state.read(exact({ launchAttemptId: "launch-attempt-absent" })),
+        null,
+      );
       const claim = await state.claim(exact({ record: initial }));
       assert.equal(claim.created, true);
       assert.deepEqual(await readdir(root), [`${expectedKey}.0.json`]);
@@ -1450,7 +1544,7 @@ test(
       }
       syncBuiltinESMExports();
     }
-    assert.deepEqual([...poisonCalls.values()], [0, 0, 0, 0]);
+    assert.deepEqual([...poisonCalls.values()], [0, 0, 0, 0, 0]);
     const restarted = createPodmanWriterSupervisorState(exact({ root }));
     assert.deepEqual(
       await restarted.read(exact({ launchAttemptId: initial.launchAttemptId })),
