@@ -530,9 +530,22 @@
   soft watermarks rotate before the 64 MiB/65,535-frame hard envelope, and
   `inspectCapacity()` exposes both boundaries. The control-plane checkpoint
   retains all operations for exact replay plus current storage and destroyed
-  tombstones; it is not a physical image checkpoint. Consequently its size and
-  aggregate provider-state bytes grow with unique operations, and this slice
-  has no retention/GC path; hosts must monitor it. Producer outputs bind
+  tombstones; it is not a physical image checkpoint. Migration 010 now adds a
+  permanent PostgreSQL operation-index foundation whose canonical prepared and
+  committed records, prepared checksums, committed-checksum provenance, and
+  record digests share one serializable durable cut with the external head.
+  Native commits retain `indexed-frame-v1` plus the exact checksum; the schema
+  reserves `unavailable-adopted-v2` with a null checksum for rotated legacy
+  history. All seven head/operation checksum and digest columns use exact-length
+  `varchar(64)` storage; migration fails on a short blank-padded legacy head
+  value. Version 2 reads quarantine that legacy suffix, and bounded paging
+  admits at most four operations. Exact prepared history may gain its committed
+  suffix once; it cannot be rebound or deleted while the anchor remains, and
+  whole-table truncation is always rejected.
+  Production still serves version 2 provider state and retains the same
+  complete local history, so hosts must continue monitoring checkpoint and
+  aggregate provider-state bytes until the version 3 adoption cut. Producer
+  outputs bind
   the archive mount-root and artifact-child tuples separately; on the consumer,
   the former makes the first remount verification-only and the latter
   authorizes verification for the exact publication root. Two hosted Ubuntu
@@ -541,7 +554,8 @@
   namespace non-propagation. This remains a clean/manual-fencing
   boundary: it does not prove power-loss or crash-prefix recovery,
   automatically fence a stale writer, or implement differential export/
-  compression, encryption, retention, or registry trust. The initialized ext4
+  compression, encryption, production history offload, or registry trust. The
+  initialized ext4
   backend now binds committed attachment identity into Podman filesystem
   authority in the same non-root producer process. Provider persistent
   filesystem/file-handle identity and the driver's same-sample runtime
@@ -596,6 +610,8 @@
 
 - Runtime delivery plan:
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
+- Provider-state operation index:
+  `docs/project_journal/2026/08/2026-08-20-provider-state-operation-index-c7e4a1.md`
 - Linux ext4 physical backend:
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - ext4-to-Podman attachment composition:
@@ -737,6 +753,7 @@
   differential/compressed export, encryption, provider-state retention, or
   registry trust. Terminal supervisor-state GC safety after PostgreSQL terminal
   commit is complete for both healthy-session callback quiescence and exact
-  same-authorization session-loss overlap. Provider history retention is the
-  next independent slice and must preserve every current attachment's origin
-  operation.
+  same-authorization session-loss overlap. The provider operation-index
+  authority foundation is complete; the next independent slice switches the
+  provider to version 3 and must preserve every current attachment's origin
+  operation while removing permanent operation history from local checkpoints.

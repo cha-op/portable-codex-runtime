@@ -118,6 +118,10 @@ import {
   createPostgresFilesystemImageProviderHeadAnchor,
 } from "../src/postgres-filesystem-image-provider-head-anchor.mjs";
 import {
+  PostgresFilesystemImageProviderStateAuthorityError,
+  createPostgresFilesystemImageProviderStateAuthority,
+} from "../src/postgres-filesystem-image-provider-state-authority.mjs";
+import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
   filesystemImageProviderStateHeadChecksum,
 } from "../src/filesystem-image-provider-state.mjs";
@@ -214,6 +218,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 9,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/010-filesystem-image-provider-operations.sql",
+      import.meta.url,
+    ),
+    version: 10,
   }),
 ]);
 
@@ -590,6 +601,1308 @@ async function assertFilesystemImageProviderHeadAnchorSchemaAndStore(
   );
 }
 
+async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
+  pool,
+  store,
+  trackedMigrations,
+) {
+  await pool.query("DROP SCHEMA IF EXISTS session_authority CASCADE");
+  await installAuthorityMigrations(pool, trackedMigrations.slice(0, 9));
+
+  const providerId = "filesystem-image-ext4";
+  const anchorId = `operation-index-${randomUUID()}`;
+  const acknowledgementLossAnchorId =
+    `operation-index-ack-loss-${randomUUID()}`;
+  const adoptedAnchorId = `operation-index-adopted-v2-${randomUUID()}`;
+  const createHeadAnchor = (selectedStore, selectedAnchorId) =>
+    createPostgresFilesystemImageProviderHeadAnchor({
+      store: selectedStore,
+      providerId,
+      anchorId: selectedAnchorId,
+    });
+  const createAuthority = (selectedStore, selectedAnchorId) =>
+    createPostgresFilesystemImageProviderStateAuthority({
+      store: selectedStore,
+      providerId,
+      anchorId: selectedAnchorId,
+    });
+  const genesis = {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    baseHeadChecksum: null,
+    checkpointStateRevision: "0",
+    checkpointFrameCount: 0,
+    checkpointChecksum: null,
+    checkpointBytes: 0,
+    frameCount: 0,
+    lastChecksum: null,
+    ledgerBytes: 0,
+  };
+  const appendHead = (expectedHead, frameChecksum, ledgerBytes) => ({
+    contractVersion: expectedHead.contractVersion,
+    anchorRevision: (BigInt(expectedHead.anchorRevision) + 1n).toString(),
+    generation: expectedHead.generation,
+    stateRevision: (BigInt(expectedHead.stateRevision) + 1n).toString(),
+    baseHeadChecksum: expectedHead.baseHeadChecksum,
+    checkpointStateRevision: expectedHead.checkpointStateRevision,
+    checkpointFrameCount: expectedHead.checkpointFrameCount,
+    checkpointChecksum: expectedHead.checkpointChecksum,
+    checkpointBytes: expectedHead.checkpointBytes,
+    frameCount: expectedHead.frameCount + 1,
+    lastChecksum: frameChecksum,
+    ledgerBytes,
+  });
+  const rotationHead = (expectedHead) => {
+    const checkpointChecksum = "e".repeat(64);
+    return {
+      contractVersion: expectedHead.contractVersion,
+      anchorRevision: (BigInt(expectedHead.anchorRevision) + 1n).toString(),
+      generation: (BigInt(expectedHead.generation) + 1n).toString(),
+      stateRevision: expectedHead.stateRevision,
+      baseHeadChecksum:
+        filesystemImageProviderStateHeadChecksum(expectedHead),
+      checkpointStateRevision: expectedHead.stateRevision,
+      checkpointFrameCount: 2,
+      checkpointChecksum,
+      checkpointBytes: 768,
+      frameCount: 0,
+      lastChecksum: checkpointChecksum,
+      ledgerBytes: 0,
+    };
+  };
+  const preparedRecord = ({
+    checksum,
+    operationId,
+    revision,
+    storageId,
+  }) => ({
+    kind: "provision",
+    operationId,
+    preparedChecksum: checksum,
+    preparedStateRevision: revision,
+    request: { storageId },
+    state: "prepared",
+    storageId,
+    storageStateBefore: null,
+  });
+  const provisionedStorage = (storageId) => ({
+    storageId,
+    sessionId: "provider-operation-index-session",
+    backendId: "backend-ext4",
+    filesystemId: "filesystem-provider-operation-index",
+    imagePath: `/var/lib/portable-codex/${storageId}.img`,
+    lifecycle: "provisioned",
+    revision: "1",
+    writerEpoch: "0",
+    writerAuthority: null,
+    mount: {
+      mountPath: `/var/lib/portable-codex/${storageId}`,
+      imageIdentity: {
+        filesystemId: "filesystem-provider-operation-index",
+        objectIdentityScheme: "linux-dev-inode",
+        objectId: `${storageId}:image`,
+      },
+      rootIdentity: {
+        filesystemId: "filesystem-provider-operation-index",
+        objectIdentityScheme: "linux-dev-inode",
+        objectId: `${storageId}:root`,
+      },
+    },
+    publicationControlIdentity: {
+      filesystemId: "filesystem-provider-operation-index",
+      objectIdentityScheme: "linux-dev-inode",
+      objectId: `${storageId}:publication`,
+    },
+    dataRoot: null,
+    attachment: null,
+  });
+  const committedRecord = (prepared, revision) => ({
+    ...prepared,
+    state: "committed",
+    committedStateRevision: revision,
+    expectedStorage: null,
+    result: { status: "created" },
+    storageState: provisionedStorage(prepared.storageId),
+  });
+  const canonicalRecordJson = (value) => {
+    if (value === null || typeof value !== "object") {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map(canonicalRecordJson).join(",")}]`;
+    }
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${canonicalRecordJson(value[key])}`,
+      )
+      .join(",")}}`;
+  };
+
+  const legacyHead = appendHead(genesis, "1".repeat(64), 512);
+  assert.equal(
+    await createHeadAnchor(store, anchorId).compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: legacyHead,
+    }),
+    true,
+  );
+  const legacyBefore = await pool.query(
+    [
+      "SELECT contract_version, anchor_revision::pg_catalog.text AS anchor_revision,",
+      "state_revision::pg_catalog.text AS state_revision, last_checksum",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, anchorId],
+  );
+  const poisonAnchorId = `operation-index-bpchar-poison-${randomUUID()}`;
+  const poisonHead = await pool.query(
+    [
+      "INSERT INTO session_authority.filesystem_image_provider_heads",
+      "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
+      "state_revision, base_head_checksum, checkpoint_state_revision,",
+      "checkpoint_frame_count, checkpoint_checksum, checkpoint_bytes,",
+      "frame_count, last_checksum, ledger_bytes)",
+      "VALUES ($1, $2, 2, 1, 0, 1, NULL, 0, 0, NULL, 0, 1, $3, 1)",
+      "RETURNING last_checksum::pg_catalog.text AS last_checksum,",
+      "pg_catalog.octet_length(last_checksum) AS last_checksum_bytes",
+    ].join(" "),
+    [providerId, poisonAnchorId, "a"],
+  );
+  assert.deepEqual(poisonHead.rows, [
+    { last_checksum: "a", last_checksum_bytes: 64 },
+  ]);
+  await assert.rejects(store.migrate(), (error) => {
+    assert.ok(error instanceof PostgresSerializableStoreError);
+    assert.equal(error.code, "migration_failed");
+    assert.equal(error.commitState, "not-committed");
+    return true;
+  });
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 9).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  const rolledBackOperationTable = await pool.query(
+    [
+      "SELECT pg_catalog.to_regclass(",
+      "'session_authority.filesystem_image_provider_operations'",
+      ") AS value",
+    ].join(" "),
+  );
+  assert.equal(rolledBackOperationTable.rows[0].value, null);
+  const rolledBackHeadChecksumType = await pool.query(
+    [
+      "SELECT pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)",
+      "AS data_type",
+      "FROM pg_catalog.pg_attribute AS attribute",
+      "JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid",
+      "JOIN pg_catalog.pg_namespace AS namespace",
+      "ON namespace.oid = relation.relnamespace",
+      "WHERE namespace.nspname = 'session_authority'",
+      "AND relation.relname = 'filesystem_image_provider_heads'",
+      "AND attribute.attname = 'last_checksum'",
+      "AND attribute.attnum > 0 AND attribute.attisdropped = false",
+    ].join(" "),
+  );
+  assert.deepEqual(rolledBackHeadChecksumType.rows, [
+    { data_type: "character(64)" },
+  ]);
+  const retainedPoisonHead = await pool.query(
+    [
+      "SELECT last_checksum::pg_catalog.text AS last_checksum,",
+      "pg_catalog.octet_length(last_checksum) AS last_checksum_bytes",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, poisonAnchorId],
+  );
+  assert.deepEqual(retainedPoisonHead.rows, poisonHead.rows);
+  const removedPoisonHead = await pool.query(
+    [
+      "DELETE FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, poisonAnchorId],
+  );
+  assert.equal(removedPoisonHead.rowCount, 1);
+  assert.deepEqual(await store.migrate(), {
+    applied: true,
+    checksum: trackedMigrations.at(-1).checksum,
+    version: 10,
+  });
+  const legacyAfter = await pool.query(
+    [
+      "SELECT contract_version, anchor_revision::pg_catalog.text AS anchor_revision,",
+      "state_revision::pg_catalog.text AS state_revision, last_checksum",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, anchorId],
+  );
+  assert.deepEqual(legacyAfter.rows, legacyBefore.rows);
+  assert.deepEqual(legacyAfter.rows, [
+    {
+      contract_version: 2,
+      anchor_revision: "1",
+      state_revision: "1",
+      last_checksum: "1".repeat(64),
+    },
+  ]);
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_heads",
+        "SET last_checksum = $3",
+        "WHERE provider_id = $1 AND anchor_id = $2",
+      ].join(" "),
+      [providerId, anchorId, "a".repeat(63)],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_heads_last_checksum_format",
+      );
+      return true;
+    },
+  );
+  const legacyAfterRejectedShortChecksum = await pool.query(
+    [
+      "SELECT contract_version, anchor_revision::pg_catalog.text AS anchor_revision,",
+      "state_revision::pg_catalog.text AS state_revision, last_checksum",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, anchorId],
+  );
+  assert.deepEqual(legacyAfterRejectedShortChecksum.rows, legacyAfter.rows);
+  const checksumColumnTypes = await pool.query(
+    [
+      "SELECT relation.relname AS relation_name,",
+      "attribute.attname AS column_name,",
+      "pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)",
+      "AS data_type",
+      "FROM pg_catalog.pg_attribute AS attribute",
+      "JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid",
+      "JOIN pg_catalog.pg_namespace AS namespace",
+      "ON namespace.oid = relation.relnamespace",
+      "WHERE namespace.nspname = 'session_authority'",
+      "AND (",
+      "(relation.relname = 'filesystem_image_provider_heads'",
+      "AND attribute.attname IN (",
+      "'base_head_checksum', 'checkpoint_checksum', 'last_checksum'",
+      ")) OR",
+      "(relation.relname = 'filesystem_image_provider_operations'",
+      "AND attribute.attname IN (",
+      "'prepared_checksum', 'prepared_record_sha256',",
+      "'committed_checksum', 'committed_record_sha256'",
+      ")))",
+      "AND attribute.attnum > 0 AND attribute.attisdropped = false",
+      "ORDER BY relation.relname COLLATE pg_catalog.\"C\",",
+      "attribute.attname COLLATE pg_catalog.\"C\"",
+    ].join(" "),
+  );
+  assert.deepEqual(checksumColumnTypes.rows, [
+    {
+      relation_name: "filesystem_image_provider_heads",
+      column_name: "base_head_checksum",
+      data_type: "character varying(64)",
+    },
+    {
+      relation_name: "filesystem_image_provider_heads",
+      column_name: "checkpoint_checksum",
+      data_type: "character varying(64)",
+    },
+    {
+      relation_name: "filesystem_image_provider_heads",
+      column_name: "last_checksum",
+      data_type: "character varying(64)",
+    },
+    {
+      relation_name: "filesystem_image_provider_operations",
+      column_name: "committed_checksum",
+      data_type: "character varying(64)",
+    },
+    {
+      relation_name: "filesystem_image_provider_operations",
+      column_name: "committed_record_sha256",
+      data_type: "character varying(64)",
+    },
+    {
+      relation_name: "filesystem_image_provider_operations",
+      column_name: "prepared_checksum",
+      data_type: "character varying(64)",
+    },
+    {
+      relation_name: "filesystem_image_provider_operations",
+      column_name: "prepared_record_sha256",
+      data_type: "character varying(64)",
+    },
+  ]);
+  const operationIndexes = await pool.query(
+    [
+      "SELECT indexname",
+      "FROM pg_catalog.pg_indexes",
+      "WHERE schemaname = 'session_authority'",
+      "AND tablename = 'filesystem_image_provider_operations'",
+      "ORDER BY indexname COLLATE pg_catalog.\"C\"",
+    ].join(" "),
+  );
+  assert.deepEqual(operationIndexes.rows, [
+    { indexname: "filesystem_image_provider_operations_one_prepared_storage" },
+    { indexname: "filesystem_image_provider_operations_pkey" },
+    { indexname: "filesystem_image_provider_operations_prepared_revision_idx" },
+    { indexname: "filesystem_image_provider_operations_state_storage_idx" },
+  ]);
+  const operationTriggers = await pool.query(
+    [
+      "SELECT trigger.tgname, trigger.tgdeferrable, trigger.tginitdeferred",
+      "FROM pg_catalog.pg_trigger AS trigger",
+      "JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid",
+      "JOIN pg_catalog.pg_namespace AS namespace",
+      "ON namespace.oid = relation.relnamespace",
+      "WHERE namespace.nspname = 'session_authority'",
+      "AND relation.relname = 'filesystem_image_provider_operations'",
+      "AND trigger.tgisinternal = false",
+      "ORDER BY trigger.tgname COLLATE pg_catalog.\"C\"",
+    ].join(" "),
+  );
+  assert.deepEqual(operationTriggers.rows, [
+    {
+      tgname: "filesystem_image_provider_operations_delete_guard",
+      tgdeferrable: true,
+      tginitdeferred: true,
+    },
+    {
+      tgname: "filesystem_image_provider_operations_insert_guard",
+      tgdeferrable: false,
+      tginitdeferred: false,
+    },
+    {
+      tgname: "filesystem_image_provider_operations_truncate_guard",
+      tgdeferrable: false,
+      tginitdeferred: false,
+    },
+    {
+      tgname: "filesystem_image_provider_operations_update_guard",
+      tgdeferrable: false,
+      tginitdeferred: false,
+    },
+  ]);
+
+  const authority = createAuthority(store, anchorId);
+  const assertStateInvalid = (error) => {
+    assert.equal(
+      error instanceof PostgresFilesystemImageProviderStateAuthorityError,
+      true,
+    );
+    assert.equal(
+      error.code,
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    );
+    return true;
+  };
+  assert.deepEqual(await authority.readHead(), legacyHead);
+  const operationZ = `provider-operation-z-${randomUUID()}`;
+  const preparedZHead = appendHead(legacyHead, "a".repeat(64), 1024);
+  const preparedZ = preparedRecord({
+    checksum: preparedZHead.lastChecksum,
+    operationId: operationZ,
+    revision: preparedZHead.stateRevision,
+    storageId: `provider-storage-z-${randomUUID()}`,
+  });
+  assert.equal(
+    await authority.compareAndAdvance({
+      expectedHead: legacyHead,
+      nextHead: preparedZHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: preparedZHead.lastChecksum,
+        record: preparedZ,
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await authority.readOperation({
+      expectedHead: preparedZHead,
+      operationId: operationZ,
+    }),
+    preparedZ,
+  );
+  const readPreparedZStored = async () =>
+    pool.query(
+      [
+        "SELECT operation_id, record_contract_version, state, kind, storage_id,",
+        "prepared_state_revision::pg_catalog.text, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256,",
+        "committed_state_revision::pg_catalog.text,",
+        "committed_checksum_provenance, committed_checksum,",
+        "committed_record_bytes, committed_record_sha256",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, anchorId, operationZ],
+    );
+  const preparedZStored = await readPreparedZStored();
+  assert.equal(preparedZStored.rowCount, 1);
+  const assertPreparedZStoredUnchanged = async () => {
+    assert.deepEqual((await readPreparedZStored()).rows, preparedZStored.rows);
+  };
+  await assert.rejects(
+    pool.query(
+      [
+        "INSERT INTO session_authority.filesystem_image_provider_operations",
+        "(provider_id, anchor_id, operation_id, record_contract_version,",
+        "state, kind, storage_id, prepared_state_revision, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256)",
+        "SELECT provider_id, anchor_id, $4, record_contract_version, state,",
+        "kind, $5, prepared_state_revision, $6, prepared_record_bytes,",
+        "prepared_record_sha256",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [
+        providerId,
+        anchorId,
+        operationZ,
+        `provider-operation-short-prepared-checksum-${randomUUID()}`,
+        `provider-storage-short-prepared-checksum-${randomUUID()}`,
+        "a".repeat(63),
+      ],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_prepared_checksum_format",
+      );
+      return true;
+    },
+  );
+  await assertPreparedZStoredUnchanged();
+  await assert.rejects(
+    pool.query(
+      [
+        "INSERT INTO session_authority.filesystem_image_provider_operations",
+        "(provider_id, anchor_id, operation_id, record_contract_version,",
+        "state, kind, storage_id, prepared_state_revision, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256)",
+        "SELECT provider_id, anchor_id, $4, record_contract_version, state,",
+        "kind, $5, prepared_state_revision, prepared_checksum,",
+        "prepared_record_bytes, $6",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [
+        providerId,
+        anchorId,
+        operationZ,
+        `provider-operation-short-prepared-sha256-${randomUUID()}`,
+        `provider-storage-short-prepared-sha256-${randomUUID()}`,
+        "b".repeat(63),
+      ],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_prepared_sha256_format",
+      );
+      return true;
+    },
+  );
+  await assertPreparedZStoredUnchanged();
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_operations",
+        "SET state = 'committed',",
+        "committed_state_revision = prepared_state_revision + 1,",
+        "committed_checksum_provenance = 'indexed-frame-v1',",
+        "committed_checksum = $4, committed_record_bytes = prepared_record_bytes,",
+        "committed_record_sha256 = prepared_record_sha256",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, anchorId, operationZ, "c".repeat(63)],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_committed_record_shape",
+      );
+      return true;
+    },
+  );
+  await assertPreparedZStoredUnchanged();
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_operations",
+        "SET state = 'committed',",
+        "committed_state_revision = prepared_state_revision + 1,",
+        "committed_checksum_provenance = 'indexed-frame-v1',",
+        "committed_checksum = prepared_checksum,",
+        "committed_record_bytes = prepared_record_bytes,",
+        "committed_record_sha256 = $4",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, anchorId, operationZ, "d".repeat(63)],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_committed_record_shape",
+      );
+      return true;
+    },
+  );
+  await assertPreparedZStoredUnchanged();
+  await assert.rejects(
+    pool.query(
+      [
+        "INSERT INTO session_authority.filesystem_image_provider_operations",
+        "(provider_id, anchor_id, operation_id, record_contract_version,",
+        "state, kind, storage_id, prepared_state_revision, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256,",
+        "committed_state_revision, committed_checksum,",
+        "committed_record_bytes, committed_record_sha256)",
+        "SELECT provider_id, anchor_id, $4, record_contract_version,",
+        "'committed', kind, storage_id, prepared_state_revision,",
+        "prepared_checksum, prepared_record_bytes, prepared_record_sha256,",
+        "prepared_state_revision + 1, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [
+        providerId,
+        anchorId,
+        operationZ,
+        `provider-operation-direct-committed-${randomUUID()}`,
+      ],
+    ),
+    (error) => {
+      assert.equal(error.code, "55000");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_insert_prepared_only",
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "INSERT INTO session_authority.filesystem_image_provider_operations",
+        "(provider_id, anchor_id, operation_id, record_contract_version,",
+        "state, kind, storage_id, prepared_state_revision, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256)",
+        "SELECT provider_id, anchor_id, $4, record_contract_version, state,",
+        "kind, storage_id, prepared_state_revision, prepared_checksum,",
+        "prepared_record_bytes, prepared_record_sha256",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [
+        providerId,
+        anchorId,
+        operationZ,
+        `provider-operation-same-storage-${randomUUID()}`,
+      ],
+    ),
+    (error) => {
+      assert.equal(error.code, "23505");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_one_prepared_storage",
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_operations",
+        "SET state = 'committed'",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, anchorId, operationZ],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_committed_record_shape",
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_operations",
+        "SET kind = 'attach'",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, anchorId, operationZ],
+    ),
+    (error) => {
+      assert.equal(error.code, "55000");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_prepared_to_committed_only",
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "DELETE FROM session_authority.filesystem_image_provider_heads",
+        "WHERE provider_id = $1 AND anchor_id = $2",
+      ].join(" "),
+      [providerId, anchorId],
+    ),
+    (error) => {
+      assert.equal(error.code, "23503");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_head_fk",
+      );
+      return true;
+    },
+  );
+
+  const reusedOperationHead = appendHead(
+    preparedZHead,
+    "2".repeat(64),
+    1536,
+  );
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: preparedZHead,
+      nextHead: reusedOperationHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: reusedOperationHead.lastChecksum,
+        record: preparedRecord({
+          checksum: reusedOperationHead.lastChecksum,
+          operationId: operationZ,
+          revision: reusedOperationHead.stateRevision,
+          storageId: preparedZ.storageId,
+        }),
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(await authority.readHead(), preparedZHead);
+
+  const committedZHead = appendHead(preparedZHead, "b".repeat(64), 1536);
+  const committedZ = committedRecord(
+    preparedZ,
+    committedZHead.stateRevision,
+  );
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: preparedZHead,
+      nextHead: committedZHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-committed-v1",
+        frameChecksum: committedZHead.lastChecksum,
+        record: {
+          ...committedZ,
+          request: { ...committedZ.request, mismatch: true },
+        },
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(await authority.readHead(), preparedZHead);
+
+  const committedAcknowledgementLossPool =
+    commitAcknowledgementLossAfterQueryPool(
+      pool,
+      "filesystem image provider committed operation index",
+      (text) =>
+        text.startsWith(
+          "UPDATE session_authority.filesystem_image_provider_operations",
+        ),
+    );
+  const committedAcknowledgementLossStore = new PostgresSerializableStore({
+    dedicatedPool: committedAcknowledgementLossPool,
+    maxTransactionAttempts: 1,
+  });
+  await assert.rejects(
+    createAuthority(
+      committedAcknowledgementLossStore,
+      anchorId,
+    ).compareAndAdvance({
+      expectedHead: preparedZHead,
+      nextHead: committedZHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-committed-v1",
+        frameChecksum: committedZHead.lastChecksum,
+        record: committedZ,
+      },
+    }),
+    assertCommitOutcomeUncertain,
+  );
+  assert.equal(
+    committedAcknowledgementLossPool.didLoseAcknowledgement(),
+    true,
+  );
+  assert.deepEqual(await authority.readHead(), committedZHead);
+  assert.deepEqual(
+    await authority.readOperation({
+      expectedHead: committedZHead,
+      operationId: operationZ,
+    }),
+    committedZ,
+  );
+
+  const operationA = `provider-operation-A-${randomUUID()}`;
+  const preparedAHead = appendHead(committedZHead, "c".repeat(64), 2048);
+  const preparedA = preparedRecord({
+    checksum: preparedAHead.lastChecksum,
+    operationId: operationA,
+    revision: preparedAHead.stateRevision,
+    storageId: `provider-storage-A-${randomUUID()}`,
+  });
+  assert.equal(
+    await authority.compareAndAdvance({
+      expectedHead: committedZHead,
+      nextHead: preparedAHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: preparedAHead.lastChecksum,
+        record: preparedA,
+      },
+    }),
+    true,
+  );
+  const committedAHead = appendHead(preparedAHead, "d".repeat(64), 2560);
+  const committedA = committedRecord(
+    preparedA,
+    committedAHead.stateRevision,
+  );
+  assert.equal(
+    await authority.compareAndAdvance({
+      expectedHead: preparedAHead,
+      nextHead: committedAHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-committed-v1",
+        frameChecksum: committedAHead.lastChecksum,
+        record: committedA,
+      },
+    }),
+    true,
+  );
+
+  const firstPage = await authority.readOperationsPage({
+    afterOperationId: null,
+    expectedHead: committedAHead,
+    limit: 1,
+  });
+  assert.deepEqual(firstPage, {
+    operations: [committedA],
+    nextAfterOperationId: operationA,
+  });
+  assert.deepEqual(
+    await authority.readOperationsPage({
+      afterOperationId: firstPage.nextAfterOperationId,
+      expectedHead: committedAHead,
+      limit: 1,
+    }),
+    {
+      operations: [committedZ],
+      nextAfterOperationId: null,
+    },
+  );
+
+  const staleExpectedHead = {
+    ...committedAHead,
+    lastChecksum: "f".repeat(64),
+  };
+  const staleNextHead = appendHead(
+    staleExpectedHead,
+    "6".repeat(64),
+    3072,
+  );
+  const staleOperationId = `provider-operation-stale-${randomUUID()}`;
+  const stalePrepared = preparedRecord({
+    checksum: staleNextHead.lastChecksum,
+    operationId: staleOperationId,
+    revision: staleNextHead.stateRevision,
+    storageId: `provider-storage-stale-${randomUUID()}`,
+  });
+  assert.equal(
+    await authority.compareAndAdvance({
+      expectedHead: staleExpectedHead,
+      nextHead: staleNextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: staleNextHead.lastChecksum,
+        record: stalePrepared,
+      },
+    }),
+    false,
+  );
+  assert.deepEqual(await authority.readHead(), committedAHead);
+  assert.equal(
+    await authority.readOperation({
+      expectedHead: committedAHead,
+      operationId: staleOperationId,
+    }),
+    null,
+  );
+
+  const missingOperationId = `provider-operation-missing-${randomUUID()}`;
+  const missingPrepared = preparedRecord({
+    checksum: "7".repeat(64),
+    operationId: missingOperationId,
+    revision: committedAHead.stateRevision,
+    storageId: `provider-storage-missing-${randomUUID()}`,
+  });
+  const missingCommittedHead = appendHead(
+    committedAHead,
+    "8".repeat(64),
+    3072,
+  );
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: committedAHead,
+      nextHead: missingCommittedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-committed-v1",
+        frameChecksum: missingCommittedHead.lastChecksum,
+        record: committedRecord(
+          missingPrepared,
+          missingCommittedHead.stateRevision,
+        ),
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(await authority.readHead(), committedAHead);
+
+  const rotatedHead = rotationHead(committedAHead);
+  assert.equal(
+    await authority.compareAndAdvance({
+      expectedHead: committedAHead,
+      nextHead: rotatedHead,
+      transition: { contractVersion: 1, type: "rotate-v1" },
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await authority.readOperationsPage({
+      afterOperationId: null,
+      expectedHead: rotatedHead,
+      limit: 2,
+    }),
+    {
+      operations: [committedA, committedZ],
+      nextAfterOperationId: null,
+    },
+  );
+
+  const adoptedAuthority = createAuthority(store, adoptedAnchorId);
+  const adoptedPreparedHead = appendHead(genesis, "4".repeat(64), 512);
+  const adoptedOperationId = `provider-operation-adopted-${randomUUID()}`;
+  const adoptedPrepared = preparedRecord({
+    checksum: adoptedPreparedHead.lastChecksum,
+    operationId: adoptedOperationId,
+    revision: adoptedPreparedHead.stateRevision,
+    storageId: `provider-storage-adopted-${randomUUID()}`,
+  });
+  assert.equal(
+    await adoptedAuthority.compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: adoptedPreparedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: adoptedPreparedHead.lastChecksum,
+        record: adoptedPrepared,
+      },
+    }),
+    true,
+  );
+  const adoptedCommittedHead = appendHead(
+    adoptedPreparedHead,
+    "5".repeat(64),
+    1024,
+  );
+  const adoptedCommitted = committedRecord(
+    adoptedPrepared,
+    adoptedCommittedHead.stateRevision,
+  );
+  const adoptedCommittedBytes = Buffer.from(
+    canonicalRecordJson(adoptedCommitted),
+    "utf8",
+  );
+  const adoptedCommittedSha256 = createHash("sha256")
+    .update(
+      "portable-codex/filesystem-image-provider-state/operation-record/v1\0",
+      "utf8",
+    )
+    .update(adoptedCommittedBytes)
+    .digest("hex");
+  assert.equal(
+    await createHeadAnchor(store, adoptedAnchorId).compareAndAdvance({
+      expectedHead: adoptedPreparedHead,
+      nextHead: adoptedCommittedHead,
+    }),
+    true,
+  );
+  const adoptedUpdateQuery = [
+    "UPDATE session_authority.filesystem_image_provider_operations",
+    "SET state = 'committed', committed_state_revision = $4::pg_catalog.numeric,",
+    "committed_checksum_provenance = 'unavailable-adopted-v2',",
+    "committed_checksum = NULL, committed_record_bytes = $5,",
+    "committed_record_sha256 = $6",
+    "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+  ].join(" ");
+  const adoptedUpdateValues = [
+    providerId,
+    adoptedAnchorId,
+    adoptedOperationId,
+    adoptedCommittedHead.stateRevision,
+    adoptedCommittedBytes,
+    adoptedCommittedSha256,
+  ];
+  await assert.rejects(
+    pool.query(adoptedUpdateQuery, adoptedUpdateValues),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_adopted_v3_cut",
+      );
+      return true;
+    },
+  );
+  const adoptedCutHead = {
+    ...rotationHead(adoptedCommittedHead),
+    contractVersion: 3,
+  };
+  const adoptedClient = await pool.connect();
+  let adoptedTransactionOpen = false;
+  try {
+    await adoptedClient.query("BEGIN");
+    adoptedTransactionOpen = true;
+    const adoptedHeadUpdate = await adoptedClient.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_heads",
+        "SET contract_version = $3, anchor_revision = $4::pg_catalog.numeric,",
+        "generation = $5::pg_catalog.numeric, state_revision = $6::pg_catalog.numeric,",
+        "base_head_checksum = $7,",
+        "checkpoint_state_revision = $8::pg_catalog.numeric,",
+        "checkpoint_frame_count = $9::pg_catalog.int8, checkpoint_checksum = $10,",
+        "checkpoint_bytes = $11::pg_catalog.int8, frame_count = $12::pg_catalog.int4,",
+        "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8",
+        "WHERE provider_id = $1 AND anchor_id = $2",
+      ].join(" "),
+      [
+        providerId,
+        adoptedAnchorId,
+        adoptedCutHead.contractVersion,
+        adoptedCutHead.anchorRevision,
+        adoptedCutHead.generation,
+        adoptedCutHead.stateRevision,
+        adoptedCutHead.baseHeadChecksum,
+        adoptedCutHead.checkpointStateRevision,
+        adoptedCutHead.checkpointFrameCount,
+        adoptedCutHead.checkpointChecksum,
+        adoptedCutHead.checkpointBytes,
+        adoptedCutHead.frameCount,
+        adoptedCutHead.lastChecksum,
+        adoptedCutHead.ledgerBytes,
+      ],
+    );
+    assert.equal(adoptedHeadUpdate.rowCount, 1);
+    const adoptedUpdate = await adoptedClient.query(
+      adoptedUpdateQuery,
+      adoptedUpdateValues,
+    );
+    assert.equal(adoptedUpdate.rowCount, 1);
+    await adoptedClient.query("COMMIT");
+    adoptedTransactionOpen = false;
+  } finally {
+    if (adoptedTransactionOpen) await adoptedClient.query("ROLLBACK");
+    adoptedClient.release();
+  }
+  const adoptedRows = await pool.query(
+    [
+      "SELECT head.contract_version, head.checkpoint_state_revision::text,",
+      "operation.committed_checksum_provenance, operation.committed_checksum",
+      "FROM session_authority.filesystem_image_provider_heads AS head",
+      "JOIN session_authority.filesystem_image_provider_operations AS operation",
+      "ON operation.provider_id = head.provider_id",
+      "AND operation.anchor_id = head.anchor_id",
+      "WHERE head.provider_id = $1 AND head.anchor_id = $2",
+    ].join(" "),
+    [providerId, adoptedAnchorId],
+  );
+  assert.deepEqual(adoptedRows.rows, [
+    {
+      contract_version: 3,
+      checkpoint_state_revision: adoptedCommittedHead.stateRevision,
+      committed_checksum_provenance: "unavailable-adopted-v2",
+      committed_checksum: null,
+    },
+  ]);
+
+  const acknowledgementLossPool = commitAcknowledgementLossAfterQueryPool(
+    pool,
+    "filesystem image provider operation index",
+    (text) =>
+      text.startsWith(
+        "INSERT INTO session_authority.filesystem_image_provider_operations",
+      ),
+  );
+  const acknowledgementLossStore = new PostgresSerializableStore({
+    dedicatedPool: acknowledgementLossPool,
+    maxTransactionAttempts: 1,
+  });
+  const acknowledgementLossAuthority = createAuthority(
+    acknowledgementLossStore,
+    acknowledgementLossAnchorId,
+  );
+  const acknowledgementLossHead = appendHead(
+    genesis,
+    "9".repeat(64),
+    512,
+  );
+  const acknowledgementLossOperationId =
+    `provider-operation-ack-loss-${randomUUID()}`;
+  const acknowledgementLossPrepared = preparedRecord({
+    checksum: acknowledgementLossHead.lastChecksum,
+    operationId: acknowledgementLossOperationId,
+    revision: acknowledgementLossHead.stateRevision,
+    storageId: `provider-storage-ack-loss-${randomUUID()}`,
+  });
+  await assert.rejects(
+    acknowledgementLossAuthority.compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: acknowledgementLossHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: acknowledgementLossHead.lastChecksum,
+        record: acknowledgementLossPrepared,
+      },
+    }),
+    assertCommitOutcomeUncertain,
+  );
+  assert.equal(acknowledgementLossPool.didLoseAcknowledgement(), true);
+  const durableAcknowledgementLossAuthority = createAuthority(
+    store,
+    acknowledgementLossAnchorId,
+  );
+  assert.deepEqual(
+    await durableAcknowledgementLossAuthority.readHead(),
+    acknowledgementLossHead,
+  );
+  assert.deepEqual(
+    await durableAcknowledgementLossAuthority.readOperation({
+      expectedHead: acknowledgementLossHead,
+      operationId: acknowledgementLossOperationId,
+    }),
+    acknowledgementLossPrepared,
+  );
+
+  const stored = await pool.query(
+    [
+      "SELECT operation_id, state, prepared_checksum,",
+      "committed_checksum_provenance, committed_checksum,",
+      "prepared_record_bytes, committed_record_bytes,",
+      "octet_length(prepared_record_bytes) AS prepared_bytes,",
+      "octet_length(committed_record_bytes) AS committed_bytes,",
+      "prepared_record_sha256, committed_record_sha256",
+      "FROM session_authority.filesystem_image_provider_operations",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+      'ORDER BY operation_id COLLATE pg_catalog."C"',
+    ].join(" "),
+    [providerId, anchorId],
+  );
+  assert.equal(stored.rows.length, 2);
+  const expectedStored = new Map([
+    [
+      operationA,
+      {
+        committed: committedA,
+        committedChecksum: committedAHead.lastChecksum,
+        prepared: preparedA,
+      },
+    ],
+    [
+      operationZ,
+      {
+        committed: committedZ,
+        committedChecksum: committedZHead.lastChecksum,
+        prepared: preparedZ,
+      },
+    ],
+  ]);
+  for (const row of stored.rows) {
+    const expected = expectedStored.get(row.operation_id);
+    assert.notEqual(expected, undefined);
+    assert.equal(row.state, "committed");
+    assert.equal(row.prepared_checksum, expected.prepared.preparedChecksum);
+    assert.equal(row.committed_checksum_provenance, "indexed-frame-v1");
+    assert.equal(row.committed_checksum, expected.committedChecksum);
+    assert.equal(row.prepared_bytes > 0, true);
+    assert.equal(row.committed_bytes > row.prepared_bytes, true);
+    assert.deepEqual(
+      JSON.parse(row.prepared_record_bytes.toString("utf8")),
+      expected.prepared,
+    );
+    assert.deepEqual(
+      JSON.parse(row.committed_record_bytes.toString("utf8")),
+      expected.committed,
+    );
+    for (const [bytes, digest] of [
+      [row.prepared_record_bytes, row.prepared_record_sha256],
+      [row.committed_record_bytes, row.committed_record_sha256],
+    ]) {
+      assert.equal(
+        createHash("sha256")
+          .update(
+            "portable-codex/filesystem-image-provider-state/operation-record/v1\0",
+            "utf8",
+          )
+          .update(bytes)
+          .digest("hex"),
+        digest,
+      );
+    }
+  }
+
+  const permanentHistoryBeforeTruncate = await pool.query(
+    [
+      "SELECT",
+      "(SELECT pg_catalog.count(*)::pg_catalog.text",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1) AS head_count,",
+      "(SELECT pg_catalog.count(*)::pg_catalog.text",
+      "FROM session_authority.filesystem_image_provider_operations",
+      "WHERE provider_id = $1) AS operation_count",
+    ].join(" "),
+    [providerId],
+  );
+  assert.notEqual(permanentHistoryBeforeTruncate.rows[0].head_count, "0");
+  assert.notEqual(permanentHistoryBeforeTruncate.rows[0].operation_count, "0");
+  await assert.rejects(
+    pool.query(
+      "TRUNCATE TABLE session_authority.filesystem_image_provider_operations",
+    ),
+    (error) => {
+      assert.equal(error.code, "55000");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_truncate_forbidden",
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(
+    (await pool.query(
+      [
+        "SELECT",
+        "(SELECT pg_catalog.count(*)::pg_catalog.text",
+        "FROM session_authority.filesystem_image_provider_heads",
+        "WHERE provider_id = $1) AS head_count,",
+        "(SELECT pg_catalog.count(*)::pg_catalog.text",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1) AS operation_count",
+      ].join(" "),
+      [providerId],
+    )).rows,
+    permanentHistoryBeforeTruncate.rows,
+  );
+
+  await assert.rejects(
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_operations",
+        "SET kind = 'attach'",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, acknowledgementLossAnchorId, acknowledgementLossOperationId],
+    ),
+    (error) => {
+      assert.equal(error.code, "55000");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_prepared_to_committed_only",
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    pool.query(
+      [
+        "DELETE FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+      ].join(" "),
+      [providerId, acknowledgementLossAnchorId, acknowledgementLossOperationId],
+    ),
+    (error) => {
+      assert.equal(error.code, "23503");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_operations_delete_requires_teardown",
+      );
+      return true;
+    },
+  );
+
+  const cleanup = await pool.connect();
+  let cleanupTransactionOpen = false;
+  try {
+    await cleanup.query("BEGIN");
+    cleanupTransactionOpen = true;
+    await cleanup.query(
+      [
+        "DELETE FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4)",
+      ].join(" "),
+      [providerId, anchorId, acknowledgementLossAnchorId, adoptedAnchorId],
+    );
+    await cleanup.query(
+      [
+        "DELETE FROM session_authority.filesystem_image_provider_heads",
+        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4)",
+      ].join(" "),
+      [providerId, anchorId, acknowledgementLossAnchorId, adoptedAnchorId],
+    );
+    await cleanup.query("COMMIT");
+    cleanupTransactionOpen = false;
+  } finally {
+    if (cleanupTransactionOpen) await cleanup.query("ROLLBACK");
+    cleanup.release();
+  }
+}
+
 function frozenNullPrototypeRecord(entries) {
   return Object.freeze(Object.assign(Object.create(null), entries));
 }
@@ -963,7 +2276,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 9,
+    version: 10,
   });
   const registry = await pool.query(
     [
@@ -1317,7 +2630,7 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 9,
+    version: 10,
   });
   const legacyTerminal = await pool.query(
     [
@@ -4841,10 +6154,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 9);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 10);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
     );
 
     await pool.query(
@@ -4854,7 +6167,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 9,
+      version: 10,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -4867,7 +6180,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 9,
+      version: 10,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -4882,7 +6195,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 9,
+      version: 10,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -4894,9 +6207,14 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 9,
+      version: 10,
     });
     await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
+    await assertFilesystemImageProviderStateAuthoritySchemaAndStore(
+      pool,
+      store,
+      trackedMigrations,
+    );
     await assertLegacyRestoreV2MigrationGate(
       pool,
       store,
@@ -11712,7 +13030,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6, 7, 8, 9],
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         );
 
         const input = writerLaunchAttemptInput(

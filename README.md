@@ -649,12 +649,29 @@ at that envelope. The provider-state checkpoint is a control-plane exact-
 replay snapshot, not a physical ext4 image checkpoint or content root. It
 retains every prepared and committed operation, current storage state, and
 destroyed tombstone; exact replay therefore makes checkpoint and aggregate
-provider-state storage grow with unique operations. This slice supplies no
-provider-state retention or garbage collection, so hosts must monitor
-`inspectCapacity()` and the provider-state directory until a retention floor or
-PostgreSQL-indexed history is designed. Any future retention floor must
-preserve the origin operation for every current attachment so its committed
-identity remains reconstructable.
+provider-state storage grow with unique operations. Migration 010 now supplies
+the additive PostgreSQL operation-index foundation: canonical prepared and
+committed records, prepared frame checksums, explicit committed-checksum
+provenance, and domain-separated record digests advance atomically with the
+external head through one serializable compare-and-swap. Native indexed
+commits store `indexed-frame-v1` plus the exact checksum. Migration 010 also
+converts the three external-head checksum columns and defines all four new
+operation checksum/digest columns as exact-length `varchar(64)` values, so a
+short blank-padded legacy value blocks migration instead of becoming poisoned
+authority. It reserves `unavailable-adopted-v2` with a null checksum for rotated legacy
+history whose original committed-frame checksum no longer exists. The version
+2 adapter quarantines that legacy suffix; the version 3 adoption cut may admit
+it only inside the adopted checkpoint boundary. Reads page at most four
+operations so limit-plus-one materialization cannot exceed five pairs of
+4 MiB record columns. The relation is permanent while its anchor exists;
+`TRUNCATE` is always rejected, a prepared row may acquire its committed suffix
+exactly once, and row deletion requires same-transaction teardown of the whole
+anchor. This foundation does
+not switch the production version 2 provider or remove local history. Hosts
+must still monitor `inspectCapacity()` and the provider-state directory until
+the version 3 checkpoint/adoption cut makes PostgreSQL the replay index. That
+cut must preserve the origin operation for every current attachment so its
+committed identity remains reconstructable.
 
 The two-host Ubuntu conformance flow runs each Node process and helper in one
 long-lived private mount namespace with dedicated `rprivate` archive and

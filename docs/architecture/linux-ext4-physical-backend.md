@@ -408,15 +408,39 @@ lookup path, not an end-to-end constant-time open.
 
 This provider-state checkpoint is a control-plane replay snapshot. It is not a
 physical ext4 image checkpoint, a published checkpoint artifact, or a content
-root. Because exact replay is permanent in this version, every unique
-operation remains in later checkpoints even after it commits. The active log
-is bounded, but checkpoint size and aggregate persistent bytes therefore grow
-with unique operations. This slice has no retention floor or garbage
-collection; a production host must monitor `inspectCapacity()` and the
-provider-state filesystem. Future work may define an authority-safe retention
-floor or move exact replay history to an indexed PostgreSQL representation.
-That floor must preserve the origin operation for every current attachment so
-its committed attachment identity remains reconstructable.
+root. Because exact replay is permanent in version 2, every unique operation
+remains in later checkpoints even after it commits. The active log is bounded,
+but checkpoint size and aggregate persistent bytes therefore grow with unique
+operations.
+
+Migration 010 adds the first retention prerequisite without changing that
+production behavior. The permanent
+`session_authority.filesystem_image_provider_operations` relation stores each
+bounded canonical checkpoint-operation record as exact UTF-8 bytes plus a
+domain-separated SHA-256. Explicit metadata binds its kind, storage, logical
+revision, prepared checksum, and committed-checksum provenance. Native commits
+store `indexed-frame-v1` with the exact checksum. The schema separately
+represents a future rotated v2 adoption whose committed checksum is no longer
+recoverable; current version 2 reads reject that suffix. Migration 010 converts
+the three head checksums and defines the four operation checksum/digest columns
+as exact-length `varchar(64)` values, so short blank-padded legacy authority
+fails the migration. The new state-authority
+adapter compares the complete expected head, advances it, and inserts or
+commits the matching operation row in one serializable transaction. A failed
+head CAS writes no history; a later record mismatch rolls back the head. The
+prepared prefix is immutable, a committed row cannot change again, a row
+cannot be deleted while its anchor remains, and `TRUNCATE` is always rejected.
+Rotation changes only the head.
+Migration 010 permits head contract versions 2 and 3 but does not create a
+version 3 writer or alter existing version 2 rows.
+
+Production version 2 still has no retention floor or garbage collection, so a
+host must monitor `inspectCapacity()` and the provider-state filesystem. The
+next slice must atomically adopt complete version 2 history, make the
+PostgreSQL index the exact-replay source, and write version 3 checkpoints that
+retain current storage and destroyed tombstones without duplicating permanent
+operation history. It must preserve the origin operation for every current
+attachment so its committed attachment identity remains reconstructable.
 
 A prepared provision has not exposed a storage result. Its retry may adopt a
 currently valid control object on the same deterministic image and mount; the

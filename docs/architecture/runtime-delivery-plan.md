@@ -12,8 +12,11 @@ plane.
 - After each squash merge, update local `master` and create the next branch from
   that new commit.
 - Run the complete repository test suite for every pull request.
-- Require GitHub Codex review, an independent Codex PR review, and an offline
-  frozen-diff review before merge.
+- Require one fresh-context local Codex review and one exact current-head
+  `@codex review` request before merge. This repository does not require a
+  Claude lane.
+- Treat a trusted GitHub Codex clean comment on the latest commit as the
+  GitHub lane pass when the pull request has no unresolved finding.
 - Resolve every pull-request conversation before merge.
 - Keep credentials, untracked private files, and unrelated repositories outside
   review and evidence artifacts.
@@ -543,13 +546,22 @@ FD-bound raw-image lifecycle below host-owned `rprivate` carriers in one
 long-lived private mount namespace, externally anchored provider state,
 distinct publication-control identities, and two-host clean detach, transfer,
 and remount verification plus a producer peer-namespace non-propagation gate.
-Their trusted
-persistent-identity bridge and same-process conformance evidence remain
-pending. See
-`linux-ext4-physical-backend.md`. Later slices own power-loss/crash-prefix
-evidence, automatic stale-writer fencing, differential export/compression,
-content-addressed distribution, encryption, retention, registry trust, remote
-transport, and broader operational hardening.
+Their trusted persistent-identity bridge and same-process conformance evidence
+are complete. Migration 010 now adds the separate PostgreSQL provider-operation
+index authority foundation: an exact head CAS and prepared/committed record
+transition share one serializable durable cut, while existing version 2 heads
+retain their logical values and serving remains unchanged. Exact-length
+checksum storage rejects short blank-padded authority, and the permanent
+history table cannot be truncated.
+Native committed suffixes retain an exact frame
+checksum; unrecoverable rotated version 2 checksums have a separate null-
+checksum provenance that remains quarantined until a covering version 3
+checkpoint cut. The next slice owns that atomic version 2 adoption and the
+version 3 checkpoint cut that removes permanent operation history from local
+checkpoints. See `linux-ext4-physical-backend.md`. Later slices own
+power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
+export/compression, content-addressed distribution, encryption, registry trust,
+remote transport, and broader operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

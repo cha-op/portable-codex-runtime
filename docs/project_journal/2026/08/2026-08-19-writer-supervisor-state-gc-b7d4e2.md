@@ -166,10 +166,10 @@ superseded_by:
 
 ## Next Steps
 
-- Define an authority-safe provider-state exact-replay retention floor or move
-  permanent provider operation history to a PostgreSQL-indexed representation.
-  This independent track must preserve the origin operation for every current
-  attachment and does not inherit authority from supervisor-state collection.
+- Migration 010 now provides the independent PostgreSQL operation-index
+  authority foundation. Complete the version 3 provider-state adoption and
+  checkpoint cut so permanent exact replay moves out of local checkpoints
+  while every current attachment retains its origin operation.
 
 ## Evidence
 

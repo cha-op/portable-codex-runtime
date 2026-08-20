@@ -219,13 +219,30 @@
   cryptographic host
   attestation or protection against an administrator cloning both root and
   marker.
-- [pending] Third, define an authority-safe provider-state exact-replay
-  retention floor or move permanent operation history to a PostgreSQL-indexed
-  representation. This track has its own replay authority and does not inherit
-  authority from the bridge or supervisor retention. Its retention floor must
-  preserve the origin operation for every current attachment. Until then,
-  monitor checkpoint bytes, retained operation counts, and aggregate provider-
-  state storage; automatic active-log rotation is not retention or garbage
+- [done] Third-a, add the authority-safe PostgreSQL operation-index foundation.
+  Migration 010 stores bounded canonical prepared and committed record bytes,
+  the prepared checksum, explicit committed-checksum provenance, and domain-
+  separated record digests behind the external provider head. Native commits
+  use `indexed-frame-v1`; rotated legacy history may later use
+  `unavailable-adopted-v2` with a null checksum, but version 2 reads quarantine
+  that suffix. A serializable head CAS and record insert/update form one durable
+  cut; mismatch rolls back both. Prepared history may acquire its committed
+  suffix exactly once, and operation deletion requires same-transaction
+  teardown of the complete anchor; whole-table truncation is forbidden. The
+  migration also converts all external-head and operation checksum/digest
+  columns to exact-length `varchar(64)`, rejecting short blank-padded legacy
+  values. Existing valid version 2 heads remain unchanged and production
+  serving is unchanged.
+- [pending] Third-b, switch provider state to version 3. Under the provider
+  lock, validate and atomically adopt complete version 2 operation history into
+  the PostgreSQL index, then keep only current storage records and destroyed
+  tombstones in local checkpoints. Exact operation replay must come from the
+  permanent index, and each current attachment must retain and verify its
+  origin operation. The cut must place every unavailable legacy committed
+  suffix at or before the version 3 checkpoint boundary before it becomes
+  readable. Until that cut lands, monitor checkpoint bytes, retained
+  operation counts, and aggregate provider-state storage; automatic active-log
+  rotation and the additive index foundation are not retention or garbage
   collection.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer
