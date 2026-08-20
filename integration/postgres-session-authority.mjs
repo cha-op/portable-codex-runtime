@@ -1962,6 +1962,8 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     { indexname: "filesystem_image_provider_operations_pkey" },
     { indexname: "filesystem_image_provider_operations_prepared_revision_idx" },
     { indexname: "filesystem_image_provider_operations_state_storage_idx" },
+    { indexname: "fs_image_operations_committed_revision_uniq" },
+    { indexname: "fs_image_operations_prepared_revision_uniq" },
   ]);
   const committedStorageTailIndex = await pool.query(
     [
