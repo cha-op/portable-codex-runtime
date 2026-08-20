@@ -1010,7 +1010,36 @@ test("fails closed on expected-head conflict and validates input before SQL", as
 });
 
 test("rejects hostile request objects and noncanonical operation records", async () => {
-  const { authority, database } = createFixture();
+  const { authority, database, store } = createFixture();
+  const revokedOptions = Proxy.revocable(
+    {
+      store,
+      providerId: "filesystem-image-ext4",
+      anchorId: "host-primary",
+    },
+    {},
+  );
+  revokedOptions.revoke();
+  assert.throws(
+    () =>
+      createPostgresFilesystemImageProviderStateAuthority(
+        revokedOptions.proxy,
+      ),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_options",
+    ),
+  );
+  const revokedReadRequest = Proxy.revocable(
+    { expectedHead: GENESIS, operationId: "operation-1" },
+    {},
+  );
+  revokedReadRequest.revoke();
+  await assert.rejects(
+    authority.readOperation(revokedReadRequest.proxy),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
   await assert.rejects(
     authority.readOperation(
       new Proxy(
@@ -1036,6 +1065,23 @@ test("rejects hostile request objects and noncanonical operation records", async
   );
   const checksum = "a".repeat(64);
   const nextHead = appendHead(GENESIS, checksum, 128);
+  const revokedRecord = Proxy.revocable(preparedRecord({ checksum }), {});
+  revokedRecord.revoke();
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: GENESIS,
+      nextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: checksum,
+        record: revokedRecord.proxy,
+      },
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
   const record = preparedRecord();
   Object.defineProperty(record, "request", {
     enumerable: true,
@@ -1121,6 +1167,206 @@ test(
       Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
     }
     assert.equal(hugeArrayEnumerations, 0);
+  },
+);
+
+test(
+  "bounds plain object precursors immediately after own-key enumeration",
+  { concurrency: false },
+  async () => {
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(Reflect, "ownKeys");
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    const methodNames = ["every", "slice", "sort"];
+    const methodDescriptors = methodNames.map((name) =>
+      Object.getOwnPropertyDescriptor(Array.prototype, name),
+    );
+    for (const descriptor of methodDescriptors) {
+      assert.equal(typeof descriptor?.value, "function");
+    }
+    const oversizedPlainObject = {};
+    for (let index = 0; index < 20_000; index += 1) {
+      oversizedPlainObject[`field-${index}`] = null;
+    }
+    let oversizedKeys = null;
+    let oversizedObjectEnumerations = 0;
+    const downstreamLargeArrayCalls = [];
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(value) {
+        const keys = Reflect.apply(ownKeysDescriptor.value, this, [value]);
+        if (value === oversizedPlainObject) {
+          oversizedKeys = keys;
+          oversizedObjectEnumerations += 1;
+        }
+        return keys;
+      },
+    });
+    for (let index = 0; index < methodNames.length; index += 1) {
+      const name = methodNames[index];
+      const descriptor = methodDescriptors[index];
+      Object.defineProperty(Array.prototype, name, {
+        ...descriptor,
+        value(...args) {
+          if (this === oversizedKeys) {
+            downstreamLargeArrayCalls.push(name);
+            throw new Error(`oversized key array must not call ${name}`);
+          }
+          return Reflect.apply(descriptor.value, this, args);
+        },
+      });
+    }
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?plain-object-bound-test"
+      );
+      const database = new FakeAuthorityDatabase();
+      const store = new PostgresSerializableStore({
+        dedicatedPool: database.createPool(),
+        maxTransactionAttempts: 1,
+      });
+      const authority =
+        authorityModule.createPostgresFilesystemImageProviderStateAuthority({
+          store,
+          providerId: "filesystem-image-ext4",
+          anchorId: "host-primary",
+        });
+      const checksum = "a".repeat(64);
+      const nextHead = appendHead(GENESIS, checksum, 128);
+      await assert.rejects(
+        authority.compareAndAdvance({
+          expectedHead: GENESIS,
+          nextHead,
+          transition: {
+            contractVersion: 1,
+            type: "append-prepared-v1",
+            frameChecksum: checksum,
+            record: {
+              ...preparedRecord({ checksum }),
+              request: oversizedPlainObject,
+            },
+          },
+        }),
+        (error) =>
+          error instanceof
+            authorityModule.PostgresFilesystemImageProviderStateAuthorityError &&
+          error.code ===
+            "invalid_postgres_filesystem_image_provider_state_authority_request",
+      );
+      assert.equal(database.queries.length, 0);
+    } finally {
+      for (let index = 0; index < methodNames.length; index += 1) {
+        Object.defineProperty(
+          Array.prototype,
+          methodNames[index],
+          methodDescriptors[index],
+        );
+      }
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(oversizedObjectEnumerations, 1);
+    assert.deepEqual(downstreamLargeArrayCalls, []);
+  },
+);
+
+test(
+  "preflights canonical key bytes before copying or sorting plain objects",
+  { concurrency: false },
+  async () => {
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(Reflect, "ownKeys");
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    const methodNames = ["slice", "sort"];
+    const methodDescriptors = methodNames.map((name) =>
+      Object.getOwnPropertyDescriptor(Array.prototype, name),
+    );
+    for (const descriptor of methodDescriptors) {
+      assert.equal(typeof descriptor?.value, "function");
+    }
+    const sharedPrefix = "k".repeat(400 * 1024);
+    const overBudgetKeysObject = {
+      [`${sharedPrefix}-a`]: null,
+      [`${sharedPrefix}-b`]: null,
+    };
+    const nonPlainObject = Object.create({ inherited: true });
+    let overBudgetKeys = null;
+    let nonPlainObjectEnumerations = 0;
+    const keyArrayCopyOrSortCalls = [];
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(value) {
+        if (value === nonPlainObject) nonPlainObjectEnumerations += 1;
+        const keys = Reflect.apply(ownKeysDescriptor.value, this, [value]);
+        if (value === overBudgetKeysObject) overBudgetKeys = keys;
+        return keys;
+      },
+    });
+    for (let index = 0; index < methodNames.length; index += 1) {
+      const name = methodNames[index];
+      const descriptor = methodDescriptors[index];
+      Object.defineProperty(Array.prototype, name, {
+        ...descriptor,
+        value(...args) {
+          if (this === overBudgetKeys) {
+            keyArrayCopyOrSortCalls.push(name);
+            throw new Error(`over-budget key array must not call ${name}`);
+          }
+          return Reflect.apply(descriptor.value, this, args);
+        },
+      });
+    }
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?plain-object-key-byte-bound-test"
+      );
+      const database = new FakeAuthorityDatabase();
+      const store = new PostgresSerializableStore({
+        dedicatedPool: database.createPool(),
+        maxTransactionAttempts: 1,
+      });
+      const authority =
+        authorityModule.createPostgresFilesystemImageProviderStateAuthority({
+          store,
+          providerId: "filesystem-image-ext4",
+          anchorId: "host-primary",
+        });
+      const checksum = "a".repeat(64);
+      const nextHead = appendHead(GENESIS, checksum, 128);
+      const rejectRequest = async (request) => {
+        await assert.rejects(
+          authority.compareAndAdvance({
+            expectedHead: GENESIS,
+            nextHead,
+            transition: {
+              contractVersion: 1,
+              type: "append-prepared-v1",
+              frameChecksum: checksum,
+              record: {
+                ...preparedRecord({ checksum }),
+                request,
+              },
+            },
+          }),
+          (error) =>
+            error instanceof
+              authorityModule.PostgresFilesystemImageProviderStateAuthorityError &&
+            error.code ===
+              "invalid_postgres_filesystem_image_provider_state_authority_request",
+        );
+      };
+      await rejectRequest(nonPlainObject);
+      await rejectRequest(overBudgetKeysObject);
+      assert.equal(database.queries.length, 0);
+    } finally {
+      for (let index = 0; index < methodNames.length; index += 1) {
+        Object.defineProperty(
+          Array.prototype,
+          methodNames[index],
+          methodDescriptors[index],
+        );
+      }
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(nonPlainObjectEnumerations, 0);
+    assert.deepEqual(keyArrayCopyOrSortCalls, []);
   },
 );
 

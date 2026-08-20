@@ -65,6 +65,13 @@ const ADVANCE_KEYS = Object.freeze([
   "nextHead",
   "transition",
 ]);
+const ROTATION_TRANSITION_KEYS = Object.freeze(["contractVersion", "type"]);
+const APPEND_TRANSITION_KEYS = Object.freeze([
+  "contractVersion",
+  "type",
+  "frameChecksum",
+  "record",
+]);
 const PREPARED_RECORD_KEYS = Object.freeze([
   "kind",
   "operationId",
@@ -396,27 +403,39 @@ function ensure(condition, code) {
   if (!condition) fail(code);
 }
 
-function inspectPlainObject(value, code) {
+function inspectPlainObject(value, maximumKeys, code) {
+  ensure(
+    numberIsSafeIntegerIntrinsic(maximumKeys) && maximumKeys >= 0,
+    code,
+  );
   ensure(
     value !== null &&
       typeof value === "object" &&
-      !arrayIsArray(value) &&
-      !isProxyValue(value),
+      !isProxyValue(value) &&
+      !arrayIsArray(value),
     code,
   );
   let prototype;
-  let keys;
   try {
     prototype = objectGetPrototypeOf(value);
+  } catch {
+    fail(code);
+  }
+  ensure(prototype === objectPrototype || prototype === null, code);
+  let keys;
+  try {
     keys = reflectOwnKeys(value);
   } catch {
     fail(code);
   }
-  ensure(
-    (prototype === objectPrototype || prototype === null) &&
-      arrayEvery(keys, (key) => typeof key === "string"),
-    code,
-  );
+  // The JavaScript object ABI has no bounded own-key iterator, so the first
+  // Reflect.ownKeys array for a plain object is an unavoidable boundary.
+  // Reject it immediately when oversized so no second huge array, O(n log n)
+  // sort, descriptor walk, or recursive traversal follows. Bounding that first
+  // enumeration requires a future serialized token/byte ABI instead of an
+  // object-valued one.
+  ensure(keys.length <= maximumKeys, code);
+  ensure(arrayEvery(keys, (key) => typeof key === "string"), code);
   return keys;
 }
 
@@ -434,8 +453,7 @@ function ownDataValue(value, key, code) {
   return descriptor.value;
 }
 
-function exactDataObject(value, expectedKeys, code) {
-  const keys = inspectPlainObject(value, code);
+function exactDataObjectFromKeys(value, keys, expectedKeys, code) {
   ensure(
     keys.length === expectedKeys.length &&
       arrayEvery(keys, (key) => arrayIncludes(expectedKeys, key)),
@@ -447,6 +465,11 @@ function exactDataObject(value, expectedKeys, code) {
     normalized[key] = ownDataValue(value, key, code);
   }
   return normalized;
+}
+
+function exactDataObject(value, expectedKeys, code) {
+  const keys = inspectPlainObject(value, expectedKeys.length, code);
+  return exactDataObjectFromKeys(value, keys, expectedKeys, code);
 }
 
 function consumeBudget(state, bytes, code) {
@@ -483,6 +506,43 @@ function assertCanonicalArrayPrecursorCapacity(length, state, code) {
       state.budget.bytes <= MAX_CANONICAL_BYTES - minimumBytes,
     code,
   );
+}
+
+function canonicalObjectPrecursorBytes(keys, state, code) {
+  ensure(
+    numberIsSafeIntegerIntrinsic(keys.length) &&
+      keys.length >= 0 &&
+      keys.length <= MAX_CANONICAL_NODES - state.budget.nodes,
+    code,
+  );
+  let keyAndStructureBytes =
+    2 + mathMaxIntrinsic(0, keys.length - 1);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = assertLosslessString(keys[index], code);
+    const encodedKeyBytes = bufferByteLength(
+      jsonStringifyIntrinsic(key),
+      "utf8",
+    );
+    ensure(
+      numberIsSafeIntegerIntrinsic(encodedKeyBytes) &&
+        encodedKeyBytes >= 0 &&
+        encodedKeyBytes < MAX_CANONICAL_BYTES &&
+        keyAndStructureBytes <=
+          MAX_CANONICAL_BYTES - encodedKeyBytes - 1,
+      code,
+    );
+    keyAndStructureBytes += encodedKeyBytes + 1;
+  }
+  // Reserve at least one JSON byte and one node for every member value before
+  // any key-array copy or sort. The exact values consume their budget during
+  // the later recursive traversal.
+  ensure(
+    keys.length <= MAX_CANONICAL_BYTES - keyAndStructureBytes &&
+      state.budget.bytes <=
+        MAX_CANONICAL_BYTES - keyAndStructureBytes - keys.length,
+    code,
+  );
+  return keyAndStructureBytes;
 }
 
 function canonicalize(
@@ -575,19 +635,18 @@ function canonicalize(
     }
     return objectFreeze(result);
   }
-  const keys = inspectPlainObject(value, code);
-  consumeBudget(state, 2 + mathMaxIntrinsic(0, keys.length - 1), code);
+  const keys = inspectPlainObject(
+    value,
+    MAX_CANONICAL_NODES - state.budget.nodes,
+    code,
+  );
+  const precursorBytes = canonicalObjectPrecursorBytes(keys, state, code);
+  consumeBudget(state, precursorBytes, code);
   const result = {};
   const sortedKeys = callIntrinsic(arraySliceIntrinsic, keys, []);
   callIntrinsic(arraySortIntrinsic, sortedKeys, []);
   for (let index = 0; index < sortedKeys.length; index += 1) {
     const key = sortedKeys[index];
-    assertLosslessString(key, code, MAX_CANONICAL_BYTES - state.budget.bytes);
-    consumeBudget(
-      state,
-      bufferByteLength(jsonStringifyIntrinsic(key), "utf8") + 1,
-      code,
-    );
     objectDefineProperty(result, key, {
       enumerable: true,
       value: canonicalize(ownDataValue(value, key, code), code, nestedState()),
@@ -597,7 +656,6 @@ function canonicalize(
 }
 
 function canonicalObject(value, code) {
-  inspectPlainObject(value, code);
   return canonicalize(value, code);
 }
 
@@ -1046,12 +1104,13 @@ function assertStorageTransition(previous, next, kind, code) {
 }
 
 function normalizeOperationRecord(value, code) {
-  const keys = inspectPlainObject(value, code);
+  const keys = inspectPlainObject(value, COMMITTED_RECORD_KEYS.length, code);
   ensure(arrayIncludes(keys, "state"), code);
   const state = ownDataValue(value, "state", code);
   ensure(state === "prepared" || state === "committed", code);
-  const record = exactDataObject(
+  const record = exactDataObjectFromKeys(
     value,
+    keys,
     state === "prepared" ? PREPARED_RECORD_KEYS : COMMITTED_RECORD_KEYS,
     code,
   );
@@ -1716,13 +1775,14 @@ async function updateCommittedInTransaction(
 }
 
 function normalizeTransition(value, expectedHead, nextHead, code) {
-  const keys = inspectPlainObject(value, code);
+  const keys = inspectPlainObject(value, APPEND_TRANSITION_KEYS.length, code);
   ensure(arrayIncludes(keys, "type"), code);
   const type = ownDataValue(value, "type", code);
   if (type === "rotate-v1") {
-    const transition = exactDataObject(
+    const transition = exactDataObjectFromKeys(
       value,
-      ["contractVersion", "type"],
+      keys,
+      ROTATION_TRANSITION_KEYS,
       code,
     );
     ensure(
@@ -1738,9 +1798,10 @@ function normalizeTransition(value, expectedHead, nextHead, code) {
     });
   }
   ensure(type === "append-prepared-v1" || type === "append-committed-v1", code);
-  const transition = exactDataObject(
+  const transition = exactDataObjectFromKeys(
     value,
-    ["contractVersion", "type", "frameChecksum", "record"],
+    keys,
+    APPEND_TRANSITION_KEYS,
     code,
   );
   const frameChecksum = canonicalChecksum(transition.frameChecksum, code);
