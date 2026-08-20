@@ -570,8 +570,11 @@ head mutation after an early constraint check.
 Version 3 checkpoints retain current storage, destroyed tombstones, attachment
 origin IDs, and the live prepared recovery working set; committed operation
 history remains only in PostgreSQL and is available for arbitrary-age exact
-replay. Cold open proves the complete prepared set and each attached storage's
-committed origin against one exact head. Native writes continue to store
+replay. Cold open submits one compact projection to the contract-version-3
+runtime authority, which independently verifies the complete prepared set and
+every attached storage origin in one serializable transaction and returns a
+domain-separated receipt. That receipt is cached only for the same exact loaded
+head and authority instance. Native writes continue to store
 `indexed-frame-v1`; the one adoption transaction alone may store
 `unavailable-adopted-v2`. The full-array adoption contract is operationally
 capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical

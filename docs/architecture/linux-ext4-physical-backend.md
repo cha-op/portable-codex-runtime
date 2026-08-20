@@ -470,13 +470,19 @@ heads exclude revision zero, while a database-managed progress transaction ID
 prevents an early constraint check from authorizing another head mutation in
 the same transaction.
 
-Cold version 3 load pages the complete PostgreSQL prepared set and proves exact
-two-way equality with the local checkpoint. For every attached storage it
-reads the recorded origin operation and requires a committed `attach` or
-`restore-attach` whose storage state equals the current state after normalizing
-only the legal monotonic revision increase. It rereads the exact head after
-these checks. Exact operation replay is always served from PostgreSQL; local
-prepared frames are recovery material, not an alternate replay authority.
+Cold version 3 load builds a compact projection summary from the complete local
+prepared set and every attached storage origin. The contract-version-3 runtime
+authority verifies the exact head and completeness marker, independently pages
+and normalizes every PostgreSQL prepared row, and batches committed origin
+reads in one serializable transaction. Every origin must be a committed
+`attach` or `restore-attach` whose storage state equals the current state after
+normalizing only the legal monotonic revision increase. It returns a
+domain-separated receipt only when both projections match. The provider reuses
+that receipt only for the same authority instance, exact head, and unchanged
+loaded generation; cold reparsing, adoption, and uncertain acknowledgement
+readback require a new comparison. Exact operation replay is always served
+from PostgreSQL; local prepared frames are recovery material, not an alternate
+replay authority.
 
 Adoption writes candidate files before the database cut. Exact old-head
 readback removes an inert candidate, exact target-head plus manifest and full

@@ -779,6 +779,51 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       )
       .join(",")}}`;
   };
+  const projectionChecksum = (domain, values) => {
+    const hash = createHash("sha256")
+      .update(domain, "utf8")
+      .update(`${values.length}\0`, "utf8");
+    for (const value of values) {
+      const bytes = Buffer.from(canonicalRecordJson(value), "utf8");
+      hash.update(`${bytes.length}\0`, "utf8").update(bytes);
+    }
+    return hash.digest("hex");
+  };
+  const stableStorageProjectionChecksum = (storage) =>
+    createHash("sha256")
+      .update(
+        "portable-codex/filesystem-image-provider-state/stable-storage-projection/v1\0",
+        "utf8",
+      )
+      .update(canonicalRecordJson({ ...storage, revision: "1" }), "utf8")
+      .digest("hex");
+  const projectionReceipt = (request) => {
+    const attachmentOriginsChecksum = projectionChecksum(
+      "portable-codex/filesystem-image-provider-state/attachment-origin-projection/v1\0",
+      request.attachmentOrigins,
+    );
+    return {
+      contractVersion: 1,
+      projectionChecksum: createHash("sha256")
+        .update(
+          "portable-codex/filesystem-image-provider-state/authority-projection-receipt/v1\0",
+          "utf8",
+        )
+        .update(
+          canonicalRecordJson({
+            attachmentOriginCount: request.attachmentOrigins.length,
+            attachmentOriginsChecksum,
+            expectedHeadChecksum: filesystemImageProviderStateHeadChecksum(
+              request.expectedHead,
+            ),
+            preparedOperationCount: request.preparedOperationCount,
+            preparedProjectionChecksum: request.preparedProjectionChecksum,
+          }),
+          "utf8",
+        )
+        .digest("hex"),
+    };
+  };
   const operationMaterial = (record) => {
     const bytes = Buffer.from(canonicalRecordJson(record), "utf8");
     const sha256 = createHash("sha256")
@@ -2774,6 +2819,169 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       limit: 4,
     }),
     { operations: [], nextAfterStorageId: null },
+  );
+  const projectionOriginOperationId =
+    `provider-operation-projection-origin-${randomUUID()}`;
+  const projectionOriginPreparedHead = appendHead(
+    indexedCutHead,
+    "1".repeat(64),
+    512,
+  );
+  const projectionOriginPrepared = preparedRecord({
+    checksum: projectionOriginPreparedHead.lastChecksum,
+    kind: "attach",
+    operationId: projectionOriginOperationId,
+    revision: projectionOriginPreparedHead.stateRevision,
+    request: { storageId: committedZ.storageId },
+    storageId: committedZ.storageId,
+    storageStateBefore: committedZ.storageState,
+  });
+  assert.equal(
+    await indexedRuntimeAuthority.compareAndAdvance({
+      expectedHead: indexedCutHead,
+      nextHead: projectionOriginPreparedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: projectionOriginPreparedHead.lastChecksum,
+        record: projectionOriginPrepared,
+      },
+    }),
+    true,
+  );
+  const projectionAttachmentId = `attachment-${randomUUID()}`;
+  const projectionAttachment = {
+    attachmentId: projectionAttachmentId,
+    leaseId: `lease-${randomUUID()}`,
+    holderId: `holder-${randomUUID()}`,
+    fencingEpoch: "1",
+    rootPath: `${committedZ.storageState.mount.mountPath}/${projectionAttachmentId}`,
+    proofId: `proof-${randomUUID()}`,
+    imageIdentity: committedZ.storageState.mount.imageIdentity,
+    rootIdentity: {
+      filesystemId: committedZ.storageState.filesystemId,
+      objectIdentityScheme: "linux-dev-inode",
+      objectId: `${committedZ.storageId}:attachment-root`,
+    },
+  };
+  const projectionAttachedStorage = {
+    ...committedZ.storageState,
+    lifecycle: "attached",
+    revision: "2",
+    writerEpoch: "1",
+    writerAuthority: {
+      fencingEpoch: projectionAttachment.fencingEpoch,
+      holderId: projectionAttachment.holderId,
+      leaseId: projectionAttachment.leaseId,
+    },
+    dataRoot: {
+      rootPath: projectionAttachment.rootPath,
+      imageIdentity: projectionAttachment.imageIdentity,
+      rootIdentity: projectionAttachment.rootIdentity,
+    },
+    attachment: projectionAttachment,
+  };
+  const projectionOriginCommittedHead = appendHead(
+    projectionOriginPreparedHead,
+    "2".repeat(64),
+    1024,
+  );
+  const projectionOriginCommitted = {
+    ...projectionOriginPrepared,
+    state: "committed",
+    committedStateRevision: projectionOriginCommittedHead.stateRevision,
+    expectedStorage: {
+      lifecycle: committedZ.storageState.lifecycle,
+      revision: committedZ.storageState.revision,
+    },
+    result: { status: "attached" },
+    storageState: projectionAttachedStorage,
+  };
+  assert.equal(
+    await indexedRuntimeAuthority.compareAndAdvance({
+      expectedHead: projectionOriginPreparedHead,
+      nextHead: projectionOriginCommittedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-committed-v1",
+        frameChecksum: projectionOriginCommittedHead.lastChecksum,
+        record: projectionOriginCommitted,
+      },
+    }),
+    true,
+  );
+  const projectionPreparedHead = appendHead(
+    projectionOriginCommittedHead,
+    "3".repeat(64),
+    1536,
+  );
+  const projectionPrepared = preparedRecord({
+    checksum: projectionPreparedHead.lastChecksum,
+    operationId: `provider-operation-projection-prepared-${randomUUID()}`,
+    revision: projectionPreparedHead.stateRevision,
+    storageId: `provider-storage-projection-prepared-${randomUUID()}`,
+  });
+  assert.equal(
+    await indexedRuntimeAuthority.compareAndAdvance({
+      expectedHead: projectionOriginCommittedHead,
+      nextHead: projectionPreparedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: projectionPreparedHead.lastChecksum,
+        record: projectionPrepared,
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await indexedRuntimeAuthority.readPreparedOperationsPage({
+      afterStorageId: null,
+      expectedHead: projectionPreparedHead,
+      limit: 4,
+    }),
+    { operations: [projectionPrepared], nextAfterStorageId: null },
+  );
+  const projectionRequest = {
+    expectedHead: projectionPreparedHead,
+    preparedOperationCount: 1,
+    preparedProjectionChecksum: projectionChecksum(
+      "portable-codex/filesystem-image-provider-state/prepared-projection/v1\0",
+      [projectionPrepared],
+    ),
+    attachmentOrigins: Object.freeze([
+      Object.freeze({
+        currentStorageRevision: projectionAttachedStorage.revision,
+        operationId: projectionOriginOperationId,
+        stableStorageChecksum: stableStorageProjectionChecksum(
+          projectionAttachedStorage,
+        ),
+        storageId: projectionAttachedStorage.storageId,
+      }),
+    ]),
+  };
+  assert.deepEqual(
+    await indexedRuntimeAuthority.compareProjection(projectionRequest),
+    projectionReceipt(projectionRequest),
+  );
+  const projectionSnapshot = await readProviderAnchorSnapshot(anchorId);
+  assert.equal(
+    await indexedRuntimeAuthority.compareProjection({
+      ...projectionRequest,
+      preparedProjectionChecksum: "f".repeat(64),
+    }),
+    null,
+  );
+  assert.equal(
+    await indexedRuntimeAuthority.compareProjection({
+      ...projectionRequest,
+      expectedHead: projectionOriginCommittedHead,
+    }),
+    null,
+  );
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(anchorId),
+    projectionSnapshot,
   );
 
   const concurrentAuthority = createAuthority(

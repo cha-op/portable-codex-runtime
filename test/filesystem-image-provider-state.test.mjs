@@ -43,6 +43,73 @@ const TRUSTED_ACL_INSPECTORS = Object.freeze({
   inspectDirectoryAcl: async () => false,
 });
 const execFileAsync = promisify(execFile);
+const PREPARED_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/prepared-projection/v1\0",
+  "utf8",
+);
+const STABLE_STORAGE_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/stable-storage-projection/v1\0",
+  "utf8",
+);
+const ATTACHMENT_ORIGIN_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/attachment-origin-projection/v1\0",
+  "utf8",
+);
+const AUTHORITY_PROJECTION_RECEIPT_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/authority-projection-receipt/v1\0",
+  "utf8",
+);
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function lengthPrefixedProjectionChecksum(domain, values) {
+  const hash = createHash("sha256").update(domain).update(`${values.length}\0`);
+  for (const value of values) {
+    const bytes = Buffer.from(canonicalJson(value), "utf8");
+    hash.update(`${bytes.length}\0`).update(bytes);
+  }
+  return hash.digest("hex");
+}
+
+function stableStorageProjectionChecksum(storage) {
+  return createHash("sha256")
+    .update(STABLE_STORAGE_PROJECTION_DOMAIN)
+    .update(canonicalJson({ ...storage, revision: "1" }))
+    .digest("hex");
+}
+
+function projectionReceiptForRequest(request) {
+  const attachmentOriginsChecksum = lengthPrefixedProjectionChecksum(
+    ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
+    request.attachmentOrigins,
+  );
+  return Object.freeze({
+    contractVersion: 1,
+    projectionChecksum: createHash("sha256")
+      .update(AUTHORITY_PROJECTION_RECEIPT_DOMAIN)
+      .update(
+        canonicalJson({
+          attachmentOriginCount: request.attachmentOrigins.length,
+          attachmentOriginsChecksum,
+          expectedHeadChecksum: filesystemImageProviderStateHeadChecksum(
+            request.expectedHead,
+          ),
+          preparedOperationCount: request.preparedOperationCount,
+          preparedProjectionChecksum: request.preparedProjectionChecksum,
+        }),
+      )
+      .digest("hex"),
+  });
+}
 
 function stateError(code) {
   return (error) =>
@@ -349,6 +416,48 @@ function createExactStateAuthorities(options = {}) {
       });
     },
   );
+  const compareProjection = Object.freeze(
+    async function compareProjection(request) {
+      requireHead(request.expectedHead);
+      tracker.projectionComparisons =
+        (tracker.projectionComparisons ?? 0) + 1;
+      if (tracker.projectionMismatch === true) return null;
+      const prepared = [...operations.values()]
+        .filter((record) => record.state === "prepared")
+        .sort((left, right) =>
+          left.storageId < right.storageId
+            ? -1
+            : left.storageId > right.storageId
+              ? 1
+              : 0,
+        );
+      if (
+        request.preparedOperationCount !== prepared.length ||
+        request.preparedProjectionChecksum !==
+          lengthPrefixedProjectionChecksum(
+            PREPARED_PROJECTION_DOMAIN,
+            prepared,
+          )
+      ) {
+        return null;
+      }
+      for (const origin of request.attachmentOrigins) {
+        const record = operations.get(origin.operationId);
+        if (
+          record?.state !== "committed" ||
+          (record.kind !== "attach" && record.kind !== "restore-attach") ||
+          record.storageId !== origin.storageId ||
+          BigInt(record.storageState.revision) >
+            BigInt(origin.currentStorageRevision) ||
+          stableStorageProjectionChecksum(record.storageState) !==
+            origin.stableStorageChecksum
+        ) {
+          return null;
+        }
+      }
+      return projectionReceiptForRequest(request);
+    },
+  );
   const compareAndAdvance = Object.freeze(
     async function compareAndAdvance({ expectedHead, nextHead, transition }) {
       tracker.advances = (tracker.advances ?? 0) + 1;
@@ -415,11 +524,12 @@ function createExactStateAuthorities(options = {}) {
   return Object.freeze({
     adoptionAuthority: Object.freeze({ contractVersion: 1, compareAndAdopt }),
     stateAuthority: Object.freeze({
-      contractVersion: 2,
+      contractVersion: 3,
       readHead,
       readOperation,
       readOperationsPage,
       readPreparedOperationsPage,
+      compareProjection,
       compareAndAdvance,
     }),
     tracker,
@@ -831,6 +941,28 @@ test("production authority mode is exact, frozen, and cannot mix with a legacy a
     () =>
       new FilesystemImageProviderState({
         ...base,
+        stateAuthority: Object.freeze({
+          ...fixture.stateAuthority,
+          contractVersion: 2,
+        }),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        stateAuthority: Object.freeze({
+          ...fixture.stateAuthority,
+          extra: true,
+        }),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
         adoptionAuthority: {
           contractVersion: 1,
           compareAndAdopt: fixture.adoptionAuthority.compareAndAdopt,
@@ -966,6 +1098,7 @@ test("v3 exact authority keeps only live recovery state and replays history from
     operationId: "operation-v3-provision-001",
     request: provisionRequest,
   });
+  const coldProjectionComparisons = fixture.tracker.projectionComparisons;
   assert.equal(historical.state, "committed");
   assert.equal(
     historical.currentAttachmentOriginOperationId,
@@ -981,7 +1114,11 @@ test("v3 exact authority keeps only live recovery state and replays history from
   assert.equal(capacity.retainedOperationCount, 0);
   assert.equal(capacity.preparedOperationCount, 0);
   assert.equal(fixture.tracker.operations.size, 2);
-  assert(fixture.tracker.operationReads >= 3);
+  assert(fixture.tracker.operationReads >= 1);
+  assert.equal(
+    fixture.tracker.projectionComparisons,
+    coldProjectionComparisons,
+  );
 
   const checkpointRequest = operationRequest("checkpoint");
   await restarted.prepareOperation({
@@ -1049,6 +1186,97 @@ test("v3 exact authority keeps only live recovery state and replays history from
     stateRevision: "10",
     storages: [destroyed],
   });
+});
+
+test("v3 projection receipts are reused only for the same loaded head", async (t) => {
+  const fixture = await createExactFixture(t);
+  assert.equal(fixture.tracker.projectionComparisons, undefined);
+
+  assert.deepEqual(await fixture.state.snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "0",
+    storages: [],
+  });
+  assert.equal(fixture.tracker.projectionComparisons, 1);
+  await fixture.state.inspectCapacity();
+  await fixture.state.snapshot();
+  assert.equal(fixture.tracker.projectionComparisons, 1);
+
+  await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-v3-projection-cache-001",
+    request: operationRequest(
+      "provision",
+      "storage-v3-projection-cache-001",
+    ),
+    storageId: "storage-v3-projection-cache-001",
+  });
+  assert.equal(fixture.tracker.projectionComparisons, 2);
+  await fixture.state.snapshot();
+  assert.equal(fixture.tracker.projectionComparisons, 2);
+
+  const restarted = fixture.createState();
+  await restarted.snapshot();
+  assert.equal(fixture.tracker.projectionComparisons, 3);
+  fixture.tracker.projectionMismatch = true;
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("corrupt_ledger"),
+  );
+  assert.equal(fixture.tracker.projectionComparisons, 4);
+});
+
+test("v3 projection receipts preserve per-record canonical budgets", async (t) => {
+  await t.test("one maximum-size request survives an exact-v3 restart", async (t) => {
+    const fixture = await createExactFixture(t);
+    const envelopeBytes = Buffer.byteLength('{"payload":""}', "utf8");
+    const payload = "x".repeat(768 * 1024 - envelopeBytes);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-v3-maximum-request-001",
+      request: { payload },
+      storageId: "storage-v3-maximum-request-001",
+    });
+
+    const projectionComparisons = fixture.tracker.projectionComparisons;
+    assert.deepEqual(await fixture.createState().snapshot(), {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "1",
+      storages: [],
+    });
+    assert.equal(
+      fixture.tracker.projectionComparisons,
+      projectionComparisons + 1,
+    );
+  });
+
+  await t.test(
+    "four valid records may exceed one canonical budget in aggregate",
+    async (t) => {
+      const fixture = await createExactFixture(t);
+      const payload = "x".repeat(200 * 1024);
+      for (let index = 0; index < 4; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        await fixture.state.prepareOperation({
+          kind: "provision",
+          operationId: `operation-v3-page-budget-${suffix}`,
+          request: { payload },
+          storageId: `storage-v3-page-budget-${suffix}`,
+        });
+      }
+
+      const projectionComparisons = fixture.tracker.projectionComparisons;
+      assert.deepEqual(await fixture.createState().snapshot(), {
+        contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+        stateRevision: "4",
+        storages: [],
+      });
+      assert.equal(
+        fixture.tracker.projectionComparisons,
+        projectionComparisons + 1,
+      );
+    },
+  );
 });
 
 test("v2 adoption materializes a v3 recovery generation before switching authority", async (t) => {

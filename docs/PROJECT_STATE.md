@@ -527,9 +527,13 @@
   version 3. The local version 3 checkpoint keeps all current storage records,
   destroyed tombstones, attachment-origin operation IDs, and only the live
   prepared recovery working set; committed history is no longer copied across
-  rotation. Cold open proves the complete prepared set against PostgreSQL,
-  validates every attached storage's committed origin, and rechecks the exact
-  head before serving.
+  rotation. The contract-version-3 runtime authority validates one compact
+  projection request in a single serializable transaction: it independently
+  pages the complete prepared set, batches committed attachment-origin reads,
+  and returns a domain-separated receipt only for an exact match. The provider
+  reuses that receipt only for the same authority instance, exact head, and
+  unchanged loaded generation; uncertain acknowledgement and adoption paths
+  require fresh validation.
   A provider-locked version 2 adoption replays revisions `1..N`, proves storage
   lineage and final projection, durably writes the covering version 3 files,
   and then imports or verifies the complete PostgreSQL history in the same

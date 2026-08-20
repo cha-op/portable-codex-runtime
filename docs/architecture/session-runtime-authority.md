@@ -2590,13 +2590,32 @@ committed revisions contains every integer from one through the checkpoint
 boundary exactly once. Head-only, partial, duplicate, extra, cross-manifest,
 or later-transaction writes roll back.
 
-Version 3 cold load proves two-way equality between the checkpoint's live
-prepared records and a bounded PostgreSQL prepared-page scan. Each attached
-storage names its origin operation; the reader requires that exact committed
-`attach` or `restore-attach`, verifies full storage equality modulo only a legal
-monotonic revision increase, and rereads the exact head. Normal version 3
-appends keep `indexed-frame-v1`; arbitrary-age reads come from the permanent
-index. An adopted prepared row may later acquire a native indexed suffix.
+The version 3 runtime authority has the exact frozen surface
+`{ contractVersion: 3, readHead, readOperation, readOperationsPage,
+readPreparedOperationsPage, compareProjection, compareAndAdvance }`.
+`compareProjection()` accepts the exact head, the count and domain-separated
+digest of all locally loaded prepared records, and storage-sorted attachment
+origin summaries. In one serializable transaction it validates the exact head
+and completeness marker, independently scans and fully normalizes every
+prepared row in bounded four-record pages, and reads attached origin operations
+in batches of at most four. Each origin must be a committed `attach` or
+`restore-attach` for the named storage; its complete canonical storage state
+must equal the current state after normalizing only a legal monotonic revision
+increase. The prepared scan and origin batch use separate length-prefixed
+projection digests, and the authority returns a domain-separated receipt only
+when both equal the caller's projection under that exact head. A mismatch
+returns no receipt; corrupt authority material remains state-invalid.
+
+The provider caches that receipt only inside the same authority instance and
+for the exact unchanged loaded generation and head. A definite normal append
+or rotation obtains the receipt for its new head before publishing the next
+cache. A cold parse, version 2 adoption, or acknowledgement-loss readback does
+not infer the receipt and must run a new comparison. Thus projection validation
+uses one serializable transaction rather than one transaction per prepared
+page or attachment, while the SQL statement count remains bounded by the
+working-set page and batch counts. Normal version 3 appends keep
+`indexed-frame-v1`; arbitrary-age reads come from the permanent index. An
+adopted prepared row may later acquire a native indexed suffix.
 
 Filesystem candidate publication precedes the database adoption. Exact target
 head, marker, manifest, and full-row readback proves success after a lost COMMIT

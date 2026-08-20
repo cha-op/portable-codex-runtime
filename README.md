@@ -650,9 +650,13 @@ Migrations 010 and 011 make PostgreSQL the permanent exact-replay index for
 provider-state version 3. The version 3 checkpoint contains every current
 storage record, destroyed tombstones, and the live prepared recovery working
 set, but no committed history. Arbitrary-age committed replay comes from the
-index. Cold open proves the checkpoint prepared set equals the bounded
-PostgreSQL prepared set, revalidates each attached storage's committed origin
-operation, and rechecks the exact head before serving. Each operation append
+index. Cold open sends a compact, domain-separated projection summary to the
+runtime authority. In one serializable snapshot, that authority independently
+pages every prepared row, batches attached-storage origin reads, and returns a
+receipt only when both PostgreSQL projections exactly match. The provider
+caches that receipt only for the same authority instance, exact head, and
+unchanged loaded generation; an acknowledgement-loss readback or adoption
+requires a fresh comparison. Each operation append
 compares the complete canonical `storageStateBefore` with the latest committed
 PostgreSQL projection in the same serializable transaction. Native commits use
 `indexed-frame-v1`; a validated version 2 adoption may use

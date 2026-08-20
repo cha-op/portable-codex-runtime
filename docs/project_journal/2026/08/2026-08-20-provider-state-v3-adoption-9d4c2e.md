@@ -60,15 +60,20 @@ superseded_by:
   `indexed-frame-v1`; an adopted prepared prefix may later receive that native
   committed suffix.
 - `createPostgresFilesystemImageProviderStateRuntimeAuthority()` has the exact
-  contract-version-2 surface needed for version 3 reads, bounded complete
-  prepared paging, and normal head-plus-operation transitions. The older
+  contract-version-3 surface needed for version 3 reads, bounded complete
+  prepared paging, compact projection comparison, and normal
+  head-plus-operation transitions. The older
   contract-version-1 authority and two-method head anchor remain explicit
   version 2 compatibility paths rather than silently changing their genesis.
-- Cold version 3 load proves exact two-way equality between local prepared
-  records and PostgreSQL's prepared pages. It validates every attached current
-  storage against the named committed `attach` or `restore-attach` origin and
-  rereads the exact head after projection checks. Arbitrary-age
-  `readOperation()` results come from PostgreSQL.
+- Cold version 3 load computes compact domain-separated summaries for all local
+  prepared records and attached-storage origins. In one serializable
+  transaction, PostgreSQL independently pages and normalizes the complete
+  prepared set, batches each named committed `attach` or `restore-attach`
+  origin, and returns a receipt only for an exact match under the exact head.
+  The provider caches that receipt only for the same authority instance, head,
+  and unchanged loaded generation; cold reparsing, adoption, and uncertain
+  acknowledgement readback revalidate it. Arbitrary-age `readOperation()`
+  results come from PostgreSQL.
 - The version 2 ext4-to-Podman persistent binding requires
   `currentAttachmentOriginOperationId` to equal the queried operation. It
   compares the origin committed storage with current storage after normalizing

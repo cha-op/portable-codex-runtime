@@ -18,7 +18,7 @@ import {
 export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION =
   1;
 export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION =
-  2;
+  3;
 export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION =
   1;
 
@@ -73,6 +73,22 @@ const ADOPTION_MANIFEST_DOMAIN = Buffer.from(
   "portable-codex/filesystem-image-provider-state/adoption-manifest/v1\0",
   "utf8",
 );
+const PREPARED_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/prepared-projection/v1\0",
+  "utf8",
+);
+const STABLE_STORAGE_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/stable-storage-projection/v1\0",
+  "utf8",
+);
+const ATTACHMENT_ORIGIN_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/attachment-origin-projection/v1\0",
+  "utf8",
+);
+const AUTHORITY_PROJECTION_RECEIPT_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/authority-projection-receipt/v1\0",
+  "utf8",
+);
 
 const OPTION_KEYS = Object.freeze(["store", "providerId", "anchorId"]);
 const READ_OPERATION_KEYS = Object.freeze(["expectedHead", "operationId"]);
@@ -85,6 +101,18 @@ const READ_PREPARED_PAGE_KEYS = Object.freeze([
   "afterStorageId",
   "expectedHead",
   "limit",
+]);
+const COMPARE_PROJECTION_KEYS = Object.freeze([
+  "expectedHead",
+  "preparedOperationCount",
+  "preparedProjectionChecksum",
+  "attachmentOrigins",
+]);
+const ATTACHMENT_ORIGIN_KEYS = Object.freeze([
+  "currentStorageRevision",
+  "operationId",
+  "stableStorageChecksum",
+  "storageId",
 ]);
 const ADOPTION_KEYS = Object.freeze([
   "expectedHead",
@@ -291,6 +319,12 @@ const READ_PREPARED_PAGE_AFTER_QUERY = [
   'ORDER BY storage_id COLLATE pg_catalog."C"',
   "LIMIT $4::pg_catalog.int4",
 ].join(" ");
+const READ_ATTACHMENT_ORIGINS_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.filesystem_image_provider_operations",
+  "WHERE provider_id = $1 AND anchor_id = $2",
+  "AND operation_id = ANY($3::text[])",
+].join(" ");
 const READ_LATEST_COMMITTED_STORAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.filesystem_image_provider_operations",
@@ -404,6 +438,7 @@ const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectHasOwnIntrinsic = Object.hasOwn;
 const objectIsIntrinsic = Object.is;
+const objectIsFrozenIntrinsic = Object.isFrozen;
 const mapSizeGetterIntrinsic = Object.getOwnPropertyDescriptor(
   Map.prototype,
   "size",
@@ -506,6 +541,10 @@ function objectDefineProperty(value, key, descriptor) {
 
 function objectFreeze(value) {
   return callIntrinsic(objectFreezeIntrinsic, ObjectConstructor, [value]);
+}
+
+function objectIsFrozen(value) {
+  return callIntrinsic(objectIsFrozenIntrinsic, ObjectConstructor, [value]);
 }
 
 function objectGetOwnPropertyDescriptor(value, key) {
@@ -644,6 +683,35 @@ function denseDataArray(value, maximumLength, code) {
     arrayPush(normalized, descriptor.value);
   }
   return normalized;
+}
+
+function frozenDenseDataArrayLength(value, maximumLength, code) {
+  ensure(
+    !isProxyValue(value) &&
+      arrayIsArray(value) &&
+      objectGetPrototypeOf(value) === arrayPrototype &&
+      numberIsSafeIntegerIntrinsic(value.length) &&
+      value.length <= maximumLength,
+    code,
+  );
+  let keys;
+  try {
+    keys = reflectOwnKeys(value);
+  } catch {
+    fail(code);
+  }
+  ensure(keys.length === value.length + 1 && objectIsFrozen(value), code);
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = objectGetOwnPropertyDescriptor(
+      value,
+      StringConstructor(index),
+    );
+    ensure(
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+      code,
+    );
+  }
+  return value.length;
 }
 
 function consumeAdoptionCanonicalBytes(budget, bytes, code) {
@@ -872,6 +940,37 @@ function canonicalString(value) {
     );
   }
   return `{${callIntrinsic(arrayJoinIntrinsic, fields, [","])}}`;
+}
+
+function beginCountedProjectionHash(domain, count) {
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [domain]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    bufferFrom(`${StringConstructor(count)}\0`, "ascii"),
+  ]);
+  return hash;
+}
+
+function updateLengthPrefixedBytes(hash, bytes) {
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    bufferFrom(`${StringConstructor(bytes.length)}\0`, "ascii"),
+  ]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [bytes]);
+}
+
+function postgresTextArrayLiteral(values) {
+  // canonicalOpaqueId excludes every PostgreSQL array delimiter and escape
+  // character. Quote each value so the otherwise-valid ID "NULL" remains
+  // text instead of PostgreSQL array syntax's unquoted SQL NULL sentinel.
+  return `{"${callIntrinsic(arrayJoinIntrinsic, values, ['","'])}"}`;
+}
+
+function digestCanonicalProjection(domain, value) {
+  const bytes = bufferFrom(canonicalString(value), "utf8");
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [domain]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [bytes]);
+  return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
 }
 
 function canonicalEqual(left, right) {
@@ -1131,6 +1230,31 @@ function canonicalStorageState(value, code) {
     dataRoot,
     attachment,
   });
+}
+
+function stableStorageProjectionChecksum(storage, code) {
+  const normalized = canonicalStorageState(
+    {
+      storageId: storage.storageId,
+      sessionId: storage.sessionId,
+      backendId: storage.backendId,
+      filesystemId: storage.filesystemId,
+      imagePath: storage.imagePath,
+      lifecycle: storage.lifecycle,
+      revision: "1",
+      writerEpoch: storage.writerEpoch,
+      writerAuthority: storage.writerAuthority,
+      mount: storage.mount,
+      publicationControlIdentity: storage.publicationControlIdentity,
+      dataRoot: storage.dataRoot,
+      attachment: storage.attachment,
+    },
+    code,
+  );
+  return digestCanonicalProjection(
+    STABLE_STORAGE_PROJECTION_DOMAIN,
+    normalized,
+  );
 }
 
 function canonicalExpectedStorage(value, code) {
@@ -2015,6 +2139,169 @@ async function readPreparedOperationsPageInTransaction(
         ? operations[operations.length - 1].storageId
         : null,
   });
+}
+
+async function comparePreparedProjectionInTransaction(
+  transaction,
+  identity,
+  expectedSnapshot,
+  expectedCount,
+  expectedChecksum,
+  structuralBound,
+  code,
+) {
+  const hash = beginCountedProjectionHash(
+    PREPARED_PROJECTION_DOMAIN,
+    expectedCount,
+  );
+  let afterStorageId = null;
+  let observedCount = 0;
+  for (;;) {
+    const page = await readPreparedOperationsPageInTransaction(
+      transaction,
+      identity,
+      objectFreeze({
+        afterStorageId,
+        expectedSnapshot,
+        limit: MAX_PAGE_SIZE,
+      }),
+      code,
+    );
+    for (let index = 0; index < page.operations.length; index += 1) {
+      observedCount += 1;
+      ensure(observedCount <= structuralBound, code);
+      const bytes = bufferFrom(
+        canonicalString(page.operations[index]),
+        "utf8",
+      );
+      updateLengthPrefixedBytes(hash, bytes);
+    }
+    if (page.nextAfterStorageId === null) break;
+    afterStorageId = page.nextAfterStorageId;
+  }
+  const checksum = callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+  if (observedCount !== expectedCount || checksum !== expectedChecksum) {
+    return null;
+  }
+  return objectFreeze({ checksum, count: observedCount });
+}
+
+function normalizeAttachmentOrigin(value, code) {
+  const origin = exactDataObject(value, ATTACHMENT_ORIGIN_KEYS, code);
+  return objectFreeze({
+    currentStorageRevision: canonicalUint64(
+      origin.currentStorageRevision,
+      code,
+      { positive: true },
+    ).value,
+    operationId: canonicalOpaqueId(origin.operationId, code),
+    stableStorageChecksum: canonicalChecksum(
+      origin.stableStorageChecksum,
+      code,
+    ),
+    storageId: canonicalOpaqueId(origin.storageId, code),
+  });
+}
+
+async function compareAttachmentOriginsInTransaction(
+  transaction,
+  identity,
+  expectedSnapshot,
+  origins,
+  originCount,
+  requestCode,
+  stateCode,
+) {
+  const hash = beginCountedProjectionHash(
+    ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
+    originCount,
+  );
+  const operationIds = new SetConstructor();
+  let previousStorageId = null;
+  let projectionMismatch = false;
+  for (let offset = 0; offset < originCount; offset += MAX_PAGE_SIZE) {
+    const batch = [];
+    const batchOperationIds = [];
+    const batchEnd = mathMinIntrinsic(offset + MAX_PAGE_SIZE, originCount);
+    for (let index = offset; index < batchEnd; index += 1) {
+      const origin = normalizeAttachmentOrigin(
+        ownDataValue(origins, StringConstructor(index), requestCode),
+        requestCode,
+      );
+      ensure(
+        (previousStorageId === null ||
+          origin.storageId > previousStorageId) &&
+          !callIntrinsic(setHasIntrinsic, operationIds, [origin.operationId]),
+        requestCode,
+      );
+      previousStorageId = origin.storageId;
+      callIntrinsic(setAddIntrinsic, operationIds, [origin.operationId]);
+      arrayPush(batch, origin);
+      arrayPush(batchOperationIds, origin.operationId);
+    }
+    const result = await queryTransaction(
+      transaction,
+      READ_ATTACHMENT_ORIGINS_QUERY,
+      [
+        identity.providerId,
+        identity.anchorId,
+        postgresTextArrayLiteral(batchOperationIds),
+      ],
+      stateCode,
+    );
+    const rows = rowsFromResult(
+      result,
+      "SELECT",
+      MAX_PAGE_SIZE,
+      stateCode,
+    );
+    const materials = new MapConstructor();
+    let mismatch = rows.length !== batch.length;
+    for (let index = 0; index < rows.length; index += 1) {
+      const material = normalizeOperationRow(
+        rows[index],
+        identity,
+        stateCode,
+      );
+      assertOperationVisibleAtHead(material, expectedSnapshot, stateCode);
+      const operationId = material.record.operationId;
+      if (
+        !arrayIncludes(batchOperationIds, operationId) ||
+        mapHas(materials, operationId)
+      ) {
+        mismatch = true;
+      } else {
+        mapSet(materials, operationId, material);
+      }
+    }
+    for (let index = 0; index < batch.length; index += 1) {
+      const origin = batch[index];
+      const material = mapGet(materials, origin.operationId);
+      if (material === undefined) {
+        mismatch = true;
+        continue;
+      }
+      const record = material.record;
+      if (
+        record.state !== "committed" ||
+        !arrayIncludes(["attach", "restore-attach"], record.kind) ||
+        record.operationId !== origin.operationId ||
+        record.storageId !== origin.storageId ||
+        BigIntConstructor(record.storageState.revision) >
+          BigIntConstructor(origin.currentStorageRevision) ||
+        stableStorageProjectionChecksum(record.storageState, stateCode) !==
+          origin.stableStorageChecksum
+      ) {
+        mismatch = true;
+        continue;
+      }
+      const bytes = bufferFrom(canonicalString(origin), "utf8");
+      updateLengthPrefixedBytes(hash, bytes);
+    }
+    if (mismatch) projectionMismatch = true;
+  }
+  if (projectionMismatch) return null;
+  return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
 }
 
 async function readLatestCommittedStorageStateInTransaction(
@@ -2903,6 +3190,24 @@ export class PostgresFilesystemImageProviderStateAuthorityError extends Error {
   }
 }
 
+function normalizeProjectionRequestOuter(value, code) {
+  const input = exactDataObject(value, COMPARE_PROJECTION_KEYS, code);
+  ensure(
+    numberIsSafeIntegerIntrinsic(input.preparedOperationCount) &&
+      input.preparedOperationCount >= 0,
+    code,
+  );
+  return objectFreeze({
+    attachmentOrigins: input.attachmentOrigins,
+    expectedHead: canonicalHead(input.expectedHead, code),
+    preparedOperationCount: input.preparedOperationCount,
+    preparedProjectionChecksum: canonicalChecksum(
+      input.preparedProjectionChecksum,
+      code,
+    ),
+  });
+}
+
 function createAuthoritySurface(args, runtimeOnly) {
   const optionCode =
     "invalid_postgres_filesystem_image_provider_state_authority_options";
@@ -3073,6 +3378,81 @@ function createAuthoritySurface(args, runtimeOnly) {
     });
   };
 
+  const compareProjection = async function compareProjection(
+    ...projectionArgs
+  ) {
+    ensure(runtimeOnly && projectionArgs.length === 1, requestCode);
+    const input = normalizeProjectionRequestOuter(
+      projectionArgs[0],
+      requestCode,
+    );
+    return await runSerializable(store, async (transaction) => {
+      const observedHead = await readHeadSnapshotInTransaction(
+        transaction,
+        identity,
+        stateCode,
+        false,
+        input.expectedHead.contractVersion,
+      );
+      if (!headEqual(observedHead.head, input.expectedHead)) return null;
+      ensure(
+        input.expectedHead.contractVersion ===
+          FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+        stateCode,
+      );
+      requireExpectedOperationIndex(observedHead, input.expectedHead, stateCode);
+      const structuralBound =
+        observedHead.head.checkpointFrameCount + observedHead.head.frameCount;
+      ensure(
+        input.preparedOperationCount <= structuralBound,
+        requestCode,
+      );
+      const attachmentOriginCount = frozenDenseDataArrayLength(
+        input.attachmentOrigins,
+        structuralBound,
+        requestCode,
+      );
+      const prepared = await comparePreparedProjectionInTransaction(
+        transaction,
+        identity,
+        observedHead,
+        input.preparedOperationCount,
+        input.preparedProjectionChecksum,
+        structuralBound,
+        stateCode,
+      );
+      if (prepared === null) return null;
+      const attachmentOriginsChecksum =
+        await compareAttachmentOriginsInTransaction(
+          transaction,
+          identity,
+          observedHead,
+          input.attachmentOrigins,
+          attachmentOriginCount,
+          requestCode,
+          stateCode,
+        );
+      if (attachmentOriginsChecksum === null) return null;
+      const receipt = objectFreeze({
+        attachmentOriginCount,
+        attachmentOriginsChecksum,
+        expectedHeadChecksum: canonicalHeadChecksum(
+          observedHead.head,
+          stateCode,
+        ),
+        preparedOperationCount: prepared.count,
+        preparedProjectionChecksum: prepared.checksum,
+      });
+      return objectFreeze({
+        contractVersion: 1,
+        projectionChecksum: digestCanonicalProjection(
+          AUTHORITY_PROJECTION_RECEIPT_DOMAIN,
+          receipt,
+        ),
+      });
+    });
+  };
+
   const compareAndAdvance = async function compareAndAdvance(...advanceArgs) {
     ensure(advanceArgs.length === 1, requestCode);
     const input = exactDataObject(advanceArgs[0], ADVANCE_KEYS, requestCode);
@@ -3152,6 +3532,7 @@ function createAuthoritySurface(args, runtimeOnly) {
   objectFreeze(readOperation);
   objectFreeze(readOperationsPage);
   objectFreeze(readPreparedOperationsPage);
+  objectFreeze(compareProjection);
   objectFreeze(compareAndAdvance);
   return runtimeOnly
     ? objectFreeze({
@@ -3161,6 +3542,7 @@ function createAuthoritySurface(args, runtimeOnly) {
         readOperation,
         readOperationsPage,
         readPreparedOperationsPage,
+        compareProjection,
         compareAndAdvance,
       })
     : objectFreeze({
