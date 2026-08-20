@@ -670,11 +670,13 @@ Migration 008 already
 requires every non-null value in the three external-head checksum columns to be
 an exact 64-byte lowercase-hex value. Migration 010 normalizes those valid values
 to `varchar(64)` before version 3 and defines all four new operation checksum and
-digest columns with the same exact format. It reserves
-`unavailable-adopted-v2` with a null checksum for rotated legacy history whose
-original committed-frame checksum no longer exists. The version
-2 adapter quarantines that legacy suffix; the version 3 adoption cut may admit
-it only inside the adopted checkpoint boundary. Reads page at most four
+digest columns with the same exact format. Migration 010 accepts only
+`indexed-frame-v1`; it neither represents nor permits an unavailable legacy
+committed-checksum suffix. PR-B migration 011 must introduce
+`unavailable-adopted-v2` together with the complete v2 validator, imported
+rows, covering version 3 checkpoint head, and exact completeness marker in one
+transaction. A transaction token or covering version 3 head alone is not that
+write capability. Reads page at most four
 operations so limit-plus-one materialization cannot exceed five pairs of
 4 MiB record columns. The relation is permanent while its anchor exists;
 `TRUNCATE` is always rejected, a prepared row may acquire its committed suffix
@@ -684,8 +686,9 @@ not switch the production version 2 provider or remove local history. Hosts
 must still monitor `inspectCapacity()` and the provider-state directory until
 the version 3 checkpoint/adoption cut makes PostgreSQL the replay index. Under
 the provider lock, that cut must import and validate the complete version 2
-history, install the covering version 3 checkpoint head, and set the exact
-completeness marker in one transaction before local history is reduced. It
+history, prove revision coverage and uniqueness, install the covering version
+3 checkpoint head, and set the exact completeness marker in one transaction
+before local history is reduced. It
 must also preserve the origin operation for every current attachment so its
 committed identity remains reconstructable.
 

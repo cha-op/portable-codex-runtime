@@ -35,12 +35,12 @@ superseded_by:
   projection rather than a second mutable storage table.
 - A row starts with the complete prepared checkpoint record. Its prepared
   prefix is immutable; it may gain the exact committed record, revision,
-  checksum provenance, and digest once. Native commits use `indexed-frame-v1`
-  with an exact checksum. A future adoption may use
-  `unavailable-adopted-v2` with a null checksum only after the parent is a
-  covering version 3 checkpoint. A committed row cannot be updated. A deferred
-  delete guard rejects partial history removal while its anchor exists, while
-  same-transaction operations-first anchor teardown remains available to tests
+  checksum provenance, and digest once. Migration 010 accepts only native
+  `indexed-frame-v1` with an exact checksum; it neither represents nor permits
+  an unavailable rotated-legacy suffix. A committed row cannot be updated. A
+  deferred delete guard rejects partial history removal while its anchor
+  exists, while same-transaction operations-first anchor teardown remains
+  available to tests
   and explicit administrative cleanup. A statement trigger rejects every
   `TRUNCATE`; no runtime deletion API is exposed. Migration 008 already requires
   every non-null value in the three head checksum columns to be an exact 64-byte
@@ -92,19 +92,21 @@ superseded_by:
 - Existing version 2 local state remains authoritative for production serving.
   No caller may remove local history merely because the additive index exists.
 - The version-3-head/checkpoint predicate is an at-rest consistency gate, not
-  proof that a row came from a validated checkpoint. The next slice must still
+  proof that a row came from a validated checkpoint or write capability. A
+  transaction token alone is likewise insufficient. The next slice must still
   validate the complete v2 checkpoint and active tail, prove import uniqueness
-  and revision coverage, and commit all rows with the covering head atomically.
+  and revision coverage, and commit all rows with the covering head and marker
+  atomically.
 
 ## Next Steps
 
-- Implement the version 3 provider-state switch. Under the provider lock,
-  validate complete version 2 checkpoint and log history, import it atomically
-  into an empty PostgreSQL index while installing the covering version 3 head
-  and its exact completeness marker, and resolve commit acknowledgement loss
-  by exact readback. All three parts must commit together. The version 3
-  checkpoint must cover every unavailable legacy suffix before that suffix
-  becomes readable.
+- Implement the version 3 provider-state switch in PR-B migration 011. Under
+  the provider lock, atomically introduce the `unavailable-adopted-v2`
+  provenance and write path only with the complete version 2 checkpoint-and-log
+  validator, revision coverage and uniqueness proof, imported rows, covering
+  version 3 head, and exact completeness marker. Resolve commit acknowledgement
+  loss by exact readback; every part must commit together before an unavailable
+  legacy suffix exists or becomes readable.
 - Make version 3 checkpoints retain current storage and destroyed tombstones
   while serving arbitrary-age exact operation replay from PostgreSQL. Preserve
   and validate each current attachment's origin operation.

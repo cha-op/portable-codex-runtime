@@ -419,9 +419,9 @@ production behavior. The permanent
 bounded canonical checkpoint-operation record as exact UTF-8 bytes plus a
 domain-separated SHA-256. Explicit metadata binds its kind, storage, logical
 revision, prepared checksum, and committed-checksum provenance. Native commits
-store `indexed-frame-v1` with the exact checksum. The schema separately
-represents a future rotated v2 adoption whose committed checksum is no longer
-recoverable; current version 2 reads reject that suffix. Migration 008 already
+store `indexed-frame-v1` with the exact checksum. Migration 010 neither
+represents nor permits a future rotated-v2 suffix whose committed checksum is
+no longer recoverable. Migration 008 already
 requires every non-null value in the three head checksum columns to be an exact
 64-byte lowercase-hex value. Migration 010 normalizes those valid values to
 `varchar(64)` before version 3 and defines the four operation checksum/digest
@@ -448,11 +448,14 @@ version 3 writer or change existing version 2 logical head values.
 
 Production version 2 still has no retention floor or garbage collection, so a
 host must monitor `inspectCapacity()` and the provider-state filesystem. The
-next slice must atomically adopt complete version 2 history, make the
-PostgreSQL index the exact-replay source, and write a covering version 3
-checkpoint head plus its exact completeness marker in the same transaction.
-Only after that cut may version 3 checkpoints retain current storage and
-destroyed tombstones without duplicating permanent operation history. It must
+next slice's migration 011 must atomically introduce the
+`unavailable-adopted-v2` provenance and write path, validate complete version 2
+history with revision coverage and uniqueness, make the PostgreSQL index the
+exact-replay source, and write a covering version 3 checkpoint head plus its
+exact completeness marker in the same transaction. A transaction token or
+covering head alone is not write capability. Only after that cut may version 3
+checkpoints retain current storage and destroyed tombstones without duplicating
+permanent operation history. It must
 preserve the origin operation for every current
 attachment so its committed attachment identity remains reconstructable.
 

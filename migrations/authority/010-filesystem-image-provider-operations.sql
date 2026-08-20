@@ -146,18 +146,10 @@ CREATE TABLE session_authority.filesystem_image_provider_operations (
         AND committed_record_sha256 IS NOT NULL
         AND committed_state_revision > prepared_state_revision
         AND committed_state_revision <= 18446744073709551615
-        AND (
-          (
-            committed_checksum_provenance = 'indexed-frame-v1'
-            AND committed_checksum IS NOT NULL
-            AND octet_length(committed_checksum) = 64
-            AND committed_checksum !~ '[^0-9a-f]'
-          )
-          OR (
-            committed_checksum_provenance = 'unavailable-adopted-v2'
-            AND committed_checksum IS NULL
-          )
-        )
+        AND committed_checksum_provenance = 'indexed-frame-v1'
+        AND committed_checksum IS NOT NULL
+        AND octet_length(committed_checksum) = 64
+        AND committed_checksum !~ '[^0-9a-f]'
         AND octet_length(committed_record_bytes) BETWEEN 1 AND 4194304
         AND octet_length(committed_record_sha256) = 64
         AND committed_record_sha256 !~ '[^0-9a-f]'
@@ -201,9 +193,9 @@ CREATE INDEX filesystem_image_provider_operations_committed_storage_tail_idx
   )
   WHERE state = 'committed';
 
--- Every history row enters through its prepared prefix. Adoption may insert
--- and then commit old history in one transaction, but it may not manufacture a
--- committed suffix without first passing through the same one-way edge.
+-- Every native indexed history row enters through its prepared prefix and may
+-- acquire one indexed-frame-v1 suffix. Legacy adoption remains unavailable
+-- until migration 011 can bind complete validation, import, head, and marker.
 CREATE FUNCTION session_authority.enforce_filesystem_image_provider_operation_insert()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -255,22 +247,6 @@ BEGIN
     AND NEW.prepared_record_bytes IS NOT DISTINCT FROM OLD.prepared_record_bytes
     AND NEW.prepared_record_sha256 IS NOT DISTINCT FROM OLD.prepared_record_sha256
   THEN
-    IF NEW.committed_checksum_provenance = 'unavailable-adopted-v2'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM session_authority.filesystem_image_provider_heads AS head
-        WHERE head.provider_id = NEW.provider_id
-          AND head.anchor_id = NEW.anchor_id
-          AND head.contract_version = 3
-          AND NEW.committed_state_revision <= head.checkpoint_state_revision
-      )
-    THEN
-      RAISE EXCEPTION
-        'adopted filesystem image provider history requires a covering version 3 checkpoint'
-        USING
-          ERRCODE = '23514',
-          CONSTRAINT = 'filesystem_image_provider_operations_adopted_v3_cut';
-    END IF;
     RETURN NEW;
   END IF;
 

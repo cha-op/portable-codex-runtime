@@ -223,10 +223,10 @@
   Migration 010 stores bounded canonical prepared and committed record bytes,
   the prepared checksum, explicit committed-checksum provenance, and domain-
   separated record digests behind the external provider head. Native commits
-  use `indexed-frame-v1`; rotated legacy history may later use
-  `unavailable-adopted-v2` with a null checksum, but version 2 reads quarantine
-  that suffix. A nullable head marker records the exact state revision whose
-  operation index is complete. Migrated version 2 heads remain unadopted;
+  use `indexed-frame-v1`; migration 010 neither represents nor permits an
+  unavailable rotated-legacy suffix. A nullable head marker records the exact
+  state revision whose operation index is complete. Migrated version 2 heads
+  remain unadopted;
   operation reads, paging, and exact-head appends fail closed until adoption.
   Genesis-created indexed heads advance the marker with each logical append
   and retain it across rotation. A serializable head CAS and record
@@ -242,11 +242,14 @@
   and gives all four new operation checksum/digest columns the same exact
   format. Existing valid version 2 heads remain unchanged and production
   serving is unchanged.
-- [pending] Third-b, switch provider state to version 3. Under the provider
-  lock, validate and atomically adopt complete version 2 operation history into
-  the PostgreSQL index, install the covering version 3 checkpoint head, and set
-  its exact operation-index completeness marker in the same transaction. Only
-  then keep current storage records and destroyed tombstones in local
+- [pending] Third-b, switch provider state to version 3. PR-B migration 011 must
+  atomically introduce the `unavailable-adopted-v2` provenance and its write
+  path only after the provider-locked complete v2 validator proves revision
+  coverage and uniqueness, imports the rows, installs the covering version 3
+  checkpoint head, and sets its exact operation-index completeness marker in
+  the same transaction. A transaction token or covering head alone is not
+  write capability. Only then keep current storage records and destroyed
+  tombstones in local
   checkpoints. Exact operation replay must come from the
   permanent index, and each current attachment must retain and verify its
   origin operation. The cut must place every unavailable legacy committed

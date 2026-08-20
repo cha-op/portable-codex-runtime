@@ -562,13 +562,15 @@ already requires every non-null value in the three head-checksum columns to be
 an exact 64-byte lowercase-hex value; migration 010 normalizes those valid
 values to `varchar(64)` before version 3, and the permanent history table cannot
 be truncated.
-Native committed suffixes retain an exact frame
-checksum; unrecoverable rotated version 2 checksums have a separate null-
-checksum provenance that remains quarantined until a covering version 3
-checkpoint cut. The next slice owns that atomic version 2 adoption and the
-version 3 checkpoint cut: complete import, covering head, and exact
-completeness marker must commit together before permanent operation history is
-removed from local checkpoints. See `linux-ext4-physical-backend.md`. Later
+Migration 010 accepts only native committed suffixes with
+`indexed-frame-v1` and an exact frame checksum; it neither represents nor
+permits a null-checksum rotated-legacy suffix. The next slice's migration 011
+must atomically introduce the `unavailable-adopted-v2` provenance and write
+path with the complete v2 validator, revision coverage and uniqueness proof,
+imported rows, covering version 3 checkpoint head, and exact completeness
+marker. A transaction token or covering head alone is not write capability,
+and permanent operation history cannot be removed from local checkpoints
+before that complete cut. See `linux-ext4-physical-backend.md`. Later
 slices own
 power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
 export/compression, content-addressed distribution, encryption, registry trust,

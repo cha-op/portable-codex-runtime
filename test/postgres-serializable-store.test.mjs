@@ -2946,8 +2946,9 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
-    /committed_checksum_provenance = 'indexed-frame-v1'[\s\S]+committed_checksum IS NOT NULL[\s\S]+octet_length\(committed_checksum\) = 64[\s\S]+committed_checksum !~ '\[\^0-9a-f\]'[\s\S]+committed_checksum_provenance = 'unavailable-adopted-v2'[\s\S]+committed_checksum IS NULL/u,
+    /committed_checksum_provenance = 'indexed-frame-v1'[\s\S]+committed_checksum IS NOT NULL[\s\S]+octet_length\(committed_checksum\) = 64[\s\S]+committed_checksum !~ '\[\^0-9a-f\]'/u,
   );
+  assert.doesNotMatch(latestMigration.sql, /unavailable-adopted-v2/u);
   for (const recordBytesColumn of [
     "prepared_record_bytes",
     "committed_record_bytes",
@@ -3025,10 +3026,6 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.match(
     latestMigration.sql,
     /enforce_filesystem_image_provider_operation_update[\s\S]+OLD\.state = 'prepared'[\s\S]+NEW\.state = 'committed'[\s\S]+NEW\.provider_id IS NOT DISTINCT FROM OLD\.provider_id[\s\S]+NEW\.anchor_id IS NOT DISTINCT FROM OLD\.anchor_id[\s\S]+NEW\.operation_id IS NOT DISTINCT FROM OLD\.operation_id[\s\S]+NEW\.record_contract_version IS NOT DISTINCT FROM OLD\.record_contract_version[\s\S]+NEW\.kind IS NOT DISTINCT FROM OLD\.kind[\s\S]+NEW\.storage_id IS NOT DISTINCT FROM OLD\.storage_id[\s\S]+NEW\.prepared_state_revision IS NOT DISTINCT FROM OLD\.prepared_state_revision[\s\S]+NEW\.prepared_checksum IS NOT DISTINCT FROM OLD\.prepared_checksum[\s\S]+NEW\.prepared_record_bytes IS NOT DISTINCT FROM OLD\.prepared_record_bytes[\s\S]+NEW\.prepared_record_sha256 IS NOT DISTINCT FROM OLD\.prepared_record_sha256[\s\S]+ERRCODE = '55000'[\s\S]+filesystem_image_provider_operations_prepared_to_committed_only/u,
-  );
-  assert.match(
-    latestMigration.sql,
-    /NEW\.committed_checksum_provenance = 'unavailable-adopted-v2'[\s\S]+NOT EXISTS \([\s\S]+FROM session_authority\.filesystem_image_provider_heads AS head[\s\S]+head\.provider_id = NEW\.provider_id[\s\S]+head\.anchor_id = NEW\.anchor_id[\s\S]+head\.contract_version = 3[\s\S]+NEW\.committed_state_revision <= head\.checkpoint_state_revision[\s\S]+ERRCODE = '23514'[\s\S]+filesystem_image_provider_operations_adopted_v3_cut/u,
   );
   assert.match(
     latestMigration.sql,

@@ -2525,12 +2525,10 @@ heads valid and reserves version 3, then creates permanent rows keyed by
 prepared bytes, their domain-separated digest, logical revision, operation and
 storage identity, and prepared checksum. A prepared row may acquire matching
 committed bytes, digest, revision, and checksum provenance exactly once. Native
-commits use `indexed-frame-v1` plus the exact committed-frame checksum. Rotated
-version 2 history whose checksum no longer exists is represented only by
-`unavailable-adopted-v2` plus a null checksum. That suffix may be written only
-after the same transaction has advanced the parent to a version 3 checkpoint
-whose boundary covers the committed revision. Updates cannot rewrite the
-prepared prefix; committed history is immutable. Migration 008 already requires
+commits use `indexed-frame-v1` plus the exact committed-frame checksum.
+Migration 010 neither represents nor permits a rotated-version-2 suffix whose
+checksum no longer exists. Updates cannot rewrite the prepared prefix;
+committed history is immutable. Migration 008 already requires
 every non-null value in the three version 2 head checksum columns to be an exact
 64-byte lowercase-hex value. Migration 010 normalizes those valid values to
 `varchar(64)` before version 3 and defines the four operation checksum/digest
@@ -2569,16 +2567,17 @@ revision and marker.
 Canonical record bytes are the replay authority; PostgreSQL JSON
 reserialization is not used. Each record may occupy at most 4 MiB. Page reads
 admit at most four operations, so the limit-plus-one query materializes no more
-than five prepared/committed record pairs. The current version 2 adapter rejects
-every `unavailable-adopted-v2` suffix; the version 3 cut may expose one only at
-or before its checkpoint boundary. An active operation tail always requires
-`indexed-frame-v1` and equality with `head.lastChecksum`.
+than five prepared/committed record pairs. Migration 010's schema and current
+version 2 adapter accept only `indexed-frame-v1`; an active operation tail also
+requires equality with `head.lastChecksum`.
 
 The parent-head predicate is an at-rest consistency gate, not checkpoint
-provenance by itself. The version 3 switch must validate the complete version 2
-checkpoint and active tail, prove that the imported set is unique and covers
-the claimed revision boundary, and write the rows with that covering head in
-one serializable transaction.
+provenance by itself. A covering version 3 head or transaction token alone is
+not write capability. PR-B migration 011 must atomically introduce the
+`unavailable-adopted-v2` provenance and write path only with the complete
+version 2 checkpoint-and-tail validator, proof that the imported set is unique
+and covers the claimed revision boundary, imported rows, covering checkpoint
+head, and exact completeness marker in one serializable transaction.
 
 This foundation is not retention by itself. Production version 2 still writes
 complete local history, so deployment hosts must monitor `inspectCapacity()`
@@ -2588,10 +2587,10 @@ with its exact completeness marker in the same transaction. Only then may it
 keep current storage and destroyed tombstones locally while serving exact
 operation replay from PostgreSQL. It
 must retain the origin operation referenced by each current attachment so the
-committed attachment identity remains reconstructable. The atomic cut must
-advance the version 3 checkpoint head and marker in the transaction that adds
-any unavailable legacy suffix, so the database constraint and reader both
-reject a partial adoption.
+committed attachment identity remains reconstructable. Migration 011 must add
+any unavailable legacy suffix only in the same atomic cut that installs its
+validator-approved rows, version 3 checkpoint head, and marker, so the database
+constraint and reader both reject a partial adoption.
 
 The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child

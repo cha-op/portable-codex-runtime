@@ -1992,7 +1992,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         assert.equal(error.code, "23514");
         assert.equal(
           error.constraint,
-          "filesystem_image_provider_operations_adopted_v3_cut",
+          "filesystem_image_provider_operations_committed_record_shape",
         );
         return true;
       },
@@ -2091,23 +2091,14 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     adoptedCommittedHead.lastChecksum,
     adoptedCommittedHead.ledgerBytes,
   ];
-  const adoptedClient = await pool.connect();
-  let adoptedTransactionOpen = false;
+  const rejectedCoveredAdoptionClient = await pool.connect();
+  let rejectedCoveredAdoptionTransactionOpen = false;
   try {
-    await adoptedClient.query("BEGIN");
-    adoptedTransactionOpen = true;
+    await rejectedCoveredAdoptionClient.query("BEGIN");
+    rejectedCoveredAdoptionTransactionOpen = true;
     assert.equal(
       (
-        await adoptedClient.query(
-          adoptedInsertQuery,
-          adoptedInsertValues,
-        )
-      ).rowCount,
-      1,
-    );
-    assert.equal(
-      (
-        await adoptedClient.query(
+        await rejectedCoveredAdoptionClient.query(
           adoptedHeadUpdateQuery,
           adoptedHeadUpdateValues,
         )
@@ -2116,29 +2107,97 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     );
     assert.equal(
       (
-        await adoptedClient.query(
-          adoptedUpdateQuery,
-          adoptedUpdateValues,
+        await rejectedCoveredAdoptionClient.query(
+          adoptedInsertQuery,
+          adoptedInsertValues,
         )
       ).rowCount,
       1,
     );
-    await adoptedClient.query("COMMIT");
-    adoptedTransactionOpen = false;
+    await assert.rejects(
+      rejectedCoveredAdoptionClient.query(
+        adoptedUpdateQuery,
+        adoptedUpdateValues,
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "filesystem_image_provider_operations_committed_record_shape",
+        );
+        return true;
+      },
+    );
+    await rejectedCoveredAdoptionClient.query("ROLLBACK");
+    rejectedCoveredAdoptionTransactionOpen = false;
   } finally {
-    if (adoptedTransactionOpen) await adoptedClient.query("ROLLBACK");
-    adoptedClient.release();
+    if (rejectedCoveredAdoptionTransactionOpen) {
+      await rejectedCoveredAdoptionClient.query("ROLLBACK");
+    }
+    rejectedCoveredAdoptionClient.release();
   }
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(adoptedAnchorId),
+    adoptedLegacySnapshot,
+  );
+
+  assert.equal(
+    (
+      await pool.query(adoptedHeadUpdateQuery, adoptedHeadUpdateValues)
+    ).rowCount,
+    1,
+  );
+  const adoptedCutSnapshot =
+    await readProviderAnchorSnapshot(adoptedAnchorId);
+  assert.deepEqual(adoptedCutSnapshot.operations, []);
+
+  const rejectedPostCutAdoptionClient = await pool.connect();
+  let rejectedPostCutAdoptionTransactionOpen = false;
+  try {
+    await rejectedPostCutAdoptionClient.query("BEGIN");
+    rejectedPostCutAdoptionTransactionOpen = true;
+    assert.equal(
+      (
+        await rejectedPostCutAdoptionClient.query(
+          adoptedInsertQuery,
+          adoptedInsertValues,
+        )
+      ).rowCount,
+      1,
+    );
+    await assert.rejects(
+      rejectedPostCutAdoptionClient.query(
+        adoptedUpdateQuery,
+        adoptedUpdateValues,
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "filesystem_image_provider_operations_committed_record_shape",
+        );
+        return true;
+      },
+    );
+    await rejectedPostCutAdoptionClient.query("ROLLBACK");
+    rejectedPostCutAdoptionTransactionOpen = false;
+  } finally {
+    if (rejectedPostCutAdoptionTransactionOpen) {
+      await rejectedPostCutAdoptionClient.query("ROLLBACK");
+    }
+    rejectedPostCutAdoptionClient.release();
+  }
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(adoptedAnchorId),
+    adoptedCutSnapshot,
+  );
+
   const adoptedRows = await pool.query(
     [
-      "SELECT head.contract_version, head.checkpoint_state_revision::text,",
-      "head.operation_index_state_revision::text,",
-      "operation.committed_checksum_provenance, operation.committed_checksum",
-      "FROM session_authority.filesystem_image_provider_heads AS head",
-      "JOIN session_authority.filesystem_image_provider_operations AS operation",
-      "ON operation.provider_id = head.provider_id",
-      "AND operation.anchor_id = head.anchor_id",
-      "WHERE head.provider_id = $1 AND head.anchor_id = $2",
+      "SELECT contract_version, checkpoint_state_revision::text,",
+      "operation_index_state_revision::text",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
     ].join(" "),
     [providerId, adoptedAnchorId],
   );
@@ -2147,8 +2206,6 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       contract_version: 3,
       checkpoint_state_revision: adoptedCommittedHead.stateRevision,
       operation_index_state_revision: adoptedCommittedHead.stateRevision,
-      committed_checksum_provenance: "unavailable-adopted-v2",
-      committed_checksum: null,
     },
   ]);
 
